@@ -319,6 +319,17 @@ async fn main() -> ExitCode {
             freshell_sessions::parse::default_opencode_data_home(),
         ),
     ));
+    // Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): wire the
+    // SAME locators + coding-CLI command specs `ws_state` (below) gets into
+    // `fresh_agent_state` too, so `POST /api/tabs` terminal-mode creates (a)
+    // accept every mode the WS `terminal.create` path does and (b) arm a
+    // fresh amplifier/opencode pane in the IDENTICAL locator instance the
+    // periodic sweep (spawned below, against `ws_state`) already polls --
+    // one shared instance, no second sweep loop.
+    let fresh_agent_state = fresh_agent_state
+        .with_cli_commands(Arc::clone(&cli_commands))
+        .with_amplifier_locator(amplifier_locator.clone())
+        .with_opencode_locator(opencode_locator.clone());
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),

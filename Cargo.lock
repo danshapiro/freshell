@@ -1287,6 +1287,7 @@ dependencies = [
  "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-sessions",
  "freshell-terminal",
  "libc",
  "serde_json",

@@ -38,17 +38,111 @@ use axum::Router;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use freshell_platform::SpawnSpec;
-use freshell_protocol::{ServerMessage, UiCommand};
+use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
+use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
+use freshell_platform::spawn::{
+    cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
+    CliLaunchInputs, LaunchIntent,
+};
+use freshell_platform::{
+    build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
+    RealFileProbe, ShellType, SpawnSpec,
+};
+use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
 
 use crate::{
     authorized, fail_json, ok_json, text_plain, FreshAgentState, TabRecord, TerminalPaneEntry,
 };
 
-/// Modes Slice 1 actually wires to a real terminal. Every other value is an
-/// honest 400 naming the deferral (spec §4.2's own "BUILD" backlog), never a
-/// silent wrong-behavior fallback.
-const SUPPORTED_TERMINAL_MODES: &[&str] = &["shell"];
+/// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
+/// on a `mode:"codex"` create -- mirrors
+/// `server/coding-cli/codex-app-server/restore-decision.ts:27-28`'s
+/// `INVALID_RAW_CODEX_RESUME_MESSAGE` verbatim (a frozen TS string literal,
+/// not importable from Rust) so a REST client sees byte-identical text to the
+/// legacy Node server for this specific rejection.
+const INVALID_RAW_CODEX_RESUME_MESSAGE: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
+
+// -- mode / resume-id / sessionRef derivation (router.ts:695-793 semantics) --
+
+/// Is `mode` a real, registered terminal launch target? `shell` always is;
+/// every other value must be a known coding-CLI spec (`state.cli_commands`,
+/// the SAME list the WS `terminal.create` path resolves `mode` against --
+/// `crates/freshell-ws/src/terminal.rs:716` `cli_spec_known`). Unlike Slice
+/// 1's hardcoded single-mode allowlist, this is generic over whatever the
+/// server's extension registry discovered at boot (claude/codex/gemini/kimi/
+/// opencode/amplifier/...), so REST/WS create-mode parity does not require
+/// updating two lists in lockstep.
+fn mode_is_known(state: &FreshAgentState, mode: &str) -> bool {
+    mode == "shell" || state.cli_commands.iter().any(|s| s.name == mode)
+}
+
+/// `acceptedSessionRefForMode` (`router.ts:230-236`): a `sessionRef` is only
+/// honored when its `provider` matches the terminal's own `mode` -- a
+/// `sessionRef` minted for a different provider is silently NOT accepted
+/// (falls through to the raw `resumeSessionId` path instead).
+fn accepted_session_ref_for_mode<'a>(
+    session_ref: Option<&'a SessionLocator>,
+    mode: &str,
+) -> Option<&'a SessionLocator> {
+    session_ref.filter(|r| r.provider == mode)
+}
+
+/// `requestedResumeSessionIdForMode` (`router.ts:214-228`): resolve the ONE
+/// resume-session-id a create should launch with -- the accepted
+/// `sessionRef` first, else (every mode EXCEPT `codex`) the legacy raw
+/// `resumeSessionId` field. `codex` is special-cased (`router.ts:221-226`,
+/// throwing `AgentRouteInputError(INVALID_RAW_CODEX_RESUME_MESSAGE)`): a raw
+/// `resumeSessionId` with no matching `sessionRef` is REJECTED outright
+/// (400), not silently accepted -- a bare codex thread id alone is not
+/// sufficient restore identity per the durable-thread contract
+/// (`restore-decision.ts`).
+///
+/// NOTE: the Rust port's WS `terminal.create` handler
+/// (`crates/freshell-ws/src/terminal.rs:763-766`) does NOT yet enforce this
+/// rejection -- it accepts a raw codex `resumeSessionId` unconditionally, a
+/// known, separately-tracked deviation (DEV-0006: the codex app-server
+/// launch planner is not wired into `terminal.create` yet). This REST path
+/// mirrors the ROUTER (the frozen legacy contract) for this specific
+/// decision, per this slice's explicit scope, rather than the WS Rust port's
+/// current interim state.
+///
+/// `Response` is a large `Err` payload (`clippy::result_large_err`), but this
+/// mirrors every other handler in this module (`fail_json` returns `Response`
+/// directly everywhere else) -- boxing just this one call site would be
+/// inconsistent with the module's own established convention for no real
+/// benefit at this call volume (one per `POST /api/tabs`).
+#[allow(clippy::result_large_err)]
+fn requested_resume_session_id_for_mode(
+    session_ref: Option<&SessionLocator>,
+    mode: &str,
+    legacy_resume_session_id: Option<&str>,
+) -> Result<Option<String>, Response> {
+    if let Some(accepted) = accepted_session_ref_for_mode(session_ref, mode) {
+        return Ok(Some(accepted.session_id.clone()));
+    }
+    let legacy = legacy_resume_session_id.filter(|s| !s.is_empty());
+    if mode == "codex" {
+        if legacy.is_some() {
+            return Err(fail_json(
+                StatusCode::BAD_REQUEST,
+                INVALID_RAW_CODEX_RESUME_MESSAGE.to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(legacy.map(str::to_string))
+}
+
+/// `now_ms()` (`Date.now()`) -- the locator arm/note-submit clock. Mirrors
+/// `crates/freshell-ws/src/terminal.rs::now_ms` (a separate, private copy per
+/// crate boundary -- see this module's top-level doc for why
+/// `freshell-freshagent` cannot depend on `freshell-ws`).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 // ── POST /api/tabs (terminal / browser / editor) ───────────────────────────
 
@@ -133,11 +227,13 @@ fn create_content_tab(
 }
 
 /// `SHELL` env var, else `/bin/bash` -- the Linux default-shell fallback
-/// (`getSystemShell`, `terminal-registry.ts`). Slice 1 scope note: this port
-/// does NOT reproduce the original's `{system,cmd,powershell,wsl}` x
-/// `{Linux,WSL,Windows}` resolution matrix (`freshell_platform::build_spawn_spec`
-/// covers that fully, but wiring its `Env`/`FileProbe` injection here is out of
-/// this slice's bounded scope) -- every requested `shell` value launches the
+/// (`getSystemShell`, `terminal-registry.ts`). Slice 1 scope note (UNCHANGED
+/// by Slice 3a -- only the `mode != "shell"` path below gains full argv
+/// fidelity): this port does NOT reproduce the original's
+/// `{system,cmd,powershell,wsl}` x `{Linux,WSL,Windows}` resolution matrix for
+/// SHELL-mode terminals (`freshell_platform::build_spawn_spec` covers that
+/// fully, but wiring its `Env`/`FileProbe` injection here is out of this
+/// slice's bounded scope) -- every requested `shell` value launches the
 /// host's default shell. Acceptable because the QA lever's shell mode only
 /// needs A real interactive shell, not shell-type fidelity.
 fn shell_spawn_spec(cwd: Option<&str>) -> SpawnSpec {
@@ -163,13 +259,159 @@ fn build_shell_env() -> BTreeMap<String, String> {
     env
 }
 
-/// The terminal-mode path (`router.ts:724-793`): resolve provider settings
-/// (Slice 1: shell only), spawn through the shared registry, attach
-/// `paneContent`, broadcast `ui.command{tab.create}` with the legacy-exact
-/// payload keys. On failure: nothing was ever recorded (tab/pane ids are
-/// local variables until the spawn succeeds) -- atomic rollback by
-/// construction, matching the original's cleanup-then-error contract
-/// (`router.ts:817-831`) without needing an explicit cleanup step.
+/// `getModeLabel` (`terminal-registry.ts:439-443`, mirrored from
+/// `crates/freshell-ws/src/terminal.rs:1258` -- a separate, private copy per
+/// crate boundary, see this module's top doc): `'Shell'` for shell, the CLI
+/// spec label otherwise (capitalized-mode fallback is unreachable here --
+/// unknown modes are rejected before launch by `mode_is_known`).
+fn mode_label(mode: &str, cli: Option<&CliLaunch>) -> String {
+    if mode == "shell" {
+        return "Shell".to_string();
+    }
+    match cli {
+        Some(l) if !l.label.is_empty() => l.label.clone(),
+        _ => {
+            let mut chars = mode.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// `buildTerminalBaseEnv` (`terminal-registry.ts:1529-1542`, mirrored from
+/// `crates/freshell-ws/src/terminal.rs:1278`): `FRESHELL`/`FRESHELL_URL`/
+/// `FRESHELL_TOKEN`/`FRESHELL_TERMINAL_ID`/`+TAB`/`PANE` -- the Rust server's
+/// canonical `PORT`/`AUTH_TOKEN` env plumbing carries over verbatim.
+fn build_terminal_base_env(
+    env: &dyn Env,
+    terminal_id: &str,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    out.insert("FRESHELL".to_string(), "1".to_string());
+    let port_raw = env
+        .get("PORT")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "3001".to_string());
+    let url = env
+        .get("FRESHELL_URL")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| format!("http://localhost:{}", js_number_string(&port_raw)));
+    out.insert("FRESHELL_URL".to_string(), url);
+    out.insert(
+        "FRESHELL_TOKEN".to_string(),
+        env.get("AUTH_TOKEN").unwrap_or_default(),
+    );
+    out.insert("FRESHELL_TERMINAL_ID".to_string(), terminal_id.to_string());
+    if let Some(t) = tab_id.filter(|s| !s.is_empty()) {
+        out.insert("FRESHELL_TAB_ID".to_string(), t.to_string());
+    }
+    if let Some(p) = pane_id.filter(|s| !s.is_empty()) {
+        out.insert("FRESHELL_PANE_ID".to_string(), p.to_string());
+    }
+    out
+}
+
+/// JS `String(Number(s))` for the `PORT` template slot (mirrored from
+/// `crates/freshell-ws/src/terminal.rs:1313`).
+fn js_number_string(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return "0".to_string();
+    }
+    match t.parse::<f64>() {
+        Ok(n) if n.is_finite() => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        _ => "NaN".to_string(),
+    }
+}
+
+/// `wrapTerminalSpawnError` (`terminal-registry.ts:450-481`, mirrored from
+/// `crates/freshell-ws/src/terminal.rs:1334`): the user-facing spawn-failure
+/// message.
+fn wrap_terminal_spawn_error(
+    err: &std::io::Error,
+    label: &str,
+    file: &str,
+    env_var: Option<&str>,
+    resumed: bool,
+) -> String {
+    let action = if resumed {
+        format!("Could not restore {label}")
+    } else {
+        format!("Could not start {label}")
+    };
+    if err.kind() == std::io::ErrorKind::NotFound {
+        let common = format!(
+            "\"{file}\" could not be started because the executable or working directory was not found on the server."
+        );
+        return match env_var {
+            Some(v) => {
+                format!("{action}: {common} Reinstall it or set {v} to the correct executable.")
+            }
+            None => format!(
+                "{action}: {common} Check that the executable exists and the working directory is valid."
+            ),
+        };
+    }
+    let base = err.to_string();
+    if base.is_empty() {
+        format!("{action}: Failed to spawn terminal")
+    } else if base.starts_with(&format!("{action}:")) {
+        base
+    } else {
+        format!("{action}: {base}")
+    }
+}
+
+/// Arm the amplifier/opencode session locator for a freshly-created REST
+/// terminal, iff it's a fresh (non-resuming) pane of the matching mode with a
+/// resolved cwd -- mirrors `crates/freshell-ws/src/amplifier_association::maybe_arm`
+/// / `opencode_association::maybe_arm` EXACTLY (same shared-instance `arm()`
+/// call, same argument shape); those wrapper fns are `pub(crate)` inside
+/// `freshell-ws` and unreachable from this crate (circular-dependency
+/// boundary, see this module's top doc), so this is the thin, crate-local
+/// equivalent -- the actual mode/resume/cwd admission logic lives ONCE, inside
+/// `AmplifierLocator::arm`/`OpencodeLocator::arm` themselves (shared by both
+/// crates via `freshell-sessions`), not duplicated here.
+fn arm_locators_for_fresh_pane(
+    state: &FreshAgentState,
+    terminal_id: &str,
+    mode: &str,
+    cwd: Option<&str>,
+    resume_session_id: Option<&str>,
+) {
+    if let Some(locator) = &state.amplifier_locator {
+        locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
+    }
+    if let Some(locator) = &state.opencode_locator {
+        locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
+    }
+}
+
+/// The terminal-mode path (`router.ts:724-793`): resolve the requested mode
+/// against the registered coding-CLI specs, derive the resume identity
+/// (`acceptedSessionRefForMode`/`requestedResumeSessionIdForMode`), spawn
+/// through the shared registry with the SAME argv/env-building pipeline the
+/// WS `terminal.create` handler uses for `mode != "shell"`
+/// (`crates/freshell-ws/src/terminal.rs:700-1050`: `cli_provider_target` ->
+/// `resolve_mcp_cwd` -> `generate_mcp_injection` -> `CliLaunchInputs` ->
+/// `resolve_coding_cli_command` -> `build_{cli_,windows_cli_,}spawn_spec`),
+/// arm the amplifier/opencode locator for a fresh pane, attach `paneContent`,
+/// broadcast `ui.command{tab.create}` with the legacy-exact payload keys. On
+/// failure: nothing was ever recorded (tab/pane ids are local variables until
+/// the spawn succeeds) -- atomic rollback by construction, matching the
+/// original's cleanup-then-error contract (`router.ts:817-831`) without
+/// needing an explicit cleanup step, PLUS the MCP-config cleanup the original
+/// also performs on a failed create (`router.ts:819`, `cw:429-448`).
 async fn create_terminal_tab(
     state: &FreshAgentState,
     name: Option<String>,
@@ -182,15 +424,14 @@ async fn create_terminal_tab(
         .unwrap_or("shell")
         .to_string();
 
-    if !SUPPORTED_TERMINAL_MODES.contains(&mode.as_str()) {
+    if !mode_is_known(state, &mode) {
         return fail_json(
             StatusCode::BAD_REQUEST,
             format!(
-                "mode \"{mode}\" is not yet supported by the Rust port's Agent-API terminal-create \
-                 path (Slice 1 ships shell only; claude/codex/gemini/kimi terminal-mode wiring is \
-                 deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §4.2). Use \
-                 {{\"agent\":\"opencode\"}} for the fresh-agent path, or open an issue if you need \
-                 this mode."
+                "mode \"{mode}\" is not a registered terminal launch target on this server \
+                 (no matching coding-CLI extension manifest, and it isn't \"shell\"). Use \
+                 {{\"agent\":\"opencode\"}} for the fresh-agent path, or open an issue if you \
+                 need this mode."
             ),
         );
     }
@@ -202,20 +443,30 @@ async fn create_terminal_tab(
         );
     };
 
-    let shell = body
+    let shell_str = body
         .get("shell")
         .and_then(Value::as_str)
         .map(str::to_string);
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
-    let resume_session_id = body
+    let legacy_resume_session_id = body
         .get("resumeSessionId")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // `sanitizeSessionRef` (`shared/session-contract.ts:55-62`): a malformed
+    // `sessionRef` (missing/empty `provider`/`sessionId`) is silently treated
+    // as absent, never a 400 -- `serde_json::from_value` on the
+    // `{provider,sessionId}` shape gives the same "well-formed or None"
+    // behavior (a wrong-shaped JSON value -> `Err` -> `None` here, since
+    // `SessionLocator`'s fields are non-optional strings).
+    let session_ref: Option<SessionLocator> = body
+        .get("sessionRef")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok());
 
     // Validate `cwd` up front: a nonexistent directory would otherwise fail
     // INSIDE the spawned child (post-fork), which a synchronous `registry.create`
     // call cannot observe -- checking here keeps the atomic-rollback contract
-    // (spec \u00a72.1 "Atomic rollback is part of the contract") honest and testable.
+    // (spec 2.1 "Atomic rollback is part of the contract") honest and testable.
     if let Some(dir) = &cwd {
         if !std::path::Path::new(dir).is_dir() {
             return fail_json(
@@ -225,41 +476,254 @@ async fn create_terminal_tab(
         }
     }
 
+    let resume_session_id = match requested_resume_session_id_for_mode(
+        session_ref.as_ref(),
+        &mode,
+        legacy_resume_session_id.as_deref(),
+    ) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let accepted_session_ref = accepted_session_ref_for_mode(session_ref.as_ref(), &mode).cloned();
+
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
-
-    let spec = shell_spawn_spec(cwd.as_deref());
-    let env = build_shell_env();
-
-    // NOTE: `on_exit` is `None` here -- harmless for this shell-only REST
-    // create path (Slice 1), since shell terminals never arm a session
-    // locator. A future rich-agent REST create path (claude/codex/gemini/
-    // kimi terminal-mode) that arms a locator (e.g. `AmplifierLocator`,
-    // `OpencodeLocator`) on create would also need to disarm it on exit --
-    // this call site would need a real `on_exit` hook wired in for that to
-    // happen. Flagging for the next slice
-    // (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §4.2).
-    if let Err(err) = registry.create(&spec, &env, terminal_id.clone(), stream_id, None, None) {
-        // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
-        // is a no-op by construction.
-        return fail_json(
-            StatusCode::BAD_REQUEST,
-            format!("failed to spawn shell terminal: {err}"),
-        );
-    }
-
+    // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
+    // `layoutStore.createTab()` before `registry.create()`) so the CLI env
+    // (`FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`) can carry them, matching the WS
+    // path's `create.tab_id`/`create.pane_id` plumbing.
     let tab_id = Uuid::new_v4().to_string();
     let pane_id = Uuid::new_v4().to_string();
+
+    let mut cli: Option<CliLaunch> = None;
+    let mut mcp_cwd: Option<String> = None;
+    let spec: SpawnSpec;
+    let child_env: BTreeMap<String, String>;
+
+    if mode == "shell" {
+        spec = shell_spawn_spec(cwd.as_deref());
+        child_env = build_shell_env();
+    } else {
+        let host_os = host_os_live();
+        let is_wsl = is_wsl_env_live();
+        let shell_type = shell_str
+            .as_deref()
+            .and_then(ShellType::parse)
+            .unwrap_or(ShellType::System);
+
+        let target = cli_provider_target(shell_type, host_os, is_wsl, cwd.as_deref(), &RealEnv);
+        mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
+
+        let mcp_injection = match generate_mcp_injection(
+            &RealMcpRuntime,
+            &mode,
+            &terminal_id,
+            mcp_cwd.as_deref(),
+            target,
+        ) {
+            Ok(i) => i,
+            Err(e) => return fail_json(StatusCode::BAD_REQUEST, e.message),
+        };
+
+        // opencode: allocate the loopback control endpoint BEFORE building the
+        // launch (mirrors `crates/freshell-ws/src/terminal.rs:802-813`).
+        let opencode_endpoint = if mode == "opencode" {
+            use freshell_opencode::serve::PortAllocator as _;
+            match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+                Ok(ep) => Some(ep),
+                Err(e) => return fail_json(StatusCode::BAD_REQUEST, e),
+            }
+        } else {
+            None
+        };
+
+        // `model`/`sandbox`/`permissionMode` overrides: explicit body values
+        // only (Slice 3a scope note -- unlike the WS path, `FreshAgentState`
+        // has no `settings.codingCli.providers[mode]` defaults tree wired in,
+        // so there is no settings-derived fallback layer here; a client that
+        // wants non-default provider settings must pass them explicitly on
+        // the create call).
+        let permission_mode = body
+            .get("permissionMode")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let sandbox = body
+            .get("sandbox")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let inputs = CliLaunchInputs {
+            mode: &mode,
+            target,
+            resume_session_id: resume_session_id.as_deref(),
+            // Always `Resume`: this path never mints its OWN preallocated
+            // session id the way the WS path's fresh-claude special case
+            // does (`crates/freshell-ws/src/terminal.rs:749-762`, out of this
+            // slice's scope, matches `router.ts`, which has no such
+            // preallocation either) -- `LaunchIntent` only matters when
+            // `resume_session_id` is `Some`, and every `Some` here IS a
+            // genuine resume (accepted `sessionRef` or legacy
+            // `resumeSessionId`).
+            launch_intent: LaunchIntent::Resume,
+            permission_mode: permission_mode.as_deref(),
+            model: model.as_deref(),
+            sandbox: sandbox.as_deref(),
+            // Codex app-server remote launch planning is not wired into
+            // EITHER create path yet (DEV-0006, `crates/freshell-ws/src/terminal.rs:815-818`)
+            // -- matches the WS Rust port's current shipped state exactly.
+            codex_remote_ws_url: None,
+            opencode_server: opencode_endpoint
+                .as_ref()
+                .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
+            mcp_injection,
+        };
+        let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
+            Ok(l) => l,
+            Err(e) => return fail_json(StatusCode::BAD_REQUEST, e.message()),
+        };
+
+        let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
+        let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
+        let overrides =
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
+
+        spec = match &launch {
+            Some(l) if windows_like => build_windows_cli_spawn_spec(
+                l,
+                shell_type,
+                host_os,
+                is_wsl,
+                cwd.as_deref(),
+                &RealEnv,
+                &overrides,
+                None,
+                None,
+            ),
+            Some(l) => {
+                build_cli_spawn_spec(l, is_wsl, cwd.as_deref(), &RealEnv, &overrides, None, None)
+            }
+            None => build_spawn_spec(
+                shell_type,
+                host_os,
+                is_wsl,
+                cwd.as_deref(),
+                &RealEnv,
+                &RealFileProbe,
+                &overrides,
+                None,
+                None,
+            ),
+        };
+        child_env = freshell_terminal::build_child_env_from_process(&spec);
+        cli = launch;
+    }
+
+    // Exit hook (`tr:1479-1510` finishTerminalPtyExit, mirrored from
+    // `crates/freshell-ws/src/terminal.rs:937-972`): cleanupMcpConfig BEFORE
+    // registry bookkeeping, then disarm both locators -- so a REST-created
+    // amplifier/opencode pane's armed entry is never left dangling on exit,
+    // exactly like the WS path's on_exit closes this same gap (the parity
+    // fix this slice's scope item 2 requires). KNOWN GAP (documented, not
+    // silently dropped): unlike the WS on_exit, this hook cannot call
+    // `identity.retire(&tid)` -- `TerminalIdentityRegistry` is
+    // `freshell-ws`-owned and unreachable here without a circular crate
+    // dependency; a REST-created terminal's identity entry (written by the
+    // SHARED locator sweep once association resolves) simply persists past
+    // exit instead of being explicitly retired. Acceptable: the entry is
+    // inert once the terminal is gone, and a future create for the same
+    // terminal id (a fresh UUID) never collides with it.
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = {
+        let tid = terminal_id.clone();
+        let cleanup_mode = mode.clone();
+        let cleanup_cwd = mcp_cwd.clone();
+        let registry_for_exit = registry.clone();
+        let amplifier_locator = state.amplifier_locator.clone();
+        let opencode_locator = state.opencode_locator.clone();
+        Some(Box::new(move |exit_code: i64| {
+            cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
+            registry_for_exit.finish_pty_exit(&tid, exit_code);
+            if let Some(locator) = &amplifier_locator {
+                locator.disarm(&tid);
+            }
+            if let Some(locator) = &opencode_locator {
+                locator.disarm(&tid);
+            }
+        }))
+    };
+
+    if let Err(err) = registry.create(
+        &spec,
+        &child_env,
+        terminal_id.clone(),
+        stream_id,
+        None,
+        on_exit,
+    ) {
+        // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
+        // is a no-op by construction, EXCEPT the MCP config file(s)
+        // `generate_mcp_injection` may already have written -- clean those up
+        // too (`router.ts:819`, `cw:429-448` -- the original's failed-create
+        // cleanup path).
+        if mode != "shell" {
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        }
+        let label = mode_label(&mode, cli.as_ref());
+        let env_var = state
+            .cli_commands
+            .iter()
+            .find(|s| s.name == mode)
+            .and_then(|s| s.env_var.clone());
+        let message = wrap_terminal_spawn_error(
+            &err,
+            &label,
+            &spec.program,
+            env_var.as_deref(),
+            resume_session_id.is_some(),
+        );
+        return fail_json(StatusCode::BAD_REQUEST, message);
+    }
+
+    registry.set_meta(
+        &terminal_id,
+        Some(mode_label(&mode, cli.as_ref())),
+        None,
+        Some(mode.clone()),
+        resume_session_id.clone(),
+    );
+
+    // Restore-across-restart fix (amplifier) + OpenCode terminal-pane restore
+    // fix (opencode): arm the SHARED locator for a FRESH (non-resuming) pane
+    // of the matching mode. No-ops for every other mode/resume case (the
+    // admission checks live inside `arm()` itself, see
+    // `arm_locators_for_fresh_pane`'s doc comment).
+    arm_locators_for_fresh_pane(
+        state,
+        &terminal_id,
+        &mode,
+        cwd.as_deref(),
+        resume_session_id.as_deref(),
+    );
 
     let mut pane_content = json!({
         "kind": "terminal",
         "terminalId": terminal_id,
         "status": "running",
         "mode": mode,
-        "shell": shell.clone().unwrap_or_else(|| "system".to_string()),
+        "shell": shell_str.clone().unwrap_or_else(|| "system".to_string()),
         "initialCwd": cwd,
     });
-    if let Some(rsid) = &resume_session_id {
+    // `paneContent` sessionRef/resumeSessionId (`router.ts:762-771`): accepted
+    // `sessionRef` wins; `resumeSessionId` only appears when there is NO
+    // accepted `sessionRef` (mutually exclusive, matching the original's
+    // `...(accepted ? {sessionRef} : {}), ...(resumeId && !accepted ? {resumeSessionId} : {})`).
+    if let Some(sref) = &accepted_session_ref {
+        pane_content["sessionRef"] =
+            json!({ "provider": sref.provider, "sessionId": sref.session_id });
+    } else if let Some(rsid) = &resume_session_id {
         pane_content["resumeSessionId"] = json!(rsid);
     }
 
@@ -283,19 +747,31 @@ async fn create_terminal_tab(
         },
     );
 
+    // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
+    // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
+    // `sessionRef` (whichever `paneContent` carries -- mutually exclusive,
+    // matching the original's `...(paneContent?.resumeSessionId ? {...} : {}),
+    // ...(paneContent?.sessionRef ? {...} : {})`), paneId, paneContent.
+    let mut payload = json!({
+        "id": tab_id,
+        "title": name,
+        "mode": mode,
+        "shell": shell_str,
+        "terminalId": terminal_id,
+        "initialCwd": cwd,
+        "paneId": pane_id,
+        "paneContent": pane_content,
+    });
+    if let Some(rsid) = pane_content.get("resumeSessionId") {
+        payload["resumeSessionId"] = rsid.clone();
+    }
+    if let Some(sref) = pane_content.get("sessionRef") {
+        payload["sessionRef"] = sref.clone();
+    }
+
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
-        payload: Some(json!({
-            "id": tab_id,
-            "title": name,
-            "mode": mode,
-            "shell": shell,
-            "terminalId": terminal_id,
-            "initialCwd": cwd,
-            "resumeSessionId": resume_session_id,
-            "paneId": pane_id,
-            "paneContent": pane_content,
-        })),
+        payload: Some(payload),
     }));
 
     ok_json(
@@ -347,7 +823,11 @@ pub(crate) async fn list_panes(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let tab_filter = params.get("tabId");
-    let terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex").clone();
+    let terminal_panes = state
+        .terminal_panes
+        .lock()
+        .expect("terminal_panes mutex")
+        .clone();
     let panes: Vec<Value> = state
         .tabs
         .lock()
@@ -355,7 +835,9 @@ pub(crate) async fn list_panes(
         .values()
         .filter(|t| tab_filter.is_none_or(|tid| tid == &t.id))
         .map(|t| {
-            let terminal_id = terminal_panes.get(&t.pane_id).map(|p| p.terminal_id.clone());
+            let terminal_id = terminal_panes
+                .get(&t.pane_id)
+                .map(|p| p.terminal_id.clone());
             json!({
                 "id": t.pane_id,
                 "tabId": t.id,
@@ -414,7 +896,33 @@ pub(crate) fn maybe_send_keys(
         ));
     }
     registry.input(&terminal_id, text.as_bytes());
+    // Feed the amplifier/opencode locator's Enter<->session correlation
+    // (`is_submit_input`/`note_possible_submit`,
+    // `crates/freshell-ws/src/amplifier_association.rs:29-33,66-72`): a
+    // REST-created fresh amplifier/opencode pane only associates once its
+    // FIRST submit-shaped input (a bare CR/LF run) is observed here -- a
+    // REST `send-keys` must feed the SAME shared locator the WS `terminal.input`
+    // path does, or a REST-driven Enter would silently never open the
+    // locator's correlation window. No-ops (`note_submit` itself checks
+    // "is this terminal armed?") for every non-armed/non-Enter case.
+    if is_submit_input(text) {
+        if let Some(locator) = &state.amplifier_locator {
+            locator.note_submit(&terminal_id, now_ms());
+        }
+        if let Some(locator) = &state.opencode_locator {
+            locator.note_submit(&terminal_id, now_ms());
+        }
+    }
     Some(ok_json(json!({ "terminalId": terminal_id }), "input sent"))
+}
+
+/// `isSubmitInput` (`shared/turn-complete-signal.ts:125-127`, mirrored from
+/// `crates/freshell-ws/src/amplifier_association.rs:29-33`): the input is
+/// ONLY a run of CR/LF bytes -- an Enter keypress, possibly repeated.
+/// Anything else (real text, control sequences, partial lines) is not a
+/// submit.
+fn is_submit_input(data: &str) -> bool {
+    !data.is_empty() && data.chars().all(|c| c == '\r' || c == '\n')
 }
 
 /// Render a terminal pane's scrollback as text (`renderCapture`, `router.ts:904-935`
@@ -728,13 +1236,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tab_unsupported_terminal_mode_is_400_with_deferral_message() {
+    async fn create_tab_unregistered_terminal_mode_is_400() {
         let state = state_with_registry();
         let (status, body) = post(app(state), "/api/tabs", json!({ "mode": "claude" }), true).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let msg = body["message"].as_str().unwrap();
         assert!(msg.contains("claude"), "{msg}");
-        assert!(msg.contains("Slice 1"), "{msg}");
+        assert!(
+            msg.contains("not a registered terminal launch target"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -845,7 +1356,13 @@ mod tests {
     async fn get_panes_lists_created_panes_with_id_and_terminal_id() {
         let state = state_with_registry();
         let router = app(state);
-        let (_status, body) = post(router.clone(), "/api/tabs", json!({ "mode": "shell" }), true).await;
+        let (_status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "mode": "shell" }),
+            true,
+        )
+        .await;
         let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
         let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
 
@@ -1010,6 +1527,420 @@ mod tests {
         let (status, _text) =
             get_text(router, &format!("/api/panes/{pane_id}/capture"), true).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    // -- Slice 3a: rich-mode terminal create (amplifier / opencode / codex) --
+
+    /// A test-only [`freshell_platform::CliCommandSpec`] whose `default_cmd`
+    /// is a real, always-present binary (`/bin/sh`) so `registry.create()`
+    /// genuinely spawns (no ENOENT) -- `-c "... ; exec sleep 30"` keeps the
+    /// PTY alive long enough for send-keys/is_running assertions, and the
+    /// leading `printf '%s\n' "$@" > argv_file` records the FULL resolved
+    /// argv (provider/base/settings/resume segments, in order) so tests can
+    /// assert on the real computed CLI launch, not just the registry's
+    /// mode/resume_session_id bookkeeping.
+    /// Writes a standalone, executable recording script (`#!/bin/sh` +
+    /// `printf '%s\n' "$@" > argv_file; exec sleep 30`) and points
+    /// `default_cmd` straight at it with EMPTY `base_args`. Deliberately NOT
+    /// a `/bin/sh -c "..."` wrapper: `codex`'s own `provider_args`
+    /// (`CODEX_TUI_NOTIFICATION_ARGS`, a run of `-c key=value` pairs)
+    /// PREPEND before `base_args` (`resolve_coding_cli_command`'s segment
+    /// order, `[remote, provider, base, settings, resume]`) -- if this
+    /// spec's own `base_args` also started with `-c`, `/bin/sh` would parse
+    /// codex's FIRST injected `-c value` as ITS `-c` flag instead, and this
+    /// script would never run. A real executable file has no such
+    /// first-arg-parsing collision: whatever argv the resolver computes for
+    /// ANY mode just lands in the script's own `"$@"`, faithfully.
+    fn recording_cli_spec(
+        name: &str,
+        argv_file: &std::path::Path,
+    ) -> freshell_platform::CliCommandSpec {
+        let script_path = std::env::temp_dir().join(format!(
+            "freshell-slice3a-recorder-{name}-{}-{}.sh",
+            std::process::id(),
+            argv_file.file_name().unwrap().to_string_lossy()
+        ));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {} 2>/dev/null\nexec sleep 30\n",
+            argv_file.display()
+        );
+        std::fs::write(&script_path, script).expect("write recording script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        freshell_platform::CliCommandSpec {
+            name: name.to_string(),
+            label: format!("{name}-label"),
+            env_var: None,
+            default_cmd: script_path.to_string_lossy().to_string(),
+            base_args: vec![],
+            base_env: BTreeMap::new(),
+            resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+            create_session_args: None,
+            model_args: None,
+            sandbox_args: None,
+            permission_mode_args: None,
+        }
+    }
+
+    fn unique_argv_file(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "freshell-slice3a-argv-{label}-{}-{n}.txt",
+            std::process::id()
+        ))
+    }
+
+    fn unique_temp_home(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-slice3a-home-{label}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Poll `path` (bounded) until it has content -- the recording script
+    /// writes its argv line asynchronously right after the PTY forks.
+    async fn read_argv_file_eventually(path: &std::path::Path) -> String {
+        for _ in 0..50 {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !content.is_empty() {
+                    return content;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn state_with_amplifier_locator(home: std::path::PathBuf) -> FreshAgentState {
+        state_with_registry().with_amplifier_locator(Some(std::sync::Arc::new(
+            freshell_sessions::amplifier_locator::AmplifierLocator::new(home),
+        )))
+    }
+
+    fn state_with_opencode_locator(home: std::path::PathBuf) -> FreshAgentState {
+        state_with_registry().with_opencode_locator(Some(std::sync::Arc::new(
+            freshell_sessions::opencode_locator::OpencodeLocator::new(home),
+        )))
+    }
+
+    #[tokio::test]
+    async fn create_amplifier_tab_fresh_spawns_recorded_argv_with_no_resume_and_arms_locator() {
+        let home = unique_temp_home("amplifier-fresh");
+        let argv_file = unique_argv_file("amplifier-fresh");
+        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
+            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
+        );
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "amplifier", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert!(state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .is_running(&terminal_id));
+
+        // Locator ARMED for the fresh amplifier pane (scope item 2's parity
+        // fix -- REST-created amplifier panes previously never armed).
+        assert_eq!(
+            state.amplifier_locator.as_ref().unwrap().armed_count(),
+            1,
+            "fresh amplifier REST create must arm the shared locator"
+        );
+
+        // No resume args in the recorded argv (fresh launch).
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(!argv.contains("--resume"), "fresh launch argv: {argv}");
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_amplifier_tab_disarms_locator_on_exit() {
+        let home = unique_temp_home("amplifier-disarm");
+        let argv_file = unique_argv_file("amplifier-disarm");
+        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
+            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
+        );
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "amplifier", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
+
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&terminal_id);
+        // `kill` drives the PTY's on_exit hook synchronously-enough that a
+        // short bounded poll always observes the disarm.
+        for _ in 0..30 {
+            if state.amplifier_locator.as_ref().unwrap().armed_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            state.amplifier_locator.as_ref().unwrap().armed_count(),
+            0,
+            "on_exit must disarm the locator (parity with the WS create path)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_opencode_tab_fresh_spawns_with_hostname_port_args_and_arms_locator() {
+        let home = unique_temp_home("opencode-fresh");
+        let argv_file = unique_argv_file("opencode-fresh");
+        let state =
+            state_with_opencode_locator(home.clone()).with_cli_commands(std::sync::Arc::new(vec![
+                recording_cli_spec("opencode", &argv_file),
+            ]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "opencode", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert!(state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .is_running(&terminal_id));
+        assert_eq!(
+            state.opencode_locator.as_ref().unwrap().armed_count(),
+            1,
+            "fresh opencode REST create must arm the shared locator"
+        );
+
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(argv.contains("--hostname"), "opencode argv: {argv}");
+        assert!(argv.contains("--port"), "opencode argv: {argv}");
+        assert!(!argv.contains("--resume"), "fresh launch argv: {argv}");
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_codex_tab_rejects_raw_resume_session_id_without_session_ref() {
+        let argv_file = unique_argv_file("codex-reject");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "codex", &argv_file,
+            )]));
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({ "mode": "codex", "resumeSessionId": "raw-thread-id-not-a-sessionref" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["message"].as_str().unwrap();
+        assert!(
+            msg.contains("sessionRef") && msg.contains("resumeSessionId"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_codex_tab_accepts_session_ref_and_derives_resume_args() {
+        let argv_file = unique_argv_file("codex-accept");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "codex", &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "codex",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "codex", "sessionId": "thread-abc-123" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(argv.contains("--resume"), "codex resume argv: {argv}");
+        assert!(argv.contains("thread-abc-123"), "codex resume argv: {argv}");
+
+        // `paneContent`/`ui.command` carry `sessionRef`, NOT `resumeSessionId`
+        // (mutually exclusive, `router.ts:762-771,784-785`).
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        assert_eq!(
+            msg["payload"]["sessionRef"],
+            json!({ "provider": "codex", "sessionId": "thread-abc-123" })
+        );
+        assert!(msg["payload"].get("resumeSessionId").is_none());
+        assert_eq!(
+            msg["payload"]["paneContent"]["sessionRef"],
+            json!({ "provider": "codex", "sessionId": "thread-abc-123" })
+        );
+        assert!(msg["payload"]["paneContent"]
+            .get("resumeSessionId")
+            .is_none());
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_tab_resume_session_id_flows_to_registry_directory_for_non_codex_mode() {
+        let argv_file = unique_argv_file("amplifier-resume");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "legacy-resume-id-xyz"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        let registry = state.terminal_registry.clone().unwrap();
+        let entry = registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == terminal_id)
+            .expect("directory entry");
+        assert_eq!(entry.mode, "amplifier");
+        assert_eq!(
+            entry.resume_session_id.as_deref(),
+            Some("legacy-resume-id-xyz")
+        );
+
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(argv.contains("--resume"), "resume argv: {argv}");
+        assert!(argv.contains("legacy-resume-id-xyz"), "resume argv: {argv}");
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn send_keys_enter_feeds_amplifier_locator_and_tick_locates_session() {
+        let home = unique_temp_home("amplifier-e2e");
+        let argv_file = unique_argv_file("amplifier-e2e");
+        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
+            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
+        );
+        let router = app(state.clone());
+        let cwd_dir = home.join("workspace-cwd");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "mode": "amplifier", "cwd": cwd_dir.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
+
+        // REST send-keys with a lone Enter must feed the SAME shared locator
+        // the WS `terminal.input` path feeds (`maybe_send_keys` ->
+        // `is_submit_input` -> `note_submit`) -- proven here by driving the
+        // locator's own `tick()` directly (the periodic sweep's core
+        // mechanism, `freshell_sessions::amplifier_locator::AmplifierLocator::tick`,
+        // is public and crate-reachable; the WS-owned broadcast fan-out
+        // `drain_and_associate` wraps is NOT reachable from this crate --
+        // see this module's doc comment -- so THAT half is covered by
+        // `crates/freshell-ws/src/amplifier_association.rs`'s own test
+        // suite, not duplicated here).
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+
+        let dir = home
+            .join("projects")
+            .join("proj")
+            .join("sessions")
+            .join("sess-rest-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            format!(
+                "{{\"event\":\"session:start\"}}\n{{\"event\":\"session:config\",\"working_dir\":\"{}\"}}\n",
+                cwd_dir.display()
+            ),
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut located_ids: Vec<String> = Vec::new();
+        for _ in 0..30 {
+            let located = state.amplifier_locator.as_ref().unwrap().tick(now_ms());
+            located_ids.extend(located.into_iter().map(|l| l.session_id));
+            if !located_ids.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            located_ids.contains(&"sess-rest-e2e".to_string()),
+            "expected the REST-armed + REST-note_submit'd terminal to correlate with the new \
+             session dir via tick(); located: {located_ids:?}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
     }
 
     #[tokio::test]
