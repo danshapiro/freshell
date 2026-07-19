@@ -5,9 +5,11 @@
 //! `server/coding-cli/codex-app-server/json-rpc-envelope.ts` and
 //! `server/coding-cli/codex-app-server/json-rpc-side-effects.ts`. Both TS files
 //! implement their OWN copy of "skip whitespace / parse a bounded string / parse a
-//! number / skip an arbitrary JSON value without recursion" — nothing behaviorally
-//! differs between the two copies, so this port consolidates them into one internal
-//! engine used by both [`crate::remote_proxy_envelope`] and
+//! number / skip an arbitrary JSON value without recursion" — the copies differ in ONE
+//! subtle way (side-effects bounds ALL numeric tokens via MAX_SCANNED_TOKEN_BYTES;
+//! envelope leaves non-id numbers unbounded), which this port preserves via
+//! skip_value's max_number_token_bytes parameter. Otherwise identical, so this port
+//! consolidates them into one internal engine used by both [`crate::remote_proxy_envelope`] and
 //! [`crate::remote_proxy_side_effects`].
 //!
 //! The whole point of scanning bytes instead of calling `serde_json::from_str` is to
