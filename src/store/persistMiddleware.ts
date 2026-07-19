@@ -94,6 +94,30 @@ import { migrateV2ToV3 } from './persistedState.js'
 
 let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any; persistedAt?: number } | null | undefined
 
+// --- Destructive empty-tabs write guard ---
+//
+// If the persisted layout exists on disk but could not be turned into a
+// usable tabs array (corrupt JSON, a thrown exception, or every tab getting
+// pruned by sanitization), loadInitialTabsState() falls back to an empty
+// tabs array. That in-memory emptiness is NOT trustworthy -- it's an
+// artifact of a failed read, not a signal that the user closed their tabs.
+// `markTabsLoadRecovery()` records that this session started in that
+// untrustworthy state; `flush()` consults it before ever persisting an
+// empty tabs array over a non-empty one already on disk.
+let tabsLoadRecoveryInProgress = false
+
+export function markTabsLoadRecovery(): void {
+  tabsLoadRecoveryInProgress = true
+}
+
+export function wasTabsLoadRecovery(): boolean {
+  return tabsLoadRecoveryInProgress
+}
+
+export function resetTabsLoadRecoveryForTests(): void {
+  tabsLoadRecoveryInProgress = false
+}
+
 /**
  * Load the combined layout from v3 key, or migrate from v2 keys.
  * Cached so both tabs and panes loading see the same data.
@@ -101,8 +125,15 @@ let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any; persistedAt
 export function loadPersistedLayout(): typeof cachedPersistedLayout {
   if (cachedPersistedLayout !== undefined) return cachedPersistedLayout
 
+  // Tracks whether there was raw persisted data on disk that we ultimately
+  // failed to turn into a usable layout. If so, the caller (loadInitialTabsState)
+  // is about to fall back to an empty state that must not be trusted for
+  // persistence purposes -- see markTabsLoadRecovery() above.
+  let rawExisted = false
+
   try {
     const raw = readRecoverablePersistedLayoutRaw(localStorage)
+    rawExisted = !!raw
     if (raw) {
       const layoutParsed = parsePersistedLayoutRaw(raw)
       if (layoutParsed) {
@@ -127,7 +158,14 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
       return cachedPersistedLayout
     }
   } catch {
-    // ignore
+    // An exception means we can't be sure whether there was something on
+    // disk worth protecting -- default to the conservative assumption that
+    // there was.
+    rawExisted = true
+  }
+
+  if (rawExisted) {
+    markTabsLoadRecovery()
   }
 
   cachedPersistedLayout = null
@@ -451,6 +489,13 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let turnCompletionDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
+  // See "Destructive empty-tabs write guard" above loadPersistedLayout().
+  // If this session's initial tabs load was a recovery from a failed/partial
+  // read, an empty in-memory tabs array is not trustworthy until real tab
+  // content is observed -- at which point emptiness (e.g. the user closing
+  // their last tab) becomes a genuine, persistable action again.
+  let distrustEmptyTabs = wasTabsLoadRecovery()
+
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
   const flush = () => {
@@ -460,7 +505,29 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
     const state = store.getState()
 
+    if ((state.tabs?.tabs?.length ?? 0) > 0) {
+      distrustEmptyTabs = false
+    }
+
     try {
+      if (tabsDirty || panesDirty) {
+        const nextTabs = state.tabs?.tabs ?? []
+
+        if (nextTabs.length === 0 && distrustEmptyTabs && canUseStorage()) {
+          const existingRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+          if (existingRaw) {
+            log.warn(
+              'Refusing to persist empty tabs: this session recovered from a failed/partial ' +
+              'layout load and no genuine tab activity has been observed yet. Leaving the ' +
+              'existing persisted layout untouched to avoid destroying it.',
+            )
+            tabsDirty = false
+            panesDirty = false
+            if (!tabRecencyDirty && !turnCompletionDirty) return
+          }
+        }
+      }
+
       if (tabsDirty || panesDirty) {
         // Prune tombstones older than 1 hour
         const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
