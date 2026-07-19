@@ -46,6 +46,7 @@ const MATRIX_SPECS = [
   // take effect via PATCH /api/settings without a restart) -- runs against
   // both server kinds as a parity control. See settings-live-reload.spec.ts.
   /settings-live-reload\.spec\.ts$/,
+  /ws-ping-pong-matrix\.spec\.ts$/,
 ]
 
 export default defineConfig({
