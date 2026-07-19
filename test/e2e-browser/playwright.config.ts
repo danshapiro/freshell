@@ -47,6 +47,10 @@ const MATRIX_SPECS = [
   // both server kinds as a parity control. See settings-live-reload.spec.ts.
   /settings-live-reload\.spec\.ts$/,
   /ws-ping-pong-matrix\.spec\.ts$/,
+  // SESSION-01 narrowed-MISSING closure -- sidebar-click resume (Codex leg
+  // runs on both kinds; the Amplifier leg self-skips on legacy via an
+  // explicit `test.skip` KNOWN DIVERGENCE call). See sidebar-click-resume.spec.ts.
+  /sidebar-click-resume\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -105,6 +109,12 @@ export default defineConfig({
         // against an owned, ephemeral Rust server. Rust-only (no legacy
         // equivalent needed -- see the spec's own doc comment in that file).
         /mcp-bridge-rust\.spec\.ts$/,
+        // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
+        // proves the Rust `freshell-terminal`/`freshell-platform` PATH-only
+        // bare-command resolution fix. Rust-only -- the bug is in the Rust
+        // port's portable-pty integration; legacy node-pty is unaffected
+        // (bare names go straight to PATH search, no cwd-first branch).
+        /term28-path-shadow-rust\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [

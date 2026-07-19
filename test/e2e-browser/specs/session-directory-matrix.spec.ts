@@ -362,6 +362,69 @@ test.describe('Session Directory Matrix', () => {
     }
   })
 
+  // SESSION-01 narrowed-MISSING closure -- provider ICON assertion. Each
+  // sidebar session row's icon comes from `resolveSessionTypeConfig`
+  // (`src/lib/session-type-utils.ts`), which falls back to
+  // `PROVIDER_ICONS[sessionType]` for any non-shell mode; `sessionType`
+  // itself defaults to the session's `provider` when no explicit
+  // sessionType override exists (`session.sessionType || provider`,
+  // `src/store/selectors/sidebarSelectors.ts:223`) -- true for every seed
+  // in this file, none of which sets a sessionType override. So asserting
+  // the rendered icon for each of these seeded sessions IS asserting its
+  // provider icon.
+  //
+  // `src/` is FROZEN for this task, so no new testid could be added to
+  // `provider-icons.tsx`/`Sidebar.tsx` to identify icons directly. Instead
+  // this uses each icon's `viewBox` attribute (`provider-icons.tsx`) as a
+  // stable, already-existing fingerprint unique per provider -- the same
+  // "use an existing greppable/DOM marker instead of inventing a new one"
+  // approach `amplifier-restore-rust.spec.ts` uses for its terminal-buffer
+  // assertions. `SidebarItem` (`src/components/Sidebar.tsx`) already puts
+  // `data-session-id={item.sessionId}` on the row button, giving an
+  // unambiguous per-session locator.
+  test('each seeded session renders its own distinct provider icon in the sidebar', async ({ freshellPage, page, e2eServerKind }) => {
+    await expect(page.getByTestId('sidebar-session-list')).toBeVisible({ timeout: 15_000 })
+    await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
+
+    // viewBox values copied verbatim from `src/components/icons/provider-icons.tsx`.
+    const PROVIDER_ICON_VIEWBOX: Record<string, string> = {
+      claude: '75.73 64.08 872.25 872.25',
+      codex: '-0.27 -0.23 16.55 16.55',
+      opencode: '444.00 174.00 312.00 312.00',
+      amplifier: '4.5 11.9 77.8 80',
+    }
+
+    async function iconViewBox(sessionId: string): Promise<string | null> {
+      const row = page.locator(`[data-session-id="${sessionId}"]`)
+      await expect(row).toBeVisible({ timeout: 10_000 })
+      return row.locator('svg').first().getAttribute('viewBox')
+    }
+
+    const alphaViewBox = await iconViewBox(SESSION_ALPHA_ID)
+    expect(alphaViewBox).toBe(PROVIDER_ICON_VIEWBOX.claude)
+
+    const gammaViewBox = await iconViewBox(CODEX_SESSION_ID)
+    expect(gammaViewBox).toBe(PROVIDER_ICON_VIEWBOX.codex)
+
+    const deltaViewBox = await iconViewBox(OPENCODE_SESSION_ID)
+    expect(deltaViewBox).toBe(PROVIDER_ICON_VIEWBOX.opencode)
+
+    // Guard against a future regression where a missing `PROVIDER_ICONS`
+    // entry silently falls back to `DefaultProviderIcon` (the same "black
+    // circle" bug `provider-icons.test.tsx` regression-guards for the
+    // picker) -- every provider asserted above must render a genuinely
+    // DIFFERENT icon from every other, not a shared fallback.
+    expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox]).size).toBe(3)
+
+    // Amplifier (rust-chromium only -- see the KNOWN DIVERGENCE note in the
+    // sibling test above): the 4th provider family's icon.
+    if (e2eServerKind === 'rust') {
+      const epsilonViewBox = await iconViewBox(AMPLIFIER_SESSION_ID)
+      expect(epsilonViewBox).toBe(PROVIDER_ICON_VIEWBOX.amplifier)
+      expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox, epsilonViewBox]).size).toBe(4)
+    }
+  })
+
   // SESSION-01 -- API-level field-parity + ordering proof. Cheaper and more
   // precise than scraping the DOM: queries the SAME `GET /api/session-directory`
   // read model the sidebar itself calls (`querySessionDirectory` in
