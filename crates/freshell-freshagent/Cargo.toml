@@ -37,6 +37,13 @@ freshell-opencode = { path = "../freshell-opencode", features = ["real-transport
 # DEV-0003), the status-guarded completion edge, model/effort normalization. The codex slice
 # drives a live freshcodex T2 turn through the Rust server (Phase 3.8b).
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
+# Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the SAME terminal
+# registry the WS `terminal.create` path uses, shared in from `freshell-server`'s
+# main.rs wiring -- Agent-API-created shell terminals live in ONE registry, no
+# orphan PTYs (spec §9 Risk 1).
+freshell-terminal = { path = "../freshell-terminal" }
+# Shell `SpawnSpec` construction for the terminal-mode `POST /api/tabs` path.
+freshell-platform = { path = "../freshell-platform" }
 # The REST router + JSON extraction.
 axum = "0.8"
 serde_json = { workspace = true }

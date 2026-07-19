@@ -40,6 +40,7 @@ pub mod claude;
 pub mod codex;
 pub mod opencode_ws;
 pub mod snapshot;
+pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
@@ -52,7 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -100,6 +101,25 @@ pub struct FreshAgentState {
     opencode: Arc<tokio::sync::Mutex<Option<OpencodeServeManager>>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
+    /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
+    /// terminal registry the WS `terminal.create` path uses, wired in from
+    /// `freshell-server`'s `main.rs` via [`Self::with_terminal_registry`].
+    /// `None` until wired -- every existing opencode-only test keeps working
+    /// unchanged (terminal-mode routes 503 instead of touching a registry
+    /// that was never given to them).
+    pub(crate) terminal_registry: Option<freshell_terminal::TerminalRegistry>,
+    /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
+    /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
+    /// and `content_panes` (browser/editor) -- a pane id appears in exactly
+    /// one of the three maps.
+    pub(crate) terminal_panes: Arc<Mutex<HashMap<String, TerminalPaneEntry>>>,
+    /// paneId -> browser/editor `paneContent` JSON (Slice 1's "cheap" content
+    /// kinds -- no process, just the content the client folds via
+    /// `ui.command{tab.create}`).
+    pub(crate) content_panes: Arc<Mutex<HashMap<String, Value>>>,
+    /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
+    /// tab-creating path (fresh-agent, terminal, browser, editor).
+    pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -111,6 +131,23 @@ struct PaneEntry {
     effort: Option<String>,
     /// The durable `ses_*` id after the first turn materializes it.
     durable_id: Option<String>,
+}
+
+/// A Slice-1 terminal pane's record: just enough to dispatch `send-keys` /
+/// `capture` / `wait-for` to the right `terminal_id` in the shared registry.
+#[derive(Clone)]
+pub(crate) struct TerminalPaneEntry {
+    pub(crate) terminal_id: String,
+}
+
+/// A `GET /api/tabs` row (Slice 1's reduced shape -- see `terminal_tabs::list_tabs`
+/// doc comment for the deviation from legacy's full layout-tree row).
+#[derive(Clone)]
+pub(crate) struct TabRecord {
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
+    pub(crate) pane_id: String,
+    pub(crate) kind: String,
 }
 
 impl FreshAgentState {
@@ -125,7 +162,22 @@ impl FreshAgentState {
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             sessions_revision: Arc::new(AtomicI64::new(0)),
+            terminal_registry: None,
+            terminal_panes: Arc::new(Mutex::new(HashMap::new())),
+            content_panes: Arc::new(Mutex::new(HashMap::new())),
+            tabs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a79 Risk 1):
+    /// wire in the SAME [`freshell_terminal::TerminalRegistry`] the WS
+    /// `terminal.create` path uses, so Agent-API-created terminals live in ONE
+    /// registry -- no orphan PTYs. `freshell-server`'s `main.rs` calls this
+    /// once at boot. Mirrors the established `with_shared_sessions_revision`
+    /// builder pattern.
+    pub fn with_terminal_registry(mut self, registry: freshell_terminal::TerminalRegistry) -> Self {
+        self.terminal_registry = Some(registry);
+        self
     }
 
     /// SESSION-09 fix-forward: replace this state's own `sessions_revision`
@@ -934,10 +986,12 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
 /// The fresh-agent sub-router, pre-bound to its state.
 pub fn router(state: FreshAgentState) -> Router {
     Router::new()
-        .route("/api/tabs", post(create_tab))
+        .route("/api/tabs", post(create_tab).get(terminal_tabs::list_tabs))
+        .route("/api/panes", get(terminal_tabs::list_panes))
         .route("/api/panes/{id}", patch(rename_pane))
         .route("/api/panes/{id}/send-keys", post(send_keys))
         .route("/api/panes/{id}/capture", get(capture))
+        .route("/api/panes/{id}/wait-for", get(terminal_tabs::wait_for))
         .with_state(state)
 }
 
@@ -1015,6 +1069,11 @@ async fn create_tab(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
     let agent = body.get("agent").and_then(Value::as_str).unwrap_or("");
+    // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a72.1): `agent`
+    // absent -> terminal / browser / editor tab creation (router.ts:710-793).
+    if agent.is_empty() {
+        return terminal_tabs::create_terminal_or_content_tab(state, body).await;
+    }
     // This surface is the opencode T2 slice; other agents are deferred (400, matching
     // the original's `unknown agent` rejection for anything without a mapping here).
     if agent != "opencode" {
@@ -1172,6 +1231,13 @@ async fn send_keys(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
+    // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a72.2): terminal
+    // panes are a DISJOINT map from the fresh-agent `panes` map below, so this
+    // never touches (or is touched by) the opencode/claude/codex send-keys path.
+    if let Some(resp) = terminal_tabs::maybe_send_keys(&state, &pane_id, &body) {
+        return resp;
+    }
+
     let text = body
         .get("data")
         .or_else(|| body.get("keys"))
@@ -1324,9 +1390,17 @@ async fn capture(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
     headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
+    }
+
+    // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a72.2): terminal
+    // and content (browser/editor) panes are DISJOINT maps from the fresh-agent
+    // `panes` map below -- checked first, falling through unchanged otherwise.
+    if let Some(resp) = terminal_tabs::maybe_capture(&state, &pane_id, &params) {
+        return resp;
     }
 
     let pane = match state
