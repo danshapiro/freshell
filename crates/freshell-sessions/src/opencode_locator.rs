@@ -578,6 +578,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // -- 6b. a foreign row created BEFORE arm, but still inside the
+    // pre-epsilon allowance, is excluded ONLY by the arm-time known-ids
+    // snapshot -- the eventual window's time bound (`arm_ms -
+    // pre_epsilon_ms`) alone would admit it (unlike test 6's "ancient" row,
+    // which predates arm by more than pre-epsilon and is excluded by the
+    // time bound too). This isolates the known-ids snapshot as a guard in
+    // its own right, not merely redundant with the time-window floor. --
+
+    #[test]
+    fn foreign_row_inside_pre_epsilon_but_before_arm_is_excluded_by_known_ids_snapshot_only() {
+        let home = unique_temp_dir("known-ids-snapshot-only");
+        let db = open_seed_db(&home);
+
+        // Created at T-100ms, i.e. inside the 250ms pre-epsilon allowance
+        // relative to the arm below (T=1_000) -- the window's time-bound
+        // lower bound (arm_ms - pre_epsilon_ms = 750) does NOT exclude it.
+        insert_session(&db, "ses_pre_arm_foreign", "/proj", 900, None, None);
+
+        let locator = OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 1_000));
+        assert!(locator.note_submit("t1", 1_100));
+
+        // The real session's row appears strictly after arm.
+        insert_session(&db, "ses_real", "/proj", 1_500, None, None);
+
+        let located = locator.tick(1_100 + OPENCODE_WINDOW_MS + 1);
+        assert_eq!(
+            located.len(),
+            1,
+            "only the post-arm row must resolve; the pre-arm foreign row \
+             (inside pre-epsilon, but pre-dating arm) must never bind despite \
+             satisfying the window's time bound"
+        );
+        assert_eq!(located[0].session_id, "ses_real");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // -- 7. two confirmed candidates in one window -> refuse + log, no bind. --
 
     #[test]

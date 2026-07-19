@@ -369,10 +369,30 @@ mod tests {
         let home = unique_temp_dir("note-submit-ignore");
         let (state, _rx) = state_with_locator(home.clone());
         maybe_arm(&state, "t1", "opencode", Some("/proj"), None);
+
+        // "hello" is not submit-shaped (`is_submit_input` rejects it) and
+        // must never reach `OpencodeLocator::note_submit` -- if it wrongly
+        // did, the locator's per-terminal evaluation window (`enter_ms`)
+        // would already be open and unresolved.
         note_possible_submit(&state, "t1", "hello");
-        // No window opened means a fresh Enter can still open one -- verify
-        // indirectly via a real Enter succeeding right after.
-        note_possible_submit(&state, "t1", "\r");
+
+        // Observable proof, via the locator's own seam:
+        // `OpencodeLocator::note_submit` returns `true` only when it (re)opens
+        // an evaluation window, and `false` when one is already open and
+        // unresolved (see its doc comment). Calling it directly here, right
+        // after "hello", proves whether "hello" already consumed the window:
+        // if it wrongly had, this call would observe `enter_ms.is_some()` and
+        // return `false`, failing the assertion below.
+        let opened_by_first_real_submit = state
+            .opencode_locator
+            .as_ref()
+            .unwrap()
+            .note_submit("t1", now_ms());
+        assert!(
+            opened_by_first_real_submit,
+            "\"hello\" must not have opened/consumed the locator's evaluation \
+             window; a genuine Enter must still be able to open a fresh one"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

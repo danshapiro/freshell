@@ -231,6 +231,14 @@ async fn create_terminal_tab(
     let spec = shell_spawn_spec(cwd.as_deref());
     let env = build_shell_env();
 
+    // NOTE: `on_exit` is `None` here -- harmless for this shell-only REST
+    // create path (Slice 1), since shell terminals never arm a session
+    // locator. A future rich-agent REST create path (claude/codex/gemini/
+    // kimi terminal-mode) that arms a locator (e.g. `AmplifierLocator`,
+    // `OpencodeLocator`) on create would also need to disarm it on exit --
+    // this call site would need a real `on_exit` hook wired in for that to
+    // happen. Flagging for the next slice
+    // (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §4.2).
     if let Err(err) = registry.create(&spec, &env, terminal_id.clone(), stream_id, None, None) {
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
         // is a no-op by construction.
