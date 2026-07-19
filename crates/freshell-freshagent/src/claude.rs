@@ -56,8 +56,11 @@ use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
+    FreshAgentEvent, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
+    ServerMessage, SessionType,
 };
+
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
@@ -76,6 +79,24 @@ pub struct FreshClaudeState {
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// placeholder-nanoid → live claude session (sidecar stdin + owned child + consumer).
     sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>,
+    /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
+    /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
+    /// resending the SAME `requestId` on every reconnect while a pane is
+    /// `status==creating` reattaches to the ONE session it already created instead of
+    /// spawning a fresh claude sidecar per resend. Cleared for a session's entries only
+    /// on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an unrequested sidecar
+    /// exit does NOT evict (mirrors legacy, see the type doc).
+    create_dedup: Arc<FreshAgentCreateDedup<ClaudeCreateRecord>>,
+}
+
+/// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
+/// `requestId` in [`FreshClaudeState::create_dedup`]. Claude's `create()` returns only a
+/// bare nanoid placeholder (no `sessionRef` -- `adapter.ts` returns `{ sessionId }` only),
+/// so only `session_id` need be cached; the replay branch mirrors the live path's own
+/// broadcast (NO `sessionRef`).
+#[derive(Clone)]
+struct ClaudeCreateRecord {
+    session_id: String,
 }
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
@@ -96,6 +117,7 @@ impl FreshClaudeState {
         Self {
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            create_dedup: Arc::new(FreshAgentCreateDedup::new()),
         }
     }
 
@@ -138,6 +160,25 @@ impl FreshClaudeState {
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
+
+        // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
+        // doc and [`Self::create_dedup`]'s field doc). Held for the whole creation
+        // attempt below, so concurrent duplicate `create`s for the same requestId
+        // serialize instead of each spawning their own sidecar.
+        let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
+            FreshAgentCreateOutcome::Replay(cached) => {
+                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+                    provider: PROVIDER.to_string(),
+                    request_id,
+                    runtime_provider: PROVIDER.to_string(),
+                    session_id: cached.session_id,
+                    session_type: session_type.to_string(),
+                    session_ref: None,
+                }));
+                return;
+            }
+            FreshAgentCreateOutcome::Proceed(guard) => guard,
+        };
 
         let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
             Ok(parts) => parts,
@@ -190,6 +231,19 @@ impl FreshClaudeState {
             },
         );
 
+        // Cache the completed create for requestId dedup BEFORE responding (mirrors
+        // codex/opencode: a duplicate `create` arriving right after this point must see
+        // the cache populated, never race past this guard's release and spawn a second
+        // sidecar).
+        self.create_dedup
+            .record_success(
+                &request_id,
+                ClaudeCreateRecord {
+                    session_id: created.clone(),
+                },
+            )
+            .await;
+
         // Broadcast freshAgent.created (ws-handler.ts:3378). NO sessionRef for claude
         // (adapter.ts returns { sessionId } only); placeholder == the bare nanoid.
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
@@ -211,6 +265,49 @@ impl FreshClaudeState {
                 retryable: None,
             },
         ));
+    }
+
+    // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
+
+    /// Handle a `freshAgent.kill` for claude/kilroy: remove the session and tear down
+    /// its owned sidecar (graceful `shutdown` request, SIGTERM so the SDK cleanly kills
+    /// its own `claude` CLI, `kill_on_drop` backstop, `/proc` ownership sweep), evict this
+    /// session's requestId dedup cache entries (mirrors
+    /// `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
+    /// `ws-handler.ts:3673`), then broadcast `freshAgent.killed`. Idempotent for an
+    /// unknown session id, matching the codex/opencode `success:true` pattern.
+    pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        let session_id = msg.session_id.clone();
+        let session_type = session_type_str(msg.session_type);
+
+        let removed = self.sessions.lock().await.remove(&session_id);
+        if let Some(session) = removed {
+            session.consumer.abort();
+            let mut stdin = session.stdin;
+            let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
+            let _ = stdin.flush().await;
+            if let Some(pid) = session.child.id() {
+                terminate_pid(pid as i32);
+            }
+            let mut child = session.child;
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&session.ownership_id);
+        }
+
+        // Explicit kill evicts this session's requestId dedup cache entries (mirrors
+        // `clearFreshAgentCreateCachesForSession`) -- a later duplicate `create` for the
+        // same requestId must genuinely mint a fresh session, not replay the one just
+        // killed.
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == session_id)
+            .await;
+
+        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+            provider: PROVIDER.to_string(),
+            session_id,
+            session_type: session_type.to_string(),
+            success: true,
+        }));
     }
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
@@ -706,6 +803,10 @@ mod tests {
 
     #[test]
     fn sidecar_entry_resolves_to_the_vendored_package() {
+        // Guard against the dedup tests' concurrent FRESHELL_CLAUDE_SIDECAR mutation
+        // (see CLAUDE_ENV_LOCK below) -- this test reads the SAME process-global env var.
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
         // The compile-time path points at the vendored Node package beside this crate.
         let entry = sidecar_entry_path();
         assert!(
@@ -718,5 +819,283 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_safe_with_no_sessions() {
         state().shutdown().await;
+    }
+
+    // ── freshAgent.create requestId dedup (parity gap fix) ──────────────────
+
+    /// Serializes every test in this file that mutates process-global env vars
+    /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE`), mirroring codex's
+    /// `ENV_LOCK` (`codex.rs`).
+    static CLAUDE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
+    /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
+    /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (so tests can count spawns without a global
+    /// tracing subscriber) and replies with a fresh `{"type":"created","sessionId":...}`;
+    /// on `{"type":"shutdown"}` it exits. `send` is intentionally unhandled -- the dedup
+    /// tests never exercise it.
+    const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
+import fs from 'node:fs'
+import readline from 'node:readline'
+
+const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
+if (spawnLog) {
+  fs.appendFileSync(spawnLog, `${process.pid}\n`)
+}
+
+let counter = 0
+const rl = readline.createInterface({ input: process.stdin, terminal: false })
+rl.on('line', (line) => {
+  const trimmed = line.trim()
+  if (!trimmed) return
+  let msg
+  try {
+    msg = JSON.parse(trimmed)
+  } catch {
+    return
+  }
+  if (msg.type === 'create') {
+    counter += 1
+    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+"#;
+
+    /// A fresh temp dir holding the fake sidecar script + this test's spawn-count log,
+    /// with `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE`/
+    /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` pointed at it. Caller must hold
+    /// [`CLAUDE_ENV_LOCK`] for the lifetime of the returned guard.
+    struct FakeClaudeSidecarEnv {
+        dir: PathBuf,
+        spawn_log: PathBuf,
+    }
+    impl FakeClaudeSidecarEnv {
+        fn install() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "freshell-fake-claude-sidecar-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
+            let script = dir.join("fake-claude-sidecar.mjs");
+            std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
+            let spawn_log = dir.join("spawn.log");
+            std::fs::write(&spawn_log, "").expect("init spawn log");
+            std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+            std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+            std::env::set_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG", &spawn_log);
+            Self { dir, spawn_log }
+        }
+
+        /// Number of times the fake sidecar has been spawned so far (one marker line per
+        /// process start).
+        fn spawn_count(&self) -> usize {
+            std::fs::read_to_string(&self.spawn_log)
+                .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+                .unwrap_or(0)
+        }
+    }
+    impl Drop for FakeClaudeSidecarEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+            std::env::remove_var("FRESHELL_CLAUDE_NODE");
+            std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
+        FreshAgentCreate {
+            request_id: request_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            provider: Some(freshell_protocol::AgentProvider::Claude),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        }
+    }
+
+    /// Drain `rx` until the `freshAgent.created` (or `.create.failed`) frame for
+    /// `request_id` arrives (mirrors codex's `await_created`).
+    async fn await_claude_created(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if (frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed")
+                    && frame["requestId"] == request_id
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
+    }
+
+    /// THE regression this task fixes: a duplicate `freshAgent.create` sharing a
+    /// `requestId` (the frozen client's reconnect-resend while a pane is
+    /// `status==creating`) must spawn the claude sidecar exactly once and replay the
+    /// SAME session id on the second response.
+    #[tokio::test]
+    async fn handle_create_duplicate_request_id_reuses_the_session_and_spawns_once() {
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq")).await;
+        let first = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
+        assert_eq!(first["type"], "freshAgent.created", "sanity: {first}");
+        let first_session_id = first["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq")).await;
+        let second = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
+
+        assert_eq!(
+            second["sessionId"], first_session_id,
+            "a duplicate requestId must replay the SAME session, not mint a new one: {second}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "two sequential creates sharing a requestId must spawn the claude sidecar \
+             exactly once"
+        );
+    }
+
+    /// The concurrent variant: two GENUINELY CONCURRENT creates sharing a `requestId`
+    /// must still spawn at most one sidecar and both resolve to the SAME session.
+    #[tokio::test]
+    async fn handle_create_concurrent_duplicate_request_id_spawns_at_most_once() {
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        let st1 = st.clone();
+        let st2 = st.clone();
+        tokio::join!(
+            st1.handle_create(dedup_create_msg("req-claude-dedup-race")),
+            st2.handle_create(dedup_create_msg("req-claude-dedup-race")),
+        );
+
+        let first = await_claude_created(&mut rx, "req-claude-dedup-race").await;
+        let second = await_claude_created(&mut rx, "req-claude-dedup-race").await;
+        assert_eq!(
+            first["sessionId"], second["sessionId"],
+            "both racing creates for the same requestId must resolve to the SAME session: \
+             {first} / {second}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "two CONCURRENT creates racing on the same requestId must spawn the claude \
+             sidecar exactly once"
+        );
+    }
+
+    /// Control: DISTINCT requestIds must never dedup against each other.
+    #[tokio::test]
+    async fn handle_create_distinct_request_ids_create_distinct_sessions() {
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-a")).await;
+        let a = await_claude_created(&mut rx, "req-claude-dedup-a").await;
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-b")).await;
+        let b = await_claude_created(&mut rx, "req-claude-dedup-b").await;
+
+        assert_ne!(
+            a["sessionId"], b["sessionId"],
+            "distinct requestIds must never replay each other's session: {a} / {b}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            2,
+            "two distinct requestIds must spawn the sidecar once each"
+        );
+    }
+
+    /// Cache invalidation: an EXPLICIT `freshAgent.kill` DOES evict the requestId dedup
+    /// cache, so a duplicate `create` for the SAME requestId after the kill genuinely
+    /// mints a fresh session (a new spawn), not a replay of the killed one.
+    ///
+    /// NOTE (task-specified suite reduction, justified): unlike codex, claude has no
+    /// exit-watcher/self-heal state machine ([`ClaudeSession`] carries no `exited` bit --
+    /// an unrequested sidecar death is simply an EOF the stdout consumer stops on, with
+    /// no separate "replay after unrequested exit" code path for the dedup cache to
+    /// interact with). That codex-suite test would be a byte-for-byte duplicate of
+    /// `handle_create_duplicate_request_id_reuses_the_session_and_spawns_once` here, so
+    /// it is dropped rather than mirrored redundantly -- 4 tests, not 5.
+    #[tokio::test]
+    async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
+        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = FakeClaudeSidecarEnv::install();
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill")).await;
+        let created = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
+        let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: killed_session_id.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill")).await;
+        let recreated = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
+
+        assert_ne!(
+            recreated["sessionId"], killed_session_id,
+            "a duplicate create after an EXPLICIT kill must mint a fresh session, not \
+             replay the killed one: {recreated}"
+        );
+        assert_eq!(
+            env.spawn_count(),
+            2,
+            "the kill must evict the dedup cache, so the duplicate create genuinely \
+             re-spawns"
+        );
+    }
+
+    /// `freshAgent.kill` for an session id this process never created is idempotent
+    /// (`success:true`), matching the codex/opencode pattern.
+    #[tokio::test]
+    async fn handle_kill_of_unknown_session_still_broadcasts_success() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshClaudeState::new(Arc::new(tx));
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: "unknown-session".to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed");
+        assert_eq!(frame["success"], true);
+        assert_eq!(frame["sessionId"], "unknown-session");
     }
 }

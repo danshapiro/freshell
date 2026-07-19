@@ -74,7 +74,7 @@ use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
-use crate::FreshAgentState;
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState};
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`).
 const SESSION_TYPE: &str = "freshopencode";
@@ -94,6 +94,24 @@ pub struct FreshOpencodeState {
     /// sessions.set(realSessionId, state)`), so a `freshAgent.send`/`kill` addressed by
     /// either id resolves to the SAME session record.
     sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>,
+    /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
+    /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
+    /// resending the SAME `requestId` on every reconnect while a pane is
+    /// `status==creating` reattaches to the ONE placeholder session it already created
+    /// instead of overwriting it with a brand-new (and possibly already-materialized)
+    /// [`OpencodeSession`] object. Cleared for a session's entries only on an explicit
+    /// `freshAgent.kill` ([`Self::handle_kill`]).
+    create_dedup: Arc<FreshAgentCreateDedup<OpencodeCreateRecord>>,
+}
+
+/// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
+/// [`FreshOpencodeState::create_dedup`]. Only the placeholder id is needed: it is
+/// deterministically derived from `requestId` (`freshopencode-<requestId>`), but caching
+/// it explicitly (rather than re-deriving it on replay) keeps the replay branch a pure
+/// cache-read, matching the codex/claude dedup shape.
+#[derive(Clone)]
+struct OpencodeCreateRecord {
+    placeholder_id: String,
 }
 
 /// One live (or not-yet-materialized) freshopencode WS session.
@@ -169,6 +187,7 @@ impl FreshOpencodeState {
         Self {
             fresh_agent,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            create_dedup: Arc::new(FreshAgentCreateDedup::new()),
         }
     }
 
@@ -196,6 +215,31 @@ impl FreshOpencodeState {
     /// `sessionId == freshopencode-<requestId>` until a `send` materializes it.
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
         let request_id = msg.request_id.clone();
+
+        // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
+        // doc and [`Self::create_dedup`]'s field doc). Without this, a client resending
+        // `freshAgent.create` with the same requestId (e.g. on reconnect while a pane is
+        // `status==creating`) would construct a brand-new [`OpencodeSession`] object and
+        // overwrite the existing one in `sessions` -- silently wiping any materialization
+        // (`real_session_id`) that had already happened since the first create.
+        let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
+            FreshAgentCreateOutcome::Replay(cached) => {
+                self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+                    provider: PROVIDER.to_string(),
+                    request_id,
+                    runtime_provider: PROVIDER.to_string(),
+                    session_id: cached.placeholder_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                    session_ref: Some(SessionLocator {
+                        provider: PROVIDER.to_string(),
+                        session_id: cached.placeholder_id,
+                    }),
+                }));
+                return;
+            }
+            FreshAgentCreateOutcome::Proceed(guard) => guard,
+        };
+
         let model = normalize_opencode_model(msg.model.as_deref());
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
@@ -205,6 +249,18 @@ impl FreshOpencodeState {
             .lock()
             .await
             .insert(placeholder.clone(), Arc::new(TokioMutex::new(session)));
+
+        // Cache the completed create for requestId dedup BEFORE responding (mirrors
+        // codex/claude: a duplicate `create` arriving right after this point must see the
+        // cache populated, never race past this guard's release).
+        self.create_dedup
+            .record_success(
+                &request_id,
+                OpencodeCreateRecord {
+                    placeholder_id: placeholder.clone(),
+                },
+            )
+            .await;
 
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
@@ -439,6 +495,15 @@ impl FreshOpencodeState {
                 bridge.abort();
             }
         }
+
+        // Explicit kill evicts this session's requestId dedup cache entries (mirrors
+        // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`) -- a later
+        // duplicate `create` for the same requestId must genuinely mint a fresh
+        // placeholder session, not replay (and thus reuse the bookkeeping of) the one
+        // just killed.
+        self.create_dedup
+            .clear_for_session(|record| record.placeholder_id == msg.session_id)
+            .await;
 
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
@@ -1093,6 +1158,163 @@ mod tests {
         assert_eq!(frame["provider"], "opencode");
         assert_eq!(frame["sessionId"], "freshopencode-req-1");
         assert_eq!(frame["sessionType"], "freshopencode");
+    }
+
+    // ── freshAgent.create requestId dedup (parity gap fix) ──────────────────
+
+    /// THE regression this task fixes: a duplicate `freshAgent.create` sharing a
+    /// `requestId` (the frozen client's reconnect-resend while a pane is
+    /// `status==creating`) must NOT construct a brand-new [`OpencodeSession`] object --
+    /// which would silently wipe any materialization (`real_session_id`) a `send` had
+    /// already produced since the first create. The second response must replay the
+    /// SAME placeholder session id.
+    #[tokio::test]
+    async fn handle_create_duplicate_request_id_preserves_materialized_session_state() {
+        let (st, killed) = state().await;
+        let _ = &killed;
+
+        st.handle_create(create_msg("req-dedup-seq")).await;
+        let placeholder = "freshopencode-req-dedup-seq";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+
+        let real_session_id = {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions
+                .get(placeholder)
+                .expect("placeholder session tracked after create")
+                .clone();
+            drop(sessions);
+            let guard = session_arc.lock().await;
+            let id = guard
+                .real_session_id
+                .clone()
+                .expect("send must have materialized a durable session");
+            id
+        };
+
+        // A duplicate create for the SAME requestId, as the frozen client resends on
+        // every reconnect while the pane is still `status==creating` on its side.
+        st.handle_create(create_msg("req-dedup-seq")).await;
+
+        let sessions = st.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            2,
+            "exactly two keys tracked (placeholder + durable) -- the duplicate create \
+             must not insert a second, fresh session object"
+        );
+        let session_arc = sessions
+            .get(placeholder)
+            .expect("placeholder must still resolve to a session")
+            .clone();
+        drop(sessions);
+        assert_eq!(
+            session_arc.lock().await.real_session_id,
+            Some(real_session_id),
+            "a duplicate create must NOT reset the already-materialized session's \
+             real_session_id back to None"
+        );
+    }
+
+    /// The concurrent variant: two GENUINELY CONCURRENT creates sharing a `requestId`
+    /// must still construct exactly ONE session object (never two, racing to overwrite
+    /// each other in the `sessions` map).
+    #[tokio::test]
+    async fn handle_create_concurrent_duplicate_request_id_constructs_session_once() {
+        let (st, _killed) = state().await;
+
+        let st1 = st.clone();
+        let st2 = st.clone();
+        tokio::join!(
+            st1.handle_create(create_msg("req-dedup-race")),
+            st2.handle_create(create_msg("req-dedup-race")),
+        );
+
+        assert_eq!(
+            st.sessions.lock().await.len(),
+            1,
+            "two CONCURRENT creates racing on the same requestId must construct exactly \
+             one session object"
+        );
+    }
+
+    /// Control: DISTINCT requestIds must never dedup against each other.
+    #[tokio::test]
+    async fn handle_create_distinct_request_ids_create_distinct_sessions() {
+        let (st, _killed) = state().await;
+
+        st.handle_create(create_msg("req-dedup-a")).await;
+        st.handle_create(create_msg("req-dedup-b")).await;
+
+        assert_eq!(
+            st.sessions.lock().await.len(),
+            2,
+            "two distinct requestIds must each construct their own session"
+        );
+    }
+
+    /// Cache invalidation: an EXPLICIT `freshAgent.kill` DOES evict the requestId dedup
+    /// cache, so a duplicate `create` for the SAME requestId after the kill genuinely
+    /// mints a FRESH session (not materialized), not a replay of the killed one.
+    ///
+    /// NOTE (task-specified suite reduction, justified): unlike codex, opencode has no
+    /// exit-watcher/self-heal state machine for its `create` path at all -- `create()`
+    /// never spawns a process ([`FreshOpencodeState::handle_create`]'s own doc: "NO
+    /// serve spawn, NO durable session yet"; the ONE shared `opencode serve` sidecar is
+    /// never torn down per-session). There is no "replay after unrequested exit" code
+    /// path distinct from the plain sequential-duplicate case above, so that codex-suite
+    /// test would be a duplicate of
+    /// `handle_create_duplicate_request_id_preserves_materialized_session_state` here --
+    /// dropped rather than mirrored redundantly. 4 tests, not 5.
+    #[tokio::test]
+    async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
+        let (st, _killed) = state().await;
+        let placeholder = "freshopencode-req-dedup-kill";
+
+        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        assert!(
+            st.sessions
+                .lock()
+                .await
+                .get(placeholder)
+                .unwrap()
+                .lock()
+                .await
+                .real_session_id
+                .is_some(),
+            "sanity: the session materialized before the kill"
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        st.handle_create(create_msg("req-dedup-kill")).await;
+
+        let sessions = st.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a duplicate create after an EXPLICIT kill must mint a genuinely FRESH \
+             (unmaterialized) session -- only the placeholder key, no durable key"
+        );
+        let session_arc = sessions.get(placeholder).cloned();
+        drop(sessions);
+        assert_eq!(
+            session_arc
+                .expect("the fresh session is tracked under the placeholder id")
+                .lock()
+                .await
+                .real_session_id,
+            None,
+            "the dedup cache must have been evicted by the kill, so this create is a \
+             genuinely fresh (unmaterialized) session, not a replay of the killed one"
+        );
     }
 
     /// Fix Task #3 (defect 3): `GET /api/fresh-agent/threads/freshopencode/opencode/<id>`
