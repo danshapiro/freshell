@@ -74,7 +74,8 @@ pub use network::{
 };
 pub use path::{
     convert_windows_path_to_wsl_path, convert_wsl_drive_path_to_windows_path,
-    detect_user_path_flavor, sanitize_user_path_input, UserPathFlavor,
+    detect_user_path_flavor, resolve_program_via_path, sanitize_user_path_input, ProgramNotFound,
+    UserPathFlavor,
 };
 pub use port_forward::{
     build_port_forwarding_script, build_wsl_port_forwarding_plan, WslPortForwardingPlan,

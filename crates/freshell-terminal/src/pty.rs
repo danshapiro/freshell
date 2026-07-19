@@ -162,6 +162,33 @@ impl PtyTerminal {
         let terminal_id = terminal_id.into();
         let stream_id = stream_id.into();
 
+        // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
+        // resolve a bare `spec.program` (e.g. a coding-CLI's default command,
+        // "amplifier") to an absolute path via a `$PATH`-ONLY search, using
+        // THIS spawn's own child env (never the server's own process env --
+        // a per-terminal `PATH` override must be honored). portable-pty
+        // 0.8.1's own `CommandBuilder::search_path` (unix) resolves a bare
+        // relative name against the spawn's cwd BEFORE `$PATH`, with a bare
+        // `.exists()` check that a same-named cwd-resident DIRECTORY
+        // satisfies -- handing that "resolved" directory to `exec` fails
+        // post-fork, and because portable-pty's `pre_exec` closes the
+        // child's own spawn-status pipe, that failure aborts the child raw
+        // instead of reporting a catchable error. Resolving here -- BEFORE
+        // portable-pty ever sees the bare name -- means it only ever
+        // receives an already-validated absolute path (safe, non-cwd-
+        // dependent), and a resolution failure is a clean, catchable
+        // `NotFound` error returned before any PTY/fork exists, rather than
+        // ever handing portable-pty the unresolved bare name.
+        let resolved_program = match freshell_platform::path::resolve_program_via_path(
+            &spec.program,
+            env.get("PATH").map(String::as_str),
+        ) {
+            Ok(program) => program,
+            Err(freshell_platform::path::ProgramNotFound) => {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+        };
+
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -173,7 +200,7 @@ impl PtyTerminal {
             .map_err(to_io)?;
 
         let build_cmd = |with_cwd: bool| {
-            let mut cmd = CommandBuilder::new(&spec.program);
+            let mut cmd = CommandBuilder::new(&resolved_program);
             cmd.args(&spec.args);
             // node-pty *replaces* the environment: clear inherited, set the computed map.
             cmd.env_clear();
@@ -542,5 +569,104 @@ mod tests {
             env.get("FRESHELL_TERMINAL_ID").map(String::as_str),
             Some("t-123")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TERM-28: bare-command $PATH resolution at the actual spawn call site
+    // (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`,
+    // grep TERM-28). These exercise the REAL `PtyTerminal::spawn` path (a
+    // real PTY, a real fork/exec), not just the pure resolver in isolation.
+    // -----------------------------------------------------------------------
+
+    /// Write an executable regular-file shell script at `dir/name` that
+    /// echoes `marker` then exits, so the test can prove the REAL PATH
+    /// binary ran (not the cwd-resident shadow directory, and not a raw
+    /// aborted child).
+    fn write_marker_script(dir: &std::path::Path, name: &str, marker: &str) {
+        let file = dir.join(name);
+        std::fs::write(&file, format!("#!/bin/sh\necho {marker}\n")).expect("write script");
+        let mut perms = std::fs::metadata(&file).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&file, perms).expect("chmod");
+    }
+
+    /// **The TERM-28 regression, end-to-end.** `spec.cwd` is a directory that
+    /// itself contains a subdirectory named exactly like the bare command
+    /// (the reported bug: an `amplifier` repo checkout shadowing the
+    /// `amplifier` CLI). `spec.program` is that same bare name, resolvable
+    /// only via a separate `$PATH` entry. The spawn must run the REAL `$PATH`
+    /// script -- never attempt to exec the shadowing directory, and never
+    /// produce the raw `fatal runtime error` abort text.
+    #[test]
+    fn spawn_bare_name_shadowed_by_cwd_directory_runs_real_path_binary() {
+        let cwd_dir = tempfile::tempdir().expect("tempdir cwd");
+        std::fs::create_dir(cwd_dir.path().join("mycli")).expect("mkdir shadow");
+
+        let path_dir = tempfile::tempdir().expect("tempdir PATH entry");
+        write_marker_script(path_dir.path(), "mycli", "TERM28_REAL_CLI_RAN");
+
+        let mut env_overrides = BTreeMap::new();
+        env_overrides.insert(
+            "PATH".to_string(),
+            path_dir.path().to_string_lossy().into_owned(),
+        );
+        let spec = SpawnSpec {
+            program: "mycli".into(),
+            args: vec![],
+            env_overrides: env_overrides.clone(),
+            cwd: Some(cwd_dir.path().to_string_lossy().into_owned()),
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HOME".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        );
+        for (k, v) in &env_overrides {
+            env.insert(k.clone(), v.clone());
+        }
+
+        let mut terminal =
+            PtyTerminal::spawn(&spec, &env, "t-term28", "s-term28", None).expect("spawn succeeds");
+
+        // Give the child a moment to run and exit, then inspect the captured stream.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let output = terminal.reassemble();
+        assert!(
+            output.contains("TERM28_REAL_CLI_RAN"),
+            "expected the real $PATH script's output, got: {output:?}"
+        );
+        assert!(
+            !output.contains("fatal runtime error"),
+            "must never surface the raw portable-pty abort text: {output:?}"
+        );
+        terminal.kill();
+    }
+
+    /// A bare command that resolves nowhere on `$PATH` must fail the spawn
+    /// with a clean, catchable `io::Error` (`ErrorKind::NotFound`) -- never a
+    /// panic, and never a raw abort inside a forked child.
+    #[test]
+    fn spawn_missing_bare_name_returns_not_found_error() {
+        let path_dir = tempfile::tempdir().expect("tempdir PATH entry");
+        // Intentionally empty: "totally-missing-cli" exists nowhere.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            path_dir.path().to_string_lossy().into_owned(),
+        );
+        let spec = SpawnSpec {
+            program: "totally-missing-cli".into(),
+            args: vec![],
+            env_overrides: BTreeMap::new(),
+            cwd: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+
+        let result = PtyTerminal::spawn(&spec, &env, "t-missing", "s-missing", None);
+        let err = result.err().expect("spawn must fail cleanly");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

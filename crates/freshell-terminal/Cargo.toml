@@ -38,3 +38,7 @@ sha2 = "0.10"
 # to assert lifecycle events fire, without depending on the global subscriber
 # `freshell-server` owns.
 tracing-subscriber = "0.3"
+# TERM-28: real tempdir PATH/cwd fixtures for the bare-command $PATH
+# resolution regression tests (a same-named shadowing directory + a real
+# executable fixture on a separate $PATH entry).
+tempfile = "3"

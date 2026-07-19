@@ -705,6 +705,111 @@ fn is_windows_absolute_launch(candidate: &str) -> bool {
         || starts_windows_rooted(candidate)
 }
 
+// ===========================================================================
+// TERM-28: `$PATH`-only bare-command resolution (portable-pty cwd-shadow fix)
+// ===========================================================================
+
+/// A bare command name (e.g. a coding-CLI's `defaultCommand`, `"amplifier"`)
+/// could not be resolved to an executable regular file anywhere on `$PATH`.
+///
+/// Carries no data: the caller already has the original, unresolved command
+/// string (it's the `program`/`command` value passed in) and uses THAT for
+/// any user-facing message -- mirroring the legacy `wrapTerminalSpawnError`
+/// ENOENT branch (`server/terminal-registry.ts:465-472`), which displays the
+/// original spawn target, never an internal resolver detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramNotFound;
+
+impl std::fmt::Display for ProgramNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("command not found on $PATH")
+    }
+}
+
+impl std::error::Error for ProgramNotFound {}
+
+/// Resolve a bare (no path separator) program name to an absolute, executable
+/// regular-file path via a `$PATH`-only search -- the cwd is NEVER consulted.
+///
+/// **TERM-28 root cause:** portable-pty 0.8.1's own
+/// `CommandBuilder::search_path` (unix) resolves a bare relative command name
+/// against the spawn's cwd BEFORE `$PATH`, using a bare `Path::exists()`
+/// check with no `is_file`/executable-bit validation. A same-named directory
+/// in the launch cwd (e.g. opening an Amplifier session in `~/code`, which
+/// contains an `amplifier/` repo checkout) is therefore treated as a match
+/// and handed to `exec`, which fails post-fork with `EACCES` (can't exec a
+/// directory) -- and because portable-pty's `pre_exec` closure closes the
+/// child's own internal spawn-status pipe (`close_random_fds`), that failure
+/// can't be reported back to the parent and the child aborts raw
+/// (`fatal runtime error: assertion failed: output.write(&bytes).is_ok()`)
+/// straight into the user's pane instead of a clean, catchable spawn error.
+///
+/// Resolving here -- BEFORE portable-pty ever sees the bare name -- sidesteps
+/// both defects: on success the returned path is absolute, which drives
+/// portable-pty's OTHER, safe branch (`access(_, X_OK)`, synchronous, never
+/// forks on failure); on failure, resolution fails synchronously, before any
+/// PTY/fork exists, so the caller can surface a plain [`ProgramNotFound`]
+/// instead of ever invoking portable-pty with the unresolved name.
+///
+/// - `program` containing a path separator (`/`) -- an absolute path, or an
+///   explicit relative path like `./foo` -- is returned unchanged: not a bare
+///   name, so no `$PATH` search applies (matches portable-pty's own
+///   absolute-path branch, which this bug never affected).
+/// - Otherwise (a bare name), `$PATH` (from `path_var`, mirroring
+///   `env.get("PATH")`) is searched in order. Each candidate must be a
+///   regular file with at least one executable bit set (owner/group/other --
+///   `access(_, X_OK)`'s filesystem-metadata equivalent); a non-existent,
+///   non-regular (a same-named directory is exactly this case), or
+///   non-executable candidate is SKIPPED and the search continues to the
+///   next `$PATH` entry (`execvp` semantics -- matches legacy node-pty, which
+///   is unaffected by this bug because it always goes straight to `$PATH`).
+/// - `Ok(path)` is the first matching candidate's absolute path.
+/// - `Err(ProgramNotFound)` when `program` is bare and no `$PATH` entry (or
+///   an empty/unset `$PATH`) contains a matching executable regular file.
+///
+/// Windows scope note: portable-pty's Windows `search_path` only ever
+/// searches `$PATH` (no cwd-first branch), so this bug is unix-specific
+/// (checklist: "Legacy node-pty is unaffected... bare names go straight to
+/// PATH search"). On non-unix this function is an unconditional passthrough
+/// (`Ok(program.to_string())`), leaving Windows behavior untouched.
+pub fn resolve_program_via_path(
+    program: &str,
+    path_var: Option<&str>,
+) -> Result<String, ProgramNotFound> {
+    if program.contains('/') {
+        return Ok(program.to_string());
+    }
+    #[cfg(unix)]
+    {
+        if let Some(path_var) = path_var {
+            for dir in std::env::split_paths(path_var) {
+                let candidate = dir.join(program);
+                if is_executable_regular_file(&candidate) {
+                    return Ok(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        Err(ProgramNotFound)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path_var;
+        Ok(program.to_string())
+    }
+}
+
+/// Regular file + at least one executable bit set -- the filesystem-metadata
+/// equivalent of `nix::unistd::access(path, X_OK)`, applied per `$PATH`
+/// candidate so a same-named directory (or a non-executable regular file) is
+/// SKIPPED rather than accepted as a match (TERM-28).
+#[cfg(unix)]
+fn is_executable_regular_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod helper_tests {
     use super::*;
