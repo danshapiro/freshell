@@ -274,4 +274,21 @@ describe('persist middleware — destructive empty-tabs guard', () => {
     // And the prior layout is backed up regardless.
     expect(localStorage.getItem(LAYOUT_BACKUP_STORAGE_KEY)).toBe(originalRaw)
   })
+
+  it('couples the guard\'s literal action-type match to the real removeTab action creator', async () => {
+    // persistMiddleware.ts matches `userClosedTabsIntent` by the literal
+    // string 'tabs/removeTab' rather than importing and comparing against
+    // the removeTab action creator's own `.type` (a circular import:
+    // tabsSlice already imports loadPersistedLayout/markTabsLoadRecovery
+    // from persistMiddleware). That string literal has NOTHING tying it to
+    // the actual action creator at compile time or test time -- if removeTab
+    // is ever renamed, or the slice's `name` changes, or the action is
+    // restructured, the literal silently stops matching. The guard would
+    // then never set userClosedTabsIntent for a genuine user-closed-last-tab
+    // action, degrading the entire destructive-empty-write protection with
+    // no test failure to catch it. This test is that missing coupling: it
+    // fails the instant the literal and the action creator drift apart.
+    const { removeTab } = await import('@/store/tabsSlice')
+    expect(removeTab('any-tab-id').type).toBe('tabs/removeTab')
+  })
 })
