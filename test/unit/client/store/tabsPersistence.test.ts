@@ -29,6 +29,8 @@ import {
 } from '@/store/persistMiddleware'
 import { onPersistBroadcast, resetPersistBroadcastForTests } from '@/store/persistBroadcast'
 import { LAYOUT_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
+import { parsePersistedLayoutRaw } from '@/store/persistedState'
+import { handleUiCommand } from '@/lib/ui-commands'
 
 function makeStore() {
   return configureStore({
@@ -472,5 +474,43 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     const tab = store.getState().tabs.tabs[0]
     expect(tab?.sessionRef).toBeUndefined()
     expect(tab?.resumeSessionId).toBeUndefined()
+  })
+
+  it('survives reload when an MCP tab.create carries a malformed mode field, keeping other tabs intact', () => {
+    localStorageMock.clear()
+    resetPersistedLayoutCacheForTests()
+
+    const store = makeStore() // preloaded with valid tab 'tab-1'
+
+    // Simulate an external/extension caller (e.g. the agent-api tab.create command) sending
+    // a payload whose `mode` field is not a string - a foreign or malformed value should not
+    // be able to nuke the entire persisted layout on the next reload.
+    handleUiCommand(
+      {
+        type: 'ui.command',
+        command: 'tab.create',
+        payload: { id: 'ext-tab', title: 'Extension Tab', mode: 42 },
+      },
+      store.dispatch,
+    )
+
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+
+    // This is exactly what happens on the next page load: the raw persisted string is
+    // re-parsed. Before the fix, a single tab with a malformed `mode` value nuked the
+    // whole layout (parsePersistedLayoutRaw returned null), wiping every tab - including
+    // 'tab-1', which had nothing wrong with it.
+    const parsed = parsePersistedLayoutRaw(raw!)
+    expect(parsed).not.toBeNull()
+
+    const ids = parsed!.tabs.tabs.map((t) => t.id)
+    expect(ids).toEqual(expect.arrayContaining(['tab-1', 'ext-tab']))
+
+    const extTab = parsed!.tabs.tabs.find((t) => t.id === 'ext-tab')
+    expect(extTab).toBeDefined()
+    expect(extTab!.mode).toBeUndefined()
   })
 })

@@ -9,8 +9,11 @@ import {
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
+import { createLogger } from '@/lib/client-logger'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
+
+const log = createLogger('PersistedState')
 
 export const TABS_SCHEMA_VERSION = 2
 export const PANES_SCHEMA_VERSION = 7
@@ -19,8 +22,17 @@ export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh
 export const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-pending`
 export const LAYOUT_FRESH_AGENT_MIGRATION_ID = 'fresh-agent-centralization'
 
-const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
-const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+// Compatibility-only fields: foreign/extension-authored tabs (e.g. from the MCP `tab.create`
+// command) may write arbitrary values here. An invalid value (wrong type, empty string) is
+// sanitized to `undefined` rather than rejecting the tab - these fields are best-effort
+// compat data, not tab identity.
+const zSanitizedOptionalString = z.preprocess(
+  (value) => (typeof value === 'string' && value.length > 0 ? value : undefined),
+  z.string().optional(),
+)
+
+const zTabMode = zSanitizedOptionalString
+const zCodingCliProvider = zSanitizedOptionalString
 
 const zTab = z.object({
   id: z.string().min(1),
@@ -28,14 +40,17 @@ const zTab = z.object({
   createdAt: z.number().optional(),
   titleSetByUser: z.boolean().optional(),
   // Compatibility-only fields (may exist in persisted tabs before pane layout is created).
-  mode: zTabMode.optional(),
-  codingCliProvider: zCodingCliProvider.optional(),
+  mode: zTabMode,
+  codingCliProvider: zCodingCliProvider,
   resumeSessionId: z.string().optional(),
 }).passthrough()
 
+// The tabs array is validated per-element (see `salvageTabs`) rather than atomically via
+// `z.array(zTab)`. A single structurally-invalid tab (e.g. missing `id`) must not invalidate
+// every other valid tab in the same persisted payload.
 const zPersistedTabsState = z.object({
   activeTabId: z.string().nullable().optional(),
-  tabs: z.array(zTab),
+  tabs: z.array(z.unknown()),
 }).passthrough()
 
 const zTombstone = z.object({
@@ -49,13 +64,42 @@ const zPersistedTabsPayload = z.object({
   tombstones: z.array(zTombstone).optional(),
 }).passthrough()
 
+type PersistedTab = z.infer<typeof zTab>
+
+export type ParsedPersistedTabsState = {
+  activeTabId: string | null
+  tabs: PersistedTab[]
+} & Record<string, unknown>
+
 export type ParsedPersistedTabs = {
   version: number
-  tabs: z.infer<typeof zPersistedTabsState>
+  tabs: ParsedPersistedTabsState
   tombstones: Array<{ id: string; deletedAt: number }>
 }
 
-type PersistedTab = z.infer<typeof zTab>
+/**
+ * Validate persisted tabs one at a time instead of atomically via `z.array(zTab)`.
+ *
+ * A single structurally-invalid tab (e.g. missing `id`) must not invalidate every other
+ * valid tab in the same persisted payload - that would silently wipe a user's entire tab
+ * strip because of one corrupt entry. Invalid tabs are dropped and logged; valid tabs are
+ * normalized and kept.
+ */
+function salvageTabs(rawTabs: unknown[]): PersistedTab[] {
+  const salvaged: PersistedTab[] = []
+  for (const rawTab of rawTabs) {
+    const res = zTab.safeParse(rawTab)
+    if (!res.success) {
+      const record = rawTab && typeof rawTab === 'object' ? (rawTab as Record<string, unknown>) : {}
+      const id = typeof record.id === 'string' ? record.id : '<unknown>'
+      const title = typeof record.title === 'string' ? record.title : '<unknown>'
+      log.error(`Dropping corrupt persisted tab (id=${id}, title=${title}): ${res.error.message}`)
+      continue
+    }
+    salvaged.push(normalizePersistedTab(res.data as unknown as Record<string, unknown>))
+  }
+  return salvaged
+}
 
 function isCodexSessionRef(sessionRef: unknown): sessionRef is { provider: 'codex'; sessionId: string } {
   return !!sessionRef
@@ -157,7 +201,7 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
     tabs: {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
-      tabs: res.data.tabs.tabs.map((tab) => normalizePersistedTab(tab as unknown as Record<string, unknown>)),
+      tabs: salvageTabs(res.data.tabs.tabs),
     },
     tombstones: res.data.tombstones || [],
   }
@@ -366,7 +410,7 @@ const zPersistedLayoutPayload = z.object({
 
 export type ParsedPersistedLayout = {
   version: number
-  tabs: z.infer<typeof zPersistedTabsState>
+  tabs: ParsedPersistedTabsState
   panes: ParsedPersistedPanes
   tombstones: Array<{ id: string; deletedAt: number }>
   persistedAt?: number
@@ -487,7 +531,7 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
     tabs: {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
-      tabs: res.data.tabs.tabs.map((tab) => normalizePersistedTab(tab as unknown as Record<string, unknown>)),
+      tabs: salvageTabs(res.data.tabs.tabs),
     },
     panes: {
       version: Math.max(panesVersion, PANES_SCHEMA_VERSION),

@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 
 import {
+  parsePersistedLayoutRaw,
   parsePersistedTabsRaw,
   parsePersistedPanesRaw,
   TABS_STORAGE_KEY,
@@ -144,6 +145,211 @@ describe('persistedState parsers', () => {
       expect(parsed!.tabs.tabs[0].sessionRef).toBeUndefined()
       expect(parsed!.tabs.tabs[0].codingCliSessionId).toBeUndefined()
       expect(parsed!.tabs.tabs[0].claudeSessionId).toBeUndefined()
+    })
+
+    it('accepts Amplifier tabs and preserves their durable session identity', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'amplifier-tab',
+          tabs: [{
+            id: 'amplifier-tab',
+            title: 'Amplifier',
+            createdAt: 1,
+            mode: 'amplifier',
+            codingCliProvider: 'amplifier',
+            resumeSessionId: 'amp-session-1',
+          }],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0]).toEqual(expect.objectContaining({
+        id: 'amplifier-tab',
+        mode: 'amplifier',
+        codingCliProvider: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
+      expect(parsed!.tabs.tabs[0].resumeSessionId).toBeUndefined()
+    })
+
+    it('sanitizes a non-string mode on one tab instead of nuking the whole tabs array', () => {
+      const validTabs = Array.from({ length: 5 }, (_, i) => ({
+        id: `tab-${i + 1}`,
+        title: `Tab ${i + 1}`,
+        createdAt: i + 1,
+        mode: 'shell',
+      }))
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 'tab-1',
+          tabs: [
+            ...validTabs,
+            {
+              id: 'ext-tab',
+              title: 'Extension Tab',
+              createdAt: 6,
+              // A foreign/extension payload sent a non-string mode value.
+              mode: 42,
+            },
+          ],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs).toHaveLength(6)
+      const extTab = parsed!.tabs.tabs.find((t) => t.id === 'ext-tab')
+      expect(extTab).toBeDefined()
+      expect(extTab!.mode).toBeUndefined()
+      expect(parsed!.tabs.tabs.map((t) => t.id)).toEqual(
+        expect.arrayContaining(['tab-1', 'tab-2', 'tab-3', 'tab-4', 'tab-5', 'ext-tab']),
+      )
+    })
+
+    it('drops a structurally invalid tab (missing id) while preserving the other valid tabs', () => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const validTabs = Array.from({ length: 5 }, (_, i) => ({
+          id: `tab-${i + 1}`,
+          title: `Tab ${i + 1}`,
+          createdAt: i + 1,
+          mode: 'shell',
+        }))
+        const raw = JSON.stringify({
+          version: TABS_SCHEMA_VERSION,
+          tabs: {
+            activeTabId: 'tab-1',
+            tabs: [
+              ...validTabs,
+              {
+                // No id at all - genuinely broken shape, not salvageable.
+                title: 'Corrupt Tab',
+                createdAt: 6,
+              },
+            ],
+          },
+        })
+
+        const parsed = parsePersistedTabsRaw(raw)
+        expect(parsed).not.toBeNull()
+        expect(parsed!.tabs.tabs).toHaveLength(5)
+        expect(parsed!.tabs.tabs.map((t) => t.id)).toEqual(['tab-1', 'tab-2', 'tab-3', 'tab-4', 'tab-5'])
+        expect(consoleErrorSpy).toHaveBeenCalledTimes(1)
+        const loggedArgs = consoleErrorSpy.mock.calls[0].join(' ')
+        expect(loggedArgs).toMatch(/Corrupt Tab/)
+      } finally {
+        consoleErrorSpy.mockRestore()
+      }
+    })
+  })
+
+  describe('parsePersistedLayoutRaw', () => {
+    it('does not reject a combined layout because one tab uses Amplifier mode', () => {
+      const raw = JSON.stringify({
+        version: 4,
+        tabs: {
+          activeTabId: 'amplifier-tab',
+          tabs: [{
+            id: 'amplifier-tab',
+            title: 'Amplifier',
+            createdAt: 1,
+            mode: 'amplifier',
+            codingCliProvider: 'amplifier',
+            sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+          }],
+        },
+        panes: {
+          version: PANES_SCHEMA_VERSION,
+          layouts: {
+            'amplifier-tab': {
+              type: 'leaf',
+              id: 'amplifier-pane',
+              content: {
+                kind: 'terminal',
+                mode: 'amplifier',
+                createRequestId: 'req-amplifier',
+                status: 'running',
+                sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+              },
+            },
+          },
+          activePane: { 'amplifier-tab': 'amplifier-pane' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      })
+
+      const parsed = parsePersistedLayoutRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0]).toEqual(expect.objectContaining({
+        id: 'amplifier-tab',
+        mode: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
+      expect(((parsed!.panes.layouts['amplifier-tab'] as any).content)).toEqual(expect.objectContaining({
+        mode: 'amplifier',
+        sessionRef: { provider: 'amplifier', sessionId: 'amp-session-1' },
+      }))
+    })
+
+    it('salvages the whole layout when only one of several tabs is corrupt', () => {
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const validTabs = Array.from({ length: 5 }, (_, i) => ({
+          id: `tab-${i + 1}`,
+          title: `Tab ${i + 1}`,
+          createdAt: i + 1,
+          mode: 'shell',
+        }))
+        const raw = JSON.stringify({
+          version: 4,
+          tabs: {
+            activeTabId: 'tab-1',
+            tabs: [
+              ...validTabs,
+              {
+                // No id - genuinely broken shape.
+                title: 'Corrupt Tab',
+                createdAt: 6,
+              },
+            ],
+          },
+          panes: {
+            version: PANES_SCHEMA_VERSION,
+            layouts: {},
+            activePane: {},
+            paneTitles: {},
+            paneTitleSetByUser: {},
+          },
+          tombstones: [],
+        })
+
+        const parsed = parsePersistedLayoutRaw(raw)
+        expect(parsed).not.toBeNull()
+        expect(parsed!.tabs.tabs).toHaveLength(5)
+        expect(parsed!.tabs.tabs.map((t) => t.id)).toEqual(['tab-1', 'tab-2', 'tab-3', 'tab-4', 'tab-5'])
+        expect(consoleErrorSpy).toHaveBeenCalledTimes(1)
+      } finally {
+        consoleErrorSpy.mockRestore()
+      }
+    })
+
+    it('still returns null for the whole layout when the JSON is unparseable', () => {
+      expect(parsePersistedLayoutRaw('not json{')).toBeNull()
+    })
+
+    it('still returns null for the whole layout when the version is newer than this build', () => {
+      const raw = JSON.stringify({
+        version: 999,
+        tabs: { activeTabId: null, tabs: [] },
+        panes: { version: PANES_SCHEMA_VERSION },
+        tombstones: [],
+      })
+      expect(parsePersistedLayoutRaw(raw)).toBeNull()
     })
   })
 
