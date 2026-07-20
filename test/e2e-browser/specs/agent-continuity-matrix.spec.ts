@@ -141,12 +141,6 @@ test.describe('Agent Continuity Matrix', () => {
     expect(send3.sessionId).toBe(send1.sessionId)
     expect(send1.sessionId).toBeTruthy()
 
-    // Cumulative context: the fake OpenCode server accumulates all three
-    // prompts as real messages against the SAME session id in its sqlite
-    // store (`fake-opencode.cjs`'s `appendPromptMessages`/`insertSession`
-    // continuity path) -- exportable via its own `export` CLI surface, but
-    // this spec asserts the durable-id evidence directly since that IS the
-    // observable continuity contract at the REST layer.
     const paneB = await createTab(baseUrl, token, sharedCwd)
     const send4 = await sendKeys(baseUrl, token, paneB.paneId, 'agent-continuity second-pane prompt')
 
@@ -154,5 +148,61 @@ test.describe('Agent Continuity Matrix', () => {
     // is per-pane, not global.
     expect(send4.sessionId).not.toBe(send1.sessionId)
     expect(send4.sessionId).toBeTruthy()
+  })
+
+  /**
+   * AGENT-08 cumulative-context clause: "Send three prompts through REST/MCP
+   * to one OpenCode pane and assert one durable ID AND cumulative context."
+   *
+   * The durable-ID assertion is in the test above. This test asserts the
+   * "cumulative context" half: the fake OpenCode app-server's
+   * `appendPromptMessages` (`fake-opencode.cjs:572`) appends a user+assistant
+   * message pair to the SAME session row in SQLite for every `prompt_async`
+   * call, using `countMessages(db, sessionId) + 1` as the sequence — so if
+   * the Rust server correctly reuses the durable ID, all three prompts land
+   * in the same session and the audit log records three `prompt_async`
+   * events with identical `sessionId` and matching prompt text.
+   *
+   * If the Rust server created a new durable session per send-keys (the bug
+   * AGENT-08 fixes), each `prompt_async` event would have a DIFFERENT
+   * `sessionId` and the message count per session would be 1 instead of 3.
+   */
+  test('cumulative context: three prompts to one pane accumulate as prompt_async events against the same durable session in the audit log', async ({ serverInfo, sharedCwd, auditLogPath }) => {
+    const { baseUrl, token } = serverInfo
+
+    const paneA = await createTab(baseUrl, token, sharedCwd)
+    const prompt1 = 'cumulative-context prompt alpha'
+    const prompt2 = 'cumulative-context prompt beta'
+    const prompt3 = 'cumulative-context prompt gamma'
+
+    const send1 = await sendKeys(baseUrl, token, paneA.paneId, prompt1)
+    const send2 = await sendKeys(baseUrl, token, paneA.paneId, prompt2)
+    const send3 = await sendKeys(baseUrl, token, paneA.paneId, prompt3)
+
+    // All three must share one durable ID (prerequisite for cumulative context)
+    expect(send1.sessionId).toBeTruthy()
+    expect(send2.sessionId).toBe(send1.sessionId)
+    expect(send3.sessionId).toBe(send1.sessionId)
+
+    // Read the fake opencode audit log and filter for prompt_async events
+    // targeting our durable session ID.
+    const auditRaw = await fs.readFile(auditLogPath, 'utf-8')
+    const auditLines = auditRaw.trim().split('\n').filter(Boolean)
+    const promptEvents = auditLines
+      .map((line) => JSON.parse(line))
+      .filter((entry: any) => entry.event === 'prompt_async' && entry.sessionId === send1.sessionId)
+
+    // Three prompt_async events — one per send-keys call — all against the
+    // same durable session. This proves cumulative context: each prompt was
+    // appended to the same session's message history rather than starting a
+    // fresh session.
+    expect(promptEvents).toHaveLength(3)
+
+    // The prompt text must match what was sent, proving no prompt was lost
+    // or redirected to a different session.
+    const recordedPrompts = promptEvents.map((e: any) => e.prompt)
+    expect(recordedPrompts).toContain(prompt1)
+    expect(recordedPrompts).toContain(prompt2)
+    expect(recordedPrompts).toContain(prompt3)
   })
 })
