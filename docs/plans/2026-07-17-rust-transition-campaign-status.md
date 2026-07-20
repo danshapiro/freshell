@@ -361,6 +361,54 @@ performed as part of this work). e2e `restore-matrix.spec.ts --project=rust-chro
 `restore-double-restart.spec.ts --project=rust-chromium` (2/2, the closest existing harness to
 this incident) both green.
 
+2026-07-19 (urgent deploy lane): **src/ deviation grown from 7 to 8 files** —
+`src/store/persistedState.ts` joins the deviation set. Cherry-picked `260a4d67`
+(`fix(client): salvage valid persisted tabs instead of nuking whole layout`, main branch
+`fix/restore-flag-guard`) to close the confirmed production bug where a single REST-created
+`amplifier` tab poisoned the entire persisted layout on reload: `parsePersistedTabsRaw` and
+`parsePersistedLayoutRaw` validated the whole `tabs` array atomically via `z.array(zTab)`, so
+one tab failing schema validation (a non-string `mode`, missing `id`, or any foreign field
+shape) wiped every other valid tab on the next page load. The fix adds two defense layers:
+(1) `mode`/`codingCliProvider` are sanitized to `undefined` via `z.preprocess` instead of
+failing the tab when the value is the wrong type or empty, and (2) tabs are validated one at a
+time (`salvageTabs`) instead of atomically, so a structurally invalid tab is dropped and logged
+while every other valid tab in the same payload survives.
+
+Conflict resolution: the port's frozen `persistedState.ts` still carried the strict
+`zTabMode`/`zCodingCliProvider` `z.enum([...])` that main's own `46d4ba4e` (#506) had already
+loosened to `z.string().min(1)` upstream of `260a4d67` — a documented case of the port being
+behind *two* stacked main fixes for the same schema fields, not one. The cherry-pick conflicted
+exactly there; resolution took the incoming side wholesale (the sanitized
+`zSanitizedOptionalString` preprocess helper), which supersedes the enum-loosening fix along
+with adding the salvage layer, so both upstream fixes are now present in a single cherry-pick.
+`test/unit/client/store/persistedState.test.ts` conflicted on a pure test-addition hunk
+(no `HEAD` content at that hunk); resolved by taking the incoming tests wholesale. One
+adaptation was required beyond the raw cherry-pick: the port's pre-existing test file did not
+import `parsePersistedLayoutRaw` (the frozen version's import list predates the tests that
+exercise it), so four tests failed with `ReferenceError: parsePersistedLayoutRaw is not
+defined` after cherry-picking; fixed by adding the missing import, matching main's import
+ordering exactly. `test/unit/client/store/tabsPersistence.test.ts` cherry-picked clean with
+zero conflict.
+
+Post-cherry-pick byte-identity verification: `git diff 260a4d67:src/store/persistedState.ts
+HEAD:src/store/persistedState.ts` is empty — `src/store/persistedState.ts` is **byte-identical**
+to the `fix/restore-flag-guard` tip version. `git diff 737cb008 --name-only -- src/` now lists
+exactly 8 files: `TerminalView.tsx`, `fresh-agent/FreshAgentView.tsx`, `icons/provider-icons.tsx`,
+`lib/terminal-restore.ts`, `store/persistMiddleware.ts`, `store/persistedState.ts`,
+`store/storage-keys.ts`, `store/tabsSlice.ts` — matching the expected count for this lane.
+
+Verification: focused suite (`persistedState.test.ts` 23 tests, `tabsPersistence.test.ts` 10
+tests, `tabsSlice.test.ts` 66 tests, `crossTabSync.test.ts` 24 tests — 123/123 green after the
+import fix); full `test/unit/client/store/` sweep (52 files / 841 tests) green; `npm run
+typecheck` (client + server) clean. `npm run build:client` succeeded — `dist/client` rebuilt
+(the deploy for this lane; the running server serves the client bundle from disk, no server
+restart performed). e2e `test/e2e-browser/specs/rest-tab-persistence.spec.ts` flipped from
+`test.fail()` to a hard requirement per its own flip-instruction comment and run 2x
+`--project=rust-chromium`: both green, confirming the salvaged client now keeps the
+REST-created amplifier tab (and the rest of the layout) across a reload instead of wiping the
+whole strip. `amplifier-restore-rust.spec.ts` and `restore-matrix.spec.ts`
+(`--project=rust-chromium`) both re-run unweakened, both green.
+
 2026-07-17 (commits `64083989`, `8888df30` — non-bisectable span, harmless at HEAD): these two
 Batch 1 commits do not build standalone in isolation. `64083989` ("add Amplifier as a fourth
 session-directory source") absorbed a concurrent agent's `main.rs` wiring change (the
