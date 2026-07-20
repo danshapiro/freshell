@@ -146,6 +146,12 @@ export default defineConfig({
         // documented for `amplifier-restore-rust.spec.ts` above, so this is
         // an absent legacy feature on this branch, not a parity gap.
         /rest-tab-persistence\.spec\.ts$/,
+        // DIAG-03 — secret redaction + log rotation (small-limit, concurrent
+        // writers, final shutdown flush). Rust-only: env-var-configurable
+        // rotation limits are a deliberate Rust-only hardening feature; the
+        // frozen legacy server/ tree has no equivalent. See
+        // diag03-rotation-redaction-rust.spec.ts.
+        /diag03-rotation-redaction-rust\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [
