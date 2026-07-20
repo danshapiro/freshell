@@ -139,6 +139,13 @@ export default defineConfig({
         // port's portable-pty integration; legacy node-pty is unaffected
         // (bare names go straight to PATH search, no cwd-first branch).
         /term28-path-shadow-rust\.spec\.ts$/,
+        // REST-TAB-PERSISTENCE (client tab-poisoning incident evidence,
+        // `rest-tab-persistence.spec.ts`): legacy's frozen `server/` tree
+        // predates upstream #514 (`05c6b1fa`) and has no `amplifier`
+        // provider registered at all -- same KNOWN DIVERGENCE already
+        // documented for `amplifier-restore-rust.spec.ts` above, so this is
+        // an absent legacy feature on this branch, not a parity gap.
+        /rest-tab-persistence\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [

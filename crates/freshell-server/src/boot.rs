@@ -224,6 +224,18 @@ async fn logs_client(
     };
     let issues = client_logs_issues(&parsed);
     if issues.is_empty() {
+        // Confirmed production bug (see this fn's doc comment): validation
+        // passing used to be a dead end -- the entries were never emitted
+        // anywhere, so every browser-reported error/warning vanished. Emit
+        // each one now, giving parity with the original's `logClientEntry`
+        // (`server/client-logs.ts:33-53`).
+        let entries = parsed
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let client = parsed.get("client").cloned();
+        emit_client_log_entries(client.as_ref(), &entries);
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -231,6 +243,108 @@ async fn logs_client(
             Json(json!({ "error": "Invalid request", "details": issues })),
         )
             .into_response()
+    }
+}
+
+/// Emit one `tracing` event per validated client-log entry, so browser-
+/// reported log lines land in `rust-server.jsonl` (target
+/// `freshell_server::client_logs`) exactly like every other structured
+/// server event, instead of being silently discarded.
+///
+/// Parity with the original (`server/client-logs.ts:33-53`): each entry is
+/// emitted at ITS OWN severity (`log[level](...)`, never coerced to a single
+/// fixed level), with `message = entry.message || entry.event || 'Client
+/// log'`. This handler runs inside the request's `http_request` span
+/// ([`crate::logging::request_logging_middleware`]), so `request_id` /
+/// `route` / `method` are already merged onto every event here by
+/// `JsonLayer` -- no extra plumbing needed to correlate a client-reported
+/// error back to the request that carried it.
+///
+/// Field names below are snake_case (`client_id`, `client_event`, ...),
+/// matching this crate's existing JSONL convention (`request_id`,
+/// `duration_ms`) rather than legacy's camelCase (`clientId`, `clientEvent`)
+/// -- a deliberate, documented naming divergence. The parity contract is
+/// "every entry lands, at its own severity, with its message and context" --
+/// not the exact key spelling. `ip`/raw `userAgent` (legacy attaches these
+/// per-entry from `req.ip`/`req.headers['user-agent']`) are not currently
+/// captured as span fields anywhere in this port and are out of scope here.
+///
+/// No separate cap is applied here: `entries` is already bounded to `1..=200`
+/// by [`client_logs_issues`]'s zod-parity check before this ever runs, so a
+/// single request can never emit an unbounded number of lines.
+fn emit_client_log_entries(client: Option<&Value>, entries: &[Value]) {
+    let client_json = client.map(ToString::to_string).unwrap_or_else(|| "null".to_string());
+    let client_id = client
+        .and_then(|c| c.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    for entry in entries {
+        let Value::Object(e) = entry else { continue };
+        let severity = e.get("severity").and_then(Value::as_str).unwrap_or("info");
+        let client_event = e.get("event").and_then(Value::as_str).unwrap_or_default();
+        let message = e
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .or({
+                if client_event.is_empty() {
+                    None
+                } else {
+                    Some(client_event)
+                }
+            })
+            .unwrap_or("Client log")
+            .to_string();
+        let console_method = e
+            .get("consoleMethod")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let stack = e.get("stack").and_then(Value::as_str).unwrap_or_default();
+        let client_timestamp = e.get("timestamp").and_then(Value::as_str).unwrap_or_default();
+        let args = e
+            .get("args")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "null".to_string());
+        let context = e
+            .get("context")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "null".to_string());
+
+        // A tiny local macro to avoid quadruplicating this field list once
+        // per severity arm below -- `tracing`'s macros must be invoked by
+        // name (the level cannot be a runtime variable), so *which* macro
+        // runs is the only thing that varies per arm.
+        macro_rules! emit_client_log {
+            ($level_macro:ident) => {
+                tracing::$level_macro!(
+                    target: "freshell_server::client_logs",
+                    event = "client_log",
+                    client_id,
+                    client = %client_json,
+                    client_timestamp,
+                    client_event,
+                    console_method,
+                    args = %args,
+                    context = %context,
+                    stack,
+                    "{}",
+                    message
+                )
+            };
+        }
+
+        match severity {
+            "error" => emit_client_log!(error),
+            "warn" => emit_client_log!(warn),
+            "debug" => emit_client_log!(debug),
+            // `info` and any other (unreachable post-validation, but kept
+            // total rather than partial) value: default to `info`, mirroring
+            // the original's implicit "unknown severities never occur past
+            // the schema gate" invariant without a silent panic if one ever
+            // does.
+            _ => emit_client_log!(info),
+        }
     }
 }
 
