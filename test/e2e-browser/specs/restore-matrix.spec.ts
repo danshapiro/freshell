@@ -622,6 +622,207 @@ test.describe('Restore Matrix', () => {
   })
 
   // -------------------------------------------------------------------
+  // SCENARIO 3b -- SESSION-10 DEDUP / REUSE (focus existing, no duplicate)
+  // -------------------------------------------------------------------
+  // Proves SESSION-10's "focus/reuse the live pane instead of opening
+  // duplicates" clause: after opening a historical session from the sidebar
+  // (which creates a new tab with a running terminal), switching to a
+  // different tab, and clicking the SAME session from the sidebar again,
+  // the EXISTING tab is focused (becomes active) and the tab count does
+  // NOT increase (no duplicate tab created).  This is the `findTabIdForSession`
+  // dedup path in `src/store/tabsSlice.ts`'s `openSessionTab` action.
+  test('SESSION-10: re-clicking a running session from the sidebar focuses the existing tab instead of creating a duplicate', async ({ page, e2eServerKind }) => {
+    const SESSION_ID = '00000000-0000-4000-8000-0000000d4444'
+    const SESSION_TITLE = 'SESSION-10 dedup reuse historical session'
+
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-session10-dedup-'))
+    const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRoot, 'bin'))
+
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {
+        env: { CLAUDE_CMD: fakeClaudePath },
+        setupHome: async (homeDir) => {
+          const projectDir = path.join(homeDir, '.claude', 'projects', 'session10-dedup-project')
+          await fs.mkdir(projectDir, { recursive: true })
+          await fs.mkdir('/tmp/freshell-session10/project', { recursive: true })
+          const lines: string[] = [
+            JSON.stringify({
+              type: 'system',
+              subtype: 'init',
+              session_id: SESSION_ID,
+              uuid: `${SESSION_ID}-system`,
+              timestamp: '2026-07-16T09:00:00.000Z',
+              cwd: '/tmp/freshell-session10/project',
+              git: { branch: 'main', dirty: false },
+            }),
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-system`,
+              cwd: '/tmp/freshell-session10/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'user',
+              message: { role: 'user', content: `${SESSION_TITLE} request 1` },
+              uuid: `${SESSION_ID}-user-1`,
+              timestamp: '2026-07-16T09:00:01.000Z',
+            }),
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-user-1`,
+              cwd: '/tmp/freshell-session10/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'assistant',
+              message: {
+                role: 'assistant',
+                model: 'claude-opus-4-6-20260301',
+                content: [{ type: 'text', text: `${SESSION_TITLE} reply 1` }],
+                usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              },
+              uuid: `${SESSION_ID}-assistant-1`,
+              timestamp: '2026-07-16T09:00:02.000Z',
+            }),
+            // Second user/assistant turn: ensures the session is classified
+            // interactive (isNonInteractive filter requires >1 user turn).
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-assistant-1`,
+              cwd: '/tmp/freshell-session10/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'user',
+              message: { role: 'user', content: `${SESSION_TITLE} request 2` },
+              uuid: `${SESSION_ID}-user-2`,
+              timestamp: '2026-07-16T09:00:03.000Z',
+            }),
+            JSON.stringify({
+              parentUuid: `${SESSION_ID}-user-2`,
+              cwd: '/tmp/freshell-session10/project',
+              sessionId: SESSION_ID,
+              version: '2.1.23',
+              gitBranch: 'main',
+              type: 'assistant',
+              message: {
+                role: 'assistant',
+                model: 'claude-opus-4-6-20260301',
+                content: [{ type: 'text', text: `${SESSION_TITLE} reply 2` }],
+                usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+              },
+              uuid: `${SESSION_ID}-assistant-2`,
+              timestamp: '2026-07-16T09:00:04.000Z',
+            }),
+            JSON.stringify({
+              type: 'summary',
+              summary: SESSION_TITLE,
+              leafUuid: `${SESSION_ID}-assistant-2`,
+            }),
+          ]
+          await fs.writeFile(path.join(projectDir, `${SESSION_ID}.jsonl`), `${lines.join('\n')}\n`)
+        },
+      },
+    })
+    const info = await server.start()
+
+    try {
+      const harness = await bootAndConnect(page, info)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+      const sessionList = page.getByTestId('sidebar-session-list')
+      await expect(sessionList).toBeVisible({ timeout: 30_000 })
+
+      const sessionItem = page.getByText(SESSION_TITLE, { exact: false }).first()
+      await expect(sessionItem).toBeVisible({ timeout: 15_000 })
+
+      // Step 1: Open the session from the sidebar — creates a new tab.
+      const tabCountBefore = await harness.getTabCount()
+      await sessionItem.click()
+
+      const sessionTabId = await (async () => {
+        let id: string | null = null
+        await expect(async () => {
+          const tabCount = await harness.getTabCount()
+          expect(tabCount).toBe(tabCountBefore + 1)
+          id = await harness.getActiveTabId()
+          expect(id).toBeTruthy()
+        }).toPass({ timeout: 15_000 })
+        return id!
+      })()
+
+      // Wait for the session tab's terminal to be running (the terminal
+      // must be live for the dedup path to consider this tab an existing
+      // owner of the session).
+      await expect(async () => {
+        const state = await harness.getState()
+        const tab = state.tabs.tabs.find((t: any) => t.id === sessionTabId)
+        expect(tab?.title).toBeTruthy()
+        expect(tab.title).not.toBe('Terminal')
+      }).toPass({ timeout: 20_000 })
+
+      // Step 2: Switch away to the first (original) tab so the session tab
+      // is no longer active.  We use the harness dispatch (same mechanism
+      // the TabBar uses internally) to avoid depending on tab-bar visibility.
+      const firstTabId = await (async () => {
+        const state = await harness.getState()
+        return state.tabs.tabs[0]?.id as string | undefined
+      })()
+      expect(firstTabId).toBeTruthy()
+      expect(firstTabId).not.toBe(sessionTabId)
+
+      await page.evaluate((tid) => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/setActiveTab', payload: tid })
+      }, firstTabId!)
+
+      // Verify we successfully switched away.
+      await expect(async () => {
+        const active = await harness.getActiveTabId()
+        expect(active).toBe(firstTabId)
+      }).toPass({ timeout: 5_000 })
+
+      // Step 3: Re-click the SAME session from the sidebar.
+      const tabCountBeforeReclick = await harness.getTabCount()
+      await sessionItem.click()
+
+      // Step 4: Assert dedup — tab count does NOT increase, and the session
+      // tab is now active (focused/reused, not duplicated).
+      await expect(async () => {
+        const tabCount = await harness.getTabCount()
+        expect(tabCount).toBe(tabCountBeforeReclick) // no new tab created
+        const active = await harness.getActiveTabId()
+        expect(active).toBe(sessionTabId) // existing tab is focused
+      }).toPass({ timeout: 15_000 })
+
+      // Step 5: Assert only one tab references this session (no duplicate
+      // owner).  `findTabIdForSession` in `src/lib/session-utils.ts` scans
+      // both pane-leaf content (sessionRef / resumeSessionId) and tab-level
+      // fallback fields.  We mirror that logic here.  Retry because
+      // sessionRef is set asynchronously after the fresh-agent create
+      // round-trip completes.
+      const collectLeafContent = (node: any): any[] => {
+        if (!node) return []
+        if (node.type === 'leaf') return [node.content]
+        if (node.type === 'split') return [...collectLeafContent(node.children?.[0]), ...collectLeafContent(node.children?.[1])]
+        return []
+      }
+      await expect(async () => {
+        const state = await harness.getState()
+        const matchingTabs = state.tabs.tabs.filter((t: any) => {
+          // Tab-level fallback fields (buildTabFallbackLocator)
+          if (t?.sessionRef?.sessionId === SESSION_ID || t?.resumeSessionId === SESSION_ID) return true
+          // Pane-leaf content (extractSessionLocators)
+          const layout = state.panes?.layouts?.[t.id]
+          const leafContents = collectLeafContent(layout)
+          return leafContents.some((c) => c?.sessionRef?.sessionId === SESSION_ID || c?.resumeSessionId === SESSION_ID)
+        })
+        expect(matchingTabs.length).toBe(1)
+      }).toPass({ timeout: 15_000 })
+    } finally {
+      await server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // -------------------------------------------------------------------
   // SCENARIO 4 -- EXIT SURFACING (never silently blank after mid-life exit)
   // -------------------------------------------------------------------
   test('a terminal that exits before reload surfaces its exited state instead of rendering blank', async ({ page, terminal, e2eServerKind }) => {
