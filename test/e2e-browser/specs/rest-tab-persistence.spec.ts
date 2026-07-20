@@ -189,28 +189,15 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
     expect(layoutAfter, 'localStorage layout must still hold the data after reload (preserved-but-rejected)').toBeTruthy()
     expect(layoutAfter).toContain('amplifier')
 
-    // RED today (see this file's top doc comment for the exact flip
-    // instruction): `zTabMode` (`src/store/persistedState.ts:22`) does not
-    // include `'amplifier'`. `freshell.layout.v3` is validated in ONE
-    // shot by `zPersistedLayoutPayload` (`persistedState.ts:360-365`),
-    // which embeds `zPersistedTabsState` -> `zTab` -> `zTabMode` for its
-    // `tabs` field -- so ONE tab carrying an out-of-enum `mode` fails
-    // `zPersistedLayoutPayload.safeParse` for the ENTIRE combined payload
-    // (tabs AND panes AND tombstones together, `parsePersistedLayoutRaw`
-    // returns `null`), not just that one tab. The rehydrated tab strip
-    // renders empty, even though the exact bytes that same tab's content
-    // came from are still sitting untouched in `freshell.layout.v3` above.
-    // This is the exact incident shape: data preserved, but rejected from
-    // ever being shown again.
-    test.fail(true, 'KNOWN BUG (client-side, shared): zTabMode enum in ' +
-      'src/store/persistedState.ts does not include "amplifier", so ' +
-      'parsePersistedTabsRaw drops the ENTIRE persisted tabs payload on ' +
-      'reload once any tab carries that mode. Once the client fix for this ' +
-      '(persistedState.ts zTabMode enum, or an equivalent tolerant-parse ' +
-      'fix) lands on this branch, this test.fail() call itself will start ' +
-      'failing (an unexpected pass trips a test.fail()-annotated test into ' +
-      'a hard failure) -- that is the signal to delete this test.fail() ' +
-      'call and let the assertion below run as a normal green expectation.')
+    // GREEN (flipped): `src/store/persistedState.ts` now sanitizes an
+    // out-of-enum `mode`/`codingCliProvider` value to `undefined` instead of
+    // failing the tab (`zSanitizedOptionalString`), and validates tabs one
+    // at a time (`salvageTabs`) instead of atomically via `z.array(zTab)` --
+    // see commit `260a4d67` ("fix(client): salvage valid persisted tabs
+    // instead of nuking whole layout"). A tab carrying an out-of-enum
+    // `mode` (or any other salvageable field) no longer poisons the whole
+    // `freshell.layout.v3` payload on reload; the tab strip must still show
+    // the REST-created tab after the reload above.
     await expect(tabStrip.getByText('amplifier-poison-tab')).toBeVisible({ timeout: 15_000 })
   })
 })
