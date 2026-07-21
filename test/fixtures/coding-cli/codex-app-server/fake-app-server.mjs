@@ -207,7 +207,7 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/resume') {
-    const threadId = params?.threadId || 'thread-new-1'
+    const threadId = behavior.threadResumeThreadId || params?.threadId || 'thread-new-1'
     const rolloutPath = behavior.threadResumeRolloutPath || behavior.rolloutPath
     const thread = makeThread(threadId, params)
     if (rolloutPath) thread.path = rolloutPath

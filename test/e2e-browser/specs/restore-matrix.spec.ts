@@ -1677,4 +1677,129 @@ test.describe('Restore Matrix', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  // -------------------------------------------------------------------
+  // SCENARIO 7 -- TERM-25: Prevent wrong-thread Codex recovery.
+  //
+  // When Freshell resumes a durable Codex session after a client reload,
+  // the server calls `thread/resume` with the ORIGINAL thread id. If the
+  // app server returns a DIFFERENT thread id in its response, Freshell
+  // must NOT silently adopt the wrong thread — the user's conversation
+  // history belongs to thread-A, and rendering thread-B would show
+  // unrelated content.
+  //
+  // The fake app server supports `threadStartThreadId` and
+  // `threadResumeThreadId` to simulate exactly this divergence: on
+  // initial `thread/start` it returns 'thread-A'; on `thread/resume`
+  // (which the reload triggers) it returns 'thread-B'.
+  //
+  // FIXME(product-bug): Both adapters currently fail this requirement:
+  //   - TypeScript adapter (server/codex/adapter.ts ~L843-868): no check
+  //     at all — silently adopts the returned thread id.
+  //   - Rust adapter (src-tauri/src/codex.rs ~L1182-1185): `debug_assert_eq!`
+  //     only — a no-op in release builds (`cargo build --release`).
+  // The test is pinned as expected-fail until a production-grade guard
+  // (reject the mismatch, or at minimum refuse to adopt the wrong id)
+  // is added to both adapters.
+  // -------------------------------------------------------------------
+  test('TERM-25: wrong-thread Codex recovery is rejected, not silently adopted', async ({ page, e2eServerKind }) => {
+    // FIXME(product-bug): both adapters silently adopt the wrong thread id
+    test.fail()
+
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-term25-'))
+    try {
+      const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
+
+      const server = await createE2eServerHandle(process.env, {
+        kind: e2eServerKind,
+        construct: {
+          env: {
+            CODEX_CMD: fakeCodexPath,
+            // Configure the fake app server to return 'thread-A' on
+            // thread/start and 'thread-B' on thread/resume.
+            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+              threadStartThreadId: 'thread-A',
+              threadResumeThreadId: 'thread-B',
+            }),
+          },
+          setupHome: async (homeDir) => {
+            const freshellDir = path.join(homeDir, '.freshell')
+            await fs.mkdir(freshellDir, { recursive: true })
+            await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+              version: 1,
+              settings: {
+                freshAgent: { enabled: true },
+                codingCli: {
+                  enabledProviders: ['codex'],
+                  providers: { codex: { model: 'gpt-5-codex', sandbox: 'workspace-write' } },
+                },
+              },
+            }, null, 2))
+          },
+        },
+      })
+      const info = await server.start()
+
+      try {
+        const harness = await bootAndConnect(page, info)
+        await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+        // Declare codex availability (the isolated HOME has no real binary).
+        await page.evaluate(() => {
+          window.__FRESHELL_TEST_HARNESS__?.dispatch({
+            type: 'connection/setAvailableClis',
+            payload: { claude: false, codex: true },
+          })
+        })
+
+        const picker = await openPanePicker(page)
+        await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+        await page.getByRole('option').first().click()
+
+        const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+        await expect(paneRoot).toBeVisible({ timeout: 15_000 })
+
+        const tabId = await harness.getActiveTabId()
+        expect(tabId).toBeTruthy()
+
+        // Wait for the initial session to settle — the fake app server's
+        // thread/start returns 'thread-A', so sessionId should be 'thread-A'.
+        const originalSessionId = await expect.poll(async () => {
+          const layout = await harness.getPaneLayout(tabId!)
+          const leaf = findFreshAgentLeaf(layout)
+          return leaf?.content?.sessionId ?? leaf?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 30_000 }).toBe('thread-A')
+
+        // Flush persistence so the durable session survives reload.
+        await page.evaluate(() => {
+          window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+        })
+        await page.reload({ waitUntil: 'domcontentloaded' })
+        await harness.waitForHarness()
+        await harness.waitForConnection()
+
+        await expect(paneRoot).toBeVisible({ timeout: 20_000 })
+
+        // After reload, Freshell calls thread/resume with threadId: 'thread-A'.
+        // The fake app server returns 'thread-B' in its response.
+        //
+        // TERM-25 requires: the session id must STILL be 'thread-A' —
+        // Freshell must never silently adopt thread-B while restoring
+        // expected thread-A.
+        //
+        // This assertion FAILS today because both adapters adopt the
+        // returned thread id without validation. The test.fail() above
+        // pins this as an expected failure (product bug).
+        await expect.poll(async () => {
+          const layout = await harness.getPaneLayout(tabId!)
+          const leaf = findFreshAgentLeaf(layout)
+          return leaf?.content?.sessionId ?? leaf?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 30_000 }).toBe(originalSessionId)
+      } finally {
+        await server.stop().catch(() => {})
+      }
+    } finally {
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
