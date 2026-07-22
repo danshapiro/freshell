@@ -151,15 +151,20 @@ fn is_session_provider_mode(mode: &str) -> bool {
 /// legacy `resumeSessionId` (EDEV-07): `claude` ids must be canonical session
 /// UUIDs (reuses `freshell_sessions::text::is_canonical_claude_session_id`,
 /// the SAME validator the session indexer and the frozen client's
-/// `CLAUDE_SESSION_ID_RE` enforce). The other session providers have no
-/// published id-shape contract (amplifier ids are directory names, opencode
-/// ids are `ses_*` rows, gemini/kimi are opaque), so the gate is the honest
-/// minimum: non-empty with no whitespace -- an id that couldn't possibly name
-/// a stored session is left on the legacy `resumeSessionId` path instead of
-/// being promoted to canonical identity.
+/// `CLAUDE_SESSION_ID_RE` enforce), and `opencode` ids must be `ses_*` rows
+/// (the published shape contract: `shared/session-flavor.ts:65`
+/// `isDurableProviderSessionId` requires `/^ses_/` for opencode). The
+/// remaining session providers have no published id-shape contract (amplifier
+/// ids are directory names, gemini/kimi are opaque), so their gate is the
+/// honest minimum: non-empty with no whitespace -- an id that couldn't
+/// possibly name a stored session is left on the legacy `resumeSessionId`
+/// path instead of being promoted to canonical identity.
 fn plausible_resume_session_id(mode: &str, id: &str) -> bool {
     if mode == "claude" {
         return freshell_sessions::text::is_canonical_claude_session_id(id);
+    }
+    if mode == "opencode" && !id.starts_with("ses_") {
+        return false;
     }
     !id.is_empty() && !id.chars().any(char::is_whitespace)
 }
@@ -2204,6 +2209,89 @@ mod tests {
         assert_eq!(
             msg["payload"]["paneContent"]["resumeSessionId"],
             json!("not a plausible id"),
+            "{msg}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_opencode_tab_with_non_ses_resume_id_does_not_synthesize() {
+        let argv_file = unique_argv_file("opencode-implausible");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "opencode", &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "opencode",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "foo"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // Implausible id shape (opencode ids are `ses_*` rows,
+        // `shared/session-flavor.ts:65` `isDurableProviderSessionId`) -> NO
+        // synthesis; legacy resumeSessionId-only shape is preserved.
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            msg["payload"]["paneContent"].get("sessionRef").is_none(),
+            "{msg}"
+        );
+        assert_eq!(
+            msg["payload"]["paneContent"]["resumeSessionId"],
+            json!("foo"),
+            "{msg}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_opencode_tab_with_ses_prefixed_resume_id_synthesizes_session_ref() {
+        let argv_file = unique_argv_file("opencode-synth");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "opencode", &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "opencode",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "ses_abc123"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            msg["payload"]["paneContent"]["sessionRef"],
+            json!({ "provider": "opencode", "sessionId": "ses_abc123" }),
+            "{msg}"
+        );
+        assert!(
+            msg["payload"]["paneContent"]
+                .get("resumeSessionId")
+                .is_none(),
             "{msg}"
         );
 

@@ -71,7 +71,13 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
         base_args: vec![],
         base_env: std::collections::BTreeMap::new(),
         resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
-        create_session_args: None,
+        // Required for the fresh-claude preallocation path: `LaunchIntent::Start`
+        // THROWS without `create_session_args` (`cli_launch.rs:436-441`), same
+        // shape as the real claude spec (`cli_launch_goldens.rs:50`).
+        create_session_args: Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
         model_args: None,
         sandbox_args: None,
         permission_mode_args: None,
@@ -112,7 +118,10 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        cli_commands: Arc::new(vec![sleeper_cli_spec("amplifier")]),
+        cli_commands: Arc::new(vec![
+            sleeper_cli_spec("amplifier"),
+            sleeper_cli_spec("claude"),
+        ]),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
         hello_timeout_ms: 5_000,
@@ -280,6 +289,80 @@ async fn resume_created_terminal_frames_carry_session_ref() {
         session_ref_of(&row),
         Some(expected_ref),
         "terminal.inventory row must carry the identity: {row}"
+    );
+
+    registry.kill(&terminal_id);
+}
+
+/// A FRESH `claude` terminal create (no `resumeSessionId`, no `sessionRef`,
+/// no restore) takes the server-preallocation path (`terminal.rs:776-789`:
+/// fresh claude ALWAYS gets a server-preallocated `--session-id` UUID) — and
+/// that preallocated identity must flow onto the wire: `terminal.created`
+/// carries `sessionRef {provider:'claude', sessionId:<the preallocated UUID>}`
+/// and a second connection's `terminal.inventory` row carries the same ref.
+/// Pins the (previously unpinned) wire-behavior change from the identity
+/// stamping commit: preallocation used to be argv-only.
+#[tokio::test]
+async fn fresh_claude_create_frames_carry_preallocated_session_ref() {
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-fresh-claude-1",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let session_ref = session_ref_of(&created).unwrap_or_else(|| {
+        panic!("fresh claude terminal.created must carry sessionRef: {created}")
+    });
+    assert_eq!(
+        session_ref["provider"],
+        serde_json::json!("claude"),
+        "provider must be claude: {created}"
+    );
+    let session_id = session_ref["sessionId"]
+        .as_str()
+        .expect("sessionId string")
+        .to_string();
+    // The preallocated id is a randomUUID() (`ws:969-975` parity) — canonical
+    // hyphenated UUID shape, NOT anything the client sent (it sent nothing).
+    assert_eq!(
+        session_id.len(),
+        36,
+        "preallocated UUID shape: {session_id}"
+    );
+    assert_eq!(
+        session_id.chars().filter(|c| *c == '-').count(),
+        4,
+        "preallocated UUID shape: {session_id}"
+    );
+
+    // A SECOND connection's handshake inventory row carries the SAME ref.
+    let (_ws2, inventory) = connect_and_capture_inventory(&url).await;
+    let row = inventory["terminals"]
+        .as_array()
+        .expect("terminals array")
+        .iter()
+        .find(|t| t["terminalId"] == serde_json::json!(terminal_id))
+        .cloned()
+        .unwrap_or_else(|| panic!("inventory must list {terminal_id}: {inventory}"));
+    assert_eq!(
+        session_ref_of(&row),
+        Some(serde_json::json!({ "provider": "claude", "sessionId": session_id })),
+        "terminal.inventory row must carry the preallocated identity: {row}"
     );
 
     registry.kill(&terminal_id);
