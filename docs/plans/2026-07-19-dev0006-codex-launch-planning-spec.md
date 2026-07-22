@@ -166,15 +166,51 @@ Port `json-rpc-envelope.ts` (`scanJsonRpcEnvelope`, `MAX_FULL_PARSE_BYTES`, `MAX
 
 ### Slice 4 — Wire BOTH create paths through shared code
 
+> **LANDED (2026-07-22, FLAG-GATED default OFF — council fence).** Commits: `d5d6e423`
+> (inc.1: lifecycle glue `crates/freshell-codex/src/launch_lifecycle.rs` — planner +
+> sidecar state machine + `SpawnedCodexAppServerRuntime` + the terminal-keyed
+> `CodexTerminalLaunchManager`; WS `terminal.create` branch; explicit
+> `require_candidate_persistence` on the proxy options) and the inc.2 commit (REST
+> `terminal_tabs.rs` branch with the `router.ts:177` resumeSessionId echo; `main.rs`
+> shutdown-owner wiring; the e2e leg
+> `crates/freshell-ws/tests/codex_managed_launch_e2e.rs`). Gate:
+> `FRESHELL_CODEX_MANAGED_LAUNCH=1`; flag OFF is byte-identical to the shipped
+> deviation shape, so **G-X0 is NOT retired yet** — it stays the live-path pin until
+> S5 lands and the flag default flips (G-X0 → G-X1 swap happens at that flip, with the
+> DEV-0006 record moving to `closed`). The shared seam is
+> `CodexTerminalLaunchManager::global()` (one planner per server process, matching
+> `server/index.ts:359`), consumed by both create paths + both exit hooks.
+>
+> **S5 follow-ups recorded from the S4 review:**
+> 1. *Spawn-helper unification*: the canonical terminal-mode app-server spawn now lives
+>    in `freshell-codex::launch_lifecycle::SpawnedCodexAppServerRuntime` (argv/env from
+>    `codex_sidecar_spawn_spec`); `freshell-freshagent/src/codex.rs::spawn_sidecar`
+>    (chat-pane topology) still carries its own copy of the spawn mechanics — point it
+>    at the shared runtime when a slice owns that file.
+> 2. *Singleton vs DI*: the manager is a process-global (`global()`) because `WsState`
+>    (`freshell-ws/src/lib.rs`) was out of the S4 file grant; if DI is preferred,
+>    thread it through `WsState`/`FreshAgentState` in S5.
+> 3. *Binding reason*: `CodexLaunchPlan.binding_reason` is computed (S3) but the Rust
+>    registry has no `sessionBindingReason` consumer yet — wire it with S5's
+>    durability binding (review note 1's non-codex fallback applies at that call site).
+> 4. *Recovery re-plan-on-loss* (`recovery.planCreate`, `deferLifecycleUntilPublished`)
+>    stays deferred per §6's risk fence; the 5-vs-1 attempt asymmetry is already
+>    structural (`plan_create_with_retry` takes the caller's budget).
+
 A single `resolve_codex_launch(...) -> Option<CodexLaunchInto>` used by both `crates/freshell-ws/src/terminal.rs` (replace `codex_remote_ws_url = None` at `:835`) and `crates/freshell-freshagent/src/terminal_tabs.rs` (replace `codex_remote_ws_url: None` at `:604`). It runs `plan_create`, sets `codex_remote_ws_url: Some(plan.remote_ws_url)`, threads `session_binding_reason` (port `getCodexSessionBindingReason`), and returns the sidecar handle for post-create `adopt`/`publish`. Keep the model/sandbox/permissionMode strip (already at `terminal.rs:800`). REST retains its raw-resume rejection (`terminal_tabs.rs:124-129`); consider aligning the WS path's raw-resume acceptance (`terminal.rs:779-782`) to the legacy reject as a follow-up (flag, do not silently change).
 
-- **Tests / goldens:** **retire `g_x0_codex_shipped_deviation_shape_dev_0006`** and promote **G-X1** (fresh live-path shape, `--remote <ws> -c features.apps=false` + notif + mcp) as the live golden; add a resume golden. Update DEV-0006 record to `status: closed` with the closing commit.
+- **Tests / goldens:** **retire `g_x0_codex_shipped_deviation_shape_dev_0006`** and promote **G-X1** (fresh live-path shape, `--remote <ws> -c features.apps=false` + notif + mcp) as the live golden; add a resume golden. Update DEV-0006 record to `status: closed` with the closing commit. *(Deferred with the flag flip: while the S4 gate defaults OFF, G-X0 remains the live-path shape and the record stays open — see the LANDED note above.)*
 
 ### Slice 5 (SEPARATE stage, gated) — durability binding + activity + `terminal.meta.updated` (DEV-0008)
 
 Consume the proxy's captured candidates to mint a durable `sessionRef`, drive `codex-activity-tracker`-equivalent turn events, and emit `terminal.meta.updated`. **Do not ship Slices 1-4 with Slice 5 half-wired** (see §6). Land Slice 5 as its own tracked change that closes DEV-0008 alongside DEV-0006.
 
 ### e2e leg (one)
+
+> **LANDED (inc.2):** `crates/freshell-ws/tests/codex_managed_launch_e2e.rs` —
+> host-gated `#[ignore]`, run alone with `--ignored --test-threads=1`. Flag OFF
+> control (today's argv, no `--remote`) + flag ON (the `--remote` 4-tuple first,
+> bel pair next, live TUI→proxy→fake-app-server initialize round-trip).
 
 A host-gated live integration test (`#[ignore]`, opt-in like `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS`): `terminal.create {mode:'codex'}` over the Rust WS server, capture the spawned child argv, assert the first four tokens are `--remote ws://127.0.0.1:<port> -c features.apps=false` and that the proxy accepts the TUI connection. This is the `original ≡ rust` differential the DEV-0006 live capture (`~/freshell-scratch-006/*-codex.json`) established.
 

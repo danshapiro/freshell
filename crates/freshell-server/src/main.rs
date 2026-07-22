@@ -750,6 +750,16 @@ async fn main() -> ExitCode {
     // SDK abort → SIGKILL straggler + `/proc` ownership sweep) so a freshclaude T2 run
     // leaves no orphaned sidecar or claude CLI grandchild.
     fresh_claude_state.shutdown().await;
+    // DEV-0006 S4: stop accepting codex managed-launch plans and tear down every
+    // launch sidecar + remote proxy the terminal-launch manager still owns (mirrors
+    // legacy's close-time `codexLaunchPlanner.shutdown()` among the shutdown owners,
+    // `server/index.ts:981-1049`). Runs AFTER `registry.kill_all()` above, so adopted
+    // launches whose exit hooks already queued teardown are simply re-shut-down
+    // (idempotent) and unadopted in-flight plans are reaped here. No-op when the
+    // managed-launch flag never planned anything.
+    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+        .shutdown()
+        .await;
     if let Err(err) = serve_result {
         eprintln!("freshell-server: serve error: {err}");
         return ExitCode::FAILURE;

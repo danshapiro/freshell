@@ -884,7 +884,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             .await
         {
             Ok(launch) => Some(launch),
-            Err(message) => {
+            Err(error) => {
+                let message = error.to_string();
                 // A thrown planCodexLaunch surfaces through the generic create catch
                 // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
                 return send_create_error(

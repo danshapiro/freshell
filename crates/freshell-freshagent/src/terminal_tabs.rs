@@ -482,6 +482,45 @@ pub(crate) struct TerminalSpawnResult {
     pub(crate) cwd: Option<String>,
 }
 
+/// DEV-0006 S4 gate, REST side (council fence: FLAG-GATED, default OFF): a codex
+/// `POST /api/tabs` / pane-split create plans a managed app-server launch ONLY when the
+/// mode is codex AND the `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"1"` — the
+/// SAME predicate the WS `terminal.create` branch gates on
+/// (`crates/freshell-ws/src/terminal.rs::codex_create_uses_managed_launch`). Flag OFF
+/// keeps the shipped plain-CLI REST codex behavior byte-identical.
+fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> bool {
+    mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
+}
+
+/// `agentRouteErrorStatus` (`router.ts:54-59`), scoped to the launch errors this
+/// branch can produce: `CodexLaunchConfigError` → 400 (an input error — invalid
+/// sandbox); every other launch failure (runtime/proxy IO, planner shutdown) → 500.
+fn codex_launch_error_response(
+    error: freshell_codex::launch_lifecycle::CodexLaunchError,
+) -> Response {
+    use freshell_codex::launch_lifecycle::CodexLaunchError;
+    let status = match &error {
+        CodexLaunchError::Config(_) => StatusCode::BAD_REQUEST,
+        CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    fail_json(status, error.to_string())
+}
+
+/// The resumeSessionId ECHO (`router.ts:177`):
+/// `opts.resumeSessionId ? (plan.sessionId ?? opts.resumeSessionId) : undefined`.
+/// The registry record (and everything keyed off it — set_meta, paneContent
+/// sessionRef promotion) carries THIS value, not the raw request field. TS truthiness:
+/// an empty requested id counts as "not requested".
+fn codex_effective_resume_session_id(
+    requested: Option<&str>,
+    plan_session_id: Option<&str>,
+) -> Option<String> {
+    match requested.filter(|s| !s.is_empty()) {
+        Some(requested) => Some(plan_session_id.unwrap_or(requested).to_string()),
+        None => None,
+    }
+}
+
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
 /// `router.ts:1326-1369` for split -- the original reuses the SAME
 /// `resolveSpawnProviderSettings`/`registry.create` sequence for both routes, and this
@@ -552,13 +591,17 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
-    let (resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+    let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
 
     let mut cli: Option<CliLaunch> = None;
     let mut mcp_cwd: Option<String> = None;
+    // DEV-0006 S4 inc.2: the flag-gated managed codex launch (None for every other
+    // mode, and for codex with the flag OFF). Planned inside the non-shell branch;
+    // consumed at create-failure (discard) and post-create (adopt) below.
+    let mut codex_launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> = None;
     let spec: SpawnSpec;
     let child_env: BTreeMap<String, String>;
 
@@ -618,6 +661,48 @@ pub(crate) async fn spawn_terminal_pane(
             .and_then(Value::as_str)
             .map(str::to_string);
 
+        // DEV-0006 S4 inc.2 (FLAG-GATED, default OFF — council fence): with
+        // `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch through
+        // the SAME `CodexTerminalLaunchManager` the WS path uses (`router.ts:160-195`
+        // semantics: `planCodexLaunchWithRetry` default budget = 5 attempts,
+        // launch-retry.ts:19; raw create cwd; body model/sandbox/permissionMode routed
+        // through the PLAN and STRIPPED from the spawn, matching legacy's codex-only
+        // `{codexAppServer}` providerSettings). Flag OFF: today's plain-CLI behavior,
+        // byte-identical. The raw-resume rejection already ran in
+        // `derive_resume_identity` — planning happens strictly after it.
+        let managed_flag =
+            std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+        codex_launch = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+            let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
+                cwd: cwd.as_deref(),
+                resume_session_id: resume_session_id.as_deref(),
+                model: model.as_deref(),
+                sandbox: sandbox.as_deref(),
+                approval_policy: permission_mode.as_deref(),
+            };
+            match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .plan_create_with_retry(
+                    &input,
+                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                )
+                .await
+            {
+                Ok(launch) => Some(launch),
+                Err(error) => return Err(codex_launch_error_response(error)),
+            }
+        } else {
+            None
+        };
+        let managed_codex = codex_launch.is_some();
+        // The resumeSessionId ECHO (`router.ts:177`): the registry record and every
+        // downstream identity consumer carry the echoed value.
+        if let Some(launch) = &codex_launch {
+            resume_session_id = codex_effective_resume_session_id(
+                resume_session_id.as_deref(),
+                launch.session_id.as_deref(),
+            );
+        }
+
         let inputs = CliLaunchInputs {
             mode: &mode,
             target,
@@ -631,13 +716,19 @@ pub(crate) async fn spawn_terminal_pane(
             // genuine resume (accepted `sessionRef` or legacy
             // `resumeSessionId`).
             launch_intent: LaunchIntent::Resume,
-            permission_mode: permission_mode.as_deref(),
-            model: model.as_deref(),
-            sandbox: sandbox.as_deref(),
-            // Codex app-server remote launch planning is not wired into
-            // EITHER create path yet (DEV-0006, `crates/freshell-ws/src/terminal.rs:815-818`)
-            // -- matches the WS Rust port's current shipped state exactly.
-            codex_remote_ws_url: None,
+            // Managed codex (flag ON): model/sandbox/permissionMode route through the
+            // PLAN, not argv (legacy's spawn providerSettings for codex carry ONLY
+            // `codexAppServer`, `router.ts:178-193`).
+            permission_mode: (!managed_codex)
+                .then_some(())
+                .and(permission_mode.as_deref()),
+            model: (!managed_codex).then_some(()).and(model.as_deref()),
+            sandbox: (!managed_codex).then_some(()).and(sandbox.as_deref()),
+            // DEV-0006 S4 inc.2: the PROXY's ws URL when the flag-gated managed launch
+            // planned one; `None` (today's shipped shape) otherwise.
+            codex_remote_ws_url: codex_launch
+                .as_ref()
+                .map(|launch| launch.remote_ws_url.as_str()),
             opencode_server: opencode_endpoint
                 .as_ref()
                 .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
@@ -708,6 +799,12 @@ pub(crate) async fn spawn_terminal_pane(
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry_for_exit.finish_pty_exit(&tid, exit_code);
+            // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
+            // (no-op for terminals without a managed launch). Sync-safe: hands the
+            // handle to the manager's async teardown worker. Same call as the WS
+            // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .notify_terminal_exit(&tid);
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
             }
@@ -733,6 +830,13 @@ pub(crate) async fn spawn_terminal_pane(
         if mode != "shell" {
             cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
         }
+        // DEV-0006 S4: a planned-but-unadopted codex launch dies with the failed create
+        // (`cleanupUnadoptedCodexLaunch`, `router.ts:445`) — sidecar + proxy torn down.
+        if let Some(launch) = codex_launch {
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .discard(launch)
+                .await;
+        }
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
             .cli_commands
@@ -747,6 +851,22 @@ pub(crate) async fn spawn_terminal_pane(
             resume_session_id.is_some(),
         );
         return Err(fail_json(StatusCode::BAD_REQUEST, message));
+    }
+
+    // DEV-0006 S4: adopt the managed codex launch for this terminal
+    // (`adoptCodexLaunch` → `launch.codexPlan.sidecar.adopt({terminalId, generation: 0})`,
+    // `router.ts:254,1591`) — ownership transfers from the planner to the terminal; the
+    // exit hook above tears it down. Adoption only fails when the planner/sidecar is
+    // already shutting down (server exit); legacy's thrown adopt fails the create, so
+    // kill the just-spawned pty and surface the error (500 — not an input error).
+    if let Some(launch) = codex_launch.take() {
+        if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .adopt(&terminal_id, launch, 0)
+            .await
+        {
+            registry.kill(&terminal_id);
+            return Err(fail_json(StatusCode::INTERNAL_SERVER_ERROR, message));
+        }
     }
 
     registry.set_meta(
@@ -1333,6 +1453,71 @@ mod tests {
             .unwrap();
         let status = resp.status();
         (status, body_text(resp).await)
+    }
+
+    // ── DEV-0006 S4 inc.2: the REST codex managed-launch gate + resume echo ─────────────
+
+    /// Same council fence as the WS path: managed codex launch is FLAG-GATED,
+    /// default OFF; only mode=codex + flag exactly "1" plans a launch. Flag OFF
+    /// keeps the shipped REST codex behavior byte-identical.
+    #[test]
+    fn rest_codex_managed_launch_gate_is_mode_and_flag_scoped() {
+        assert!(codex_create_uses_managed_launch("codex", Some("1")));
+        assert!(!codex_create_uses_managed_launch("codex", None));
+        assert!(!codex_create_uses_managed_launch("codex", Some("0")));
+        assert!(!codex_create_uses_managed_launch("codex", Some("")));
+        assert!(!codex_create_uses_managed_launch("shell", Some("1")));
+        assert!(!codex_create_uses_managed_launch("claude", Some("1")));
+        assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
+    }
+
+    /// `agentRouteErrorStatus` (`router.ts:54-59`): a `CodexLaunchConfigError` (invalid
+    /// sandbox etc.) is an INPUT error → 400; any other launch failure (runtime/proxy
+    /// IO, planner shutdown) → 500.
+    #[test]
+    fn rest_codex_launch_error_maps_config_to_400_and_failed_to_500() {
+        use freshell_codex::launch_lifecycle::CodexLaunchError;
+        use freshell_codex::launch_plan::CodexLaunchConfigError;
+        let config =
+            codex_launch_error_response(CodexLaunchError::Config(CodexLaunchConfigError {
+                message: "Invalid Codex sandbox setting \"x\".".to_string(),
+            }));
+        assert_eq!(config.status(), StatusCode::BAD_REQUEST);
+        let failed = codex_launch_error_response(CodexLaunchError::Failed(
+            "codex app-server WS never came up".to_string(),
+        ));
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// `router.ts:177`: `resumeSessionId: opts.resumeSessionId ? (plan.sessionId ??
+    /// opts.resumeSessionId) : undefined` — the plan's sessionId wins when a resume was
+    /// requested; a fresh create yields NO resume id even if the plan carried one; TS
+    /// truthiness makes an empty requested id count as "not requested".
+    #[test]
+    fn rest_codex_resume_echo_matches_router_semantics() {
+        // resume requested + plan echoes it back (the normal resume shape).
+        assert_eq!(
+            codex_effective_resume_session_id(Some("thread-a"), Some("thread-a")),
+            Some("thread-a".to_string())
+        );
+        // resume requested, plan.sessionId differs → the PLAN's id wins (`??` picks
+        // the first non-nullish operand).
+        assert_eq!(
+            codex_effective_resume_session_id(Some("thread-a"), Some("thread-b")),
+            Some("thread-b".to_string())
+        );
+        // resume requested, plan carries none → fall back to the requested id.
+        assert_eq!(
+            codex_effective_resume_session_id(Some("thread-a"), None),
+            Some("thread-a".to_string())
+        );
+        // fresh create → undefined, even if the plan somehow carried a session id.
+        assert_eq!(
+            codex_effective_resume_session_id(None, Some("thread-x")),
+            None
+        );
+        // TS truthiness: the empty string is falsy → undefined.
+        assert_eq!(codex_effective_resume_session_id(Some(""), Some("t")), None);
     }
 
     // ── POST /api/tabs (terminal: shell) ────────────────────────────────────

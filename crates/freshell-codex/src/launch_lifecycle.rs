@@ -411,12 +411,11 @@ impl CodexTerminalLaunchManager {
         &self,
         input: &CodexLaunchPlanInput<'_>,
         attempts: u32,
-    ) -> Result<CodexTerminalLaunch, String> {
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         self.ensure_teardown_worker();
         self.planner
             .plan_create_with_retry(input, attempts, CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS)
             .await
-            .map_err(|error| error.to_string())
     }
 
     /// Adopt the launch for a created terminal (`codexPlan.sidecar.adopt({terminalId,
@@ -454,6 +453,23 @@ impl CodexTerminalLaunchManager {
         };
         if let Some(tx) = self.teardown_tx.get() {
             let _ = tx.send(entry);
+        }
+    }
+
+    /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
+    /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
+    /// the planner stops accepting plans and tears down its unadopted sidecars — PLUS
+    /// the adopted (terminal-owned) launches this manager keys, since server exit ends
+    /// those terminals too (their exit hooks may also queue teardown; sidecar shutdown
+    /// is idempotent, so both paths are safe).
+    pub async fn shutdown(&self) {
+        self.planner.shutdown().await;
+        let adopted: Vec<AdoptedTerminalLaunch> = {
+            let mut map = self.adopted.lock().unwrap();
+            map.drain().map(|(_, entry)| entry).collect()
+        };
+        for entry in adopted {
+            let _ = entry.sidecar.shutdown().await;
         }
     }
 

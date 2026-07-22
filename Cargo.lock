@@ -1335,6 +1335,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "freshell-api",
+ "freshell-codex",
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",

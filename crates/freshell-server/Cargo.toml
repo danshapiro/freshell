@@ -24,6 +24,11 @@ freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
 # The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.
 freshell-freshagent = { path = "../freshell-freshagent" }
+# DEV-0006 S4 inc.2: the codex managed-launch lifecycle manager — main.rs calls its
+# shutdown() during graceful exit (mirrors legacy's close-time codexLaunchPlanner.shutdown(),
+# server/index.ts:981-1049). real-transport is already enabled transitively via
+# freshell-freshagent; declared so main.rs can name the launch_lifecycle path.
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # Platform detection (`/proc/version` → platform string) for the SPA boot payload.
 freshell-platform = { path = "../freshell-platform" }
 # Read-only coding-CLI transcript parsers, reused to back `GET /api/session-directory`

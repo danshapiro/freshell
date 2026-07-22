@@ -406,6 +406,47 @@ async fn manager_discard_tears_down_an_unadopted_plan() {
 }
 
 #[tokio::test]
+async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans() {
+    // main.rs graceful-shutdown wiring (inc.2): `manager.shutdown()` mirrors legacy's
+    // close-time `codexLaunchPlanner.shutdown()` — the planner stops accepting plans
+    // and tears down its unadopted sidecars — PLUS the adopted (terminal-owned)
+    // launches the Rust manager keys, since server exit ends those terminals too.
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
+        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+
+    // One adopted launch + one unadopted plan.
+    let adopted = manager
+        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .await
+        .unwrap();
+    manager.adopt("term-live", adopted, 0).await.unwrap();
+    let _unadopted = manager
+        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .await
+        .unwrap();
+
+    manager.shutdown().await;
+    // Both sidecars (two FakeRuntime instances? no — one shared runtime, one
+    // shutdown call per sidecar) torn down: 2 runtime shutdowns.
+    assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 2);
+
+    // New plans are rejected with the legacy planner-shutdown message.
+    let err = manager
+        .plan_create_with_retry(&CodexLaunchPlanInput::default(), 5)
+        .await
+        .unwrap_err();
+    match err {
+        CodexLaunchError::Failed(message) => {
+            assert_eq!(message, CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE);
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn manager_exit_for_unknown_terminal_is_a_noop() {
     let runtime = FakeRuntime::start().await;
     let factory_runtime = runtime.clone();
