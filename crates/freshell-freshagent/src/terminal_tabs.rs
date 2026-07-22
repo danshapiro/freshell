@@ -34,7 +34,6 @@ use std::collections::BTreeMap;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::Router;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -131,6 +130,38 @@ fn requested_resume_session_id_for_mode(
         return Ok(None);
     }
     Ok(legacy.map(str::to_string))
+}
+
+/// The terminal modes whose sessions live in a provider-durable store the
+/// session directory can resolve (`amplifier`/`opencode`/`claude`/`gemini`/
+/// `kimi`) -- the providers for which a bare `resumeSessionId` IS sufficient
+/// canonical identity to mint `sessionRef {provider: mode, sessionId}`.
+/// Deliberately NOT `codex`: a raw codex thread id alone is not restore
+/// identity (`INVALID_RAW_CODEX_RESUME_MESSAGE` / `restore-decision.ts`), and
+/// [`requested_resume_session_id_for_mode`] rejects it before this list is
+/// ever consulted.
+fn is_session_provider_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "amplifier" | "opencode" | "claude" | "gemini" | "kimi"
+    )
+}
+
+/// Plausibility gate for synthesizing a `sessionRef` from a caller-supplied
+/// legacy `resumeSessionId` (EDEV-07): `claude` ids must be canonical session
+/// UUIDs (reuses `freshell_sessions::text::is_canonical_claude_session_id`,
+/// the SAME validator the session indexer and the frozen client's
+/// `CLAUDE_SESSION_ID_RE` enforce). The other session providers have no
+/// published id-shape contract (amplifier ids are directory names, opencode
+/// ids are `ses_*` rows, gemini/kimi are opaque), so the gate is the honest
+/// minimum: non-empty with no whitespace -- an id that couldn't possibly name
+/// a stored session is left on the legacy `resumeSessionId` path instead of
+/// being promoted to canonical identity.
+fn plausible_resume_session_id(mode: &str, id: &str) -> bool {
+    if mode == "claude" {
+        return freshell_sessions::text::is_canonical_claude_session_id(id);
+    }
+    !id.is_empty() && !id.chars().any(char::is_whitespace)
 }
 
 /// `now_ms()` (`Date.now()`) -- the locator arm/note-submit clock. Mirrors
@@ -742,15 +773,24 @@ pub(crate) async fn spawn_terminal_pane(
         "shell": shell_str.clone().unwrap_or_else(|| "system".to_string()),
         "initialCwd": cwd,
     });
-    // `paneContent` sessionRef/resumeSessionId (`router.ts:762-771`): accepted
-    // `sessionRef` wins; `resumeSessionId` only appears when there is NO
-    // accepted `sessionRef` (mutually exclusive, matching the original's
-    // `...(accepted ? {sessionRef} : {}), ...(resumeId && !accepted ? {resumeSessionId} : {})`).
+    // `paneContent` sessionRef/resumeSessionId, still mutually exclusive like
+    // `router.ts:762-771` -- but with the EDEV-07 upgrade over legacy: a legacy
+    // `resumeSessionId` for a known session provider is PROMOTED to the
+    // canonical `sessionRef {provider: mode, sessionId}` the frozen client's
+    // sidebar matcher / dedupe / persistence all key on (the legacy
+    // resumeSessionId-only shape is invisible to all three for every mode but
+    // `claude` -- see `port/oracle/DEVIATIONS.md` EDEV-07). An implausible id
+    // shape ([`plausible_resume_session_id`]) is NOT promoted and keeps the
+    // legacy resumeSessionId-only shape.
     if let Some(sref) = &accepted_session_ref {
         pane_content["sessionRef"] =
             json!({ "provider": sref.provider, "sessionId": sref.session_id });
     } else if let Some(rsid) = &resume_session_id {
-        pane_content["resumeSessionId"] = json!(rsid);
+        if is_session_provider_mode(&mode) && plausible_resume_session_id(&mode, rsid) {
+            pane_content["sessionRef"] = json!({ "provider": mode, "sessionId": rsid });
+        } else {
+            pane_content["resumeSessionId"] = json!(rsid);
+        }
     }
 
     state
@@ -840,6 +880,29 @@ async fn create_terminal_tab(
     }
     if let Some(sref) = pane_content.get("sessionRef") {
         payload["sessionRef"] = sref.clone();
+    }
+
+    // STATE-SYNC FIX 1 increment 2b invariant alarm: a `tab.create` for a
+    // session-provider mode carrying NEITHER `sessionRef` nor
+    // `resumeSessionId` is exactly the payload shape that minted every
+    // grey-sidebar pane (the frozen client has no identity key to join on
+    // until a locator association lands — and gemini/kimi have no locator at
+    // all). Legitimate for a fresh create, but worth a bounded WARN (one
+    // create per terminal) on the shared invariants target so identity loss
+    // is observable at the write path that mints it.
+    if is_session_provider_mode(&mode)
+        && payload.get("sessionRef").is_none()
+        && payload.get("resumeSessionId").is_none()
+    {
+        tracing::warn!(
+            target: "freshell_ws::invariants",
+            terminal_id = %terminal_id,
+            mode = %mode,
+            "tab_create_missing_session_identity: ui.command tab.create for a \
+             session-provider mode carries neither sessionRef nor resumeSessionId; \
+             the pane has no identity key until (and unless) a locator association \
+             resolves"
+        );
     }
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
@@ -1197,6 +1260,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::Router;
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
@@ -1964,6 +2028,189 @@ mod tests {
         let _ = std::fs::remove_file(&argv_file);
     }
 
+    // ── STATE-SYNC FIX 1 / Increment 1: REST create sessionRef synthesis ────
+    //
+    // The frozen client's sidebar matcher (`src/lib/session-utils.ts:135-139`)
+    // promotes a terminal pane's bare `resumeSessionId` to a session locator
+    // ONLY for `mode === 'claude'`, and persist-save strips `resumeSessionId`
+    // entirely — so a REST-created resume tab for any other session provider
+    // renders grey in the sidebar, duplicates on sidebar click, and loses its
+    // durable identity across server restart. The server must therefore mint
+    // the canonical `sessionRef {provider: mode, sessionId}` itself (EDEV-07,
+    // `port/oracle/DEVIATIONS.md`).
+
+    #[tokio::test]
+    async fn create_amplifier_tab_with_legacy_resume_synthesizes_session_ref() {
+        let argv_file = unique_argv_file("amplifier-synth");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "web-1737000000000-abc123"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        let expected_ref =
+            json!({ "provider": "amplifier", "sessionId": "web-1737000000000-abc123" });
+        assert_eq!(
+            msg["payload"]["paneContent"]["sessionRef"], expected_ref,
+            "paneContent must carry the synthesized sessionRef: {msg}"
+        );
+        assert!(
+            msg["payload"]["paneContent"]
+                .get("resumeSessionId")
+                .is_none(),
+            "sessionRef and resumeSessionId stay mutually exclusive: {msg}"
+        );
+        assert_eq!(
+            msg["payload"]["sessionRef"], expected_ref,
+            "the tab.create payload mirrors the synthesized sessionRef: {msg}"
+        );
+        assert!(msg["payload"].get("resumeSessionId").is_none(), "{msg}");
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_claude_tab_with_canonical_resume_id_synthesizes_session_ref() {
+        let argv_file = unique_argv_file("claude-synth");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "claude", &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "550e8400-e29b-41d4-a716-446655440000"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            msg["payload"]["paneContent"]["sessionRef"],
+            json!({ "provider": "claude", "sessionId": "550e8400-e29b-41d4-a716-446655440000" }),
+            "{msg}"
+        );
+        assert!(
+            msg["payload"]["paneContent"]
+                .get("resumeSessionId")
+                .is_none(),
+            "{msg}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_claude_tab_with_non_canonical_resume_id_does_not_synthesize() {
+        let argv_file = unique_argv_file("claude-implausible");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "claude", &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "not-a-canonical-uuid"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        // Implausible id shape (claude ids must be canonical UUIDs,
+        // `freshell_sessions::text::is_canonical_claude_session_id`) -> NO
+        // synthesis; legacy resumeSessionId-only shape is preserved.
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            msg["payload"]["paneContent"].get("sessionRef").is_none(),
+            "{msg}"
+        );
+        assert_eq!(
+            msg["payload"]["paneContent"]["resumeSessionId"],
+            json!("not-a-canonical-uuid"),
+            "{msg}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn create_amplifier_tab_with_whitespace_resume_id_does_not_synthesize() {
+        let argv_file = unique_argv_file("amplifier-implausible");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "not a plausible id"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert!(
+            msg["payload"]["paneContent"].get("sessionRef").is_none(),
+            "{msg}"
+        );
+        assert_eq!(
+            msg["payload"]["paneContent"]["resumeSessionId"],
+            json!("not a plausible id"),
+            "{msg}"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
     #[tokio::test]
     async fn send_keys_enter_feeds_amplifier_locator_and_tick_locates_session() {
         let home = unique_temp_home("amplifier-e2e");
@@ -2038,6 +2285,187 @@ mod tests {
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    // ── STATE-SYNC FIX 1 / Increment 2b: tab.create identity invariant alarm ─
+
+    mod invariant_capture {
+        //! Thread-local capturing subscriber recording TARGET + message +
+        //! fields — the `codex.rs` `tracing_capture` convention, extended
+        //! with `metadata().target()` because the invariant alarms are
+        //! target-scoped (`freshell_ws::invariants`).
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct CapturedEvent {
+            pub target: String,
+            pub message: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        target: event.metadata().target().to_string(),
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        pub fn capture() -> (
+            Arc<Mutex<Vec<CapturedEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (events, guard)
+        }
+    }
+
+    fn missing_identity_warnings(
+        events: &[invariant_capture::CapturedEvent],
+    ) -> Vec<invariant_capture::CapturedEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::invariants"
+                    && e.message.contains("tab_create_missing_session_identity")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A fresh (no resume) session-provider tab.create legitimately starts
+    /// with NO identity — but the payload carrying NEITHER `sessionRef` nor
+    /// `resumeSessionId` is exactly the shape that minted every grey-sidebar
+    /// pane, so it must WARN (bounded: one create per terminal) on the
+    /// `freshell_ws::invariants` target for observability.
+    #[tokio::test]
+    async fn create_fresh_session_provider_tab_without_identity_warns_invariant() {
+        let (events, _guard) = invariant_capture::capture();
+        let argv_file = unique_argv_file("gemini-invariant");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "gemini", &argv_file,
+            )]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "gemini", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let warnings = missing_identity_warnings(&events.lock().unwrap());
+        assert_eq!(
+            warnings.len(),
+            1,
+            "a fresh session-provider tab.create with no identity keys must warn once"
+        );
+        assert_eq!(
+            warnings[0].fields.get("mode").map(String::as_str),
+            Some("gemini")
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// The alarm must stay QUIET when the payload carries identity (a resume
+    /// create, whose sessionRef increment 1 synthesizes) and for shell tabs
+    /// (never session-identified by design).
+    #[tokio::test]
+    async fn create_tab_with_identity_or_shell_mode_does_not_warn_invariant() {
+        let (events, _guard) = invariant_capture::capture();
+        let argv_file = unique_argv_file("amplifier-no-warn");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "amplifier",
+                &argv_file,
+            )]));
+        let tmp = std::env::temp_dir();
+        let router = app(state.clone());
+
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "resumeSessionId": "sess-no-warn-1"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let resumed_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shell_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        assert!(
+            missing_identity_warnings(&events.lock().unwrap()).is_empty(),
+            "identity-carrying and shell tab.creates must not trip the alarm"
+        );
+
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&resumed_id);
+        registry.kill(&shell_id);
         let _ = std::fs::remove_file(&argv_file);
     }
 

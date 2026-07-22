@@ -50,8 +50,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
-    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, TerminalAttachReady,
-    TerminalExit, TerminalOutput, TerminalRunStatus,
+    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
+    TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -258,6 +258,24 @@ impl TerminalShared {
             session_ref: None,
         }
     }
+}
+
+/// One terminal's row for the identity-invariant sweep
+/// ([`TerminalRegistry::identity_probe_rows`]): the identity-relevant fields
+/// only — deliberately NO scrollback snapshot (unlike [`DirectoryEntry`]), so
+/// a periodic sweep stays cheap.
+#[derive(Debug, Clone)]
+pub struct IdentityProbeRow {
+    pub terminal_id: String,
+    pub mode: String,
+    pub status: TerminalRunStatus,
+    pub created_at: i64,
+    /// The registry-side resume/session id (create-time resume OR a locator
+    /// association written back via `set_meta`) — a terminal with this set is
+    /// identity-resolved even if the caller's identity registry has no entry
+    /// (e.g. REST-created resumes, whose creates can't reach the WS-owned
+    /// identity registry across the crate boundary).
+    pub resume_session_id: Option<String>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -566,6 +584,21 @@ impl TerminalRegistry {
     ///
     /// Re-attaching the same `conn_id` REPLACES its subscription (new `attachRequestId`,
     /// re-replay) — the reconnect / viewport-hydrate path.
+    ///
+    /// `session_ref` is the terminal's canonical session identity, resolved by
+    /// the CALLER (the WS handler owns the identity registry — this crate is
+    /// deliberately identity-agnostic) and stamped verbatim onto the
+    /// `terminal.attach.ready` frame (STATE-SYNC FIX 1 increment 2a: the frozen
+    /// client folds `attach.ready.sessionRef` into pane identity via
+    /// `reconcileTerminalSessionAssociation`, a repair channel that was dead
+    /// while this frame hardcoded `None`).
+    ///
+    /// 8 arguments (`clippy::too_many_arguments`): every one is a distinct,
+    /// non-optional attach input with exactly one call site outside tests
+    /// (`freshell_ws::terminal::handle_attach`, which forwards the parsed
+    /// `terminal.attach` frame fields 1:1) — a params struct would just
+    /// restate the wire message this crate deliberately doesn't own.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
         terminal_id: &str,
@@ -574,6 +607,7 @@ impl TerminalRegistry {
         attach_request_id: Option<String>,
         since_seq: i64,
         terminal_output_batch_v1: bool,
+        session_ref: Option<SessionLocator>,
     ) -> AttachOutcome {
         // Take the terminal's shared Arc under the registry lock, then drop the
         // registry lock so we hold ONLY the per-terminal lock during the handoff.
@@ -628,7 +662,7 @@ impl TerminalRegistry {
             geometry_epoch: Some(s.geometry_epoch),
             replay_reset_reason: None,
             requested_since_seq: Some(since_seq),
-            session_ref: None,
+            session_ref,
         });
         sink(ready);
 
@@ -919,6 +953,35 @@ impl TerminalRegistry {
                 .then_with(|| a.terminal_id.cmp(&b.terminal_id))
         });
         out
+    }
+
+    /// Lightweight identity-probe rows for the STATE-SYNC invariant sweep
+    /// (`freshell_ws::invariants`): terminal id, mode, run status, creation
+    /// time, and the registry-side resume id — WITHOUT the reassembled
+    /// scrollback snapshot [`Self::directory`] pays for, so a periodic sweep
+    /// can call this every tick.
+    pub fn identity_probe_rows(&self) -> Vec<IdentityProbeRow> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        shareds
+            .iter()
+            .map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                IdentityProbeRow {
+                    terminal_id: s.terminal_id.clone(),
+                    mode: s.mode.clone(),
+                    status: s.status,
+                    created_at: s.created_at,
+                    resume_session_id: s.resume_session_id.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Set a terminal's directory metadata (title/description/mode/resumeSessionId) —
@@ -1492,7 +1555,7 @@ mod tests {
 
         // (a) legacy subscriber (no capability) — must get `terminal.output` only.
         let (legacy_sink, legacy_seen) = collector();
-        reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false);
+        reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false, None);
         let legacy = outputs(&legacy_seen);
         assert!(
             !legacy.is_empty(),
@@ -1515,7 +1578,7 @@ mod tests {
         // `terminal.output.batch`, reassembling to the SAME bytes, with UTF-16
         // endOffsets and a self-consistent serializedBytes.
         let (batch_sink, batch_seen) = collector();
-        reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true);
+        reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true, None);
         let bs = batches(&batch_seen);
         assert!(
             !bs.is_empty(),
@@ -1562,7 +1625,7 @@ mod tests {
         reg.feed("T", frame(1, "a\u{1F600}b\r\n", "S")); // a😀b␍␊
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("m".into()), 0, true);
+        reg.attach("T", 1, sink, Some("m".into()), 0, true, None);
         let bs = batches(&seen);
         assert_eq!(bs.len(), 1);
         let b = &bs[0];
@@ -1583,7 +1646,7 @@ mod tests {
         reg.feed("T", frame(3, "three\r\n", "S"));
 
         let (sink, seen) = collector();
-        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0, false);
+        let out = reg.attach("T", 1, sink, Some("att-1".into()), 0, false, None);
         assert!(out.found);
 
         // attach.ready first, then the 3 replayed frames.
@@ -1615,7 +1678,7 @@ mod tests {
         reg.insert_headless("T", "S");
 
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
 
@@ -1631,7 +1694,7 @@ mod tests {
 
         // A fresh attach replays the FULL scrollback (both frames).
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 2, sink_b, Some("b".into()), 0, false);
+        reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None);
         let replayed = outputs(&seen_b);
         assert_eq!(
             replayed.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
@@ -1646,9 +1709,9 @@ mod tests {
 
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false);
+        reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false, None);
         // Second attach: geometry authority flips to multi_client_unknown.
-        reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false);
+        reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false, None);
         let ready_b = attach_ready(&seen_b).unwrap();
         assert_eq!(
             ready_b.geometry_authority,
@@ -1672,7 +1735,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
         }
@@ -1682,7 +1745,7 @@ mod tests {
         // with sinceSeq=3. Only frames 4 and 5 are replayed (seqStart > 3).
         reg.detach("T", 1);
         let (sink_r, seen_r) = collector();
-        reg.attach("T", 2, sink_r, Some("a2".into()), 3, false);
+        reg.attach("T", 2, sink_r, Some("a2".into()), 3, false, None);
         let ready = attach_ready(&seen_r).unwrap();
         assert_eq!(ready.effective_since_seq, Some(3));
         assert_eq!(ready.replay_from_seq, 4);
@@ -1701,7 +1764,7 @@ mod tests {
         reg.feed("T", frame(1, "old\r\n", "S"));
 
         let (sink, seen) = collector();
-        reg.attach("T", 7, sink, Some("z".into()), 0, false);
+        reg.attach("T", 7, sink, Some("z".into()), 0, false, None);
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
 
@@ -1723,7 +1786,7 @@ mod tests {
     fn attach_to_unknown_terminal_reports_not_found() {
         let reg = TerminalRegistry::new();
         let (sink, seen) = collector();
-        let out = reg.attach("nope", 1, sink, None, 0, false);
+        let out = reg.attach("nope", 1, sink, None, 0, false, None);
         assert!(!out.found);
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -1734,7 +1797,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let rev_before = reg.revision();
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
 
         assert!(reg.kill("T"));
         assert!(!reg.is_running("T"), "killed terminal is removed");
@@ -1762,8 +1825,8 @@ mod tests {
         reg.insert_headless("T-b", "S2");
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        reg.attach("T-a", 1, sink_a, None, 0, false);
-        reg.attach("T-b", 2, sink_b, None, 0, false);
+        reg.attach("T-a", 1, sink_a, None, 0, false, None);
+        reg.attach("T-b", 2, sink_b, None, 0, false, None);
         let rev_before = reg.revision();
 
         let killed = reg.kill_all();
@@ -1979,7 +2042,7 @@ mod tests {
         assert!(!dir[0].has_clients);
 
         let (sink, _seen) = collector();
-        reg.attach("T", 9, sink, Some("a".into()), 0, false);
+        reg.attach("T", 9, sink, Some("a".into()), 0, false, None);
         assert!(reg.directory()[0].has_clients);
         reg.detach("T", 9);
         assert!(!reg.directory()[0].has_clients);
@@ -1992,13 +2055,13 @@ mod tests {
         let (sink, seen) = collector();
         // default 120x30, epoch 1.
         reg.resize("T", 120, 30); // unchanged -> no epoch bump
-        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         assert_eq!(attach_ready(&seen).unwrap().geometry_epoch, Some(1));
 
         // A real change bumps the epoch (observed on the next attach.ready).
         reg.resize("T", 100, 40);
         let (sink2, seen2) = collector();
-        reg.attach("T", 2, sink2, Some("b".into()), 0, false);
+        reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
         assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
     }
 
@@ -2009,8 +2072,8 @@ mod tests {
         reg.insert_headless("T2", "S2");
         let (sink1, seen1) = collector();
         let (sink2, seen2) = collector();
-        reg.attach("T1", 42, sink1, Some("a".into()), 0, false);
-        reg.attach("T2", 42, sink2, Some("a".into()), 0, false);
+        reg.attach("T1", 42, sink1, Some("a".into()), 0, false, None);
+        reg.attach("T2", 42, sink2, Some("a".into()), 0, false, None);
 
         reg.remove_connection(42);
         // Both terminals survive; the swept connection receives no further output.
@@ -2036,7 +2099,7 @@ mod tests {
         assert!(reg.finish_pty_exit("T", 7));
 
         let (sink, seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         assert!(outcome.found);
 
         let exit = seen.lock().unwrap().iter().find_map(|m| match m {
@@ -2098,7 +2161,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
         // Far past any threshold, but a client is attached -- legacy:
@@ -2192,7 +2255,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S")); // another 10 bytes -> over cap
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         let replayed = outputs(&seen);
         // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
         // must have been evicted once the second pushed bytes over the cap.
@@ -2210,7 +2273,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S"));
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false);
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         let replayed = outputs(&seen);
         assert_eq!(
             replayed.len(),
@@ -2242,7 +2305,7 @@ mod tests {
         reg_ascii.feed("A", frame(1, "abcdef", "S")); // 6 chars, 6 bytes
         reg_ascii.feed("A", frame(2, "ghijkl", "S")); // 6 chars, 6 bytes -> 12 total, at cap
         let (sink_a, seen_a) = collector();
-        reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false);
+        reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false, None);
         let ascii_chars: usize = outputs(&seen_a)
             .iter()
             .map(|f| f.data.chars().count())
@@ -2261,7 +2324,7 @@ mod tests {
             frame(2, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", "S"),
         );
         let (sink_b, seen_b) = collector();
-        reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false);
+        reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false, None);
         let box_chars: usize = outputs(&seen_b)
             .iter()
             .map(|f| f.data.chars().count())
@@ -2295,7 +2358,7 @@ mod tests {
         }
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("r".into()), 0, false);
+        reg.attach("T", 1, sink, Some("r".into()), 0, false, None);
         let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
         assert!(
             retained_chars as i64 <= cap,

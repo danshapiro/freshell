@@ -23,6 +23,7 @@
 pub mod amplifier_association;
 pub mod backpressure;
 pub mod identity;
+pub(crate) mod invariants;
 pub mod opencode_association;
 pub mod origin;
 pub mod screenshot;
@@ -341,9 +342,23 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
     if let Some(config_fallback) = state.config_fallback.clone() {
         messages.push(ServerMessage::ConfigFallback(config_fallback));
     }
+    // STATE-SYNC FIX 1 increment 2a: stamp each inventory row with the
+    // canonical identity from the shared registry (create-time resume ids AND
+    // locator-associated ids both live there) -- the frozen client's
+    // reconnect reconcile loop (`src/App.tsx:976-985`) keys off this field
+    // and was dead code against this port while the rows hardcoded `None`
+    // (`crates/freshell-terminal/src/registry.rs` `inventory()`;
+    // `docs/plans/2026-07-19-state-sync-cartography.md` §1.4). Shell
+    // terminals have no identity entry and stay unstamped.
+    let mut terminals = state.registry.inventory();
+    for terminal in &mut terminals {
+        if terminal.session_ref.is_none() {
+            terminal.session_ref = state.identity.session_ref_for(&terminal.terminal_id);
+        }
+    }
     messages.push(ServerMessage::TerminalInventory(TerminalInventory {
         boot_id,
-        terminals: state.registry.inventory(),
+        terminals,
         terminal_meta: Vec::new(),
     }));
     messages

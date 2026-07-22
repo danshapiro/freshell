@@ -1066,34 +1066,26 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
     // `terminal.meta.updated` create-time slice after the create frame is sent.
     let terminal_id_for_meta = terminal_id.clone();
 
-    let created = ServerMessage::TerminalCreated(TerminalCreated {
-        created_at: now_ms(),
-        request_id: create.request_id,
-        terminal_id,
-        clear_codex_durability: None,
-        // Echo the resolved cwd (`record.cwd`) when the shell spec carries one.
-        cwd: spec.cwd.clone(),
-        restore_error: None,
-        session_ref: None,
-    });
-    let sent = send(ws_tx, &created).await;
-    // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
-    // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
-    // exists this is unconditional. Live-pinned frame order (exit-orig.json):
-    // `terminal.created` then `terminals.changed`.
-    broadcast_terminals_changed(state);
     // DEV-0008 (`port/oracle/DEVIATIONS.md`) create-time slice: when this create
-    // established a session identity, push `terminal.meta.updated` so the SPA's
-    // pane header (`formatPaneRuntimeLabel`, `PaneContainer.tsx`) has cwd/provider/
+    // established a session identity, seed the shared identity registry and (after
+    // the create frame below) push `terminal.meta.updated` so the SPA's pane
+    // header (`formatPaneRuntimeLabel`, `PaneContainer.tsx`) has cwd/provider/
     // sessionId to key off of instead of showing nothing. See
     // `terminal_meta_record_for_create` for exactly what's (and isn't) ported.
-    if let Some(record) = terminal_meta_record_for_create(
+    // Computed BEFORE the `terminal.created` frame (STATE-SYNC FIX 1 increment
+    // 2a) so the frame itself can carry the canonical `sessionRef` -- the frozen
+    // client folds `terminal.created.sessionRef` into pane identity
+    // (`src/App.tsx:946-959` -> `reconcileTerminalSessionAssociation`), a repair
+    // channel that was dead against this port while the frame hardcoded `None`
+    // (`docs/plans/2026-07-19-state-sync-cartography.md` §1.4).
+    let create_meta_record = terminal_meta_record_for_create(
         &terminal_id_for_meta,
         &mode,
         resume_session_id.as_deref(),
         spec.cwd.as_deref(),
         now_ms(),
-    ) {
+    );
+    if let Some(record) = &create_meta_record {
         // Fix Spec: Session Naming Cluster (SYMPTOM 2/1) -- populate the shared
         // identity registry alongside the broadcast, the SAME fields, so the
         // `freshell-server` rename cascades (`terminals.rs`/`sessions.rs`) and the
@@ -1106,6 +1098,27 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             record.cwd.as_deref(),
             record.updated_at,
         );
+    }
+
+    let created = ServerMessage::TerminalCreated(TerminalCreated {
+        created_at: now_ms(),
+        request_id: create.request_id,
+        terminal_id,
+        clear_codex_durability: None,
+        // Echo the resolved cwd (`record.cwd`) when the shell spec carries one.
+        cwd: spec.cwd.clone(),
+        restore_error: None,
+        // The canonical create-time identity, from the SAME registry every other
+        // identity-stamped frame reads (shell creates have no entry -> `None`).
+        session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+    });
+    let sent = send(ws_tx, &created).await;
+    // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
+    // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
+    // exists this is unconditional. Live-pinned frame order (exit-orig.json):
+    // `terminal.created` then `terminals.changed`.
+    broadcast_terminals_changed(state);
+    if let Some(record) = create_meta_record {
         broadcast_terminal_meta_created(state, record);
     }
     sent
@@ -1413,6 +1426,11 @@ fn handle_attach(
         attach.attach_request_id.clone(),
         attach.since_seq.unwrap_or(0),
         terminal_output_batch_v1,
+        // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
+        // `attach.ready` from the shared identity registry (create-time
+        // resume ids AND locator-associated ids both live there); the
+        // registry crate is identity-agnostic, so it's resolved here.
+        state.identity.session_ref_for(&attach.terminal_id),
     );
 }
 

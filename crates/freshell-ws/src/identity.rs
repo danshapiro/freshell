@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use freshell_protocol::SessionLocator;
+
 /// One terminal's coding-CLI session identity, as known to this port. A faithful
 /// subset of `TerminalMeta` (`terminal-metadata-service.ts:19-31`): only the fields
 /// the rename cascades and the session-directory join actually consume.
@@ -129,6 +131,28 @@ impl TerminalIdentityRegistry {
             .collect()
     }
 
+    /// The canonical wire `sessionRef` for a terminal, when (and only when)
+    /// its identity is FULLY resolved -- both `provider` and `session_id`
+    /// present. This is the single derivation every identity-stamped frame
+    /// (`terminal.created` / `terminal.inventory` / `terminal.attach.ready`)
+    /// uses, closing the dead-repair-channel gap the state-sync cartography
+    /// mapped (`docs/plans/2026-07-19-state-sync-cartography.md` §1.4):
+    /// shell terminals never get an entry here (create-time seeding skips
+    /// them), so they are never stamped. Deliberately uses [`Self::get`]
+    /// (retired entries INCLUDED): an exited terminal listed in the
+    /// inventory keeps its durable identity, exactly like the rename
+    /// cascade's post-exit lookup.
+    pub fn session_ref_for(&self, terminal_id: &str) -> Option<SessionLocator> {
+        let entry = self.get(terminal_id)?;
+        match (entry.provider, entry.session_id) {
+            (Some(provider), Some(session_id)) => Some(SessionLocator {
+                provider,
+                session_id,
+            }),
+            _ => None,
+        }
+    }
+
     /// `findTerminalForSession` (`rename-cascade.ts:9-17`) over the LIVE set
     /// (`.list()`, matching the reverse cascade's `deps.terminalMetadata.list()`
     /// input, `sessions-router.ts:149`): the terminal, if any, currently running
@@ -210,6 +234,37 @@ mod tests {
         reg.upsert("t1", Some("claude"), Some("s1"), None, 1);
         assert!(reg.find_by_session("codex", "s1").is_none());
         assert!(reg.find_by_session("claude", "other").is_none());
+    }
+
+    #[test]
+    fn session_ref_for_requires_both_provider_and_session_id() {
+        let reg = TerminalIdentityRegistry::new();
+        assert!(reg.session_ref_for("unknown").is_none());
+
+        reg.upsert("partial", Some("amplifier"), None, None, 1);
+        assert!(reg.session_ref_for("partial").is_none());
+
+        reg.upsert("full", Some("amplifier"), Some("sess-1"), None, 2);
+        assert_eq!(
+            reg.session_ref_for("full"),
+            Some(SessionLocator {
+                provider: "amplifier".to_string(),
+                session_id: "sess-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_ref_for_survives_retirement() {
+        // An exited terminal keeps its durable identity on frames that still
+        // list it (inventory rows with status 'exited').
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("t1", Some("claude"), Some("sess-9"), None, 1);
+        reg.retire("t1");
+        assert_eq!(
+            reg.session_ref_for("t1").map(|r| r.session_id),
+            Some("sess-9".to_string())
+        );
     }
 
     #[test]

@@ -207,9 +207,20 @@ fn broadcast_terminal_session_associated(
 pub fn spawn_amplifier_locator_sweep(state: WsState, interval: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // STATE-SYNC FIX 1 increment 2b: the identity invariant alarm rides
+        // this same sweep cadence (the sweep is spawned whenever the
+        // amplifier locator exists, `freshell-server/src/main.rs`), with a
+        // sweep-lifetime once-per-terminal bound.
+        let mut identity_warned = std::collections::HashSet::new();
         loop {
             ticker.tick().await;
             drain_and_associate(&state).await;
+            crate::invariants::warn_unresolved_terminal_identities(
+                &state.registry.identity_probe_rows(),
+                &state.identity,
+                &mut identity_warned,
+                now_ms(),
+            );
         }
     });
 }

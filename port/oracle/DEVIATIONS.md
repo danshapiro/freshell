@@ -812,6 +812,45 @@ proves the pre-existing gap, and the rust leg proves the improvement.
 - user_impact: On the Rust server, configuring an all-whitespace auth token fails fast at
   startup instead of booting with a secret that can't realistically be typed/used.
 
+### EDEV-07 — REST tab create SYNTHESIZES canonical `sessionRef` from a legacy `resumeSessionId` (state-sync hardening)
+- what_differs: `POST /api/tabs` (and `POST /api/panes/:id/split`, which shares
+  `spawn_terminal_pane`) with `{mode: <session provider>, resumeSessionId}` and no
+  `sessionRef` now mints `sessionRef {provider: mode, sessionId: resumeSessionId}` into
+  the pane content and the broadcast `ui.command{tab.create}` payload
+  (`crates/freshell-freshagent/src/terminal_tabs.rs`, `spawn_terminal_pane`'s
+  paneContent build). Legacy (`server/agent-api/router.ts:762-771`) keeps the two keys
+  mutually exclusive and forwards the bare `resumeSessionId` untouched — the port
+  previously froze that behavior verbatim. Session providers: `amplifier`/`opencode`/
+  `claude`/`gemini`/`kimi`; NOT `codex` (a raw codex resume stays rejected with the
+  legacy-exact `INVALID_RAW_CODEX_RESUME_MESSAGE`). Synthesis is gated on a plausible id
+  shape: `claude` requires a canonical session UUID
+  (`freshell_sessions::text::is_canonical_claude_session_id`, the same validator the
+  indexer and the frozen client's `CLAUDE_SESSION_ID_RE` enforce); the other providers
+  (no published id-shape contract) require non-empty/no-whitespace. An implausible id
+  falls back to the legacy resumeSessionId-only shape.
+- why_intentional: Rust is the better side — the legacy shape is the root cause of the
+  2026-07-19 "sidebar grey for REST tabs" incident
+  (`docs/plans/2026-07-19-state-sync-cartography.md` Part 1): the frozen client's
+  sidebar open-state matcher promotes a terminal pane's bare `resumeSessionId` only for
+  `mode === 'claude'` (`src/lib/session-utils.ts:135-139`), tab dedupe keys on the same
+  extraction (duplicate tabs on sidebar click), and persist-save strips
+  `resumeSessionId` outright (`src/store/persistMiddleware.ts:245-264`) so the pane's
+  only durable key never reaches disk (no restore after server restart + refresh).
+  Minting the canonical key server-side closes all three with ZERO client changes — the
+  cartography's fix direction (a), the authoritative-home fix.
+- evidence: RED-first unit coverage in `crates/freshell-freshagent/src/terminal_tabs.rs`
+  (`create_amplifier_tab_with_legacy_resume_synthesizes_session_ref`,
+  `create_claude_tab_with_canonical_resume_id_synthesizes_session_ref`,
+  `create_claude_tab_with_non_canonical_resume_id_does_not_synthesize`,
+  `create_amplifier_tab_with_whitespace_resume_id_does_not_synthesize`, plus the
+  pre-existing codex raw-resume rejection pin
+  `create_codex_tab_rejects_raw_resume_session_id_without_session_ref`). Legacy shape:
+  `server/agent-api/router.ts:762-771`; client blind spot: `src/lib/session-utils.ts:135-139`.
+- user_impact: A remotely-created resume tab (REST/MCP `new-tab` with a session id) for
+  amplifier/opencode/gemini/kimi now shows as OPEN in the sidebar, dedupes on sidebar
+  click instead of opening a duplicate, and survives a server restart + browser refresh
+  with its session identity intact.
+
 <!--
 Template:
 
