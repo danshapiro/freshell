@@ -146,6 +146,11 @@ export default defineConfig({
         // documented for `amplifier-restore-rust.spec.ts` above, so this is
         // an absent legacy feature on this branch, not a parity gap.
         /rest-tab-persistence\.spec\.ts$/,
+        // REMOTE-TAB-LINKAGE (STATE-SYNC FIX 1 e2e proof, rust commit
+        // 80772ff2): sidebar open-state + dedupe + restart durability for a
+        // REST-created amplifier resume tab. Rust-only: same amplifier
+        // KNOWN DIVERGENCE as amplifier-restore-rust.spec.ts above.
+        /remote-tab-linkage-rust\.spec\.ts$/,
         // DIAG-03 — secret redaction + log rotation (small-limit, concurrent
         // writers, final shutdown flush). Rust-only: env-var-configurable
         // rotation limits are a deliberate Rust-only hardening feature; the
