@@ -48,6 +48,8 @@ pub mod remote_proxy_envelope;
 pub mod remote_proxy_side_effects;
 
 #[cfg(feature = "real-transport")]
+pub mod launch_lifecycle;
+#[cfg(feature = "real-transport")]
 pub mod remote_proxy;
 #[cfg(feature = "real-transport")]
 pub mod transport;

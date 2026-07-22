@@ -1410,6 +1410,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",
  "freshell-platform",

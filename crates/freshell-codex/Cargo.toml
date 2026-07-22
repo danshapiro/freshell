@@ -31,7 +31,7 @@ publish.workspace = true
 # feature (verified to compile; wired live in the next step). Default-off keeps the shared
 # workspace build lean.
 default = []
-real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util"]
+real-transport = ["dep:tokio-tungstenite", "dep:futures-util", "dep:libc", "tokio/net", "tokio/io-util", "tokio/process"]
 
 [dependencies]
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` params/result model

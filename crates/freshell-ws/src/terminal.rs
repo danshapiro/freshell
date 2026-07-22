@@ -720,6 +720,14 @@ fn home_dir() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// DEV-0006 S4 gate (council fence: FLAG-GATED, default OFF): a codex terminal.create
+/// plans a managed app-server launch ONLY when the mode is codex AND the
+/// `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"1"`. Flag OFF keeps the shipped
+/// plain-CLI codex argv byte-identical (golden G-X0 stays the live-path shape).
+fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> bool {
+    mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
@@ -839,11 +847,60 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         None
     };
 
-    // codex `--remote <wsUrl>`: the Rust codex app-server launch planner is NOT
-    // wired into terminal.create yet, so codex TUI panes launch WITHOUT the
-    // `--remote ... -c features.apps=false` pair — a real behavioral divergence
-    // tracked as DEVIATIONS.md DEV-0006 (spec §5 U2), NOT silently shipped.
-    let codex_remote_ws_url: Option<String> = None;
+    // codex `--remote <wsUrl>` (DEV-0006 S4, FLAG-GATED default OFF — council fence):
+    // with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch
+    // (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
+    // initial budget) and point the TUI at the PROXY's ws URL; the codex provider
+    // settings route through the PLAN, not argv (the `ws:2464-2465` strip above).
+    // Flag OFF: today's plain-CLI launch, byte-identical to the shipped deviation
+    // shape (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+    let managed_flag =
+        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    let codex_launch = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+        let codex_provider = state.settings.coding_cli.providers.get("codex");
+        let provider_str = |key: &str| {
+            codex_provider
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let plan_model = provider_str("model");
+        let plan_sandbox = provider_str("sandbox");
+        // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
+        let plan_approval = provider_str("permissionMode");
+        let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
+            // Legacy plans with the RAW create cwd (`ws:2444` passes `m.cwd`).
+            cwd: create.cwd.as_deref(),
+            resume_session_id: resume_session_id.as_deref(),
+            model: plan_model.as_deref(),
+            sandbox: plan_sandbox.as_deref(),
+            approval_policy: plan_approval.as_deref(),
+        };
+        match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .plan_create_with_retry(
+                &input,
+                freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+            )
+            .await
+        {
+            Ok(launch) => Some(launch),
+            Err(message) => {
+                // A thrown planCodexLaunch surfaces through the generic create catch
+                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::PtySpawnFailed,
+                    message,
+                    &create.request_id,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+    let codex_remote_ws_url: Option<String> =
+        codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
 
     // ProviderTarget + host-native mcp cwd (`tr:911-914,1153,1203,1236,1262`).
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
@@ -988,6 +1045,11 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
+            // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
+            // (no-op for terminals without a managed launch). Sync-safe: hands the
+            // handle to the manager's async teardown worker.
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .notify_terminal_exit(&tid);
             identity.retire(&tid);
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
@@ -1009,6 +1071,13 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         // Failed-spawn parity (`tr:1601-1610`): clean up MCP side-effects with the
         // mcpCwd (NOT procCwd), then surface `wrapTerminalSpawnError`'s message as
         // an `error{code:PTY_SPAWN_FAILED}` frame.
+        // DEV-0006 S4: a planned-but-unadopted codex launch dies with the failed
+        // create (the `pendingCodexPlan` cleanup path) — sidecar + proxy torn down.
+        if let Some(launch) = codex_launch {
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .discard(launch)
+                .await;
+        }
         cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
         let label = mode_label(&mode, cli.as_ref());
         let env_var = state
@@ -1030,6 +1099,28 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             &create.request_id,
         )
         .await;
+    }
+
+    // DEV-0006 S4: adopt the managed codex launch for this terminal
+    // (`codexPlan.sidecar.adopt({terminalId, generation: 0})`, `ws:2511`) — ownership
+    // transfers from the planner to the terminal; the PTY exit hook above tears it
+    // down. Adoption only fails when the planner/sidecar is already shutting down
+    // (server exit); legacy's thrown adopt fails the create, so kill the just-spawned
+    // pty and surface the error.
+    if let Some(launch) = codex_launch {
+        if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .adopt(&terminal_id, launch, 0)
+            .await
+        {
+            state.registry.kill(&terminal_id);
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                message,
+                &create.request_id,
+            )
+            .await;
+        }
     }
 
     // Directory metadata (`tr:1614` getModeLabel title + the CLI resume session id).
@@ -1784,6 +1875,20 @@ mod cli_create_helper_tests {
         assert_eq!(js_number_string(" 17872 "), "17872");
         assert_eq!(js_number_string("abc"), "NaN");
         assert_eq!(js_number_string(" "), "0");
+    }
+
+    /// DEV-0006 S4 council fence: managed codex launch is FLAG-GATED, default OFF.
+    /// OFF keeps today's plain-CLI codex behavior byte-identical (golden G-X0 stays
+    /// the live-path shape); only mode=codex + flag exactly "1" plans a launch.
+    #[test]
+    fn codex_managed_launch_gate_is_mode_and_flag_scoped() {
+        assert!(codex_create_uses_managed_launch("codex", Some("1")));
+        assert!(!codex_create_uses_managed_launch("codex", None));
+        assert!(!codex_create_uses_managed_launch("codex", Some("0")));
+        assert!(!codex_create_uses_managed_launch("codex", Some("")));
+        assert!(!codex_create_uses_managed_launch("shell", Some("1")));
+        assert!(!codex_create_uses_managed_launch("claude", Some("1")));
+        assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
     }
 
     #[test]

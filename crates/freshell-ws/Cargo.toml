@@ -56,6 +56,11 @@ uuid = { version = "1", features = ["v4"] }
 # (freshell-opencode/src/transport.rs). real-transport is already enabled
 # transitively via freshell-freshagent.
 freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# DEV-0006 S4: the codex managed-launch lifecycle (launch planner + app-server sidecar +
+# remote proxy) the FLAG-GATED terminal.create codex branch wires through. real-transport
+# is already enabled transitively via freshell-freshagent; declared here so this crate can
+# name the launch_lifecycle/launch_plan paths.
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # DIAG-01 lifecycle events (connection established/closed, hello rejected,
 # keepalive termination): flow to the global `tracing` subscriber
 # `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --

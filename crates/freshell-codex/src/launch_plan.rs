@@ -54,6 +54,21 @@ pub const CODEX_REMOTE_INVALID_URL_MESSAGE: &str =
 pub const CODEX_REMOTE_NON_LOOPBACK_MESSAGE: &str =
     "Codex launch requires a loopback app-server websocket URL.";
 
+// ─── S4 flag gate (council fence) ────────────────────────────────────────────────────────────────
+
+/// The env var that opts a server process into DEV-0006 S4's managed codex terminal
+/// launches. Council fence: S4's wiring is FLAG-GATED, default OFF — legacy's proxy path
+/// exists to feed durability binding (S5), so the launch mechanism ships dark until S5's
+/// consumers land; S5 + the flag-default flip land together.
+pub const FRESHELL_CODEX_MANAGED_LAUNCH_ENV: &str = "FRESHELL_CODEX_MANAGED_LAUNCH";
+
+/// Whether the managed-launch flag value enables the S4 wiring. Only the exact string
+/// `"1"` enables; unset/anything else keeps today's plain-CLI codex behavior
+/// byte-identical (golden G-X0 stays the live shape while OFF).
+pub fn codex_managed_launch_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 // ─── CodexLaunchConfigError (codex-launch-config.ts:5-10) ───────────────────────────────
 
 /// `CodexLaunchConfigError` — a NON-RETRYABLE launch-configuration error. The retry
@@ -1163,6 +1178,30 @@ mod tests {
         assert_eq!(
             plan_codex_launch_retry(3, 5, u64::MAX, false),
             CodexLaunchRetryDecision::Retry { delay_ms: u64::MAX }
+        );
+    }
+
+    // ── S4 flag gate (council fence: managed launch is FLAG-GATED, default OFF) ──
+
+    #[test]
+    fn managed_launch_flag_defaults_off() {
+        // Unset env → OFF: today's plain-CLI codex behavior stays byte-identical.
+        assert!(!codex_managed_launch_enabled(None));
+    }
+
+    #[test]
+    fn managed_launch_flag_enables_only_on_exactly_1() {
+        assert!(codex_managed_launch_enabled(Some("1")));
+        for value in ["", "0", "true", "yes", "on", " 1", "1 ", "2"] {
+            assert!(!codex_managed_launch_enabled(Some(value)), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn managed_launch_env_name_is_pinned() {
+        assert_eq!(
+            FRESHELL_CODEX_MANAGED_LAUNCH_ENV,
+            "FRESHELL_CODEX_MANAGED_LAUNCH"
         );
     }
 

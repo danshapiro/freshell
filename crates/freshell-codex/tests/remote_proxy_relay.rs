@@ -130,9 +130,9 @@ impl FakeUpstreamConn {
 
 // ── small helpers ────────────────────────────────────────────────────────────────────
 
-async fn connect_tui(ws_url: &str) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+async fn connect_tui(
+    ws_url: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let (ws, _) = timeout(RECV_TIMEOUT, connect_async(ws_url))
         .await
         .expect("TUI: timed out connecting to the proxy")
@@ -177,12 +177,14 @@ fn huge_string(bytes: usize) -> String {
 #[tokio::test]
 async fn relays_a_small_non_stateful_request_and_response_byte_identical_both_ways() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .expect("proxy should start");
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .expect("proxy should start");
 
     let mut tui = connect_tui(proxy.ws_url()).await;
-    let request = json!({"jsonrpc":"2.0","id":1,"method":"foo/bar","params":{"hello":"world"}}).to_string();
+    let request =
+        json!({"jsonrpc":"2.0","id":1,"method":"foo/bar","params":{"hello":"world"}}).to_string();
     tui.send(Message::Text(request.clone())).await.unwrap();
 
     let mut conn = upstream.accept().await;
@@ -203,9 +205,10 @@ async fn relays_frames_larger_than_max_full_parse_bytes_raw_forward_passthrough(
     // (not full-JSON.parse) path for a non-stateful method, asserting bytes are still
     // relayed unchanged (only stateful methods get their contents inspected/rewritten).
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
 
     let big_payload = huge_string(2 * 1024 * 1024);
@@ -222,9 +225,10 @@ async fn relays_frames_larger_than_max_full_parse_bytes_raw_forward_passthrough(
 #[tokio::test]
 async fn frames_are_relayed_in_order_in_both_directions() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
@@ -235,7 +239,11 @@ async fn frames_are_relayed_in_order_in_both_directions() {
     for i in 0..20 {
         let forwarded = conn.recv_text().await;
         let parsed: Value = serde_json::from_str(&forwarded).unwrap();
-        assert_eq!(parsed["id"], json!(i), "client->upstream ordering must be preserved");
+        assert_eq!(
+            parsed["id"],
+            json!(i),
+            "client->upstream ordering must be preserved"
+        );
     }
 
     for i in 0..20 {
@@ -244,7 +252,11 @@ async fn frames_are_relayed_in_order_in_both_directions() {
     for i in 0..20 {
         let received = recv_text(&mut tui).await;
         let parsed: Value = serde_json::from_str(&received).unwrap();
-        assert_eq!(parsed["id"], json!(i), "upstream->client ordering must be preserved");
+        assert_eq!(
+            parsed["id"],
+            json!(i),
+            "upstream->client ordering must be preserved"
+        );
     }
 
     proxy.close().await;
@@ -259,18 +271,23 @@ async fn rejects_client_frames_over_max_raw_forward_bytes_with_error_and_closes(
     // upstream would race the oversized-frame rejection with an unrelated dial-failure
     // teardown of the same connection.
     let mut upstream = start_fake_upstream().await;
-    let mut options = CodexRemoteProxyOptions::new(&upstream.ws_url);
+    let mut options = CodexRemoteProxyOptions::new(&upstream.ws_url, true);
     options.max_raw_forward_bytes = 256; // tiny cap so the test doesn't allocate 64MB
     let (proxy, mut events) = CodexRemoteProxy::start(options).await.unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let _conn = upstream.accept().await;
 
-    let oversized = json!({"id": 1, "method": "thread/start", "params": {"payload": huge_string(1024)}}).to_string();
+    let oversized =
+        json!({"id": 1, "method": "thread/start", "params": {"payload": huge_string(1024)}})
+            .to_string();
     tui.send(Message::Text(oversized)).await.unwrap();
 
     let reply = recv_text(&mut tui).await;
     let parsed: Value = serde_json::from_str(&reply).unwrap();
-    assert!(parsed.get("error").is_some(), "expected a JSON-RPC error reply, got {parsed}");
+    assert!(
+        parsed.get("error").is_some(),
+        "expected a JSON-RPC error reply, got {parsed}"
+    );
 
     let received_events = recv_events(&mut events, 1).await;
     assert!(matches!(
@@ -293,9 +310,10 @@ async fn rejects_client_frames_over_max_raw_forward_bytes_with_error_and_closes(
 #[tokio::test]
 async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
 
     let request = json!({"id": 7, "method": "thread/start", "params": {}}).to_string();
@@ -311,7 +329,10 @@ async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event
     conn.send_text(response.clone());
 
     let received = recv_text(&mut tui).await;
-    assert_eq!(received, response, "thread/start response must relay byte-identical");
+    assert_eq!(
+        received, response,
+        "thread/start response must relay byte-identical"
+    );
 
     let received_events = recv_events(&mut events, 1).await;
     match &received_events[0] {
@@ -331,9 +352,10 @@ async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event
 #[tokio::test]
 async fn thread_fork_request_is_rewritten_to_exclude_turns_before_forwarding() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
@@ -351,7 +373,10 @@ async fn thread_fork_request_is_rewritten_to_exclude_turns_before_forwarding() {
     tui.send(Message::Text(request.clone())).await.unwrap();
 
     let forwarded = conn.recv_text().await;
-    assert_ne!(forwarded, request, "the fork request must be rewritten, not forwarded verbatim");
+    assert_ne!(
+        forwarded, request,
+        "the fork request must be rewritten, not forwarded verbatim"
+    );
     let forwarded_json: Value = serde_json::from_str(&forwarded).unwrap();
     assert_eq!(forwarded_json["params"]["threadId"], "parent-1");
     assert_eq!(
@@ -366,9 +391,10 @@ async fn thread_fork_request_is_rewritten_to_exclude_turns_before_forwarding() {
 #[tokio::test]
 async fn thread_fork_response_is_normalized_for_the_tui_and_yields_a_candidate() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
@@ -410,9 +436,10 @@ async fn thread_fork_response_is_normalized_for_the_tui_and_yields_a_candidate()
 #[tokio::test]
 async fn thread_started_notification_yields_candidate_and_thread_started_lifecycle() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let _tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -429,9 +456,9 @@ async fn thread_started_notification_yields_candidate_and_thread_started_lifecyc
         e,
         RemoteProxyEvent::Candidate(c) if c.source == CandidateSource::ThreadStartedNotification && c.thread.id == "thread-notified"
     )));
-    assert!(received_events
-        .iter()
-        .any(|e| matches!(e, RemoteProxyEvent::ThreadStarted(l) if l.thread.id == "thread-notified")));
+    assert!(received_events.iter().any(
+        |e| matches!(e, RemoteProxyEvent::ThreadStarted(l) if l.thread.id == "thread-notified")
+    ));
 
     proxy.close().await;
 }
@@ -439,9 +466,10 @@ async fn thread_started_notification_yields_candidate_and_thread_started_lifecyc
 #[tokio::test]
 async fn turn_started_and_completed_notifications_carry_full_params_for_small_frames() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let _tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -479,9 +507,10 @@ async fn turn_started_and_completed_notifications_carry_full_params_for_small_fr
 #[tokio::test]
 async fn fs_changed_notification_emits_a_repair_trigger() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let _tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -491,7 +520,10 @@ async fn fs_changed_notification_emits_a_repair_trigger() {
 
     let received_events = recv_events(&mut events, 1).await;
     match &received_events[0] {
-        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::FsChanged { watch_id, changed_paths }) => {
+        RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::FsChanged {
+            watch_id,
+            changed_paths,
+        }) => {
             assert_eq!(watch_id, "w1");
             assert_eq!(changed_paths, &vec!["/repo/a.rs".to_string()]);
         }
@@ -506,13 +538,17 @@ async fn fs_changed_notification_emits_a_repair_trigger() {
 #[tokio::test]
 async fn interrupt_for_an_already_completed_turn_is_acknowledged_without_reaching_upstream() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
-    conn.send_text(json!({"method": "turn/started", "params": {"threadId": "t1", "turnId": "turn-1"}}).to_string());
+    conn.send_text(
+        json!({"method": "turn/started", "params": {"threadId": "t1", "turnId": "turn-1"}})
+            .to_string(),
+    );
     let _ = recv_events(&mut events, 1).await;
     conn.send_text(
         json!({"method": "turn/completed", "params": {"threadId": "t1", "turnId": "turn-1", "status": "completed"}})
@@ -537,7 +573,10 @@ async fn interrupt_for_an_already_completed_turn_is_acknowledged_without_reachin
 
     // The interrupt must never have reached the fake upstream.
     let never_reaches_upstream = timeout(Duration::from_millis(300), conn.incoming.recv()).await;
-    assert!(never_reaches_upstream.is_err(), "turn/interrupt for a completed turn must be short-circuited locally");
+    assert!(
+        never_reaches_upstream.is_err(),
+        "turn/interrupt for a completed turn must be short-circuited locally"
+    );
 
     proxy.close().await;
 }
@@ -555,9 +594,10 @@ async fn tui_clean_disconnect_closes_the_upstream_connection() {
     // closing handshake — this is legacy's actual behavior, not a defect introduced here,
     // and this port preserves it byte-for-byte (see `HubMsg::UpstreamClosed`).
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
@@ -588,9 +628,10 @@ async fn tui_clean_disconnect_closes_the_upstream_connection() {
 #[tokio::test]
 async fn upstream_clean_disconnect_closes_the_tui_and_emits_a_proxy_close_repair_trigger() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -616,13 +657,16 @@ async fn upstream_clean_disconnect_closes_the_tui_and_emits_a_proxy_close_repair
 #[tokio::test]
 async fn malformed_json_from_the_tui_is_rejected_with_an_error_and_the_proxy_survives() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let _conn = upstream.accept().await;
 
-    tui.send(Message::Text("{not valid json".to_string())).await.unwrap();
+    tui.send(Message::Text("{not valid json".to_string()))
+        .await
+        .unwrap();
 
     let reply = recv_text(&mut tui).await;
     let parsed: Value = serde_json::from_str(&reply).unwrap();
@@ -641,15 +685,19 @@ async fn malformed_json_from_the_tui_is_rejected_with_an_error_and_the_proxy_sur
     // start a second proxy instance against upstream2 to prove the hub task (shared
     // machinery under test) is generically still alive and functional, not just this one
     // connection's teardown path.
-    let (proxy2, _events2) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream2.ws_url))
-        .await
-        .unwrap();
+    let (proxy2, _events2) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream2.ws_url, true))
+            .await
+            .unwrap();
     let mut tui2 = connect_tui(proxy2.ws_url()).await;
     let request = json!({"id": 1, "method": "still/alive", "params": {}}).to_string();
     tui2.send(Message::Text(request.clone())).await.unwrap();
     let mut conn2 = upstream2.accept().await;
     let forwarded = conn2.recv_text().await;
-    assert_eq!(forwarded, request, "a fresh connection must still relay correctly after a malformed frame");
+    assert_eq!(
+        forwarded, request,
+        "a fresh connection must still relay correctly after a malformed frame"
+    );
 
     proxy.close().await;
     proxy2.close().await;
@@ -658,9 +706,10 @@ async fn malformed_json_from_the_tui_is_rejected_with_an_error_and_the_proxy_sur
 #[tokio::test]
 async fn malformed_frame_from_upstream_fails_closed_without_crashing() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, mut events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -686,9 +735,10 @@ async fn malformed_frame_from_upstream_fails_closed_without_crashing() {
 #[tokio::test]
 async fn a_slow_tui_consumer_does_not_lose_messages_from_upstream() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let conn = upstream.accept().await;
 
@@ -702,7 +752,11 @@ async fn a_slow_tui_consumer_does_not_lose_messages_from_upstream() {
     for i in 0..N {
         let received = recv_text(&mut tui).await;
         let parsed: Value = serde_json::from_str(&received).unwrap();
-        assert_eq!(parsed["params"]["n"], json!(i), "no message should be dropped or reordered under slow consumption");
+        assert_eq!(
+            parsed["params"]["n"],
+            json!(i),
+            "no message should be dropped or reordered under slow consumption"
+        );
     }
 
     proxy.close().await;
@@ -713,9 +767,10 @@ async fn a_slow_tui_consumer_does_not_lose_messages_from_upstream() {
 #[tokio::test]
 async fn close_tears_down_active_connections_and_stops_accepting_new_ones() {
     let mut upstream = start_fake_upstream().await;
-    let (proxy, _events) = CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url))
-        .await
-        .unwrap();
+    let (proxy, _events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
     let ws_url = proxy.ws_url().to_string();
     let mut tui = connect_tui(&ws_url).await;
     let _conn = upstream.accept().await;

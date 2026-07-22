@@ -94,13 +94,21 @@ pub struct CodexRemoteProxyOptions {
     pub upstream_ws_url: String,
     /// `maxRawForwardBytes` (`remote-proxy.ts:90,141`); default [`MAX_RAW_FORWARD_BYTES`].
     pub max_raw_forward_bytes: usize,
+    /// `requireCandidatePersistence` (`remote-proxy.ts:89,140`). Legacy defaults this to
+    /// `true` AT THE PROXY; the Rust options carry NO default — the launch planner passes
+    /// the plan's value explicitly on both the fresh and resume branches (S3 review
+    /// note 2: no shadow default may stand in for the planner's intent). RECORDED ONLY in
+    /// this slice: the identity gate that consumes it (`markCandidatePersisted`,
+    /// hold-until-persisted) is deliberately deferred to S5 — see the module docs.
+    pub require_candidate_persistence: bool,
 }
 
 impl CodexRemoteProxyOptions {
-    pub fn new(upstream_ws_url: impl Into<String>) -> Self {
+    pub fn new(upstream_ws_url: impl Into<String>, require_candidate_persistence: bool) -> Self {
         Self {
             upstream_ws_url: upstream_ws_url.into(),
             max_raw_forward_bytes: MAX_RAW_FORWARD_BYTES,
+            require_candidate_persistence,
         }
     }
 }
@@ -115,7 +123,10 @@ impl std::fmt::Display for ProxyStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProxyStartError::Bind(message) => {
-                write!(f, "codex remote proxy failed to bind a loopback listener: {message}")
+                write!(
+                    f,
+                    "codex remote proxy failed to bind a loopback listener: {message}"
+                )
             }
         }
     }
@@ -152,8 +163,13 @@ pub enum ThreadLifecycleLossEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteProxyRepairTrigger {
     ProxyClose,
-    ProxyError { message: String },
-    FsChanged { watch_id: String, changed_paths: Vec<String> },
+    ProxyError {
+        message: String,
+    },
+    FsChanged {
+        watch_id: String,
+        changed_paths: Vec<String>,
+    },
 }
 
 /// The proxy's typed consumer event stream — the seam Slice 3/5 will subscribe to for
@@ -185,6 +201,7 @@ pub struct CodexRemoteProxy {
     hub_tx: mpsc::UnboundedSender<HubMsg>,
     accept_task: JoinHandle<()>,
     hub_task: JoinHandle<()>,
+    require_candidate_persistence: bool,
 }
 
 impl CodexRemoteProxy {
@@ -232,6 +249,7 @@ impl CodexRemoteProxy {
                 hub_tx,
                 accept_task,
                 hub_task,
+                require_candidate_persistence: options.require_candidate_persistence,
             },
             events_rx,
         ))
@@ -239,6 +257,13 @@ impl CodexRemoteProxy {
 
     pub fn ws_url(&self) -> &str {
         &self.ws_url
+    }
+
+    /// The `requireCandidatePersistence` value this proxy was constructed with —
+    /// recorded for the S5 identity gate; asserted by the launch-planner tests so the
+    /// fresh(true)/resume(false) knob can never drift behind a hidden default.
+    pub fn require_candidate_persistence(&self) -> bool {
+        self.require_candidate_persistence
     }
 
     /// Tear down the listener and every active client/upstream socket pair
@@ -394,7 +419,11 @@ async fn handle_client_connection(
     client_writer_task.abort();
 }
 
-async fn dial_upstream(conn_id: u64, upstream_ws_url: String, hub_tx: mpsc::UnboundedSender<HubMsg>) {
+async fn dial_upstream(
+    conn_id: u64,
+    upstream_ws_url: String,
+    hub_tx: mpsc::UnboundedSender<HubMsg>,
+) {
     let (ws, _) = match connect_async(&upstream_ws_url).await {
         Ok(pair) => pair,
         Err(_) => {
@@ -546,7 +575,10 @@ async fn run_hub(
     while let Some(msg) = rx.recv().await {
         match msg {
             HubMsg::ClientConnected { conn_id, tx } => {
-                let conn = hub.connections.entry(conn_id).or_insert_with(ConnState::new);
+                let conn = hub
+                    .connections
+                    .entry(conn_id)
+                    .or_insert_with(ConnState::new);
                 conn.client_tx = Some(tx);
             }
             HubMsg::UpstreamConnected { conn_id, tx } => {
@@ -558,35 +590,51 @@ async fn run_hub(
                 }
             }
             HubMsg::UpstreamDialFailed { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
-                    message: "Codex remote proxy could not connect to the upstream app-server."
-                        .to_string(),
-                }));
+                hub.emit(RemoteProxyEvent::RepairTrigger(
+                    RemoteProxyRepairTrigger::ProxyError {
+                        message: "Codex remote proxy could not connect to the upstream app-server."
+                            .to_string(),
+                    },
+                ));
                 hub.close_connection(conn_id);
             }
-            HubMsg::ClientFrame { conn_id, data, binary } => {
+            HubMsg::ClientFrame {
+                conn_id,
+                data,
+                binary,
+            } => {
                 hub.handle_client_frame(conn_id, data, binary);
             }
-            HubMsg::UpstreamFrame { conn_id, data, binary } => {
+            HubMsg::UpstreamFrame {
+                conn_id,
+                data,
+                binary,
+            } => {
                 hub.handle_upstream_frame(conn_id, data, binary);
             }
             HubMsg::ClientClosed { conn_id } => {
                 hub.close_connection(conn_id);
             }
             HubMsg::ClientErrored { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
-                    message: "Codex remote proxy client connection errored.".to_string(),
-                }));
+                hub.emit(RemoteProxyEvent::RepairTrigger(
+                    RemoteProxyRepairTrigger::ProxyError {
+                        message: "Codex remote proxy client connection errored.".to_string(),
+                    },
+                ));
                 hub.close_connection(conn_id);
             }
             HubMsg::UpstreamClosed { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyClose));
+                hub.emit(RemoteProxyEvent::RepairTrigger(
+                    RemoteProxyRepairTrigger::ProxyClose,
+                ));
                 hub.close_connection(conn_id);
             }
             HubMsg::UpstreamErrored { conn_id } => {
-                hub.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
-                    message: "Codex remote proxy upstream connection errored.".to_string(),
-                }));
+                hub.emit(RemoteProxyEvent::RepairTrigger(
+                    RemoteProxyRepairTrigger::ProxyError {
+                        message: "Codex remote proxy upstream connection errored.".to_string(),
+                    },
+                ));
                 hub.close_connection(conn_id);
             }
             HubMsg::Shutdown { done } => {
@@ -639,11 +687,18 @@ impl Hub {
             }
             // Upstream dial hasn't completed yet — queue it (see `pending_to_upstream`'s
             // docs) rather than dropping it.
-            None => conn.pending_to_upstream.push_back(OutFrame { data, binary }),
+            None => conn
+                .pending_to_upstream
+                .push_back(OutFrame { data, binary }),
         }
     }
 
-    fn send_json_rpc_error_to_client(&self, conn_id: u64, id: Option<&JsonRpcEnvelopeId>, message: &str) {
+    fn send_json_rpc_error_to_client(
+        &self,
+        conn_id: u64,
+        id: Option<&JsonRpcEnvelopeId>,
+        message: &str,
+    ) {
         let mut obj = Map::new();
         obj.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
         if let Some(id) = id {
@@ -677,10 +732,13 @@ impl Hub {
                 id.as_ref(),
                 "Codex remote proxy rejected a JSON-RPC frame because it is too large.",
             );
-            self.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
-                message: "Codex remote proxy rejected a JSON-RPC frame because it is too large."
-                    .to_string(),
-            }));
+            self.emit(RemoteProxyEvent::RepairTrigger(
+                RemoteProxyRepairTrigger::ProxyError {
+                    message:
+                        "Codex remote proxy rejected a JSON-RPC frame because it is too large."
+                            .to_string(),
+                },
+            ));
             self.close_connection(conn_id);
             return;
         }
@@ -693,9 +751,11 @@ impl Hub {
                     None,
                     &client_envelope_failure_message(reason),
                 );
-                self.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError {
-                    message: client_envelope_failure_message(reason),
-                }));
+                self.emit(RemoteProxyEvent::RepairTrigger(
+                    RemoteProxyRepairTrigger::ProxyError {
+                        message: client_envelope_failure_message(reason),
+                    },
+                ));
                 self.close_connection(conn_id);
                 return;
             }
@@ -729,10 +789,8 @@ impl Hub {
         id: Option<JsonRpcEnvelopeId>,
         method: Option<String>,
     ) {
-        if let (Some(id), Some(method)) = (
-            id.as_ref().and_then(envelope_id_to_request_id),
-            method,
-        ) {
+        if let (Some(id), Some(method)) = (id.as_ref().and_then(envelope_id_to_request_id), method)
+        {
             if let Some(conn) = self.connections.get_mut(&conn_id) {
                 conn.pending_methods.insert(id, method);
             }
@@ -780,7 +838,13 @@ impl Hub {
                 conn.pending_fork_requests.insert(req_id, parent_thread_id);
             }
         }
-        self.forward_client_frame(conn_id, rewritten, binary, id, Some("thread/fork".to_string()));
+        self.forward_client_frame(
+            conn_id,
+            rewritten,
+            binary,
+            id,
+            Some("thread/fork".to_string()),
+        );
     }
 
     // ── upstream -> client (`handleUpstreamMessage`, `remote-proxy.ts:457-511`) ─────
@@ -803,7 +867,9 @@ impl Hub {
             let req_id = envelope_id_to_request_id(&id);
             let (method, fork_request) = match self.connections.get_mut(&conn_id) {
                 Some(conn) => {
-                    let method = req_id.as_ref().and_then(|rid| conn.pending_methods.remove(rid));
+                    let method = req_id
+                        .as_ref()
+                        .and_then(|rid| conn.pending_methods.remove(rid));
                     let fork_request = req_id
                         .as_ref()
                         .and_then(|rid| conn.pending_fork_requests.get(rid).cloned());
@@ -847,7 +913,11 @@ impl Hub {
         req_id: Option<RequestId>,
     ) {
         let Some(req_id) = req_id else {
-            self.fail_unsafe_upstream_frame(conn_id, Some("thread/start"), "id_not_pending_thread_start");
+            self.fail_unsafe_upstream_frame(
+                conn_id,
+                Some("thread/start"),
+                "id_not_pending_thread_start",
+            );
             return;
         };
         let mut pending = HashSet::new();
@@ -863,7 +933,11 @@ impl Hub {
                 self.send_to_client(conn_id, data, binary);
             }
             Err(reason) => {
-                self.fail_unsafe_upstream_frame(conn_id, Some("thread/start"), &format!("{reason:?}"));
+                self.fail_unsafe_upstream_frame(
+                    conn_id,
+                    Some("thread/start"),
+                    &format!("{reason:?}"),
+                );
             }
         }
     }
@@ -895,7 +969,11 @@ impl Hub {
         ) {
             Ok(candidate) => candidate,
             Err(reason) => {
-                self.fail_unsafe_upstream_frame(conn_id, Some("thread/fork"), &format!("{reason:?}"));
+                self.fail_unsafe_upstream_frame(
+                    conn_id,
+                    Some("thread/fork"),
+                    &format!("{reason:?}"),
+                );
                 return;
             }
         };
@@ -903,12 +981,20 @@ impl Hub {
         let normalized = match normalize_thread_fork_response_for_tui(&data) {
             Ok(bytes) => bytes,
             Err(reason) => {
-                self.fail_unsafe_upstream_frame(conn_id, Some("thread/fork"), &format!("{reason:?}"));
+                self.fail_unsafe_upstream_frame(
+                    conn_id,
+                    Some("thread/fork"),
+                    &format!("{reason:?}"),
+                );
                 return;
             }
         };
         if normalized.len() > self.max_raw_forward_bytes {
-            self.fail_unsafe_upstream_frame(conn_id, Some("thread/fork"), "raw_forward_cap_exceeded");
+            self.fail_unsafe_upstream_frame(
+                conn_id,
+                Some("thread/fork"),
+                "raw_forward_cap_exceeded",
+            );
             return;
         }
 
@@ -932,7 +1018,11 @@ impl Hub {
             }
             None => {
                 if data.len() > MAX_FULL_PARSE_BYTES {
-                    self.fail_unsafe_upstream_frame(conn_id, Some(method), "unrecoverable_stateful_frame");
+                    self.fail_unsafe_upstream_frame(
+                        conn_id,
+                        Some(method),
+                        "unrecoverable_stateful_frame",
+                    );
                 } else {
                     self.send_to_client(conn_id, data, binary);
                 }
@@ -989,7 +1079,10 @@ impl Hub {
             if thread_id.is_empty() {
                 return None;
             }
-            let turn_id = params.get("turnId").and_then(|v| v.as_str()).map(str::to_string);
+            let turn_id = params
+                .get("turnId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let event = TurnEventParams {
                 thread_id,
                 turn_id,
@@ -1017,11 +1110,19 @@ impl Hub {
                     params.insert("turnId".to_string(), Value::String(turn_id.clone()));
                 }
                 Effects {
-                    turn_started: vec![TurnEventParams { thread_id, turn_id, params }],
+                    turn_started: vec![TurnEventParams {
+                        thread_id,
+                        turn_id,
+                        params,
+                    }],
                     ..Default::default()
                 }
             }
-            SideEffectTurnEvent::Completed { thread_id, turn_id, status } => {
+            SideEffectTurnEvent::Completed {
+                thread_id,
+                turn_id,
+                status,
+            } => {
                 let mut params = Map::new();
                 params.insert("threadId".to_string(), Value::String(thread_id.clone()));
                 if let Some(turn_id) = &turn_id {
@@ -1031,7 +1132,11 @@ impl Hub {
                     params.insert("status".to_string(), Value::String(status.clone()));
                 }
                 Effects {
-                    turn_completed: vec![TurnEventParams { thread_id, turn_id, params }],
+                    turn_completed: vec![TurnEventParams {
+                        thread_id,
+                        turn_id,
+                        params,
+                    }],
                     ..Default::default()
                 }
             }
@@ -1071,7 +1176,9 @@ impl Hub {
             }
             None => format!("Codex remote proxy rejected an unsafe upstream frame: {reason}."),
         };
-        self.emit(RemoteProxyEvent::RepairTrigger(RemoteProxyRepairTrigger::ProxyError { message }));
+        self.emit(RemoteProxyEvent::RepairTrigger(
+            RemoteProxyRepairTrigger::ProxyError { message },
+        ));
         self.close_connection(conn_id);
     }
 
@@ -1080,7 +1187,9 @@ impl Hub {
     // `remote-proxy.ts:1100-1132` — proxy-wide, not per-connection; see module docs.)
 
     fn record_turn_started(&mut self, params: &TurnEventParams) {
-        let Some(turn_id) = &params.turn_id else { return };
+        let Some(turn_id) = &params.turn_id else {
+            return;
+        };
         let key = turn_key(&params.thread_id, turn_id);
         self.active_turn_keys.insert(key.clone());
         if self.completed_turn_keys_set.remove(&key) {
@@ -1089,7 +1198,9 @@ impl Hub {
     }
 
     fn record_turn_completed(&mut self, params: &TurnEventParams) {
-        let Some(turn_id) = &params.turn_id else { return };
+        let Some(turn_id) = &params.turn_id else {
+            return;
+        };
         let key = turn_key(&params.thread_id, turn_id);
         self.active_turn_keys.remove(&key);
         self.remember_completed_turn_key(key);
@@ -1141,10 +1252,12 @@ fn lifecycle_effects_from_event(event: ThreadLifecycleEvent) -> Effects {
         ThreadLifecycleEvent::ThreadStatusChanged { thread_id, status } => {
             let status_type = status.get("type").and_then(|v| v.as_str());
             let loss = match status_type {
-                Some("notLoaded") | Some("systemError") => vec![ThreadLifecycleLossEvent::ThreadStatusChanged {
-                    thread_id: thread_id.clone(),
-                    status: status_type.unwrap().to_string(),
-                }],
+                Some("notLoaded") | Some("systemError") => {
+                    vec![ThreadLifecycleLossEvent::ThreadStatusChanged {
+                        thread_id: thread_id.clone(),
+                        status: status_type.unwrap().to_string(),
+                    }]
+                }
                 _ => Vec::new(),
             };
             Effects {
@@ -1187,7 +1300,9 @@ fn envelope_id_to_json(id: &JsonRpcEnvelopeId) -> Value {
             if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
                 Value::Number((*n as i64).into())
             } else {
-                serde_json::Number::from_f64(*n).map(Value::Number).unwrap_or(Value::Null)
+                serde_json::Number::from_f64(*n)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
             }
         }
     }
@@ -1206,7 +1321,9 @@ fn client_envelope_failure_message(reason: JsonRpcEnvelopeScanError) -> String {
 /// — via a bounded byte scan (not a full parse), so this is safe to call regardless of
 /// frame size.
 fn extract_thread_fork_parent_thread_id(raw: &[u8]) -> Option<String> {
-    use crate::json_scan::{decode_string_entry, find_entry, scan_object, skip_whitespace, ValueKind, BYTE_OPEN_BRACE};
+    use crate::json_scan::{
+        decode_string_entry, find_entry, scan_object, skip_whitespace, ValueKind, BYTE_OPEN_BRACE,
+    };
     use crate::remote_proxy_envelope::MAX_SCANNED_TOKEN_BYTES;
 
     let start = skip_whitespace(raw, 0);
@@ -1253,12 +1370,18 @@ mod tests {
 
     #[test]
     fn envelope_id_to_request_id_rejects_fractional_and_out_of_range_numbers() {
-        assert_eq!(envelope_id_to_request_id(&JsonRpcEnvelopeId::Num(1.5)), None);
+        assert_eq!(
+            envelope_id_to_request_id(&JsonRpcEnvelopeId::Num(1.5)),
+            None
+        );
         assert_eq!(
             envelope_id_to_request_id(&JsonRpcEnvelopeId::Num(f64::MAX)),
             None
         );
-        assert_eq!(envelope_id_to_request_id(&JsonRpcEnvelopeId::Num(f64::NAN)), None);
+        assert_eq!(
+            envelope_id_to_request_id(&JsonRpcEnvelopeId::Num(f64::NAN)),
+            None
+        );
     }
 
     #[test]
