@@ -174,6 +174,8 @@ describe('App perf audit milestones', () => {
   })
 
   it('marks auth-required visibility when the auth modal is shown in perf-audit mode', async () => {
+    // perf-audit mode emits perf_logging_enabled/toggled telemetry to console.info.
+    vi.spyOn(console, 'info').mockImplementation(() => {})
     render(
       <Provider store={createStore()}>
         <App />

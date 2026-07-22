@@ -561,6 +561,9 @@ describe('TerminalView durable session contract', () => {
     })
     wsMocks.send.mockClear()
 
+    // INVALID_TERMINAL_ID with no durable session ref logs a restore_unavailable warning.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
     messageHandler?.({
       type: 'error',
       code: 'INVALID_TERMINAL_ID',
@@ -611,5 +614,12 @@ describe('TerminalView durable session contract', () => {
       ))
       expect(secondFreshCreates).toHaveLength(0)
     })
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[TerminalView]'),
+      'restore_unavailable',
+      expect.objectContaining({ event: 'restore_unavailable' }),
+    )
+    warnSpy.mockRestore()
   })
 })

@@ -6,6 +6,7 @@ import { createRequire } from 'module'
 import pino, { type DestinationStream, type LevelWithSilent } from 'pino'
 import { createStream, type RotatingFileStream } from 'rotating-file-stream'
 import { getFreshellHomeDir } from './freshell-home.js'
+import { createConsoleCaptureStream } from './test-log-capture.js'
 
 const env = process.env.NODE_ENV || 'development'
 const level = process.env.LOG_LEVEL || 'debug'
@@ -249,6 +250,7 @@ function createConsoleStream(shouldPrettyPrint: boolean): DestinationStream {
   return pretty
 }
 
+
 export function attachDebugStreamWarnings(
   stream: RotatingFileStream,
   consoleLogger: pino.Logger,
@@ -270,7 +272,9 @@ export function createLogger(destination?: DestinationStream) {
   }
 
   const shouldPrettyPrint = env !== 'production' && env !== 'test'
-  const consoleStream = createConsoleStream(shouldPrettyPrint)
+  const consoleStream = isTestRuntime(process.env)
+    ? createConsoleCaptureStream()
+    : createConsoleStream(shouldPrettyPrint)
   const consoleLogger = pino(createPinoOptions({ level: DEFAULT_CONSOLE_LOG_LEVEL }), consoleStream)
   const consoleDiagnosticLogger = pino(createPinoOptions({ level: 'warn' }), consoleStream)
   const streams: Array<{ stream: DestinationStream; level: LevelWithSilent }> = [

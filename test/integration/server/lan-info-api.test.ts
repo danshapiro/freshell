@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { createNetworkRouter } from '../../../server/network-router.js'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -124,6 +125,9 @@ describe('LAN Info API', () => {
 
       expect(res.status).toBe(500)
       expect(res.body).toEqual({ error: 'Failed to get LAN info' })
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'Failed to get LAN info'),
+      ).toHaveLength(1)
     })
   })
 })

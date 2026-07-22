@@ -103,11 +103,18 @@ describe('console error collector (index.html inline script)', () => {
   })
 
   it('does not capture console.warn or console.log', () => {
+    // The raw console.warn/console.log calls are the SUBJECT here: the test proves the
+    // collector ignores them. Opt out of the warn trap so the raw warn reaches the (patched)
+    // console, and silence the raw log so it doesn't leak to stdout. Neither is captured.
+    ;(globalThis as any).__ALLOW_CONSOLE_WARN__ = true
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
     console.warn('warning')
     console.log('info')
 
     const errors = (window as any).__consoleErrors
     expect(errors).toHaveLength(0)
+    logSpy.mockRestore()
   })
 
   it('handles Error objects by stringifying them', () => {

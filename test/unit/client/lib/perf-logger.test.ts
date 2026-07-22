@@ -20,16 +20,21 @@ describe('client perf logger config', () => {
 
   it('can toggle at runtime', async () => {
     const { getClientPerfConfig, setClientPerfEnabled } = await loadPerfLoggerModule()
+    // Toggling perf logging emits a perf_logging_enabled console.info; silence it.
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
     const cfg = getClientPerfConfig()
     setClientPerfEnabled(true, 'test')
     expect(cfg.enabled).toBe(true)
     setClientPerfEnabled(false, 'test')
     expect(cfg.enabled).toBe(false)
+    infoSpy.mockRestore()
   })
 
   it('ignores /api/logs/client resource entries in perf.resource_slow warnings', async () => {
     const { setClientPerfEnabled } = await loadPerfLoggerModule()
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // Toggling perf logging emits a perf_logging_enabled console.info; silence it.
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
     const originalObserver = (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver
     const resourceCallbacks: Array<(entries: PerformanceResourceTiming[]) => void> = []
 
@@ -83,6 +88,7 @@ describe('client perf logger config', () => {
     setClientPerfEnabled(false, 'test')
     ;(globalThis as { PerformanceObserver?: unknown }).PerformanceObserver = originalObserver
     warnSpy.mockRestore()
+    infoSpy.mockRestore()
   })
 
   it('logs terminal input-to-first-output latency samples with percentiles', async () => {

@@ -657,25 +657,37 @@ describe('codex refresh rehydrate flow (e2e)', () => {
 
     const baselineMessages = sentMessages().length
 
-    act(() => {
-      wsHarness.emit({
-        type: 'error',
-        code: 'INVALID_TERMINAL_ID',
-        message: 'Unknown terminalId',
-        terminalId: 'term-codex-live-only',
+    // The live-only recovery path intentionally logs a restore_unavailable notice.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      act(() => {
+        wsHarness.emit({
+          type: 'error',
+          code: 'INVALID_TERMINAL_ID',
+          message: 'Unknown terminalId',
+          terminalId: 'term-codex-live-only',
+        })
       })
-    })
 
-    await waitFor(() => {
-      const recreated = sentMessages().slice(baselineMessages).find((msg) => msg?.type === 'terminal.create')
-      expect(recreated).toMatchObject({
-        type: 'terminal.create',
-        mode: 'codex',
-        recoveryIntent: 'fresh_after_restore_unavailable',
+      await waitFor(() => {
+        const recreated = sentMessages().slice(baselineMessages).find((msg) => msg?.type === 'terminal.create')
+        expect(recreated).toMatchObject({
+          type: 'terminal.create',
+          mode: 'codex',
+          recoveryIntent: 'fresh_after_restore_unavailable',
+        })
+        expect(recreated?.restore).toBeUndefined()
+        expect(recreated?.sessionRef).toBeUndefined()
+        expect(recreated?.codexDurability).toBeUndefined()
       })
-      expect(recreated?.restore).toBeUndefined()
-      expect(recreated?.sessionRef).toBeUndefined()
-      expect(recreated?.codexDurability).toBeUndefined()
-    })
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[TerminalView]'),
+        'restore_unavailable',
+        expect.anything(),
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })

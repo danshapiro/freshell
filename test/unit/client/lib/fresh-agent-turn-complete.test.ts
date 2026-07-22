@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { setSessionStatus } from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -106,6 +106,9 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
     const store = makeStore()
     store.dispatch(setSessionStatus({ sessionId: SESSION_ID, sessionType: 'freshopencode', provider: 'opencode', status: 'idle' }))
 
+    // Dropping a malformed edge warns; that warning is part of the behavior under test.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
       sessionId: SESSION_ID,
@@ -125,6 +128,8 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
       event: { type: 'freshAgent.turn.complete', sessionId: SESSION_ID, at: Number.NaN } as never,
     })
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    expect(warnSpy).toHaveBeenCalled()
+    warnSpy.mockRestore()
   })
 
   it('ignores a completion for a session that owns no live pane', () => {
@@ -209,10 +214,13 @@ describe('server-authoritative fresh-agent waiting edge (client)', () => {
 
   it('drops a malformed waiting edge without a numeric at', () => {
     const store = makeClaudeStore()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event', sessionId: RUNTIME_ID, sessionType: 'freshclaude', provider: 'claude',
       event: { type: 'freshAgent.turn.waiting', sessionId: RUNTIME_ID },
     })
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    expect(warnSpy).toHaveBeenCalled()
+    warnSpy.mockRestore()
   })
 })

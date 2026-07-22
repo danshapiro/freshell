@@ -17,6 +17,10 @@ describe('client logger', () => {
   })
 
   it('forwards console warnings to the server', async () => {
+    // The logger patches console.warn to forward it; a spy would sit under that
+    // patch and break the forwarding this test asserts. The raw console.warn IS
+    // the subject, so opt this test out of the global warn trap instead.
+    ;(globalThis as any).__ALLOW_CONSOLE_WARN__ = true
     mockFetch.mockResolvedValueOnce({ ok: true })
 
     const logger = createClientLogger({
@@ -50,6 +54,7 @@ describe('client logger', () => {
   })
 
   it('does not enqueue perf telemetry payloads for remote transport', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_WARN__ = true
     mockFetch.mockResolvedValueOnce({ ok: true })
 
     const logger = createClientLogger({
@@ -67,6 +72,7 @@ describe('client logger', () => {
   })
 
   it('drops duplicate warning entries within the dedupe window', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_WARN__ = true
     mockFetch.mockResolvedValueOnce({ ok: true })
 
     const logger = createClientLogger({

@@ -224,7 +224,10 @@ async function runLargeForwardStressChild(options: {
   timeoutMs: number
 }): Promise<void> {
   try {
-    const result = await execFileAsync(process.execPath, [
+    // The child exits non-zero (rejecting here) on failure; on success its stdout
+    // is only a memory diagnostic, which the catch below surfaces on failure. So
+    // there is nothing to read on success — echoing it would just be test noise.
+    await execFileAsync(process.execPath, [
       `--max-old-space-size=${options.heapMb}`,
       '--import',
       'tsx',
@@ -237,10 +240,6 @@ async function runLargeForwardStressChild(options: {
       timeout: options.timeoutMs,
       maxBuffer: 1024 * 1024,
     })
-    const stdout = result.stdout.trim()
-    if (stdout.length > 0) {
-      console.info(stdout)
-    }
   } catch (error) {
     const failure = error as Error & { stdout?: string; stderr?: string }
     throw new Error([

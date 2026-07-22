@@ -466,6 +466,7 @@ describe('App WS bootstrap recovery', () => {
   })
 
   it('recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const recoveredSettings = {
       ...defaultSettings,
       sidebar: {
@@ -597,6 +598,10 @@ describe('App WS bootstrap recovery', () => {
     expect(sidebarCalls).toBe(2)
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
+
+    // The transient 503s are logged as they are contained and recovered from.
+    expect(warnSpy).toHaveBeenCalledWith('[App]', 'Failed to load bootstrap data', expect.anything())
+    expect(warnSpy).toHaveBeenCalledWith('[App]', 'Failed to load initial sidebar session window', expect.anything())
   })
 
   it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
@@ -1969,6 +1974,7 @@ describe('App WS bootstrap recovery', () => {
     // failure leaked an unhandled rejection that fails the whole test run even though every
     // test "passed" — the same failure class the terminal.inventory site already contains.
     const store = createStore()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     // Reject every snapshot fetch. The bootstrap sidebar load fails but is contained by
     // ensureSidebarSessionsWindow (so no window ever commits -> hasCommittedWindow stays
@@ -2007,6 +2013,9 @@ describe('App WS bootstrap recovery', () => {
           (reason) => reason instanceof Error && reason.message.includes('window snapshot unavailable'),
         ),
       ).toHaveLength(0)
+
+      // The contained sidebar-window failure is logged rather than leaked.
+      expect(warnSpy).toHaveBeenCalledWith('[App]', 'Failed to load initial sidebar session window', expect.anything())
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }

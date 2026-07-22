@@ -769,6 +769,7 @@ describe('Component Edge Cases', () => {
 
     describe('SettingsView with pending save', () => {
       it('handles rapid setting changes without crash', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {})
         mockApiTyped.post.mockResolvedValue({ valid: true })
 
         const store = createTestStore()
@@ -875,6 +876,7 @@ describe('Component Edge Cases', () => {
 
     describe('SettingsView API error handling', () => {
       it('handles API patch failure gracefully', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
         mockApiTyped.post.mockResolvedValue({ valid: true })
         mockApiTyped.patch.mockRejectedValueOnce(new Error('Save failed'))
 
@@ -895,6 +897,11 @@ describe('Component Edge Cases', () => {
         expect(mockApiTyped.post).toHaveBeenCalledWith('/api/files/validate-dir', { path: '/tmp/save-failure' })
         expect(mockApiTyped.patch).toHaveBeenCalledWith('/api/settings', { defaultCwd: '/tmp/save-failure' })
         expect(screen.getByText('Settings')).toBeInTheDocument()
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('[settingsThunks]'),
+          expect.stringContaining('Failed to save server settings patch'),
+          expect.anything(),
+        )
       })
     })
   })

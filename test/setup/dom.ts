@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
 import { resetWsClientForTests } from '@/lib/ws-client'
+import { installConsoleTraps } from './console-trap'
 
 enableMapSet()
 
@@ -98,42 +99,20 @@ beforeEach(() => {
 })
 // ── end matchMedia polyfill ─────────────────────────────────────────
 
-let errorSpy: ReturnType<typeof vi.spyOn> | null = null
-let consoleErrorCalls: Array<{ args: unknown[]; stack?: string }> = []
-let hasCapturedErrorStack = false
+let installedConsoleTraps: ReturnType<typeof installConsoleTraps> | null = null
 
 beforeEach(() => {
-  consoleErrorCalls = []
-  hasCapturedErrorStack = false
-  const impl = (...args: unknown[]) => {
-    // Capturing stacks for every console.error can be expensive; keep the first one for debugging.
-    let stack: string | undefined
-    if (!hasCapturedErrorStack) {
-      hasCapturedErrorStack = true
-      const err = new Error('console.error captured')
-      // Exclude this helper from the captured stack for better signal.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ;(Error as any).captureStackTrace?.(err, impl)
-      stack = err.stack
-    }
-    consoleErrorCalls.push({ args, stack })
-  }
-  errorSpy = vi.spyOn(console, 'error').mockImplementation(impl)
+  installedConsoleTraps = installConsoleTraps()
 })
 
 afterEach(() => {
   resetWsClientForTests()
-  errorSpy?.mockRestore()
-  errorSpy = null
 
-  const allow = (globalThis as any).__ALLOW_CONSOLE_ERROR__ === true
-  ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = false
+  const failures = installedConsoleTraps?.collectFailures() ?? []
+  installedConsoleTraps = null
 
-  if (!allow && consoleErrorCalls.length > 0) {
-    const first = consoleErrorCalls[0]
-    const rendered = first?.args?.map(String).join(' ') ?? ''
-    const stack = first?.stack ? `\n${first.stack}` : ''
-    throw new Error(`Unexpected console.error: ${rendered}${stack}`)
+  if (failures.length > 0) {
+    throw new Error(failures.join('\n'))
   }
 })
 

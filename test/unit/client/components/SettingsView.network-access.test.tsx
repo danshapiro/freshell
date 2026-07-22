@@ -317,6 +317,7 @@ describe('SettingsView network access section', () => {
   })
 
   it('surfaces a visible error when disabling WSL remote access fails', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { api } = await import('@/lib/api')
     vi.mocked(api.post).mockRejectedValueOnce({
       status: 500,
@@ -345,9 +346,15 @@ describe('SettingsView network access section', () => {
       expect(screen.getByRole('alert')).toHaveTextContent(/disable failed/i)
     })
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[NetworkSettings]'),
+      expect.stringContaining('Failed to disable remote access'),
+      expect.anything(),
+    )
   })
 
   it('surfaces a visible error when a direct remote access configure request is rejected', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { api } = await import('@/lib/api')
     vi.mocked(api.post).mockRejectedValueOnce(new Error('Configure failed'))
 
@@ -372,6 +379,11 @@ describe('SettingsView network access section', () => {
       expect(screen.getByRole('alert')).toHaveTextContent(/configure failed/i)
     })
     expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[NetworkSettings]'),
+      expect.stringContaining('Failed to configure remote access'),
+      expect.anything(),
+    )
   })
 
   it('shows a visible error when WSL teardown polling finishes but remote access is still enabled', async () => {
@@ -469,6 +481,7 @@ describe('SettingsView network access section', () => {
 
   it('shows a visible error and performs a final status refresh when WSL teardown polling fails', async () => {
     vi.useFakeTimers()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { api } = await import('@/lib/api')
     vi.mocked(api.post).mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
     vi.mocked(api.get)
@@ -508,6 +521,11 @@ describe('SettingsView network access section', () => {
     expect(api.get).toHaveBeenCalledTimes(2)
     expect(screen.getByRole('alert')).toHaveTextContent(/failed to refresh remote access status/i)
     expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[NetworkSettings]'),
+      expect.stringContaining('Failed to refresh remote access status'),
+      expect.anything(),
+    )
   })
 
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {

@@ -3047,16 +3047,26 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalInstances.length).toBeGreaterThan(0)
     })
 
-    act(() => {
-      messageHandler!({
-        type: 'terminal.input.blocked',
-        terminalId: 'term-codex',
-        reason: 'codex_identity_pending',
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      act(() => {
+        messageHandler!({
+          type: 'terminal.input.blocked',
+          terminalId: 'term-codex',
+          reason: 'codex_identity_pending',
+        })
       })
-    })
 
-    const term = terminalInstances[0]
-    expectTerminalWriteContaining(term, 'Input not sent: Codex is still saving restore state. Try again in a moment.')
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Input not sent: Codex is still saving restore state. Try again in a moment.')
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[TerminalView]'),
+        'terminal_input_blocked',
+        expect.objectContaining({ reason: 'codex_identity_pending' }),
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('shows feedback when Codex input is blocked by lifecycle-loss proof', async () => {
@@ -3077,16 +3087,26 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalInstances.length).toBeGreaterThan(0)
     })
 
-    act(() => {
-      messageHandler!({
-        type: 'terminal.input.blocked',
-        terminalId: 'term-codex',
-        reason: 'codex_lifecycle_loss_pending',
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      act(() => {
+        messageHandler!({
+          type: 'terminal.input.blocked',
+          terminalId: 'term-codex',
+          reason: 'codex_lifecycle_loss_pending',
+        })
       })
-    })
 
-    const term = terminalInstances[0]
-    expectTerminalWriteContaining(term, 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.')
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.')
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[TerminalView]'),
+        'terminal_input_blocked',
+        expect.objectContaining({ reason: 'codex_lifecycle_loss_pending' }),
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('shows feedback when Codex input is blocked by clean-exit state resolution', async () => {
@@ -3107,16 +3127,26 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalInstances.length).toBeGreaterThan(0)
     })
 
-    act(() => {
-      messageHandler!({
-        type: 'terminal.input.blocked',
-        terminalId: 'term-codex',
-        reason: 'codex_clean_exit_decision_pending',
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      act(() => {
+        messageHandler!({
+          type: 'terminal.input.blocked',
+          terminalId: 'term-codex',
+          reason: 'codex_clean_exit_decision_pending',
+        })
       })
-    })
 
-    const term = terminalInstances[0]
-    expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[TerminalView]'),
+        'terminal_input_blocked',
+        expect.objectContaining({ reason: 'codex_clean_exit_decision_pending' }),
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
@@ -3724,6 +3754,17 @@ describe('TerminalView lifecycle updates', () => {
   })
 
   describe('v2 stream lifecycle', () => {
+    // Invalid/mismatched stream frames intentionally emit `[TerminalView]` warnings
+    // as part of the fail-closed behavior these tests exercise.
+    let streamWarnSpy: ReturnType<typeof vi.spyOn> | null = null
+    beforeEach(() => {
+      streamWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    })
+    afterEach(() => {
+      streamWarnSpy?.mockRestore()
+      streamWarnSpy = null
+    })
+
     async function renderTerminalHarness(opts?: {
       status?: 'creating' | 'running'
       terminalId?: string

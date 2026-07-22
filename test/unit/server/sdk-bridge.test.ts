@@ -59,6 +59,7 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }))
 
 import { SdkBridge } from '../../../server/sdk-bridge.js'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 describe('SdkBridge', () => {
   let bridge: SdkBridge
@@ -230,6 +231,7 @@ describe('SdkBridge', () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
       await new Promise((r) => setTimeout(r, 100))
       expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
+      expect(consumeCapturedLogRecords((r) => r.msg === 'SDK stream ended with error')).toHaveLength(1)
     })
   })
 
@@ -1143,6 +1145,7 @@ describe('SdkBridge', () => {
       expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
       // Process cleaned up
       expect(bridge.sendUserMessage(session.sessionId, 'hello')).toBe(false)
+      expect(consumeCapturedLogRecords((r) => r.msg === 'SDK stream ended with error')).toHaveLength(1)
     })
 
     it('killSession works for sessions whose stream has ended', async () => {

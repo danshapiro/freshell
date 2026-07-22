@@ -17,6 +17,7 @@ import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
 import * as wslModule from '../../../server/wsl-port-forward.js'
+import { consumeCapturedLogRecords } from '../../../server/test-log-capture.js'
 
 // Mock firewall detection to avoid real system calls
 vi.mock('../../../server/firewall.js', async () => {
@@ -1406,6 +1407,9 @@ describe('Network API integration', () => {
       expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
 
       await waitForFirewallRepairSettled()
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'WSL2 port forwarding failed').length,
+      ).toBeGreaterThanOrEqual(1)
     })
 
     it('returns 409 in-progress for fresh and confirmed requests while a prior elevated repair is still running', async () => {
@@ -1492,6 +1496,9 @@ describe('Network API integration', () => {
 
       finishRepair?.()
       await waitForFirewallRepairSettled()
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'WSL2 port forwarding failed').length,
+      ).toBeGreaterThanOrEqual(1)
     })
   })
 
@@ -1800,6 +1807,10 @@ describe('Network API integration', () => {
       expect(statusRes.body.remoteAccessEnabled).toBe(true)
       expect(statusRes.body.remoteAccessRequested).toBe(true)
       expect(statusRes.body.accessUrl).toContain('192.168.1.100')
+
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'WSL2 remote access teardown failed').length,
+      ).toBeGreaterThanOrEqual(1)
     })
 
     it('releases the confirmed repair lock when the confirmed noop disable save fails', async () => {
@@ -1871,6 +1882,12 @@ describe('Network API integration', () => {
 
       expect(followUpRes.status).toBe(200)
       expect(followUpRes.body).toEqual({ method: 'none', message: 'Remote access disabled' })
+
+      expect(
+        consumeCapturedLogRecords(
+          (r) => r.msg === 'Failed to persist confirmed remote access disable settings',
+        ),
+      ).toHaveLength(1)
     })
 
     it('returns 409 in-progress for disable requests while a confirmed WSL repair is still running', async () => {
@@ -1938,6 +1955,9 @@ describe('Network API integration', () => {
 
       finishRepair?.()
       await waitForFirewallRepairSettled()
+      expect(
+        consumeCapturedLogRecords((r) => r.msg === 'WSL2 port forwarding failed').length,
+      ).toBeGreaterThanOrEqual(1)
     })
 
     it('returns the teardown probe failure instead of treating it as a successful noop', async () => {
