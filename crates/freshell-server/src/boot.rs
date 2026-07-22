@@ -272,8 +272,98 @@ async fn logs_client(
 /// No separate cap is applied here: `entries` is already bounded to `1..=200`
 /// by [`client_logs_issues`]'s zod-parity check before this ever runs, so a
 /// single request can never emit an unbounded number of lines.
+/// Pre-emission redaction for client-supplied strings (review follow-up on
+/// the `emit_client_log_entries` fix, commit ad77b571): the writer-level
+/// [`scrub`](crate::logging) regexes match `"token":"…"` / `"cookie":"…"`
+/// fields with PLAIN quotes on the final disk line -- but client-supplied
+/// `message`/`args`/`context` strings are re-serialized JSON that the JSONL
+/// writer JSON-encodes AGAIN, so any secret-bearing field inside them
+/// reaches the disk line with ESCAPED quotes (`\"token\":…`, `\\\"token\\\":…`)
+/// that defeat those patterns.
+///
+/// This scrub therefore runs over the RAW string forms here, BEFORE
+/// emission, and matches BOTH quote forms:
+///   * plain `"key":"value"` (a client that put JSON text straight into
+///     `message` -- depth 0 in the raw string, escaped once on disk);
+///   * escaped `\"key\":\"value\"` at any backslash depth (`\\+"`) -- the
+///     reported leak: a client logging an object something upstream had
+///     already serialized, so the `args`/`context` element is a STRING of
+///     JSON text (depth 1+ in the raw string after this module's own
+///     `ToString` re-serialization).
+///
+/// The plain-quote patterns are kept byte-identical to `logging.rs`'s
+/// writer-level ones (which remain in place as the belt-and-braces layer;
+/// the exact-`AUTH_TOKEN` replacement there already catches the live secret
+/// at any depth since it is a quote-free literal match). Known, accepted
+/// residual of the escaped variant: the value matcher is lazy, so a token
+/// value that ITSELF contains a deeper-escaped quote (depth >= 2 nesting
+/// inside the value) terminates the redaction span at that inner quote --
+/// the token-named KEY at every depth still matches directly, and the
+/// replacement always removes the value bytes up to the first quote, so the
+/// failure direction is over-truncated redaction, never a longer leak than
+/// today's.
+fn scrub_client_supplied(raw: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Plain-quote token/cookie fields (byte-identical to logging.rs).
+    static PLAIN_TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    let plain_token = PLAIN_TOKEN_RE.get_or_init(|| {
+        Regex::new(r#"(?i)"([a-z0-9_-]*token[a-z0-9_-]*)"\s*:\s*"((?:\\.|[^"\\])*)""#)
+            .expect("valid plain token-field redaction regex")
+    });
+    static PLAIN_COOKIE_RE: OnceLock<Regex> = OnceLock::new();
+    let plain_cookie = PLAIN_COOKIE_RE.get_or_init(|| {
+        Regex::new(r#"(?i)"(cookie)"\s*:\s*"((?:\\.|[^"\\])*)""#)
+            .expect("valid plain cookie-field redaction regex")
+    });
+
+    // Escaped-quote variants: a quote at JSON-encode depth n appears as
+    // (2^n - 1) backslashes + `"`, so `\\+"` covers every depth >= 1.
+    static ESCAPED_TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    let escaped_token = ESCAPED_TOKEN_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\\+"([a-z0-9_-]*token[a-z0-9_-]*)\\+"\s*:\s*\\+"(?:\\.|[^"\\])*?\\+""#)
+            .expect("valid escaped token-field redaction regex")
+    });
+    static ESCAPED_COOKIE_RE: OnceLock<Regex> = OnceLock::new();
+    let escaped_cookie = ESCAPED_COOKIE_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\\+"(cookie)\\+"\s*:\s*\\+"(?:\\.|[^"\\])*?\\+""#)
+            .expect("valid escaped cookie-field redaction regex")
+    });
+
+    // Raw `Cookie:`/`Set-Cookie:` header fragments (quote-free value, so the
+    // one pattern already works at any escape depth).
+    static COOKIE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
+    let cookie_header = COOKIE_HEADER_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(cookie|set-cookie)\s*:\s*[^\r\n\x22]+")
+            .expect("valid cookie-header redaction regex")
+    });
+
+    let out = plain_token.replace_all(raw, |caps: &regex::Captures| {
+        format!("\"{}\":\"***REDACTED***\"", &caps[1])
+    });
+    let out = plain_cookie.replace_all(&out, |caps: &regex::Captures| {
+        format!("\"{}\":\"***REDACTED***\"", &caps[1])
+    });
+    // Replacements below re-emit the canonical single-escape (`\"`) form:
+    // the secret bytes are gone either way, and a depth-1 payload (the
+    // reported case) stays parseable as the nested JSON it was.
+    let out = escaped_token.replace_all(&out, |caps: &regex::Captures| {
+        format!("\\\"{}\\\":\\\"***REDACTED***\\\"", &caps[1])
+    });
+    let out = escaped_cookie.replace_all(&out, |caps: &regex::Captures| {
+        format!("\\\"{}\\\":\\\"***REDACTED***\\\"", &caps[1])
+    });
+    let out = cookie_header.replace_all(&out, |caps: &regex::Captures| {
+        format!("{}: ***REDACTED***", &caps[1])
+    });
+    out.into_owned()
+}
+
 fn emit_client_log_entries(client: Option<&Value>, entries: &[Value]) {
-    let client_json = client.map(ToString::to_string).unwrap_or_else(|| "null".to_string());
+    let client_json = client
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "null".to_string());
     let client_id = client
         .and_then(|c| c.get("id"))
         .and_then(Value::as_str)
@@ -296,19 +386,26 @@ fn emit_client_log_entries(client: Option<&Value>, entries: &[Value]) {
             })
             .unwrap_or("Client log")
             .to_string();
+        // Client-supplied free-form strings get the pre-emission scrub (see
+        // `scrub_client_supplied`): the writer-level scrub cannot see secrets
+        // once these are JSON-encoded onto the disk line.
+        let message = scrub_client_supplied(&message);
         let console_method = e
             .get("consoleMethod")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let stack = e.get("stack").and_then(Value::as_str).unwrap_or_default();
-        let client_timestamp = e.get("timestamp").and_then(Value::as_str).unwrap_or_default();
+        let client_timestamp = e
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let args = e
             .get("args")
-            .map(ToString::to_string)
+            .map(|v| scrub_client_supplied(&v.to_string()))
             .unwrap_or_else(|| "null".to_string());
         let context = e
             .get("context")
-            .map(ToString::to_string)
+            .map(|v| scrub_client_supplied(&v.to_string()))
             .unwrap_or_else(|| "null".to_string());
 
         // A tiny local macro to avoid quadruplicating this field list once
@@ -720,6 +817,43 @@ mod tests {
             HeaderValue::from_static("freshell-auth=s3cr3t-token-abcdef"),
         );
         assert!(is_authed(&h, "s3cr3t-token-abcdef"));
+    }
+
+    #[test]
+    fn scrub_client_supplied_redacts_nested_json_token_field() {
+        // The reported leak shape: an args element that is a STRING of JSON
+        // text -- after this module's ToString re-serialization the field's
+        // quotes are escaped, defeating plain-quote patterns.
+        let raw = r#"["{\"authToken\":\"nested-secret-123\"}","harmless"]"#;
+        let out = scrub_client_supplied(raw);
+        assert!(!out.contains("nested-secret-123"), "leaked: {out}");
+        assert!(
+            out.contains("harmless"),
+            "non-secret content dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn scrub_client_supplied_redacts_nested_json_cookie_field() {
+        let raw = r#"["{\"cookie\":\"freshell-auth=abcdef123456\"}"]"#;
+        let out = scrub_client_supplied(raw);
+        assert!(!out.contains("abcdef123456"), "leaked: {out}");
+    }
+
+    #[test]
+    fn scrub_client_supplied_redacts_plain_json_token_field() {
+        // Depth-0: JSON text pasted straight into a message string.
+        let raw = r#"request failed {"apiToken":"plain-secret-456"} retrying"#;
+        let out = scrub_client_supplied(raw);
+        assert!(!out.contains("plain-secret-456"), "leaked: {out}");
+        assert!(out.contains("request failed"));
+        assert!(out.contains("retrying"));
+    }
+
+    #[test]
+    fn scrub_client_supplied_preserves_non_secret_content() {
+        let raw = r#"{"route":"/api/health","status":200,"note":"all good"}"#;
+        assert_eq!(scrub_client_supplied(raw), raw);
     }
 
     #[test]

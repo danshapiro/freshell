@@ -86,6 +86,135 @@ fn drain_stderr(child: &mut Child) -> String {
     buf
 }
 
+/// Redaction hardening for the client-log re-emission path (review follow-up
+/// on the `emit_client_log_entries` fix): client-supplied `message`/`args`/
+/// `context` strings are re-emitted into `rust-server.jsonl`, but the
+/// writer-level `scrub` regexes only match `"token":"…"` / `"cookie":"…"`
+/// with PLAIN quotes. A secret inside a NESTED JSON-encoded string (a client
+/// logging an object serialized as `{\"token\":\"abc\"}`) reaches the disk
+/// line with escaped quotes (`\\\"token\\\":…`), which defeats those
+/// patterns -- the secret lands in the log verbatim.
+///
+/// This test posts exactly that shape and asserts, black-box (reading the
+/// real JSONL the real binary wrote):
+///   1. a nested-JSON-encoded token value in `args` is NOT in the log;
+///   2. a nested-JSON-encoded cookie value in `args` is NOT in the log;
+///   3. a nested-JSON-encoded token inside a `context` value is NOT in the log;
+///   4. plain (depth-0) JSON secrets in `message` are NOT in the log;
+///   5. non-secret content (the marker message, a harmless args element)
+///      still passes through intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_json_encoded_secrets_in_client_log_strings_are_redacted() {
+    let server_binary = discover_server_binary();
+
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+
+    let port = allocate_ephemeral_port();
+    let token = format!("diag02-nested-redaction-secret-{}", uuid::Uuid::new_v4());
+
+    let mut child = Command::new(&server_binary)
+        .env("PORT", port.to_string())
+        .env("AUTH_TOKEN", &token)
+        .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env("HOME", &home_path)
+        .env("FRESHELL_HOME", &home_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn freshell-server");
+
+    let healthy = wait_for_health(port, &mut child, Duration::from_secs(20)).await;
+    if !healthy {
+        let stderr = drain_stderr(&mut child);
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("freshell-server never became healthy on port {port}; stderr:\n{stderr}");
+    }
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let marker = format!("diag02-nested-marker-{}", uuid::Uuid::new_v4());
+    // Secrets are plain uuid-ish strings (no quotes/backslashes), so they
+    // appear byte-identically at ANY JSON escape depth -- `content.contains`
+    // below is escape-depth-independent.
+    let nested_token_secret = format!("nested-token-secret-{}", uuid::Uuid::new_v4());
+    let nested_cookie_secret = format!("nested-cookie-secret-{}", uuid::Uuid::new_v4());
+    let context_token_secret = format!("context-token-secret-{}", uuid::Uuid::new_v4());
+    let plain_message_secret = format!("plain-message-secret-{}", uuid::Uuid::new_v4());
+    let harmless = format!("harmless-arg-{}", uuid::Uuid::new_v4());
+
+    // The reported leak shape: the client logged an OBJECT that something
+    // upstream had already serialized -- so the args array element is a
+    // STRING whose content is JSON text with a token + cookie field.
+    let nested_json_arg = serde_json::json!({
+        "authToken": nested_token_secret,
+        "cookie": format!("freshell-auth={nested_cookie_secret}"),
+    })
+    .to_string();
+    let nested_json_context_value =
+        serde_json::json!({ "token": context_token_secret }).to_string();
+
+    let body = serde_json::json!({
+        "client": { "id": "test-client-redaction" },
+        "entries": [
+            {
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "severity": "error",
+                // Depth-0 case: JSON text directly in the message string.
+                "message": format!("{marker} payload {{\"apiToken\":\"{plain_message_secret}\"}}"),
+                "args": [nested_json_arg, harmless],
+                "context": { "detail": nested_json_context_value },
+            },
+        ],
+    });
+
+    let resp = client
+        .post(format!("{base}/api/logs/client"))
+        .header("x-auth-token", &token)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body).expect("serialize request body"))
+        .send()
+        .await
+        .expect("POST /api/logs/client");
+    assert_eq!(resp.status().as_u16(), 204);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let log_path = home_path
+        .join(".freshell")
+        .join("logs")
+        .join("rust-server.jsonl");
+    let content = std::fs::read_to_string(&log_path).expect("read log file");
+
+    // The entry itself must have landed (non-secret passthrough).
+    assert!(
+        content.contains(&marker),
+        "expected the client-log entry (marker {marker}) to be emitted at all"
+    );
+    assert!(
+        content.contains(&harmless),
+        "non-secret args content must pass through unaltered"
+    );
+
+    // The secrets must NOT have landed, at any escape depth.
+    for (label, secret) in [
+        ("nested-JSON token in args", &nested_token_secret),
+        ("nested-JSON cookie in args", &nested_cookie_secret),
+        ("nested-JSON token in context", &context_token_secret),
+        ("plain JSON token in message", &plain_message_secret),
+    ] {
+        assert!(
+            !content.contains(secret.as_str()),
+            "{label} leaked into the structured log: found {secret:?} in:\n{content}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_log_entries_are_emitted_into_the_structured_log() {
     let server_binary = discover_server_binary();
@@ -94,10 +223,7 @@ async fn client_log_entries_are_emitted_into_the_structured_log() {
     let home_path = home.path().to_path_buf();
 
     let port = allocate_ephemeral_port();
-    let token = format!(
-        "diag02-client-log-emission-secret-{}",
-        uuid::Uuid::new_v4()
-    );
+    let token = format!("diag02-client-log-emission-secret-{}", uuid::Uuid::new_v4());
 
     let mut child = Command::new(&server_binary)
         .env("PORT", port.to_string())
@@ -218,7 +344,8 @@ async fn client_log_entries_are_emitted_into_the_structured_log() {
     ] {
         let expected_msg = format!("{marker} {suffix}");
         let found = parsed.iter().any(|v| {
-            let target_ok = v.get("target").and_then(|t| t.as_str()) == Some("freshell_server::client_logs");
+            let target_ok =
+                v.get("target").and_then(|t| t.as_str()) == Some("freshell_server::client_logs");
             let level_ok = v.get("level").and_then(|l| l.as_str()) == Some(level);
             let msg_ok = v
                 .get("msg")
