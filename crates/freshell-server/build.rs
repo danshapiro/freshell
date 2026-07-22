@@ -117,5 +117,26 @@ fn rerun_paths() -> Vec<PathBuf> {
         }
     }
 
+    // The git INDEX (worktree-aware via `--git-path`, like `HEAD` above):
+    // observed production staleness this closes -- `buildDirty` is read at
+    // COMPILE time, so with only HEAD/ref/packed-refs watched, a cached
+    // rebuild after `git add` / `git restore --staged` / `git stash` /
+    // `git checkout -- <file>` served the stale flag from an earlier
+    // compile (tree clean, binary still reporting `buildDirty: true`).
+    // Every staging-side dirty<->clean transition rewrites the index, so
+    // watching it restamps those. KNOWN RESIDUAL (documented, not closed):
+    // purely worktree-side transitions -- an UNSTAGED content edit to a
+    // tracked file, or adding/removing an UNTRACKED file -- change no git
+    // metadata file at all, so no `rerun-if-changed` path can observe them;
+    // the stamp lags until the next watched-file change (add/commit/
+    // checkout/stash). `git status`'s own opportunistic stat-cache index
+    // rewrites narrow this window in practice but do not guarantee it away.
+    if let Some(index) = run_git(&["rev-parse", "--git-path", "index"]) {
+        let path = PathBuf::from(index);
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+
     paths
 }

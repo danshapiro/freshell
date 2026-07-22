@@ -268,7 +268,13 @@ the SAME agent conversation from both; terminals/layouts are per-server (differe
    `crates/freshell-server/build.rs`) and `buildDirty` (whether `git status --porcelain` was
    non-empty at that same build time, fail-closed to `true` if git was unavailable at build
    time) -- an operator can confirm exactly which commit + dirty-state a running `:3002` binary
-   was built from without cross-referencing deploy logs. The boot line (`freshell-server
+   was built from without cross-referencing deploy logs. Staleness caveat: `buildDirty` is
+   stamped only when the build script RERUNS; it restamps on HEAD/ref/packed-refs/index changes
+   (commit, checkout, add, restore, stash), but a purely worktree-side transition (an unstaged
+   edit to a tracked file, or adding/removing an untracked file) changes no git metadata file,
+   so a cached rebuild can serve a lagging flag until the next watched-file change -- treat the
+   pre-build dirty-tree guard above (which runs `git status` live) as the deploy gate, and
+   `buildDirty` as post-hoc provenance. The boot line (`freshell-server
    listening on ... [commit <sha>]`) reports the same `commit` value for a same-glance check
    without an authenticated request.
 
