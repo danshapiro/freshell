@@ -41,6 +41,7 @@ pub mod app_server;
 pub mod durability;
 pub mod events;
 mod json_scan;
+pub mod launch_plan;
 pub mod model;
 pub mod protocol;
 pub mod remote_proxy_envelope;
