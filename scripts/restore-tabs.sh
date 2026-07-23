@@ -39,9 +39,13 @@ done
 auth=(-H "x-auth-token: ${TOKEN}")
 
 if $LIST; then
-  curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" | jq -r '
+  resp=$(curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots") || {
+    echo "ERROR: list request failed (URL/token correct? server up?)" >&2
+    exit 1
+  }
+  jq -r '
     .devices[] | .deviceId as $d | .generations[] |
-    "\($d)\tgen=\(.generation)\tid=\(.generationId)\trev=\(.snapshotRevision)\trecords=\(.recordCount)\tcapturedAt=\(.capturedAt)\tlabel=\(.deviceLabel)"'
+    "\($d)\tgen=\(.generation)\tid=\(.generationId)\trev=\(.snapshotRevision)\trecords=\(.recordCount)\tcapturedAt=\(.capturedAt)\tlabel=\(.deviceLabel)"' <<<"$resp"
   exit 0
 fi
 
