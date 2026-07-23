@@ -46,7 +46,7 @@ fn gen_id(dir: &std::path::Path, device: &str, n: usize) -> String {
     let snap = freshell_ws::tabs_persist::read_generation(dir, device, n)
         .unwrap()
         .expect("generation present");
-    freshell_ws::tabs_persist::snapshot_content_id(&snap)
+    freshell_ws::tabs_persist::snapshot_generation_id(&snap)
 }
 
 #[tokio::test]
@@ -187,6 +187,62 @@ async fn unreadable_marker_fails_loud_409() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["markerError"], true);
+}
+
+#[test]
+fn semantically_corrupt_marker_documents_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let dd = device_dir(dir.path(), "dev-1");
+    std::fs::create_dir_all(&dd).unwrap();
+    for bad in [
+        json!({ "version": 99, "sources": {} }),
+        json!({ "version": 2, "sources": { "source": {} } }),
+        json!({ "version": 2, "sources": { "source": { "at": 1 } } }),
+        json!({ "version": 2, "sources": { "source": { "panes": {} } } }),
+        json!({ "version": 2, "sources": { "source": {
+            "at": 1, "panes": { "tab#pane": { "state": "garbage", "terminalId": null } }
+        } } }),
+    ] {
+        std::fs::write(
+            dd.join(RESTORE_MARKER),
+            serde_json::to_vec_pretty(&bad).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            read_marker_doc(&dd).is_err(),
+            "semantically corrupt marker was accepted: {bad}"
+        );
+    }
+}
+
+#[test]
+fn marker_ledger_retention_bounds_sources_and_keeps_the_newest() {
+    let dir = tempfile::tempdir().unwrap();
+    let dd = device_dir(dir.path(), "dev-1");
+    let mut doc = MarkerDoc::new();
+    for n in 0..(MAX_RESTORE_MARKER_SOURCES + 7) {
+        let mut panes = Marker::new();
+        panes.insert(
+            format!("tab-{n}#pane"),
+            PaneMark {
+                state: "restored".into(),
+                terminal_id: Some(format!("terminal-{n}")),
+            },
+        );
+        doc.insert(format!("source-{n:03}"), (n as i64, panes));
+    }
+    write_marker_doc(&dd, &doc).unwrap();
+    let retained = read_marker_doc(&dd).unwrap();
+    assert_eq!(retained.len(), MAX_RESTORE_MARKER_SOURCES);
+    assert!(retained.contains_key(&format!("source-{:03}", MAX_RESTORE_MARKER_SOURCES + 6)));
+    assert!(!retained.contains_key("source-000"));
+
+    // The source currently being updated remains even when it is older than
+    // every other entry; pruning may evict the next-oldest source instead.
+    let mut with_active = doc;
+    prune_marker_doc(&mut with_active, Some("source-000"));
+    assert_eq!(with_active.len(), MAX_RESTORE_MARKER_SOURCES);
+    assert!(with_active.contains_key("source-000"));
 }
 
 #[tokio::test]

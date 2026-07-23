@@ -108,6 +108,7 @@ pub async fn run(
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    ui_screenshot_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -150,6 +151,11 @@ pub async fn run(
             }
         })
     };
+    if ui_screenshot_v1 {
+        state
+            .screenshots
+            .add_capable_client(conn_id, Arc::clone(&conn_sink));
+    }
     // Catastrophic-backpressure monitor: fires if this connection's queued
     // output stays above `catastrophic_buffered_bytes` continuously for
     // `catastrophic_stall_ms` (mirrors `broker.ts`'s `catastrophicBlocked`).
@@ -385,6 +391,9 @@ pub async fn run(
     // Teardown: drop this connection's subscriptions. Terminals KEEP RUNNING as
     // background sessions — a future socket re-attaches. (PTYs are reaped by
     // terminal.kill or, on shutdown, the registry's Drop.)
+    if ui_screenshot_v1 {
+        state.screenshots.remove_capable_client(conn_id);
+    }
     state.registry.remove_connection(conn_id);
 }
 
@@ -595,7 +604,8 @@ async fn handle_client_text(
         // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
         // an already-resolved requestId are dropped inside `resolve`.
         ClientMessage::UiScreenshotResult(result) => {
-            state.screenshots.resolve(
+            state.screenshots.resolve_from(
+                conn_id,
                 &result.request_id,
                 crate::screenshot::ScreenshotResult {
                     ok: result.ok,

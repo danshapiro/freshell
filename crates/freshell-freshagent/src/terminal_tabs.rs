@@ -191,6 +191,24 @@ fn now_ms() -> i64 {
 /// (continuity trio) — restore MUST reuse this exact pipeline because it is the
 /// path that stamps session identity.
 pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value) -> Response {
+    create_terminal_or_content_tab_with_delivery(state, body, true).await
+}
+
+/// Run the ordinary create pipeline but return its `ui.command` instead of
+/// broadcasting it. Snapshot restore uses this to deliver the command to the
+/// exact WebSocket connection selected under its restore lock.
+pub async fn create_terminal_or_content_tab_deferred(
+    state: FreshAgentState,
+    body: Value,
+) -> Response {
+    create_terminal_or_content_tab_with_delivery(state, body, false).await
+}
+
+async fn create_terminal_or_content_tab_with_delivery(
+    state: FreshAgentState,
+    body: Value,
+    broadcast: bool,
+) -> Response {
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
     // Continuity trio (`tabs_snapshots.rs:632`): a restore-driven create tags
     // itself with a deterministic `restoreKey` so a restore RETRY can reconcile
@@ -216,6 +234,7 @@ pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value)
                 "devToolsOpen": body.get("devToolsOpen").and_then(Value::as_bool).unwrap_or(false),
             }),
             restore_key.as_deref(),
+            broadcast,
         );
     }
     if let Some(file_path) = body.get("editor").and_then(Value::as_str) {
@@ -237,9 +256,10 @@ pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value)
                 "wordWrap": body.get("wordWrap").and_then(Value::as_bool).unwrap_or(true),
             }),
             restore_key.as_deref(),
+            broadcast,
         );
     }
-    create_terminal_tab(&state, name, &body, restore_key.as_deref()).await
+    create_terminal_tab(&state, name, &body, restore_key.as_deref(), broadcast).await
 }
 
 /// The "cheap" content kinds (`router.ts:720-723`): no process, no rollback
@@ -250,6 +270,7 @@ fn create_content_tab(
     kind: &str,
     pane_content: Value,
     restore_key: Option<&str>,
+    broadcast: bool,
 ) -> Response {
     let tab_id = Uuid::new_v4().to_string();
     let pane_id = Uuid::new_v4().to_string();
@@ -287,7 +308,7 @@ fn create_content_tab(
         );
     }
 
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+    let command = ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(json!({
             "id": tab_id,
@@ -295,42 +316,16 @@ fn create_content_tab(
             "paneId": pane_id,
             "paneContent": pane_content,
         })),
-    }));
-
-    ok_json(json!({ "tabId": tab_id, "paneId": pane_id }), "tab created")
-}
-
-/// `SHELL` env var, else `/bin/bash` -- the Linux default-shell fallback
-/// (`getSystemShell`, `terminal-registry.ts`). Slice 1 scope note (UNCHANGED
-/// by Slice 3a -- only the `mode != "shell"` path below gains full argv
-/// fidelity): this port does NOT reproduce the original's
-/// `{system,cmd,powershell,wsl}` x `{Linux,WSL,Windows}` resolution matrix for
-/// SHELL-mode terminals (`freshell_platform::build_spawn_spec` covers that
-/// fully, but wiring its `Env`/`FileProbe` injection here is out of this
-/// slice's bounded scope) -- every requested `shell` value launches the
-/// host's default shell. Acceptable because the QA lever's shell mode only
-/// needs A real interactive shell, not shell-type fidelity.
-fn shell_spawn_spec(cwd: Option<&str>) -> SpawnSpec {
-    let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    SpawnSpec {
-        program,
-        args: vec![],
-        env_overrides: BTreeMap::new(),
-        cwd: cwd.map(str::to_string),
-        cols: 120,
-        rows: 30,
+    });
+    if broadcast {
+        state.broadcast(&command);
     }
-}
 
-/// The child env: parent env minus `STRIP_ENV` (`buildSpawnSpec`,
-/// `terminal-registry.ts:1083-1097` -- never leak the server's own secrets
-/// (`AUTH_TOKEN`, etc.) into a spawned shell).
-fn build_shell_env() -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    for key in freshell_platform::spawn::STRIP_ENV {
-        env.remove(*key);
+    let mut data = json!({ "tabId": tab_id, "paneId": pane_id });
+    if !broadcast {
+        data["uiCommand"] = serde_json::to_value(command).expect("UiCommand serializes");
     }
-    env
+    ok_json(data, "tab created")
 }
 
 /// `getModeLabel` (`terminal-registry.ts:439-443`, mirrored from
@@ -639,8 +634,26 @@ pub(crate) async fn spawn_terminal_pane(
     let child_env: BTreeMap<String, String>;
 
     if mode == "shell" {
-        spec = shell_spawn_spec(cwd.as_deref());
-        child_env = build_shell_env();
+        let host_os = host_os_live();
+        let is_wsl = is_wsl_env_live();
+        let shell_type = shell_str
+            .as_deref()
+            .and_then(ShellType::parse)
+            .unwrap_or(ShellType::System);
+        let overrides =
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
+        spec = build_spawn_spec(
+            shell_type,
+            host_os,
+            is_wsl,
+            cwd.as_deref(),
+            &RealEnv,
+            &RealFileProbe,
+            &overrides,
+            None,
+            None,
+        );
+        child_env = freshell_terminal::build_child_env_from_process(&spec);
     } else {
         let host_os = host_os_live();
         let is_wsl = is_wsl_env_live();
@@ -999,6 +1012,7 @@ async fn create_terminal_tab(
     name: Option<String>,
     body: &Value,
     restore_key: Option<&str>,
+    broadcast: bool,
 ) -> Response {
     // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
     // `layoutStore.createTab()` before `registry.create()`) so the CLI env
@@ -1087,15 +1101,19 @@ async fn create_terminal_tab(
         );
     }
 
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+    let command = ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(payload),
-    }));
+    });
+    if broadcast {
+        state.broadcast(&command);
+    }
 
-    ok_json(
-        json!({ "tabId": tab_id, "paneId": pane_id, "terminalId": terminal_id }),
-        "tab created",
-    )
+    let mut data = json!({ "tabId": tab_id, "paneId": pane_id, "terminalId": terminal_id });
+    if !broadcast {
+        data["uiCommand"] = serde_json::to_value(command).expect("UiCommand serializes");
+    }
+    ok_json(data, "tab created")
 }
 
 // ── GET /api/tabs ───────────────────────────────────────────────────────────
@@ -1897,6 +1915,79 @@ mod tests {
             capture_text.contains("FRESHELL_SLICE1_MARKER"),
             "capture must contain the echoed marker: {capture_text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_powershell_shell_spawns_the_configured_powershell_program_on_wsl() {
+        if !is_wsl_env_live() {
+            return;
+        }
+        let _env_guard = crate::codex::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = std::env::var_os("POWERSHELL_EXE");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var("POWERSHELL_EXE", value) },
+                    None => unsafe { std::env::remove_var("POWERSHELL_EXE") },
+                }
+            }
+        }
+        let _restore = RestoreEnv(prior);
+
+        let temp = unique_temp_home("powershell-shell");
+        let fake_powershell = temp.join("fake-powershell");
+        std::fs::write(
+            &fake_powershell,
+            "#!/bin/sh\nprintf 'REQUESTED_POWERSHELL_SPAWNED\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_powershell).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_powershell, permissions).unwrap();
+        unsafe { std::env::set_var("POWERSHELL_EXE", &fake_powershell) };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let state = state_with_registry();
+            let registry = state.terminal_registry.clone().unwrap();
+            let (status, body) = post(
+                app(state),
+                "/api/tabs",
+                json!({ "mode": "shell", "shell": "powershell", "cwd": "/tmp" }),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let terminal_id = body["data"]["terminalId"].as_str().unwrap();
+
+            let mut snapshot = String::new();
+            for _ in 0..50 {
+                snapshot = registry
+                    .directory()
+                    .into_iter()
+                    .find(|entry| entry.terminal_id == terminal_id)
+                    .map(|entry| entry.snapshot)
+                    .unwrap_or_default();
+                if snapshot.contains("REQUESTED_POWERSHELL_SPAWNED") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                snapshot.contains("REQUESTED_POWERSHELL_SPAWNED"),
+                "requested PowerShell executable did not run; snapshot: {snapshot:?}"
+            );
+            assert!(registry.kill(terminal_id));
+        });
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

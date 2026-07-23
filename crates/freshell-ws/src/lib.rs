@@ -530,19 +530,14 @@ async fn handle_socket(
         .unwrap_or(false);
 
     // `capabilities.uiScreenshotV1` (`ws-handler.ts:1846`) marks this socket as able
-    // to answer a `screenshot.capture` command. Count it for the life of the
-    // connection so `POST /api/screenshots` knows a capable UI exists; decrement on
-    // disconnect. The oracle's T0/T1 capture clients send no such capability, so this
-    // stays a no-op on the graded paths.
+    // to answer a `screenshot.capture` command. `terminal::run` registers the
+    // connection's id + direct sink for its lifetime, allowing restore to bind both
+    // tab delivery and acknowledgement to this exact socket.
     let ui_screenshot_v1 = value
         .get("capabilities")
         .and_then(|c| c.get("uiScreenshotV1"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if ui_screenshot_v1 {
-        state.screenshots.add_capable_client();
-    }
-
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
     terminal::run(
@@ -550,13 +545,10 @@ async fn handle_socket(
         &state,
         bcast_rx,
         terminal_output_batch_v1,
+        ui_screenshot_v1,
         origin_kind,
     )
     .await;
-
-    if ui_screenshot_v1 {
-        state.screenshots.remove_capable_client();
-    }
 }
 
 /// WS close codes (`ws-handler.ts`'s `CLOSE_CODES`). S3: the original always

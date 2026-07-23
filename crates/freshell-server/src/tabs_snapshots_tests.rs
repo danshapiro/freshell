@@ -6,7 +6,7 @@ use super::*;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
@@ -304,49 +304,41 @@ fn mixed_records() -> Vec<Value> {
     ]
 }
 
-// The in-process "browser": subscribes to the SAME broadcast bus the restore
-// broadcasts on and answers every `screenshot.capture` (the delivery ack) while
-// `on` is true. This is a REAL WS receiver (not a counter): a resolved reply is
-// exactly what proves the client received the earlier in-order `tab.create`.
-// Subscribing synchronously before returning means frames are buffered, so the
-// task can never miss the first capture.
-fn spawn_browser(r: &Rig, on: std::sync::Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
-    r.state.screenshots.add_capable_client();
-    let mut rx = r.bus.subscribe();
+// The in-process "browser" registers the same per-connection sink a real WS
+// connection does and answers every targeted `screenshot.capture` while `on`
+// is true. The connection id is carried into `resolve_from`, so another
+// browser cannot acknowledge this target's restore.
+fn spawn_browser(r: &Rig, on: std::sync::Arc<AtomicBool>) -> u64 {
+    static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
     let broker = r.state.screenshots.clone();
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(frame) => {
-                    if !on.load(Ordering::SeqCst) {
-                        continue; // silent -> ack times out
-                    }
-                    let v: Value = match serde_json::from_str(&frame) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if v["type"] == "ui.command" && v["command"] == "screenshot.capture" {
-                        if let Some(rid) = v["payload"]["requestId"].as_str() {
-                            broker.resolve(
-                                rid,
-                                freshell_ws::screenshot::ScreenshotResult {
-                                    ok: true,
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break, // sender dropped
+    let observed = r.bus.clone();
+    r.state.screenshots.add_capable_client(
+        client_id,
+        std::sync::Arc::new(move |message| {
+            if !on.load(Ordering::SeqCst) {
+                return;
             }
-        }
-    })
+            let v = serde_json::to_value(message).expect("server message serializes");
+            let _ = observed.send(v.to_string());
+            if v["type"] == "ui.command" && v["command"] == "screenshot.capture" {
+                if let Some(request_id) = v["payload"]["requestId"].as_str() {
+                    broker.resolve_from(
+                        client_id,
+                        request_id,
+                        freshell_ws::screenshot::ScreenshotResult {
+                            ok: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }),
+    );
+    client_id
 }
 // A rig with exactly one connected, RESPONSIVE browser.
-fn connected(
-    dir: &std::path::Path,
-) -> (Rig, std::sync::Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+fn connected(dir: &std::path::Path) -> (Rig, std::sync::Arc<AtomicBool>, u64) {
     let r = rig(dir);
     let on = std::sync::Arc::new(AtomicBool::new(true));
     let h = spawn_browser(&r, on.clone());
@@ -378,7 +370,7 @@ async fn restore_rebuilds_supported_panes_and_reports_skips() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["broadcastScope"], "all-connected-clients");
+    assert_eq!(body["broadcastScope"], "target-client");
     assert_eq!(
         body["deliveryConfirmed"], true,
         "single responsive browser acked every tab.create"
@@ -400,6 +392,201 @@ async fn restore_rebuilds_supported_panes_and_reports_skips() {
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0]["reason"], "unsupported-kind");
     assert_eq!(body["failed"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn restore_rejects_non_boolean_control_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "browser",
+            json!({ "url": "https://example.com" }),
+        )],
+    );
+    for (field, value) in [
+        ("dryRun", json!("true")),
+        ("dryRun", json!(1)),
+        ("dryRun", Value::Null),
+        ("force", json!("true")),
+        ("force", json!(1)),
+        ("force", Value::Null),
+    ] {
+        let mut request = json!({ "deviceId": "dev-1", "dryRun": true });
+        request[field] = value;
+        let (status, body) = post(
+            router(test_state(dir.path())),
+            "/api/tabs-sync/restore",
+            request,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+        assert_eq!(
+            body["error"],
+            format!("{field} must be a boolean"),
+            "{field}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dry_run_reads_and_classifies_the_restore_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "browser",
+            json!({ "url": "https://example.com" }),
+        )],
+    );
+    let (connected_rig, _on, _client) = connected(dir.path());
+    let (_, first) = post(
+        router(connected_rig.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await;
+    assert_eq!(first["restored"].as_array().unwrap().len(), 1, "{first}");
+
+    let (_, preview) = post(
+        router(test_state(dir.path())),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "dryRun": true }),
+        true,
+    )
+    .await;
+    assert_eq!(
+        preview["restored"].as_array().unwrap().len(),
+        0,
+        "{preview}"
+    );
+    assert_eq!(preview["skipped"][0]["reason"], "already-restored");
+
+    let marker_path = dir
+        .path()
+        .join(freshell_ws::tabs_persist::encode_device_id("dev-1").unwrap())
+        .join(RESTORE_MARKER);
+    let mut marker = marker_json(dir.path(), "dev-1");
+    let pane = marker["sources"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap()["panes"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    pane["state"] = json!("in-progress");
+    std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+    let (_, reconciled) = post(
+        router(connected_rig.state),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "dryRun": true }),
+        true,
+    )
+    .await;
+    assert_eq!(
+        reconciled["restored"][0]["reconciled"], true,
+        "{reconciled}"
+    );
+
+    let (_, unconfirmed) = post(
+        router(test_state(dir.path())),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "dryRun": true }),
+        true,
+    )
+    .await;
+    assert_eq!(
+        unconfirmed["failed"][0]["reason"], "in-progress-unconfirmed",
+        "{unconfirmed}"
+    );
+
+    std::fs::write(&marker_path, b"{corrupt").unwrap();
+    let (status, corrupt) = post(
+        router(test_state(dir.path())),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "dryRun": true }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{corrupt}");
+    assert_eq!(corrupt["markerError"], true);
+}
+
+#[tokio::test]
+async fn connection_churn_cannot_redirect_delivery_or_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "browser",
+            json!({ "url": "https://example.com" }),
+        )],
+    );
+    let r = rig(dir.path());
+    let target_id = 71;
+    let late_id = 72;
+    let broker = r.state.screenshots.clone();
+    let late_frames = std::sync::Arc::new(AtomicUsize::new(0));
+    let late_frames_for_sink = late_frames.clone();
+    r.state.screenshots.add_capable_client(
+        target_id,
+        std::sync::Arc::new(move |message| {
+            let value = serde_json::to_value(message).unwrap();
+            if value["command"] == "tab.create" {
+                let late_frames = late_frames_for_sink.clone();
+                broker.add_capable_client(
+                    late_id,
+                    std::sync::Arc::new(move |_| {
+                        late_frames.fetch_add(1, Ordering::SeqCst);
+                    }),
+                );
+            }
+            if value["command"] == "screenshot.capture" {
+                let request_id = value["payload"]["requestId"].as_str().unwrap();
+                // A late client guesses the request id, but cannot satisfy the
+                // target-bound pending request.
+                broker.resolve_from(
+                    late_id,
+                    request_id,
+                    freshell_ws::screenshot::ScreenshotResult {
+                        ok: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }),
+    );
+
+    let (status, body) = post(
+        router(r.state),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restored"].as_array().unwrap().len(), 0, "{body}");
+    assert_eq!(body["failed"][0]["reason"], "delivery-unconfirmed");
+    assert_eq!(late_frames.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -524,7 +711,9 @@ async fn restore_refuses_unless_exactly_one_browser_connected() {
     let two = rig(dir.path());
     let on2 = std::sync::Arc::new(AtomicBool::new(true));
     let _h2 = spawn_browser(&two, on2); // count -> 1 (responsive)
-    two.state.screenshots.add_capable_client(); // count -> 2
+    two.state
+        .screenshots
+        .add_capable_client(9_999_999, std::sync::Arc::new(|_| {})); // count -> 2
     let (status, body) = post(
         router(two.state.clone()),
         "/api/tabs-sync/restore",

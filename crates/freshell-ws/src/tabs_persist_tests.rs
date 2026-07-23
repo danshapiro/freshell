@@ -463,7 +463,7 @@ fn global_per_device_cap_holds_across_rotating_client_ids() {
 }
 
 #[test]
-fn content_id_is_stable_and_selects_the_right_generation() {
+fn generation_id_is_stable_and_selects_the_right_generation() {
     let dir = tempfile::tempdir().unwrap();
     put(
         dir.path(),
@@ -482,11 +482,11 @@ fn content_id_is_stable_and_selects_the_right_generation() {
         vec![codex_pane_record("dev:t", "sess-new", 2)],
     );
     let old = gen_n(dir.path(), "dev", 1).unwrap();
-    let id = snapshot_content_id(&old);
+    let id = snapshot_generation_id(&old);
     // Stable: recomputing over the re-read file yields the same id.
     assert_eq!(
         id,
-        snapshot_content_id(&gen_n(dir.path(), "dev", 1).unwrap())
+        snapshot_generation_id(&gen_n(dir.path(), "dev", 1).unwrap())
     );
     // Selecting by id returns the OLD generation regardless of index shifts.
     let by_id = gen_by_id(dir.path(), "dev", &id).unwrap();
@@ -682,8 +682,8 @@ fn union_by_ids_restores_the_multi_client_bundle_not_a_single_client() {
         1001,
         vec![codex_pane_record("dev:tabB", "sess-B", 1)],
     );
-    let a_id = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
-    let b_id = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientB"));
+    let a_id = snapshot_generation_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
+    let b_id = snapshot_generation_id(&gen_by_id_scan(dir.path(), "dev", "clientB"));
     let both = match read_generations_union_by_ids(dir.path(), "dev", &[a_id.clone(), b_id.clone()])
         .unwrap()
     {
@@ -728,7 +728,7 @@ fn union_by_ids_fails_loud_when_any_requested_component_is_missing() {
         1000,
         vec![codex_pane_record("dev:tabA", "sess-A", 1)],
     );
-    let present = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
+    let present = snapshot_generation_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
     let pruned = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
     match read_generations_union_by_ids(dir.path(), "dev", &[present.clone(), pruned.clone()])
         .unwrap()
@@ -740,6 +740,59 @@ fn union_by_ids_fails_loud_when_any_requested_component_is_missing() {
             panic!("one-pruned-one-present must fail loudly, got partial union {v}")
         }
     }
+}
+
+#[test]
+fn union_by_ids_resolves_exact_generation_files_when_digests_repeat_across_clients() {
+    // Regression: generation ids used to hash only `records`. After client A/X
+    // and client B/Y were captured, a later A/Y file shared B/Y's id. Filtering
+    // by those two record digests selected all three files, then newest-per-client
+    // displaced A/X with A/Y and silently omitted X from the restored bundle.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        1,
+        1000,
+        vec![open_record("dev:x", "X", 1)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "clientB",
+        1,
+        1001,
+        vec![open_record("dev:y", "Y", 1)],
+    );
+    let a_x = gen_by_id_scan(dir.path(), "dev", "clientA");
+    let b_y = gen_by_id_scan(dir.path(), "dev", "clientB");
+    let a_x_id = snapshot_generation_id(&a_x);
+    let b_y_id = snapshot_generation_id(&b_y);
+
+    // Reuse B's records under A in a later generation. The two files have the
+    // same record content but are distinct immutable generations.
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        2,
+        2000,
+        b_y["records"].as_array().unwrap().clone(),
+    );
+
+    let restored =
+        match read_generations_union_by_ids(dir.path(), "dev", &[a_x_id, b_y_id]).unwrap() {
+            ComponentsUnion::Found(v) => v,
+            ComponentsUnion::Missing(m) => panic!("captured files still exist: {m:?}"),
+        };
+    let keys: Vec<&str> = restored["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["tabKey"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["dev:x", "dev:y"]);
 }
 
 #[test]
@@ -843,4 +896,86 @@ fn corrupt_generation_file_reads_as_error_not_absence() {
         read_device_union(dir.path(), "ghost").unwrap().is_none(),
         "absent device is Ok(None)"
     );
+}
+
+#[test]
+fn semantically_corrupt_generation_files_fail_loud() {
+    fn assert_corrupt(mut mutate: impl FnMut(&mut Value)) {
+        let dir = tempfile::tempdir().unwrap();
+        put(
+            dir.path(),
+            "dev",
+            "c1",
+            1,
+            1000,
+            vec![open_record("dev:t", "t", 1)],
+        );
+        let file = list_generations(dir.path(), "dev", "c1")
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        mutate(&mut value);
+        std::fs::write(&file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert!(read_device_union(dir.path(), "dev").is_err(), "{value}");
+        assert!(read_generation(dir.path(), "dev", 0).is_err(), "{value}");
+        assert!(list_snapshot_devices(dir.path()).is_err(), "{value}");
+    }
+
+    for field in [
+        "deviceId",
+        "deviceLabel",
+        "capturedAt",
+        "clientInstanceId",
+        "serverInstanceId",
+        "snapshotRevision",
+        "records",
+    ] {
+        assert_corrupt(|v| {
+            v.as_object_mut().unwrap().remove(field);
+        });
+    }
+    for (field, bad) in [
+        ("deviceId", json!(7)),
+        ("deviceLabel", json!(false)),
+        ("capturedAt", json!("1000")),
+        ("clientInstanceId", json!(false)),
+        ("serverInstanceId", json!(7)),
+        ("snapshotRevision", json!(1.5)),
+        ("records", json!({})),
+    ] {
+        assert_corrupt(|v| v[field] = bad.clone());
+    }
+    for field in [
+        "revision",
+        "updatedAt",
+        "tabKey",
+        "tabId",
+        "tabName",
+        "status",
+        "paneCount",
+        "panes",
+    ] {
+        assert_corrupt(|v| {
+            v["records"][0].as_object_mut().unwrap().remove(field);
+        });
+    }
+    for (field, bad) in [
+        ("revision", json!("1")),
+        ("updatedAt", json!(false)),
+        ("tabKey", json!(9)),
+        ("tabId", json!(9)),
+        ("tabName", json!({})),
+        ("status", json!("closed")),
+        ("paneCount", json!("0")),
+        ("panes", json!({})),
+    ] {
+        assert_corrupt(|v| v["records"][0][field] = bad.clone());
+    }
+
+    assert_corrupt(|v| {
+        v["records"][0]["panes"] = json!([{ "paneId": "p1", "kind": "terminal" }]);
+    });
 }

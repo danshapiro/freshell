@@ -3,6 +3,7 @@
 //! keep that module under the port/AGENTS.md:81 1,000-line-per-file limit.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -60,20 +61,151 @@ fn canonicalize(v: &Value) -> Value {
     }
 }
 
-/// Stable, key-order-independent, COLLISION-RESISTANT content digest of a
-/// snapshot: SHA-256 over the CANONICAL serialization of its `records`, truncated
-/// to 32 lower-hex chars (128 bits). Used as a generation's `generationId`, the
-/// restore marker's `sourceId`, and the restore-by-id key — so nothing is ever
-/// referenced by a shifting positional index, two semantically-equal records
-/// hash identically regardless of key order, and distinct content never collides
-/// on a recovery-selection key (a 64-bit FNV digest over raw `preserve_order`
-/// bytes was too weak AND not order-stable — both defects are fixed here).
+/// Stable, key-order-independent, collision-resistant identity of a selected
+/// snapshot's record content. Restore markers use this as their `sourceId`, so
+/// semantically equal selected snapshots share idempotency history. Individual
+/// generation files and restore-by-id selectors use [`snapshot_generation_id`]
+/// instead, because a records-only digest cannot identify an immutable file.
 pub fn snapshot_content_id(snap: &Value) -> String {
+    digest_value(&snap.get("records").cloned().unwrap_or(Value::Null))
+}
+
+/// Stable identity of one immutable on-disk generation file. Unlike
+/// [`snapshot_content_id`], this covers the complete persisted document, so
+/// two clients (or two ordered generations for one client) that happen to
+/// publish identical `records` remain distinct bundle components.
+pub fn snapshot_generation_id(snap: &Value) -> String {
+    digest_value(snap)
+}
+
+fn digest_value(value: &Value) -> String {
     use sha2::{Digest, Sha256};
-    let records = snap.get("records").cloned().unwrap_or(Value::Null);
-    let bytes = serde_json::to_vec(&canonicalize(&records)).unwrap_or_default();
+    let bytes = serde_json::to_vec(&canonicalize(value)).unwrap_or_default();
     let digest = Sha256::digest(&bytes);
     digest[..16].iter().map(|b| format!("{b:02x}")).collect() // 16 bytes = 128 bits
+}
+
+fn corrupt_generation(path: &Path, why: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("corrupt snapshot generation {}: {why}", path.display()),
+    )
+}
+
+/// Validate the persisted schema before any reader indexes, unions, or reports
+/// a generation. Snapshot files are recovery material: syntactically-valid JSON
+/// with missing/wrongly-typed identity, ordering, or record fields must fail
+/// loudly rather than defaulting to an empty/zero-valued successful restore.
+fn validate_generation(path: &Path, value: &Value) -> std::io::Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| corrupt_generation(path, "top-level value is not an object"))?;
+    let required_nonempty_string = |owner: &Value, field: &str| {
+        owner
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|_| ())
+            .ok_or_else(|| {
+                corrupt_generation(path, format!("`{field}` must be a non-empty string"))
+            })
+    };
+    required_nonempty_string(value, "deviceId")?;
+    required_nonempty_string(value, "clientInstanceId")?;
+    required_nonempty_string(value, "serverInstanceId")?;
+    object
+        .get("deviceLabel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| corrupt_generation(path, "`deviceLabel` must be a string"))?;
+    for field in ["capturedAt", "snapshotRevision"] {
+        object
+            .get(field)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| corrupt_generation(path, format!("`{field}` must be an integer")))?;
+    }
+    let records = object
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| corrupt_generation(path, "`records` must be an array"))?;
+    for (record_index, record) in records.iter().enumerate() {
+        let record_object = record.as_object().ok_or_else(|| {
+            corrupt_generation(path, format!("`records[{record_index}]` must be an object"))
+        })?;
+        required_nonempty_string(record, "tabKey")?;
+        required_nonempty_string(record, "tabId")?;
+        record_object
+            .get("tabName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                corrupt_generation(
+                    path,
+                    format!("`records[{record_index}].tabName` must be a string"),
+                )
+            })?;
+        if record_object.get("status").and_then(Value::as_str) != Some("open") {
+            return Err(corrupt_generation(
+                path,
+                format!("`records[{record_index}].status` must be `open`"),
+            ));
+        }
+        for field in ["revision", "updatedAt"] {
+            record_object
+                .get(field)
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    corrupt_generation(
+                        path,
+                        format!("`records[{record_index}].{field}` must be an integer"),
+                    )
+                })?;
+        }
+        record_object
+            .get("paneCount")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                corrupt_generation(
+                    path,
+                    format!("`records[{record_index}].paneCount` must be an integer"),
+                )
+            })?;
+        let panes = record_object
+            .get("panes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                corrupt_generation(
+                    path,
+                    format!("`records[{record_index}].panes` must be an array"),
+                )
+            })?;
+        for (pane_index, pane) in panes.iter().enumerate() {
+            if !pane.is_object() {
+                return Err(corrupt_generation(
+                    path,
+                    format!("`records[{record_index}].panes[{pane_index}]` must be an object"),
+                ));
+            }
+            required_nonempty_string(pane, "paneId")?;
+            required_nonempty_string(pane, "kind")?;
+            pane.get("payload")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    corrupt_generation(
+                        path,
+                        format!(
+                            "`records[{record_index}].panes[{pane_index}].payload` must be an object"
+                        ),
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn read_generation_file(path: &Path) -> std::io::Result<Value> {
+    let text = std::fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&text).map_err(|e| corrupt_generation(path, e))?;
+    validate_generation(path, &value)?;
+    Ok(value)
 }
 
 /// The device dir, guaranteed to be a direct child of `<dir>` (belt-and-suspenders
@@ -144,14 +276,11 @@ fn all_generations_parsed(
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let text = std::fs::read_to_string(&path)?; // IO error on an existing file -> Err
-        let v: Value = serde_json::from_str(&text).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("corrupt snapshot generation {}: {e}", path.display()),
-            )
-        })?;
-        let captured = v.get("capturedAt").and_then(Value::as_i64).unwrap_or(0);
+        let v = read_generation_file(&path)?;
+        let captured = v
+            .get("capturedAt")
+            .and_then(Value::as_i64)
+            .expect("validated capturedAt");
         files.push((captured, path, v));
     }
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
@@ -183,16 +312,13 @@ fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
             .map(|f| f.path())
             .find(|p| p.extension().is_some_and(|x| x == "json"));
         if let Some(p) = first_json {
-            let text = std::fs::read_to_string(&p)?;
-            let v: Value = serde_json::from_str(&text).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("corrupt snapshot generation {}: {e}", p.display()),
-                )
-            })?;
-            if let Some(id) = v.get("deviceId").and_then(Value::as_str) {
-                ids.push(id.to_string());
-            }
+            let v = read_generation_file(&p)?;
+            ids.push(
+                v.get("deviceId")
+                    .and_then(Value::as_str)
+                    .expect("validated deviceId")
+                    .to_string(),
+            );
         }
     }
     ids.sort();
@@ -216,8 +342,9 @@ pub fn read_generation(
     })
 }
 
-/// The single point-in-time file whose content digest == `generation_id`
-/// (stable across file additions/removals, unlike the positional index).
+/// The single point-in-time file whose immutable generation digest ==
+/// `generation_id` (stable across file additions/removals and distinct across
+/// clients/order metadata, unlike a records-only digest or positional index).
 /// `Ok(None)` if no file matches, `Err` on IO/parse.
 pub fn read_generation_by_id(
     dir: &Path,
@@ -228,7 +355,7 @@ pub fn read_generation_by_id(
         Ok(all_generations_parsed(dir, device_id)?
             .into_iter()
             .map(|(_, _, v)| v)
-            .find(|v| snapshot_content_id(v) == generation_id))
+            .find(|v| snapshot_generation_id(v) == generation_id))
     })
 }
 
@@ -258,19 +385,24 @@ pub fn read_generations_union_by_ids(
     ids: &[String],
 ) -> std::io::Result<ComponentsUnion> {
     with_persist_lock(|| {
-        let want: std::collections::HashSet<String> = ids.iter().cloned().collect();
-        let picked: Vec<(i64, PathBuf, Value)> = all_generations_parsed(dir, device_id)?
-            .into_iter()
-            .filter(|(_, _, v)| want.contains(&snapshot_content_id(v)))
-            .collect();
-        let found: std::collections::HashSet<String> = picked
-            .iter()
-            .map(|(_, _, v)| snapshot_content_id(v))
-            .collect();
+        let mut available: HashMap<String, (i64, PathBuf, Value)> =
+            all_generations_parsed(dir, device_id)?
+                .into_iter()
+                .map(|generation| (snapshot_generation_id(&generation.2), generation))
+                .collect();
+        let mut picked = Vec::new();
         let mut missing: Vec<String> = Vec::new();
         for id in ids {
-            if !found.contains(id) && !missing.contains(id) {
-                missing.push(id.clone());
+            if picked
+                .iter()
+                .any(|(_, _, value)| snapshot_generation_id(value) == *id)
+            {
+                continue;
+            }
+            match available.remove(id) {
+                Some(generation) => picked.push(generation),
+                None if !missing.contains(id) => missing.push(id.clone()),
+                None => {}
             }
         }
         if !missing.is_empty() {
@@ -334,7 +466,9 @@ fn union_of_newest_per_client(
     }
     let label_src = newest
         .values()
-        .max_by(|a, b| (a.0, snapshot_content_id(&a.2)).cmp(&(b.0, snapshot_content_id(&b.2))))
+        .max_by(|a, b| {
+            (a.0, snapshot_generation_id(&a.2)).cmp(&(b.0, snapshot_generation_id(&b.2)))
+        })
         .map(|(_, _, v)| v.clone())
         .unwrap_or(Value::Null);
     // A record's dedupe rank: `(revision, updatedAt, clientInstanceId, generationId)`.
@@ -356,7 +490,7 @@ fn union_of_newest_per_client(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let src_gen = snapshot_content_id(snap);
+        let src_gen = snapshot_generation_id(snap);
         for rec in snap
             .get("records")
             .and_then(Value::as_array)
@@ -432,7 +566,7 @@ fn read_device_overview_locked(
         .map(|(n, (captured, _, v))| {
             json!({
                 "generation": n,
-                "generationId": snapshot_content_id(v),
+                "generationId": snapshot_generation_id(v),
                 "capturedAt": captured,
                 "snapshotRevision": v.get("snapshotRevision").cloned().unwrap_or(Value::Null),
                 "deviceLabel": v.get("deviceLabel").cloned().unwrap_or(Value::Null),
@@ -482,6 +616,38 @@ static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn with_persist_lock<T>(f: impl FnOnce() -> T) -> T {
     let _guard = PERSIST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     f()
+}
+
+/// Durably replace `destination` with `bytes`: write + `sync_all` the temporary
+/// file, rename it atomically, then `sync_all` the parent directory so the new
+/// name survives a power/kernel failure. Callers choose a sibling temp name
+/// that their orphan sweep can recognize.
+pub fn atomic_write_durable(
+    destination: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("destination has no parent: {}", destination.display()),
+        )
+    })?;
+    if temporary.parent() != Some(parent) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic-write temporary file must be a sibling of the destination",
+        ));
+    }
+    std::fs::create_dir_all(parent)?;
+    let mut file = std::fs::File::create(temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(temporary, destination)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Remove any orphaned `.tmp` files a crashed write left behind in this device
@@ -561,8 +727,7 @@ pub(crate) fn persist_generation(
         sweep_orphan_tmp(&device_dir);
         let name = format!("{client_enc}-{captured_at:020}-r{snapshot_revision:012}.json");
         let tmp = device_dir.join(format!(".{name}.tmp"));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, device_dir.join(&name))?;
+        atomic_write_durable(&device_dir.join(&name), &tmp, &bytes)?;
         // Per-client prune: keep newest MAX_SNAPSHOT_GENERATIONS for THIS client.
         let mut client_files: Vec<PathBuf> = std::fs::read_dir(&device_dir)?
             .flatten()

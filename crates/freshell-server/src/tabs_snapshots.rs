@@ -192,9 +192,11 @@ async fn get_snapshot(
 
 #[path = "tabs_snapshots_marker.rs"]
 mod marker_mod;
-use marker_mod::{read_marker_doc, write_marker_doc, Marker, MarkerDoc, PaneMark};
+use marker_mod::{
+    prune_marker_doc, read_marker_doc, write_marker_doc, Marker, MarkerDoc, PaneMark,
+};
 #[cfg(test)]
-use marker_mod::{RESTORE_MARKER, RESTORE_MARKER_TMP};
+use marker_mod::{MAX_RESTORE_MARKER_SOURCES, RESTORE_MARKER, RESTORE_MARKER_TMP};
 
 /// Map one snapshot pane to its `POST /api/tabs` body, or Err(reason). A terminal
 /// pane whose `sessionRef` is present-but-invalid (not an object, missing a
@@ -325,6 +327,7 @@ async fn persist_marker(
 ) -> std::io::Result<()> {
     let Some(dd) = device_dir else { return Ok(()) };
     doc.insert(source_id.to_string(), (at, panes.clone()));
+    prune_marker_doc(doc, Some(source_id));
     let (dd, doc) = (dd.to_path_buf(), doc.clone());
     match tokio::task::spawn_blocking(move || {
         freshell_ws::tabs_persist::with_persist_lock(|| write_marker_doc(&dd, &doc))
@@ -336,26 +339,50 @@ async fn persist_marker(
     }
 }
 
-/// Delivery ack: broadcast a `screenshot.capture` to the (single) target client
-/// and await ANY reply within `timeout`. A reply proves the client received every
+/// Delivery ack: send `screenshot.capture` to the selected target connection
+/// and await a reply from that same connection within `timeout`. A reply proves the client received every
 /// earlier in-order frame (incl. this pane's `tab.create`); a timeout means the
 /// connection dropped/stalled. The request id carries the caller's PER-ATTEMPT
 /// `nonce` (`restore-ack:{nonce}:{paneKey}`), so a stale reply from a
 /// timed-out earlier attempt (same paneKey, different nonce) can never resolve
 /// a later attempt's registration (`:403`). Returns `true` iff delivery was
 /// confirmed.
-async fn confirm_delivery(state: &TabsSnapshotsState, nonce: &str, pane_key: &str) -> bool {
+async fn confirm_delivery(
+    state: &TabsSnapshotsState,
+    target_client_id: u64,
+    nonce: &str,
+    pane_key: &str,
+) -> bool {
     let request_id = format!("restore-ack:{nonce}:{pane_key}");
-    let rx = state.screenshots.register(request_id.clone());
-    state
+    let rx = state
         .screenshots
-        .send_capture(&request_id, "view", None, None);
+        .register_for_client(request_id.clone(), target_client_id);
+    if !state
+        .screenshots
+        .send_capture_to(target_client_id, &request_id, "view", None, None)
+    {
+        state.screenshots.cancel(&request_id);
+        return false;
+    }
     match tokio::time::timeout(state.restore_ack_timeout, rx).await {
         Ok(_) => true, // ANY resolve (ok OR error) == received
         Err(_) => {
             state.screenshots.cancel(&request_id);
             false
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn optional_bool(body: &Value, field: &str) -> Result<bool, Response> {
+    match body.get(field) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("{field} must be a boolean") })),
+        )
+            .into_response()),
     }
 }
 
@@ -377,18 +404,14 @@ async fn restore_tabs(
                 .into_response()
         }
     };
-    let dry_run = body.get("dryRun").and_then(Value::as_bool).unwrap_or(false);
-    let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
-    let connected = state.screenshots.capable_client_count();
-
-    // Target gate: EXACTLY ONE capable client (reject 0 AND >1). dryRun creates
-    // nothing (always allowed); force is an explicit operator override.
-    if !dry_run && !force && connected != 1 {
-        return (StatusCode::CONFLICT, Json(json!({
-            "error": format!("restore requires exactly one connected browser (found {connected}); connect the target device only, or pass force"),
-            "connectedClients": connected,
-        }))).into_response();
-    }
+    let dry_run = match optional_bool(&body, "dryRun") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let force = match optional_bool(&body, "force") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     let Some(dir) = state.snapshots_dir.clone() else {
         return (
@@ -528,6 +551,17 @@ async fn restore_tabs(
     // Serialize: hold the lock across read-marker -> create -> ack -> write-marker.
     let _guard = state.restore_lock.lock().await;
 
+    // Bind the whole restore attempt to the exact connection selected while
+    // holding the restore lock. A later connection cannot receive its tab.create
+    // frames or satisfy its delivery acknowledgements.
+    let (connected, target_client_id) = state.screenshots.client_snapshot();
+    if !dry_run && !force && target_client_id.is_none() {
+        return (StatusCode::CONFLICT, Json(json!({
+            "error": format!("restore requires exactly one connected browser (found {connected}); connect the target device only, or pass force"),
+            "connectedClients": connected,
+        }))).into_response();
+    }
+
     let device_dir = freshell_ws::tabs_persist::encode_device_id(&device_id).map(|e| dir.join(e));
     // ALWAYS load the prior marker LEDGER (force too, so history is preserved —
     // :1497). It is kept per (deviceId, sourceId): restoring source A, then B,
@@ -536,8 +570,8 @@ async fn restore_tabs(
     // marker is the sole idempotency record, so "can't read it" must never be
     // treated as "nothing restored yet". `force` is the explicit operator
     // override: it discards the unreadable ledger and rebuilds it.
-    let mut doc: MarkerDoc = match (&device_dir, dry_run) {
-        (Some(dd), false) => match read_marker_doc_async(dd).await {
+    let mut doc: MarkerDoc = match &device_dir {
+        Some(dd) => match read_marker_doc_async(dd).await {
             Ok(doc) => doc,
             Err(err) if force => {
                 tracing::warn!(target: "freshell_server::tabs_snapshots", device_id = %device_id,
@@ -555,7 +589,7 @@ async fn restore_tabs(
                 }))).into_response();
             }
         },
-        _ => MarkerDoc::new(),
+        None => MarkerDoc::new(),
     };
     let prior: Marker = doc
         .get(&source_id)
@@ -621,12 +655,6 @@ async fn restore_tabs(
                 }
                 Ok(b) => b,
             };
-            if dry_run {
-                restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
-                    "request": create_body, "tabId": Value::Null }));
-                continue;
-            }
-
             let prior_mark = prior.get(&pk).cloned();
             // (1) already-restored SKIP first when !force (:1623): a rerun over a
             // fully-restored pane is a no-op and must REPORT as a skip, whether or
@@ -681,10 +709,23 @@ async fn restore_tabs(
                     .filter(|e| e.terminal_id.is_none())
                     .map(|e| e.tab_id.clone());
                 if live_terminal_id.is_some() || ledger_content_tab.is_some() {
+                    if dry_run {
+                        restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                            "terminalId": live_terminal_id,
+                            "tabId": ledger_content_tab.map(Value::from).unwrap_or(Value::Null),
+                            "reconciled": true, "dryRun": true }));
+                        continue;
+                    }
                     // Re-ack only when a client is present (blind force has no target).
-                    let acked = connected >= 1
-                        && !connection_dropped
-                        && confirm_delivery(&state, &nonce, &pk).await;
+                    let acked = target_client_id.is_some_and(|target| {
+                        !connection_dropped && state.screenshots.has_client(target)
+                    }) && confirm_delivery(
+                        &state,
+                        target_client_id.expect("checked Some"),
+                        &nonce,
+                        &pk,
+                    )
+                    .await;
                     if !acked {
                         delivery_confirmed = false;
                         marker.insert(pk.clone(), pm.clone()); // keep the prior record
@@ -718,6 +759,11 @@ async fn restore_tabs(
             if connection_dropped {
                 failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
                     "reason": "connection-dropped" }));
+                continue;
+            }
+            if dry_run {
+                restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                    "request": create_body, "tabId": Value::Null, "dryRun": true }));
                 continue;
             }
 
@@ -755,7 +801,7 @@ async fn restore_tabs(
 
             let mut tagged_body = create_body.clone();
             tagged_body["restoreKey"] = json!(restore_key);
-            let resp = freshell_freshagent::terminal_tabs::create_terminal_or_content_tab(
+            let resp = freshell_freshagent::terminal_tabs::create_terminal_or_content_tab_deferred(
                 state.fresh_agent.clone(),
                 tagged_body,
             )
@@ -788,6 +834,9 @@ async fn restore_tabs(
                 .get("terminalId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let ui_command = data.get("uiCommand").cloned().and_then(|value| {
+                serde_json::from_value::<freshell_protocol::ServerMessage>(value).ok()
+            });
             // Record the terminalId (still in-progress until acked) and PERSIST it
             // IMMEDIATELY — this shrinks the crash-between-create-and-marker window
             // to a single fsync-rename, so a retry reconciles the live terminal by
@@ -820,11 +869,21 @@ async fn restore_tabs(
                 );
             }
 
-            // DELIVERY ACK (skip when force has no target to ack).
-            let confirmed = if connected >= 1 {
-                confirm_delivery(&state, &nonce, &pk).await
+            // Deliver and acknowledge on the exact target selected above. A
+            // newly-connected socket cannot receive or acknowledge this frame.
+            let delivered = target_client_id
+                .zip(ui_command)
+                .is_some_and(|(target, command)| state.screenshots.send_to_client(target, command));
+            let confirmed = if delivered {
+                confirm_delivery(
+                    &state,
+                    target_client_id.expect("delivered requires a target"),
+                    &nonce,
+                    &pk,
+                )
+                .await
             } else {
-                false /* force + 0 clients: blind */
+                false
             };
             if confirmed {
                 marker.insert(
@@ -836,7 +895,7 @@ async fn restore_tabs(
                 );
                 restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
                     "tabId": data.get("tabId").cloned().unwrap_or(Value::Null), "terminalId": terminal_id }));
-            } else if connected >= 1 {
+            } else if target_client_id.is_some() {
                 // A real client that stopped answering == dropped mid-restore. The
                 // terminal WAS created (recorded in-progress with its id for the
                 // next run's reconciliation); it is reported failed, NOT restored.
@@ -882,7 +941,7 @@ async fn restore_tabs(
         "generationId": generation_id_req,
         "sourceId": source_id,
         "sourceCapturedAt": snap.get("capturedAt").cloned().unwrap_or(Value::Null),
-        "broadcastScope": "all-connected-clients",
+        "broadcastScope": if target_client_id.is_some() { "target-client" } else { "none" },
         "connectedClients": connected,
         "deliveryConfirmed": dry_run || delivery_confirmed,
         "restored": restored,

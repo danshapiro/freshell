@@ -7,27 +7,24 @@
 //! 1. the REST handler [`register`]s a `requestId` and gets a [`oneshot`] receiver;
 //! 2. it [`send_capture`]s a `{type:"ui.command", command:"screenshot.capture",
 //!    payload:{requestId, scope, tabId?, paneId?}}` frame onto the shared broadcast
-//!    bus (the exact shape `src/lib/ui-commands.ts:73` dispatches);
+//!    bus (the exact shape `src/lib/ui-commands.ts:73` dispatches), or
+//!    [`send_capture_to`] sends it to one connection for a restore delivery fence;
 //! 3. the screenshot-capable SPA client renders the DOM (`captureUiScreenshot` /
 //!    html2canvas) and replies `{type:"ui.screenshot.result", requestId, ...}`
 //!    (`src/lib/ui-commands.ts:51`);
-//! 4. the `/ws` inbound loop routes that reply through [`resolve`], waking the
+//! 4. the `/ws` inbound loop routes that reply through [`resolve_from`], waking the
 //!    awaiting REST handler with the base64 PNG.
 //!
-//! The original targets ONE specific socket (the layout-source connection, requiring
-//! the `uiScreenshotV1` capability). The port broadcasts the capture command instead:
-//! only a screenshot-capable client answers (others ignore an unknown `ui.command`),
-//! the broker resolves on the FIRST `requestId` match and drops the request, and a
-//! [`capable_client_count`] gate reproduces the original's `NO_SCREENSHOT_CLIENT`
-//! rejection when no capable UI is connected. This is behaviourally equivalent for
-//! the single-UI e2e and harmless for multi-client (duplicate late replies are
-//! dropped). Purely additive — the handshake + terminal byte path (oracle T0/T1) are
-//! untouched.
+//! Ordinary screenshot requests retain broadcast behavior. Restore uses the
+//! connection registry plus target-bound requests: a result from any connection
+//! other than the selected target is ignored, closing the connection-churn race
+//! between the exactly-one-client gate, tab delivery, and acknowledgement.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use freshell_protocol::{ServerMessage, UiCommand};
+use freshell_terminal::FrameSink;
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -46,13 +43,19 @@ pub struct ScreenshotResult {
 }
 
 struct Inner {
-    /// Number of currently-connected clients that advertised `uiScreenshotV1`.
-    capable: AtomicI64,
+    /// Currently-connected clients that advertised `uiScreenshotV1`, keyed by
+    /// the WS connection id and carrying a direct per-connection sink.
+    capable: Mutex<HashMap<u64, FrameSink>>,
     /// In-flight requests keyed by `requestId` → the waker for the REST handler.
-    pending: Mutex<HashMap<String, oneshot::Sender<ScreenshotResult>>>,
+    pending: Mutex<HashMap<String, PendingRequest>>,
     /// The shared server→client broadcast bus (the capture command is fanned out
     /// here; the capable SPA client receives + answers it).
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+}
+
+struct PendingRequest {
+    expected_client_id: Option<u64>,
+    sender: oneshot::Sender<ScreenshotResult>,
 }
 
 /// A cheaply-cloneable handle shared by every `/ws` connection and the
@@ -67,7 +70,7 @@ impl ScreenshotBroker {
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                capable: AtomicI64::new(0),
+                capable: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 broadcast_tx,
             }),
@@ -75,25 +78,22 @@ impl ScreenshotBroker {
     }
 
     /// A connection advertising `capabilities.uiScreenshotV1` joined.
-    pub fn add_capable_client(&self) {
-        self.inner.capable.fetch_add(1, Ordering::SeqCst);
+    pub fn add_capable_client(&self, connection_id: u64, sink: FrameSink) {
+        self.inner
+            .capable
+            .lock()
+            .unwrap()
+            .insert(connection_id, sink);
     }
 
-    /// A capability-advertising connection left (never drops below zero).
-    pub fn remove_capable_client(&self) {
-        // `fetch_update` clamps at 0 so an accidental double-decrement can't make
-        // the gate report "no client" while one is still connected.
-        let _ = self
-            .inner
-            .capable
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(if n > 0 { n - 1 } else { 0 })
-            });
+    /// A capability-advertising connection left. Removing an unknown id is a no-op.
+    pub fn remove_capable_client(&self, connection_id: u64) {
+        self.inner.capable.lock().unwrap().remove(&connection_id);
     }
 
     /// How many screenshot-capable UI clients are connected right now.
     pub fn capable_client_count(&self) -> i64 {
-        self.inner.capable.load(Ordering::SeqCst)
+        self.inner.capable.lock().unwrap().len() as i64
     }
 
     /// True iff at least one screenshot-capable UI client is connected.
@@ -101,10 +101,57 @@ impl ScreenshotBroker {
         self.capable_client_count() > 0
     }
 
+    /// Return the stable connection id iff exactly one capable client is
+    /// connected at this instant.
+    pub fn exclusive_client_id(&self) -> Option<u64> {
+        self.client_snapshot().1
+    }
+
+    /// Atomically snapshot the capable-client count and exclusive id.
+    pub fn client_snapshot(&self) -> (i64, Option<u64>) {
+        let capable = self.inner.capable.lock().unwrap();
+        let exclusive = (capable.len() == 1)
+            .then(|| capable.keys().next().copied())
+            .flatten();
+        (capable.len() as i64, exclusive)
+    }
+
+    /// Whether the selected capable connection is still registered.
+    pub fn has_client(&self, connection_id: u64) -> bool {
+        self.inner
+            .capable
+            .lock()
+            .unwrap()
+            .contains_key(&connection_id)
+    }
+
     /// Register a pending request, returning the receiver the REST handler awaits.
     pub fn register(&self, request_id: String) -> oneshot::Receiver<ScreenshotResult> {
+        self.register_expected(request_id, None)
+    }
+
+    /// Register a request that only `connection_id` is permitted to resolve.
+    pub fn register_for_client(
+        &self,
+        request_id: String,
+        connection_id: u64,
+    ) -> oneshot::Receiver<ScreenshotResult> {
+        self.register_expected(request_id, Some(connection_id))
+    }
+
+    fn register_expected(
+        &self,
+        request_id: String,
+        expected_client_id: Option<u64>,
+    ) -> oneshot::Receiver<ScreenshotResult> {
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(request_id, tx);
+        self.inner.pending.lock().unwrap().insert(
+            request_id,
+            PendingRequest {
+                expected_client_id,
+                sender: tx,
+            },
+        );
         rx
     }
 
@@ -116,9 +163,49 @@ impl ScreenshotBroker {
     /// Route an inbound `ui.screenshot.result` to its waiting REST handler. Unknown
     /// / already-resolved `requestId`s are ignored (a late duplicate from a second
     /// capable client).
+    pub fn resolve_from(&self, connection_id: u64, request_id: &str, result: ScreenshotResult) {
+        let mut pending = self.inner.pending.lock().unwrap();
+        let matches = pending.get(request_id).is_some_and(|request| {
+            request
+                .expected_client_id
+                .is_none_or(|id| id == connection_id)
+        });
+        if matches {
+            if let Some(request) = pending.remove(request_id) {
+                let _ = request.sender.send(result);
+            }
+        }
+    }
+
+    /// Test/compatibility helper for request producers with no target binding.
+    /// Target-bound restore requests cannot be resolved through this path.
     pub fn resolve(&self, request_id: &str, result: ScreenshotResult) {
-        if let Some(tx) = self.inner.pending.lock().unwrap().remove(request_id) {
-            let _ = tx.send(result);
+        let mut pending = self.inner.pending.lock().unwrap();
+        let is_unbound = pending
+            .get(request_id)
+            .is_some_and(|request| request.expected_client_id.is_none());
+        if is_unbound {
+            if let Some(request) = pending.remove(request_id) {
+                let _ = request.sender.send(result);
+            }
+        }
+    }
+
+    /// Send one already-typed frame to a specific capable connection. Returns
+    /// false when that exact connection is no longer registered.
+    pub fn send_to_client(&self, connection_id: u64, frame: ServerMessage) -> bool {
+        let sink = self
+            .inner
+            .capable
+            .lock()
+            .unwrap()
+            .get(&connection_id)
+            .cloned();
+        if let Some(sink) = sink {
+            sink(frame);
+            true
+        } else {
+            false
         }
     }
 
@@ -149,6 +236,31 @@ impl ScreenshotBroker {
         // and reports the same "no UI answered" outcome the original would.
         let _ = self.inner.broadcast_tx.send(frame.to_string());
     }
+
+    /// Send the capture fence only to `connection_id`.
+    pub fn send_capture_to(
+        &self,
+        connection_id: u64,
+        request_id: &str,
+        scope: &str,
+        tab_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> bool {
+        let mut payload = json!({ "requestId": request_id, "scope": scope });
+        if let Some(tab_id) = tab_id {
+            payload["tabId"] = json!(tab_id);
+        }
+        if let Some(pane_id) = pane_id {
+            payload["paneId"] = json!(pane_id);
+        }
+        self.send_to_client(
+            connection_id,
+            ServerMessage::UiCommand(UiCommand {
+                command: "screenshot.capture".to_string(),
+                payload: Some(payload),
+            }),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -163,16 +275,18 @@ mod tests {
     #[test]
     fn capability_count_tracks_and_clamps() {
         let b = broker();
+        let sink: FrameSink = Arc::new(|_| {});
         assert!(!b.has_capable_client());
-        b.add_capable_client();
-        b.add_capable_client();
+        b.add_capable_client(1, sink.clone());
+        b.add_capable_client(2, sink);
         assert_eq!(b.capable_client_count(), 2);
         assert!(b.has_capable_client());
-        b.remove_capable_client();
+        assert_eq!(b.exclusive_client_id(), None);
+        b.remove_capable_client(1);
         assert_eq!(b.capable_client_count(), 1);
-        // Over-decrement clamps at 0 (never negative).
-        b.remove_capable_client();
-        b.remove_capable_client();
+        assert_eq!(b.exclusive_client_id(), Some(2));
+        b.remove_capable_client(2);
+        b.remove_capable_client(2);
         assert_eq!(b.capable_client_count(), 0);
         assert!(!b.has_capable_client());
     }
@@ -220,6 +334,46 @@ mod tests {
             },
         );
         assert!(rx.await.is_err(), "cancelled sender dropped");
+    }
+
+    #[tokio::test]
+    async fn target_bound_request_ignores_another_client() {
+        let b = broker();
+        let mut rx = b.register_for_client("targeted".to_string(), 7);
+        b.resolve_from(
+            8,
+            "targeted",
+            ScreenshotResult {
+                ok: true,
+                ..Default::default()
+            },
+        );
+        assert!(rx.try_recv().is_err(), "wrong client must not resolve");
+        b.resolve_from(
+            7,
+            "targeted",
+            ScreenshotResult {
+                ok: true,
+                ..Default::default()
+            },
+        );
+        assert!(rx.await.expect("target resolved").ok);
+    }
+
+    #[test]
+    fn direct_capture_reaches_only_the_selected_client() {
+        let b = broker();
+        let seen_1 = Arc::new(Mutex::new(Vec::new()));
+        let seen_2 = Arc::new(Mutex::new(Vec::new()));
+        for (id, seen) in [(1, seen_1.clone()), (2, seen_2.clone())] {
+            b.add_capable_client(
+                id,
+                Arc::new(move |message| seen.lock().unwrap().push(message)),
+            );
+        }
+        assert!(b.send_capture_to(1, "req-direct", "view", None, None));
+        assert_eq!(seen_1.lock().unwrap().len(), 1);
+        assert!(seen_2.lock().unwrap().is_empty());
     }
 
     #[test]
