@@ -47,6 +47,12 @@
   - claude: `<home>/.claude/projects/<munged-cwd>/<sessionId>.jsonl` (cwd path separators → `-`; `crates/freshell-sessions/src/directory_index.rs:154-205`). Claude session ids must be canonical UUIDs (`terminal_tabs.rs:162-166`).
 - The historical bug for the Deliverable 2 proof: at `136b9e94~1` the WS `terminal.create` codex arm read ONLY `resumeSessionId` and ignored `sessionRef`, so every codex open/restore spawned plain `codex` with no resume args (see `git show 136b9e94`). A codex leg that asserts seeded-history visibility MUST fail there and pass at HEAD.
 - Real CLIs on this host: `codex` (codex-cli 0.145.0), `amplifier` (`~/.local/bin/amplifier`), `claude` (2.1.218), `jq` at `/usr/bin/jq`.
+- Load-bearing validation findings (this plan's anchors re-verified at HEAD; ledger in the run's logs dir):
+  - `pub mod terminal_tabs` is ALREADY public (`crates/freshell-freshagent/src/lib.rs:44`) — Task 2's visibility change is exactly the fn `pub(crate) async fn create_terminal_or_content_tab` (`terminal_tabs.rs:189`) → `pub`, nothing else.
+  - A session-provider `POST /api/tabs` create carrying NEITHER `sessionRef` nor `resumeSessionId` SUCCEEDS: it logs the `tab_create_missing_session_identity` WARN (`terminal_tabs.rs:1023-1033`), still broadcasts `ui.command{tab.create}` and returns `{tabId, paneId, terminalId}` — so Task 10's failure-path "fresh codex, NO sessionRef" create works as written (expect that WARN in the ephemeral server's logs; it is unrelated to the `terminal_identity_unresolved` invariant WARN).
+  - The `/api/tabs-sync/*` REST namespace is free except `client-retire` (`boot.rs:91`); `freshell_freshagent::snapshot::router` serves only `/api/fresh-agent/threads/...` — no collision for the new `snapshots`/`restore` routes.
+  - The default `chromium` Playwright project has NO `testMatch` and matches EVERY spec file; rust-only specs are kept sane by the in-spec hard guard `expect(e2eServerKind).toBe('rust')` (convention across all 9 existing rust-only specs). Tasks 5 and 10's skeletons carry that guard; Task 7's `testIgnore` keeps the smoke spec out of every match-all project.
+  - Restart-respawn-with-identity (Task 10 happy path, Task 7 disruption leg) is already proven end-to-end by the committed-green `codex-terminal-bounce-rust.spec.ts` (reconnect → new terminalId → re-spawned argv contains `resume <sessionId>`).
 
 ## Scope check
 
@@ -1088,7 +1094,8 @@ const run = promisify(execFile)
 const CODEX_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 
 test.describe('tabs-sync snapshot -> wipe -> one-command restore (rust only)', () => {
-  test('restored tabs point at the SAME sessions', async ({ browser }) => {
+  test('restored tabs point at the SAME sessions', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust') // rust-only guard: the default `chromium` project has NO testMatch (matches every spec); all 9 existing rust-only specs guard hard like this (e.g. codex-terminal-bounce-rust.spec.ts:102)
     test.setTimeout(240_000)
     const server = new RustServer({
       env: { /* fake codex CLI wiring copied from codex-terminal-bounce-rust.spec.ts */ },
@@ -1758,7 +1765,8 @@ async function tabDiff(args: string[]) {
 }
 
 test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
-  test('verify passes when identity survives a restart and fails loudly when it does not', async ({ page }) => {
+  test('verify passes when identity survives a restart and fails loudly when it does not', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust') // rust-only guard, same convention as codex-terminal-bounce-rust.spec.ts:102 (the default `chromium` project matches every spec file)
     test.setTimeout(240_000)
     const server = new RustServer({
       env: { /* fake codex CLI wiring copied from codex-terminal-bounce-rust.spec.ts */ },
