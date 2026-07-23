@@ -2373,6 +2373,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 set -euo pipefail
 
 URL="" TOKEN="${FRESHELL_TOKEN:-}" DEVICE="" GENERATION="" GENERATION_ID="" COMPONENTS="" DRY_RUN=false LIST=false
+PANES=()   # repeatable --pane "tabKey#paneId": restore ONLY these panes (targeted remediation)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url) URL="$2"; shift 2 ;;
@@ -2381,6 +2382,7 @@ while [[ $# -gt 0 ]]; do
     --generation) GENERATION="$2"; shift 2 ;;
     --generation-id) GENERATION_ID="$2"; shift 2 ;;
     --components) COMPONENTS="$2"; shift 2 ;;   # comma-separated generation ids (the deploy bundle)
+    --pane) PANES+=("$2"); shift 2 ;;           # repeatable; server rejects unknown keys fail-closed
     --dry-run) DRY_RUN=true; shift ;;
     --list) LIST=true; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -2392,10 +2394,29 @@ done
 
 auth=(-H "x-auth-token: ${TOKEN}")
 
+# Print a loud failure WITHOUT masking the server's refusal: curl runs with
+# --fail-with-body so an HTTP error still yields the response body, and the
+# server's explanation (e.g. the 409 "restore requires exactly one connected
+# browser" gate) reaches the operator. Prefers the JSON .message/.error field,
+# falls back to the raw body, and keeps the generic hint when there is no body.
+#   $1 = what failed, $2 = generic hint, $3 = response body (may be empty)
+fail_loud() {
+  local msg=""
+  if [[ -n "$3" ]]; then
+    msg=$(jq -r '.message // .error // empty' <<<"$3" 2>/dev/null) || msg=""
+    printf 'ERROR: %s: %s\n' "$1" "${msg:-$3}" >&2
+  else
+    printf 'ERROR: %s (%s)\n' "$1" "$2" >&2
+  fi
+  exit 1
+}
+
 if $LIST; then
-  curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" | jq -r '
+  resp=$(curl --fail-with-body -sS "${auth[@]}" "${URL}/api/tabs-sync/snapshots") ||
+    fail_loud "list request failed" "URL/token correct? server up?" "${resp:-}"
+  jq -r '
     .devices[] | .deviceId as $d | .generations[] |
-    "\($d)\tgen=\(.generation)\tid=\(.generationId)\trev=\(.snapshotRevision)\trecords=\(.recordCount)\tcapturedAt=\(.capturedAt)\tlabel=\(.deviceLabel)"'
+    "\($d)\tgen=\(.generation)\tid=\(.generationId)\trev=\(.snapshotRevision)\trecords=\(.recordCount)\tcapturedAt=\(.capturedAt)\tlabel=\(.deviceLabel)"' <<<"$resp"
   exit 0
 fi
 
@@ -2415,11 +2436,17 @@ elif [[ -n "$GENERATION_ID" ]]; then
 elif [[ -n "$GENERATION" ]]; then
   body=$(jq --argjson g "$GENERATION" '. + {generation: $g}' <<<"$body"); sel="generation=$GENERATION"
 fi
-resp=$(curl -fsS "${auth[@]}" -H 'content-type: application/json' \
-  -d "$body" "${URL}/api/tabs-sync/restore") || {
-  echo "ERROR: restore request failed (is the snapshot/device id right? try --list)" >&2
-  exit 1
-}
+# Targeted remediation (deploy-tab-diff): restore ONLY the named panes. Each
+# --pane value becomes one JSON string; the server 400s on unknown keys and
+# reports unselected panes as skipped{not-selected} -- never a silent drop.
+if [[ ${#PANES[@]} -gt 0 ]]; then
+  panes_json=$(printf '%s\0' "${PANES[@]}" | jq -Rs 'split("\u0000") | map(select(length>0))')
+  body=$(jq --argjson p "$panes_json" '. + {panes: $p}' <<<"$body")
+  sel="$sel panes=${#PANES[@]}"
+fi
+resp=$(curl --fail-with-body -sS "${auth[@]}" -H 'content-type: application/json' \
+  -d "$body" "${URL}/api/tabs-sync/restore") ||
+  fail_loud "restore request failed" "is the snapshot/device id right? try --list" "${resp:-}"
 
 echo "== restore ${DEVICE} (${sel}) =="
 echo "$resp" | jq -r '
@@ -2450,12 +2477,19 @@ THOME=$(mktemp -d)
 SRV=""
 cleanup() {
   # Kill ONLY the server we spawned, and ONLY if that exact PID is (still) OUR
-  # server -- verify via /proc/<pid>/cmdline containing this run's unique $THOME.
-  # Never signal a PID we did not spawn or that was reused by another process.
-  if [[ -n "$SRV" ]] && kill -0 "$SRV" 2>/dev/null \
-     && tr '\0' ' ' < "/proc/$SRV/cmdline" 2>/dev/null | grep -q -- "$THOME"; then
-    kill "$SRV" 2>/dev/null || true
-    wait "$SRV" 2>/dev/null || true
+  # server. An `env FRESHELL_HOME=... command` assignment is NOT in the child's
+  # argv (env execs the target), so check /proc/<pid>/ENVIRON -- NUL-separated
+  # KEY=VALUE pairs -- for this run's unique $THOME. Never signal a PID we did
+  # not spawn or that was reused by another process, and NEVER delete the home
+  # out from under a live process we refused to kill.
+  if [[ -n "$SRV" ]] && kill -0 "$SRV" 2>/dev/null; then
+    if tr '\0' '\n' < "/proc/$SRV/environ" 2>/dev/null | grep -qx -- "FRESHELL_HOME=$THOME"; then
+      kill "$SRV" 2>/dev/null || true
+      wait "$SRV" 2>/dev/null || true
+    else
+      echo "cleanup: PID $SRV is not our server (env mismatch/reused pid); NOT killing it and NOT removing $THOME" >&2
+      return 0
+    fi
   fi
   rm -rf "$THOME"
 }
@@ -2469,18 +2503,21 @@ cat > "$THOME/.freshell/tabs-snapshots/dev_2d1/c1-00000000000000002000-r00000000
     "panes": [{ "paneId": "p1", "kind": "terminal", "payload": { "mode": "shell" } }] }] }
 EOF
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-# setsid -> the server leads its own process group ($THOME appears in its argv/env
-# via FRESHELL_HOME, which the cleanup match keys on). Check main.rs:16-40 for the
-# exact env names (token/port) the binary reads; adjust if they differ.
-setsid env FRESHELL_HOME="$THOME" AUTH_TOKEN=devtok PORT="$PORT" ./target/release/freshell-server &
+# setsid -> the server leads its own process group ($THOME appears in the child's
+# ENVIRONMENT via FRESHELL_HOME -- /proc/<pid>/environ -- which the cleanup match
+# keys on). AUTH_TOKEN must be >=16 chars or the server REFUSES TO START
+# (validate_auth_token, crates/freshell-server/src/main.rs). Check main.rs:16-40
+# for the exact env names (token/port) the binary reads; adjust if they differ.
+TOK=devtok-0123456789abcdef
+setsid env FRESHELL_HOME="$THOME" AUTH_TOKEN="$TOK" PORT="$PORT" ./target/release/freshell-server &
 SRV=$!
 sleep 2
-scripts/restore-tabs.sh --url "http://127.0.0.1:$PORT" --token devtok --list
-scripts/restore-tabs.sh --url "http://127.0.0.1:$PORT" --token devtok --device dev-1 --dry-run
+scripts/restore-tabs.sh --url "http://127.0.0.1:$PORT" --token "$TOK" --list
+scripts/restore-tabs.sh --url "http://127.0.0.1:$PORT" --token "$TOK" --device dev-1 --dry-run
 # cleanup runs on EXIT (success or failure) -- no explicit kill/rm needed here.
 ```
 
-Expected: `--list` prints one `dev-1 gen=0 id=<digest>` line; `--dry-run` prints one RESTORED line with `tabId=null` and exits 0. Do NOT run a REAL (non-dry) restore here — with no browser connected the exactly-one-client gate returns 409 by design; the real create path (with a connected browser) is proven end-to-end in Task 5. (Confirm the binary's env names for port/token in `crates/freshell-server/src/main.rs` before running; the RustServer harness `boot()` shows the exact ones it passes. `FRESHELL_HOME` must appear in the process's `/proc/<pid>/cmdline` — because we launch via `env FRESHELL_HOME=... ./target/release/freshell-server`, the `env` invocation places it there; if your platform lacks `/proc`, use a process-group kill `kill -- -"$SRV"` on the setsid group instead, still gated on `kill -0`.)
+Expected: `--list` prints one `dev-1 gen=0 id=<digest>` line; `--dry-run` prints one RESTORED line with `tabId=null` and exits 0. Do NOT run a REAL (non-dry) restore here — with no browser connected the exactly-one-client gate returns 409 by design; the real create path (with a connected browser) is proven end-to-end in Task 5. (Confirm the binary's env names for port/token in `crates/freshell-server/src/main.rs` before running; the RustServer harness `boot()` shows the exact ones it passes. `FRESHELL_HOME` appears in the process's `/proc/<pid>/environ` — NOT its `cmdline`: `env` execs the server, so the assignment becomes part of the child's environment, not its argv — which is what cleanup greps (NUL-separated, hence `tr '\0' '\n'`); if your platform lacks `/proc`, use a process-group kill `kill -- -"$SRV"` on the setsid group instead, still gated on `kill -0`.)
 
 - [ ] **Step 3: Commit**
 
@@ -2982,16 +3019,32 @@ const RUST_ONLY_SPECS = [
 ]
 ```
 
-Register the smoke project (dedicated, outside the default matrix):
+Register the smoke project CONDITIONALLY (dedicated, and genuinely outside the
+default matrix): a project-less Playwright run executes EVERY registered
+project, so an unconditionally-registered project WOULD still run in bare
+`npx playwright test` invocations even with the spec in `RUST_ONLY_SPECS` on
+the match-all projects. Gate the registration itself behind an explicit
+request (this is exactly what shipped in `test/e2e-browser/playwright.config.ts`):
 
 ```ts
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
     // codex/amplifier/claude CLIs from PATH. Run via `npm run smoke:continuity`.
-    {
-      name: 'continuity-smoke',
-      use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' as const },
-      testMatch: [/continuity-smoke\.spec\.ts$/],
-    },
+    // Registered CONDITIONALLY: included only when explicitly requested via
+    // FRESHELL_SMOKE=1 (set by the `smoke:continuity` npm script) or an
+    // explicit `--project=continuity-smoke` CLI arg, so a project-less run
+    // can never pick it up. The spec also stays in RUST_ONLY_SPECS so no
+    // match-all project ever matches it even when the project IS registered.
+    ...(process.env.FRESHELL_SMOKE
+      || process.argv.includes('--project=continuity-smoke')
+      || (process.argv.includes('--project')
+        && process.argv[process.argv.indexOf('--project') + 1] === 'continuity-smoke')
+      ? [
+        {
+          name: 'continuity-smoke',
+          use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' as const },
+          testMatch: [/continuity-smoke\.spec\.ts$/],
+        },
+      ] : []),
 ```
 
 Verify exclusion (with and without CI): the smoke spec must appear ONLY under
@@ -3006,7 +3059,7 @@ Neither listing may show any of the three under `[chromium]`, `[firefox]`, or `[
 `package.json` scripts:
 
 ```json
-"smoke:continuity": "playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke"
+"smoke:continuity": "cross-env FRESHELL_SMOKE=1 playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke"
 ```
 
 - [ ] **Step 2: Write the smoke spec**
@@ -3230,9 +3283,15 @@ BIN=/tmp/freshell-pre-136b9e94/target/release/freshell-server
 echo "historical binary: $BIN (built from $(git -C /tmp/freshell-pre-136b9e94 rev-parse HEAD), sha256 $(sha256sum "$BIN" | cut -d' ' -f1))" \
   | tee /tmp/smoke-pre-fix.binid
 JSON=/tmp/smoke-pre-fix.json
+# Capture npm's exit code from PIPESTATUS IMMEDIATELY after the pipeline.
+# NO trailing `|| true`: that runs `true` as a new command and OVERWRITES
+# PIPESTATUS, so `code` would always read true's 0. `set +e` keeps the
+# expected-to-fail pipeline from aborting an errexit shell instead.
+set +e
 FRESHELL_E2E_RUST_SERVER_BIN="$BIN" PLAYWRIGHT_JSON_OUTPUT_NAME="$JSON" \
-  npm run smoke:continuity -- --reporter=json 2>&1 | tee /tmp/smoke-pre-fix.out || true
+  npm run smoke:continuity -- --reporter=json 2>&1 | tee /tmp/smoke-pre-fix.out
 code=${PIPESTATUS[0]}
+set -e
 [ "$code" -ne 0 ] || { echo "REGRESSION-PROOF FAILED: historical binary unexpectedly PASSED the smoke (exit 0)" >&2; exit 1; }
 [ -f "$JSON" ] || { echo "FATAL: no JSON report produced ($JSON)" >&2; exit 1; }
 # Collect every failed-assertion message from the Playwright JSON report.
@@ -3323,8 +3382,8 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `GET /api/tabs-sync/snapshots`, `GET /api/tabs-sync/snapshots/{device}` (Task 2), `GET /api/terminals` (existing). STRICTLY read-only against the server.
 - Produces:
   - `scripts/deploy-tab-diff.sh capture --url U --token T --out FILE` → **ATOMICALLY** (`:2544`) writes `{"capturedAt", "url", "devices": {"<deviceId>": <newest UNION snapshot>}, "terminals": [<raw /api/terminals array>], "bundles": {"<deviceId>": {"components": [<per-client component generation ids at capture>], "capturedAt": <n>}}}`. Capture fetches into a TEMP file with EXPLICIT per-request curl/jq status checks (never process-substitution failure masking), validates the assembled JSON's shape, THEN renames over `FILE` — any failure leaves a prior good `FILE` untouched and exits nonzero. The `bundles[deviceId].components` list is the IMMUTABLE recovery bundle remediation restores (`:2621`). Arbitrary device ids are handled safely: the device list is read NUL-delimited into a loop (`jq -j '... + "\u0000"'` + `while IFS= read -r -d ''`), each id is URL-encoded for its path segment (`jq -rn '$d|@uri'`), and the large snapshot/terminals documents are streamed into `jq` via temp files + `--slurpfile` (never `--argjson`, which would blow the OS arg-size limit at ~1 MiB-per-client scale).
-  - `scripts/deploy-tab-diff.sh verify --url U --token T --before FILE [--after FILE]` → exit 0 when every previously-live identity pane came back with the SAME `sessionRef`; exit 1 with a loud pane-by-pane diff (`MISSING` / `FRESH (identity lost)` / `RE-POINTED` / `NOT RESPAWNED`) and, per diverged device, a `restore-tabs.sh --components <bundle>` remediation otherwise. `--after FILE` (optional) feeds a synthetic after-state instead of fetching live — with `--after` supplied verify performs **ZERO network operations** (`:2619`): both the diff and the remediation read only local files. Used by the deterministic diff-engine test (Task 10); default fetches live.
-  - Verify semantics (liveness gated on the BEFORE state, so no vacuous OK and no false red): **"live" means `status == "running"`** — the `/api/terminals` array includes `exited` terminals (verified `terminals.rs:704-708`), which are filtered OUT of both the before and after live sets so an exited id never causes a false `NOT RESPAWNED`. A pane is "counted" only if it had a `payload.sessionRef` OR its `payload.liveTerminal.terminalId` was ACTUALLY present-and-running in the before `/api/terminals` array. For each counted pane, find the same `(tabKey, paneId)` in the device's AFTER union snapshot: absent → `MISSING`; before had `sessionRef` and after doesn't → `FRESH`; both present but `sessionId`/`provider` differ → `RE-POINTED`; a genuinely-live-before pane whose after `liveTerminal.terminalId` is absent from the after RUNNING set → `NOT RESPAWNED`. **Coverage guard (full set-difference, `:2559`/`:2563`):** verify computes the COMPLETE set of running-at-capture terminals covered by NO persisted snapshot pane (binding the id to a jq variable before indexing — `. as $t | $covered | index($t)` — never `$covered | index(.)`, which would rebind `.` to the array) and FAILS loudly LISTING them if that set is nonempty (a PARTIAL-coverage gap fails too, not just all-or-none). Remediation prints, per diverged device, `restore-tabs.sh --components <bundle>` using the BEFORE file's `bundles[deviceId].components` — the immutable multi-client bundle (`:2621`), never a single-client `--generation-id`; if the before-file has no bundle for a device it FAILS LOUDLY for that device. The printed command is shell-quoted (`printf %q` for url/device/components) so a metacharacter id can't inject when copied.
+  - `scripts/deploy-tab-diff.sh verify --url U --token T --before FILE [--after FILE]` → exit 0 when every previously-live identity pane came back with the SAME `sessionRef`; exit 1 with a loud pane-by-pane diff (`MISSING` / `FRESH (identity lost)` / `RE-POINTED` / `NOT RESPAWNED`) and, per diverged device, a TARGETED `restore-tabs.sh --components <bundle> --pane <tabKey#paneId>...` remediation (only the diverged panes, so healthy panes are never re-restored) otherwise. `--after FILE` (optional) feeds a synthetic after-state instead of fetching live — with `--after` supplied verify performs **ZERO network operations** (`:2619`): both the diff and the remediation read only local files. Used by the deterministic diff-engine test (Task 10); default fetches live.
+  - Verify semantics (liveness gated on the BEFORE state, so no vacuous OK and no false red): **"live" means `status == "running"`** — the `/api/terminals` array includes `exited` terminals (verified `terminals.rs:704-708`), which are filtered OUT of both the before and after live sets so an exited id never causes a false `NOT RESPAWNED`. A pane is "counted" only if it had a `payload.sessionRef` OR its `payload.liveTerminal.terminalId` was ACTUALLY present-and-running in the before `/api/terminals` array. For each counted pane, find the same `(tabKey, paneId)` in the device's AFTER union snapshot: absent → `MISSING`; before had `sessionRef` and after doesn't → `FRESH`; both present but `sessionId`/`provider` differ → `RE-POINTED`; a genuinely-live-before pane whose after `liveTerminal.terminalId` is absent from the after RUNNING set → `NOT RESPAWNED`. **Coverage guard (full set-difference, `:2559`/`:2563`):** verify computes the COMPLETE set of running-at-capture terminals covered by NO persisted snapshot pane (binding the id to a jq variable before indexing — `. as $t | $covered | index($t)` — never `$covered | index(.)`, which would rebind `.` to the array) and FAILS loudly LISTING them if that set is nonempty (a PARTIAL-coverage gap fails too, not just all-or-none). Remediation prints, per diverged device, `restore-tabs.sh --components <bundle>` plus one `--pane <tabKey#paneId>` per diverged pane (the restore API's fail-closed selective mode) using the BEFORE file's `bundles[deviceId].components` — the immutable multi-client bundle (`:2621`), never a single-client `--generation-id`; if the before-file has no bundle for a device it FAILS LOUDLY for that device. The printed command is shell-quoted (`printf %q` for url/device/components) so a metacharacter id can't inject when copied.
 
 - [ ] **Step 1: Write the script**
 
@@ -3361,10 +3420,17 @@ auth=(-H "x-auth-token: ${TOKEN}")
 # contain spaces/slashes), each is URL-encoded for its path segment, and the
 # growing documents are streamed into jq via temp files + --slurpfile (never
 # --argjson, which would exceed ARG_MAX at ~1 MiB-per-client scale).
+#
+# LOGICALLY COHERENT (:40): the generation index is fetched ONCE and .bundles
+# is derived from THAT snapshot of it; after every other fetch completes, the
+# index is re-fetched and compared -- if a tabs-sync push landed mid-capture
+# (the two indexes disagree on any device's generation set), the capture is
+# INCOHERENT and returns 3 so the caller can retry, never emitting an artifact
+# whose .devices and .bundles describe different generations.
 fetch_state() {
-  local snaps_tmp dev_tmp term_tmp d enc snap_tmp
-  snaps_tmp=$(mktemp); dev_tmp=$(mktemp); term_tmp=$(mktemp)
-  _cleanup_fetch() { rm -f "$snaps_tmp" "$dev_tmp" "$term_tmp"; }
+  local snaps_tmp snaps2_tmp dev_tmp term_tmp out_tmp d enc snap_tmp
+  snaps_tmp=$(mktemp); snaps2_tmp=$(mktemp); dev_tmp=$(mktemp); term_tmp=$(mktemp); out_tmp=$(mktemp)
+  _cleanup_fetch() { rm -f "$snaps_tmp" "$snaps2_tmp" "$dev_tmp" "$term_tmp" "$out_tmp"; }
   # EXPLICIT curl/jq status checks throughout (never rely on `set -e` propagating
   # through a function called in an `if`, nor through process substitution -- the
   # :2544 failure-masking hazard). Any failure -> return 1, no partial artifact.
@@ -3389,30 +3455,64 @@ fetch_state() {
     echo "ERROR: GET /api/terminals failed" >&2; _cleanup_fetch; return 1; fi
   jq -e 'type=="array"' "$term_tmp" >/dev/null \
     || { echo "ERROR: /terminals not an array" >&2; _cleanup_fetch; return 1; }
+  # COHERENCE GATE (:40): re-fetch the index and compare the generation sets.
+  # generationIds are content digests, so identical projections mean every
+  # fetch above happened against one logical state (an A-B-A flip would mean
+  # identical content -- still coherent by construction).
+  if ! curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" > "$snaps2_tmp"; then
+    echo "ERROR: coherence re-fetch of /api/tabs-sync/snapshots failed" >&2; _cleanup_fetch; return 1; fi
+  local proj='[.devices[] | { deviceId, gens: ([.generations[].generationId] | sort) }] | sort_by(.deviceId)'
+  if [[ "$(jq -cS "$proj" "$snaps_tmp")" != "$(jq -cS "$proj" "$snaps2_tmp")" ]]; then
+    echo "WARN: generation index changed mid-capture (concurrent tabs-sync push); capture incoherent" >&2
+    _cleanup_fetch; return 3; fi
   # Assemble the capture doc INCLUDING the immutable per-device bundle: the exact
   # set of per-client component generation ids at capture (all clients), so
   # remediation restores the SAME coherent union, never a single client (:2621).
+  # Both .devices and .bundles derive from the SAME pinned index snapshot.
+  # Newest-per-client tie-break MIRRORS the server's `newest_per_client`
+  # (crates/freshell-ws/src/tabs_persist.rs): higher capturedAt wins; an equal-
+  # millisecond tie is broken by the greater filename, which for one client's
+  # files (same encoded prefix) is exactly the greater zero-padded
+  # snapshotRevision -- so max_by([capturedAt, snapshotRevision]) is the exact
+  # mirror (:69), never max_by(capturedAt) alone.
   if ! jq -n --arg url "$URL" --slurpfile devices "$dev_tmp" --slurpfile terminals "$term_tmp" \
        --slurpfile snaps "$snaps_tmp" '
        { capturedAt: (now * 1000 | floor), url: $url,
          devices: $devices[0], terminals: $terminals[0],
          bundles: ($snaps[0].devices | map({ key: .deviceId, value: {
            components: (.generations | group_by(.clientInstanceId)
-                        | map(max_by(.capturedAt) | .generationId)),
-           capturedAt: (.capturedAt // 0) } }) | from_entries) }'; then
+                        | map(max_by([.capturedAt, .snapshotRevision]) | .generationId)),
+           capturedAt: (.capturedAt // 0) } }) | from_entries) }' > "$out_tmp"; then
     echo "ERROR: assembling capture JSON failed" >&2; _cleanup_fetch; return 1; fi
+  cat "$out_tmp"
   _cleanup_fetch
+}
+
+# fetch_state with a bounded retry on the mid-capture-coherence failure (rc 3).
+# Any other failure is immediate (rc 1).
+fetch_state_coherent() {
+  local attempt rc
+  for attempt in 1 2 3; do
+    rc=0; fetch_state || rc=$?
+    [[ $rc -eq 3 ]] || return "$rc"
+    echo "WARN: retrying capture (attempt $((attempt + 1))/3) after mid-capture change" >&2
+  done
+  echo "ERROR: generation index kept changing across 3 capture attempts; server too busy to capture coherently" >&2
+  return 1
 }
 
 case "$CMD" in
   capture)
     [[ -n "$OUT" ]] || { echo "ERROR: capture requires --out FILE" >&2; exit 2; }
-    # ATOMIC (:2544): fetch into a TEMP file, validate it parses + has the expected
-    # shape, THEN rename over the final artifact. Any failure leaves a prior good
-    # $OUT UNTOUCHED and exits nonzero.
-    tmp_out=$(mktemp)
-    if ! fetch_state > "$tmp_out"; then
-      echo "ERROR: capture failed (server unreachable/invalid); previous $OUT left UNTOUCHED" >&2
+    # ATOMIC (:2544/:82): fetch into a TEMP file created IN THE DESTINATION
+    # DIRECTORY (mktemp defaults to /tmp, which may be a different filesystem;
+    # a cross-device mv is copy+unlink, NOT atomic), validate it parses + has
+    # the expected shape, THEN rename over the final artifact -- a same-fs
+    # rename is atomic. Any failure leaves a prior good $OUT UNTOUCHED and
+    # exits nonzero.
+    tmp_out=$(mktemp "$(dirname "$OUT")/.$(basename "$OUT").XXXXXX")
+    if ! fetch_state_coherent > "$tmp_out"; then
+      echo "ERROR: capture failed (server unreachable/invalid/incoherent); previous $OUT left UNTOUCHED" >&2
       rm -f "$tmp_out"; exit 1
     fi
     if ! jq -e '(.devices|type=="object") and (.terminals|type=="array") and (.capturedAt|type=="number")' \
@@ -3434,9 +3534,12 @@ case "$CMD" in
       AFTER="$AFTER_IN"
     else
       AFTER=$(mktemp); AFTER_OWNED=true
-      if ! fetch_state > "$AFTER"; then echo "ERROR: fetching AFTER state failed" >&2; rm -f "$AFTER"; exit 1; fi
+      if ! fetch_state_coherent > "$AFTER"; then echo "ERROR: fetching AFTER state failed" >&2; rm -f "$AFTER"; exit 1; fi
     fi
-    cleanup() { $AFTER_OWNED && rm -f "$AFTER"; }
+    # Guard form (not `$AFTER_OWNED && rm`): with --after supplied AFTER_OWNED is
+    # false, and a bare `false && ...` returns 1 -- under `set -e` that would kill
+    # the OK path with exit 1 before its `exit 0`.
+    cleanup() { if $AFTER_OWNED; then rm -f "$AFTER"; fi; }
 
     # Coverage guard (:2559): compute the COMPLETE set of running terminals at
     # capture that are covered by NO persisted snapshot pane, and FAIL listing them
@@ -3460,10 +3563,14 @@ case "$CMD" in
     # are filtered out so they never cause a false NOT RESPAWNED). A pane counts
     # only if it carried session identity OR was ACTUALLY running at capture.
     DIFF=$(jq -n --slurpfile b "$BEFORE" --slurpfile a "$AFTER" '
-      def panes(dev; snap):
-        (snap.records // [])[] | select(.status == "open") as $rec
+      # $dev/$snap are VALUE params (bound at the call site): plain filter params
+      # are lazy closures re-evaluated against the CURRENT input, so `dev` (.key)
+      # would evaluate against the pane object and yield null for every pane,
+      # breaking the device column and the per-device remediation lookup.
+      def panes($dev; $snap):
+        ($snap.records // [])[] | select(.status == "open") as $rec
         | ($rec.panes // [])[]
-        | {device: dev, tabKey: $rec.tabKey, tabName: $rec.tabName, paneId: .paneId,
+        | {device: $dev, tabKey: $rec.tabKey, tabName: $rec.tabName, paneId: .paneId,
            kind: .kind, sessionRef: .payload.sessionRef,
            liveTerminalId: .payload.liveTerminal.terminalId};
       ($b[0].terminals | map(select(.status=="running") | .terminalId)) as $liveBefore
@@ -3496,19 +3603,30 @@ case "$CMD" in
     echo "================ TAB-DIFF DIVERGENCE (${COUNT}) ================"
     jq -r '.[] | "\(.verdict)\tdevice=\(.pane.device)\ttab=\(.pane.tabName) (\(.pane.tabKey))\tpane=\(.pane.paneId)\tkind=\(.pane.kind)\twas=\(.pane.sessionRef.provider // "-"):\(.pane.sessionRef.sessionId // "-")\(if .after then "\tnow=\(.after.provider):\(.after.sessionId)" else "" end)"' <<<"$DIFF"
     echo "================================================================"
-    # Remediation restores the IMMUTABLE multi-client BUNDLE recorded in the BEFORE
-    # capture (the exact set of per-client component generation ids at capture),
-    # via --components -- the SAME coherent union the capture saw, NEVER a single
-    # client's generationId (:2621). The bundle is read from the BEFORE file, so
-    # verify performs ZERO network operations in --after/offline mode (:2619).
-    echo "REMEDIATION (rebuild each diverged device from its captured immutable bundle):"
+    # Remediation is TARGETED (:175): it restores ONLY the diverged panes (one
+    # --pane per diverged paneKey, the restore API's selective mode) from the
+    # IMMUTABLE multi-client BUNDLE recorded in the BEFORE capture (the exact
+    # set of per-client component generation ids at capture), via --components
+    # -- the SAME coherent union the capture saw, NEVER a single client's
+    # generationId (:2621), and never the WHOLE union (which would duplicate
+    # every still-healthy pane). Everything is read from the BEFORE file +
+    # $DIFF, so verify performs ZERO network operations in --after/offline
+    # mode (:2619).
+    echo "REMEDIATION (rebuild each diverged device's MISSING panes from its captured immutable bundle):"
     while IFS= read -r -d '' dev; do
       comps=$(jq -r --arg d "$dev" '(.bundles[$d].components // []) | join(",")' "$BEFORE")
       if [[ -z "$comps" ]]; then
         printf 'ERROR: no captured bundle for device %q in the before-file; cannot recommend a union-consistent restore.\n' "$dev" >&2
         continue
       fi
-      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %q\n' "$URL" "$dev" "$comps"
+      pane_args=""
+      while IFS= read -r -d '' pk; do
+        pane_args+=$(printf ' --pane %q' "$pk")
+      done < <(jq -j --arg d "$dev" \
+        '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
+        <<<"$DIFF")
+      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s%s\n' \
+        "$URL" "$dev" "$comps" "$pane_args"
     done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$DIFF")
     cleanup; exit 1
     ;;
