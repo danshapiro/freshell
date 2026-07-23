@@ -271,7 +271,17 @@ async fn main() -> ExitCode {
     // The shared in-memory tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
-    let tabs = freshell_ws::tabs::TabsRegistry::new();
+    //
+    // Tabs registry now persists rolling snapshot generations under
+    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
+    // device's tabs can be rebuilt after client-state loss (continuity trio,
+    // docs/plans/2026-07-22-continuity-safety-trio.md).
+    let tabs = match &home {
+        Some(home) => freshell_ws::tabs::TabsRegistry::with_persist_dir(
+            home.join(".freshell").join("tabs-snapshots"),
+        ),
+        None => freshell_ws::tabs::TabsRegistry::new(),
+    };
 
     // Follow-up 3.19: discover the CLI extensions (bundled `extensions/` + user/local
     // dirs) once. Feeds THREE consumers: the WS terminal spawner's coding-CLI command

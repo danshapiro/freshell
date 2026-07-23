@@ -1627,15 +1627,32 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
         .unwrap_or(0);
     let records = crate::tabs::envelope_records(value);
 
-    match state.tabs.replace_client_snapshot(
-        state.server_instance_id.as_str(),
-        device_id,
-        device_label,
-        client_instance_id,
-        snapshot_revision,
-        records,
-    ) {
-        Ok(ack) => {
+    // `replace_client_snapshot` now runs the blocking snapshot-persistence
+    // filesystem cycle (`crate::tabs_persist::persist_generation`, serialized
+    // under a process-wide mutex), so it must NOT run on a Tokio worker: own
+    // the small `&str` args as `String`s and move the whole call into
+    // `spawn_blocking` (`TabsRegistry` is `Clone`/`Arc`-backed; `records` is
+    // already owned).
+    let reg = state.tabs.clone();
+    let server_instance_id = state.server_instance_id.as_str().to_string();
+    let (device_id, device_label, client_instance_id) = (
+        device_id.to_string(),
+        device_label.to_string(),
+        client_instance_id.to_string(),
+    );
+    let joined = tokio::task::spawn_blocking(move || {
+        reg.replace_client_snapshot(
+            &server_instance_id,
+            &device_id,
+            &device_label,
+            &client_instance_id,
+            snapshot_revision,
+            records,
+        )
+    })
+    .await;
+    match joined {
+        Ok(Ok(ack)) => {
             let msg = ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
                 accepted: ack.accepted,
                 open_records: ack.open_records,
@@ -1643,7 +1660,12 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
             });
             send(ws_tx, &msg).await
         }
-        Err(message) => send_tabs_error(ws_tx, &message).await,
+        Ok(Err(message)) => send_tabs_error(ws_tx, &message).await,
+        Err(join_err) => {
+            tracing::warn!(target: "freshell_ws::tabs", error = %join_err,
+                "tabs_push_persist_task_panicked");
+            send_tabs_error(ws_tx, "tabs snapshot persistence task failed").await
+        }
     }
 }
 

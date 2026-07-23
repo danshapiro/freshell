@@ -28,6 +28,7 @@ pub mod opencode_association;
 pub mod origin;
 pub mod screenshot;
 pub mod tabs;
+pub mod tabs_persist;
 pub mod terminal;
 
 use std::sync::Arc;

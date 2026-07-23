@@ -66,8 +66,15 @@ freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --
 # this crate only emits events, it never installs its own subscriber.
 tracing = "0.1"
+# tabs-sync snapshot generation ids (continuity trio): SHA-256 over the
+# canonical `records` serialization, truncated to 128 bits. Same version the
+# workspace already resolves via crates/freshell-terminal/Cargo.toml:36.
+sha2 = "0.10"
 
 [dev-dependencies]
+# tabs_persist tests write snapshot generations into throwaway dirs. Same
+# version other workspace crates pin (e.g. crates/freshell-terminal).
+tempfile = "3"
 # DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
 # to assert lifecycle events fire, without depending on the global subscriber
 # `freshell-server` owns.

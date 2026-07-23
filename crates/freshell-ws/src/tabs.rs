@@ -26,6 +26,7 @@
 //! they are invisible to the in-process e2e flows the oracle grades.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,11 +89,24 @@ pub struct PushAck {
 #[derive(Clone, Default)]
 pub struct TabsRegistry {
     inner: Arc<Mutex<State>>,
+    /// Root of the on-disk snapshot-generation store (continuity trio,
+    /// [`crate::tabs_persist`]). `None` (the `new()`/`Default` path) keeps the
+    /// registry purely in-memory, exactly as before.
+    persist_dir: Option<Arc<PathBuf>>,
 }
 
 impl TabsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry that ALSO persists each accepted non-empty client snapshot as
+    /// a rolling on-disk generation under `dir` (see [`crate::tabs_persist`]).
+    pub fn with_persist_dir(dir: PathBuf) -> Self {
+        Self {
+            inner: Arc::default(),
+            persist_dir: Some(Arc::new(dir)),
+        }
     }
 
     /// `replaceClientSnapshot` (store.ts:1091): store this client's open snapshot,
@@ -188,6 +202,16 @@ impl TabsRegistry {
 
         let open_count = open_records.len() as i64;
         let closed_count = closed_records.len() as i64;
+        // Best-effort snapshot generation (never fails the push). Clone BEFORE
+        // `open_records` is moved into ClientOpenSnapshot below; skip empty
+        // snapshots so a wipe/unload push never overwrites the last-good one.
+        let persist_input = self.persist_dir.as_ref().and_then(|dir| {
+            if open_records.is_empty() {
+                None
+            } else {
+                Some((Arc::clone(dir), open_records.clone()))
+            }
+        });
         state.open_snapshots.insert(
             key.clone(),
             ClientOpenSnapshot {
@@ -205,6 +229,20 @@ impl TabsRegistry {
                 last_seen_at: now,
             },
         );
+
+        drop(state); // release the registry mutex before filesystem I/O
+        if let Some((dir, records)) = persist_input {
+            crate::tabs_persist::persist_generation(
+                &dir,
+                server_instance_id,
+                device_id,
+                device_label,
+                client_instance_id,
+                snapshot_revision,
+                &records,
+                now,
+            );
+        }
 
         Ok(PushAck {
             accepted: true,
@@ -317,7 +355,7 @@ impl TabsRegistry {
         closed.sort_by(sort_by_closed_desc);
 
         let mut devices: Vec<&DeviceEntry> = state.devices.values().collect();
-        devices.sort_by(|a, b| b.last_seen_at.cmp(&a.last_seen_at));
+        devices.sort_by_key(|d| std::cmp::Reverse(d.last_seen_at));
         let devices: Vec<Value> = devices
             .into_iter()
             .map(|d| {
