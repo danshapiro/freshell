@@ -32,11 +32,34 @@ if (persisted?.layouts && typeof persisted.layouts === 'object') {
   }
 }
 
+// NOTE ON SEMANTICS (non-destructive peek, not one-shot consume):
+//
+// A restore round can be interrupted by any number of dropped connections /
+// server restarts before a pane actually anchors (receives terminal.created
+// for its createRequestId). Every retry of terminal.create for the SAME
+// requestId must still see restore:true, or the server mints a fresh
+// session and the pane's history becomes invisible even though the pane
+// itself never gave up trying to restore.
+//
+// So despite the name (kept for call-site compatibility), this function does
+// NOT delete the entry on read -- it is a peek. The flag is only ever removed
+// by an explicit call to `clearTerminalRestoreRequestId`, which callers must
+// invoke once the requestId's fate is settled: the pane anchored, or the
+// requestId is being abandoned in favor of a newly-minted one. Until that
+// happens, this keeps returning true for as many interrupted restore rounds
+// as it takes to anchor.
 export function consumeTerminalRestoreRequestId(requestId: string): boolean {
   if (freshRecoveryRequestIds.has(requestId)) return false
-  if (!restoredCreateRequestIds.has(requestId)) return false
+  return restoredCreateRequestIds.has(requestId)
+}
+
+// Explicitly resolves a restore-request id, removing it from the armed set.
+// Call this once the requestId's restore fate is settled -- e.g. the pane
+// anchored (terminal.created received for this requestId), or the requestId
+// is being abandoned in favor of a newly-minted one. Safe to call on an id
+// that was never armed (no-op).
+export function clearTerminalRestoreRequestId(requestId: string): void {
   restoredCreateRequestIds.delete(requestId)
-  return true
 }
 
 export function addTerminalRestoreRequestId(requestId: string): void {
@@ -50,7 +73,7 @@ export function consumeTerminalFreshRecoveryRequest(
   const intent = freshRecoveryRequestIds.get(requestId)
   if (!intent) return undefined
   freshRecoveryRequestIds.delete(requestId)
-  restoredCreateRequestIds.delete(requestId)
+  clearTerminalRestoreRequestId(requestId)
   return intent
 }
 
@@ -58,6 +81,6 @@ export function addTerminalFreshRecoveryRequestId(
   requestId: string,
   intent: TerminalFreshRecoveryIntent,
 ): void {
-  restoredCreateRequestIds.delete(requestId)
+  clearTerminalRestoreRequestId(requestId)
   freshRecoveryRequestIds.set(requestId, intent)
 }

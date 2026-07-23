@@ -14,7 +14,7 @@ import {
   parsePersistedLayoutRaw,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState.js'
-import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
+import { LAYOUT_BACKUP_STORAGE_KEY, LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
@@ -490,11 +490,22 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
   // See "Destructive empty-tabs write guard" above loadPersistedLayout().
-  // If this session's initial tabs load was a recovery from a failed/partial
-  // read, an empty in-memory tabs array is not trustworthy until real tab
-  // content is observed -- at which point emptiness (e.g. the user closing
-  // their last tab) becomes a genuine, persistable action again.
-  let distrustEmptyTabs = wasTabsLoadRecovery()
+  //
+  // v1 of this guard (`distrustEmptyTabs`) only protected the FIRST empty
+  // write after a recovery boot, then permanently disarmed itself the
+  // moment ANY non-empty tabs state was observed -- including tabs state
+  // that arrived via a non-user path (e.g. a cross-tab hydrateTabs merge).
+  // Once disarmed, any LATER emptying (whatever the vector) persisted
+  // destructively, with nothing logged to make the occurrence provable.
+  //
+  // v2 is a stateless, permanent rule instead of a one-shot latch: flush()
+  // must NEVER overwrite a non-empty persisted layout with an empty tabs
+  // array unless THIS SPECIFIC write was caused by a genuine user action
+  // that closed their last tab (see `userClosedTabsIntent` below, set from
+  // the real close-tab action in tabsSlice). This check runs on every
+  // flush, indefinitely -- there is no window after which it stops
+  // protecting the persisted layout.
+  let userClosedTabsIntent = false
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
@@ -504,26 +515,56 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     if (!tabsDirty && !panesDirty && !tabRecencyDirty && !turnCompletionDirty) return
 
     const state = store.getState()
-
-    if ((state.tabs?.tabs?.length ?? 0) > 0) {
-      distrustEmptyTabs = false
-    }
+    // Consume-and-reset: only the write cycle in progress right now may be
+    // authorized by this specific user action. A later, unrelated dirty
+    // cycle must not inherit an intent flag from a previous close.
+    const closedByUser = userClosedTabsIntent
+    userClosedTabsIntent = false
 
     try {
       if (tabsDirty || panesDirty) {
         const nextTabs = state.tabs?.tabs ?? []
 
-        if (nextTabs.length === 0 && distrustEmptyTabs && canUseStorage()) {
+        if (nextTabs.length === 0) {
           const existingRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
-          if (existingRaw) {
-            log.warn(
-              'Refusing to persist empty tabs: this session recovered from a failed/partial ' +
-              'layout load and no genuine tab activity has been observed yet. Leaving the ' +
-              'existing persisted layout untouched to avoid destroying it.',
-            )
-            tabsDirty = false
-            panesDirty = false
-            if (!tabRecencyDirty && !turnCompletionDirty) return
+          const existingParsed = existingRaw ? parsePersistedLayoutRaw(existingRaw) : null
+          // If existingRaw exists but fails to parse, we can't prove it's
+          // safe to overwrite -- conservatively treat it as worth
+          // protecting, same as a parsed non-empty layout.
+          const existingWorthProtecting = existingRaw
+            ? (existingParsed ? existingParsed.tabs.tabs.length > 0 : true)
+            : false
+
+          if (existingWorthProtecting) {
+            // Always back up the layout we're about to potentially
+            // overwrite -- whether or not the write below proceeds. This
+            // is the last line of defense: if some future bug slips past
+            // the guard (or the guard's premise is ever wrong), the prior
+            // non-empty layout is still recoverable from
+            // LAYOUT_BACKUP_STORAGE_KEY.
+            if (existingRaw) {
+              try {
+                localStorage.setItem(LAYOUT_BACKUP_STORAGE_KEY, existingRaw)
+              } catch (backupErr) {
+                log.error('Failed to write layout backup before empty-tabs write', backupErr)
+              }
+            }
+
+            if (!closedByUser) {
+              log.error(
+                'Refusing to persist empty tabs over a non-empty persisted layout: no genuine ' +
+                'user close action was observed for this write. Leaving the existing layout ' +
+                'untouched (backed up to LAYOUT_BACKUP_STORAGE_KEY).',
+                {
+                  reason: 'empty_tabs_write_refused',
+                  wasLoadRecovery: wasTabsLoadRecovery(),
+                  existingParseFailed: !!existingRaw && !existingParsed,
+                },
+              )
+              tabsDirty = false
+              panesDirty = false
+              if (!tabRecencyDirty && !turnCompletionDirty) return
+            }
           }
         }
       }
@@ -664,6 +705,16 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       if (a.type.startsWith('tabs/') && tabsChanged) {
         tabsDirty = true
         scheduleFlush()
+      }
+      // Matched by literal type string (not the removeTab action creator)
+      // to avoid a circular import: tabsSlice already imports from this
+      // module (loadPersistedLayout, markTabsLoadRecovery). removeTab is
+      // ONLY ever dispatched from the closeTab thunk (the single, genuine
+      // user-close-tab path -- close/close-others/close-to-right all funnel
+      // through it), so this is a reliable "the user just closed a tab"
+      // signal for the destructive empty-tabs write guard above.
+      if (a.type === 'tabs/removeTab') {
+        userClosedTabsIntent = true
       }
       if (a.type.startsWith('panes/') && panesChanged) {
         panesDirty = true

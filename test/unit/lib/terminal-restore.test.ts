@@ -19,11 +19,39 @@ describe('terminal-restore', () => {
     const { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } = await import('@/lib/terminal-restore')
     addTerminalRestoreRequestId('new-reconnect-id')
     expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(true)
-    // Consumed — second call returns false
-    expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(false)
+    // v2 semantics: this is a non-destructive PEEK, not a one-shot consume.
+    // An interrupted restore round (dropped reconnect, server restart before
+    // terminal.created lands) must be able to retry terminal.create with
+    // restore:true as many times as it takes to anchor -- so repeated reads
+    // keep returning true until the caller explicitly resolves the id.
+    expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(true)
+    expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(true)
   })
 
-  it('registering new IDs after clearDeadTerminals enables restore bypass', async () => {
+  it('clearTerminalRestoreRequestId resolves the flag so it no longer peeks true', async () => {
+    const {
+      consumeTerminalRestoreRequestId,
+      addTerminalRestoreRequestId,
+      clearTerminalRestoreRequestId,
+    } = await import('@/lib/terminal-restore')
+    addTerminalRestoreRequestId('anchored-id')
+    // Interrupted rounds keep peeking true...
+    expect(consumeTerminalRestoreRequestId('anchored-id')).toBe(true)
+    expect(consumeTerminalRestoreRequestId('anchored-id')).toBe(true)
+    // ...until the caller confirms the requestId's fate is settled (e.g. the
+    // pane anchored via terminal.created), at which point it's gone for good.
+    clearTerminalRestoreRequestId('anchored-id')
+    expect(consumeTerminalRestoreRequestId('anchored-id')).toBe(false)
+    expect(consumeTerminalRestoreRequestId('anchored-id')).toBe(false)
+  })
+
+  it('clearTerminalRestoreRequestId is a no-op for an id that was never armed', async () => {
+    const { clearTerminalRestoreRequestId, consumeTerminalRestoreRequestId } = await import('@/lib/terminal-restore')
+    expect(() => clearTerminalRestoreRequestId('never-armed-id')).not.toThrow()
+    expect(consumeTerminalRestoreRequestId('never-armed-id')).toBe(false)
+  })
+
+  it('registering new IDs after clearDeadTerminals enables restore bypass across repeated peeks', async () => {
     const { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } = await import('@/lib/terminal-restore')
     // Simulate the flow: clearDeadTerminals generates new IDs,
     // then App.tsx registers them with addTerminalRestoreRequestId
@@ -31,13 +59,13 @@ describe('terminal-restore', () => {
     for (const id of newIds) {
       addTerminalRestoreRequestId(id)
     }
-    // All new IDs should be consumable (enabling restore: true)
+    // All new IDs should be consumable (enabling restore: true) across any
+    // number of peeks -- interrupted restore rounds must not lose the flag.
     for (const id of newIds) {
       expect(consumeTerminalRestoreRequestId(id)).toBe(true)
     }
-    // Already consumed
     for (const id of newIds) {
-      expect(consumeTerminalRestoreRequestId(id)).toBe(false)
+      expect(consumeTerminalRestoreRequestId(id)).toBe(true)
     }
   })
 

@@ -40,6 +40,7 @@ vi.mock('@/lib/terminal-themes', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   consumeTerminalRestoreRequestId: vi.fn(() => false),
   addTerminalRestoreRequestId: vi.fn(),
+  clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
 }))
