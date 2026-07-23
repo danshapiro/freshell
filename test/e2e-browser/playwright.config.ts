@@ -74,10 +74,10 @@ const MATRIX_SPECS = [
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
-// Task 7 appends /continuity-smoke\.spec\.ts$/ and Task 10 appends
-// /deploy-tab-diff-rust\.spec\.ts$/.
+// Task 10 appends /deploy-tab-diff-rust\.spec\.ts$/.
 const RUST_ONLY_SPECS = [
   /snapshot-restore-rust\.spec\.ts$/,
+  /continuity-smoke\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -177,6 +177,16 @@ export default defineConfig({
         // legacy has no persisted snapshot generations or restore endpoint.
         /snapshot-restore-rust\.spec\.ts$/,
       ],
+    },
+    // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
+    // codex/amplifier/claude CLIs from PATH. Run via `npm run smoke:continuity`.
+    // NOT part of the default matrix: no other project matches this spec
+    // (RUST_ONLY_SPECS testIgnore on every match-all project; explicit
+    // testMatch lists everywhere else).
+    {
+      name: 'continuity-smoke',
+      use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' as const },
+      testMatch: [/continuity-smoke\.spec\.ts$/],
     },
     ...(process.env.CI ? [
       {
