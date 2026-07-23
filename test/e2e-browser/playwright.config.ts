@@ -74,10 +74,10 @@ const MATRIX_SPECS = [
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
-// Task 10 appends /deploy-tab-diff-rust\.spec\.ts$/.
 const RUST_ONLY_SPECS = [
   /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
+  /deploy-tab-diff-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -176,6 +176,9 @@ export default defineConfig({
         // snapshot generations + one-command restore round-trip. Rust-only:
         // legacy has no persisted snapshot generations or restore endpoint.
         /snapshot-restore-rust\.spec\.ts$/,
+        // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
+        // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
+        /deploy-tab-diff-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
