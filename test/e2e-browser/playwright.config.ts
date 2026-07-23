@@ -72,6 +72,14 @@ const MATRIX_SPECS = [
   /agent-checkpoint-rewind\.spec\.ts$/,
 ]
 
+// CONTINUITY TRIO: rust-only specs kept out of every match-all project
+// (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
+// Task 7 appends /continuity-smoke\.spec\.ts$/ and Task 10 appends
+// /deploy-tab-diff-rust\.spec\.ts$/.
+const RUST_ONLY_SPECS = [
+  /snapshot-restore-rust\.spec\.ts$/,
+]
+
 export default defineConfig({
   testDir: './specs',
   fullyParallel: true,
@@ -96,6 +104,7 @@ export default defineConfig({
     {
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
+      testIgnore: RUST_ONLY_SPECS,
     },
     // HARNESS-02 -- the Node/Rust matrix. Both projects run the SAME spec
     // files (`MATRIX_SPECS`) over the SAME testDir; only the `e2eServerKind`
@@ -163,16 +172,22 @@ export default defineConfig({
         // frozen legacy server/ tree has no equivalent. See
         // diag03-rotation-redaction-rust.spec.ts.
         /diag03-rotation-redaction-rust\.spec\.ts$/,
+        // CONTINUITY TRIO deliverable 1 (docs/plans/2026-07-22-continuity-safety-trio.md):
+        // snapshot generations + one-command restore round-trip. Rust-only:
+        // legacy has no persisted snapshot generations or restore endpoint.
+        /snapshot-restore-rust\.spec\.ts$/,
       ],
     },
     ...(process.env.CI ? [
       {
         name: 'firefox',
         use: { ...devices['Desktop Firefox'] },
+        testIgnore: RUST_ONLY_SPECS,
       },
       {
         name: 'webkit',
         use: { ...devices['Desktop Safari'] },
+        testIgnore: RUST_ONLY_SPECS,
       },
     ] : []),
   ],
