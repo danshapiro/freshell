@@ -184,7 +184,7 @@ case "$CMD" in
         printf 'ERROR: no captured bundle for device %q in the before-file; cannot recommend a union-consistent restore.\n' "$dev" >&2
         continue
       fi
-      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %q\n' "$URL" "$dev" "$comps"
+      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s\n' "$URL" "$dev" "$comps"
     done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$DIFF")
     cleanup; exit 1
     ;;
