@@ -186,10 +186,11 @@ fn now_ms() -> i64 {
 /// `browser` truthy -> browser pane; `editor` truthy -> editor pane; otherwise
 /// terminal (`mode||'shell'`). Mutually exclusive, matching the original's
 /// `if/else if/else` chain.
-pub(crate) async fn create_terminal_or_content_tab(
-    state: FreshAgentState,
-    body: Value,
-) -> Response {
+///
+/// Also driven in-process by `freshell-server`'s `POST /api/tabs-sync/restore`
+/// (continuity trio) — restore MUST reuse this exact pipeline because it is the
+/// path that stamps session identity.
+pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value) -> Response {
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
     if let Some(url) = body.get("browser").and_then(Value::as_str) {
