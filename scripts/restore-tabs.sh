@@ -38,11 +38,26 @@ done
 
 auth=(-H "x-auth-token: ${TOKEN}")
 
+# Print a loud failure WITHOUT masking the server's refusal: curl runs with
+# --fail-with-body so an HTTP error still yields the response body, and the
+# server's explanation (e.g. the 409 "restore requires exactly one connected
+# browser" gate) reaches the operator. Prefers the JSON .message/.error field,
+# falls back to the raw body, and keeps the generic hint when there is no body.
+#   $1 = what failed, $2 = generic hint, $3 = response body (may be empty)
+fail_loud() {
+  local msg=""
+  if [[ -n "$3" ]]; then
+    msg=$(jq -r '.message // .error // empty' <<<"$3" 2>/dev/null) || msg=""
+    printf 'ERROR: %s: %s\n' "$1" "${msg:-$3}" >&2
+  else
+    printf 'ERROR: %s (%s)\n' "$1" "$2" >&2
+  fi
+  exit 1
+}
+
 if $LIST; then
-  resp=$(curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots") || {
-    echo "ERROR: list request failed (URL/token correct? server up?)" >&2
-    exit 1
-  }
+  resp=$(curl --fail-with-body -sS "${auth[@]}" "${URL}/api/tabs-sync/snapshots") ||
+    fail_loud "list request failed" "URL/token correct? server up?" "${resp:-}"
   jq -r '
     .devices[] | .deviceId as $d | .generations[] |
     "\($d)\tgen=\(.generation)\tid=\(.generationId)\trev=\(.snapshotRevision)\trecords=\(.recordCount)\tcapturedAt=\(.capturedAt)\tlabel=\(.deviceLabel)"' <<<"$resp"
@@ -65,11 +80,9 @@ elif [[ -n "$GENERATION_ID" ]]; then
 elif [[ -n "$GENERATION" ]]; then
   body=$(jq --argjson g "$GENERATION" '. + {generation: $g}' <<<"$body"); sel="generation=$GENERATION"
 fi
-resp=$(curl -fsS "${auth[@]}" -H 'content-type: application/json' \
-  -d "$body" "${URL}/api/tabs-sync/restore") || {
-  echo "ERROR: restore request failed (is the snapshot/device id right? try --list)" >&2
-  exit 1
-}
+resp=$(curl --fail-with-body -sS "${auth[@]}" -H 'content-type: application/json' \
+  -d "$body" "${URL}/api/tabs-sync/restore") ||
+  fail_loud "restore request failed" "is the snapshot/device id right? try --list" "${resp:-}"
 
 echo "== restore ${DEVICE} (${sel}) =="
 echo "$resp" | jq -r '
