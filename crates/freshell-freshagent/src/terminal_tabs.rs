@@ -819,6 +819,8 @@ pub(crate) async fn spawn_terminal_pane(
         &child_env,
         terminal_id.clone(),
         stream_id,
+        &mode,
+        resume_session_id.as_deref(),
         None,
         on_exit,
     ) {

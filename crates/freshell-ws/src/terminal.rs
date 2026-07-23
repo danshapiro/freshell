@@ -795,13 +795,18 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             // handler does not have.
             resume_session_id = Some(Uuid::new_v4().to_string());
             launch_intent = LaunchIntent::Start;
-        } else if mode == "codex" {
-            // Raw codex resume (the durable-thread restore planner is
-            // coding-cli.md scope); `launchIntent` stays 'resume' (`tr:1570-1571`).
-            resume_session_id = create.resume_session_id.clone().filter(|s| !s.is_empty());
         } else {
             // `requestedSessionRef.provider === mode ? sessionRef.sessionId :
-            // m.resumeSessionId` (`ws:2040-2047`).
+            // m.resumeSessionId` (`ws:2040-2047`). This INCLUDES codex: legacy
+            // derives the codex resume id from the sessionRef too (the
+            // `durable_session_ref_resume` plan, `ws:2037-2040`). A former
+            // codex-special arm here read ONLY `create.resumeSessionId` -- but
+            // the frozen client carries identity ONLY in `sessionRef`
+            // (`TerminalView.tsx:2782-2795`), so every codex bounce-restore and
+            // sidebar reopen spawned plain `codex` with no resume args
+            // (2026-07-22 incident; regression test:
+            // `tests/codex_session_ref_resume.rs`). `launchIntent` stays
+            // 'resume' (`tr:1570-1571`).
             resume_session_id = requested_ref
                 .map(|r| r.session_id.clone())
                 .or_else(|| create.resume_session_id.clone())
@@ -1066,6 +1071,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         &child_env,
         terminal_id.clone(),
         stream_id,
+        &mode,
+        resume_session_id.as_deref(),
         None,
         on_exit,
     ) {

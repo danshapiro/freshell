@@ -496,12 +496,27 @@ impl TerminalRegistry {
     /// any attached subscriber) via [`ingest`]. Bumps the inventory revision.
     ///
     /// Create does NOT attach — the client sends `terminal.attach` next (`§1.2`).
+    ///
+    /// `mode` and `resume_session_id` are the REAL launch identity, stamped
+    /// onto the record (and the `terminal.created` tracing event) from birth.
+    /// Both used to be hardcoded (`mode: "shell"`, `resume: None`) until the
+    /// WS handler's later `set_meta` overwrote them — during the 2026-07-22
+    /// codex-resume incident that lying log reported six codex panes as plain
+    /// shells and actively misled the forensic investigation.
+    ///
+    /// 8 arguments (`clippy::too_many_arguments`): every one is a distinct,
+    /// non-optional create input; a params struct would just restate the
+    /// `terminal.create` wire message this crate deliberately doesn't own
+    /// (same justification as [`Self::attach`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         spec: &SpawnSpec,
         env: &std::collections::BTreeMap<String, String>,
         terminal_id: String,
         stream_id: String,
+        mode: &str,
+        resume_session_id: Option<&str>,
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
@@ -528,8 +543,8 @@ impl TerminalRegistry {
             cwd: spec.cwd.clone(),
             title: "Shell".to_string(),
             description: None,
-            mode: "shell".to_string(),
-            resume_session_id: None,
+            mode: mode.to_string(),
+            resume_session_id: resume_session_id.map(str::to_string),
             subscribers: HashMap::new(),
         }));
 
@@ -565,9 +580,15 @@ impl TerminalRegistry {
         inner.revision += 1;
         drop(inner);
 
+        // DIAG-01 + 2026-07-22 incident fix: log the REAL mode and whether a
+        // resume id was applied. This line used to hardcode `mode = "shell"`,
+        // which reported resumed codex panes as plain shells and misled the
+        // incident investigation. (The wire `terminal.created` frame was
+        // already correct -- it's built in the WS handler; only this LOG lied.)
         tracing::info!(
             terminal_id = %terminal_id,
-            mode = "shell",
+            mode = %mode,
+            resume_applied = resume_session_id.is_some(),
             cwd = %spec.cwd.as_deref().unwrap_or(""),
             pid = pid.unwrap_or(0),
             "terminal.created"
@@ -1320,6 +1341,8 @@ mod tests {
             &env,
             "T-diag-created".to_string(),
             "S-diag-created".to_string(),
+            "shell",
+            None,
             None,
             None,
         )
@@ -1346,6 +1369,71 @@ mod tests {
 
         drop(captured);
         reg.kill("T-diag-created");
+    }
+
+    /// **RED (2026-07-22 incident)**: the `terminal.created` tracing event used
+    /// to hardcode `mode = "shell"` (and the initial record's mode/resume) no
+    /// matter what was actually launched -- during the codex-resume incident it
+    /// reported six resumed-with-`resume <id>`-expected codex panes as plain
+    /// shells, actively misleading the forensic investigation. The event (and
+    /// the record, from birth -- no stamping window) must carry the REAL mode
+    /// and whether a resume id was applied.
+    #[test]
+    fn create_emits_terminal_created_event_with_real_mode_and_resume() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-diag-created-codex".to_string(),
+            "S-diag-created-codex".to_string(),
+            "codex",
+            Some("sess-codex-resume-1"),
+            None,
+            None,
+        )
+        .expect("spawn /bin/sh -c 'sleep 30'");
+
+        let captured = events.lock().unwrap();
+        let created = captured
+            .iter()
+            .find(|e| e.message == "terminal.created")
+            .expect("expected a terminal.created tracing event");
+        assert_eq!(
+            created.fields.get("mode").map(String::as_str),
+            Some("codex"),
+            "the created event must log the REAL mode, not a hardcoded 'shell'"
+        );
+        assert_eq!(
+            created.fields.get("resume_applied").map(String::as_str),
+            Some("true"),
+            "the created event must say whether resume args were applied"
+        );
+        drop(captured);
+
+        // The record itself carries the real mode/resume from birth -- no
+        // misleading window before the WS handler's `set_meta` stamps them.
+        let rows = reg.identity_probe_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.terminal_id == "T-diag-created-codex")
+            .expect("registry lists the created terminal");
+        assert_eq!(row.mode, "codex");
+        assert_eq!(
+            row.resume_session_id.as_deref(),
+            Some("sess-codex-resume-1")
+        );
+
+        reg.kill("T-diag-created-codex");
     }
 
     /// **RED before implementation**: `TerminalRegistry::finish_pty_exit`
@@ -1878,6 +1966,8 @@ mod tests {
             &env,
             terminal_id.clone(),
             "S".to_string(),
+            "shell",
+            None,
             None,
             Some(Box::new(move |code| {
                 // Mirrors the production wiring (`freshell-ws`'s on_exit hook):
@@ -1942,6 +2032,8 @@ mod tests {
             &env,
             terminal_id.clone(),
             "S".to_string(),
+            "shell",
+            None,
             None,
             None,
         )

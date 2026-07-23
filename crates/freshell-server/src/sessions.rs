@@ -417,6 +417,8 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 terminal_id.to_string(),
                 "stream-test".to_string(),
+                "shell",
+                None,
                 None,
                 None,
             )

@@ -115,42 +115,36 @@ test.describe('Sidebar Click Resume', () => {
   // doc comment above).
   // -------------------------------------------------------------------
   test('clicking a seeded Codex session in the sidebar spawns it via `codex resume <id>`', async ({ page, e2eServerKind }) => {
-    // DISCOVERED (2026-07-19, this task) -- the premise of this test does
-    // NOT hold on either server kind, for two DIFFERENT reasons, so this
-    // test is diagnostic-only (`test.fixme`) rather than a green assertion:
+    // DISCOVERED (2026-07-19) / RE-DIAGNOSED (2026-07-22 incident, "codex
+    // tabs lose their sessions on every server restart"):
     //
-    //   - `legacy-chromium`: clicking this seeded Codex session's sidebar
-    //     row correctly dispatches a resume (the pane's persisted content
-    //     shows the correct `sessionRef: { provider: 'codex', sessionId }`
-    //     and `initialCwd`), but the server-side terminal-create request
-    //     settles into `content.status === 'error'` with NO `terminalId`
-    //     ever assigned -- confirmed with `CODEX_CMD` pointed at a real,
-    //     executable fake CLI (proven to work for the identical claude-CLI
-    //     shape in `restore-matrix.spec.ts`) and with
+    //   - `legacy-chromium` (still `test.fixme`): clicking this seeded Codex
+    //     session's sidebar row correctly dispatches a resume (the pane's
+    //     persisted content shows the correct `sessionRef: { provider:
+    //     'codex', sessionId }` and `initialCwd`), but the server-side
+    //     terminal-create request settles into `content.status === 'error'`
+    //     with NO `terminalId` ever assigned -- confirmed with `CODEX_CMD`
+    //     pointed at a real, executable fake CLI (proven to work for the
+    //     identical claude-CLI shape in `restore-matrix.spec.ts`) and with
     //     `codingCli.enabledProviders` explicitly including `codex` (ruling
     //     out the `ws-handler.ts` enabled-provider gate). `server/` is
-    //     FROZEN for this task, so this cannot be root-caused/fixed here.
-    //   - `rust-chromium`: the pane DOES get a real `terminalId` and a
-    //     running process, but the captured argv is NOT `["resume", id]` --
-    //     it is a set of `-c key=value` config overrides
-    //     (`tui.notification_method=bel`, `mcp_servers.freshell.command=...`)
-    //     characteristic of the FreshCodex JSON-RPC app-server protocol
-    //     (`fake-app-server.mjs`'s shape in `restore-matrix.spec.ts`), NOT
-    //     the plain-CLI `server/terminal-registry.ts`/`cli_launch_goldens.rs`
-    //     resume-argv path this fixture assumes. In other words: resuming a
-    //     `codex`-provider session from the sidebar on Rust today routes
-    //     through the FreshCodex sidecar's JSON-RPC resume message, not a
-    //     bare `codex resume <id>` argv -- a genuinely different mechanism
-    //     from Amplifier's plain-terminal-CLI resume (proven below), which
-    //     this test's argv-log assertion cannot observe. Proving THAT
-    //     mechanism (JSON-RPC resume-on-click) is real work, out of scope
-    //     for this pass, and is left as a follow-up rather than silently
-    //     misrepresented as covered by this file.
-    //
-    // `test.fixme` keeps this compiled and runnable for diagnostics (see the
-    // DEBUG-derived findings above) while making clear no claim is made that
-    // it currently passes.
-    test.fixme(true, 'See DISCOVERED comment above: neither server kind resumes this seeded Codex session via a plain `codex resume <id>` CLI argv today.')
+    //     FROZEN, so this cannot be root-caused/fixed here.
+    //   - `rust-chromium` (now GREEN): the 2026-07-19 finding here -- a real
+    //     `terminalId` + running process whose argv was ONLY the `-c
+    //     key=value` overrides, no `["resume", id]` -- was MISDIAGNOSED as
+    //     "the resume routes through the FreshCodex JSON-RPC sidecar". It
+    //     was actually THE incident bug: the Rust WS create path's
+    //     codex-special resume derivation
+    //     (`crates/freshell-ws/src/terminal.rs`) read ONLY
+    //     `create.resumeSessionId` and ignored `create.sessionRef` -- the
+    //     only place the frozen client carries identity -- so the spawn was
+    //     plain `codex` with no resume args. Legacy derives the codex resume
+    //     id from the sessionRef (`server/ws-handler.ts:2040-2047`, the
+    //     `durable_session_ref_resume` plan); the fix aligns the Rust port
+    //     with that anchor, and this leg now passes as a real regression
+    //     guard (see also `codex-terminal-bounce-rust.spec.ts` for the
+    //     restart leg, and `crates/freshell-ws/tests/codex_session_ref_resume.rs`).
+    test.fixme(e2eServerKind === 'legacy', 'Legacy leg only -- see the legacy-chromium DISCOVERED finding above (frozen server/ tree settles this create into status:error).')
 
     const CODEX_SESSION_ID = 'codex-click-resume-0001'
     const SESSION_TITLE = 'sidebar-click-resume codex session'
@@ -263,14 +257,22 @@ test.describe('Sidebar Click Resume', () => {
 
         // (2) Argv-log proof: independent of terminal-buffer scraping --
         // the fake CLI mirrors its OWN argv to a file on every invocation.
+        // NOTE: `resume` is NOT argv[0] for codex -- the launch-arg builder
+        // appends `resumeArgs` LAST, after the `-c` settings/mcp overrides
+        // (see `fake-codex-cli.mjs`'s own doc comment) -- so search for the
+        // adjacent `resume <id>` pair anywhere in argv.
+        const hasResumePair = (argv: string[]) => {
+          const idx = argv.indexOf('resume')
+          return idx >= 0 && argv[idx + 1] === CODEX_SESSION_ID
+        }
         const resumeInvocations = (await expect.poll(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((entry) => entry.argv[0] === 'resume')
+          return lines.filter((entry) => hasResumePair(entry.argv))
         }, { timeout: 20_000 }).not.toEqual([]).then(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((entry) => entry.argv[0] === 'resume')
+          return lines.filter((entry) => hasResumePair(entry.argv))
         }))
-        expect(resumeInvocations.some((entry) => entry.argv[1] === CODEX_SESSION_ID)).toBe(true)
+        expect(resumeInvocations.length).toBeGreaterThan(0)
       } finally {
         await server.stop().catch(() => {})
       }

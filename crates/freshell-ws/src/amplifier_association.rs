@@ -390,6 +390,8 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 "t1".to_string(),
                 "stream-1".to_string(),
+                "amplifier",
+                None,
                 None,
                 None,
             )

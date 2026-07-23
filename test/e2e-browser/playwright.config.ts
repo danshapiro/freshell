@@ -123,6 +123,12 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
+        // CODEX-BOUNCE (2026-07-22 incident regression): a sidebar-resumed
+        // codex pane must re-resume (`codex resume <id>` argv) across a
+        // server restart WITHOUT a page reload. Rust-only: the bug was the
+        // Rust WS create path's codex-special resume derivation ignoring
+        // `sessionRef` (legacy anchor `ws-handler.ts:2040-2047` was correct).
+        /codex-terminal-bounce-rust\.spec\.ts$/,
         // MCP bridge pin (Slice 2, docs/plans/2026-07-18-agent-api-mcp-parity-spec.md
         // §6/§8.3): drives the UNMODIFIED legacy Node MCP stdio binary
         // against an owned, ephemeral Rust server. Rust-only (no legacy
