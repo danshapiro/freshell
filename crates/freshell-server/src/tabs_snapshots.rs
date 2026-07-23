@@ -224,6 +224,18 @@ async fn get_snapshot(
 
 const RESTORE_MARKER: &str = "last-restore.marker"; // .marker ext -> invisible to *.json listing
 
+/// In-flight temp filename for the atomic marker write. Deliberately `.new`,
+/// NOT `.tmp`: freshell-ws's `sweep_orphan_tmp` reaps every `*.tmp` in this
+/// SAME device dir under its own ws-internal lock (PERSIST_LOCK is not shared
+/// with our restore lock), and restore provokes concurrent pushes (each
+/// `tab.create` broadcast triggers a client tabs-sync push -> sweep). A `.tmp`
+/// suffix here could be deleted between our write and rename, failing the
+/// post-create marker write and leaving an `in-progress` marker with no
+/// terminalId -- a rerun would then duplicate the live terminal. Pinned by
+/// `marker_in_flight_temp_is_invisible_to_the_ws_orphan_tmp_sweep` and the
+/// freshell-ws sweep test.
+const RESTORE_MARKER_TMP: &str = ".last-restore.marker.new";
+
 /// Map one snapshot pane to its `POST /api/tabs` body, or Err(reason). A terminal
 /// pane whose `sessionRef` is present-but-invalid (not an object, missing a
 /// nonempty `sessionId`, or `provider != mode`) is rejected HERE (reason
@@ -345,7 +357,7 @@ fn write_marker(
         "sourceId": source_id, "at": at, "panes": Value::Object(panes_json)
     }))
     .unwrap_or_default();
-    let tmp = device_dir.join(format!(".{RESTORE_MARKER}.tmp"));
+    let tmp = device_dir.join(RESTORE_MARKER_TMP);
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, device_dir.join(RESTORE_MARKER))
 }

@@ -415,9 +415,16 @@ static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Remove any orphaned `.tmp` files a crashed write left behind in this device
 /// dir. They are hidden dotfiles excluded from the `*.json` cap math, so an
 /// un-reaped `.tmp` would silently consume disk OUTSIDE every cap and falsify the
-/// hard 2.5 GiB bound. Reaped under `PERSIST_LOCK` (no other writer owns an
-/// in-flight `.tmp` concurrently), BEFORE cap accounting, so caps see the true
+/// hard 2.5 GiB bound. Reaped BEFORE cap accounting, so caps see the true
 /// on-disk footprint. Reap failures are LOGGED (never ignored).
+///
+/// SCOPE: `PERSIST_LOCK` only serializes THIS crate's generation writes — it is
+/// NOT shared with freshell-server's restore path, which concurrently writes
+/// its write-ahead marker into this SAME device dir (and restore provokes
+/// pushes, so the overlap is real). The marker's in-flight temp is therefore
+/// named `.last-restore.marker.new` (NOT `*.tmp`,
+/// `tabs_snapshots.rs::RESTORE_MARKER_TMP`) precisely so this sweep can never
+/// reap it mid-write. Only ever reap the `tmp` extension here.
 fn sweep_orphan_tmp(device_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(device_dir) else {
         return;

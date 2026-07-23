@@ -757,3 +757,22 @@ async fn force_preserves_prior_marker_and_never_duplicates_live_terminal() {
         "restored"
     );
 }
+
+#[test]
+fn marker_in_flight_temp_is_invisible_to_the_ws_orphan_tmp_sweep() {
+    // freshell-ws's `sweep_orphan_tmp` reaps every `*.tmp` in the device dir
+    // without any lock shared with the restore path, so the marker's in-flight
+    // temp must never carry the `tmp` extension (see RESTORE_MARKER_TMP docs
+    // and the freshell-ws test
+    // `restore_marker_in_flight_temp_survives_the_sweep_while_stray_tmp_is_reaped`).
+    assert!(
+        std::path::Path::new(RESTORE_MARKER_TMP)
+            .extension()
+            .is_none_or(|e| e != "tmp"),
+        "RESTORE_MARKER_TMP must not use the .tmp extension: freshell-ws's \
+         orphan-tmp sweep would reap it mid-write"
+    );
+    // And it must still be a hidden dotfile so the *.json generation listing
+    // never sees it either.
+    assert!(RESTORE_MARKER_TMP.starts_with('.'));
+}

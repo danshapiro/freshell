@@ -614,6 +614,53 @@ fn orphan_tmp_is_reaped_before_cap_math() {
 }
 
 #[test]
+fn restore_marker_in_flight_temp_survives_the_sweep_while_stray_tmp_is_reaped() {
+    // CROSS-CRATE INVARIANT: freshell-server's restore handler writes its
+    // write-ahead marker atomically via an in-flight temp file in this SAME
+    // device dir (`tabs_snapshots.rs::write_marker`), WITHOUT holding
+    // PERSIST_LOCK (it is ws-crate-internal). Restore provokes concurrent
+    // pushes (each tab.create broadcast triggers a client tabs-sync push ->
+    // persist_generation -> sweep), so the sweep must NEVER reap the marker's
+    // in-flight temp: doing so between the marker's write and rename can leave
+    // an `in-progress` marker with no terminalId, and a rerun would duplicate
+    // the live terminal. The marker temp is therefore named `*.new` (NOT
+    // `*.tmp`) precisely so this sweep cannot see it.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        1,
+        1000,
+        vec![open_record("dev:t", "t", 1)],
+    );
+    let enc = encode_device_id("dev").unwrap();
+    let device_dir = dir.path().join(&enc);
+    // The marker's in-flight temp filename (see tabs_snapshots.rs
+    // RESTORE_MARKER_TMP) -- must survive.
+    let marker_tmp = device_dir.join(".last-restore.marker.new");
+    std::fs::write(&marker_tmp, b"{\"sourceId\":\"gen-1\"}").unwrap();
+    // A stray crashed-write generation temp -- must still be reaped.
+    std::fs::write(device_dir.join(".c1-orphan.tmp"), b"partial write").unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        2,
+        2000,
+        vec![open_record("dev:t", "t", 2)],
+    );
+    assert!(
+        marker_tmp.exists(),
+        "the restore marker's in-flight temp file must be invisible to the sweep"
+    );
+    assert!(
+        !device_dir.join(".c1-orphan.tmp").exists(),
+        "a stray generation .tmp must still be reaped"
+    );
+}
+
+#[test]
 fn union_by_ids_restores_the_multi_client_bundle_not_a_single_client() {
     // Two clients, each newest generation is one bundle COMPONENT. The
     // union-by-ids of BOTH ids yields BOTH clients' tabs (:2621); a single
