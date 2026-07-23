@@ -342,4 +342,88 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     expect(g.out).not.toContain('T-covered')          // the covered one is NOT flagged
     await fs.rm(tmp, { recursive: true, force: true })
   })
+
+  test('capture rejects same-digest generation churn and preserves the prior artifact', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-coherence-'))
+    try {
+      const binDir = path.join(tmp, 'bin')
+      await fs.mkdir(binDir)
+      const counter = path.join(tmp, 'counter')
+      const pre = path.join(tmp, 'pre.json')
+      const post = path.join(tmp, 'post.json')
+      const snapshot = path.join(tmp, 'snapshot.json')
+      const terminals = path.join(tmp, 'terminals.json')
+      const out = path.join(tmp, 'capture.json')
+      const generation = (
+        generationIndex: number,
+        generationId: string,
+        clientInstanceId: string,
+        capturedAt: number,
+        snapshotRevision: number,
+      ) => ({ generation: generationIndex, generationId, clientInstanceId, capturedAt, snapshotRevision })
+      await fs.writeFile(pre, JSON.stringify({ devices: [{
+        deviceId: 'dev-1',
+        generations: [
+          generation(0, 'digest-a', 'client-a', 20, 2),
+          generation(1, 'digest-b', 'client-b', 10, 1),
+        ],
+      }] }))
+      // The digest multiset is unchanged, but ownership/order metadata changes
+      // which file is newest for each client.
+      await fs.writeFile(post, JSON.stringify({ devices: [{
+        deviceId: 'dev-1',
+        generations: [
+          generation(0, 'digest-b', 'client-a', 30, 3),
+          generation(1, 'digest-a', 'client-b', 20, 2),
+        ],
+      }] }))
+      await fs.writeFile(snapshot, JSON.stringify({
+        deviceId: 'dev-1', deviceLabel: 'Device', capturedAt: 20,
+        records: [], clientInstanceId: 'client-a', snapshotRevision: 2,
+      }))
+      await fs.writeFile(terminals, '[]')
+      await fs.writeFile(out, 'PRIOR_GOOD_ARTIFACT')
+      await fs.writeFile(path.join(binDir, 'curl'), `#!/usr/bin/env bash
+set -euo pipefail
+n=0
+if [[ -f "$FAKE_CURL_COUNTER" ]]; then n=$(<"$FAKE_CURL_COUNTER"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$FAKE_CURL_COUNTER"
+case $(((n - 1) % 4)) in
+  0) cat "$FAKE_CURL_PRE" ;;
+  1) cat "$FAKE_CURL_SNAPSHOT" ;;
+  2) cat "$FAKE_CURL_TERMINALS" ;;
+  3) cat "$FAKE_CURL_POST" ;;
+esac
+`, { mode: 0o755 })
+
+      let result: { code: number, out: string }
+      try {
+        const { stdout, stderr } = await run(
+          'scripts/deploy-tab-diff.sh',
+          ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out],
+          {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              PATH: `${binDir}:${process.env.PATH}`,
+              FAKE_CURL_COUNTER: counter,
+              FAKE_CURL_PRE: pre,
+              FAKE_CURL_POST: post,
+              FAKE_CURL_SNAPSHOT: snapshot,
+              FAKE_CURL_TERMINALS: terminals,
+            },
+          },
+        )
+        result = { code: 0, out: `${stdout}${stderr}` }
+      } catch (err: any) {
+        result = { code: err.code ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` }
+      }
+      expect(result.code).not.toBe(0)
+      expect(result.out).toMatch(/generation index changed mid-capture|server too busy/i)
+      expect(await fs.readFile(out, 'utf8')).toBe('PRIOR_GOOD_ARTIFACT')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
 })

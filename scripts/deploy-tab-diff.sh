@@ -65,13 +65,16 @@ fetch_state() {
     echo "ERROR: GET /api/terminals failed" >&2; _cleanup_fetch; return 1; fi
   jq -e 'type=="array"' "$term_tmp" >/dev/null \
     || { echo "ERROR: /terminals not an array" >&2; _cleanup_fetch; return 1; }
-  # COHERENCE GATE (:40): re-fetch the index and compare the generation sets.
-  # generationIds are content digests, so identical projections mean every
-  # fetch above happened against one logical state (an A-B-A flip would mean
-  # identical content -- still coherent by construction).
+  # COHERENCE GATE (:40): re-fetch the index and compare the complete ordered
+  # generation metadata. A digest multiset alone is insufficient: one client
+  # can publish content equal to another client's older generation while
+  # changing newest-per-client selection. Client identity, order, capture time,
+  # and revision therefore all participate in the fence.
   if ! curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" > "$snaps2_tmp"; then
     echo "ERROR: coherence re-fetch of /api/tabs-sync/snapshots failed" >&2; _cleanup_fetch; return 1; fi
-  local proj='[.devices[] | { deviceId, gens: ([.generations[].generationId] | sort) }] | sort_by(.deviceId)'
+  local proj='[.devices[] | { deviceId, generations: [.generations[] | {
+    generation, generationId, clientInstanceId, capturedAt, snapshotRevision
+  }] }] | sort_by(.deviceId)'
   if [[ "$(jq -cS "$proj" "$snaps_tmp")" != "$(jq -cS "$proj" "$snaps2_tmp")" ]]; then
     echo "WARN: generation index changed mid-capture (concurrent tabs-sync push); capture incoherent" >&2
     _cleanup_fetch; return 3; fi
