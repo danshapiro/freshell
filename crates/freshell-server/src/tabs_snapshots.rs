@@ -611,18 +611,6 @@ async fn restore_tabs(
                     continue;
                 }
             }
-            // (2) already-restored SKIP only when !force (force re-creates a
-            // restored-but-no-longer-live pane; ordinary is idempotent — :1497).
-            if !force {
-                if let Some(pm) = &prior_mark {
-                    if pm.state == "restored" {
-                        skipped.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
-                            "reason": "already-restored" }));
-                        continue;
-                    }
-                }
-            }
-
             if connection_dropped {
                 failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
                     "reason": "connection-dropped" }));
