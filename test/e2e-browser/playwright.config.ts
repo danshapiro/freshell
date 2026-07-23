@@ -180,14 +180,26 @@ export default defineConfig({
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
     // codex/amplifier/claude CLIs from PATH. Run via `npm run smoke:continuity`.
-    // NOT part of the default matrix: no other project matches this spec
-    // (RUST_ONLY_SPECS testIgnore on every match-all project; explicit
-    // testMatch lists everywhere else).
-    {
-      name: 'continuity-smoke',
-      use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' as const },
-      testMatch: [/continuity-smoke\.spec\.ts$/],
-    },
+    // Registered CONDITIONALLY (mirroring the CI-only browser projects below):
+    // this is a pre-deploy gate that spawns real CLIs and hard-fails on
+    // machines without provider auth (e.g. no readable ~/.codex/auth.json),
+    // so it must never run in a bare project-less invocation like
+    // `npm run test:e2e`. It is included only when explicitly requested via
+    // FRESHELL_SMOKE=1 (set by the `smoke:continuity` npm script) or an
+    // explicit `--project=continuity-smoke` CLI arg. The spec itself stays in
+    // RUST_ONLY_SPECS so no match-all project ever picks it up even when the
+    // project IS registered.
+    ...(process.env.FRESHELL_SMOKE
+      || process.argv.includes('--project=continuity-smoke')
+      || (process.argv.includes('--project')
+        && process.argv[process.argv.indexOf('--project') + 1] === 'continuity-smoke')
+      ? [
+        {
+          name: 'continuity-smoke',
+          use: { ...devices['Desktop Chrome'], e2eServerKind: 'rust' as const },
+          testMatch: [/continuity-smoke\.spec\.ts$/],
+        },
+      ] : []),
     ...(process.env.CI ? [
       {
         name: 'firefox',

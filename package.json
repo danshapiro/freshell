@@ -60,7 +60,7 @@
     "test:codex-real-provider-smoke": "vitest run --config config/vitest/vitest.codex-real-provider-smoke.config.ts",
     "test:opencode-serve-smoke": "vitest run --config config/vitest/vitest.opencode-serve-real-provider-smoke.config.ts",
     "smoke:browser-use": "python3 test/browser_use/smoke_freshell.py",
-    "smoke:continuity": "playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke",
+    "smoke:continuity": "cross-env FRESHELL_SMOKE=1 playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke",
     "prepare:icons": "node assets/icons/prepare-icons.mjs",
     "lint": "eslint src --ext .js,.jsx,.ts,.tsx",
     "lint:fix": "eslint src --ext .js,.jsx,.ts,.tsx --fix",
