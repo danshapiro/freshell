@@ -1226,6 +1226,9 @@ rl.on('line', (line) => {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // Success is silent -- no `error`/other frame was broadcast for this interrupt.
-        assert!(rx.try_recv().is_err(), "a successful interrupt must not broadcast");
+        assert!(
+            rx.try_recv().is_err(),
+            "a successful interrupt must not broadcast"
+        );
     }
 }
