@@ -37,7 +37,7 @@
 - Home resolution: `FRESHELL_HOME` else `HOME` (`crates/freshell-server/src/main.rs:16,120`); server disk state lives under `<home>/.freshell/` (`settings_store.rs:164`).
 - `POST /api/tabs` (the proven create pipeline): `crates/freshell-freshagent/src/lib.rs:1150-1171` (`create_tab`; `agent` absent → `terminal_tabs::create_terminal_or_content_tab(state, body).await`); terminal path `crates/freshell-freshagent/src/terminal_tabs.rs:189-224,952-1046` — body keys `mode`, `cwd`, `name`, `sessionRef` (honored when `sessionRef.provider == mode` via `accepted_session_ref_for_mode`, `terminal_tabs.rs:82-87`), `resumeSessionId` (legacy; rejected with HTTP 400 for codex, `terminal_tabs.rs:113-133,62`), `browser: <url>`, `editor: <filePath>`.
   - **RESPONSE ENVELOPE (verified `terminal_tabs.rs:1040-1043,267` via the `ok_json`/`fail_json` helpers at `lib.rs:1106-1133`):** success is `{ "status":"ok", "data": {<ids>}, "message":"tab created" }` — NOT a flat id object. For a terminal tab `data = {tabId, paneId, terminalId}`; for a content (browser/editor) tab `data = {tabId, paneId}` (NO `terminalId`). Errors are `{ "status":"error", "message": <msg> }` at a non-2xx HTTP status (no `data` key). **Every consumer in this plan MUST unwrap `.data` (Rust: `resp_body["data"]["tabId"]`; JS: `body.data.terminalId`).**
-  - Success also broadcasts `ui.command{tab.create}` to ALL connected clients on the shared bus (no device/client targeting — `lib.rs:305-311`, comment "broadcast to ALL clients"); connected clients fold it into Redux via `src/lib/ui-commands.ts:79` (`addTab` is unconditional — every browser adds the tab; see restore broadcast handling in Task 3). The terminal `tab.create` payload carries `paneContent.sessionRef` (`terminal_tabs.rs:995-1010`), so the receiving client's Redux pane gets `content.sessionRef` — this is the uniform, provider-agnostic same-session evidence source used by `codex-terminal-bounce-rust.spec.ts` (`harness.getPaneLayout(tabId).content.sessionRef`).
+  - Ordinary `POST /api/tabs` success broadcasts `ui.command{tab.create}` on the shared bus. Restore calls the same pipeline in deferred-delivery mode, then sends that exact typed command only through the selected screenshot-capable connection's direct sink. The terminal payload carries `paneContent.sessionRef`, so the receiving client's Redux pane gets `content.sessionRef` — the provider-agnostic same-session evidence source used by the Rust e2e specs.
   - A session-provider create carrying NEITHER `sessionRef` NOR `resumeSessionId` still SUCCEEDS and returns the normal envelope (only logs the `tab_create_missing_session_identity` WARN, target `freshell_ws::invariants`, `terminal_tabs.rs:1020-1033`). `is_session_provider_mode` = amplifier|opencode|claude|gemini|kimi (codex/shell excluded).
 - REST auth: `x-auth-token` header (or cookie) — `is_authed`/`unauthorized` are `pub(crate)` in `crates/freshell-server/src/boot.rs:686,713`; import as `use crate::boot::is_authed;`.
 - Live terminal registry REST: `GET /api/terminals` (`crates/freshell-server/src/terminals.rs:103,395-530`) is **BRANCHED (verified `terminals.rs:403-415`)**: with NO read-model query param it returns a **RAW JSON ARRAY** of items (`Json(Value::Array(items))`, line 414); the `{items, nextCursor, revision}` PAGED shape is returned ONLY when any of `cursor`/`priority`/`revision`/`limit` is present, AND `priority` (`"visible"|"background"`) is then REQUIRED (else HTTP 400, `terminals.rs:428-437`). **This plan uses the RAW-ARRAY form (no query params): iterate the array directly (JS `terms.filter(...)`, jq `.[]`), NEVER `terms.items`.** Each item: `terminalId`, `title`, `mode`, `sessionRef?`, `createdAt`, `lastActivityAt`, `status`, `hasClients`, `cwd?`, `lastLine`. **`sessionRef` is DELIBERATELY OMITTED for `mode == "codex"` (and `"shell"`) items (`terminals.rs:674-682`)** and is only synthesized (`{provider:mode, sessionId:resumeSessionId}`) for non-codex/non-shell modes — so codex same-session identity MUST be asserted via the Redux pane (`harness.getPaneLayout(tabId).content.sessionRef`), never via `/api/terminals`. Also `GET /api/terminals/{id}/search?query=...` (**the handler reads the `query` param — verified `terminals.rs:176`; `?q=...` is IGNORED/400, NOT a synonym**) (`terminals.rs:108,382-392`) returns `{ "matches":[{line,column,text}], "nextCursor": <string|null> }` — assert `.matches.length` (the strongest offline proof a CLI rendered text into a pane). `DELETE /api/terminals/{id}` (`terminals.rs:1018-1035`) only writes a `{deleted:true}` settings override + broadcasts `terminals.changed`; it does NOT kill the PTY or close a UI tab (do NOT use it to simulate pane loss).
@@ -64,7 +64,7 @@
   - `create_terminal_or_content_tab` is `pub(crate)` at `terminal_tabs.rs:189` and `pub mod terminal_tabs` is already public (`lib.rs:44`) with NO crate-root re-export. Task 3 changes ONLY that fn's visibility to `pub`, then calls it by full path `freshell_freshagent::terminal_tabs::create_terminal_or_content_tab(state, body).await`. No re-export is needed (or added).
   - `FreshAgentState` has NO `new_for_tests`. Construct it in tests exactly as `terminal_tabs.rs:1394-1402` does: `let (tx,_rx)=tokio::sync::broadcast::channel::<String>(64); FreshAgentState::new(Arc::new(TOKEN.to_string()), Arc::new(tx)).with_terminal_registry(freshell_terminal::TerminalRegistry::new())` (both `new` and `with_terminal_registry` are `pub`; `freshell-server` already depends on `freshell-terminal` and `tokio`).
   - **Restore identity/idempotency substrate:** the REST `POST /api/tabs` create path does NOT synchronously upsert `TerminalIdentityRegistry` for codex (only the WS `terminal.create` path does, `terminal.rs:1193`; REST codex identity is never written there — `terminal_tabs.rs:778-791` documents this gap). So post-create identity CANNOT be re-verified via that registry for codex. Restore therefore proves identity by (i) a STRICT PREFLIGHT that rejects any terminal pane whose snapshot `sessionRef` is present but is not a valid object with a nonempty `sessionId` AND `provider == mode` (a malformed/partial ref is a reported FAILURE, never silently dropped; the create pipeline's `accepted_session_ref_for_mode` acceptance is deterministic, so a pane that passes preflight is spawned WITH its session), and (ii) the response-envelope success check. Idempotency uses a per-device on-disk restore marker keyed by the snapshot's stable content id + PANE-level restored keys (Task 3), not the live registry.
-  - **Connected-browser gate for restore:** `freshell_ws::screenshot::ScreenshotBroker` (constructed at `main.rs:202`, `Clone`) exposes `capable_client_count() -> i64` (`screenshot.rs:95`) counting connected UI clients that advertised `uiScreenshotV1` — the real browser client always does (`src/lib/ws-client.ts:340`). Restore clones the broker into its state and refuses (HTTP 409) unless there is EXACTLY ONE capable client (both 0 and >1 are rejected) — 0 because no browser would receive the restored tabs (broadcast sends are silently discarded), >1 because the create pipeline broadcasts to ALL clients and would duplicate onto bystanders. `force:true` overrides; `dryRun` bypasses (creates nothing). Verifiable in e2e (0 clients → 409; 2 contexts → 409; exactly 1 → OK).
+  - **Connected-browser gate for restore:** `freshell_ws::screenshot::ScreenshotBroker` registers each `uiScreenshotV1` socket by connection id with a direct sink. Under the restore lock, restore atomically snapshots the count and selects the id only when exactly one capable client exists; it refuses ordinary restore at 0 or >1. Both `tab.create` and the screenshot acknowledgement fence target that same id, and results from other connections are ignored. `force:true` overrides the count gate without broadcasting; `dryRun` creates nothing but still reads and classifies marker state.
   - Restart-respawn-with-identity (Task 10 happy path, Task 7 disruption leg) is already proven end-to-end by the committed-green `codex-terminal-bounce-rust.spec.ts` (reconnect → new terminalId → re-spawned argv contains `resume <sessionId>`; same-session asserted via `harness.getPaneLayout(tabId).content.sessionRef`, argv via the fake-codex `FAKE_CODEX_ARGV_LOG`).
 
 ## Scope check
@@ -117,13 +117,14 @@ Three deliverables, one plan: they share one subsystem (tabs-sync identity conti
   - `TabsRegistry::with_persist_dir(dir: std::path::PathBuf) -> TabsRegistry` (on `tabs.rs`, delegates persistence to `tabs_persist`).
   - `pub const MAX_SNAPSHOT_GENERATIONS: usize = 5;` / `pub const MAX_SNAPSHOT_FILES_PER_DEVICE: usize = 40;` / `pub const MAX_SNAPSHOT_DEVICES: usize = 64;` / `pub const MAX_SNAPSHOT_BYTES: usize = 1_048_576;`
   - `pub fn encode_device_id(id: &str) -> Option<String>` — injective, containment-safe folder/name segment (keeps ONLY `[A-Za-z0-9]`, escapes every other byte — INCLUDING `-` as `_2d` and `_` as `_5f` — as `_<2-lower-hex>`; returns `None` for an EMPTY id). Output contains no `.`/`/`/`-`, so `..`, `.`, `a/b` can never resolve outside `<root>` and the `-` delimiter is unambiguous; distinct ids never collide (`"dev a/1" -> "dev_20a_2f1"` ≠ `"dev_a_1" -> "dev_5fa_5f1"`; `"a" -> "a"` ≠ `"a-b" -> "a_2db"`).
-  - `pub fn snapshot_content_id(snap: &serde_json::Value) -> String` — a STABLE, key-order-independent, collision-resistant content digest: **SHA-256** (`sha2::Sha256`) over the **CANONICAL** serialization of the snapshot's `records` array (a recursive key-sorted normalization — see `canonicalize` below — because this workspace enables `serde_json`'s `preserve_order` at `Cargo.toml:33`, so two semantically-equal objects built in different key orders serialize to different bytes and MUST be normalized before hashing), truncated to **32 lower-hex chars (128 bits)**. Used as the generation's `generationId` in listings, the restore marker's `sourceId`, and the restore-by-id selector, so nothing is ever referenced by a shifting positional index. (A 64-bit FNV-1a digest over raw `preserve_order` bytes was BOTH too weak for a recovery-selection key AND not key-order-stable — replaced.)
+  - `pub fn snapshot_content_id(snap: &serde_json::Value) -> String` — the stable canonical digest of the `records` array, used for the restore marker's logical `sourceId`.
+  - `pub fn snapshot_generation_id(snap: &serde_json::Value) -> String` — the stable canonical digest of the full generation document, used as the immutable `generationId` in listings, restore-by-id, and component bundles. Two clients/files with equal records therefore remain independently addressable.
   - **Fail-loud reads (error taxonomy, `:480`):** every reader returns `std::io::Result<...>` so the REST layer can distinguish "no backup" (`Ok(None)`/`Ok(empty)` → 404/empty) from "backup is present but unreadable/corrupt" (`Err` → 500 + structured log with `path` + `error`). A missing device/root directory is ABSENCE (`Ok`); a `read_dir` failure on an existing directory, or a file that exists but fails to read or parse, is an ERROR (`Err`) — a corrupt backup is NEVER silently treated as missing.
   - `pub fn list_snapshot_devices(dir: &std::path::Path) -> std::io::Result<Vec<String>>` — the RAW `deviceId`s (read from each device's stored `deviceId`, NOT the encoded folder name), sorted, deduped. `Err` on an unreadable dir or a corrupt device file.
   - `pub fn list_generations(dir: &std::path::Path, device_id: &str, client_instance_id: &str) -> Vec<std::path::PathBuf>` (one client, newest first; a pure filename listing — no parse — so it stays infallible and returns an empty Vec when the dir is absent).
   - `pub fn read_device_union(dir: &std::path::Path, device_id: &str) -> std::io::Result<Option<serde_json::Value>>` — the COHERENT device recovery snapshot: the union of each client's NEWEST generation's records, deduped by `tabKey` keeping the highest `(revision, updatedAt)`; **the tie-break when BOTH revision and updatedAt are equal is the SOURCE generation's `(clientInstanceId, generationId)`** (which differs per candidate — the tab key does NOT, so it can never resolve a tie), applied by the SHARED `union_of_newest_per_client` function used by BOTH this and `read_device_overview` so the two paths can never disagree (`:570`). `capturedAt`/`snapshotRevision` = the max across clients; `deviceLabel`/`deviceId` taken from the client whose newest generation has the max `(capturedAt, generationId)` (deterministic, not iteration-order-dependent). `Ok(None)` when the device has no generations; `Err` on IO/parse failure.
   - `pub fn read_generation(dir: &std::path::Path, device_id: &str, generation: usize) -> std::io::Result<Option<serde_json::Value>>` — the Nth-newest single point-in-time FILE across the merged (all-clients) `capturedAt`-then-filename-sorted list (0 = newest single file). A SINGLE-CLIENT file, NOT a coherent device-wide generation. `Ok(None)` when out of range, `Err` on IO/parse.
-  - `pub fn read_generation_by_id(dir: &std::path::Path, device_id: &str, generation_id: &str) -> std::io::Result<Option<serde_json::Value>>` — the single point-in-time file whose `snapshot_content_id` equals `generation_id` (stable across file additions/removals, unlike the positional index). `Ok(None)` when no file matches, `Err` on IO/parse. Restore-by-id uses this.
+  - `pub fn read_generation_by_id(dir: &std::path::Path, device_id: &str, generation_id: &str) -> std::io::Result<Option<serde_json::Value>>` — the single point-in-time file whose full-document `snapshot_generation_id` equals `generation_id`. `Ok(None)` when no file matches, `Err` on IO/parse.
   - `pub fn read_generations_union_by_ids(dir: &std::path::Path, device_id: &str, ids: &[String]) -> std::io::Result<Option<serde_json::Value>>` — the union of the SPECIFIC generations named by `ids` (the IMMUTABLE multi-client bundle the deploy capture records, `:2621`), via the SHARED union routine. `Ok(None)` when none match, `Err` on IO/parse. The deploy remediation restores THIS (never a single-client `generationId`).
   - `pub fn read_device_overview(dir: &std::path::Path, device_id: &str) -> std::io::Result<Option<(serde_json::Value, Vec<serde_json::Value>)>>` — a SINGLE directory scan returning `(union, generations_meta)` where each meta is `{generation, generationId, capturedAt, snapshotRevision, deviceLabel, clientInstanceId, recordCount}` newest-first. The list endpoint (Task 2) calls THIS once per device instead of `read_generation` per index (fixes the quadratic re-scan/re-parse DoS). `Ok(None)` when absent, `Err` on IO/parse.
   - `pub(crate) fn persist_generation(dir, server_instance_id, device_id, device_label, client_instance_id, snapshot_revision, open_records: &[Value], captured_at: i64)` — a FREE function (all args explicit incl. `captured_at`, so tests inject deterministic timestamps directly), called only within `freshell-ws` (from `tabs.rs` and these tests). Runs the ENTIRE read-plan-mutate filesystem cycle (orphan-`.tmp` sweep → cap accounting → atomic write → prune → eviction) under ONE process-wide persistence mutex (`:678`), so concurrent pushes to the same OR different devices can never race directory enumeration, eviction, or `remove_dir_all`. Enforces oversize/per-client/global-per-device/device-count caps; deletion/eviction failures are LOGGED (never `let _ =`-ignored); orphaned `.tmp` files are swept AND counted toward caps before cap math. Best-effort: a persistence failure WARNs, never fails the push. Called only from inside `tokio::task::spawn_blocking` (see Step 3b).
@@ -1605,13 +1606,13 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Modify: `crates/freshell-server/src/tabs_snapshots.rs` (add the restore route + handler)
 
 **Interfaces:**
-- Consumes: `freshell_freshagent::terminal_tabs::create_terminal_or_content_tab(state: FreshAgentState, body: Value) -> Response` — change ONLY that fn's visibility `pub(crate)` → `pub` (`pub mod terminal_tabs` is already public, `lib.rs:44`, so NO re-export is added), and call it by FULL PATH `freshell_freshagent::terminal_tabs::create_terminal_or_content_tab(...)`. Also `freshell_ws::tabs_persist::{read_device_union, read_generation, read_generation_by_id, snapshot_content_id, encode_device_id}` (Task 1); `state.screenshots` — BOTH `capable_client_count()` (the target-identity gate) AND the delivery-ack round-trip `register(requestId)` / `send_capture(...)` / `resolve(...)` (`screenshot.rs:104-151`); `state.terminals.is_running(terminalId)` (marker reconciliation); `state.restore_lock` (serialization); `state.restore_ack_timeout`.
-- **Target identity (why a screenshot round-trip is a valid delivery ack):** `main.rs:196,202,232` wire the `ScreenshotBroker` and the `FreshAgentState` create pipeline to ONE shared `broadcast::Sender`. So a pane's `ui.command{tab.create}` and a subsequent `ui.command{screenshot.capture}` traverse the SAME ordered per-connection channel; a `ui.screenshot.result` reply therefore PROVES the client received and processed every earlier frame — including that `tab.create` — folding it into Redux. This is the "existing WS ack machinery" (the client already answers `screenshot.capture`, `ui-commands.ts:51`); no new client message is added (the client is FROZEN). The exactly-one-capable-client gate makes that single connected browser the UNAMBIGUOUS, sole recipient and ack source (there is no second client to duplicate onto or to ambiguate the reply).
+- Consumes: `freshell_freshagent::terminal_tabs::create_terminal_or_content_tab_deferred(...)`, which runs the same identity-stamping create pipeline but returns the typed `ui.command` without broadcasting it. Also consumes the snapshot readers/identities, `ScreenshotBroker::{client_snapshot,send_to_client,register_for_client,send_capture_to,resolve_from}`, live terminal reconciliation, the restore lock, and the acknowledgement timeout.
+- **Target identity:** under the restore lock the handler selects one connection id. It sends both the deferred `tab.create` and the subsequent `screenshot.capture` through that connection's direct sink. The pending acknowledgement records the same expected id, so a result from a connection that arrived during the restore cannot satisfy it. No client protocol change is required.
 - Produces: `POST /api/tabs-sync/restore`, body `{"deviceId":"...", "components":<[string]?>, "generation":<usize?>, "generationId":<string?>, "dryRun":<bool?>, "force":<bool?>}` (`components` = an immutable set of stable generation ids restored as ONE coherent multi-client union — the deploy bundle, `:2621`) →
   - `400` when `deviceId` missing/empty.
-  - **`409` target gate — requires EXACTLY ONE capable client** (not `dryRun`, not `force`): `{"error":"restore requires exactly one connected browser (found N); ...","connectedClients":N}` when `capable_client_count() != 1`. Rejects `>1` (the create pipeline broadcasts to ALL clients, `lib.rs:305-311`, so a bystander would get a duplicate and the ack would be ambiguous) AND `0` (no browser to receive OR to acknowledge). `force:true` overrides the gate (operator accepts fan-out/blind restore); `dryRun` bypasses it (creates nothing).
+  - **`409` target gate — requires EXACTLY ONE capable client** (not `dryRun`, not `force`): `{"error":"restore requires exactly one connected browser (found N); ...","connectedClients":N}` when there is no exclusive connection id. `force:true` overrides the gate but never fans out; `dryRun` bypasses delivery while still reading the marker and classifying already-restored, reconciled-live, in-progress-unconfirmed, and corrupt-marker outcomes.
   - `404` when no such snapshot for `deviceId`.
-  - `200 {"deviceId","generation","generationId","sourceId","sourceCapturedAt","broadcastScope":"all-connected-clients","connectedClients":N,"deliveryConfirmed":<bool>,"restored":[{"tabKey","paneId","kind","request"?,"tabId"?,"terminalId"?}],"skipped":[{"tabKey","paneId","kind","reason"}],"failed":[{"tabKey","paneId","kind","status"?,"error"?,"reason"?}]}`. `deliveryConfirmed` is `true` only when every `restored` pane's `tab.create` was acknowledged by the target browser (or `dryRun`); `false` only under `force` with no capable client (blind restore).
+  - `200 {"deviceId","generation","generationId","sourceId","sourceCapturedAt","broadcastScope":"target-client"|"none","connectedClients":N,"deliveryConfirmed":<bool>,"restored":[...],"skipped":[...],"failed":[...]}`. `deliveryConfirmed` is true only when every delivered pane was acknowledged by the selected browser (or the request was a dry run).
   - `500` ONLY when a marker write fails (see below) — the request must NOT silently report success after failing to record what it restored.
 - Snapshot source (priority): `components=[ids]` → `read_generations_union_by_ids` (the immutable multi-client bundle, `:2621`); else `generationId=<digest>` → `read_generation_by_id` (stable point-in-time); else `generation=N` → `read_generation` (positional point-in-time); else `read_device_union` (coherent, all-clients default). `sourceCapturedAt` echoes the chosen snapshot's `capturedAt`; **`sourceId = snapshot_content_id(&snap)`** is the STABLE content identity of whatever snapshot was chosen — the marker keys off THIS, never a positional index. All snapshot reads + marker IO run inside `spawn_blocking` (`:1480`).
 - Concurrency: the handler takes `let _guard = state.restore_lock.lock().await;` for the whole read-marker → create → ack → write-marker critical section, so two concurrent restores of the same device can't both see an empty marker.
@@ -1716,7 +1717,7 @@ those tests do — reuse their constructor):
         let (status, body) = post(router(r.state.clone()), "/api/tabs-sync/restore",
             json!({ "deviceId": "dev-1" }), true).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["broadcastScope"], "all-connected-clients");
+        assert_eq!(body["broadcastScope"], "target-client");
         assert_eq!(body["deliveryConfirmed"], true, "single responsive browser acked every tab.create");
         assert!(body["sourceId"].is_string());
         let restored = body["restored"].as_array().unwrap();
@@ -1928,9 +1929,23 @@ In `tabs_snapshots.rs` add to `router()`:
         .route("/api/tabs-sync/restore", axum::routing::post(restore_tabs))
 ```
 
-Handler + helpers:
+Shipped implementation source of truth:
 
-```rust
+- `crates/freshell-server/src/tabs_snapshots.rs`
+- `crates/freshell-server/src/tabs_snapshots_marker.rs`
+- `crates/freshell-server/src/tabs_snapshots_selectors.rs`
+- `crates/freshell-server/src/tabs_snapshots_tests.rs`
+- `crates/freshell-server/src/tabs_snapshots_restore_tests.rs`
+
+The shipped handler uses exact connection-bound delivery and acknowledgement,
+strict boolean parsing, marker-aware dry runs, a bounded and semantically
+validated marker ledger, durable writes, immutable full-generation identities,
+and exact component resolution. Do not reconstruct it from an inline sketch.
+
+<details>
+<summary>Archived pre-implementation sketch — non-executable; do not copy</summary>
+
+```text
 const RESTORE_MARKER: &str = "last-restore.marker"; // .marker ext -> invisible to *.json listing
 
 /// Map one snapshot pane to its `POST /api/tabs` body, or Err(reason). A terminal
@@ -2303,6 +2318,8 @@ fn marker_error(device_id: &str, snap: &Value, connected: i64, delivery_confirme
     }))).into_response()
 }
 ```
+
+</details>
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2901,47 +2918,61 @@ the spec. All probes in a throwaway HOME; `script -qec` provides a PTY. Use
 UUIDv4 session ids.
 
 ```bash
-PROBE=$(mktemp -d); CWD="$PROBE/proj"; mkdir -p "$CWD"
+REAL_HOME=$HOME
+PROBE=$(mktemp -d)
+trap 'rm -rf "$PROBE"' EXIT
+CWD="$PROBE/proj"; mkdir -p "$CWD"
 CID=$(python3 -c 'import uuid; print(uuid.uuid4())')   # codex
-ALID=amp-continuity-probe                              # amplifier
+ALID=$(python3 -c 'import uuid; print(uuid.uuid4())')  # amplifier also requires UUID
 CLID=$(python3 -c 'import uuid; print(uuid.uuid4())')  # claude
 
 # codex rollout (real layout: sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl)
 D="$PROBE/.codex/sessions/2026/07/22"; mkdir -p "$D"
 cat > "$D/rollout-2026-07-22T08-00-00-$CID.jsonl" <<EOF
-{"timestamp":"2026-07-22T08:00:00.000Z","type":"session_meta","payload":{"id":"$CID","cwd":"$CWD"}}
+{"timestamp":"2026-07-22T08:00:00.000Z","type":"session_meta","payload":{"session_id":"$CID","id":"$CID","timestamp":"2026-07-22T08:00:00.000Z","cwd":"$CWD","originator":"codex_cli_rs","cli_version":"0.145.0","source":"cli","thread_source":"user","model_provider":"openai","history_mode":"legacy"}}
 {"timestamp":"2026-07-22T08:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"MARKER-CODEX-7f3a the aubergine protocol"}]}}
+{"timestamp":"2026-07-22T08:00:01.500Z","type":"event_msg","payload":{"type":"user_message","message":"MARKER-CODEX-7f3a the aubergine protocol","kind":"plain"}}
 {"timestamp":"2026-07-22T08:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ack MARKER-CODEX-7f3a"}]}}
+{"timestamp":"2026-07-22T08:00:02.500Z","type":"event_msg","payload":{"type":"agent_message","message":"ack MARKER-CODEX-7f3a"}}
 EOF
-(cd "$CWD" && HOME="$PROBE" timeout 30 script -qec "codex resume $CID" /dev/null > /tmp/probe-codex.out || true)
+# Codex requires the real auth file copied read-only into the throwaway HOME,
+# a trusted-project entry, and one Enter at its resume-cwd picker.
+cp "$REAL_HOME/.codex/auth.json" "$PROBE/.codex/auth.json"
+cat > "$PROBE/.codex/config.toml" <<EOF
+[projects."$CWD"]
+trust_level = "trusted"
+EOF
+(cd "$CWD" && printf '\r' | HOME="$PROBE" timeout 30 \
+  script -qec "codex resume $CID" /dev/null > /tmp/probe-codex.out || true)
 grep -c "MARKER-CODEX-7f3a" /tmp/probe-codex.out
 
-# amplifier session dir
-AD="$PROBE/.amplifier/projects/probe-proj/sessions/$ALID"; mkdir -p "$AD"
+# amplifier session dir: project slug replaces `/` only; dots are preserved.
+AMP_SLUG=${CWD//\//-}
+AD="$PROBE/.amplifier/projects/$AMP_SLUG/sessions/$ALID"; mkdir -p "$AD"
 cat > "$AD/metadata.json" <<EOF
-{"session_id":"$ALID","working_dir":"$CWD","created":"2026-07-22T08:00:00.000Z","name":"probe","description":"probe"}
+{"session_id":"$ALID","created":"2026-07-22T08:00:00.000000+00:00","bundle":"bundle:anchors","model":"anthropic/claude-fable-5","turn_count":1,"working_dir":"$CWD"}
 EOF
 printf '%s\n%s\n' \
   '{"role":"user","content":"MARKER-AMP-9c1e the cerulean ledger"}' \
   '{"role":"assistant","content":"ack MARKER-AMP-9c1e"}' > "$AD/transcript.jsonl"
 (cd "$CWD" && HOME="$PROBE" timeout 30 script -qec "amplifier resume $ALID" /dev/null > /tmp/probe-amp.out || true)
 grep -c "MARKER-AMP-9c1e" /tmp/probe-amp.out
-# If `amplifier resume` is not the real verb, check what the server launches:
-# grep -rn "amplifier" crates/freshell-platform/src/cli_launch_goldens.rs (resume args template)
-# and try `amplifier --help`.
 
-# claude project session (cwd-munged dir; format may need iteration -- if the
-# first shape fails, copy a REAL session file's first 3 lines from your own
-# ~/.claude/projects/** as the template, replacing text with MARKERs)
-MUNGED=$(python3 -c "import sys; print(sys.argv[1].replace('/', '-'))" "$CWD")
+# claude project session: project slug replaces BOTH `/` and `.`.
+MUNGED=${CWD//\//-}; MUNGED=${MUNGED//./-}
 CD="$PROBE/.claude/projects/$MUNGED"; mkdir -p "$CD"
+CUUID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+AUUID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 cat > "$CD/$CLID.jsonl" <<EOF
-{"type":"user","uuid":"$(python3 -c 'import uuid; print(uuid.uuid4())')","sessionId":"$CLID","timestamp":"2026-07-22T08:00:01.000Z","cwd":"$CWD","message":{"role":"user","content":[{"type":"text","text":"MARKER-CLAUDE-4b8d the vermilion archive"}]}}
-{"type":"assistant","uuid":"$(python3 -c 'import uuid; print(uuid.uuid4())')","sessionId":"$CLID","timestamp":"2026-07-22T08:00:02.000Z","cwd":"$CWD","message":{"role":"assistant","content":[{"type":"text","text":"ack MARKER-CLAUDE-4b8d"}]}}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"$CUUID","sessionId":"$CLID","timestamp":"2026-07-22T08:00:01.000Z","cwd":"$CWD","userType":"external","version":"2.1.218","message":{"role":"user","content":"MARKER-CLAUDE-4b8d the vermilion archive"}}
+{"parentUuid":"$CUUID","isSidechain":false,"type":"assistant","uuid":"$AUUID","sessionId":"$CLID","timestamp":"2026-07-22T08:00:02.000Z","cwd":"$CWD","userType":"external","version":"2.1.218","message":{"role":"assistant","content":[{"type":"text","text":"ack MARKER-CLAUDE-4b8d"}]}}
 EOF
-(cd "$CWD" && HOME="$PROBE" timeout 30 script -qec "claude --resume $CLID" /dev/null > /tmp/probe-claude.out || true)
+cat > "$PROBE/.claude.json" <<EOF
+{"hasCompletedOnboarding":true,"theme":"dark","projects":{"$CWD":{"hasTrustDialogAccepted":true,"allowedTools":[],"history":[]}}}
+EOF
+(cd "$CWD" && env -u ANTHROPIC_API_KEY HOME="$PROBE" timeout 30 \
+  script -qec "claude --resume $CLID" /dev/null > /tmp/probe-claude.out || true)
 grep -c "MARKER-CLAUDE-4b8d" /tmp/probe-claude.out
-rm -rf "$PROBE"
 ```
 
 For each CLI record: (a) does resume render the MARKER offline (grep count ≥ 1)?
@@ -3050,9 +3081,28 @@ request (this is exactly what shipped in `test/e2e-browser/playwright.config.ts`
 Verify exclusion (with and without CI): the smoke spec must appear ONLY under
 `[continuity-smoke]`, and `snapshot-restore-rust`/`deploy-tab-diff-rust` must
 NOT appear under `[chromium]`:
-```
-npx playwright test --config test/e2e-browser/playwright.config.ts --list | grep -E 'continuity-smoke|snapshot-restore-rust|deploy-tab-diff-rust'
-CI=1 npx playwright test --config test/e2e-browser/playwright.config.ts --list | grep -E 'continuity-smoke|snapshot-restore-rust|deploy-tab-diff-rust'
+```bash
+set -euo pipefail
+CFG=test/e2e-browser/playwright.config.ts
+FRESHELL_SMOKE=1 npx playwright test --config "$CFG" \
+  --project=continuity-smoke --list | tee /tmp/continuity-smoke.list
+grep -qE '^[[:space:]]*\[continuity-smoke\].*continuity-smoke\.spec\.ts' /tmp/continuity-smoke.list
+
+npx playwright test --config "$CFG" --project=chromium --list \
+  | tee /tmp/continuity-chromium.list
+if grep -Eq 'continuity-smoke|snapshot-restore-rust|deploy-tab-diff-rust' \
+    /tmp/continuity-chromium.list; then
+  echo "FATAL: a Rust-only spec leaked into chromium" >&2
+  exit 1
+fi
+
+CI=1 npx playwright test --config "$CFG" \
+  --project=firefox --project=webkit --list | tee /tmp/continuity-ci-match-all.list
+if grep -Eq 'continuity-smoke|snapshot-restore-rust|deploy-tab-diff-rust' \
+    /tmp/continuity-ci-match-all.list; then
+  echo "FATAL: a Rust-only spec leaked into a CI match-all project" >&2
+  exit 1
+fi
 ```
 Neither listing may show any of the three under `[chromium]`, `[firefox]`, or `[webkit]`.
 
@@ -3298,7 +3348,7 @@ set -e
 errs=$(jq -r '[.. | objects | select(has("error")) | .error.message? // empty] | .[]' "$JSON")
 [ -n "$errs" ] || { echo "FATAL: nonzero exit but NO failed-assertion error in the JSON (env/startup failure, not a regression)" >&2; exit 1; }
 # (a) The failing assertion IS the codex BEHAVIORAL assertion.
-echo "$errs" | grep -qiE 'codex.*(MARKER rendered by real CLI|same session)|(MARKER rendered by real CLI|same session).*codex' \
+echo "$errs" | grep -qiE 'codex.*(MARKER rendered by real CLI|same session|history never rendered|picker never settled)|(MARKER rendered by real CLI|same session|history never rendered|picker never settled).*codex' \
   || { echo "FATAL: the failing assertion is not the codex resume/MARKER behavior:" >&2; echo "$errs" >&2; exit 1; }
 # (b) It is NOT a control-leg assertion and NOT an infra/env error.
 if echo "$errs" | grep -qiE 'amplifier|claude'; then
@@ -3455,13 +3505,13 @@ fetch_state() {
     echo "ERROR: GET /api/terminals failed" >&2; _cleanup_fetch; return 1; fi
   jq -e 'type=="array"' "$term_tmp" >/dev/null \
     || { echo "ERROR: /terminals not an array" >&2; _cleanup_fetch; return 1; }
-  # COHERENCE GATE (:40): re-fetch the index and compare the generation sets.
-  # generationIds are content digests, so identical projections mean every
-  # fetch above happened against one logical state (an A-B-A flip would mean
-  # identical content -- still coherent by construction).
+  # COHERENCE GATE (:40): re-fetch the index and compare the complete ordered
+  # generation metadata. Digest multisets alone miss newest-per-client churn.
   if ! curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" > "$snaps2_tmp"; then
     echo "ERROR: coherence re-fetch of /api/tabs-sync/snapshots failed" >&2; _cleanup_fetch; return 1; fi
-  local proj='[.devices[] | { deviceId, gens: ([.generations[].generationId] | sort) }] | sort_by(.deviceId)'
+  local proj='[.devices[] | { deviceId, generations: [.generations[] | {
+    generation, generationId, clientInstanceId, capturedAt, snapshotRevision
+  }] }] | sort_by(.deviceId)'
   if [[ "$(jq -cS "$proj" "$snaps_tmp")" != "$(jq -cS "$proj" "$snaps2_tmp")" ]]; then
     echo "WARN: generation index changed mid-capture (concurrent tabs-sync push); capture incoherent" >&2
     _cleanup_fetch; return 3; fi
@@ -3960,7 +4010,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ## Self-review record (spec vs plan)
 
-1. **Spec coverage:** D1 sessionRef persisted in a NEW focused `tabs_persist` module (keeps `tabs.rs` under the 1k-line limit); ALL snapshot-directory mutation runs under ONE process-wide persistence mutex held for the whole read-plan-mutate cycle (concurrency test: two concurrent pushes to same+different devices), deletion/eviction errors are logged, orphaned `.tmp` are swept + counted before cap math (failure-injection test); per-(device,client) generations pruned to 5, a GLOBAL-per-device file cap (40) across client-id rotation (the critical unbounded-disk fix), device-count cap (64), oversize skip that keeps last-good, injective containment-safe id encoding that escapes `-`; a COLLISION-RESISTANT key-order-independent `snapshot_content_id` (SHA-256 over canonical JSON, 128-bit, key-order test); a coherent cross-client `read_device_union` whose equal-`(revision,updatedAt)` tie-break is the SOURCE `(clientId, generationId)` via ONE shared `union_of_newest_per_client` used by both the union and overview paths (exact-tie test); FAIL-LOUD `io::Result` readers (corrupt-file → Err, not absence) (Task 1). REST read surface: fail-loud handlers (404 absence / 400 malformed-selector fail-closed / 500 corrupt+structured-log, taxonomy table) via a single-scan `read_device_overview` in `spawn_blocking` (Task 2). Restore drives the REAL create pipeline (full module path, envelope `.data`), a STRICT preflight (present-but-invalid sessionRef → reported FAIL), an EXACTLY-ONE target-client gate (rejects 0 and >1) AND per-pane VERIFIED DELIVERY via the shared-bus screenshot round-trip ack (drop → remaining panes FAILED; real in-process WS-receiver tests), a WRITE-AHEAD marker `{state:in-progress→restored, terminalId}` reconciled on retry against `is_running` (crash-point no-duplicate test), `force` that LOADS+unions the prior marker (force-preserves-history test), all fs/marker IO in `spawn_blocking`, and a union-of-`components` bundle mode (Task 3). Operator script defaults to the union, adds `--components` (Task 4). E2e round-trip via `new RustServer(...)` (ephemeral-only) with mixed kinds + codex identity via `getPaneLayout` AND the fake-CLI `resume <id>` argv proof + fresh-context wipe + bystander gate proof + rerun idempotency (Task 5). D2 real server + real CLIs (Task 7), seeded fixtures per real discovery layout with probes (Task 6), sidebar + REST open paths, restart-without-reload then reload, tab-count/session-id(pane)/MARKER(search `?query=`→`.matches`) BEHAVIORAL assertions with a NON-VACUOUS fallback (server `resume_applied:true` + Redux id) — codex leg discriminates on BEHAVIOR, never the log field; fail-closed historical binary (`resolveRustServerBin` + override self-tests) + MACHINE-CHECKED regression (Playwright JSON: codex behavioral assertion failed, controls/infra not implicated; nonzero@`136b9e94~1`, zero@HEAD) evidence (Task 8). D3 ATOMIC capture (temp→validate→rename, explicit curl/jq status checks) emitting an immutable per-device `bundles` set + verify with a FULL set-difference coverage guard (correct jq var-binding, lists uncovered) + `--components` bundle remediation read from the BEFORE file (Task 9); e2e LIVE pass + MISSING loud-fail + executed-`--components`-remediation-with-argv-resume-proof, PLUS a deterministic, FULLY OFFLINE `--after` diff-engine test (fake `curl` aborts on any network call) covering all four verdicts, the PARTIAL-coverage guard, and the MULTI-CLIENT bundle remediation (Task 10). No `port/oracle/DEVIATIONS.md` entry — the surface is purely additive (its entry rules require an objective defect in a ported behavior).
+1. **Spec coverage:** D1 persists sessionRef in a focused `tabs_persist` module; all snapshot-directory mutation is serialized; retention is bounded; generation files and marker documents are semantically validated; generation and marker writes fsync the temp file and parent directory; `snapshot_content_id` identifies logical restore content while the full-document `snapshot_generation_id` immutably identifies each file; exact component bundles cannot be displaced by later equal-content files. Restore drives the real create pipeline in deferred mode, sends only to one selected connection, accepts acknowledgements only from that id, strictly parses control flags, performs marker-aware dry runs, and bounds the marker-source ledger. Requested shell type is resolved by the platform spawn matrix. D2's real-CLI smoke uses the formats/auth/trust/picker behavior proven by the probes. D3's atomic capture coherence fence compares complete ordered generation metadata, and its offline test catches same-digest client/order churn. No `port/oracle/DEVIATIONS.md` entry is required because the surface is additive.
 2. **Deferral audit (1b):** one intentional, LOUD limitation: restore recreates `terminal`/`browser`/`editor` panes and reports `fresh-agent` panes as `skipped: unsupported-kind` (the REST pipeline has no agent-resume shape — `lib.rs:1158-1171`), surfaced in the response, the operator script, and the module docs — not silent. A terminal pane whose captured `sessionRef` is present-but-invalid (not an object, empty/missing `sessionId`, or `provider != mode`) is reported `failed: session-identity-mismatch` (never spawned as a fresh session labelled "restored"). No requirement was moved to "future work".
 3. **Placeholder scan:** remaining `<...>` tokens are run-time values (uuids, shas, captured output) or explicit mirror-this-file instructions pointing at a named existing spec/block — no TBD/TODO steps.
 4. **Type consistency:** `tabs_persist::{with_persist_dir(on TabsRegistry)/list_generations(3-arg)/read_generation/read_generation_by_id/read_generations_union_by_ids/read_device_union/read_device_overview/list_snapshot_devices/encode_device_id/snapshot_content_id/persist_generation/MAX_SNAPSHOT_{GENERATIONS,FILES_PER_DEVICE,DEVICES,BYTES}}` names match across Tasks 1-3 (all readers return `io::Result`); `TabsSnapshotsState{auth_token, snapshots_dir, fresh_agent, screenshots, terminals, restore_lock, restore_ack_timeout}` matches Tasks 2-3 and the `main.rs` merge; the create envelope `{status,data,message}` `.data` unwrap is used uniformly (Tasks 3,5,10); the restore body selector priority `components > generationId > generation > union` is identical in the handler, `restore-tabs.sh` (`--components`/`--generation-id`/`--generation`), and the Task 9 `--components` remediation executed in Task 10; the deploy `bundles[deviceId].components` shape matches the restore `components` field; the deploy script's `--after` (offline) matches Task 10's fake-curl offline test; `RUST_ONLY_SPECS` testIgnore spans Tasks 5/7/10; new specs construct `new RustServer(...)` (ephemeral-only); `FRESHELL_E2E_RUST_SERVER_BIN` + `resolveRustServerBin`/`rustServerBinSha256` (fail-closed, self-tested) match Tasks 6 and 8.
