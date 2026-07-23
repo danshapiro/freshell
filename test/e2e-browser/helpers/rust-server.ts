@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
@@ -99,6 +99,43 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
   }
   rustBuildDone = true
   return bin
+}
+
+/** Resolve the freshell-server binary the harness will spawn. FAIL CLOSED
+ *  (:2015): when `FRESHELL_E2E_RUST_SERVER_BIN` is set it MUST be an executable
+ *  file or this THROWS — a typo/stale/non-exec path must never silently fall back
+ *  to the FIXED HEAD binary (which would make the historical-regression proof run
+ *  the wrong binary and pass). Returns `{ bin, source }`; `source` is `'override'`
+ *  or `'built'`. `buildHead` is injected so tests need not compile HEAD. */
+export function resolveRustServerBin(
+  env: NodeJS.ProcessEnv,
+  buildHead: () => string = ensureRustServerBuilt,
+): { bin: string; source: 'override' | 'built' } {
+  const overrideBin = env.FRESHELL_E2E_RUST_SERVER_BIN
+  if (overrideBin !== undefined && overrideBin.trim() !== '') {
+    const p = overrideBin.trim()
+    let st: fs.Stats
+    try {
+      st = fs.statSync(p)
+    } catch {
+      throw new Error(`FRESHELL_E2E_RUST_SERVER_BIN is set but does not exist: ${p}`)
+    }
+    if (!st.isFile()) {
+      throw new Error(`FRESHELL_E2E_RUST_SERVER_BIN is set but is not a regular file: ${p}`)
+    }
+    try {
+      fs.accessSync(p, fs.constants.X_OK)
+    } catch {
+      throw new Error(`FRESHELL_E2E_RUST_SERVER_BIN is set but is not executable: ${p}`)
+    }
+    return { bin: p, source: 'override' }
+  }
+  return { bin: buildHead(), source: 'built' }
+}
+
+/** sha256 of a binary, for evidence that the SELECTED override was actually run. */
+export function rustServerBinSha256(bin: string): string {
+  return createHash('sha256').update(fs.readFileSync(bin)).digest('hex')
 }
 
 /**
@@ -293,7 +330,11 @@ export class RustServer implements E2eServerHandle {
 
   /** Spawn the binary bound to the given home/port/token and wait for health. */
   private async boot(homeDir: string, port: number, token: string): Promise<TestServerInfo> {
-    const bin = ensureRustServerBuilt()
+    const { bin, source } = resolveRustServerBin(process.env)
+    if (source === 'override') {
+      // eslint-disable-next-line no-console
+      console.log(`[rust-server] using FRESHELL_E2E_RUST_SERVER_BIN=${bin} sha256=${rustServerBinSha256(bin).slice(0, 12)}`)
+    }
 
     // Ordering matches `TestServer.start()`: `setupHome` runs BEFORE the
     // wizard-bypass config write, so a caller-provided `setupHome` may
