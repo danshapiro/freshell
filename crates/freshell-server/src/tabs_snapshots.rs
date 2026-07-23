@@ -560,10 +560,28 @@ async fn restore_tabs(
             }
 
             let prior_mark = prior.get(&pk).cloned();
-            // (1) Live-terminal reconciliation applies ALWAYS (force or not): a
-            // prior create whose terminal is STILL RUNNING must NEVER be recreated
-            // (that is the duplicate the crash-window and blind force would cause).
-            // Re-ack; promote to restored on confirm, else report reconciled-live.
+            // (1) already-restored SKIP first when !force (:1623): a rerun over a
+            // fully-restored pane is a no-op and must REPORT as a skip, whether or
+            // not its terminal is still running (nothing is re-created either way;
+            // `marker` already carries the prior record via the `prior` clone).
+            // force bypasses this skip (re-creates a restored-but-dead pane) and
+            // falls through to reconciliation, which still prevents duplicating a
+            // live terminal (:1497).
+            if !force {
+                if let Some(pm) = &prior_mark {
+                    if pm.state == "restored" {
+                        skipped.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                            "reason": "already-restored" }));
+                        continue;
+                    }
+                }
+            }
+            // (2) Live-terminal reconciliation for everything that got past the
+            // skip (crash-window `in-progress` panes always; `restored` panes only
+            // under force): a prior create whose terminal is STILL RUNNING must
+            // NEVER be recreated (that is the duplicate the crash-window and blind
+            // force would cause). Re-ack; promote to restored on confirm, else
+            // report reconciled-live.
             if let Some(pm) = &prior_mark {
                 if pm
                     .terminal_id
