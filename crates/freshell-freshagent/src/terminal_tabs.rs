@@ -192,8 +192,20 @@ fn now_ms() -> i64 {
 /// path that stamps session identity.
 pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value) -> Response {
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
+    // Continuity trio (`tabs_snapshots.rs:632`): a restore-driven create tags
+    // itself with a deterministic `restoreKey` so a restore RETRY can reconcile
+    // a create whose write-ahead marker promotion never landed. Recorded after
+    // the create succeeds; absent for ordinary creates.
+    let restore_key = body
+        .get("restoreKey")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     if let Some(url) = body.get("browser").and_then(Value::as_str) {
+        // `devToolsOpen` flows into the frozen client verbatim via
+        // `paneContent` (ui-commands.ts `tab.create` -> initLayout), so a
+        // snapshot restore can round-trip the captured value. Default stays
+        // `false` for ordinary creates.
         return create_content_tab(
             &state,
             name,
@@ -201,11 +213,15 @@ pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value)
             json!({
                 "kind": "browser",
                 "url": url,
-                "devToolsOpen": false,
+                "devToolsOpen": body.get("devToolsOpen").and_then(Value::as_bool).unwrap_or(false),
             }),
+            restore_key.as_deref(),
         );
     }
     if let Some(file_path) = body.get("editor").and_then(Value::as_str) {
+        // language/readOnly/viewMode/wordWrap flow into the frozen client
+        // verbatim via `paneContent` (same round-trip rationale as browser's
+        // `devToolsOpen` above); defaults match the pre-existing behavior.
         return create_content_tab(
             &state,
             name,
@@ -213,15 +229,17 @@ pub async fn create_terminal_or_content_tab(state: FreshAgentState, body: Value)
             json!({
                 "kind": "editor",
                 "filePath": file_path,
-                "language": Value::Null,
-                "readOnly": false,
+                "language": body.get("language").and_then(Value::as_str)
+                    .map(Value::from).unwrap_or(Value::Null),
+                "readOnly": body.get("readOnly").and_then(Value::as_bool).unwrap_or(false),
                 "content": "",
-                "viewMode": "source",
-                "wordWrap": true,
+                "viewMode": body.get("viewMode").and_then(Value::as_str).unwrap_or("source"),
+                "wordWrap": body.get("wordWrap").and_then(Value::as_bool).unwrap_or(true),
             }),
+            restore_key.as_deref(),
         );
     }
-    create_terminal_tab(&state, name, &body).await
+    create_terminal_tab(&state, name, &body, restore_key.as_deref()).await
 }
 
 /// The "cheap" content kinds (`router.ts:720-723`): no process, no rollback
@@ -231,6 +249,7 @@ fn create_content_tab(
     name: Option<String>,
     kind: &str,
     pane_content: Value,
+    restore_key: Option<&str>,
 ) -> Response {
     let tab_id = Uuid::new_v4().to_string();
     let pane_id = Uuid::new_v4().to_string();
@@ -254,6 +273,19 @@ fn create_content_tab(
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+    // Continuity trio (`tabs_snapshots.rs:632`): record BEFORE the broadcast,
+    // so by the time any client could have received the `tab.create`, a
+    // restore retry can already prove the create happened.
+    if let Some(key) = restore_key {
+        state.record_restore_key(
+            key,
+            crate::RestoreKeyEntry {
+                tab_id: tab_id.clone(),
+                pane_id: pane_id.clone(),
+                terminal_id: None,
+            },
+        );
+    }
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
@@ -901,6 +933,14 @@ pub(crate) async fn spawn_terminal_pane(
         "shell": shell_str.clone().unwrap_or_else(|| "system".to_string()),
         "initialCwd": cwd,
     });
+    // Continuity trio (`tabs_snapshots.rs:245`): a restore-driven create passes
+    // the CAPTURED `codexDurability` record through so the frozen client's
+    // terminal pane state round-trips (the client folds `paneContent`
+    // verbatim via ui-commands.ts `tab.create` -> initLayout). Body-driven and
+    // optional: absent for ordinary creates, and only ever an object.
+    if let Some(cd) = body.get("codexDurability").filter(|v| v.is_object()) {
+        pane_content["codexDurability"] = cd.clone();
+    }
     // `paneContent` sessionRef/resumeSessionId, still mutually exclusive like
     // `router.ts:762-771` -- but with the EDEV-07 upgrade over legacy: a legacy
     // `resumeSessionId` for a known session provider is PROMOTED to the
@@ -958,6 +998,7 @@ async fn create_terminal_tab(
     state: &FreshAgentState,
     name: Option<String>,
     body: &Value,
+    restore_key: Option<&str>,
 ) -> Response {
     // Minted BEFORE spawn (`router.ts:740-744` mints `{tabId,paneId}` via
     // `layoutStore.createTab()` before `registry.create()`) so the CLI env
@@ -987,6 +1028,19 @@ async fn create_terminal_tab(
             kind: "terminal".to_string(),
         },
     );
+    // Continuity trio (`tabs_snapshots.rs:632`): record the spawned terminal
+    // under the caller's restoreKey BEFORE the broadcast, so a restore retry
+    // can reconcile this create even if its marker promotion never lands.
+    if let Some(key) = restore_key {
+        state.record_restore_key(
+            key,
+            crate::RestoreKeyEntry {
+                tab_id: tab_id.clone(),
+                pane_id: pane_id.clone(),
+                terminal_id: Some(terminal_id.clone()),
+            },
+        );
+    }
 
     // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
     // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
@@ -1580,6 +1634,39 @@ mod tests {
         assert_eq!(payload["paneContent"]["kind"], json!("terminal"));
         assert_eq!(payload["paneContent"]["terminalId"], json!(terminal_id));
         assert_eq!(payload["paneContent"]["status"], json!("running"));
+    }
+
+    #[tokio::test]
+    async fn create_tab_passes_codex_durability_through_and_records_restore_key() {
+        // Continuity trio (`tabs_snapshots.rs:245`/`:632`): a restore-driven
+        // create carries the captured `codexDurability` into the broadcast
+        // paneContent verbatim, and its `restoreKey` is recorded in the
+        // ledger with the spawned terminal id for crash-window reconciliation.
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy(),
+                    "codexDurability": { "schemaVersion": 1, "state": "durable" },
+                    "restoreKey": "restore:dev:src:pk" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        let frame = rx.recv().await.expect("tab.create broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            msg["payload"]["paneContent"]["codexDurability"]["state"],
+            json!("durable")
+        );
+        let entry = state
+            .lookup_restore_key("restore:dev:src:pk")
+            .expect("restore key recorded");
+        assert_eq!(entry.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        assert_eq!(entry.tab_id, body["data"]["tabId"].as_str().unwrap());
     }
 
     #[tokio::test]

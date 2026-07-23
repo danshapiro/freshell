@@ -92,6 +92,9 @@ fn device_dir_for(dir: &Path, device_id: &str) -> Option<PathBuf> {
 /// descending == chronological descending within a client; the encoded client
 /// prefix has no `-`, so `client-a` never matches `client-a-b`'s files).
 pub fn list_generations(dir: &Path, device_id: &str, client_instance_id: &str) -> Vec<PathBuf> {
+    with_persist_lock(|| list_generations_locked(dir, device_id, client_instance_id))
+}
+fn list_generations_locked(dir: &Path, device_id: &str, client_instance_id: &str) -> Vec<PathBuf> {
     let Some(device_dir) = device_dir_for(dir, device_id) else {
         return Vec::new();
     };
@@ -160,6 +163,9 @@ fn all_generations_parsed(
 /// name). Sorted + deduped. FAIL-LOUD: a missing root is absence (`Ok(empty)`);
 /// an unreadable dir or a corrupt device file is an ERROR (`Err`).
 pub fn list_snapshot_devices(dir: &Path) -> std::io::Result<Vec<String>> {
+    with_persist_lock(|| list_snapshot_devices_locked(dir))
+}
+fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -202,10 +208,12 @@ pub fn read_generation(
     device_id: &str,
     generation: usize,
 ) -> std::io::Result<Option<Value>> {
-    Ok(all_generations_parsed(dir, device_id)?
-        .into_iter()
-        .nth(generation)
-        .map(|(_, _, v)| v))
+    with_persist_lock(|| {
+        Ok(all_generations_parsed(dir, device_id)?
+            .into_iter()
+            .nth(generation)
+            .map(|(_, _, v)| v))
+    })
 }
 
 /// The single point-in-time file whose content digest == `generation_id`
@@ -216,10 +224,23 @@ pub fn read_generation_by_id(
     device_id: &str,
     generation_id: &str,
 ) -> std::io::Result<Option<Value>> {
-    Ok(all_generations_parsed(dir, device_id)?
-        .into_iter()
-        .map(|(_, _, v)| v)
-        .find(|v| snapshot_content_id(v) == generation_id))
+    with_persist_lock(|| {
+        Ok(all_generations_parsed(dir, device_id)?
+            .into_iter()
+            .map(|(_, _, v)| v)
+            .find(|v| snapshot_content_id(v) == generation_id))
+    })
+}
+
+/// Outcome of a components-bundle lookup: every unique requested id resolved
+/// (`Found`), or the ids that did NOT resolve (`Missing`, in first-requested
+/// order). There is deliberately NO partial-success shape: restoring a subset
+/// of a captured bundle would silently convert an incomplete recovery into a
+/// clean success (the `tabs_persist.rs:232` review finding).
+#[derive(Debug)]
+pub enum ComponentsUnion {
+    Found(Value),
+    Missing(Vec<String>),
 }
 
 /// Union of a SPECIFIC set of generations addressed by their stable ids — the
@@ -228,26 +249,45 @@ pub fn read_generation_by_id(
 /// per-client component generations), never a single client's slice. Runs the
 /// SHARED `union_of_newest_per_client` over just the picked files, so a bundle of
 /// each client's newest generation reproduces that capture's union exactly.
-/// `Ok(None)` when NONE of the ids match; `Err` on IO/parse.
+/// EVERY unique requested id must resolve: if ANY component is missing/pruned
+/// the result is `Missing` naming the unresolved ids (never a partial union).
+/// `Err` on IO/parse.
 pub fn read_generations_union_by_ids(
     dir: &Path,
     device_id: &str,
     ids: &[String],
-) -> std::io::Result<Option<Value>> {
-    let want: std::collections::HashSet<String> = ids.iter().cloned().collect();
-    let picked: Vec<(i64, PathBuf, Value)> = all_generations_parsed(dir, device_id)?
-        .into_iter()
-        .filter(|(_, _, v)| want.contains(&snapshot_content_id(v)))
-        .collect();
-    let Some((records, max_captured, max_rev, label_src)) = union_of_newest_per_client(&picked)
-    else {
-        return Ok(None);
-    };
-    Ok(Some(json!({
-        "deviceId": label_src.get("deviceId").cloned().unwrap_or(Value::Null),
-        "deviceLabel": label_src.get("deviceLabel").cloned().unwrap_or(Value::Null),
-        "snapshotRevision": max_rev, "capturedAt": max_captured, "records": records,
-    })))
+) -> std::io::Result<ComponentsUnion> {
+    with_persist_lock(|| {
+        let want: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let picked: Vec<(i64, PathBuf, Value)> = all_generations_parsed(dir, device_id)?
+            .into_iter()
+            .filter(|(_, _, v)| want.contains(&snapshot_content_id(v)))
+            .collect();
+        let found: std::collections::HashSet<String> = picked
+            .iter()
+            .map(|(_, _, v)| snapshot_content_id(v))
+            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        for id in ids {
+            if !found.contains(id) && !missing.contains(id) {
+                missing.push(id.clone());
+            }
+        }
+        if !missing.is_empty() {
+            return Ok(ComponentsUnion::Missing(missing));
+        }
+        let Some((records, max_captured, max_rev, label_src)) = union_of_newest_per_client(&picked)
+        else {
+            // Unreachable when `ids` is nonempty (every id resolved to a file),
+            // but an EMPTY request must still fail loudly, not union broadly.
+            return Ok(ComponentsUnion::Missing(ids.to_vec()));
+        };
+        Ok(ComponentsUnion::Found(json!({
+            "deviceId": label_src.get("deviceId").cloned().unwrap_or(Value::Null),
+            "deviceLabel": label_src.get("deviceLabel").cloned().unwrap_or(Value::Null),
+            "snapshotRevision": max_rev, "capturedAt": max_captured, "records": records,
+        })))
+    })
 }
 
 /// Newest generation file per client instance, deterministic even at equal
@@ -350,6 +390,9 @@ fn union_of_newest_per_client(
 /// The COHERENT device recovery snapshot (the shared union above). `Ok(None)`
 /// when the device has no generations; `Err` on IO/parse (`:480`).
 pub fn read_device_union(dir: &Path, device_id: &str) -> std::io::Result<Option<Value>> {
+    with_persist_lock(|| read_device_union_locked(dir, device_id))
+}
+fn read_device_union_locked(dir: &Path, device_id: &str) -> std::io::Result<Option<Value>> {
     let parsed = all_generations_parsed(dir, device_id)?;
     let Some((records, max_captured, max_rev, label_src)) = union_of_newest_per_client(&parsed)
     else {
@@ -370,6 +413,12 @@ pub fn read_device_union(dir: &Path, device_id: &str) -> std::io::Result<Option<
 /// so the list view and the restore/read view agree. `Ok(None)` when absent,
 /// `Err` on IO/parse (`:480`).
 pub fn read_device_overview(
+    dir: &Path,
+    device_id: &str,
+) -> std::io::Result<Option<(Value, Vec<Value>)>> {
+    with_persist_lock(|| read_device_overview_locked(dir, device_id))
+}
+fn read_device_overview_locked(
     dir: &Path,
     device_id: &str,
 ) -> std::io::Result<Option<(Value, Vec<Value>)>> {
@@ -403,14 +452,37 @@ pub fn read_device_overview(
 }
 
 /// Process-wide serialization of ALL snapshot-directory mutation (write, prune,
-/// device-file eviction, device-dir `remove_dir_all`). Held across the ENTIRE
-/// read-plan-mutate cycle, so concurrent pushes to the SAME or DIFFERENT devices
-/// can never race directory enumeration, eviction, or removal — the critical
-/// data-loss defect (`:678`). `Mutex::new(())` is `const`, so this needs no
-/// lazy init. Restores/pushes are low-frequency and this lock guards only the
-/// filesystem cycle (in-memory registry work already dropped its own lock), so
-/// contention is negligible and there is no nested acquisition to deadlock on.
+/// device-file eviction, device-dir `remove_dir_all`) AND of every reader in
+/// this module. Held across the ENTIRE read-plan-mutate cycle, so concurrent
+/// pushes to the SAME or DIFFERENT devices can never race directory
+/// enumeration, eviction, or removal — the critical data-loss defect (`:678`)
+/// — and so a reader (restore's snapshot selection, the REST read surface)
+/// can never observe a half-pruned directory or race a device eviction's
+/// `remove_dir_all`. `Mutex::new(())` is `const`, so this needs no lazy init.
+/// Restores/pushes are low-frequency and this lock guards only the filesystem
+/// cycle (in-memory registry work already dropped its own lock), so contention
+/// is negligible.
+///
+/// LOCK HIERARCHY (single level, no nesting): every acquisition goes through
+/// [`with_persist_lock`]; no function that holds it calls another function
+/// that acquires it (the pub readers self-lock and only call lock-free private
+/// helpers), so there is no nested acquisition to deadlock on.
 static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` under the process-wide snapshot-persistence lock. This is THE ONE
+/// way to acquire [`PERSIST_LOCK`], exported so `freshell-server`'s restore
+/// path can make its write-ahead-marker IO (which lives in the SAME device
+/// dir) mutually exclusive with generation writes, retention pruning, and
+/// device eviction — previously restore used only its own unrelated request
+/// lock, so a concurrent new-device push at the device cap could
+/// `remove_dir_all` the source device while restore was reading or writing
+/// its marker. Poison-tolerant: a prior panic while persisting must not wedge
+/// all future pushes/restores. `f` MUST NOT call back into any function that
+/// acquires this lock (see the hierarchy note above).
+pub fn with_persist_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = PERSIST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f()
+}
 
 /// Remove any orphaned `.tmp` files a crashed write left behind in this device
 /// dir. They are hidden dotfiles excluded from the `*.json` cap math, so an
@@ -418,13 +490,13 @@ static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// hard 2.5 GiB bound. Reaped BEFORE cap accounting, so caps see the true
 /// on-disk footprint. Reap failures are LOGGED (never ignored).
 ///
-/// SCOPE: `PERSIST_LOCK` only serializes THIS crate's generation writes — it is
-/// NOT shared with freshell-server's restore path, which concurrently writes
-/// its write-ahead marker into this SAME device dir (and restore provokes
-/// pushes, so the overlap is real). The marker's in-flight temp is therefore
-/// named `.last-restore.marker.new` (NOT `*.tmp`,
-/// `tabs_snapshots.rs::RESTORE_MARKER_TMP`) precisely so this sweep can never
-/// reap it mid-write. Only ever reap the `tmp` extension here.
+/// SCOPE: freshell-server's restore path now runs its marker IO under this
+/// SAME lock (via [`with_persist_lock`]), so this sweep can no longer run
+/// concurrently with a marker write. The marker's in-flight temp keeps its
+/// `.last-restore.marker.new` name (NOT `*.tmp`,
+/// `tabs_snapshots.rs::RESTORE_MARKER_TMP`) as defense-in-depth so the sweep
+/// could never reap it mid-write even if the lock sharing regressed. Only
+/// ever reap the `tmp` extension here.
 fn sweep_orphan_tmp(device_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(device_dir) else {
         return;
@@ -458,9 +530,7 @@ pub(crate) fn persist_generation(
     open_records: &[Value],
     captured_at: i64,
 ) {
-    // Serialize the whole filesystem cycle. Poison-tolerant: a prior panic
-    // while persisting must not wedge all future pushes.
-    let _guard = PERSIST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Serialize the whole filesystem cycle (see `with_persist_lock`).
     let write = || -> std::io::Result<()> {
         let Some(device_dir) = device_dir_for(dir, device_id) else {
             return Ok(()); // empty/uncontainable device id -> never persist
@@ -515,7 +585,7 @@ pub(crate) fn persist_generation(
         enforce_device_file_cap(&device_dir)?;
         Ok(())
     };
-    if let Err(err) = write() {
+    if let Err(err) = with_persist_lock(write) {
         tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, dir = %dir.display(),
             error = %err, "tabs_snapshot_persist_failed: generation not written");
     }

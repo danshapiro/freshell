@@ -133,6 +133,16 @@ pub struct FreshAgentState {
     /// pre-existing per-kind maps (`terminal_panes`/`content_panes`/`panes`)
     /// rather than duplicating tab-membership tracking inside each of them.
     pub(crate) pane_tabs: Arc<Mutex<HashMap<String, String>>>,
+    /// restoreKey -> what a `restoreKey`-tagged create produced (continuity
+    /// trio, `tabs_snapshots.rs:632`). The tabs-sync restore path tags every
+    /// `POST /api/tabs`-pipeline create it drives with a DETERMINISTIC key so
+    /// a retry can reconcile a create whose write-ahead marker promotion never
+    /// landed (the crash window between the pre-create marker write and the
+    /// post-create terminalId record). In-memory only: after a full process
+    /// restart in-process terminals are dead anyway, and the restore path
+    /// treats a missing key accordingly (recreate terminals; fail-loud for
+    /// browser/editor panes it cannot prove undelivered).
+    pub(crate) restore_keys: Arc<Mutex<HashMap<String, RestoreKeyEntry>>>,
     /// Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the
     /// registered coding-CLI command specs (claude/codex/opencode/gemini/
     /// kimi/amplifier/...), the SAME list `freshell_ws::WsState::cli_commands`
@@ -180,6 +190,16 @@ pub(crate) struct TerminalPaneEntry {
     pub(crate) terminal_id: String,
 }
 
+/// What a `restoreKey`-tagged create produced (continuity trio,
+/// `tabs_snapshots.rs:632`): the minted tab/pane ids plus the spawned
+/// terminal id (None for the no-process browser/editor content kinds).
+#[derive(Clone, Debug)]
+pub struct RestoreKeyEntry {
+    pub tab_id: String,
+    pub pane_id: String,
+    pub terminal_id: Option<String>,
+}
+
 /// A `GET /api/tabs` row (Slice 1's reduced shape -- see `terminal_tabs::list_tabs`
 /// doc comment for the deviation from legacy's full layout-tree row).
 #[derive(Clone)]
@@ -207,10 +227,35 @@ impl FreshAgentState {
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
             pane_tabs: Arc::new(Mutex::new(HashMap::new())),
+            restore_keys: Arc::new(Mutex::new(HashMap::new())),
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
         }
+    }
+
+    /// Record what a `restoreKey`-tagged create produced (continuity trio,
+    /// `tabs_snapshots.rs:632`). Called by `terminal_tabs`'s create paths
+    /// immediately after the tab/pane maps are populated, so a restore retry
+    /// in this SAME process can reconcile a create whose write-ahead marker
+    /// promotion never landed (crash window between the pre-create marker
+    /// write and the post-create terminalId record).
+    pub(crate) fn record_restore_key(&self, key: &str, entry: RestoreKeyEntry) {
+        self.restore_keys
+            .lock()
+            .expect("restore_keys mutex")
+            .insert(key.to_string(), entry);
+    }
+
+    /// Look up what a prior `restoreKey`-tagged create produced in THIS
+    /// process (`None` after a process restart — in-process terminals died
+    /// with the process, so the restore path treats absence accordingly).
+    pub fn lookup_restore_key(&self, key: &str) -> Option<RestoreKeyEntry> {
+        self.restore_keys
+            .lock()
+            .expect("restore_keys mutex")
+            .get(key)
+            .cloned()
     }
 
     /// Slice 3a: wire in the SAME registered coding-CLI command specs the WS

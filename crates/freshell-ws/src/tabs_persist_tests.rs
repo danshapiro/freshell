@@ -684,9 +684,12 @@ fn union_by_ids_restores_the_multi_client_bundle_not_a_single_client() {
     );
     let a_id = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
     let b_id = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientB"));
-    let both = read_generations_union_by_ids(dir.path(), "dev", &[a_id.clone(), b_id.clone()])
+    let both = match read_generations_union_by_ids(dir.path(), "dev", &[a_id.clone(), b_id.clone()])
         .unwrap()
-        .unwrap();
+    {
+        ComponentsUnion::Found(v) => v,
+        ComponentsUnion::Missing(m) => panic!("both components present, got Missing({m:?})"),
+    };
     let keys: Vec<String> = both["records"]
         .as_array()
         .unwrap()
@@ -697,18 +700,106 @@ fn union_by_ids_restores_the_multi_client_bundle_not_a_single_client() {
         keys.contains(&"dev:tabA".to_string()) && keys.contains(&"dev:tabB".to_string()),
         "bundle must union ALL components: {keys:?}"
     );
-    let only_a = read_generations_union_by_ids(dir.path(), "dev", &[a_id])
-        .unwrap()
-        .unwrap();
+    let only_a = match read_generations_union_by_ids(dir.path(), "dev", &[a_id]).unwrap() {
+        ComponentsUnion::Found(v) => v,
+        ComponentsUnion::Missing(m) => panic!("component present, got Missing({m:?})"),
+    };
     assert_eq!(
         only_a["records"].as_array().unwrap().len(),
         1,
         "single component = one client only"
     );
+    match read_generations_union_by_ids(dir.path(), "dev", &["nope".to_string()]).unwrap() {
+        ComponentsUnion::Missing(m) => assert_eq!(m, vec!["nope".to_string()]),
+        ComponentsUnion::Found(v) => panic!("unknown id must be Missing, got Found({v})"),
+    }
+}
+
+#[test]
+fn union_by_ids_fails_loud_when_any_requested_component_is_missing() {
+    // ONE component present, ONE pruned (`tabs_persist.rs:232`): the lookup must
+    // NOT silently restore the partial union -- it must name the missing id.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "clientA",
+        1,
+        1000,
+        vec![codex_pane_record("dev:tabA", "sess-A", 1)],
+    );
+    let present = snapshot_content_id(&gen_by_id_scan(dir.path(), "dev", "clientA"));
+    let pruned = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    match read_generations_union_by_ids(dir.path(), "dev", &[present.clone(), pruned.clone()])
+        .unwrap()
+    {
+        ComponentsUnion::Missing(m) => {
+            assert_eq!(m, vec![pruned], "must name EXACTLY the missing component");
+        }
+        ComponentsUnion::Found(v) => {
+            panic!("one-pruned-one-present must fail loudly, got partial union {v}")
+        }
+    }
+}
+
+#[test]
+fn persist_lock_excludes_device_eviction_from_concurrent_readers() {
+    // LOCK UNIFICATION (`tabs_persist.rs:421`): restore's marker IO and
+    // generation reads run under `with_persist_lock`, the SAME lock device
+    // eviction (`enforce_device_cap`'s `remove_dir_all`) requires. The
+    // interleaving below is deterministic BECAUSE of the lock (no sleeps):
+    // while thread A holds it, thread B's at-cap push CANNOT evict the victim
+    // device, so A's reads of the victim dir + marker file can never observe a
+    // half-removed directory.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    // Fill the root EXACTLY to the device cap; dev-000 (oldest capturedAt) is
+    // the deterministic eviction victim for the next NEW device.
+    for n in 0..MAX_SNAPSHOT_DEVICES {
+        let dev = format!("dev-{n:03}");
+        put(
+            &root,
+            &dev,
+            "c1",
+            1,
+            1000 + n as i64,
+            vec![open_record(&format!("{dev}:t"), "t", 1)],
+        );
+    }
+    let victim_dir = root.join(encode_device_id("dev-000").unwrap());
+    // A restore-style marker file lives in the victim's device dir.
+    std::fs::write(victim_dir.join("last-restore.marker"), b"{\"sources\":{}}").unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let root_b = root.clone();
+    let evicted_after_release = with_persist_lock(|| {
+        // Thread B: an at-cap push for a NEW device -- would evict dev-000.
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            put(
+                &root_b,
+                "dev-new",
+                "c1",
+                1,
+                99_000,
+                vec![open_record("dev-new:t", "t", 1)],
+            );
+        });
+        started_rx.recv().unwrap(); // B is definitely running past this point
+                                    // B cannot have evicted: eviction requires the lock THIS closure holds.
+        assert!(
+            victim_dir.join("last-restore.marker").exists(),
+            "victim's marker vanished while the persistence lock was held"
+        );
+        assert!(victim_dir.exists(), "victim dir evicted under the lock");
+        handle
+    })
+    .join();
+    evicted_after_release.unwrap();
+    // After release B proceeded: the eviction really did happen (the test
+    // exercised a REAL at-cap eviction, not a vacuous no-op).
     assert!(
-        read_generations_union_by_ids(dir.path(), "dev", &["nope".to_string()])
-            .unwrap()
-            .is_none()
+        !victim_dir.exists(),
+        "expected dev-000 to be evicted once the lock was released"
     );
 }
 // Helper: the parsed generation owned by a given client (there is one each here).

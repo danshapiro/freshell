@@ -356,6 +356,14 @@ fn marker_json(dir: &std::path::Path, device: &str) -> Value {
     let enc = freshell_ws::tabs_persist::encode_device_id(device).unwrap();
     serde_json::from_slice(&std::fs::read(dir.join(enc).join(RESTORE_MARKER)).unwrap()).unwrap()
 }
+// The v2 marker is a per-source LEDGER (`tabs_snapshots_marker.rs`); these
+// tests restore exactly one source, so return that single source's panes map.
+fn marker_panes(dir: &std::path::Path, device: &str) -> Value {
+    let doc = marker_json(dir, device);
+    let sources = doc["sources"].as_object().expect("v2 marker sources");
+    assert_eq!(sources.len(), 1, "single-source test marker: {doc}");
+    sources.values().next().unwrap()["panes"].clone()
+}
 
 #[tokio::test]
 async fn restore_rebuilds_supported_panes_and_reports_skips() {
@@ -629,8 +637,8 @@ async fn delivery_drop_fails_remaining_panes_and_writes_in_progress_marker() {
         "the pane after the drop must be FAILED, never restored"
     );
     // The created terminal is recorded IN-PROGRESS in the marker.
-    let m = marker_json(dir.path(), "dev-1");
-    let states: Vec<&str> = m["panes"]
+    let m = marker_panes(dir.path(), "dev-1");
+    let states: Vec<&str> = m
         .as_object()
         .unwrap()
         .values()
@@ -699,7 +707,7 @@ async fn write_ahead_reconciles_live_terminal_no_duplicate_on_retry() {
     );
     assert_eq!(second["failed"].as_array().unwrap().len(), 0);
     assert_eq!(
-        marker_json(dir.path(), "dev-1")["panes"][pane_key("dev-1:t1", "p-t1").as_str()]["state"],
+        marker_panes(dir.path(), "dev-1")[pane_key("dev-1:t1", "p-t1").as_str()]["state"],
         "restored"
     );
 }
@@ -753,7 +761,7 @@ async fn force_preserves_prior_marker_and_never_duplicates_live_terminal() {
     );
     // The marker STILL records t1 restored -- force did not discard prior history.
     assert_eq!(
-        marker_json(dir.path(), "dev-1")["panes"][pane_key("dev-1:t1", "p-t1").as_str()]["state"],
+        marker_panes(dir.path(), "dev-1")[pane_key("dev-1:t1", "p-t1").as_str()]["state"],
         "restored"
     );
 }
@@ -776,3 +784,8 @@ fn marker_in_flight_temp_is_invisible_to_the_ws_orphan_tmp_sweep() {
     // never sees it either.
     assert!(RESTORE_MARKER_TMP.starts_with('.'));
 }
+
+// Restore-hardening tests (cross-model review delta r1) live in a sibling file
+// so both test files stay under the repo's 1,000-line-per-file limit.
+#[path = "tabs_snapshots_restore_tests.rs"]
+mod restore_tests;
