@@ -205,6 +205,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         expect(r.devices.some((d: any) => d.generations[0]?.capturedAt > before2Cap)).toBe(true)
       }).toPass({ timeout: 30_000 })
 
+      const tabCountBeforeRemediation = await harness.getTabCount() // codex closed; shell survives
       const bad = await tabDiff(['verify', '--url', info.baseUrl, '--token', info.token, '--before', before2])
       expect(bad.code).not.toBe(0)                         // exits non-zero
       expect(bad.out).toContain('TAB-DIFF DIVERGENCE')     // loud
@@ -212,8 +213,11 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       expect(bad.out).toContain('tab=work')                // names the diverged tab
       expect(bad.out).toContain('scripts/restore-tabs.sh') // prints the remediation
       // Remediation references the immutable multi-client BUNDLE (--components,
-      // stable digests), NEVER a single-client --generation-id (:2621).
+      // stable digests), NEVER a single-client --generation-id (:2621), and is
+      // TARGETED (:175): one --pane per diverged pane, so still-healthy panes
+      // are never re-restored.
       expect(bad.out).toMatch(/--components [0-9a-f,]+/)
+      expect(bad.out).toMatch(/--pane \S+/)
       expect(bad.out).not.toMatch(/--generation-id/)
       expect(bad.out).not.toMatch(/--generation \d/)
 
@@ -222,9 +226,14 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       //    restore exactly-one-client gate allows it. --
       const comps = bad.out.match(/--components ([0-9a-f,]+)/)![1]
       const dev = bad.out.match(/--device (\S+)/)![1]
+      // The printed pane keys are %q-quoted for the shell; strip backslash
+      // escapes when passing them as direct argv entries.
+      const paneArgs = [...bad.out.matchAll(/--pane (\S+)/g)]
+        .flatMap((m) => ['--pane', m[1].replace(/\\/g, '')])
+      expect(paneArgs.length).toBeGreaterThan(0)
       const argvBefore = (await readArgvLog(argLogPath)).length
       const rem = await run('scripts/restore-tabs.sh',
-        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps],
+        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, ...paneArgs],
         { cwd: process.cwd() })
       expect(rem.stdout).toContain('failed=0')
       await expect(async () => {
@@ -236,6 +245,15 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         const entries = (await readArgvLog(argLogPath)).slice(argvBefore)
         expect(entries.some((e) => hasResumePair(e.argv, SESSION_ID)),
           'remediation must exec `codex resume <sessionId>`').toBe(true)
+      }).toPass({ timeout: 20_000 })
+      // TARGETED (:175): ONLY the missing codex pane was restored -- the
+      // surviving shell pane is NOT duplicated and the total tab count is
+      // exactly the pre-failure count (codex back, shell untouched).
+      await expect(async () => {
+        const st = await harness.getState()
+        const shellTabs = st.tabs.tabs.filter((t: any) => t.title === 'sh' || t.name === 'sh')
+        expect(shellTabs.length, 'surviving shell tab must not be duplicated').toBeLessThanOrEqual(1)
+        expect(await harness.getTabCount()).toBe(tabCountBeforeRemediation + 1) // codex back, nothing else
       }).toPass({ timeout: 20_000 })
     } finally {
       await server.stop()
@@ -299,6 +317,16 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     // a single-client --generation-id (:2621).
     expect(d.out).toMatch(/--components aaaa1111,bbbb2222/)
     expect(d.out).not.toMatch(/--generation-id/)
+    // ...and is TARGETED (:175): one --pane per diverged paneKey, so a restore
+    // of the whole union (which would duplicate healthy panes) is never printed.
+    for (const key of [
+      'dev-1:codexMiss#p-terminal',
+      'dev-1:codexRepoint#p-terminal',
+      'dev-1:codexFresh#p-terminal',
+      'dev-1:sh#p-terminal',
+    ]) {
+      expect(d.out).toContain(`--pane ${key}`)
+    }
 
     // PARTIAL-coverage guard (:2559): TWO running terminals, only ONE covered by a
     // snapshot pane -> still FAILS, LISTING the uncovered one (not a silent OK).

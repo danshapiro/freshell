@@ -19,6 +19,7 @@
 set -euo pipefail
 
 URL="" TOKEN="${FRESHELL_TOKEN:-}" DEVICE="" GENERATION="" GENERATION_ID="" COMPONENTS="" DRY_RUN=false LIST=false
+PANES=()   # repeatable --pane "tabKey#paneId": restore ONLY these panes (targeted remediation)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url) URL="$2"; shift 2 ;;
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --generation) GENERATION="$2"; shift 2 ;;
     --generation-id) GENERATION_ID="$2"; shift 2 ;;
     --components) COMPONENTS="$2"; shift 2 ;;   # comma-separated generation ids (the deploy bundle)
+    --pane) PANES+=("$2"); shift 2 ;;           # repeatable; server rejects unknown keys fail-closed
     --dry-run) DRY_RUN=true; shift ;;
     --list) LIST=true; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -79,6 +81,14 @@ elif [[ -n "$GENERATION_ID" ]]; then
   body=$(jq --arg g "$GENERATION_ID" '. + {generationId: $g}' <<<"$body"); sel="generationId=$GENERATION_ID"
 elif [[ -n "$GENERATION" ]]; then
   body=$(jq --argjson g "$GENERATION" '. + {generation: $g}' <<<"$body"); sel="generation=$GENERATION"
+fi
+# Targeted remediation (deploy-tab-diff): restore ONLY the named panes. Each
+# --pane value becomes one JSON string; the server 400s on unknown keys and
+# reports unselected panes as skipped{not-selected} -- never a silent drop.
+if [[ ${#PANES[@]} -gt 0 ]]; then
+  panes_json=$(printf '%s\0' "${PANES[@]}" | jq -Rs 'split("\u0000") | map(select(length>0))')
+  body=$(jq --argjson p "$panes_json" '. + {panes: $p}' <<<"$body")
+  sel="$sel panes=${#PANES[@]}"
 fi
 resp=$(curl --fail-with-body -sS "${auth[@]}" -H 'content-type: application/json' \
   -d "$body" "${URL}/api/tabs-sync/restore") ||
