@@ -33,6 +33,7 @@ mod session_metadata;
 mod sessions;
 mod settings;
 mod settings_store;
+mod tabs_snapshots;
 mod terminals;
 mod updater;
 
@@ -650,6 +651,20 @@ async fn main() -> ExitCode {
             },
         ))
         .merge(boot::router(boot_state))
+        // Continuity trio Task 2: the tabs-sync snapshot read surface. The
+        // `snapshots_dir` MUST match the `tabs-snapshots` dir wired into the
+        // `TabsRegistry` above so the reads serve exactly what pushes persist.
+        .merge(tabs_snapshots::router(tabs_snapshots::TabsSnapshotsState {
+            auth_token: Arc::clone(&auth_token),
+            snapshots_dir: home
+                .as_ref()
+                .map(|h| h.join(".freshell").join("tabs-snapshots")),
+            fresh_agent: fresh_agent_state.clone(),
+            screenshots: screenshots.clone(),
+            terminals: registry.clone(), // the SAME TerminalRegistry from main.rs:246
+            restore_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            restore_ack_timeout: std::time::Duration::from_secs(5),
+        }))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
         .merge(sessions::router(sessions::SessionsState {
