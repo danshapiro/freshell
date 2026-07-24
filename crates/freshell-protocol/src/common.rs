@@ -334,6 +334,28 @@ pub struct CodexActivityRecord {
     pub session_id: Option<String>,
 }
 
+/// `AmplifierActivityRecordSchema.phase` (`shared/ws-protocol.ts:169`) —
+/// extension surface, see `tests/activity_extension.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AmplifierPhase {
+    Idle,
+    Busy,
+}
+
+/// `AmplifierActivityRecordSchema` (`shared/ws-protocol.ts:166-171`) —
+/// extension surface (the frozen T0 inventory predates the amplifier
+/// provider's activity family; the frozen client already consumes it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityRecord {
+    pub terminal_id: String,
+    pub phase: AmplifierPhase,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpencodeActivityRecord {

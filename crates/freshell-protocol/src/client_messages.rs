@@ -42,6 +42,11 @@ pub enum ClientMessage {
     OpencodeActivityList(ActivityList),
     #[serde(rename = "claude.activity.list")]
     ClaudeActivityList(ActivityList),
+    // Extension surface (not in the frozen T0 inventory — see
+    // `EXTENSION_CLIENT_MESSAGE_TYPES`): the frozen client already sends this
+    // on connect (`src/App.tsx:696-701`), mirroring the legacy zod schema.
+    #[serde(rename = "amplifier.activity.list")]
+    AmplifierActivityList(ActivityList),
     #[serde(rename = "ui.layout.sync")]
     UiLayoutSync(UiLayoutSync),
     #[serde(rename = "ui.screenshot.result")]
@@ -103,6 +108,11 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
     "ui.layout.sync",
     "ui.screenshot.result",
 ];
+
+/// Extension client→server discriminants declared BEYOND the frozen T0
+/// inventory — see `EXTENSION_SERVER_MESSAGE_TYPES` (server_messages.rs) for
+/// the rationale; shapes pinned by `tests/activity_extension.rs`.
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 1] = ["amplifier.activity.list"];
 
 // --- hello ------------------------------------------------------------------
 
