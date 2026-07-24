@@ -246,8 +246,25 @@ fn codex_durability(path: &Path, payload: &Value, name: &str) -> std::io::Result
 }
 
 fn validate_terminal(path: &Path, payload: &Value, name: &str) -> std::io::Result<()> {
-    nonempty_string(path, payload, "mode", &format!("{name}.mode"))?;
-    let mode = payload.get("mode").and_then(Value::as_str).unwrap();
+    optional_enum(
+        path,
+        payload,
+        "mode",
+        &format!("{name}.mode"),
+        &[
+            "shell",
+            "claude",
+            "codex",
+            "opencode",
+            "gemini",
+            "kimi",
+            "amplifier",
+        ],
+    )?;
+    let mode = payload
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid(path, &format!("{name}.mode"), "a supported terminal mode"))?;
     optional_enum(
         path,
         payload,

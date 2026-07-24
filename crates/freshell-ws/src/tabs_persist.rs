@@ -97,6 +97,14 @@ fn corrupt_generation(path: &Path, why: impl std::fmt::Display) -> std::io::Erro
 mod validation;
 use validation::validate_generation;
 
+/// Apply the persisted-generation validator to an authenticated
+/// `tabs.sync.push` candidate before it reaches either the in-memory registry
+/// or disk. Keeping this wrapper beside [`read_generation_file`] makes the
+/// acceptance and read paths share one semantic source of truth.
+pub(crate) fn validate_incoming_generation(value: &Value) -> std::io::Result<()> {
+    validate_generation(Path::new("<tabs.sync.push>"), value)
+}
+
 fn read_generation_file(path: &Path) -> std::io::Result<Value> {
     let text = std::fs::read_to_string(path)?;
     let value: Value = serde_json::from_str(&text).map_err(|e| corrupt_generation(path, e))?;
@@ -115,10 +123,35 @@ fn device_dir_for(dir: &Path, device_id: &str) -> Option<PathBuf> {
     Some(device_dir)
 }
 
+/// Monotonic-first generation ordering. Client clocks may move backwards, but
+/// `snapshotRevision` may not; wall-clock capture time is only a tie-breaker.
+fn generation_rank(value: &Value) -> (i64, i64) {
+    (
+        value
+            .get("snapshotRevision")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MIN),
+        value
+            .get("capturedAt")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MIN),
+    )
+}
+
+fn generation_path_rank(path: &Path) -> (i64, i64, PathBuf) {
+    let rank = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|value| generation_rank(&value))
+        .unwrap_or((i64::MIN, i64::MIN));
+    (rank.0, rank.1, path.to_path_buf())
+}
+
 /// All generation FILES for one client, newest first (filename embeds a
-/// zero-padded capturedAt then a zero-padded revision, so lexicographic
-/// descending == chronological descending within a client; the encoded client
-/// prefix has no `-`, so `client-a` never matches `client-a-b`'s files).
+/// zero-padded capturedAt and revision for uniqueness, but ordering is read from
+/// the document as `(snapshotRevision, capturedAt)` so a clock rollback cannot
+/// make a later revision look stale. The encoded client prefix has no `-`, so
+/// `client-a` never matches `client-a-b`'s files.
 pub fn list_generations(dir: &Path, device_id: &str, client_instance_id: &str) -> Vec<PathBuf> {
     with_persist_lock(|| list_generations_locked(dir, device_id, client_instance_id))
 }
@@ -142,15 +175,15 @@ fn list_generations_locked(dir: &Path, device_id: &str, client_instance_id: &str
                 .is_some_and(|n| n.starts_with(&prefix))
         })
         .collect();
-    files.sort();
+    files.sort_by_key(|path| generation_path_rank(path));
     files.reverse();
     files
 }
 
 /// Every generation file for a device across ALL clients, PARSED ONCE, newest
 /// first. The single scan behind read_generation/read_generation_by_id/overview
-/// (no per-index rescan). Sort: capturedAt desc, then filename desc — fully
-/// deterministic even at equal capturedAt (filename embeds the padded revision).
+/// (no per-index rescan). Sort: snapshotRevision desc, then capturedAt desc,
+/// then filename desc — monotonic under clock rollback and fully deterministic.
 /// FAIL-LOUD (`:480`): a MISSING device dir is absence (`Ok(empty)`); a `read_dir`
 /// failure on an existing dir, or a `*.json` file that exists but cannot be read
 /// or parsed, is an ERROR (`Err`) — a corrupt backup is never silently skipped.
@@ -179,7 +212,11 @@ fn all_generations_parsed(
             .expect("validated capturedAt");
         files.push((captured, path, v));
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    files.sort_by(|a, b| {
+        generation_rank(&b.2)
+            .cmp(&generation_rank(&a.2))
+            .then_with(|| b.1.cmp(&a.1))
+    });
     Ok(files)
 }
 
@@ -318,9 +355,9 @@ pub fn read_generations_union_by_ids(
     })
 }
 
-/// Newest generation file per client instance, deterministic even at equal
-/// capturedAt (higher capturedAt wins; tie broken by the greater path — filename
-/// embeds the padded revision). Returns (client -> parsed snapshot).
+/// Newest generation file per client instance, ordered by monotonic
+/// snapshotRevision first, then capturedAt, then path. Returns
+/// (client -> parsed snapshot).
 fn newest_per_client(parsed: &[(i64, PathBuf, Value)]) -> HashMap<String, (i64, PathBuf, Value)> {
     let mut newest: HashMap<String, (i64, PathBuf, Value)> = HashMap::new();
     for (captured, path, v) in parsed {
@@ -333,7 +370,7 @@ fn newest_per_client(parsed: &[(i64, PathBuf, Value)]) -> HashMap<String, (i64, 
         newest
             .entry(client)
             .and_modify(|cur| {
-                if (cand.0, &cand.1) > (cur.0, &cur.1) {
+                if (generation_rank(&cand.2), &cand.1) > (generation_rank(&cur.2), &cur.1) {
                     *cur = cand.clone();
                 }
             })
@@ -351,8 +388,9 @@ fn newest_per_client(parsed: &[(i64, PathBuf, Value)]) -> HashMap<String, (i64, 
 /// does NOT, so it can never break a tie). Returns
 /// `(records, max_capturedAt, max_snapshotRevision, label_source)` or `None` when
 /// the device has no generations. `deviceId`/`deviceLabel` come from the client
-/// whose newest generation has the max `(capturedAt, generationId)` — never from
-/// arbitrary iteration order.
+/// whose newest generation has the max
+/// `(snapshotRevision, capturedAt, generationId)` — never from arbitrary
+/// iteration order.
 fn union_of_newest_per_client(
     parsed: &[(i64, PathBuf, Value)],
 ) -> Option<(Vec<Value>, i64, i64, Value)> {
@@ -363,7 +401,8 @@ fn union_of_newest_per_client(
     let label_src = newest
         .values()
         .max_by(|a, b| {
-            (a.0, snapshot_generation_id(&a.2)).cmp(&(b.0, snapshot_generation_id(&b.2)))
+            (generation_rank(&a.2), snapshot_generation_id(&a.2))
+                .cmp(&(generation_rank(&b.2), snapshot_generation_id(&b.2)))
         })
         .map(|(_, _, v)| v.clone())
         .unwrap_or(Value::Null);
@@ -503,6 +542,26 @@ static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// locked filesystem operations and async process/delivery work.
 static ACTIVE_RESTORE_DIRS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static INJECTED_DELETE_FAILURES: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+fn inject_delete_failure(path: PathBuf) {
+    INJECTED_DELETE_FAILURES.lock().unwrap().insert(path);
+}
+
+fn injected_delete_failure(_path: &Path) -> Option<std::io::Error> {
+    #[cfg(test)]
+    if INJECTED_DELETE_FAILURES.lock().unwrap().contains(_path) {
+        return Some(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("injected deletion failure for {}", _path.display()),
+        ));
+    }
+    None
+}
 
 /// Restore-scoped eviction lease. It holds no mutex across await points; the
 /// eviction planner consults the counted directory set while holding its own
@@ -666,27 +725,42 @@ pub(crate) fn persist_generation(
         sweep_orphan_tmp(&device_dir);
         let name = format!("{client_enc}-{captured_at:020}-r{snapshot_revision:012}.json");
         let tmp = device_dir.join(format!(".{name}.tmp"));
-        atomic_write_durable(&device_dir.join(&name), &tmp, &bytes)?;
-        // Per-client prune: keep newest MAX_SNAPSHOT_GENERATIONS for THIS client.
-        let mut client_files: Vec<PathBuf> = std::fs::read_dir(&device_dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&format!("{client_enc}-")))
-            })
-            .collect();
-        client_files.sort();
-        while client_files.len() > MAX_SNAPSHOT_GENERATIONS {
-            remove_file_logged(&client_files.remove(0));
+        let generation_path = device_dir.join(&name);
+        atomic_write_durable(&generation_path, &tmp, &bytes)?;
+        let retention = (|| -> std::io::Result<()> {
+            // Per-client prune: keep the highest monotonic revisions even when
+            // capturedAt moves backwards.
+            let mut client_files: Vec<PathBuf> = std::fs::read_dir(&device_dir)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(&format!("{client_enc}-")))
+                })
+                .collect();
+            client_files.sort_by_key(|path| generation_path_rank(path));
+            while client_files.len() > MAX_SNAPSHOT_GENERATIONS {
+                remove_file_logged(&client_files[0])?;
+                client_files.remove(0);
+            }
+            // GLOBAL-per-device cap: bound total files across ALL clients so a
+            // rotating clientInstanceId can't grow the dir without limit.
+            enforce_device_file_cap(&device_dir)
+        })();
+        if let Err(retention_error) = retention {
+            // The new generation was already durable. Remove it again so a
+            // failed victim deletion cannot grow the store past its prior
+            // accounting. If rollback also fails, return both failures loudly.
+            return match remove_file_logged(&generation_path) {
+                Ok(()) => Err(retention_error),
+                Err(rollback_error) => Err(std::io::Error::other(format!(
+                    "snapshot retention failed ({retention_error}); rollback of {} also failed ({rollback_error})",
+                    generation_path.display()
+                ))),
+            };
         }
-        // GLOBAL-per-device cap: bound total files across ALL clients so a
-        // rotating clientInstanceId can't grow the dir without limit. Evict
-        // the globally OLDEST files (by capturedAt embedded in the filename,
-        // which sorts client-prefix-then-capturedAt) until at/under the cap.
-        enforce_device_file_cap(&device_dir)?;
         Ok(())
     };
     if let Err(err) = with_persist_lock(write) {
@@ -695,52 +769,72 @@ pub(crate) fn persist_generation(
     }
 }
 
-/// Remove a file, logging (not swallowing) any failure.
-fn remove_file_logged(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
+/// Remove a file, logging and returning any failure so callers cannot remove a
+/// failed victim from their accounting.
+fn remove_file_logged(path: &Path) -> std::io::Result<()> {
+    let result = match injected_delete_failure(path) {
+        Some(error) => Err(error),
+        None => std::fs::remove_file(path),
+    };
+    if let Err(err) = &result {
         tracing::warn!(target: "freshell_ws::tabs", path = %path.display(),
             error = %err, "tabs_snapshot_evict_file_failed");
     }
+    result
+}
+
+fn remove_dir_all_logged(path: &Path) -> std::io::Result<()> {
+    let result = match injected_delete_failure(path) {
+        Some(error) => Err(error),
+        None => std::fs::remove_dir_all(path),
+    };
+    if let Err(err) = &result {
+        tracing::warn!(target: "freshell_ws::tabs", path = %path.display(),
+            error = %err, "tabs_snapshot_evict_device_failed");
+    }
+    result
 }
 
 /// Enforce MAX_SNAPSHOT_FILES_PER_DEVICE across ALL clients in one device dir.
-/// Removes the globally OLDEST files (by the capturedAt field embedded in the
-/// filename `<client>-<capturedAt:020>-r<rev:012>.json`; `<client>` is escaped
-/// and has no `-`, so the 2nd `-`-delimited field is always capturedAt) until
+/// Removes the globally lowest `(snapshotRevision, capturedAt)` files until
 /// at/under the cap. Caller holds `PERSIST_LOCK`; the `.tmp` sweep already ran,
-/// so only real `*.json` generations are in view. This is the global-within-
-/// device bound that survives client-id rotation.
+/// so only real `*.json` generations are in view.
 fn enforce_device_file_cap(device_dir: &Path) -> std::io::Result<()> {
-    let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(device_dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .filter_map(|p| {
-            let name = p.file_name()?.to_str()?;
-            let captured = name.split('-').nth(1)?.to_string(); // 020-padded -> lexicographic == numeric
-            Some((captured, p))
-        })
-        .collect();
+    let mut files: Vec<(i64, i64, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(device_dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        // Retention needs only the two ordering fields. Semantic validation is
+        // enforced at WebSocket acceptance and by every public snapshot reader;
+        // keeping this scan structural lets corruption tests (and legacy files)
+        // remain visible to those readers as a fail-loud error instead of
+        // silently rolling the just-written file back.
+        let text = std::fs::read_to_string(&path)?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|error| corrupt_generation(&path, error))?;
+        let (revision, captured_at) = generation_rank(&value);
+        files.push((revision, captured_at, path));
+    }
     if files.len() <= MAX_SNAPSHOT_FILES_PER_DEVICE {
         return Ok(());
     }
-    files.sort(); // oldest capturedAt (then filename) first
+    files.sort();
     while files.len() > MAX_SNAPSHOT_FILES_PER_DEVICE {
-        let (_, victim) = files.remove(0);
-        remove_file_logged(&victim);
+        let victim = &files[0].2;
+        remove_file_logged(victim)?;
+        files.remove(0);
     }
     Ok(())
 }
 
-/// Enforce MAX_SNAPSHOT_DEVICES. If `target_dir` is NEW and the root is already
-/// at the cap, remove the device dir with the OLDEST newest-generation capturedAt.
-/// Caller holds `PERSIST_LOCK`, so no writer is populating a victim concurrently.
-/// A missing root is absence (`Ok`); any other `read_dir` failure propagates so
-/// the caller logs it rather than silently skipping the cap.
+/// Enforce MAX_SNAPSHOT_DEVICES before a write. New targets reserve one slot;
+/// existing targets also repair a previously over-cap root. Lease-protected
+/// restores and the write target are never candidates. If no eligible victim
+/// remains, fail with `WouldBlock` rather than creating another directory.
 fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
-    if target_dir.exists() {
-        return Ok(());
-    }
+    let target_exists = target_dir.exists();
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -769,14 +863,22 @@ fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
         })
         .collect();
     let mut device_count = dirs.len();
-    dirs.retain(|(_, path)| !restore_protects(path));
-    while device_count >= MAX_SNAPSHOT_DEVICES && !dirs.is_empty() {
+    let allowed_before_write = if target_exists {
+        MAX_SNAPSHOT_DEVICES
+    } else {
+        MAX_SNAPSHOT_DEVICES.saturating_sub(1)
+    };
+    dirs.retain(|(_, path)| path != target_dir && !restore_protects(path));
+    while device_count > allowed_before_write {
+        if dirs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "snapshot device cap is exhausted: all eviction candidates are protected by active restores; retry the tabs-sync push",
+            ));
+        }
         dirs.sort_by_key(|(c, _)| *c);
         let (_, victim) = dirs.remove(0);
-        if let Err(err) = std::fs::remove_dir_all(&victim) {
-            tracing::warn!(target: "freshell_ws::tabs", path = %victim.display(),
-                error = %err, "tabs_snapshot_evict_device_failed");
-        }
+        remove_dir_all_logged(&victim)?;
         device_count -= 1;
     }
     Ok(())

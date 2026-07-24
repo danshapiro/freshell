@@ -321,7 +321,7 @@ fn spawn_browser(r: &Rig, on: std::sync::Arc<AtomicBool>) -> u64 {
         client_id,
         std::sync::Arc::new(move |message| {
             if !on.load(Ordering::SeqCst) {
-                return;
+                return true;
             }
             let v = serde_json::to_value(message).expect("server message serializes");
             let _ = observed.send(v.to_string());
@@ -337,6 +337,7 @@ fn spawn_browser(r: &Rig, on: std::sync::Arc<AtomicBool>) -> u64 {
                     );
                 }
             }
+            true
         }),
     );
     client_id
@@ -561,6 +562,7 @@ async fn connection_churn_cannot_redirect_delivery_or_acknowledgement() {
                     late_id,
                     std::sync::Arc::new(move |_| {
                         late_frames.fetch_add(1, Ordering::SeqCst);
+                        true
                     }),
                 );
             }
@@ -577,6 +579,7 @@ async fn connection_churn_cannot_redirect_delivery_or_acknowledgement() {
                     },
                 );
             }
+            true
         }),
     );
 
@@ -716,7 +719,7 @@ async fn restore_refuses_unless_exactly_one_browser_connected() {
     let _h2 = spawn_browser(&two, on2); // count -> 1 (responsive)
     two.state
         .screenshots
-        .add_capable_client(9_999_999, std::sync::Arc::new(|_| {})); // count -> 2
+        .add_capable_client(9_999_999, std::sync::Arc::new(|_| true)); // count -> 2
     let (status, body) = post(
         router(two.state.clone()),
         "/api/tabs-sync/restore",
@@ -949,7 +952,10 @@ async fn force_preserves_prior_marker_and_never_duplicates_live_terminal() {
         forced["restored"][0]["terminalId"], tid,
         "no duplicate under force"
     );
-    assert_ne!(forced["restored"][0]["tabId"], first_tab_id);
+    assert_eq!(
+        forced["restored"][0]["tabId"], first_tab_id,
+        "the reused PTY must keep the ids injected into its environment"
+    );
     // The marker STILL records t1 restored -- force did not discard prior history.
     assert_eq!(
         marker_panes(dir.path(), "dev-1")[pane_key("dev-1:t1", "p-t1").as_str()]["state"],

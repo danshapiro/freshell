@@ -238,7 +238,10 @@ async fn create_terminal_or_content_tab_with_delivery(
             broadcast,
         );
     }
-    if let Some(file_path) = body.get("editor").and_then(Value::as_str) {
+    if let Some(file_path) = body
+        .get("editor")
+        .filter(|file_path| file_path.is_string() || file_path.is_null())
+    {
         // language/readOnly/viewMode/wordWrap flow into the frozen client
         // verbatim via `paneContent` (same round-trip rationale as browser's
         // `devToolsOpen` above); defaults match the pre-existing behavior.
@@ -1685,6 +1688,67 @@ mod tests {
             .expect("restore key recorded");
         assert_eq!(entry.terminal_id.as_deref(), Some(terminal_id.as_str()));
         assert_eq!(entry.tab_id, body["data"]["tabId"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn forced_terminal_reissue_preserves_process_environment_identity() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let restore_key = "restore:dev:source:tab#pane";
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "shell",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "restoreKey": restore_key,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let original = state.lookup_restore_key(restore_key).unwrap();
+
+        let (closed_tab_id, reissued) = state
+            .reissue_restore_key_terminal(restore_key)
+            .expect("live terminal restore entry");
+        assert_eq!(closed_tab_id, original.tab_id);
+        assert_eq!(reissued.tab_id, original.tab_id);
+        assert_eq!(reissued.pane_id, original.pane_id);
+        assert_eq!(reissued.terminal_id, original.terminal_id);
+
+        let marker = format!("ENV_IDS={}/{}", original.tab_id, original.pane_id);
+        let encoded_marker = marker.replace('=', "%3D").replace('/', "%2F");
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{}/send-keys", original.pane_id),
+            json!({
+                "data": "printf 'ENV_IDS=%s/%s\\n' \"$FRESHELL_TAB_ID\" \"$FRESHELL_PANE_ID\"\r"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+        let (wait_status, wait_body) = get(
+            router.clone(),
+            &format!(
+                "/api/panes/{}/wait-for?pattern={encoded_marker}&T=15",
+                original.pane_id,
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(wait_status, StatusCode::OK, "{wait_body}");
+        let (_, capture) = get_text(
+            router,
+            &format!("/api/panes/{}/capture", original.pane_id),
+            true,
+        )
+        .await;
+        assert!(
+            capture.contains(&marker),
+            "the reused process must still point at resolvable ids: {capture}"
+        );
     }
 
     #[tokio::test]

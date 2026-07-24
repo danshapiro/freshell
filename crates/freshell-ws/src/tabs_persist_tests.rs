@@ -230,6 +230,50 @@ fn union_newest_per_client_tiebreak_is_deterministic_on_equal_capturedat() {
 }
 
 #[test]
+fn clock_rollback_keeps_highest_revision_newest_and_retained() {
+    let dir = tempfile::tempdir().unwrap();
+    for revision in 1..=(MAX_SNAPSHOT_GENERATIONS as i64 + 2) {
+        put(
+            dir.path(),
+            "dev",
+            "c1",
+            revision,
+            10_000 - revision,
+            vec![codex_pane_record(
+                "dev:t",
+                &format!("sess-{revision}"),
+                revision,
+            )],
+        );
+    }
+
+    let generations = list_generations(dir.path(), "dev", "c1");
+    assert_eq!(generations.len(), MAX_SNAPSHOT_GENERATIONS);
+    assert_eq!(
+        gen_n(dir.path(), "dev", 0).unwrap()["snapshotRevision"],
+        MAX_SNAPSHOT_GENERATIONS as i64 + 2
+    );
+    assert_eq!(
+        union(dir.path(), "dev").unwrap()["records"][0]["panes"][0]["payload"]["sessionRef"]
+            ["sessionId"],
+        format!("sess-{}", MAX_SNAPSHOT_GENERATIONS + 2)
+    );
+    let retained_revisions: Vec<i64> = generations
+        .iter()
+        .map(|path| {
+            serde_json::from_str::<Value>(&std::fs::read_to_string(path).unwrap()).unwrap()
+                ["snapshotRevision"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        !retained_revisions.contains(&1) && !retained_revisions.contains(&2),
+        "clock rollback pruned a later revision: {retained_revisions:?}"
+    );
+}
+
+#[test]
 fn content_id_is_key_order_independent_and_collision_distinct() {
     // `preserve_order` is enabled workspace-wide, so two records with the SAME
     // fields inserted in a DIFFERENT key order serialize to different bytes;
@@ -460,6 +504,149 @@ fn global_per_device_cap_holds_across_rotating_client_ids() {
         count <= MAX_SNAPSHOT_FILES_PER_DEVICE,
         "global-per-device file cap breached: {count} > {MAX_SNAPSHOT_FILES_PER_DEVICE}"
     );
+}
+
+#[test]
+fn per_client_delete_failure_rolls_back_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    for revision in 1..=MAX_SNAPSHOT_GENERATIONS as i64 {
+        put(
+            dir.path(),
+            "dev",
+            "c1",
+            revision,
+            1000 + revision,
+            vec![open_record("dev:t", "t", revision)],
+        );
+    }
+    let victim = list_generations(dir.path(), "dev", "c1")
+        .last()
+        .unwrap()
+        .clone();
+    inject_delete_failure(victim.clone());
+
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        MAX_SNAPSHOT_GENERATIONS as i64 + 1,
+        2000,
+        vec![open_record("dev:t", "new", 99)],
+    );
+
+    assert!(victim.exists(), "failed victim must remain accounted for");
+    assert_eq!(
+        list_generations(dir.path(), "dev", "c1").len(),
+        MAX_SNAPSHOT_GENERATIONS,
+        "failed pruning must roll back the newly written generation"
+    );
+    assert_eq!(
+        gen_n(dir.path(), "dev", 0).unwrap()["snapshotRevision"],
+        MAX_SNAPSHOT_GENERATIONS as i64
+    );
+}
+
+#[test]
+fn global_file_delete_failure_rolls_back_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..MAX_SNAPSHOT_FILES_PER_DEVICE {
+        put(
+            dir.path(),
+            "dev",
+            &format!("client-{index}"),
+            1,
+            1000 + index as i64,
+            vec![open_record(&format!("dev:t{index}"), "t", 1)],
+        );
+    }
+    let victim = list_generations(dir.path(), "dev", "client-0")
+        .into_iter()
+        .next()
+        .unwrap();
+    inject_delete_failure(victim.clone());
+
+    put(
+        dir.path(),
+        "dev",
+        "new-client",
+        2,
+        5000,
+        vec![open_record("dev:new", "new", 2)],
+    );
+
+    let device_dir = device_dir_for(dir.path(), "dev").unwrap();
+    let count = std::fs::read_dir(device_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(count, MAX_SNAPSHOT_FILES_PER_DEVICE);
+    assert!(victim.exists());
+    assert!(list_generations(dir.path(), "dev", "new-client").is_empty());
+}
+
+#[test]
+fn device_delete_failure_does_not_create_over_cap_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..MAX_SNAPSHOT_DEVICES {
+        put(
+            dir.path(),
+            &format!("dev-{index:03}"),
+            "c1",
+            1,
+            1000 + index as i64,
+            vec![open_record(&format!("dev-{index:03}:t"), "t", 1)],
+        );
+    }
+    let victim = device_dir_for(dir.path(), "dev-000").unwrap();
+    inject_delete_failure(victim.clone());
+
+    put(
+        dir.path(),
+        "dev-new",
+        "c1",
+        1,
+        9000,
+        vec![open_record("dev-new:t", "new", 1)],
+    );
+
+    assert!(victim.exists());
+    assert!(!device_dir_for(dir.path(), "dev-new").unwrap().exists());
+    assert_eq!(devices(dir.path()).len(), MAX_SNAPSHOT_DEVICES);
+}
+
+#[test]
+fn all_lease_protected_devices_make_new_write_retryable_without_exceeding_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..MAX_SNAPSHOT_DEVICES {
+        put(
+            dir.path(),
+            &format!("dev-{index:03}"),
+            "c1",
+            1,
+            1000 + index as i64,
+            vec![open_record(&format!("dev-{index:03}:t"), "t", 1)],
+        );
+    }
+    let leases: Vec<_> = (0..MAX_SNAPSHOT_DEVICES)
+        .map(|index| {
+            protect_snapshot_device(dir.path(), &format!("dev-{index:03}"))
+                .expect("seeded device gets a lease")
+        })
+        .collect();
+
+    put(
+        dir.path(),
+        "dev-blocked",
+        "c1",
+        1,
+        9999,
+        vec![open_record("dev-blocked:t", "blocked", 1)],
+    );
+
+    assert_eq!(leases.len(), MAX_SNAPSHOT_DEVICES);
+    assert!(!device_dir_for(dir.path(), "dev-blocked").unwrap().exists());
+    assert_eq!(devices(dir.path()).len(), MAX_SNAPSHOT_DEVICES);
 }
 
 #[test]
@@ -929,6 +1116,10 @@ fn semantically_corrupt_generation_files_fail_loud() {
     assert_bad_pane(json!({
         "paneId": "p1", "kind": "terminal",
         "payload": { "mode": "shell", "shell": "fish" }
+    }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "terminal",
+        "payload": { "mode": "bogus", "shell": "system" }
     }));
     assert_bad_pane(json!({
         "paneId": "p1", "kind": "browser",

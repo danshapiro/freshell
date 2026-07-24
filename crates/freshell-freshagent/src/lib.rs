@@ -298,80 +298,20 @@ impl FreshAgentState {
         Some(entry)
     }
 
-    /// Replace a restore-owned terminal tab's UI identity while keeping its
-    /// live PTY. Force recovery uses this after the client tab disappears.
+    /// Reissue a restore-owned terminal tab while keeping both its live PTY and
+    /// its original tab/pane identity. Those ids were injected into the child
+    /// as immutable `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID` values at spawn, so a
+    /// forced replay must close and recreate the same client identity.
     pub fn reissue_restore_key_terminal(&self, key: &str) -> Option<(String, RestoreKeyEntry)> {
-        let previous = self.lookup_restore_key(key)?;
-        let terminal_id = previous.terminal_id.clone()?;
-        let new_tab_id = Uuid::new_v4().to_string();
-        let new_pane_id = Uuid::new_v4().to_string();
-        let mut command = previous.ui_command.clone();
-        let ServerMessage::UiCommand(ui_command) = &mut command else {
-            return None;
-        };
-        let payload = ui_command.payload.as_mut()?.as_object_mut()?;
-        payload.insert("id".to_string(), json!(new_tab_id.clone()));
-        payload.insert("paneId".to_string(), json!(new_pane_id.clone()));
-        let replay_title = payload
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
-        let old_tab = self
-            .tabs
-            .lock()
-            .expect("tabs mutex")
-            .remove(&previous.tab_id);
-        let title = old_tab
-            .as_ref()
-            .and_then(|tab| tab.title.clone())
-            .or(replay_title);
-        let kind = old_tab
-            .map(|tab| tab.kind)
-            .unwrap_or_else(|| "terminal".to_string());
-        self.tabs.lock().expect("tabs mutex").insert(
-            new_tab_id.clone(),
-            TabRecord {
-                id: new_tab_id.clone(),
-                title,
-                pane_id: new_pane_id.clone(),
-                kind,
-            },
-        );
-        self.terminal_panes
-            .lock()
-            .expect("terminal_panes mutex")
-            .remove(&previous.pane_id);
-        self.terminal_panes
-            .lock()
-            .expect("terminal_panes mutex")
-            .insert(
-                new_pane_id.clone(),
-                TerminalPaneEntry {
-                    terminal_id: terminal_id.clone(),
-                },
-            );
-        self.pane_tabs
-            .lock()
-            .expect("pane_tabs mutex")
-            .remove(&previous.pane_id);
-        self.pane_tabs
-            .lock()
-            .expect("pane_tabs mutex")
-            .insert(new_pane_id.clone(), new_tab_id.clone());
-
-        let replacement = RestoreKeyEntry {
-            tab_id: new_tab_id,
-            pane_id: new_pane_id,
-            terminal_id: Some(terminal_id),
-            ui_command: command,
-            delivered_to: HashSet::new(),
-        };
+        let mut replacement = self.lookup_restore_key(key)?;
+        replacement.terminal_id.as_ref()?;
+        let original_tab_id = replacement.tab_id.clone();
+        replacement.delivered_to.clear();
         self.restore_keys
             .lock()
             .expect("restore_keys mutex")
             .insert(key.to_string(), replacement.clone());
-        Some((previous.tab_id, replacement))
+        Some((original_tab_id, replacement))
     }
 
     /// Slice 3a: wire in the SAME registered coding-CLI command specs the WS

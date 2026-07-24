@@ -152,9 +152,10 @@ pub async fn run(
         })
     };
     if ui_screenshot_v1 {
+        let tx = conn_tx.clone();
         state
             .screenshots
-            .add_capable_client(conn_id, Arc::clone(&conn_sink));
+            .add_capable_client(conn_id, Arc::new(move |message| tx.send(message).is_ok()));
     }
     // Catastrophic-backpressure monitor: fires if this connection's queued
     // output stays above `catastrophic_buffered_bytes` continuously for
@@ -1622,34 +1623,59 @@ fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
 /// returns `Err`, which we surface as an `error{code:INVALID_MESSAGE}` frame (the
 /// original's `catch` arm; the SPA maps a `/tabs/i` error to its sync-error state).
 async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: &WsState) -> bool {
-    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
-    let device_label = value
-        .get("deviceLabel")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let client_instance_id = value
-        .get("clientInstanceId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let snapshot_revision = value
-        .get("snapshotRevision")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let records = crate::tabs::envelope_records(value);
+    match tabs_push_response(
+        value,
+        state.tabs.clone(),
+        state.server_instance_id.as_str().to_string(),
+    )
+    .await
+    {
+        TabsPushResponse::Ack(message) => send(ws_tx, &message).await,
+        TabsPushResponse::Error(frame) => send_raw(ws_tx, &frame).await,
+    }
+}
 
+enum TabsPushResponse {
+    Ack(ServerMessage),
+    Error(serde_json::Value),
+}
+
+/// Build the exact handler response around the persistence mutation. Keeping
+/// response construction socket-independent lets malformed-input tests assert
+/// both the wire error and the absence of registry/disk mutation.
+async fn tabs_push_response(
+    value: &serde_json::Value,
+    reg: crate::tabs::TabsRegistry,
+    server_instance_id: String,
+) -> TabsPushResponse {
+    match process_tabs_push(value, reg, server_instance_id).await {
+        Ok(ack) => {
+            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
+                accepted: ack.accepted,
+                open_records: ack.open_records,
+                closed_records: ack.closed_records,
+            }))
+        }
+        Err(message) => TabsPushResponse::Error(tabs_error_frame(&message)),
+    }
+}
+
+/// The complete mutation half of `tabs.sync.push`, separated from the socket
+/// send so malformed-frame persistence can be tested in sandboxes that forbid
+/// binding even an ephemeral loopback listener.
+async fn process_tabs_push(
+    value: &serde_json::Value,
+    reg: crate::tabs::TabsRegistry,
+    server_instance_id: String,
+) -> Result<crate::tabs::PushAck, String> {
+    let (device_id, device_label, client_instance_id, snapshot_revision, records) =
+        validate_tabs_push(value, &server_instance_id)?;
     // `replace_client_snapshot` now runs the blocking snapshot-persistence
     // filesystem cycle (`crate::tabs_persist::persist_generation`, serialized
     // under a process-wide mutex), so it must NOT run on a Tokio worker: own
     // the small `&str` args as `String`s and move the whole call into
     // `spawn_blocking` (`TabsRegistry` is `Clone`/`Arc`-backed; `records` is
     // already owned).
-    let reg = state.tabs.clone();
-    let server_instance_id = state.server_instance_id.as_str().to_string();
-    let (device_id, device_label, client_instance_id) = (
-        device_id.to_string(),
-        device_label.to_string(),
-        client_instance_id.to_string(),
-    );
     let joined = tokio::task::spawn_blocking(move || {
         reg.replace_client_snapshot(
             &server_instance_id,
@@ -1662,20 +1688,164 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
     })
     .await;
     match joined {
-        Ok(Ok(ack)) => {
-            let msg = ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
-                accepted: ack.accepted,
-                open_records: ack.open_records,
-                closed_records: ack.closed_records,
-            });
-            send(ws_tx, &msg).await
-        }
-        Ok(Err(message)) => send_tabs_error(ws_tx, &message).await,
+        Ok(result) => result,
         Err(join_err) => {
             tracing::warn!(target: "freshell_ws::tabs", error = %join_err,
                 "tabs_push_persist_task_panicked");
-            send_tabs_error(ws_tx, "tabs snapshot persistence task failed").await
+            Err("tabs snapshot persistence task failed".to_string())
         }
+    }
+}
+
+type ValidatedTabsPush = (String, String, String, i64, Vec<serde_json::Value>);
+
+/// Strictly parse a `tabs.sync.push` envelope and validate every open record
+/// against the same schema used by snapshot readers. Identity fields are
+/// stamped into a temporary candidate exactly as the registry will stamp
+/// them, so a push acknowledged here can never persist a generation that the
+/// list/get/restore paths reject later.
+fn validate_tabs_push(
+    value: &serde_json::Value,
+    server_instance_id: &str,
+) -> Result<ValidatedTabsPush, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "tabs.sync.push must be an object".to_string())?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("tabs.sync.push") {
+        return Err("tabs.sync.push type is invalid".to_string());
+    }
+    let required_nonempty = |field: &str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("tabs.sync.push `{field}` must be a non-empty string"))
+    };
+    let device_id = required_nonempty("deviceId")?;
+    let device_label = required_nonempty("deviceLabel")?;
+    let client_instance_id = required_nonempty("clientInstanceId")?;
+    let snapshot_revision = object
+        .get("snapshotRevision")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|revision| *revision >= 0)
+        .ok_or_else(|| {
+            "tabs.sync.push `snapshotRevision` must be a non-negative integer".to_string()
+        })?;
+    let records = object
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| "tabs.sync.push `records` must be an array".to_string())?;
+
+    let mut open_records = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let status = record
+            .as_object()
+            .and_then(|record| record.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!("tabs.sync.push `records[{index}].status` must be `open` or `closed`")
+            })?;
+        if !matches!(status, "open" | "closed") {
+            return Err(format!(
+                "tabs.sync.push `records[{index}].status` must be `open` or `closed`"
+            ));
+        }
+        if status == "open" {
+            let mut stamped = record.clone();
+            let map = stamped
+                .as_object_mut()
+                .expect("status lookup already proved the record is an object");
+            map.insert(
+                "serverInstanceId".to_string(),
+                serde_json::json!(server_instance_id),
+            );
+            map.insert("deviceId".to_string(), serde_json::json!(device_id));
+            map.insert("deviceLabel".to_string(), serde_json::json!(device_label));
+            map.insert(
+                "clientInstanceId".to_string(),
+                serde_json::json!(client_instance_id),
+            );
+            open_records.push(stamped);
+        }
+    }
+    let candidate = serde_json::json!({
+        "deviceId": device_id,
+        "deviceLabel": device_label,
+        "clientInstanceId": client_instance_id,
+        "serverInstanceId": server_instance_id,
+        "snapshotRevision": snapshot_revision,
+        "capturedAt": 0,
+        "records": open_records,
+    });
+    crate::tabs_persist::validate_incoming_generation(&candidate)
+        .map_err(|error| error.to_string())?;
+
+    Ok((
+        device_id,
+        device_label,
+        client_instance_id,
+        snapshot_revision,
+        records,
+    ))
+}
+
+#[cfg(test)]
+mod tabs_push_validation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_websocket_push_is_rejected_without_touching_persistence() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let raw = r#"{
+            "type":"tabs.sync.push",
+            "deviceId":"dev-1",
+            "deviceLabel":"Device 1",
+            "clientInstanceId":"client-1",
+            "snapshotRevision":1,
+            "records":[{
+                "tabKey":"dev-1:tab-1",
+                "tabId":"tab-1",
+                "tabName":"poison",
+                "status":"open",
+                "revision":1,
+                "updatedAt":1,
+                "paneCount":1,
+                "panes":[{
+                    "paneId":"pane-1",
+                    "kind":"terminal",
+                    "payload":{"mode":"bogus","shell":"system"}
+                }]
+            }]
+        }"#;
+        let frame: serde_json::Value =
+            serde_json::from_str(raw).expect("raw WebSocket JSON fixture");
+
+        let error = match tabs_push_response(&frame, tabs.clone(), "srv-test".to_string()).await {
+            TabsPushResponse::Error(error) => error,
+            TabsPushResponse::Ack(_) => panic!("malformed open record must be rejected"),
+        };
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["code"], "INVALID_MESSAGE");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("mode")),
+            "{error}"
+        );
+        assert!(
+            crate::tabs_persist::list_snapshot_devices(snapshots.path())
+                .unwrap()
+                .is_empty(),
+            "rejected push must not create a persisted generation"
+        );
+        assert_eq!(
+            tabs.query("dev-1", "client-1")["localOpen"],
+            serde_json::json!([]),
+            "rejected push must not mutate the in-memory registry"
+        );
     }
 }
 
@@ -1728,15 +1898,13 @@ async fn send_raw(ws_tx: &mut WsSink, value: &serde_json::Value) -> bool {
     }
 }
 
-/// Emit a minimal `error{code:INVALID_MESSAGE}` frame for a rejected tabs push.
-async fn send_tabs_error(ws_tx: &mut WsSink, message: &str) -> bool {
-    let frame = serde_json::json!({
+fn tabs_error_frame(message: &str) -> serde_json::Value {
+    serde_json::json!({
         "type": "error",
         "code": "INVALID_MESSAGE",
         "message": message,
         "timestamp": crate::now_iso(),
-    });
-    send_raw(ws_tx, &frame).await
+    })
 }
 
 #[cfg(test)]

@@ -24,9 +24,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{ServerMessage, UiCommand};
-use freshell_terminal::FrameSink;
 use serde_json::json;
 use tokio::sync::oneshot;
+
+/// A direct per-connection delivery sink. Unlike the terminal registry's
+/// fire-and-forget `FrameSink`, restore needs to know whether the outbound
+/// channel actually accepted a command.
+pub type ClientSink = Arc<dyn Fn(ServerMessage) -> bool + Send + Sync>;
 
 /// The normalized screenshot outcome the REST handler consumes. Mirrors the
 /// non-`type`/`requestId` fields of `UiScreenshotResultSchema`.
@@ -45,7 +49,7 @@ pub struct ScreenshotResult {
 struct Inner {
     /// Currently-connected clients that advertised `uiScreenshotV1`, keyed by
     /// the WS connection id and carrying a direct per-connection sink.
-    capable: Mutex<HashMap<u64, FrameSink>>,
+    capable: Mutex<HashMap<u64, ClientSink>>,
     /// In-flight requests keyed by `requestId` → the waker for the REST handler.
     pending: Mutex<HashMap<String, PendingRequest>>,
     /// The shared server→client broadcast bus (the capture command is fanned out
@@ -78,7 +82,7 @@ impl ScreenshotBroker {
     }
 
     /// A connection advertising `capabilities.uiScreenshotV1` joined.
-    pub fn add_capable_client(&self, connection_id: u64, sink: FrameSink) {
+    pub fn add_capable_client(&self, connection_id: u64, sink: ClientSink) {
         self.inner
             .capable
             .lock()
@@ -202,8 +206,7 @@ impl ScreenshotBroker {
             .get(&connection_id)
             .cloned();
         if let Some(sink) = sink {
-            sink(frame);
-            true
+            sink(frame)
         } else {
             false
         }
@@ -275,7 +278,7 @@ mod tests {
     #[test]
     fn capability_count_tracks_and_clamps() {
         let b = broker();
-        let sink: FrameSink = Arc::new(|_| {});
+        let sink: ClientSink = Arc::new(|_| true);
         assert!(!b.has_capable_client());
         b.add_capable_client(1, sink.clone());
         b.add_capable_client(2, sink);
@@ -368,12 +371,33 @@ mod tests {
         for (id, seen) in [(1, seen_1.clone()), (2, seen_2.clone())] {
             b.add_capable_client(
                 id,
-                Arc::new(move |message| seen.lock().unwrap().push(message)),
+                Arc::new(move |message| {
+                    seen.lock().unwrap().push(message);
+                    true
+                }),
             );
         }
         assert!(b.send_capture_to(1, "req-direct", "view", None, None));
         assert_eq!(seen_1.lock().unwrap().len(), 1);
         assert!(seen_2.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_send_reports_a_closed_outbound_channel() {
+        let b = broker();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        b.add_capable_client(7, Arc::new(move |message| tx.send(message).is_ok()));
+        assert!(
+            !b.send_to_client(
+                7,
+                ServerMessage::UiCommand(UiCommand {
+                    command: "tab.create".to_string(),
+                    payload: None,
+                }),
+            ),
+            "a registered sink with a closed channel is not successful delivery"
+        );
     }
 
     #[test]

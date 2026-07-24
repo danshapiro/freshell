@@ -404,6 +404,45 @@ async fn restore_round_trips_non_default_pane_state_to_the_client() {
 }
 
 #[tokio::test]
+async fn restore_round_trips_scratch_editor_with_null_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "scratch",
+            "editor",
+            json!({
+                "filePath": null,
+                "language": null,
+                "readOnly": false,
+                "viewMode": "source",
+                "wordWrap": true,
+            }),
+        )],
+    );
+    let (r, _on, _client) = connected(dir.path());
+    let mut frames = r.bus.subscribe();
+    let body = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await
+    .1;
+
+    assert_eq!(body["failed"], json!([]), "{body}");
+    assert_eq!(body["restored"].as_array().unwrap().len(), 1, "{body}");
+    let creates = tab_creates(&drain(&mut frames));
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0]["paneContent"]["kind"], "editor");
+    assert_eq!(creates[0]["paneContent"]["filePath"], Value::Null);
+}
+
+#[tokio::test]
 async fn crash_window_terminal_reconciles_via_restore_key_ledger() {
     // CRASH WINDOW (`:632`), terminal leg: the create succeeded but NEITHER
     // marker write after it landed (in-progress entry with NO terminalId on
@@ -531,6 +570,7 @@ async fn reconciled_delivery_drop_fails_and_stops_before_later_panes() {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(message).unwrap());
+            true
         }),
     );
     let body = post(
@@ -661,6 +701,101 @@ async fn force_recreates_content_pane_in_same_server_process() {
     }
 }
 
+#[tokio::test]
+async fn forced_terminal_retry_closes_and_replays_one_stable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "terminal",
+            json!({ "mode": "shell", "initialCwd": "/tmp" }),
+        )],
+    );
+    let (r, _on, first_client) = connected(dir.path());
+    let first = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await
+    .1;
+    let original_tab_id = first["restored"][0]["tabId"].as_str().unwrap().to_string();
+    let terminal_id = first["restored"][0]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.state.screenshots.remove_capable_client(first_client);
+
+    let first_attempt_frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_attempt_sink = first_attempt_frames.clone();
+    r.state.screenshots.add_capable_client(
+        850,
+        std::sync::Arc::new(move |message| {
+            first_attempt_sink
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(message).unwrap());
+            true
+        }),
+    );
+    let unconfirmed = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "force": true }),
+        true,
+    )
+    .await
+    .1;
+    assert_eq!(
+        unconfirmed["failed"][0]["reason"], "delivery-unconfirmed",
+        "{unconfirmed}"
+    );
+    let first_attempt_frames = first_attempt_frames.lock().unwrap().clone();
+    let first_close = first_attempt_frames
+        .iter()
+        .find(|frame| frame["command"] == "tab.close")
+        .unwrap();
+    let first_create = tab_creates(&first_attempt_frames);
+    assert_eq!(first_close["payload"]["id"], original_tab_id);
+    assert_eq!(first_create.len(), 1);
+    assert_eq!(first_create[0]["id"], original_tab_id);
+
+    r.state.screenshots.remove_capable_client(850);
+    let responsive = std::sync::Arc::new(AtomicBool::new(true));
+    let _retry_client = spawn_browser(&r, responsive);
+    let mut retry_frames = r.bus.subscribe();
+    let retry = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1", "force": true }),
+        true,
+    )
+    .await
+    .1;
+    assert_eq!(retry["failed"], json!([]), "{retry}");
+    assert_eq!(retry["restored"][0]["tabId"], original_tab_id, "{retry}");
+    assert_eq!(retry["restored"][0]["terminalId"], terminal_id, "{retry}");
+    let retry_frames = drain(&mut retry_frames);
+    let retry_close = retry_frames
+        .iter()
+        .find(|frame| frame["command"] == "tab.close")
+        .unwrap();
+    let retry_create = tab_creates(&retry_frames);
+    assert_eq!(retry_close["payload"]["id"], original_tab_id);
+    assert_eq!(retry_create.len(), 1);
+    assert_eq!(retry_create[0]["id"], original_tab_id);
+    assert_eq!(
+        r.terminals.inventory().len(),
+        1,
+        "unconfirmed delivery and retry must not spawn or orphan another PTY"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_restore_survives_production_device_eviction_interleaving() {
     let dir = tempfile::tempdir().unwrap();
@@ -703,6 +838,7 @@ async fn active_restore_survives_production_device_eviction_interleaving() {
                     let _ = tx.send(());
                 }
             }
+            true
         }),
     );
     let app = router(r.state.clone());

@@ -220,9 +220,9 @@ fn pane_to_create_body(tab_name: Option<&Value>, pane: &Value) -> Result<Value, 
             }
             None => Err("missing-url"),
         },
-        "editor" => match payload.get("filePath").and_then(Value::as_str) {
-            Some(fp) => {
-                let mut b = json!({ "editor": fp, "name": name });
+        "editor" => match payload.get("filePath") {
+            Some(file_path) if file_path.is_string() || file_path.is_null() => {
+                let mut b = json!({ "editor": file_path, "name": name });
                 if let Some(lang) = payload.get("language").filter(|v| v.is_string()) {
                     b["language"] = lang.clone();
                 }
@@ -237,7 +237,7 @@ fn pane_to_create_body(tab_name: Option<&Value>, pane: &Value) -> Result<Value, 
                 }
                 Ok(b)
             }
-            None => Err("missing-filePath"),
+            _ => Err("missing-filePath"),
         },
         _ => Err("unsupported-kind"),
     }
