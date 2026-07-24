@@ -467,7 +467,9 @@ async fn handle_client_text(
             true
         }
         ClientMessage::ClientDiagnostic(_) => true,
-        ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
+        ClientMessage::TerminalCreate(create) => {
+            handle_create(create, ws_tx, state, pane_reconcile_v1).await
+        }
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
             true
@@ -758,7 +760,43 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
-async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsState) -> bool {
+async fn handle_create(
+    create: TerminalCreate,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    pane_reconcile_v1: bool,
+) -> bool {
+    // Single-flight create-dedupe (reconciliation design §5.4, the council's
+    // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
+    // a create whose `createRequestId` already has a live terminal ADOPTS it —
+    // `terminal.created` names the EXISTING terminal and spawns nothing, so
+    // two reconciling connections that both received `respawn` for one key
+    // converge to one PTY (one JSONL writer per session file). The frozen
+    // client never negotiates the capability, so its create flow is
+    // byte-for-byte unchanged (§11 fence).
+    if pane_reconcile_v1 {
+        if let Some(existing) = state
+            .registry
+            .newest_live_by_create_request_id(&create.request_id)
+        {
+            tracing::info!(
+                terminal_id = %existing,
+                create_request_id = %create.request_id,
+                "terminal.create.adopted"
+            );
+            let created = ServerMessage::TerminalCreated(TerminalCreated {
+                created_at: now_ms(),
+                request_id: create.request_id,
+                terminal_id: existing.clone(),
+                clear_codex_durability: None,
+                cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
+                restore_error: None,
+                session_ref: state.identity.session_ref_for(&existing),
+            });
+            return send(ws_tx, &created).await;
+        }
+    }
+
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
     let terminal_id = Uuid::new_v4().simple().to_string();

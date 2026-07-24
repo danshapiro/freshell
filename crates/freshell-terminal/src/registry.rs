@@ -282,6 +282,9 @@ pub struct IdentityProbeRow {
     /// (e.g. REST-created resumes, whose creates can't reach the WS-owned
     /// identity registry across the crate boundary).
     pub resume_session_id: Option<String>,
+    /// The terminal's working directory — carried so the §5.4 adopt branch can
+    /// echo the EXISTING terminal's cwd on its `terminal.created` frame.
+    pub cwd: Option<String>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -1100,6 +1103,7 @@ impl TerminalRegistry {
                     status: s.status,
                     created_at: s.created_at,
                     resume_session_id: s.resume_session_id.clone(),
+                    cwd: s.cwd.clone(),
                 }
             })
             .collect()
@@ -1329,6 +1333,7 @@ impl TerminalRegistry {
                 status: s.status,
                 created_at: s.created_at,
                 resume_session_id: s.resume_session_id.clone(),
+                cwd: s.cwd.clone(),
             }
         })
     }
