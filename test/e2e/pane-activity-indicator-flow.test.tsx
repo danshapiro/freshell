@@ -390,6 +390,49 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
+  it('shows persistent idle green on a claude pane header whenever the session is known and not busy', () => {
+    const pane: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId: 'term-claude',
+      resumeSessionId: '11111111-1111-4111-8111-111111111111',
+    }
+
+    const { store } = renderHarness({
+      pane,
+      tab: {
+        mode: 'claude',
+        terminalId: 'term-claude',
+        resumeSessionId: '11111111-1111-4111-8111-111111111111',
+      },
+    })
+
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+    // Session known (resumeSessionId) and not busy -> persistent green, no
+    // one-shot attention event required.
+    expect(paneHeader.getAttribute('class')).toContain('bg-emerald-50')
+
+    // Busy -> blue wins, green clears.
+    act(() => {
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'busy', updatedAt: 1 }],
+      }))
+    })
+    expect(paneHeader.getAttribute('class') ?? '').not.toContain('bg-emerald-50')
+
+    // Idle again -> green returns without any attention event (persistent state,
+    // independent of tab shading and click-clearing).
+    act(() => {
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'idle', updatedAt: 2 }],
+      }))
+    })
+    expect(paneHeader.getAttribute('class')).toContain('bg-emerald-50')
+  })
+
   it('keeps a claude pane blue across a transport reconnect (rehydrates busy from the server snapshot)', () => {
     const pane: TerminalPaneContent = {
       kind: 'terminal',

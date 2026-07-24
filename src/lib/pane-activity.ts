@@ -196,6 +196,62 @@ export function resolvePaneActivity(input: {
   return IDLE_PANE_ACTIVITY
 }
 
+const TRULY_IDLE_CLI_MODES = new Set(['claude', 'codex', 'opencode', 'amplifier'])
+
+/** Terminal CLI modes whose alerting (green/bell/shade) is server-authoritative. */
+export function isTrulyIdleCliMode(mode: string | undefined): boolean {
+  return mode !== undefined && TRULY_IDLE_CLI_MODES.has(mode)
+}
+
+/**
+ * Persistent green for terminal CLI panes (claude/codex/opencode/amplifier):
+ * shown whenever the pane's CLI session is known and the pane is not busy.
+ * Replaces the one-shot needs-attention green for these panes; fresh-agent
+ * panes keep the attention-based green.
+ *
+ * "Session known" = an activity record exists for the terminal (claude/amplifier
+ * track from creation, codex from session binding) OR the pane content carries a
+ * bound sessionRef / resumeSessionId (opencode has no idle-phase records — its
+ * records exist only while busy).
+ */
+export function resolvePaneIdleGreen(input: {
+  paneId: string
+  content: PaneContent
+  tabMode?: Tab['mode']
+  isOnlyPane: boolean
+  codexActivityByTerminalId: Record<string, CodexActivityRecord>
+  opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
+  claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
+  amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
+  paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
+  freshAgentSessions?: Record<string, FreshAgentSessionState>
+}): boolean {
+  if (input.content.kind !== 'terminal') return false
+  if (input.content.status !== 'running') return false
+
+  const effectiveMode = input.content.mode !== 'shell'
+    ? input.content.mode
+    : input.tabMode
+  if (!isTrulyIdleCliMode(effectiveMode)) return false
+
+  if (resolvePaneActivity(input).isBusy) return false
+
+  const terminalId = input.content.terminalId
+  const record = terminalId
+    ? (effectiveMode === 'codex' && input.codexActivityByTerminalId[terminalId])
+      || (effectiveMode === 'claude' && input.claudeActivityByTerminalId[terminalId])
+      || (effectiveMode === 'amplifier' && input.amplifierActivityByTerminalId[terminalId])
+      || (effectiveMode === 'opencode' && input.opencodeActivityByTerminalId[terminalId])
+      || undefined
+    : undefined
+
+  return Boolean(
+    record
+    || input.content.sessionRef?.sessionId
+    || input.content.resumeSessionId,
+  )
+}
+
 export function getBusyPaneIdsForTab(input: {
   tab: Tab
   paneLayouts: Record<string, PaneNode | undefined>

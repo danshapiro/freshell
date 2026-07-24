@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { collectBusySessionKeys, resolvePaneActivity } from '@/lib/pane-activity'
+import { collectBusySessionKeys, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { Tab } from '@/store/types'
@@ -477,5 +477,145 @@ describe('pane activity', () => {
     }
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
     expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: {} }).isBusy).toBe(false)
+  })
+
+  describe('resolvePaneIdleGreen (persistent green for terminal CLI panes)', () => {
+    const emptyMaps = {
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+    }
+
+    function terminalContent(overrides: Partial<TerminalPaneContent> = {}): TerminalPaneContent {
+      return {
+        kind: 'terminal',
+        createRequestId: 'c1',
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        terminalId: 't1',
+        ...overrides,
+      } as TerminalPaneContent
+    }
+
+    it('is green when the CLI session is known (idle activity record) and not busy', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent(),
+        isOnlyPane: true,
+        ...emptyMaps,
+        claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
+      })).toBe(true)
+    })
+
+    it('is not green while busy (blue wins)', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent(),
+        isOnlyPane: true,
+        ...emptyMaps,
+        claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      })).toBe(false)
+    })
+
+    it('is not green when no session is known yet (no record, no sessionRef, no resume id)', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent(),
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(false)
+    })
+
+    it('treats a bound sessionRef or resumeSessionId as a known session (opencode has no idle records)', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({
+          mode: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses-1' },
+        }),
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(true)
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'opencode', resumeSessionId: 'ses-1' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(true)
+    })
+
+    it('is not green for a busy opencode terminal even with a bound session', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({
+          mode: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses-1' },
+        }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        opencodeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1, lastObservedAt: 1 } as any },
+      })).toBe(false)
+    })
+
+    it('is not green for codex while pending (queued submit is busy)', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'codex' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        codexActivityByTerminalId: { t1: { terminalId: 't1', phase: 'pending', updatedAt: 1 } },
+      })).toBe(false)
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'codex' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        codexActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
+      })).toBe(true)
+    })
+
+    it('is never green for shell panes, exited terminals, or non-terminal panes', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'shell' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(false)
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ status: 'exited' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
+      })).toBe(false)
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: { kind: 'browser', url: 'https://example.com' } as any,
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(false)
+    })
+
+    it('is never green for custom CLI modes (gemini/kimi are status-inert)', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'gemini', resumeSessionId: 'ses-1' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+      })).toBe(false)
+    })
+
+    it('is green for an amplifier pane with an idle activity record', () => {
+      expect(resolvePaneIdleGreen({
+        paneId: 'p1',
+        content: terminalContent({ mode: 'amplifier' }),
+        isOnlyPane: true,
+        ...emptyMaps,
+        amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } },
+      })).toBe(true)
+    })
   })
 })
