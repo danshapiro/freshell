@@ -7,7 +7,7 @@
 
 **Goal:** Give freshell's Rust port a continuity safety net: durable tabs-sync snapshot generations with a one-command restore, a real-CLI continuity smoke test (single wall-clock budget: **≤5 minutes**, matching the 300 s Playwright timeout) as a pre-deploy gate, and a read-only deploy tab-diff ritual script.
 
-**Architecture:** All server work is additive in `crates/` (the client `src/`, `shared/`, and legacy `server/` are FROZEN). Deliverable 1 persists the tabs-sync registry's per-device snapshots to `~/.freshell/tabs-snapshots/` (last 5 generations per device) and adds read + restore REST endpoints that rebuild tabs by driving the existing, proven `POST /api/tabs` create pipeline. Deliverable 2 is one Playwright scenario against the real `freshell-server` binary and the REAL `codex`/`amplifier`/`claude` CLIs, registered outside the default test matrix. Deliverable 3 is a read-only bash script (`capture`/`verify`) over the new snapshot GETs plus the existing `GET /api/terminals`, with an e2e proof that it fails loudly on identity loss.
+**Architecture:** All server work is additive in `crates/` (the client `src/`, `shared/`, and legacy `server/` are FROZEN). Deliverable 1 persists the tabs-sync registry's per-device snapshots to `~/.freshell/tabs-snapshots/` (last 5 generations per (device, client), capped at 40 files per device) and adds read + restore REST endpoints that rebuild tabs by driving the existing, proven `POST /api/tabs` create pipeline. Deliverable 2 is one Playwright scenario against the real `freshell-server` binary and the REAL `codex`/`amplifier`/`claude` CLIs, registered outside the default test matrix. Deliverable 3 is a read-only bash script (`capture`/`verify`) over the new snapshot GETs plus the existing `GET /api/terminals`, with an e2e proof that it fails loudly on identity loss.
 
 **Tech Stack:** Rust (axum, serde_json, tokio) in `crates/freshell-ws` + `crates/freshell-server` + `crates/freshell-freshagent`; Playwright (`test/e2e-browser/`, `RustServer` harness); bash + curl + jq operator scripts.
 
@@ -1173,7 +1173,8 @@ reuse that binding; a `None` home keeps the in-memory-only registry):
 
 ```rust
     // Tabs registry now persists rolling snapshot generations under
-    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
+    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per (device,
+    // client), 40 files per device) so a
     // device's tabs can be rebuilt after client-state loss (continuity trio,
     // docs/plans/2026-07-22-continuity-safety-trio.md).
     let tabs = match &home {

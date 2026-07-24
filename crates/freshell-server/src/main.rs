@@ -274,7 +274,9 @@ async fn main() -> ExitCode {
     // so the unload beacon and the socket path retire against ONE cross-device view.
     //
     // Tabs registry now persists rolling snapshot generations under
-    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
+    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per (device,
+    // client) -- MAX_SNAPSHOT_GENERATIONS -- capped at 40 files per device
+    // across all clients -- MAX_SNAPSHOT_FILES_PER_DEVICE) so a
     // device's tabs can be rebuilt after client-state loss (continuity trio,
     // docs/plans/2026-07-22-continuity-safety-trio.md).
     let tabs = match &home {
