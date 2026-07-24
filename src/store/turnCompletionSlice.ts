@@ -11,9 +11,19 @@ type TurnCompletePayload = {
 
 export type TurnCompleteEvent = TurnCompletePayload & { seq: number }
 
+export type TerminalIdlePayload = {
+  tabId: string
+  paneId: string
+  terminalId: string
+  at: number
+  reason: 'grace' | 'queue-empty'
+}
+
 export interface TurnCompletionState {
   seq: number
   lastAtByTerminalId: Record<string, number>
+  /** Truly-idle (terminal.idle) dedupe baseline — separate namespace from turn-complete `at`s. */
+  lastIdleAtByTerminalId: Record<string, number>
   lastAppliedCompletionSeqByTerminalId?: Record<string, number>
   pendingEvents: TurnCompleteEvent[]
   attentionByTab: Record<string, boolean>
@@ -71,6 +81,7 @@ const persistedTurnCompletion = loadPersistedTurnCompletionState()
 const initialState: TurnCompletionState = {
   seq: 0,
   lastAtByTerminalId: {},
+  lastIdleAtByTerminalId: {},
   lastAppliedCompletionSeqByTerminalId: persistedTurnCompletion.lastAppliedCompletionSeqByTerminalId,
   pendingEvents: [],
   attentionByTab: persistedTurnCompletion.attentionByTab,
@@ -103,12 +114,32 @@ const turnCompletionSlice = createSlice({
         seq: state.seq,
       })
     },
+    // Truly-idle edge (terminal.idle) for terminal CLI panes: the ONLY event that
+    // rings the bell / shades the tab for claude/codex/opencode/amplifier terminal
+    // panes. Deduped per terminal by monotonic `at` in its own namespace so it can
+    // never poison (or be poisoned by) the turn-complete baselines.
+    recordTerminalIdle(state, action: PayloadAction<TerminalIdlePayload>) {
+      const { tabId, paneId, terminalId, at } = action.payload
+      const baselines = state.lastIdleAtByTerminalId ??= {}
+      const last = baselines[terminalId]
+      if (last !== undefined && at <= last) return
+      baselines[terminalId] = at
+      state.seq += 1
+      state.pendingEvents.push({
+        tabId,
+        paneId,
+        terminalId,
+        at,
+        seq: state.seq,
+      })
+    },
     // Cleared on a real server restart (not a plain reconnect). The new process has no
     // buffered events to replay, and its wall clock may be behind a clamp-inflated
     // pre-restart `at`, so dropping the per-terminal `at` baseline lets the first genuine
     // post-restart completion through instead of swallowing it as a stale replay.
     resetCompletionDedupeBaselines(state) {
       state.lastAtByTerminalId = {}
+      state.lastIdleAtByTerminalId = {}
     },
     consumeTurnCompleteEvents(state, action: PayloadAction<{ throughSeq: number }>) {
       const { throughSeq } = action.payload
@@ -136,6 +167,7 @@ const turnCompletionSlice = createSlice({
 
 export const {
   recordTurnComplete,
+  recordTerminalIdle,
   resetCompletionDedupeBaselines,
   consumeTurnCompleteEvents,
   markTabAttention,
