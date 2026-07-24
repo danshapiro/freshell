@@ -342,6 +342,12 @@ struct RegistryInner {
     /// Run-monotonic inventory revision (`terminals.changed.revision`, `§7.5`). Only
     /// its monotonic increase is asserted by the oracle, not the value.
     revision: i64,
+    /// Respawn-generation counters per `createRequestId` (reconciliation design
+    /// §7.5): consecutive generations that exited WITHIN the liveness window.
+    /// Reset to 0 whenever a generation survives the window. Read by
+    /// [`TerminalRegistry::respawn_exhausted`], which turns an infinite
+    /// respawn ↔ instant-exit loop into a terminal `dead_session` verdict.
+    respawn_generations: HashMap<String, u32>,
 }
 
 /// Shared, cheaply-cloneable owner of all live terminals, keyed by `terminalId`.
@@ -352,6 +358,11 @@ struct RegistryInner {
 /// a [`TerminalRegistry`] is constructed but `set_auto_kill_idle_minutes`
 /// hasn't been called yet (e.g. before the boot-time settings load completes).
 const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
+
+/// Reconciliation §7.5 defaults: a resumed CLI that exits within 30s of
+/// spawn, 3 generations in a row, is a respawn ↔ instant-exit loop.
+const DEFAULT_RESPAWN_LIVENESS_WINDOW_MS: i64 = 30_000;
+const DEFAULT_RESPAWN_GENERATION_CAP: i64 = 3;
 
 #[derive(Clone)]
 pub struct TerminalRegistry {
@@ -379,6 +390,14 @@ pub struct TerminalRegistry {
     /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
     /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
     scrollback_max_bytes: Arc<AtomicI64>,
+    /// Reconciliation §7.5: a generation that exits within this window of its
+    /// creation counts toward the respawn cap; one that survives it resets the
+    /// counter. Atomic (mirrors `auto_kill_idle_minutes`) so tests can shrink
+    /// it without sleeping.
+    respawn_liveness_window_ms: Arc<AtomicI64>,
+    /// Reconciliation §7.5: consecutive short-lived generations after which
+    /// [`Self::respawn_exhausted`] fires.
+    respawn_generation_cap: Arc<AtomicI64>,
 }
 
 impl Default for TerminalRegistry {
@@ -401,11 +420,16 @@ impl TerminalRegistry {
             inner: Arc::new(Mutex::new(RegistryInner {
                 terminals: HashMap::new(),
                 revision: 0,
+                respawn_generations: HashMap::new(),
             })),
             conn_seq: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
+            respawn_liveness_window_ms: Arc::new(AtomicI64::new(
+                DEFAULT_RESPAWN_LIVENESS_WINDOW_MS,
+            )),
+            respawn_generation_cap: Arc::new(AtomicI64::new(DEFAULT_RESPAWN_GENERATION_CAP)),
         }
     }
 
@@ -461,6 +485,31 @@ impl TerminalRegistry {
     /// The byte cap NEW terminals are created with.
     pub fn scrollback_max_bytes(&self) -> i64 {
         self.scrollback_max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Reconciliation §7.5: shrink/grow the liveness window a generation must
+    /// survive to reset the respawn counter (tests use small values).
+    pub fn set_respawn_liveness_window_ms(&self, ms: i64) {
+        self.respawn_liveness_window_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reconciliation §7.5: how many consecutive short-lived generations
+    /// exhaust a key.
+    pub fn set_respawn_generation_cap(&self, cap: i64) {
+        self.respawn_generation_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Reconciliation §7.5: whether this `createRequestId` has hit the
+    /// respawn-generation cap — the verdict derivation returns
+    /// `dead_session(reason='respawn_exhausted')` instead of another
+    /// `respawn`, restoring §7's "at most one respawn" bound as a guarantee.
+    pub fn respawn_exhausted(&self, create_request_id: &str) -> bool {
+        let cap = self.respawn_generation_cap.load(Ordering::Relaxed).max(1) as u32;
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .respawn_generations
+            .get(create_request_id)
+            .is_some_and(|count| *count >= cap)
     }
 
     /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
@@ -972,9 +1021,12 @@ impl TerminalRegistry {
         if s.status == TerminalRunStatus::Exited {
             return false;
         }
+        let now = now_ms();
         s.status = TerminalRunStatus::Exited;
         s.exit_code = Some(exit_code);
-        s.last_activity_at = now_ms();
+        s.last_activity_at = now;
+        let respawn_key = s.create_request_id.clone();
+        let lifetime_ms = now.saturating_sub(s.created_at);
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
@@ -984,6 +1036,19 @@ impl TerminalRegistry {
         }
         s.subscribers.clear();
         drop(s);
+        // Reconciliation §7.5: a generation that died inside the liveness
+        // window counts toward the respawn cap; one that survived it resets
+        // the counter (a healthy resume is not penalized). Natural exits only
+        // — a user-initiated `kill` removes the record without passing here.
+        if let Some(key) = respawn_key {
+            let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
+            let mut inner = self.inner.lock().expect("registry lock");
+            if lifetime_ms < window {
+                *inner.respawn_generations.entry(key).or_insert(0) += 1;
+            } else {
+                inner.respawn_generations.remove(&key);
+            }
+        }
         tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
         true
     }
@@ -2831,5 +2896,73 @@ mod tests {
             reg.newest_live_by_create_request_id("cr-race"),
             Some("race2".to_string())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Respawn-generation cap (design §7.5): a respawn ↔ instant-exit loop
+    // must converge to a terminal dead_session verdict instead of thrashing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn respawn_cap_exhausts_after_n_short_lived_generations() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(3);
+
+        for gen in 1..=3 {
+            let id = format!("cap-gen{gen}");
+            // created_at = now → the exit below is inside the liveness window.
+            headless(&reg, &id, Some("cr-cap"), now_ms());
+            assert!(
+                !reg.respawn_exhausted("cr-cap"),
+                "cap must not fire before generation {gen} exits"
+            );
+            reg.finish_pty_exit(&id, 1);
+        }
+        assert!(
+            reg.respawn_exhausted("cr-cap"),
+            "3 short-lived generations must exhaust the cap"
+        );
+        // An unrelated key is unaffected.
+        assert!(!reg.respawn_exhausted("cr-other"));
+    }
+
+    #[test]
+    fn healthy_generation_resets_the_respawn_counter() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(3);
+
+        for gen in 1..=2 {
+            let id = format!("reset-gen{gen}");
+            headless(&reg, &id, Some("cr-reset"), now_ms());
+            reg.finish_pty_exit(&id, 1);
+        }
+        // A generation that SURVIVED the liveness window (created long ago)
+        // exits: the counter resets — a healthy resume is not penalized.
+        headless(&reg, "reset-healthy", Some("cr-reset"), now_ms() - 60_000);
+        reg.finish_pty_exit("reset-healthy", 0);
+        assert!(!reg.respawn_exhausted("cr-reset"));
+
+        // The next two short-lived exits count from zero again.
+        for gen in 3..=4 {
+            let id = format!("reset-gen{gen}");
+            headless(&reg, &id, Some("cr-reset"), now_ms());
+            reg.finish_pty_exit(&id, 1);
+        }
+        assert!(
+            !reg.respawn_exhausted("cr-reset"),
+            "only 2 short-lived generations since the healthy reset"
+        );
+    }
+
+    #[test]
+    fn exits_without_a_create_request_id_never_count() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(1);
+        headless(&reg, "keyless", None, now_ms());
+        reg.finish_pty_exit("keyless", 1);
+        assert!(!reg.respawn_exhausted(""));
     }
 }
