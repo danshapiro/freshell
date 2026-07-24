@@ -64,6 +64,11 @@ const MATRIX_SPECS = [
   /safe01-auth-matrix\.spec\.ts$/,
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
+  // Truly-idle alerting (terminal.idle): end-to-end blue -> green + one alert
+  // edge + tab shade -> activate clears. Legacy leg runs; the rust leg is
+  // test.fixme pending the rust terminal.idle emitter
+  // (feat/rust-terminal-activity-idle) so it flips on trivially.
+  /truly-idle-alerting\.spec\.ts$/,
   // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
   // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
   // POST restore, verify file bytes). Legacy is a true parity control: the
