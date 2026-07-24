@@ -401,6 +401,13 @@ pub struct TerminalRegistry {
     /// Reconciliation §7.5: consecutive short-lived generations after which
     /// [`Self::respawn_exhausted`] fires.
     respawn_generation_cap: Arc<AtomicI64>,
+    /// §5.4 single-flight: `createRequestId`s with a keyed create currently
+    /// in flight (claimed before the spawn, released after the insert). The
+    /// spawn takes milliseconds and the row only becomes observable at
+    /// insert, so without this reservation two truly concurrent creates for
+    /// one key could BOTH pass the `newest_live_by_create_request_id` check
+    /// and both spawn — the exact duplicate-writer shape the dedupe closes.
+    keyed_create_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -433,6 +440,7 @@ impl TerminalRegistry {
                 DEFAULT_RESPAWN_LIVENESS_WINDOW_MS,
             )),
             respawn_generation_cap: Arc::new(AtomicI64::new(DEFAULT_RESPAWN_GENERATION_CAP)),
+            keyed_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1354,6 +1362,26 @@ impl TerminalRegistry {
                 .create_request_id
                 .clone()
         })
+    }
+
+    /// §5.4 single-flight claim: reserve `key` for an in-flight keyed create.
+    /// `false` means another create currently holds the reservation — the
+    /// caller should re-check for a live terminal (adopt) instead of
+    /// spawning. Pair with [`Self::end_keyed_create`].
+    pub fn begin_keyed_create(&self, key: &str) -> bool {
+        self.keyed_create_inflight
+            .lock()
+            .expect("keyed-create inflight lock")
+            .insert(key.to_string())
+    }
+
+    /// Release a [`Self::begin_keyed_create`] reservation (success OR failure
+    /// — the spawn's outcome is discoverable via the registry itself).
+    pub fn end_keyed_create(&self, key: &str) {
+        self.keyed_create_inflight
+            .lock()
+            .expect("keyed-create inflight lock")
+            .remove(key);
     }
 
     /// §5.4 backstop detector (always-on, capability-independent): if a key
@@ -2958,6 +2986,29 @@ mod tests {
         assert!(
             !reg.respawn_exhausted("cr-reset"),
             "only 2 short-lived generations since the healthy reset"
+        );
+    }
+
+    /// §5.4 single-flight claim: the in-flight keyed-create reservation that
+    /// closes the check-then-spawn window between two truly concurrent
+    /// creates for one key (the spawn itself takes milliseconds; the row only
+    /// becomes observable at insert).
+    #[test]
+    fn keyed_create_claim_is_exclusive_until_released() {
+        let reg = TerminalRegistry::new();
+        assert!(reg.begin_keyed_create("cr-claim"), "first claim wins");
+        assert!(
+            !reg.begin_keyed_create("cr-claim"),
+            "a second concurrent create must NOT also claim the key"
+        );
+        assert!(
+            reg.begin_keyed_create("cr-other"),
+            "unrelated keys are free"
+        );
+        reg.end_keyed_create("cr-claim");
+        assert!(
+            reg.begin_keyed_create("cr-claim"),
+            "a released key is claimable again"
         );
     }
 

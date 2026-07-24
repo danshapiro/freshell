@@ -757,6 +757,21 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// RAII release of a §5.4 keyed-create reservation
+/// ([`freshell_terminal::TerminalRegistry::begin_keyed_create`]): dropped on
+/// EVERY exit path of `handle_create`'s spawn — success, spawn error, or the
+/// task being cancelled by a socket close.
+struct KeyedCreateGuard {
+    registry: freshell_terminal::TerminalRegistry,
+    key: String,
+}
+
+impl Drop for KeyedCreateGuard {
+    fn drop(&mut self) {
+        self.registry.end_keyed_create(&self.key);
+    }
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
@@ -774,28 +789,50 @@ async fn handle_create(
     // converge to one PTY (one JSONL writer per session file). The frozen
     // client never negotiates the capability, so its create flow is
     // byte-for-byte unchanged (§11 fence).
+    let mut keyed_create_guard: Option<KeyedCreateGuard> = None;
     if pane_reconcile_v1 {
-        if let Some(existing) = state
-            .registry
-            .newest_live_by_create_request_id(&create.request_id)
-        {
-            tracing::info!(
-                terminal_id = %existing,
-                create_request_id = %create.request_id,
-                "terminal.create.adopted"
-            );
-            let created = ServerMessage::TerminalCreated(TerminalCreated {
-                created_at: now_ms(),
-                request_id: create.request_id,
-                terminal_id: existing.clone(),
-                clear_codex_durability: None,
-                cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
-                restore_error: None,
-                session_ref: state.identity.session_ref_for(&existing),
-            });
-            return send(ws_tx, &created).await;
+        // Claim loop: adopt a live terminal if one exists; otherwise RESERVE
+        // the key before spawning (the spawn takes milliseconds and the row
+        // only becomes observable at insert, so check-then-spawn alone would
+        // let two truly concurrent creates both pass the check). A racing
+        // create that finds the key reserved waits briefly and re-checks —
+        // it then adopts the winner's terminal. Bounded: after ~5s it
+        // proceeds to spawn anyway (fail-open; the §5.4 backstop detector
+        // makes any residual duplicate loud).
+        for _ in 0..500u16 {
+            if let Some(existing) = state
+                .registry
+                .newest_live_by_create_request_id(&create.request_id)
+            {
+                tracing::info!(
+                    terminal_id = %existing,
+                    create_request_id = %create.request_id,
+                    "terminal.create.adopted"
+                );
+                let created = ServerMessage::TerminalCreated(TerminalCreated {
+                    created_at: now_ms(),
+                    request_id: create.request_id,
+                    terminal_id: existing.clone(),
+                    clear_codex_durability: None,
+                    cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
+                    restore_error: None,
+                    session_ref: state.identity.session_ref_for(&existing),
+                });
+                return send(ws_tx, &created).await;
+            }
+            if state.registry.begin_keyed_create(&create.request_id) {
+                keyed_create_guard = Some(KeyedCreateGuard {
+                    registry: state.registry.clone(),
+                    key: create.request_id.clone(),
+                });
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
+    // Released on EVERY exit path of the spawn below (RAII), success or error;
+    // the outcome itself is discoverable through the registry.
+    let _keyed_create_guard = keyed_create_guard;
 
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
