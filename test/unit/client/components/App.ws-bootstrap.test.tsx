@@ -247,7 +247,7 @@ function createStore(options?: {
       turnCompletion: {
         seq: 0,
         lastAtByTerminalId: {},
-        lastAppliedCompletionSeqByTerminalId: {},
+        lastIdleAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
@@ -1335,7 +1335,7 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
-  it('records OpenCode turn completion from the production WebSocket message path', async () => {
+  it('records the terminal.idle edge from the production WebSocket message path', async () => {
     const store = createStore({
       tabs: [{
         id: 'tab-opencode',
@@ -1381,6 +1381,7 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.status).toBe('ready')
     })
 
+    // terminal.turn.complete is informational for terminal CLI panes: no bell/shade.
     act(() => {
       messageHandler?.({
         type: 'terminal.turn.complete',
@@ -1391,17 +1392,28 @@ describe('App WS bootstrap recovery', () => {
         completionSeq: 5,
       })
     })
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+    expect(store.getState().turnCompletion.seq).toBe(0)
+
+    // The truly-idle edge is the ONLY bell/shade trigger.
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.idle',
+        terminalId: 'term-opencode',
+        at: 2345,
+        reason: 'grace',
+      })
+    })
 
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBe(true)
-    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(1234)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(5)
+    expect(store.getState().turnCompletion.lastIdleAtByTerminalId['term-opencode']).toBe(2345)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
-  it('applies latest turn completions from activity list responses once across reconnect refreshes', async () => {
+  it('ignores latestTurnCompletions in activity list responses (turn completions no longer ring or shade)', async () => {
     const store = createStore({
       tabs: [{
         id: 'tab-opencode',
@@ -1466,50 +1478,15 @@ describe('App WS bootstrap recovery', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
-    })
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
-    expect(store.getState().turnCompletion.seq).toBe(1)
-
-    act(() => {
-      messageHandler?.({
-        type: 'ready',
-        timestamp: new Date().toISOString(),
-        serverInstanceId: 'srv-preconnected-opencode-latest-completion',
-      })
-    })
-
-    await waitFor(() => {
-      const opencodeRequests = wsMocks.send.mock.calls
-        .map(([payload]) => payload)
-        .filter((payload) => payload?.type === 'opencode.activity.list')
-      expect(opencodeRequests.length).toBeGreaterThanOrEqual(2)
-    })
-    const secondRequestId = wsMocks.send.mock.calls
-      .map(([payload]) => payload)
-      .filter((payload) => payload?.type === 'opencode.activity.list')
-      .at(-1)?.requestId as string
-
-    act(() => {
-      messageHandler?.({
-        type: 'opencode.activity.list.response',
-        requestId: secondRequestId,
-        terminals: [],
-        latestTurnCompletions: [{
-          terminalId: 'term-opencode',
-          at: 2_000,
-          completionSeq: 7,
-        }],
-      })
-    })
-
-    expect(store.getState().turnCompletion.seq).toBe(1)
-    expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
+    // Turn completions are informational: no bell, no shade, no pending events —
+    // the truly-idle terminal.idle edge is the only alerting trigger.
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+    expect(store.getState().turnCompletion.seq).toBe(0)
+    expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBeUndefined()
   })
 
-  it('records OpenCode turn completion against the active tab when a terminal is duplicated', async () => {
+  it('records the terminal.idle edge against the active tab when a terminal is duplicated', async () => {
     const store = createStore({
       activeTabId: 'tab-active',
       tabs: [
@@ -1584,12 +1561,10 @@ describe('App WS bootstrap recovery', () => {
 
     act(() => {
       messageHandler?.({
-        type: 'terminal.turn.complete',
+        type: 'terminal.idle',
         terminalId: 'term-opencode',
-        provider: 'opencode',
-        sessionId: 'session-opencode',
         at: 5678,
-        completionSeq: 6,
+        reason: 'queue-empty',
       })
     })
 
@@ -1597,8 +1572,7 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().turnCompletion.attentionByPane['pane-active']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-active']).toBe(true)
-    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(5678)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(6)
+    expect(store.getState().turnCompletion.lastIdleAtByTerminalId['term-opencode']).toBe(5678)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
