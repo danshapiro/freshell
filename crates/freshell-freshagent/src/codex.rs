@@ -511,10 +511,31 @@ impl FreshCodexState {
                 return;
             }
         };
-        debug_assert_eq!(
-            started.thread_id, resume_session_id,
-            "thread/resume must preserve the requested id"
-        );
+        // TERM-25: never silently proceed against the wrong thread. `thread/resume`
+        // answering with a different id than requested means the sidecar is sitting on a
+        // thread the user did NOT ask for -- adopting it (or renaming it) would bind the
+        // pane to an unrelated conversation. Reject loudly instead.
+        if started.thread_id != resume_session_id {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            reap_owned_codex_sidecars(&ownership_id);
+            tracing::error!(
+                requested = %resume_session_id,
+                returned = %started.thread_id,
+                "freshagent.codex.wrong_thread_resume_rejected"
+            );
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                &format!(
+                    "codex thread/resume returned wrong thread id {} (requested {}); \
+                     refusing to adopt the wrong thread",
+                    started.thread_id, resume_session_id
+                ),
+            );
+            return;
+        }
         let thread_id = resume_session_id;
         self.clear_dead_thread(&thread_id).await;
 
@@ -1179,10 +1200,26 @@ impl FreshCodexState {
                 return Err(EnsureAliveError::RespawnFailed(err.to_string()));
             }
         };
-        debug_assert_eq!(
-            started.thread_id, session_id,
-            "thread/resume must preserve the requested id"
-        );
+        // TERM-25: never silently proceed against the wrong thread. Re-registering the
+        // ORIGINAL id against a sidecar that `thread/resume` actually put on a DIFFERENT
+        // thread would route every subsequent send to an unrelated conversation. Reject
+        // loudly instead; the caller surfaces it as a respawn failure.
+        if started.thread_id != session_id {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            reap_owned_codex_sidecars(&ownership_id);
+            tracing::error!(
+                requested = %session_id,
+                returned = %started.thread_id,
+                "freshagent.codex.wrong_thread_resume_rejected"
+            );
+            return Err(EnsureAliveError::RespawnFailed(format!(
+                "codex thread/resume returned wrong thread id {} (requested {session_id}); \
+                 refusing to adopt the wrong thread",
+                started.thread_id
+            )));
+        }
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
@@ -1689,19 +1726,44 @@ impl FreshCodexState {
                 },
             )
             .await;
-        if let Err(err) = resume_result {
+        let started = match resume_result {
+            Ok(started) => started,
+            Err(err) => {
+                client.close().await;
+                let mut child = child;
+                let _ = child.start_kill();
+                reap_owned_codex_sidecars(&ownership_id);
+                if is_codex_thread_not_found(&err) {
+                    // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone
+                    // so a later attach/snapshot-read against it fails fast instead of
+                    // repeating this same spawn-resume-fail cycle.
+                    self.mark_thread_dead(thread_id).await;
+                    return Err(ResumeSessionError::NotFound);
+                }
+                return Err(ResumeSessionError::Transient(err.to_string()));
+            }
+        };
+
+        // TERM-25: never silently proceed against the wrong thread. Registering the
+        // requested id against a sidecar that `thread/resume` actually put on a DIFFERENT
+        // thread would bind the pane to an unrelated conversation. Reject loudly as a
+        // transient failure (NOT NotFound -- the requested thread may be perfectly fine;
+        // the app-server misbehaved), so the client keeps the durable identity.
+        if started.thread_id != thread_id {
             client.close().await;
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
-            if is_codex_thread_not_found(&err) {
-                // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
-                // a later attach/snapshot-read against it fails fast instead of repeating
-                // this same spawn-resume-fail cycle.
-                self.mark_thread_dead(thread_id).await;
-                return Err(ResumeSessionError::NotFound);
-            }
-            return Err(ResumeSessionError::Transient(err.to_string()));
+            tracing::error!(
+                requested = %thread_id,
+                returned = %started.thread_id,
+                "freshagent.codex.wrong_thread_resume_rejected"
+            );
+            return Err(ResumeSessionError::Transient(format!(
+                "codex thread/resume returned wrong thread id {} (requested {thread_id}); \
+                 refusing to adopt the wrong thread",
+                started.thread_id
+            )));
         }
 
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive --
@@ -4438,6 +4500,194 @@ pub(crate) mod tests {
         assert!(
             !st.sessions.lock().await.contains_key("thread-truly-gone"),
             "no session may be registered for a resume target that was never actually created"
+        );
+    }
+
+    // -- TERM-25: wrong-thread resume rejection --
+
+    /// TERM-25 (restore-matrix SCENARIO 7): when `thread/resume` answers with a DIFFERENT
+    /// thread id than the one requested, the create-with-resume path must REJECT the
+    /// mismatch loudly -- `freshAgent.create.failed` to the client, no session registered
+    /// under EITHER id, never a silent proceed against the wrong thread.
+    #[tokio::test]
+    async fn handle_create_with_resume_wrong_thread_id_fails_create_and_never_adopts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(FreshAgentCreate {
+            request_id: "req-term25-create".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: Some("thread-A-requested".to_string()),
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+        })
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+
+        assert_eq!(
+            frame["type"], "freshAgent.create.failed",
+            "a wrong-thread resume answer must fail the create loudly, never proceed \
+             against the wrong thread: {frame}"
+        );
+        assert_eq!(frame["requestId"], "req-term25-create");
+        assert_eq!(frame["code"], "FRESH_AGENT_CREATE_FAILED");
+        let message = frame["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("thread-B-wrong") && message.contains("thread-A-requested"),
+            "the rejection must name BOTH ids so the mismatch is diagnosable: {frame}"
+        );
+        let sessions = st.sessions.lock().await;
+        assert!(
+            !sessions.contains_key("thread-A-requested"),
+            "the requested id must not be registered against a sidecar on the wrong thread"
+        );
+        assert!(
+            !sessions.contains_key("thread-B-wrong"),
+            "the wrong thread id must never be adopted"
+        );
+    }
+
+    /// TERM-25 (restore-matrix SCENARIO 7): the not-tracked `freshAgent.attach` resume
+    /// path (`ensure_session_resumable`) must likewise reject a wrong-thread answer --
+    /// a `CODEX_ATTACH_RESUME_FAILED` error (transient shape, so the frozen client keeps
+    /// the durable identity instead of abandoning it), never an idle snapshot that
+    /// silently binds the pane to a sidecar sitting on the wrong thread.
+    #[tokio::test]
+    async fn handle_attach_unknown_session_wrong_thread_id_is_rejected_not_adopted() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_attach(attach_msg("thread-A-requested")).await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "error" || frame["type"] == "freshAgent.event" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("attach resolves within the budget");
+
+        assert_eq!(
+            frame["type"], "error",
+            "a wrong-thread resume answer must surface as an error, never a session \
+             snapshot adopting the wrong thread: {frame}"
+        );
+        let message = frame["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("CODEX_ATTACH_RESUME_FAILED:"),
+            "wrong-thread is a resume failure (transient shape -- the client must keep \
+             the durable identity), got: {frame}"
+        );
+        assert!(
+            message.contains("thread-B-wrong") && message.contains("thread-A-requested"),
+            "the rejection must name BOTH ids so the mismatch is diagnosable: {frame}"
+        );
+        let sessions = st.sessions.lock().await;
+        assert!(
+            !sessions.contains_key("thread-A-requested"),
+            "the requested id must not be registered against a sidecar on the wrong thread"
+        );
+        assert!(
+            !sessions.contains_key("thread-B-wrong"),
+            "the wrong thread id must never be adopted"
+        );
+    }
+
+    /// TERM-25 (restore-matrix SCENARIO 7): crash recovery (`ensure_session_alive`'s
+    /// resume-first path) must also reject a wrong-thread answer -- the tracked session's
+    /// recovery fails loudly (`CODEX_ATTACH_RESPAWN_FAILED` on the attach surface) instead
+    /// of silently re-registering the ORIGINAL id against a sidecar on the wrong thread.
+    #[tokio::test]
+    async fn crash_recovery_resume_wrong_thread_id_is_rejected_not_silently_recovered() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
+        let (st, mut rx) = state_with_bus();
+
+        // A dead in-process client + a child that exits immediately: the exit-watcher
+        // flips `exited`, so the next attach takes the crash-recovery resume path.
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn true fixture");
+        insert_fake_session(
+            &st,
+            "thread-A-crashed",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-term25-recovery",
+        )
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let exited = st
+                    .sessions
+                    .lock()
+                    .await
+                    .get("thread-A-crashed")
+                    .map(|s| s.exited.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                if exited {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the exit-watcher observes the crash within the budget");
+
+        st.handle_attach(attach_msg("thread-A-crashed")).await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "error" {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("attach resolves within the budget");
+
+        let message = frame["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("CODEX_ATTACH_RESPAWN_FAILED:"),
+            "wrong-thread crash recovery must fail the respawn loudly, got: {frame}"
+        );
+        assert!(
+            message.contains("thread-B-wrong") && message.contains("thread-A-crashed"),
+            "the rejection must name BOTH ids so the mismatch is diagnosable: {frame}"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-B-wrong"),
+            "the wrong thread id must never be adopted"
         );
     }
 

@@ -102,7 +102,12 @@ d5cf534a naming cluster: PATCH /api/panes/:id, rename cascades, sidebar live-ter
 2. **Fresh codex terminal residual sidebar duplicate** — session id unknown at spawn; needs the
    deferred association scanner (SESSION-09 slice). Documented, pinned by test.
 3. **restore-matrix scenario 3** fixme (sidebar seeded-session visibility in that spec; both kinds).
+   **RESOLVED (evidence 2026-07-24):** fixed by 8fd9233a (see wave 1–6 summary above); re-verified at
+   ec9970c2 — `restore-matrix.spec.ts::opening a seeded historical session…` green on rust-chromium.
 4. **multi-client reconnect flake** — fails on BOTH server kinds + untouched baseline (pre-existing).
+   **NOT REPRODUCIBLE at ec9970c2 (evidence 2026-07-24):** deflaked by 031a7c12 (over-constrained
+   exact-attach-intent assertion relaxed with in-spec evidence notes); `multi-client.spec.ts` green
+   3x on BOTH kinds (2 quiet runs + 1 under concurrent cargo-build load).
 5. **Codex crash-recovery mints a new thread id** (no thread/resume on crash path) — UI continuity ok,
    model memory not preserved. Follow-up.
 6. Checkpoints: create-only ported; list/restore deferred. Directory perf 0.55s multi-provider vs

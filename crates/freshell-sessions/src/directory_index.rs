@@ -898,7 +898,6 @@ impl SessionIndex {
     pub async fn warm(&self) {
         let _ = self.snapshot().await;
     }
-
 }
 
 /// Free-function form of the save-decision gate (see
