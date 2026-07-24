@@ -24,6 +24,7 @@ import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
 import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
+import { TrulyIdleEmitter, wireTrulyIdleEmitter } from './coding-cli/truly-idle-emitter.js'
 import { createAmplifierActivityIntegration } from './coding-cli/amplifier-activity-integration.js'
 import { AmplifierSessionLocator } from './coding-cli/amplifier-session-locator.js'
 import { AmplifierSessionController } from './coding-cli/amplifier-session-controller.js'
@@ -538,6 +539,18 @@ async function main() {
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+
+  // Truly-idle alerting (terminal.idle): one emitter per provider tracker,
+  // fed by the tracker's 'changed' + 'turn.complete' streams. One-shot grace
+  // timers only — no polling, no per-pane intervals.
+  const trulyIdleWirings = [codexActivity.tracker, claudeActivity.tracker, amplifierActivity.tracker, opencodeActivity.tracker]
+    .map((tracker) => {
+      const emitter = new TrulyIdleEmitter()
+      emitter.on('idle', (event) => {
+        wsHandler.broadcastTerminalIdle(event)
+      })
+      return wireTrulyIdleEmitter({ tracker, emitter })
+    })
 
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
@@ -1227,6 +1240,7 @@ async function main() {
     await extWatcher?.close()
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
+    for (const wiring of trulyIdleWirings) wiring.dispose()
     codexActivity.dispose()
     claudeActivity.dispose()
     amplifierActivity.dispose()

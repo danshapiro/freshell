@@ -27,6 +27,7 @@ import type {
   OpencodeActivityRecord,
   TerminalTurnCompletionSnapshot,
   TerminalTurnCompleteMessage,
+  TerminalIdleMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -71,6 +72,7 @@ import {
   OpencodeActivityListSchema,
   OpencodeActivityUpdatedSchema,
   TerminalTurnCompleteSchema,
+  TerminalIdleSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -3817,6 +3819,20 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid terminal.turn.complete payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastTerminalIdle(msg: Omit<TerminalIdleMessage, 'type'>): void {
+    const parsed = TerminalIdleSchema.safeParse({
+      type: 'terminal.idle',
+      ...msg,
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid terminal.idle payload')
       return
     }
 
