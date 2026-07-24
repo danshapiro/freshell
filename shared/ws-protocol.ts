@@ -194,6 +194,24 @@ export const TerminalTurnCompleteSchema = z.object({
   completionSeq: z.number().int().positive(),
 })
 
+/**
+ * Truly-idle edge for terminal-mode CLI panes (claude/codex/opencode/amplifier).
+ * Emitted once per busy -> truly-idle transition, after a grace window with no
+ * new session-file activity AND no detectable queued user prompt. Never emitted
+ * after crash/interrupt/exit; subagent completions inside a running turn never
+ * produce it. This is the ONLY edge the client rings/shades on for terminal CLI
+ * panes ('terminal.turn.complete' stays informational for them).
+ *
+ * Pinned wire contract shared with the Rust server port - do not change
+ * unilaterally: { terminalId, at (server epoch ms), reason: 'grace' | 'queue-empty' }.
+ */
+export const TerminalIdleSchema = z.object({
+  type: z.literal('terminal.idle'),
+  terminalId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+  reason: z.enum(['grace', 'queue-empty']),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -759,6 +777,7 @@ export type AmplifierActivityListResponseMessage = z.infer<typeof AmplifierActiv
 export type AmplifierActivityUpdatedMessage = z.infer<typeof AmplifierActivityUpdatedSchema>
 
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
+export type TerminalIdleMessage = z.infer<typeof TerminalIdleSchema>
 
 // -- Sessions --
 
@@ -990,6 +1009,7 @@ export type ServerMessage =
   | AmplifierActivityListResponseMessage
   | AmplifierActivityUpdatedMessage
   | TerminalTurnCompleteMessage
+  | TerminalIdleMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
