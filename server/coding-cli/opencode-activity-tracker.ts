@@ -13,6 +13,7 @@ import {
   type OpencodeOwnershipAction,
   type OpencodeOwnershipState,
 } from './opencode-ownership-reducer.js'
+import { TurnCompletionLedger } from './turn-completion-ledger.js'
 
 export const OPENCODE_HEALTH_POLL_MS = 200
 // Applies per health-wait cycle; connection failures restart the cycle after backoff.
@@ -204,8 +205,7 @@ const defaultResolveOpencodeSessionRoots = async (
 
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
-  private readonly completionSeqByTerminalId = new Map<string, number>()
-  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
+  private readonly completionLedger = new TurnCompletionLedger()
   private readonly monitors = new Map<string, MonitorState>()
   private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly sessionRootsByTerminal = new Map<string, Map<string, string>>()
@@ -255,7 +255,7 @@ export class OpencodeActivityTracker extends EventEmitter {
   }
 
   listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
-    return Array.from(this.latestCompletions.values())
+    return this.completionLedger.listLatestCompletions()
   }
 
   expire(at = this.now()): void {
@@ -635,7 +635,7 @@ export class OpencodeActivityTracker extends EventEmitter {
         continue
       }
       if (action.kind === 'turnComplete') {
-        this.emit('turn.complete', this.recordTurnCompletion({
+        this.emit('turn.complete', this.completionLedger.recordTurnCompletion({
           terminalId,
           sessionId: action.sessionId,
           at: action.at,
@@ -648,24 +648,6 @@ export class OpencodeActivityTracker extends EventEmitter {
           sessionIds: action.sessionIds,
         }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
       }
-    }
-  }
-
-  private recordTurnCompletion(input: {
-    terminalId: string
-    sessionId: string
-    at: number
-  }): OpencodeTurnCompleteEvent {
-    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
-    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
-    this.latestCompletions.set(input.terminalId, {
-      terminalId: input.terminalId,
-      at: input.at,
-      completionSeq,
-    })
-    return {
-      ...input,
-      completionSeq,
     }
   }
 

@@ -12,7 +12,7 @@ vi.mock('@ai-sdk/google', () => ({
 
 import { createSessionsRouter } from '../../server/sessions-router.js'
 
-function mountRouter() {
+function mountRouter(options: { projects?: any[] } = {}) {
   const store: Record<string, Record<string, unknown>> = {}
   const patchSessionOverride = vi.fn(async (key: string, patch: Record<string, unknown>) => {
     store[key] = { ...(store[key] || {}), ...patch }
@@ -25,7 +25,7 @@ function mountRouter() {
       getSessionOverride: async (key: string) => store[key],
       patchSessionOverride,
     },
-    codingCliIndexer: { getProjects: () => [], refresh },
+    codingCliIndexer: { getProjects: () => options.projects ?? [], refresh },
     codingCliProviders: [],
     perfConfig: { slowAiSummaryMs: 500 },
   }
@@ -78,5 +78,35 @@ describe('POST /sessions/:id/generate-title', () => {
       titleOverride: 'AI Generated Title',
       titleSource: 'ai',
     })
+  })
+
+  it('returns the provider-generated title without writing an ai override', async () => {
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY = 'test-key'
+    const { app, patchSessionOverride } = mountRouter({
+      projects: [
+        {
+          projectPath: '/project/a',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId: 'abc',
+              title: 'Provider Named Session',
+              titleSource: 'provider-generated',
+            },
+          ],
+        },
+      ],
+    })
+    const res = await request(app)
+      .post('/api/sessions/abc/generate-title?provider=claude')
+      .send({ firstMessage: 'Fix the login redirect bug' })
+
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('provider-generated')
+    expect(res.body.title).toBe('Provider Named Session')
+    expect(patchSessionOverride).not.toHaveBeenCalledWith(
+      'claude:abc',
+      expect.objectContaining({ titleSource: 'ai' }),
+    )
   })
 })

@@ -759,7 +759,7 @@ describe('State Edge Cases', () => {
           store.dispatch(updateSettingsLocal({ terminal: { fontSize: i } }))
         }
 
-        expect(store.getState().settings.settings.terminal.fontSize).toBe(32)
+        expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
       })
     })
 
@@ -935,8 +935,8 @@ describe('State Edge Cases', () => {
           })
         )
 
-        expect(store.getState().settings.settings.uiScale).toBe(1.5)
-        expect(store.getState().settings.settings.terminal.fontSize).toBe(32)
+        expect(store.getState().settings.settings.uiScale).toBe(4)
+        expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
       })
     })
   })

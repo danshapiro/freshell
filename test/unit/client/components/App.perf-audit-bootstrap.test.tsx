@@ -43,6 +43,11 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({}),
   },
   isApiUnauthorizedError: (err: unknown) => !!err && typeof err === 'object' && (err as { status?: number }).status === 401,
+  isTransientRequestFailure: (err: unknown) =>
+    !!err &&
+    ((err as Error).name === 'NetworkError' ||
+      (err as Error).name === 'AbortError' ||
+      [502, 503, 504].includes((err as { status?: number }).status as number)),
 }))
 
 vi.mock('@/components/Sidebar', () => ({

@@ -68,6 +68,7 @@ describe('pane activity', () => {
       },
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
@@ -80,6 +81,7 @@ describe('pane activity', () => {
       },
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
 
@@ -92,6 +94,7 @@ describe('pane activity', () => {
       },
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }).isBusy).toBe(false)
   })
@@ -113,6 +116,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: {},
     }).isBusy).toBe(false)
@@ -138,6 +142,7 @@ describe('pane activity', () => {
         'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
       },
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })).toMatchObject({ isBusy: true, source: 'opencode' })
 
@@ -150,6 +155,7 @@ describe('pane activity', () => {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
       },
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }).isBusy).toBe(false)
   })
@@ -219,6 +225,7 @@ describe('pane activity', () => {
       claudeActivityByTerminalId: {
         'term-claude': { terminalId: 'term-claude', phase: 'busy', updatedAt: 1 },
       },
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-1' },
@@ -263,6 +270,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-1' },
@@ -305,6 +313,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       freshAgentSessions: freshAgentSessionMap(
         { sessionType: 'freshclaude', provider: 'claude', sessionId: 'sdk-restore-2' },
@@ -362,6 +371,7 @@ describe('pane activity', () => {
         },
       },
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 
@@ -406,6 +416,7 @@ describe('pane activity', () => {
         },
       },
       claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
 
@@ -420,6 +431,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
       claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     })
     expect(result).toEqual({ isBusy: true, source: 'claude-terminal' })
@@ -432,9 +444,38 @@ describe('pane activity', () => {
       isOnlyPane: true,
       codexActivityByTerminalId: {},
       opencodeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }
     expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
     expect(resolvePaneActivity({ ...base, claudeActivityByTerminalId: {} }).isBusy).toBe(false)
+  })
+
+  it('treats an amplifier terminal as busy when the server record is busy', () => {
+    const result = resolvePaneActivity({
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'amplifier', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'busy', updatedAt: 1 } },
+      paneRuntimeActivityByPaneId: {},
+    })
+    expect(result).toEqual({ isBusy: true, source: 'amplifier' })
+  })
+
+  it('treats an amplifier terminal as idle when the server record is idle or absent', () => {
+    const base = {
+      paneId: 'p1',
+      content: { kind: 'terminal', createRequestId: 'c1', status: 'running', mode: 'amplifier', terminalId: 't1' } as any,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
+      claudeActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+    }
+    expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: { t1: { terminalId: 't1', phase: 'idle', updatedAt: 1 } } }).isBusy).toBe(false)
+    expect(resolvePaneActivity({ ...base, amplifierActivityByTerminalId: {} }).isBusy).toBe(false)
   })
 })

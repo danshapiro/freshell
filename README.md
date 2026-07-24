@@ -37,7 +37,7 @@
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.7.0 https://github.com/danshapiro/freshell.git
+git clone --branch v0.7.5 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
@@ -103,6 +103,7 @@ npm run serve   # Production build and run
 | `OPENCODE_CMD` | No | OpenCode CLI command override |
 | `GEMINI_CMD` | No | Gemini CLI command override |
 | `KIMI_CMD` | No | Kimi CLI command override |
+| `AMPLIFIER_CMD` | No | Amplifier CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
 
 ### Coding CLI Providers
@@ -116,11 +117,14 @@ Freshell indexes local session history and can launch terminals for these coding
 | **OpenCode** | Yes | Yes | `XDG_DATA_HOME/opencode` (or platform default) |
 | **Gemini** | — | Yes | — |
 | **Kimi** | — | Yes | — |
+| **Amplifier** | Yes | Yes | `~/.amplifier` |
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
 OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
 
 OpenCode permissions are controlled by the OpenCode configuration for the OS user running freshell. Freshell does not set `OPENCODE_PERMISSION` or pass `--dangerously-skip-permissions` for OpenCode sessions; OS filesystem permissions remain the hard boundary.
+
+Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
 ## Tech Stack
 

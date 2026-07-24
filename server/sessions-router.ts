@@ -174,6 +174,17 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'firstMessage is required' })
     }
 
+    // An authoritative provider-generated title (e.g. Amplifier's own AI-generated
+    // name) is already the canonical name. Short-circuit before any 'ai' override
+    // write so freshell never shadows it.
+    const parsed = deps.codingCliIndexer
+      .getProjects()
+      .flatMap((p) => p.sessions)
+      .find((s) => makeSessionKey(s.provider, s.sessionId) === compositeKey)
+    if (parsed?.titleSource === 'provider-generated') {
+      return res.json({ title: parsed.title ?? null, source: 'provider-generated' })
+    }
+
     // No Gemini key: finalize from the first user message instead of failing.
     // Uses the same (default) length as the client first-message title so the
     // persisted name matches and there is no visible flip.

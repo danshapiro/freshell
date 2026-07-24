@@ -7,8 +7,9 @@ on:
 jobs:
   release:
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-15-intel, macos-latest, ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -27,7 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build and publish Electron app
+      - name: Build Electron app
         run: npm run electron:build
+
+      - name: Upload installers to GitHub Release
+        shell: bash
+        run: npx tsx scripts/upload-electron-release-assets.ts "$GITHUB_REF_NAME" release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

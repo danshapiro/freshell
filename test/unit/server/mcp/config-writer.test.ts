@@ -133,6 +133,28 @@ describe('generateMcpInjection -- per-agent config', () => {
     expect(parsed.mcpServers.freshell).toBeDefined()
   })
 
+  it('amplifier mode: returns env with AMPLIFIER_MCP_CONFIG pointing to temp file', async () => {
+    const { generateMcpInjection } = await importModule()
+    const result = generateMcpInjection('amplifier', 'term-amp')
+    expect(result.args).toEqual([])
+    expect(result.env).toHaveProperty('AMPLIFIER_MCP_CONFIG')
+    expect(toPosixPath(result.env.AMPLIFIER_MCP_CONFIG)).toMatch(/freshell-mcp\/term-amp\.json$/)
+  })
+
+  it('amplifier mode: temp file contains valid JSON with mcpServers.freshell.command node', async () => {
+    const { generateMcpInjection } = await importModule()
+    const result = generateMcpInjection('amplifier', 'term-amp')
+    const writeCall = mockFs.writeFileSync.mock.calls.find(
+      (call: any[]) => typeof call[0] === 'string' && call[0].includes('freshell-mcp')
+    )
+    expect(writeCall).toBeDefined()
+    // The env var and the written temp file refer to the same path.
+    expect(toPosixPath(result.env.AMPLIFIER_MCP_CONFIG)).toBe(toPosixPath(writeCall![0]))
+    const parsed = JSON.parse(writeCall![1])
+    expect(parsed.mcpServers.freshell.command).toBe('node')
+    expect(Array.isArray(parsed.mcpServers.freshell.args)).toBe(true)
+  })
+
   it('opencode mode: reads existing config and merges freshell entry', async () => {
     mockFs.readFileSync.mockImplementation((filePath: string) => {
       if (typeof filePath === 'string' && filePath.includes('opencode.json')) {

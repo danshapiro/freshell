@@ -62,6 +62,7 @@ const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
+const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
@@ -227,6 +228,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   )
   const claudeActivityByTerminalId = useAppSelector(
     (s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID
+  )
+  const amplifierActivityByTerminalId = useAppSelector(
+    (s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID
   )
   const opencodeActivityByTerminalId = useAppSelector(
     (s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID
@@ -518,6 +522,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       isOnlyPane,
       codexActivityByTerminalId,
       claudeActivityByTerminalId,
+      amplifierActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       freshAgentSessions,

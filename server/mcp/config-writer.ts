@@ -284,6 +284,13 @@ export function generateMcpInjection(
       return { args: ['--mcp-config-file', filePath], env: {} }
     }
 
+    case 'amplifier': {
+      // Amplifier reads MCP config from $AMPLIFIER_MCP_CONFIG (tool-mcp discovery chain).
+      // Standard { mcpServers: { freshell: { command, args } } } -- same file the others use.
+      const filePath = writeMcpConfigFile(terminalId, platform)
+      return { args: [], env: { AMPLIFIER_MCP_CONFIG: filePath } }
+    }
+
     case 'opencode': {
       if (!cwd) {
         throw new Error(

@@ -22,6 +22,7 @@ import {
 } from './fresh-agent/history/claude/history-source.js'
 import type {
   ClaudeActivityRecord,
+  AmplifierActivityRecord,
   CodexActivityRecord,
   OpencodeActivityRecord,
   TerminalTurnCompletionSnapshot,
@@ -60,6 +61,9 @@ import {
   ClaudeActivityListResponseSchema,
   ClaudeActivityListSchema,
   ClaudeActivityUpdatedSchema,
+  AmplifierActivityListResponseSchema,
+  AmplifierActivityListSchema,
+  AmplifierActivityUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
   CodexActivityUpdatedSchema,
@@ -207,8 +211,10 @@ export type WsHandlerOptions = {
   extensionManager?: ExtensionManager
   codexActivityListProvider?: () => CodexActivityRecord[]
   claudeActivityListProvider?: () => ClaudeActivityRecord[]
+  amplifierActivityListProvider?: () => AmplifierActivityRecord[]
   codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  amplifierLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   agentHistorySource?: ClaudeFreshAgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
@@ -542,9 +548,11 @@ export class WsHandler {
   private terminalMetaListProvider?: () => TerminalMeta[]
   private codexActivityListProvider?: () => CodexActivityRecord[]
   private claudeActivityListProvider?: () => ClaudeActivityRecord[]
+  private amplifierActivityListProvider?: () => AmplifierActivityRecord[]
   private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   private codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  private amplifierLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
@@ -567,7 +575,8 @@ export class WsHandler {
   private readonly bootId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
-  private clientMessageSchema: z.ZodTypeAny
+  // Definitely assigned via rebuildClientMessageSchema() in the constructor (and re-run on dev reload).
+  private clientMessageSchema!: z.ZodTypeAny
   private onTerminalExitBound = (payload: { terminalId?: string; recoverableForRestore?: boolean }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
@@ -607,9 +616,11 @@ export class WsHandler {
     this.terminalMetaListProvider = options.terminalMetaListProvider
     this.codexActivityListProvider = options.codexActivityListProvider
     this.claudeActivityListProvider = options.claudeActivityListProvider
+    this.amplifierActivityListProvider = options.amplifierActivityListProvider
     this.opencodeActivityListProvider = options.opencodeActivityListProvider
     this.codexLatestTurnCompletionsProvider = options.codexLatestTurnCompletionsProvider
     this.claudeLatestTurnCompletionsProvider = options.claudeLatestTurnCompletionsProvider
+    this.amplifierLatestTurnCompletionsProvider = options.amplifierLatestTurnCompletionsProvider
     this.opencodeLatestTurnCompletionsProvider = options.opencodeLatestTurnCompletionsProvider
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
@@ -629,94 +640,10 @@ export class WsHandler {
     this.registry.setServerInstanceId?.(this.serverInstanceId)
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
-    // Build the set of valid CLI provider/mode names from extensions
-    const extensionManager = this.extensionManager
-    const canEnumerateCliExtensions = typeof extensionManager?.getAll === 'function'
-    const extensionModes = canEnumerateCliExtensions && extensionManager
-      ? extensionManager.getAll()
-          .filter(e => e.manifest.category === 'cli')
-          .map(e => e.manifest.name)
-      : []
-    const allModes = new Set<string>(['shell', ...extensionModes])
-
-    // Build dynamic schemas for the two process-spawning messages.
-    // All other schemas (SessionLocatorSchema, TerminalMetaRecordSchema, etc.)
-    // already accept any string via the widened CodingCliProviderSchema.
-    const dynamicTerminalCreateSchema = z.object({
-      type: z.literal('terminal.create'),
-      requestId: z.string().min(1),
-      mode: z.string().min(1).default('shell').superRefine((val, ctx) => {
-        if (!canEnumerateCliExtensions || allModes.has(val)) return
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}`,
-        })
-      }),
-      shell: ShellSchema.default('system'),
-      cwd: z.string().optional(),
-      resumeSessionId: z.string().optional(),
-      sessionRef: SessionLocatorSchema.optional(),
-      codexDurability: CodexDurabilityRefSchema.optional(),
-      liveTerminal: LiveTerminalHandleSchema.optional(),
-      restore: z.boolean().optional(),
-      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
-      tabId: z.string().min(1).optional(),
-      paneId: z.string().min(1).optional(),
-    }).strict()
-
-    const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
-      if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `Unknown CLI provider: '${val}'`,
-      })
-    })
-
-    const dynamicCodingCliCreateSchema = z.object({
-      type: z.literal('codingcli.create'),
-      requestId: z.string().min(1),
-      provider: dynamicProviderSchema,
-      prompt: z.string().min(1),
-      cwd: z.string().optional(),
-      resumeSessionId: z.string().optional(),
-      model: z.string().optional(),
-      maxTurns: z.number().int().positive().optional(),
-      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    }).strict()
-
-    this.clientMessageSchema = z.discriminatedUnion('type', [
-      HelloSchema,
-      PingSchema,
-      ClientDiagnosticSchema,
-      dynamicTerminalCreateSchema,
-      TerminalCodexCandidatePersistedSchema,
-      TerminalAttachSchema,
-      TerminalDetachSchema,
-      TerminalInputSchema,
-      TerminalResizeSchema,
-      TerminalKillSchema,
-      CodexActivityListSchema,
-      ClaudeActivityListSchema,
-      OpencodeActivityListSchema,
-      TabsSyncPushSchema,
-      TabsSyncQuerySchema,
-      TabsSyncClientRetireSchema,
-      dynamicCodingCliCreateSchema,
-      CodingCliInputSchema,
-      CodingCliKillSchema,
-      FreshAgentCreateSchema,
-      FreshAgentAttachSchema,
-      FreshAgentSendSchema,
-      FreshAgentInterruptSchema,
-      FreshAgentCompactSchema,
-      FreshAgentApprovalRespondSchema,
-      FreshAgentQuestionRespondSchema,
-      FreshAgentKillSchema,
-      FreshAgentForkSchema,
-      UiLayoutSyncSchema,
-      UiScreenshotResultSchema,
-    ])
+    // Build the set of valid CLI provider/mode names from extensions and bake
+    // them into this.clientMessageSchema. Extracted so a dev hot-reload can
+    // rebuild the schema when provider modes are added/renamed at runtime.
+    this.rebuildClientMessageSchema()
     const registryWithEvents = this.registry as unknown as {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
@@ -810,6 +737,112 @@ export class WsHandler {
       this.sessionRepairService.on('repaired', onRepaired)
       this.sessionRepairService.on('error', onError)
     }
+  }
+
+  /**
+   * Rebuild the client message validator from the extension manager's current
+   * registry. Called once from the constructor and again by
+   * refreshExtensionModes() when a dev hot-reload adds/renames provider modes.
+   */
+  private rebuildClientMessageSchema(): void {
+    // Build the set of valid CLI provider/mode names from extensions
+    const extensionManager = this.extensionManager
+    const canEnumerateCliExtensions = typeof extensionManager?.getAll === 'function'
+    const extensionModes = canEnumerateCliExtensions && extensionManager
+      ? extensionManager.getAll()
+          .filter(e => e.manifest.category === 'cli')
+          .map(e => e.manifest.name)
+      : []
+    const allModes = new Set<string>(['shell', ...extensionModes])
+
+    // Build dynamic schemas for the two process-spawning messages.
+    // All other schemas (SessionLocatorSchema, TerminalMetaRecordSchema, etc.)
+    // already accept any string via the widened CodingCliProviderSchema.
+    const dynamicTerminalCreateSchema = z.object({
+      type: z.literal('terminal.create'),
+      requestId: z.string().min(1),
+      mode: z.string().min(1).default('shell').superRefine((val, ctx) => {
+        if (!canEnumerateCliExtensions || allModes.has(val)) return
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}`,
+        })
+      }),
+      shell: ShellSchema.default('system'),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      sessionRef: SessionLocatorSchema.optional(),
+      codexDurability: CodexDurabilityRefSchema.optional(),
+      liveTerminal: LiveTerminalHandleSchema.optional(),
+      restore: z.boolean().optional(),
+      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
+      tabId: z.string().min(1).optional(),
+      paneId: z.string().min(1).optional(),
+    }).strict()
+
+    const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
+      if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unknown CLI provider: '${val}'`,
+      })
+    })
+
+    const dynamicCodingCliCreateSchema = z.object({
+      type: z.literal('codingcli.create'),
+      requestId: z.string().min(1),
+      provider: dynamicProviderSchema,
+      prompt: z.string().min(1),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      model: z.string().optional(),
+      maxTurns: z.number().int().positive().optional(),
+      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    }).strict()
+
+    this.clientMessageSchema = z.discriminatedUnion('type', [
+      HelloSchema,
+      PingSchema,
+      ClientDiagnosticSchema,
+      dynamicTerminalCreateSchema,
+      TerminalCodexCandidatePersistedSchema,
+      TerminalAttachSchema,
+      TerminalDetachSchema,
+      TerminalInputSchema,
+      TerminalResizeSchema,
+      TerminalKillSchema,
+      CodexActivityListSchema,
+      ClaudeActivityListSchema,
+      AmplifierActivityListSchema,
+      OpencodeActivityListSchema,
+      TabsSyncPushSchema,
+      TabsSyncQuerySchema,
+      TabsSyncClientRetireSchema,
+      dynamicCodingCliCreateSchema,
+      CodingCliInputSchema,
+      CodingCliKillSchema,
+      FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentCompactSchema,
+      FreshAgentApprovalRespondSchema,
+      FreshAgentQuestionRespondSchema,
+      FreshAgentKillSchema,
+      FreshAgentForkSchema,
+      UiLayoutSyncSchema,
+      UiScreenshotResultSchema,
+    ])
+  }
+
+  /**
+   * DEV hot-reload hook: re-derive the valid provider/mode set from the
+   * extension manager after a live manifest re-scan so newly-added CLI modes
+   * are accepted without a server restart.
+   */
+  refreshExtensionModes(): void {
+    this.rebuildClientMessageSchema()
   }
 
   /**
@@ -3055,6 +3088,28 @@ export class WsHandler {
         return
       }
 
+      case 'amplifier.activity.list': {
+        const terminals = this.amplifierActivityListProvider ? this.amplifierActivityListProvider() : []
+        const latestTurnCompletions = this.amplifierLatestTurnCompletionsProvider ? this.amplifierLatestTurnCompletionsProvider() : []
+        const response = AmplifierActivityListResponseSchema.safeParse({
+          type: 'amplifier.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+          latestTurnCompletions,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid amplifier.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Amplifier activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
       case 'tabs.sync.push': {
         if (!this.tabsRegistryStore) {
           this.sendError(ws, {
@@ -3733,6 +3788,21 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid claude.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastAmplifierActivityUpdated(msg: { upsert?: AmplifierActivityRecord[]; remove?: string[] }): void {
+    const parsed = AmplifierActivityUpdatedSchema.safeParse({
+      type: 'amplifier.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid amplifier.activity.updated payload')
       return
     }
 

@@ -8,9 +8,10 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import { extractTitleFromMessage } from '../title-utils.js'
 import type { CodingCliProvider } from './provider.js'
-import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ParsedSessionTitleSource, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
-import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
+import { extractClaudeGeneratedTitleFromJsonlObject } from './providers/claude-title.js'
+import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot, statMtimeMs } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -114,6 +115,53 @@ export async function scanFileForUserTextMessages(filePath: string): Promise<boo
   return false
 }
 
+async function scanFileForClaudeGeneratedTitle(filePath: string): Promise<string | undefined> {
+  try {
+    const fd = await fsp.open(filePath, 'r')
+    try {
+      const stat = await fd.stat()
+      const chunkSize = 64 * 1024
+      const buf = Buffer.alloc(chunkSize)
+      let position = 0
+      let pending = ''
+      let latestTitle: string | undefined
+
+      while (position < stat.size) {
+        const { bytesRead } = await fd.read(buf, 0, Math.min(chunkSize, stat.size - position), position)
+        if (bytesRead <= 0) break
+        position += bytesRead
+        pending += buf.subarray(0, bytesRead).toString('utf8')
+        const lines = pending.split(/\r?\n/)
+        pending = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line) continue
+          try {
+            const title = extractClaudeGeneratedTitleFromJsonlObject(JSON.parse(line), 200)
+            if (title) latestTitle = title
+          } catch {
+            // Skip malformed session lines.
+          }
+        }
+      }
+
+      if (pending) {
+        try {
+          latestTitle = extractClaudeGeneratedTitleFromJsonlObject(JSON.parse(pending), 200) ?? latestTitle
+        } catch {
+          // Skip malformed trailing lines.
+        }
+      }
+
+      return latestTitle
+    } finally {
+      await fd.close()
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function isPathWithin(basePath: string, targetPath: string): boolean {
   const relative = path.relative(basePath, targetPath)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
@@ -153,14 +201,21 @@ export function isSubagentSession(filePath: string): boolean {
   return normalized.includes('/.claude/') || normalized.includes('\\.claude\\')
 }
 
-function applyOverride(session: CodingCliSession, ov: SessionOverride | undefined): CodingCliSession | null {
+function applyOverride(
+  session: CodingCliSession,
+  ov: SessionOverride | undefined,
+  titleSource?: ParsedSessionTitleSource,
+): CodingCliSession | null {
   if (ov?.deleted) return null
+  const shouldApplyTitleOverride = !!ov?.titleOverride
+    && !(titleSource === 'provider-generated' && (ov.titleSource === 'dir' || ov.titleSource === 'first-message'))
   return {
     ...session,
-    title: ov?.titleOverride || session.title,
+    title: shouldApplyTitleOverride ? ov.titleOverride : session.title,
     summary: ov?.summaryOverride || session.summary,
     createdAt: ov?.createdAtOverride ?? session.createdAt,
     archived: ov?.archived ?? session.archived ?? false,
+    titleSource,
   }
 }
 
@@ -221,18 +276,26 @@ type LightweightFileMeta = {
   sessionId?: string
   cwd?: string
   title?: string
+  titleSource?: ParsedSessionTitleSource
   createdAt?: number
   lastActivityAt?: number
+}
+
+type LightweightMetaOptions = {
+  generatedTitleExtractor?: (obj: unknown) => string | undefined
 }
 
 /**
  * Read just the head and tail of a session file to extract sidebar-ready metadata.
  * Head gives sessionId, cwd, title; tail gives lastActivityAt for correct sort ordering.
  */
-async function readLightweightMeta(filePath: string): Promise<LightweightFileMeta> {
+async function readLightweightMeta(
+  filePath: string,
+  options: LightweightMetaOptions = {},
+): Promise<LightweightFileMeta> {
   try {
     const stat = await fsp.stat(filePath)
-    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const mtimeMs = statMtimeMs(stat)
     const size = stat.size
     if (size === 0) return { filePath, mtimeMs, size }
 
@@ -254,11 +317,18 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
       let sessionId: string | undefined
       let cwd: string | undefined
       let title: string | undefined
+      let titleSource: ParsedSessionTitleSource | undefined
       let createdAt: number | undefined
 
       for (const line of headLines) {
         let obj: any
         try { obj = JSON.parse(line) } catch { continue }
+
+        const generatedTitle = options.generatedTitleExtractor?.(obj)
+        if (generatedTitle) {
+          title = generatedTitle
+          titleSource = 'provider-generated'
+        }
 
         if (!sessionId) {
           sessionId = obj?.sessionId || obj?.session_id
@@ -270,7 +340,8 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
           if (typeof c === 'string' && (c.startsWith('/') || (IS_WINDOWS && /^[a-zA-Z]:/.test(c)))) cwd = c
         }
         if (!createdAt && obj?.timestamp) {
-          const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+          // Floor numeric timestamps: downstream read-model schemas require integer epoch-ms.
+          const parsed = typeof obj.timestamp === 'number' ? Math.floor(obj.timestamp) : Date.parse(obj.timestamp)
           if (Number.isFinite(parsed)) createdAt = parsed
         }
         if (!title) {
@@ -303,26 +374,34 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
             }
           }
         }
-        if (sessionId && cwd && title && createdAt) break
       }
 
       // Parse tail backwards for lastActivityAt (skip timestampless records like file-history-snapshot)
       let lastActivityAt: number | undefined
       if (tailBuf) {
         const tailLines = tailBuf.toString('utf8').split('\n').filter(Boolean)
+        let tailGeneratedTitleFound = false
         for (let i = tailLines.length - 1; i >= 0; i--) {
           try {
             const obj = JSON.parse(tailLines[i])
-            if (obj?.timestamp) {
-              const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
-              if (Number.isFinite(parsed)) { lastActivityAt = parsed; break }
+            const generatedTitle = options.generatedTitleExtractor?.(obj)
+            if (generatedTitle && !tailGeneratedTitleFound) {
+              title = generatedTitle
+              titleSource = 'provider-generated'
+              tailGeneratedTitleFound = true
+            }
+            if (!lastActivityAt && obj?.timestamp) {
+              // Floor numeric timestamps: downstream read-model schemas require integer epoch-ms.
+              const parsed = typeof obj.timestamp === 'number' ? Math.floor(obj.timestamp) : Date.parse(obj.timestamp)
+              if (Number.isFinite(parsed)) lastActivityAt = parsed
             }
           } catch { /* skip malformed lines */ }
+          if (lastActivityAt && (!options.generatedTitleExtractor || tailGeneratedTitleFound)) break
         }
       }
       if (!lastActivityAt) lastActivityAt = createdAt
 
-      return { filePath, mtimeMs, size, sessionId, cwd, title, createdAt, lastActivityAt }
+      return { filePath, mtimeMs, size, sessionId, cwd, title, titleSource, createdAt, lastActivityAt }
     } finally {
       await fd.close()
     }
@@ -336,8 +415,16 @@ type CachedSessionEntry = {
   mtimeMs: number
   size: number
   baseSession: CodingCliSession | null
+  titleSource?: ParsedSessionTitleSource
   /** True when populated by a lightweight scan and not yet fully enriched. */
   lightweight?: boolean
+  /**
+   * Newest mtime (ms) among the session's activity sidecars (see
+   * CodingCliProvider.getActivityMtimeMs). Shared between the re-parse gate and the
+   * recency fold so a grown sidecar forces a re-parse even when the primary file is
+   * byte-identical. Undefined for providers that don't expose sidecar activity.
+   */
+  activityMtimeMs?: number
 }
 
 export type SessionIndexerOptions = {
@@ -800,11 +887,23 @@ export class CodingCliSessionIndexer {
       return
     }
 
-    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const mtimeMs = statMtimeMs(stat)
     const size = stat.size
+    // Newest activity-sidecar mtime (Amplifier transcript.jsonl / events.jsonl). Statted
+    // once here and reused by both the re-parse gate and the recency fold below. Only
+    // providers that opt in pay the extra stat cost; others leave it undefined.
+    const activityMtimeMs = provider.getActivityMtimeMs
+      ? await provider.getActivityMtimeMs(filePath)
+      : undefined
 
     const cached = this.fileCache.get(cacheKey)
-    if (cached && cached.mtimeMs === mtimeMs && cached.size === size && !cached.lightweight) {
+    if (
+      cached &&
+      cached.mtimeMs === mtimeMs &&
+      cached.size === size &&
+      cached.activityMtimeMs === activityMtimeMs &&
+      !cached.lightweight
+    ) {
       return
     }
 
@@ -831,12 +930,20 @@ export class CodingCliSessionIndexer {
         tailMeta?.codexTaskEvents,
       )
     }
+    if (snippet.truncated && provider.name === 'claude' && meta.titleSource !== 'provider-generated') {
+      const generatedTitle = await scanFileForClaudeGeneratedTitle(filePath)
+      if (generatedTitle) {
+        meta.title = generatedTitle
+        meta.titleSource = 'provider-generated'
+      }
+    }
     if (!meta.cwd) {
       this.fileCache.set(cacheKey, {
         provider: provider.name,
         mtimeMs,
         size,
         baseSession: null,
+        activityMtimeMs,
       })
       return
     }
@@ -849,15 +956,25 @@ export class CodingCliSessionIndexer {
     const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
     const parsedTitle = normalizeTitle(meta.title)
     const resolvedTitle = resolveSessionTitle(parsedTitle, sameSession ? previous?.title : undefined, storedTitle)
+    let resolvedTitleSource: ParsedSessionTitleSource | undefined
+    if (parsedTitle) {
+      resolvedTitleSource = meta.titleSource
+    } else if (sameSession && previous?.title) {
+      resolvedTitleSource = cached?.titleSource
+    }
     const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
     const createdAt = appendOnlyReparse
       ? minDefined(previous?.createdAt, meta.createdAt)
       : (sameSession ? (meta.createdAt ?? previous?.createdAt) : meta.createdAt)
-    const lastActivityAt = appendOnlyReparse
+    let lastActivityAt = appendOnlyReparse
       ? (maxDefined(previous?.lastActivityAt, meta.lastActivityAt) ?? createdAt ?? 0)
       : (sameSession
           ? (meta.lastActivityAt ?? previous?.lastActivityAt ?? createdAt ?? 0)
           : (meta.lastActivityAt ?? createdAt ?? 0))
+    // Fold real file activity (newest sidecar mtime) into recency so a session that was
+    // active/resumed after its metadata timestamps still rises in the recency-sorted
+    // sidebar. maxDefined never regresses below the metadata-derived value.
+    lastActivityAt = Math.floor(maxDefined(lastActivityAt, activityMtimeMs) ?? 0)
 
     const checkoutRoot = meta.cwd ? await resolveGitCheckoutRoot(meta.cwd) : undefined
     const checkoutPath = checkoutRoot && checkoutRoot !== projectPath ? checkoutRoot : undefined
@@ -892,6 +1009,8 @@ export class CodingCliSessionIndexer {
       mtimeMs,
       size,
       baseSession,
+      titleSource: resolvedTitleSource,
+      activityMtimeMs,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
@@ -1020,7 +1139,7 @@ export class CodingCliSessionIndexer {
           }
         }
       }
-      const merged = applyOverride(cached.baseSession, ov)
+      const merged = applyOverride(cached.baseSession, ov, cached.titleSource)
       if (!merged) continue
       const metaKey = makeSessionKey(merged.provider, merged.sessionId)
       const meta = sessionMetadata[metaKey]
@@ -1111,7 +1230,11 @@ export class CodingCliSessionIndexer {
     for (let i = 0; i < allFiles.length; i += LIGHTWEIGHT_SCAN_CONCURRENCY) {
       const batch = allFiles.slice(i, i + LIGHTWEIGHT_SCAN_CONCURRENCY)
       const results = await Promise.all(batch.map(({ provider, filePath }) =>
-        readLightweightMeta(filePath).then((meta) => ({ provider, meta })),
+        readLightweightMeta(filePath, {
+          generatedTitleExtractor: provider.name === 'claude'
+            ? extractClaudeGeneratedTitleFromJsonlObject
+            : undefined,
+        }).then((meta) => ({ provider, meta })),
       ))
       metas.push(...results)
     }
@@ -1148,6 +1271,7 @@ export class CodingCliSessionIndexer {
         mtimeMs: meta.mtimeMs,
         size: meta.size,
         baseSession,
+        titleSource: meta.titleSource,
         lightweight: true,
       })
       this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), meta.filePath)
@@ -1194,7 +1318,7 @@ export class CodingCliSessionIndexer {
             let mtime = statCache.get(cacheKey)
             if (mtime === undefined) {
               const stat = await fsp.stat(filePath)
-              mtime = stat.mtimeMs || stat.mtime.getTime()
+              mtime = statMtimeMs(stat)
               statCache.set(cacheKey, mtime)
             }
             lastActivityAt = mtime

@@ -703,6 +703,64 @@ describe('searchSessions tier forwarding', () => {
   })
 })
 
+describe('searchSessions cursor pagination', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('surfaces nextCursor and hasMore=true when the server returns a non-null nextCursor', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-42',
+        provider: 'claude',
+        projectPath: '/repo',
+        title: 'Match 42',
+        matchedIn: 'title',
+        isRunning: false,
+        lastActivityAt: 4_200,
+      }],
+      nextCursor: 'cursor-page-2',
+      revision: 7,
+    }))
+
+    const response = await searchSessions({ query: 'widget' })
+
+    expect(response.nextCursor).toBe('cursor-page-2')
+    expect(response.hasMore).toBe(true)
+  })
+
+  it('reports hasMore=false and a null nextCursor when the server has no further pages', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 7,
+    }))
+
+    const response = await searchSessions({ query: 'widget' })
+
+    expect(response.nextCursor).toBeNull()
+    expect(response.hasMore).toBe(false)
+  })
+
+  it('forwards the cursor to the session-directory request when paginating a search', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 7,
+    }))
+
+    await searchSessions({ query: 'widget', cursor: 'cursor-page-2' })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    expect(requestUrl).toContain('cursor=cursor-page-2')
+  })
+})
+
 describe('setSessionMetadata()', () => {
   beforeEach(() => {
     mockFetch.mockReset()

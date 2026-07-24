@@ -46,7 +46,9 @@ export function defaultOpencodeDataHome(): string {
 }
 
 function toValidTimestamp(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  // SQLite columns are dynamically typed, so time_updated/time_created can arrive
+  // as REAL. Downstream read-model schemas require integer epoch-ms, so floor.
+  return typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : undefined
 }
 
 function sleep(ms: number): Promise<void> {

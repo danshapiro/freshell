@@ -2,6 +2,7 @@ import { isFinalizedTitleSource } from '../shared/title-source.js'
 import { basenameSegment } from '../shared/path-basename.js'
 import { extractTitleFromMessage } from '../shared/title-utils.js'
 import type { SessionOverride } from './config-store.js'
+import type { ParsedSessionTitleSource } from './coding-cli/types.js'
 
 /**
  * Decide the next automatic title override for an active coding-agent session.
@@ -63,6 +64,7 @@ export function computeSessionTitleSync(input: {
   cwd?: string
   firstUserMessage?: string
   aiWillAutoName: boolean
+  parsedTitleSource?: ParsedSessionTitleSource
   terminals: Array<{ terminalId: string; title?: string }>
 }): {
   overridePatch: SessionOverride | null
@@ -82,7 +84,8 @@ export function computeSessionTitleSync(input: {
   const shouldGenerateAi =
     aiWillAutoName &&
     !!firstUserMessage?.trim() &&
-    !isFinalizedTitleSource(override?.titleSource)
+    !isFinalizedTitleSource(override?.titleSource) &&
+    input.parsedTitleSource !== 'provider-generated'
 
   return { overridePatch, canonicalTitle, terminalIdsToUpdate, shouldGenerateAi }
 }

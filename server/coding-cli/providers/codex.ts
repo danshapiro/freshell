@@ -44,7 +44,8 @@ function toFiniteNumber(value: unknown): number | undefined {
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
+  // Floor numeric passthroughs: downstream read-model schemas require integer epoch-ms.
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value)
   if (typeof value === 'string' && value.trim()) {
     const parsed = Date.parse(value)
     if (Number.isFinite(parsed)) return parsed

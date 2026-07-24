@@ -11,9 +11,9 @@ import type {
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { Tab } from '@/store/types'
-import type { CodexActivityRecord, ClaudeActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
+import type { CodexActivityRecord, ClaudeActivityRecord, AmplifierActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
 
-type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'fresh-agent' | 'browser'
+type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'amplifier' | 'fresh-agent' | 'browser'
 
 export type PaneActivityProjection = {
   isBusy: boolean
@@ -114,6 +114,7 @@ export function resolvePaneActivity(input: {
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
+  amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): PaneActivityProjection {
@@ -160,6 +161,16 @@ export function resolvePaneActivity(input: {
         : IDLE_PANE_ACTIVITY
     }
 
+    if (effectiveMode === 'amplifier') {
+      const terminalId = input.content.terminalId
+      const record = terminalId
+        ? input.amplifierActivityByTerminalId[terminalId]
+        : undefined
+      return record?.phase === 'busy'
+        ? { isBusy: true, source: 'amplifier' }
+        : IDLE_PANE_ACTIVITY
+    }
+
     return IDLE_PANE_ACTIVITY
   }
 
@@ -191,6 +202,7 @@ export function getBusyPaneIdsForTab(input: {
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
+  amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): string[] {
@@ -207,6 +219,7 @@ export function getBusyPaneIdsForTab(input: {
       codexActivityByTerminalId: input.codexActivityByTerminalId,
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+      amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy
@@ -224,6 +237,7 @@ export function getBusyPaneIdsForTab(input: {
       codexActivityByTerminalId: input.codexActivityByTerminalId,
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+      amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy)
@@ -236,6 +250,7 @@ export function collectBusySessionKeys(input: {
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
+  amplifierActivityByTerminalId: Record<string, AmplifierActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): string[] {
@@ -255,6 +270,7 @@ export function collectBusySessionKeys(input: {
         codexActivityByTerminalId: input.codexActivityByTerminalId,
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+        amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         freshAgentSessions: input.freshAgentSessions,
       }).isBusy
@@ -275,6 +291,7 @@ export function collectBusySessionKeys(input: {
         codexActivityByTerminalId: input.codexActivityByTerminalId,
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         claudeActivityByTerminalId: input.claudeActivityByTerminalId,
+        amplifierActivityByTerminalId: input.amplifierActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         freshAgentSessions: input.freshAgentSessions,
       }).isBusy

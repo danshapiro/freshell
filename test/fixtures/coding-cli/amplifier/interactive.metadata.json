@@ -1,0 +1,12 @@
+{
+  "session_id": "1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8",
+  "created": "2026-07-04T20:29:04.000280+00:00",
+  "bundle": "bundle:anchors",
+  "model": "claude-opus-4-8",
+  "turn_count": 7,
+  "working_dir": "/home/dan/code/freshell",
+  "name": "Porting freshell to Rust/Tauri",
+  "name_generated_at": "2026-07-04T20:37:41Z",
+  "description": "Autonomously porting freshell to a Rust/Tauri stack.",
+  "description_updated_at": "2026-07-04T21:31:16Z"
+}

@@ -97,6 +97,8 @@ export interface TokenPayload {
   totalCost?: number             // USD
 }
 
+export type ParsedSessionTitleSource = 'provider-generated'
+
 /**
  * Session-level token aggregate used for runtime metadata.
  * `TokenPayload` above remains the live event payload shape.
@@ -137,6 +139,7 @@ export interface ParsedSessionMeta {
   createdAt?: number
   lastActivityAt?: number
   title?: string
+  titleSource?: ParsedSessionTitleSource
   summary?: string
   firstUserMessage?: string
   messageCount?: number
@@ -172,6 +175,7 @@ export interface CodingCliSession {
   archived?: boolean
   messageCount?: number
   title?: string
+  titleSource?: ParsedSessionTitleSource
   summary?: string
   firstUserMessage?: string
   cwd?: string

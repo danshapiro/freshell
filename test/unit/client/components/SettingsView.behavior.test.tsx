@@ -63,17 +63,149 @@ describe('SettingsView behavior sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const uiScaleSlider = getSlider((slider) => {
-        const min = slider.getAttribute('min')
-        const step = slider.getAttribute('step')
-        return min === '0.75' && step === '0.05'
-      })
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' })
 
-      fireEvent.change(uiScaleSlider, { target: { value: '1.5' } })
+      fireEvent.change(uiScaleSlider, { target: { value: '33' } })
       fireEvent.pointerUp(uiScaleSlider)
 
-      expect(store.getState().settings.settings.uiScale).toBe(1.5)
-      expect(screen.getByText('150%')).toBeInTheDocument()
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+      const spinbutton = screen.getByRole('spinbutton', { name: 'UI scale' }) as HTMLInputElement
+      expect(spinbutton.value).toBe('400')
+    })
+
+    it('commits keyboard-only slider changes across the 200% boundary', () => {
+      const store = createSettingsViewStore({ settings: { uiScale: 2.0 } })
+      renderSettingsView(store)
+
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' })
+
+      // No pointer events: keyboard changes must commit immediately.
+      fireEvent.change(uiScaleSlider, { target: { value: '26' } })
+
+      expect(store.getState().settings.settings.uiScale).toBe(2.25)
+    })
+
+    it('clamps numeric UI scale input to the supported range without calling /api/settings', async () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: '999' } })
+      fireEvent.blur(uiScaleInput)
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+
+      fireEvent.change(uiScaleInput, { target: { value: '50' } })
+      fireEvent.keyDown(uiScaleInput, { key: 'Enter' })
+      expect(store.getState().settings.settings.uiScale).toBe(0.75)
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).not.toHaveBeenCalled()
+    })
+
+    it('commits typed off-list UI scale percentages without snapping', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: '137' } })
+      fireEvent.blur(uiScaleInput)
+
+      expect(store.getState().settings.settings.uiScale).toBeCloseTo(1.37)
+    })
+
+    it('ignores invalid numeric UI scale input', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+      const initialUiScale = store.getState().settings.settings.uiScale
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' })
+
+      fireEvent.change(uiScaleInput, { target: { value: 'abc' } })
+      fireEvent.blur(uiScaleInput)
+
+      expect(store.getState().settings.settings.uiScale).toBe(initialUiScale)
+    })
+
+    it('updates font size slider to the max stop', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' })
+
+      // Index 32 is the last stop -> 64px.
+      fireEvent.change(fontSizeSlider, { target: { value: '32' } })
+      fireEvent.pointerUp(fontSizeSlider)
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
+      const spinbutton = screen.getByRole('spinbutton', { name: 'Font size' }) as HTMLInputElement
+      expect(spinbutton.value).toBe('64')
+    })
+
+    it('commits keyboard-only font size changes across the 32px boundary', () => {
+      const store = createSettingsViewStore({ settings: { terminal: { fontSize: 32 } } })
+      renderSettingsView(store)
+
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' })
+
+      // No pointer events: keyboard changes must commit immediately. Index 21 -> 34px.
+      fireEvent.change(fontSizeSlider, { target: { value: '21' } })
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(34)
+    })
+
+    it('clamps numeric font size input to the supported range without calling /api/settings', async () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' })
+
+      fireEvent.change(fontSizeInput, { target: { value: '999' } })
+      fireEvent.blur(fontSizeInput)
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
+
+      fireEvent.change(fontSizeInput, { target: { value: '8' } })
+      fireEvent.keyDown(fontSizeInput, { key: 'Enter' })
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(12)
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).not.toHaveBeenCalled()
+    })
+
+    it('commits typed off-list font sizes without snapping', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' })
+
+      fireEvent.change(fontSizeInput, { target: { value: '33' } })
+      fireEvent.blur(fontSizeInput)
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(33)
+      // Slider renders the nearest stop; the 32-vs-34 tie resolves to the lower index (20).
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' }) as HTMLInputElement
+      expect(fontSizeSlider.value).toBe('20')
+      expect(fontSizeSlider.getAttribute('aria-valuetext')).toBe('33px (206%)')
+    })
+
+    it('ignores invalid numeric font size input', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+      const initialFontSize = store.getState().settings.settings.terminal.fontSize
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' })
+
+      fireEvent.change(fontSizeInput, { target: { value: 'abc' } })
+      fireEvent.blur(fontSizeInput)
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(initialFontSize)
     })
 
     it('updates sidebar sort mode locally without calling /api/settings', async () => {

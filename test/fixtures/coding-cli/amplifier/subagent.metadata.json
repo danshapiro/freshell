@@ -1,0 +1,13 @@
+{
+  "session_id": "0000000000000000-793624e9e3c3486d",
+  "created": "2026-07-04T20:35:00.000000+00:00",
+  "bundle": "bundle:anchors",
+  "model": "claude-opus-4-8",
+  "turn_count": 3,
+  "working_dir": "/home/dan/code/freshell",
+  "name": "anchors-builder",
+  "parent_id": "1d2dea08-9a63-4ecf-bc4b-ee25a852a4d8",
+  "trace_id": "trace-abc123",
+  "agent_name": "anchors-builder",
+  "child_span": "span-1"
+}

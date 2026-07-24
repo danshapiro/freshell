@@ -9,7 +9,7 @@ import {
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
+import { api, isApiUnauthorizedError, isTransientRequestFailure, type VersionInfo } from '@/lib/api'
 import {
   fetchSessionWindow,
   loadInitialSessionsWindow,
@@ -65,6 +65,7 @@ import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
+import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { applyServerCompletion } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
@@ -236,9 +237,11 @@ export default function App() {
   const userOpenedSidebarOnMobileRef = useRef(false)
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
   const claudeActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const amplifierActivityListRequestSeqRef = useRef(new Map<string, number>())
   const opencodeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
   const claudeActivityOrderRef = useRef(0)
+  const amplifierActivityOrderRef = useRef(0)
   const opencodeActivityOrderRef = useRef(0)
   const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
@@ -492,6 +495,7 @@ export default function App() {
         if (!cancelled) {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
+          resetAmplifierActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
@@ -524,8 +528,8 @@ export default function App() {
               break
             } catch (err) {
               lastBootstrapError = err
-              const isTransientFetchFailure = err instanceof TypeError && /failed to fetch/i.test(err.message)
-              if (attempt === 0 && isTransientFetchFailure && !cancelled) {
+              const isTransientFailure = isTransientRequestFailure(err)
+              if (attempt === 0 && isTransientFailure && !cancelled) {
                 await new Promise((resolve) => setTimeout(resolve, 150))
                 continue
               }
@@ -688,6 +692,16 @@ export default function App() {
         })
       }
 
+      const requestAmplifierActivityList = () => {
+        const requestId = `amplifier-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++amplifierActivityOrderRef.current
+        amplifierActivityListRequestSeqRef.current.set(requestId, requestSeq)
+        ws.send({
+          type: 'amplifier.activity.list',
+          requestId,
+        })
+      }
+
       const requestOpencodeActivityList = () => {
         const requestId = `opencode-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         const requestSeq = ++opencodeActivityOrderRef.current
@@ -708,6 +722,11 @@ export default function App() {
         dispatch(resetClaudeActivity())
       }
 
+      const resetAmplifierActivityOverlay = () => {
+        amplifierActivityListRequestSeqRef.current.clear()
+        dispatch(resetAmplifierActivity())
+      }
+
       const resetOpencodeActivityOverlay = () => {
         opencodeActivityListRequestSeqRef.current.clear()
         dispatch(resetOpencodeActivity())
@@ -721,6 +740,7 @@ export default function App() {
         if (cancelled) return
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
+        resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
         dispatch(setStatus('disconnected'))
       }) ?? null
@@ -895,6 +915,7 @@ export default function App() {
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
+          resetAmplifierActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
@@ -917,6 +938,7 @@ export default function App() {
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
           requestClaudeActivityList()
+          requestAmplifierActivityList()
           requestOpencodeActivityList()
           lastSessionsRevision = -1
           void recoverMissingStartupState()
@@ -1105,6 +1127,43 @@ export default function App() {
             }))
           }
         }
+        if (msg.type === 'amplifier.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = amplifierActivityListRequestSeqRef.current.get(requestId)
+          amplifierActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setAmplifierActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+          for (const completion of msg.latestTurnCompletions || []) {
+            dispatch(applyServerCompletion({
+              provider: 'amplifier',
+              terminalId: completion.terminalId,
+              at: completion.at,
+              completionSeq: completion.completionSeq,
+            }) as any)
+          }
+        }
+        if (msg.type === 'amplifier.activity.updated') {
+          const mutationSeq = ++amplifierActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertAmplifierActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeAmplifierActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
+          }
+        }
         if (msg.type === 'opencode.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
           if (!requestId) return
@@ -1231,6 +1290,7 @@ export default function App() {
         lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
+        resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
@@ -1242,6 +1302,7 @@ export default function App() {
         if (!cancelled) {
           requestCodexActivityList()
           requestClaudeActivityList()
+          requestAmplifierActivityList()
           requestOpencodeActivityList()
         }
         void recoverMissingStartupState()
@@ -1257,6 +1318,7 @@ export default function App() {
         if (!cancelled) {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
+          resetAmplifierActivityOverlay()
           resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))

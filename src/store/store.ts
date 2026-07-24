@@ -13,6 +13,7 @@ import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
 import claudeActivityReducer from './claudeActivitySlice'
+import amplifierActivityReducer from './amplifierActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import freshAgentReducer from './freshAgentSlice'
 import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
@@ -51,6 +52,7 @@ export const store = configureStore({
     terminalMeta: terminalMetaReducer,
     codexActivity: codexActivityReducer,
     claudeActivity: claudeActivityReducer,
+    amplifierActivity: amplifierActivityReducer,
     opencodeActivity: opencodeActivityReducer,
     freshAgent: freshAgentReducer,
     paneRuntimeActivity: paneRuntimeActivityReducer,

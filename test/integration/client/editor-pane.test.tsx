@@ -6,6 +6,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 import PaneLayout from '@/components/panes/PaneLayout'
 
 // Mock Monaco to avoid loading issues in tests
@@ -182,14 +183,18 @@ function createRoutedFetch(opts?: {
   }
 }
 
-const createTestStore = () =>
-  configureStore({
+const createTestStore = () => {
+  const store = configureStore({
     reducer: {
       panes: panesReducer,
       tabs: tabsReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
   })
+  store.dispatch(setStatus('ready'))
+  return store
+}
 
 async function selectEditorFromPicker(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: /add pane/i }))

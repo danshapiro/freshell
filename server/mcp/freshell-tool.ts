@@ -160,6 +160,50 @@ async function fetchPanes(tabId?: string): Promise<PaneSummary[]> {
   return (obj.panes || []) as PaneSummary[]
 }
 
+// The session directory endpoint caps each page at 50 items and returns a
+// `nextCursor` to fetch the next page. We follow the cursor and aggregate, but
+// bound the number of pages so a huge history can't blow up the token budget.
+// 6 pages ~= 300 most-recent sessions.
+const SESSION_DIRECTORY_MAX_PAGES = 6
+
+/**
+ * Fetch `/api/session-directory?<baseQuery>` and follow `nextCursor` up to
+ * `maxPages`, concatenating `items` from every page.
+ *
+ * Returns `truncated: true` only when it stopped because it hit `maxPages`
+ * while the server still had a non-null `nextCursor` (i.e. more sessions exist
+ * beyond what we returned).
+ */
+async function fetchAllSessionDirectoryPages(
+  c: ApiClient,
+  baseQuery: string,
+  maxPages = SESSION_DIRECTORY_MAX_PAGES,
+): Promise<{ items: unknown[]; truncated: boolean; pages: number }> {
+  const items: unknown[] = []
+  let cursor: string | null = null
+  let pages = 0
+  let truncated = false
+
+  for (;;) {
+    const url = cursor
+      ? `/api/session-directory?${baseQuery}&cursor=${encodeURIComponent(cursor)}`
+      : `/api/session-directory?${baseQuery}`
+    const page = unwrapData(await c.get(url)) as { items?: unknown[]; nextCursor?: string | null } | undefined
+    pages++
+    if (Array.isArray(page?.items)) items.push(...page.items)
+
+    const nextCursor = page?.nextCursor ?? null
+    if (!nextCursor) break // No more pages -- fully drained.
+    if (pages >= maxPages) {
+      truncated = true // More pages remain but we hit the bounded cap.
+      break
+    }
+    cursor = nextCursor
+  }
+
+  return { items, truncated, pages }
+}
+
 async function resolveTabTarget(target?: string): Promise<{ tab?: TabSummary; message?: string }> {
   const { tabs, activeTabId } = await fetchTabs()
   if (!tabs.length) return { message: 'no tabs' }
@@ -256,7 +300,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -371,7 +415,7 @@ Rules:
 ## Command reference
 
 Tab commands:
-  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?, prompt?
+  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume? (alias: resumeSessionId), sessionRef?, prompt?
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
                   To open a URL in a browser pane, use 'open-browser' instead.
@@ -593,11 +637,17 @@ async function routeAction(
     }
     // -- Tab actions --
     case 'new-tab': {
-      const { name, mode, shell, cwd, browser, editor, resume, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
-      const codexResumeError = rejectRawCodexResume(mode, resume, explicitSessionRef)
+      const { name, mode, shell, cwd, browser, editor, resume, resumeSessionId, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
+      // `resumeSessionId` is accepted as an alias for the shorthand `resume` --
+      // it's the exact field name the CLI sends and the server itself
+      // returns/broadcasts on created panes, so agents naturally reach for it.
+      // Both resolve to the canonical sessionRef below; the raw legacy field is
+      // never forwarded over the wire.
+      const legacyResume = typeof resume === 'string' ? resume : resumeSessionId
+      const codexResumeError = rejectRawCodexResume(mode, legacyResume, explicitSessionRef)
       if (codexResumeError) return codexResumeError
-      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
-        ? { provider: mode, sessionId: resume }
+      const sessionRef = explicitSessionRef ?? (typeof mode === 'string' && mode !== 'codex' && typeof legacyResume === 'string'
+        ? { provider: mode, sessionId: legacyResume }
         : undefined)
       const tabResult = await c.post('/api/tabs', {
         name,
@@ -850,11 +900,17 @@ async function routeAction(
     }
 
     // -- Session --
-    case 'list-sessions':
-      return c.get('/api/session-directory?priority=visible')
+    // Both actions follow the server's `nextCursor` and aggregate pages so
+    // sessions beyond the first (50-item) page stay visible. `truncated` flags
+    // when the bounded page cap was hit while more pages remained.
+    case 'list-sessions': {
+      const { items, truncated } = await fetchAllSessionDirectoryPages(c, 'priority=visible')
+      return { items, count: items.length, truncated }
+    }
     case 'search-sessions': {
       const query = requireParam(params, 'query')
-      return c.get(`/api/session-directory?priority=visible&query=${encodeURIComponent(query)}`)
+      const { items, truncated } = await fetchAllSessionDirectoryPages(c, `priority=visible&query=${encodeURIComponent(query)}`)
+      return { items, count: items.length, truncated }
     }
 
     // -- Info --

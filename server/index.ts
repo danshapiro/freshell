@@ -9,6 +9,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
 import rateLimit from 'express-rate-limit'
+import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
@@ -22,10 +23,17 @@ import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
+import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
+import { createAmplifierActivityIntegration } from './coding-cli/amplifier-activity-integration.js'
+import { AmplifierSessionLocator } from './coding-cli/amplifier-session-locator.js'
+import { AmplifierSessionController } from './coding-cli/amplifier-session-controller.js'
 import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { amplifierProvider } from './coding-cli/providers/amplifier.js'
+import { overrideKeysToClear } from './coding-cli/provider-title-cleanup.js'
+import type { CodingCliProvider } from './coding-cli/provider.js'
 import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { computeSessionTitleSync } from './auto-title.js'
 import { generateAiSessionTitle } from './ai-title.js'
@@ -89,6 +97,8 @@ import {
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { startCodexObservability } from './coding-cli/codex-observability.js'
+import { installCodexChildExitHandlers, snapshotCodexChildren } from './coding-cli/codex-child-registry.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
 
@@ -98,6 +108,37 @@ function compileArgTemplate(
 ): ((value: string) => string[]) | undefined {
   if (!template) return undefined
   return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
+}
+
+// Build the CLI spawn table from CLI-category extension manifests.
+// Pure over the manager's current registry; used at startup and by the dev
+// hot-reload watcher to hot-swap the spawn table without a restart.
+function buildCliCommandsMap(extensionManager: ExtensionManager): Map<string, CodingCliCommandSpec> {
+  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
+  for (const ext of extensionManager.getAll()) {
+    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
+    const cli = ext.manifest.cli
+    const spec: CodingCliCommandSpec = {
+      label: ext.manifest.label,
+      envVar: cli.envVar || '',
+      defaultCommand: cli.command,
+      args: cli.args,
+      env: cli.env,
+      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
+      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
+      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
+      createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),
+      permissionModeEnvVar: cli.permissionModeEnvVar,
+      permissionModeEnvValues: cli.permissionModeValues,
+    }
+    if (cli.resumeArgs) {
+      const template = cli.resumeArgs
+      spec.resumeArgs = (sessionId: string) =>
+        template.map(arg => arg.replace('{{sessionId}}', sessionId))
+    }
+    cliCommandsMap.set(ext.manifest.name, spec)
+  }
+  return cliCommandsMap
 }
 
 const __filename = fileURLToPath(import.meta.url)
@@ -198,7 +239,7 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
+  const codingCliProviders: CodingCliProvider[] = [claudeProvider, codexProvider, opencodeProvider, amplifierProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -213,10 +254,41 @@ async function main() {
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
   const claudeActivity = wireClaudeActivityTracker({ registry })
+  const amplifierActivity = wireAmplifierActivityTracker({ registry })
+  // Events layer (plan 2026-07-08 §6/§9 Phase 2): tailer→reducer→tracker on
+  // top of the PTY wiring above. Composition only — path discovery goes
+  // through the indexer + the amplifier provider capability.
+  const amplifierEventsIntegration = createAmplifierActivityIntegration({
+    registry,
+    tracker: amplifierActivity.tracker,
+    resolveEventsPath: (sessionId) => {
+      const sessionFilePath = codingCliIndexer.getFilePathForSession(sessionId, 'amplifier')
+      if (!sessionFilePath) return undefined
+      return amplifierProvider.getLiveEventsPath?.(sessionFilePath)
+    },
+    log: logger,
+  })
+  // Phase 3 (plan 2026-07-08 §5): deterministic PTY↔session association for
+  // fresh amplifier sessions via first-prompt correlation; the coordinator
+  // slow-path below stays untouched as fallback.
+  const amplifierSessionLocator = new AmplifierSessionLocator({
+    registry,
+    amplifierHome: amplifierProvider.homeDir,
+  })
+  const amplifierSessionController = new AmplifierSessionController({ registry, locator: amplifierSessionLocator })
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
-  await runCodexStartupReaper({ serverInstanceId })
+  try {
+    await runCodexStartupReaper({ serverInstanceId })
+  } catch (err) {
+    // I4: boot must never die in the reaper. Unresolved records are retried by the hourly
+    // observability tick and on the next boot.
+    log.warn({ err }, 'Codex startup reaper failed; continuing startup (fail-open)')
+  }
+  // Boot + hourly codex-log-db line (WAL size, holder count, quarantine count), hourly retry of
+  // pending reaper records, and the quarantine rescan trigger. Observation-only; unref()'d timer.
+  const codexObservability = startCodexObservability({ serverInstanceId })
   const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
@@ -228,31 +300,7 @@ async function main() {
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
 
   // Build CLI commands from extension manifests
-  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
-  for (const ext of extensionManager.getAll()) {
-    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const cli = ext.manifest.cli
-    const spec: CodingCliCommandSpec = {
-      label: ext.manifest.label,
-      envVar: cli.envVar || '',
-      defaultCommand: cli.command,
-      args: cli.args,
-      env: cli.env,
-      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
-      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
-      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
-      createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),
-      permissionModeEnvVar: cli.permissionModeEnvVar,
-      permissionModeEnvValues: cli.permissionModeValues,
-    }
-    if (cli.resumeArgs) {
-      const template = cli.resumeArgs
-      spec.resumeArgs = (sessionId: string) =>
-        template.map(arg => arg.replace('{{sessionId}}', sessionId))
-    }
-    cliCommandsMap.set(ext.manifest.name, spec)
-  }
-  registerCodingCliCommands(cliCommandsMap)
+  registerCodingCliCommands(buildCliCommandsMap(extensionManager))
 
   // Build CLI detection specs from extension manifests
   const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
@@ -388,6 +436,8 @@ async function main() {
       codexLatestTurnCompletionsProvider: () => codexActivity.tracker.listLatestCompletions(),
       claudeActivityListProvider: () => claudeActivity.tracker.list(),
       claudeLatestTurnCompletionsProvider: () => claudeActivity.tracker.listLatestCompletions(),
+      amplifierActivityListProvider: () => amplifierActivity.tracker.list(),
+      amplifierLatestTurnCompletionsProvider: () => amplifierActivity.tracker.listLatestCompletions(),
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
       opencodeLatestTurnCompletionsProvider: () => opencodeActivity.tracker.listLatestCompletions(),
@@ -436,6 +486,56 @@ async function main() {
     wsHandler.broadcast({ type: 'extension.server.error', name, error })
   })
 
+  // DEV ONLY: hot-reload extension manifests. Watches the three extension dirs
+  // for freshell.json changes and live re-scans — refreshing the CLI spawn
+  // table, the WS mode validator, and the client registry — WITHOUT dropping
+  // panes or requiring a page reload. Gated by isDev so prod never builds it.
+  let extWatcher: chokidar.FSWatcher | undefined
+  if (isDev) {
+    const reloadExtensions = () => {
+      try {
+        // scan() clears the registry first, so this is a full re-scan.
+        extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
+        const cliCommandsMap = buildCliCommandsMap(extensionManager)
+        registerCodingCliCommands(cliCommandsMap)
+        wsHandler.refreshExtensionModes()
+        wsHandler.broadcast({
+          type: 'extensions.registry',
+          extensions: extensionManager.toClientRegistry(),
+        })
+        console.log(`[dev] reloaded extensions (${cliCommandsMap.size} cli)`)
+      } catch (err) {
+        // A malformed manifest must not crash the dev server.
+        logger.warn({ err }, '[dev] extension reload failed')
+      }
+    }
+
+    let reloadTimer: ReturnType<typeof setTimeout> | undefined
+    const scheduleReload = () => {
+      if (reloadTimer) clearTimeout(reloadTimer)
+      reloadTimer = setTimeout(reloadExtensions, 300)
+    }
+
+    // Watch the extension DIRS (not a file glob) so both manifest edits and
+    // whole-dir add/remove (e.g. `rm -rf extensions/foo`) reliably re-scan.
+    const extDirs = [userExtDir, localExtDir, builtinExtDir]
+    const onFileEvent = (changed: string) => {
+      if (changed.endsWith('freshell.json')) scheduleReload()
+    }
+    extWatcher = chokidar.watch(extDirs, {
+      ignoreInitial: true,
+      depth: 3,
+      ignored: /(^|[/\\])node_modules([/\\]|$)/,
+    })
+    extWatcher.on('add', onFileEvent)
+    extWatcher.on('change', onFileEvent)
+    extWatcher.on('unlink', onFileEvent)
+    extWatcher.on('unlinkDir', scheduleReload)
+    extWatcher.on('error', (err) => logger.warn({ err }, '[dev] extension watcher error'))
+    // console.log (not pino) so the notice is visible in the dev terminal.
+    console.log(`[dev] hot-reloading extension manifests under: ${extDirs.join(', ')}`)
+  }
+
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
@@ -472,6 +572,18 @@ async function main() {
       ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     })
   })
+  amplifierActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastAmplifierActivityUpdated(payload)
+  })
+  amplifierActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'amplifier',
+      terminalId: payload.terminalId,
+      at: payload.at,
+      completionSeq: payload.completionSeq,
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    })
+  })
   opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
     try {
       broadcastTerminalSessionAssociation({
@@ -486,6 +598,25 @@ async function main() {
     } catch (err) {
       log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
     }
+  })
+  amplifierSessionController.on('associated', ({ terminalId, sessionId, eventsPath }) => {
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'amplifier',
+        terminalId,
+        sessionId,
+        source: 'amplifier_locator',
+      })
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast Amplifier session association')
+    }
+    // Fresh session: attach the events tailer at offset 0 (plan §5 step 6). The
+    // indexer cannot resolve this path yet — metadata.json only lands at the
+    // first prompt:complete — so the locator-discovered path is passed through.
+    void amplifierEventsIntegration.attachTailer(terminalId, sessionId, eventsPath, 'start')
   })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -760,6 +891,7 @@ async function main() {
             cwd: session.cwd,
             firstUserMessage: session.firstUserMessage,
             aiWillAutoName,
+            parsedTitleSource: session.titleSource,
             terminals: matching.map((t) => ({ terminalId: t.terminalId, title: t.title })),
           })
 
@@ -818,16 +950,19 @@ async function main() {
     })
   })
 
-  // Fast-path session association for newly discovered Claude sessions.
-  // Most providers now associate from onUpdate, but onNewSession still reduces the
-  // delay before a freshly discovered Claude session binds to a matching terminal.
+  // Fast-path session association for newly discovered Claude and Amplifier
+  // sessions. Most providers now associate from onUpdate, but onNewSession still
+  // reduces the delay before a freshly discovered session binds to a matching
+  // terminal. For amplifier this is the plan 2026-07-08 §5 step 8 safety net
+  // (fires when metadata.json lands if the locator missed).
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
   codingCliIndexer.onNewSession((session) => {
-    if (session.provider !== 'claude') return
+    if (session.provider !== 'claude' && session.provider !== 'amplifier') return
     if (!session.cwd) return
+    const provider = session.provider
     const shouldAssociate = associationCoordinator.noteSession({
-      provider: 'claude',
+      provider,
       sessionId: session.sessionId,
       projectPath: session.projectPath,
       lastActivityAt: session.lastActivityAt,
@@ -835,7 +970,7 @@ async function main() {
     })
     if (!shouldAssociate) return
     const result = associationCoordinator.associateSingleSession({
-      provider: 'claude',
+      provider,
       sessionId: session.sessionId,
       projectPath: session.projectPath,
       lastActivityAt: session.lastActivityAt,
@@ -845,7 +980,7 @@ async function main() {
     const terminalId = result.terminalId
     log.info({
       event: 'session_bind_applied',
-      provider: 'claude',
+      provider,
       terminalId,
       sessionId: session.sessionId,
     }, 'session_bind_applied')
@@ -854,24 +989,24 @@ async function main() {
         wsHandler,
         terminalMetadata,
         broadcastTerminalMetaUpserts,
-        provider: 'claude',
+        provider,
         terminalId,
         sessionId: session.sessionId,
-        source: 'claude_new_session',
+        source: provider === 'claude' ? 'claude_new_session' : 'amplifier_new_session',
       })
     } catch (err) {
       log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to broadcast session association')
     }
 
     void (async () => {
-      const latestClaudeSession = findCodingCliSession('claude', session.sessionId)
-      if (!latestClaudeSession) return
-      const upsert = await terminalMetadata.applySessionMetadata(terminalId, latestClaudeSession)
+      const latestSession = findCodingCliSession(provider, session.sessionId)
+      if (!latestSession) return
+      const upsert = await terminalMetadata.applySessionMetadata(terminalId, latestSession)
       if (upsert) {
         broadcastTerminalMetaUpserts([upsert])
       }
     })().catch((err) => {
-      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to apply Claude terminal metadata after association')
+      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to apply terminal metadata after association')
     })
   })
 
@@ -896,10 +1031,27 @@ async function main() {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-      .then(() => {
+      .then(async () => {
         sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id, 'claude'))
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
+
+        // One-time cleanup: drop auto-written (non-user) title overrides that
+        // shadow an authoritative provider-generated title (e.g. Amplifier's own
+        // AI name). Keyed on provider capability so it never depends on live
+        // enrichment; runs once after the first full index, not on every refresh.
+        if (!(await configStore.isMigrationDone('ai-title-shadow-cleanup'))) {
+          const authoritative = new Set<string>(
+            codingCliProviders.filter((p) => p.providesAuthoritativeTitle?.()).map((p) => p.name),
+          )
+          const snap = await configStore.snapshot()
+          const keys = overrideKeysToClear(snap.sessionOverrides ?? {}, authoritative)
+          for (const key of keys) {
+            await configStore.patchSessionOverride(key, { titleOverride: undefined, titleSource: undefined })
+          }
+          await configStore.markMigrationDone('ai-title-shadow-cleanup')
+          if (keys.length) await codingCliIndexer.refresh()
+        }
       })
       .catch((err) => {
         logger.error({ err }, 'Coding CLI indexer failed to start')
@@ -980,11 +1132,39 @@ async function main() {
 
   // Graceful shutdown handler
   let isShuttingDown = false
+  // Stage 1a (plan §6): hard-exit safety net for teardown HANGS. All three handled signals
+  // (SIGTERM/SIGINT/SIGHUP) share the same hang exposure in joinCodexShutdownOwners below. A
+  // *throw* from joinCodexShutdownOwners already dies on its own: shutdown() is invoked un-awaited,
+  // so the rejection is unhandled -> default-fatal -> 'exit' -> reapSync. The timer exists for the
+  // hang case, where teardown never settles and 'exit' would otherwise never fire. 30s (panel M6):
+  // a legitimately slow-but-healthy shutdown awaits in-flight HTTP responses plus several bounded
+  // steps that can sum near 15s, so the old 15s budget force-killed healthy teardowns.
+  const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 30_000
   const shutdown = async (signal: string) => {
     if (isShuttingDown) return
     isShuttingDown = true
 
-    log.info({ signal }, 'Shutting down...')
+    // m7 (first step): stop the hourly codex observability/maintenance tick so it cannot race
+    // teardown (e.g. re-running the reaper while sidecars are being torn down).
+    codexObservability.stop()
+
+    const hardExitTimer = setTimeout(() => {
+      // May be slow rather than hung — but past the budget we force the exit either way. Write the
+      // final line synchronously too: async pino may not flush before process.exit.
+      const message = `Shutdown did not complete within ${SHUTDOWN_HARD_EXIT_TIMEOUT_MS}ms; forcing exit`
+      try {
+        log.error({ signal, timeoutMs: SHUTDOWN_HARD_EXIT_TIMEOUT_MS }, message)
+      } catch {
+        // stderr below is the fallback
+      }
+      process.stderr.write(`${message}\n`)
+      process.exit(1)
+    }, SHUTDOWN_HARD_EXIT_TIMEOUT_MS)
+    hardExitTimer.unref()
+
+    // The codexChildren snapshot is the pre-termination registry listing used by the Stage 1a
+    // acceptance tests (plan §6): every listed {pid, pgid} must be gone after exit.
+    log.info({ signal, codexChildren: snapshotCodexChildren() }, 'Shutting down...')
 
     // 1. Establish terminal creation admission barriers before waiting on terminal teardown.
     terminalCreateAdmissionOpen = false
@@ -999,6 +1179,17 @@ async function main() {
         resolve()
       })
     })
+    // M6: server.close() only stops NEW connections — keep-alive/in-flight sockets would otherwise
+    // hold httpServerClosed open toward the hard-exit budget. r2-10: close idle keep-alive sockets
+    // immediately, but give in-flight HTTP responses a 3s grace before severing everything (WS
+    // panes were already severed by wsHandler.close() above). Node >=18.2 APIs, optional-chained
+    // defensively; the timer is unref()'d and cleared if the server finishes closing first.
+    server.closeIdleConnections?.()
+    const closeAllConnectionsTimer = setTimeout(() => {
+      server.closeAllConnections?.()
+    }, 3_000)
+    closeAllConnectionsTimer.unref()
+    void httpServerClosed.then(() => clearTimeout(closeAllConnectionsTimer))
 
     // 3. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
@@ -1032,21 +1223,34 @@ async function main() {
     // 9. Stop session indexer
     await codingCliIndexer.stop()
 
+    // 9a. Stop the DEV extension-manifest watcher (undefined in production)
+    await extWatcher?.close()
+
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
     claudeActivity.dispose()
+    amplifierActivity.dispose()
+    await amplifierEventsIntegration.dispose()
+    amplifierSessionController.dispose()
+    await amplifierSessionLocator.dispose()
     opencodeActivity.dispose()
 
     // 10. Stop session repair service
     await sessionRepairService.stop()
 
-    // 11. Exit cleanly
+    // 11. Exit cleanly (hygiene: the force-exit timer is unref()d, but clear it anyway)
+    clearTimeout(hardExitTimer)
     log.info('Shutdown complete')
     process.exit(0)
   }
 
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
+  // Stage 1a (plan §6): 'exit' -> reapSync (synchronous best-effort SIGKILL of still-registered
+  // codex process groups), SIGHUP -> the same graceful shutdown (idempotent via isShuttingDown),
+  // and uncaughtExceptionMonitor as observe-only (default fatal semantics untouched; the fatal
+  // path then runs 'exit' -> reapSync).
+  installCodexChildExitHandlers({ requestShutdown: (signal) => void shutdown(signal) })
 }
 
 main().catch((err) => {

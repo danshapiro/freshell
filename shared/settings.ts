@@ -33,20 +33,30 @@ export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
 const NETWORK_HOST_VALUES = ['127.0.0.1', '0.0.0.0'] as const
 const UI_SCALE_MIN = 0.75
-const UI_SCALE_MAX = 1.5
+const UI_SCALE_MAX = 4
+// Slider stops for the UI scale control, in integer percent (avoids float drift).
+// Fine 5% steps up to 200%, coarse 25% steps to 400%.
+export const UI_SCALE_PERCENT_OPTIONS: readonly number[] = [
+  75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150,
+  155, 160, 165, 170, 175, 180, 185, 190, 195, 200,
+  225, 250, 275, 300, 325, 350, 375, 400,
+]
 const TERMINAL_FONT_SIZE_MIN = 12
-const TERMINAL_FONT_SIZE_MAX = 32
+const TERMINAL_FONT_SIZE_MAX = 64
+// Slider stops for the terminal font size control, in px.
+// Fine 1px steps up to 32 (every previously reachable value stays on-list),
+// then 2px steps to 48 and 4px steps to 64 (~6-8% relative change per stop).
+export const TERMINAL_FONT_SIZE_PX_OPTIONS: readonly number[] = [
+  12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+  34, 36, 38, 40, 42, 44, 46, 48,
+  52, 56, 60, 64,
+]
 const TERMINAL_LINE_HEIGHT_MIN = 1
 const TERMINAL_LINE_HEIGHT_MAX = 1.8
 const PANE_SNAP_THRESHOLD_MIN = 0
 const PANE_SNAP_THRESHOLD_MAX = 8
 const SIDEBAR_WIDTH_MIN = 200
 const SIDEBAR_WIDTH_MAX = 500
-const FRESH_AGENT_FONT_SCALE_MIN = 1
-const FRESH_AGENT_FONT_SCALE_MAX = 2
-// Fresh-agent panes render 50% larger than the base UI by default.
-export const FRESH_AGENT_FONT_SCALE_DEFAULT = 1.5
-export const FRESH_AGENT_FONT_SCALE_OPTIONS = [1, 1.25, 1.5, 1.75, 2] as const
 export const FRESH_AGENT_STYLE_VALUES = ['sans', 'serif', 'mono'] as const
 export type FreshAgentStyle = (typeof FRESH_AGENT_STYLE_VALUES)[number]
 export const DEFAULT_FRESH_AGENT_STYLE: FreshAgentStyle = 'sans'
@@ -77,7 +87,6 @@ const FRESH_AGENT_LOCAL_KEYS = [
   'showThinking',
   'showTools',
   'showTimecodes',
-  'fontScale',
 ] as const
 
 export type ThemeMode = (typeof THEME_VALUES)[number]
@@ -206,7 +215,6 @@ export type LocalSettings = {
     showThinking: boolean
     showTools: boolean
     showTimecodes: boolean
-    fontScale: number
   }
   notifications: {
     soundEnabled: boolean
@@ -452,13 +460,6 @@ function normalizeRoundedClampedNumber(value: unknown, min: number, max: number)
   return Math.round(normalized)
 }
 
-function normalizeFreshAgentFontScale(value: unknown): number {
-  return (
-    normalizeClampedNumber(value, FRESH_AGENT_FONT_SCALE_MIN, FRESH_AGENT_FONT_SCALE_MAX)
-    ?? FRESH_AGENT_FONT_SCALE_DEFAULT
-  )
-}
-
 export function normalizeFreshAgentStyleOverride(value: unknown): FreshAgentStyle | undefined {
   return FreshAgentStyleSchema.safeParse(value).success
     ? value as FreshAgentStyle
@@ -467,10 +468,6 @@ export function normalizeFreshAgentStyleOverride(value: unknown): FreshAgentStyl
 
 export function normalizeFreshAgentStyle(value: unknown): FreshAgentStyle {
   return normalizeFreshAgentStyleOverride(value) ?? DEFAULT_FRESH_AGENT_STYLE
-}
-
-function normalizeLocalFreshAgent(value: LocalSettings['freshAgent']): LocalSettings['freshAgent'] {
-  return { ...value, fontScale: normalizeFreshAgentFontScale(value.fontScale) }
 }
 
 function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSettingsPatch | undefined {
@@ -604,14 +601,6 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
     if (typeof patch.freshAgent.showTimecodes === 'boolean') {
       freshAgent.showTimecodes = patch.freshAgent.showTimecodes as boolean
-    }
-    const normalizedFontScale = normalizeClampedNumber(
-      patch.freshAgent.fontScale,
-      FRESH_AGENT_FONT_SCALE_MIN,
-      FRESH_AGENT_FONT_SCALE_MAX,
-    )
-    if (normalizedFontScale !== undefined) {
-      freshAgent.fontScale = normalizedFontScale
     }
     if (Object.keys(freshAgent).length > 0) {
       normalized.freshAgent = freshAgent
@@ -868,7 +857,6 @@ export const defaultLocalSettings: LocalSettings = {
     showThinking: false,
     showTools: false,
     showTimecodes: false,
-    fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
   },
   notifications: {
     soundEnabled: true,
@@ -891,14 +879,6 @@ function sanitizeFreshAgentLocalSettingsPatchInput(
   }
   if (typeof rawFreshAgent.showTimecodes === 'boolean') {
     freshAgent.showTimecodes = rawFreshAgent.showTimecodes
-  }
-  const normalizedFontScale = normalizeClampedNumber(
-    rawFreshAgent.fontScale,
-    FRESH_AGENT_FONT_SCALE_MIN,
-    FRESH_AGENT_FONT_SCALE_MAX,
-  )
-  if (normalizedFontScale !== undefined) {
-    freshAgent.fontScale = normalizedFontScale
   }
   return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
 }
@@ -1276,7 +1256,7 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
-    freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
+    freshAgent: mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }

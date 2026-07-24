@@ -12,6 +12,8 @@ export interface SessionWindowState {
   oldestLoadedTimestamp?: number
   oldestLoadedSessionId?: string
   hasMore?: boolean
+  /** Opaque cursor for continuing an active search query's pagination (server-side). */
+  searchCursor?: string
   loading?: boolean
   loadingKind?: SessionWindowLoadingKind
   error?: string
@@ -126,6 +128,7 @@ type SessionWindowCommitPayload = {
   oldestLoadedTimestamp?: number
   oldestLoadedSessionId?: string
   hasMore?: boolean
+  searchCursor?: string
   query?: string
   searchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
@@ -144,6 +147,7 @@ function commitWindowPayload(
   window.oldestLoadedTimestamp = payload.oldestLoadedTimestamp
   window.oldestLoadedSessionId = payload.oldestLoadedSessionId
   window.hasMore = payload.hasMore
+  window.searchCursor = payload.searchCursor
   window.error = undefined
   window.deepSearchPending = payload.deepSearchPending ?? false
   window.partial = payload.partial

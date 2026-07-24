@@ -9,6 +9,8 @@ import {
   mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
+  TERMINAL_FONT_SIZE_PX_OPTIONS,
+  UI_SCALE_PERCENT_OPTIONS,
 } from '@shared/settings'
 
 describe('shared settings contract', () => {
@@ -157,7 +159,7 @@ describe('shared settings contract', () => {
 
     expect(resolved.freshAgent.showTools).toBe(true)
     expect(resolved.freshAgent.showThinking).toBe(true)
-    expect(resolved.freshAgent.fontScale).toBe(1.25)
+    expect('fontScale' in resolved.freshAgent).toBe(false)
     expect('agentChat' in resolved).toBe(false)
   })
 
@@ -430,7 +432,7 @@ describe('shared settings contract', () => {
     })).toEqual({
       uiScale: 0.75,
       terminal: {
-        fontSize: 32,
+        fontSize: 64,
         lineHeight: 1,
       },
       panes: {
@@ -440,6 +442,75 @@ describe('shared settings contract', () => {
         width: 200,
       },
     })
+  })
+
+  it('clamps oversized uiScale to the 400% maximum when extracting a legacy seed', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      uiScale: 999,
+    })).toEqual({
+      uiScale: 4,
+    })
+  })
+
+  it('pins the UI scale percent options: 5% steps to 200, 25% steps to 400', () => {
+    expect(UI_SCALE_PERCENT_OPTIONS).toEqual([
+      75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150,
+      155, 160, 165, 170, 175, 180, 185, 190, 195, 200,
+      225, 250, 275, 300, 325, 350, 375, 400,
+    ])
+
+    // Invariants: ascending integers spanning the shared clamp range.
+    expect(UI_SCALE_PERCENT_OPTIONS[0]).toBe(75)
+    expect(UI_SCALE_PERCENT_OPTIONS[UI_SCALE_PERCENT_OPTIONS.length - 1]).toBe(400)
+    for (let i = 0; i < UI_SCALE_PERCENT_OPTIONS.length; i++) {
+      expect(Number.isInteger(UI_SCALE_PERCENT_OPTIONS[i])).toBe(true)
+      if (i === 0) continue
+      const delta = UI_SCALE_PERCENT_OPTIONS[i] - UI_SCALE_PERCENT_OPTIONS[i - 1]
+      expect(delta).toBeGreaterThan(0)
+      expect(delta).toBe(UI_SCALE_PERCENT_OPTIONS[i] <= 200 ? 5 : 25)
+    }
+  })
+
+  it('pins the terminal font size px options: 1px steps to 32, 2px to 48, 4px to 64', () => {
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS).toEqual([
+      12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+      34, 36, 38, 40, 42, 44, 46, 48,
+      52, 56, 60, 64,
+    ])
+  })
+
+  it('keeps the terminal font size px options strictly ascending integers spanning 12..64', () => {
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS[0]).toBe(12)
+    expect(TERMINAL_FONT_SIZE_PX_OPTIONS[TERMINAL_FONT_SIZE_PX_OPTIONS.length - 1]).toBe(64)
+    for (let i = 0; i < TERMINAL_FONT_SIZE_PX_OPTIONS.length; i++) {
+      expect(Number.isInteger(TERMINAL_FONT_SIZE_PX_OPTIONS[i])).toBe(true)
+      if (i === 0) continue
+      expect(TERMINAL_FONT_SIZE_PX_OPTIONS[i]).toBeGreaterThan(TERMINAL_FONT_SIZE_PX_OPTIONS[i - 1])
+    }
+    // Backward compatibility: every previously reachable value 12..32 stays on-list.
+    for (let px = 12; px <= 32; px++) {
+      expect(TERMINAL_FONT_SIZE_PX_OPTIONS).toContain(px)
+    }
+  })
+
+  it('ties the font size options max to the legacy-seed clamp maximum', () => {
+    const clamped = extractLegacyLocalSettingsSeed({
+      terminal: { fontSize: 1_000_000 },
+    })
+    expect(clamped).toEqual({
+      terminal: {
+        fontSize: TERMINAL_FONT_SIZE_PX_OPTIONS[TERMINAL_FONT_SIZE_PX_OPTIONS.length - 1],
+      },
+    })
+  })
+
+  it('clamps legacy-seed font sizes at the 64px boundary with round-after-clamp', () => {
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 64 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 65 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
+    expect(extractLegacyLocalSettingsSeed({ terminal: { fontSize: 63.5 } }))
+      .toEqual({ terminal: { fontSize: 64 } })
   })
 
   it('strips moved local settings while preserving server-backed settings', () => {
@@ -533,49 +604,47 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ panes: { multirowTabs: true } }).success).toBe(false)
   })
 
-  describe('legacy fresh-agent font scale settings', () => {
-    it('keeps the legacy fresh-agent font scale default for old stored settings', () => {
-      const resolved = resolveLocalSettings(undefined)
-      expect(resolved.freshAgent.fontScale).toBe(1.5)
+  describe('deprecated fresh-agent font scale is dropped', () => {
+    it('resolves the default fresh-agent settings without a fontScale key', () => {
+      expect(resolveLocalSettings(undefined).freshAgent).toEqual({
+        showThinking: false,
+        showTools: false,
+        showTimecodes: false,
+      })
     })
 
-    it('resolves a configured fresh-agent font scale without mirroring agentChat', () => {
-      const resolved = resolveLocalSettings({ freshAgent: { fontScale: 1.75 } })
-      expect(resolved.freshAgent.fontScale).toBe(1.75)
+    it('drops a canonical freshAgent.fontScale regardless of value', () => {
+      for (const value of [1.75, 5, 'big']) {
+        expect(resolveLocalSettings({ freshAgent: { fontScale: value } } as never).freshAgent).toEqual({
+          showThinking: false,
+          showTools: false,
+          showTimecodes: false,
+        })
+      }
+    })
+
+    it('drops the legacy agentChat alias fontScale while keeping its siblings', () => {
+      const resolved = resolveLocalSettings({ agentChat: { showTools: true, fontScale: 1.25 } } as never)
+      expect(resolved.freshAgent.showTools).toBe(true)
+      expect('fontScale' in resolved.freshAgent).toBe(false)
       expect('agentChat' in resolved).toBe(false)
     })
 
-    it('accepts the legacy fresh-agent font scale through the agentChat alias', () => {
-      const resolved = resolveLocalSettings({ agentChat: { fontScale: 1.25 } } as never)
-      expect(resolved.freshAgent.fontScale).toBe(1.25)
-      expect('agentChat' in resolved).toBe(false)
-    })
-
-    it('clamps an out-of-range legacy fresh-agent font scale into the supported range', () => {
-      expect(resolveLocalSettings({ freshAgent: { fontScale: 5 } }).freshAgent.fontScale).toBe(2)
-      expect(resolveLocalSettings({ freshAgent: { fontScale: 0.1 } }).freshAgent.fontScale).toBe(1)
-    })
-
-    it('falls back to the default when the legacy fresh-agent font scale is not a finite number', () => {
-      expect(
-        resolveLocalSettings({
-          freshAgent: { fontScale: 'big' as unknown as number },
-        }).freshAgent.fontScale,
-      ).toBe(1.5)
-    })
-
-    it('keeps the resolved legacy fresh-agent font scale in composed settings', () => {
+    it('carries no fontScale into composed settings', () => {
       const resolved = composeResolvedSettings(
         createDefaultServerSettings({ loggingDebug: false }),
-        resolveLocalSettings({ freshAgent: { fontScale: 2 } }),
+        resolveLocalSettings({ freshAgent: { fontScale: 2 } } as never),
       )
-      expect(resolved.freshAgent.fontScale).toBe(2)
+      expect('fontScale' in resolved.freshAgent).toBe(false)
     })
 
-    it('clamps the legacy fresh-agent font scale when extracting a local seed', () => {
+    it('drops fontScale when extracting a legacy local seed', () => {
       expect(
         extractLegacyLocalSettingsSeed({ agentChat: { fontScale: 9 } } as Record<string, unknown>),
-      ).toEqual({ freshAgent: { fontScale: 2 } })
+      ).toEqual(undefined)
+      expect(
+        extractLegacyLocalSettingsSeed({ agentChat: { showTools: true, fontScale: 9 } } as Record<string, unknown>),
+      ).toEqual({ freshAgent: { showTools: true } })
     })
   })
 })

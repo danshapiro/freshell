@@ -5,9 +5,10 @@ import { extractTitleFromMessage } from '../../title-utils.js'
 import { isValidClaudeSessionId } from '../../claude-session-id.js'
 import { getClaudeHome } from '../../claude-home.js'
 import type { CodingCliProvider } from '../provider.js'
-import { normalizeFirstUserMessage, type NormalizedEvent, type ParsedSessionMeta, type TokenSummary } from '../types.js'
+import { normalizeFirstUserMessage, type NormalizedEvent, type ParsedSessionMeta, type ParsedSessionTitleSource, type TokenSummary } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
 import { looksLikePath, extractUserAuthoredText, resolveGitRepoRoot } from '../utils.js'
+import { extractClaudeGeneratedTitleFromJsonlObject } from './claude-title.js'
 
 export type JsonlMeta = {
   sessionId?: string
@@ -15,6 +16,7 @@ export type JsonlMeta = {
   createdAt?: number
   lastActivityAt?: number
   title?: string
+  titleSource?: ParsedSessionTitleSource
   summary?: string
   firstUserMessage?: string
   messageCount?: number
@@ -74,7 +76,8 @@ function toFiniteNumber(value: unknown): number | undefined {
 }
 
 function parseTimestampMs(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
+  // Floor numeric passthroughs: downstream read-model schemas require integer epoch-ms.
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.floor(value)
   if (typeof value === 'string' && value.trim()) {
     const parsed = Date.parse(value)
     if (Number.isFinite(parsed)) return parsed
@@ -328,6 +331,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let title: string | undefined
   let customTitle: string | undefined
   let agentName: string | undefined
+  let generatedSummaryTitle: string | undefined
   let summary: string | undefined
   let firstUserMessage: string | undefined
   let gitBranch: string | undefined
@@ -408,6 +412,10 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     }
     if (obj?.type === 'agent-name' && typeof obj?.agentName === 'string' && obj.agentName.trim()) {
       agentName = obj.agentName.trim().slice(0, 200)
+    }
+    const generatedTitle = extractClaudeGeneratedTitleFromJsonlObject(obj, 200)
+    if (generatedTitle) {
+      generatedSummaryTitle = generatedTitle
     }
 
     if (!firstUserMessage) {
@@ -493,12 +501,16 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     }
   }
 
+  const resolvedTitle = customTitle ?? agentName ?? generatedSummaryTitle ?? title
+  const titleSource = customTitle || agentName || generatedSummaryTitle ? 'provider-generated' : undefined
+
   return {
     sessionId,
     cwd,
     createdAt,
     lastActivityAt,
-    title: customTitle ?? agentName ?? title,
+    title: resolvedTitle,
+    titleSource,
     summary,
     firstUserMessage,
     messageCount: lines.length,

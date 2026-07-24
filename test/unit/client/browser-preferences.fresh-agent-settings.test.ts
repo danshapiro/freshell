@@ -30,12 +30,11 @@ describe('browser preferences fresh-agent settings compatibility', () => {
       freshAgent: {
         showTools: true,
         showThinking: true,
-        fontScale: 1.25,
       },
     })
     expect(resolved.freshAgent.showTools).toBe(true)
     expect(resolved.freshAgent.showThinking).toBe(true)
-    expect(resolved.freshAgent.fontScale).toBe(1.25)
+    expect('fontScale' in resolved.freshAgent).toBe(false)
     expect('agentChat' in (record.settings ?? {})).toBe(false)
     expect('agentChat' in resolved).toBe(false)
   })
@@ -55,7 +54,6 @@ describe('browser preferences fresh-agent settings compatibility', () => {
     expect(raw.settings).toEqual({
       freshAgent: {
         showTools: true,
-        fontScale: 1.25,
       },
     })
     expect(raw.settings.agentChat).toBeUndefined()

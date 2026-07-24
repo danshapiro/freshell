@@ -693,6 +693,43 @@ describe('claude provider cross-platform tests', () => {
       const meta = parseSessionContent(content)
       expect(meta.title).toBeUndefined()
     })
+
+    it('uses Claude generated summary records as the session title over the prompt fallback', () => {
+      const meta = parseSessionContent([
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'can you take a look at this?' } }),
+        JSON.stringify({ type: 'summary', summary: 'Auth Redirect Fix' }),
+      ].join('\n'))
+
+      expect(meta.title).toBe('Auth Redirect Fix')
+      expect(meta.titleSource).toBe('provider-generated')
+      expect(meta.summary).toBe('Auth Redirect Fix')
+      expect(meta.firstUserMessage).toBe('can you take a look at this?')
+    })
+
+    it('keeps Claude rename records ahead of generated summary titles', () => {
+      const meta = parseSessionContent([
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'can you take a look at this?' } }),
+        JSON.stringify({ type: 'summary', summary: 'Auth Redirect Fix' }),
+        JSON.stringify({ type: 'agent-name', agentName: 'Agent Name' }),
+        JSON.stringify({ type: 'custom-title', customTitle: 'Pinned Name' }),
+      ].join('\n'))
+
+      expect(meta.title).toBe('Pinned Name')
+      expect(meta.titleSource).toBe('provider-generated')
+      expect(meta.summary).toBe('Auth Redirect Fix')
+    })
+
+    it('uses the latest Claude generated summary record when multiple summary records exist', () => {
+      const meta = parseSessionContent([
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'can you take a look at this?' } }),
+        JSON.stringify({ type: 'summary', summary: 'Initial Investigation' }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }),
+        JSON.stringify({ type: 'summary', summary: 'Auth Redirect Fix' }),
+      ].join('\n'))
+
+      expect(meta.title).toBe('Auth Redirect Fix')
+      expect(meta.titleSource).toBe('provider-generated')
+    })
   })
 
   describe('parseSessionContent() - summary extraction', () => {

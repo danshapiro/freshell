@@ -1,0 +1,4 @@
+{"role": "user", "content": "Port freshell to Rust/Tauri"}
+{"role": "assistant", "content": [{"type": "thinking", "thinking": "Planning the port strategy before writing code."}, {"type": "text", "text": "Starting the port now."}]}
+{"role": "tool", "name": "read_file", "tool_call_id": "toolu_01abc", "content": "sanitized file contents"}
+{"role": "assistant", "content": [{"type": "text", "text": "Read the entry point; proceeding."}]}

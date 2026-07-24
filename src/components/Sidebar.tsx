@@ -28,6 +28,7 @@ const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
+const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
@@ -321,6 +322,7 @@ export default function Sidebar({
     paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
     codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
     claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
+    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
@@ -468,31 +470,41 @@ export default function Sidebar({
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
+  const sidebarSearchCursor = sidebarWindow?.searchCursor
   const hasAppliedQuery = appliedQuery.length > 0
 
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const requestSidebarAppend = useCallback(() => {
     if (!sidebarHasMore || sidebarWindow?.loading || loadMoreInFlightRef.current) return
-    if (sidebarOldestLoadedTimestamp == null || sidebarOldestLoadedSessionId == null) return
-    if (hasAppliedQuery) return
+    if (hasAppliedQuery) {
+      // Active search: paginate the query itself via the stored search cursor,
+      // mirroring how the plain list continues from its oldest-loaded pointer.
+      if (sidebarSearchCursor == null) return
+    } else if (sidebarOldestLoadedTimestamp == null || sidebarOldestLoadedSessionId == null) {
+      return
+    }
 
     loadMoreInFlightRef.current = true
     void dispatch(fetchSessionWindow({
       surface: 'sidebar',
       priority: 'visible',
       append: true,
+      ...(hasAppliedQuery ? { query: appliedQuery, searchTier: appliedSearchTier } : {}),
     }) as any)
     if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
     loadMoreTimeoutRef.current = setTimeout(() => {
       loadMoreInFlightRef.current = false
     }, 15_000)
   }, [
+    appliedQuery,
+    appliedSearchTier,
     dispatch,
     hasAppliedQuery,
     sidebarHasMore,
     sidebarOldestLoadedSessionId,
     sidebarOldestLoadedTimestamp,
+    sidebarSearchCursor,
     sidebarWindow?.loading,
   ])
 

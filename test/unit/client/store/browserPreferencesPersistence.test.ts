@@ -226,12 +226,12 @@ describe('browserPreferencesPersistence', () => {
     expect(bp.settings?.agentChat).toBeUndefined()
   })
 
-  it('does not persist deprecated freshAgent.fontScale values', () => {
+  it('ignores removed freshAgent.fontScale values', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
       freshAgent: { fontScale: 1.75 },
-    }))
+    } as never))
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
@@ -240,7 +240,7 @@ describe('browserPreferencesPersistence', () => {
     expect(bp.settings?.agentChat).toBeUndefined()
   })
 
-  it('still accepts legacy freshAgent.fontScale records when rehydrating old preferences', () => {
+  it('drops legacy freshAgent.fontScale records when rehydrating old preferences', () => {
     const store = createStore()
 
     store.dispatch(updateSettingsLocal({
@@ -253,8 +253,9 @@ describe('browserPreferencesPersistence', () => {
     const rehydrated = resolveLocalSettings({
       ...bp.settings,
       freshAgent: { ...bp.settings.freshAgent, fontScale: 1.75 },
-    })
-    expect(rehydrated.freshAgent.fontScale).toBe(1.75)
+    } as never)
+    expect(rehydrated.freshAgent.showTools).toBe(true)
+    expect('fontScale' in rehydrated.freshAgent).toBe(false)
     expect('agentChat' in rehydrated).toBe(false)
   })
 })
