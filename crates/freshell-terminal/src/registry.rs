@@ -325,6 +325,39 @@ struct RegistryInner {
 /// hasn't been called yet (e.g. before the boot-time settings load completes).
 const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
 
+/// TERM-15/TERM-16 activity tap: the registry-level lifecycle events the
+/// activity hub (`freshell-ws`) subscribes to. `Created`/`Exit` fire for
+/// every mode; `Input`/`Output` fire only for CLI modes (`mode != "shell"`)
+/// so plain shells pay zero per-chunk tap cost. The observer runs on the
+/// caller's thread (`Created`/`Input`/kill-`Exit`) or the PTY reader thread
+/// (`Output`/natural-exit `Exit`) — it must be cheap and non-blocking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivityEvent {
+    Created {
+        terminal_id: String,
+        mode: String,
+        resume_session_id: Option<String>,
+        at: i64,
+    },
+    Input {
+        terminal_id: String,
+        data: String,
+        at: i64,
+    },
+    Output {
+        terminal_id: String,
+        data: String,
+        at: i64,
+    },
+    Exit {
+        terminal_id: String,
+        at: i64,
+    },
+}
+
+/// The activity tap callback (see [`ActivityEvent`]).
+pub type ActivityObserver = Arc<dyn Fn(ActivityEvent) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -351,6 +384,10 @@ pub struct TerminalRegistry {
     /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
     /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
     scrollback_max_bytes: Arc<AtomicI64>,
+    /// TERM-15/TERM-16 activity tap (see [`ActivityEvent`]). Set once at boot
+    /// by the activity hub; `None` (the default) keeps every fire point a
+    /// cheap no-op. RwLock: read per event, written once.
+    activity_observer: Arc<std::sync::RwLock<Option<ActivityObserver>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -378,6 +415,7 @@ impl TerminalRegistry {
             active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
+            activity_observer: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -401,6 +439,26 @@ impl TerminalRegistry {
     /// NEXT sweep reads. Callers (the boot-time settings load, and any future
     /// live `PATCH /api/settings` wiring) push `settings.safety.autoKillIdleMinutes`
     /// here; `<= 0` disables the sweep (legacy: `!killMinutes || killMinutes <= 0`).
+    /// Install the TERM-15/TERM-16 activity tap (see [`ActivityEvent`]).
+    /// Set once at boot by the activity hub; later calls replace it.
+    pub fn set_activity_observer(&self, observer: ActivityObserver) {
+        *self
+            .activity_observer
+            .write()
+            .expect("activity observer lock") = Some(observer);
+    }
+
+    /// Fire the activity tap, if installed. Cheap no-op otherwise.
+    fn notify_activity(&self, event: ActivityEvent) {
+        let guard = self
+            .activity_observer
+            .read()
+            .expect("activity observer lock");
+        if let Some(observer) = guard.as_ref() {
+            observer(event);
+        }
+    }
+
     pub fn set_auto_kill_idle_minutes(&self, minutes: i64) {
         self.auto_kill_idle_minutes
             .store(minutes, Ordering::Relaxed);
@@ -552,7 +610,28 @@ impl TerminalRegistry {
         // the replay log + fan out (stamped) to subscribers. Captures the shared
         // state, NOT the PTY (which does not exist yet).
         let sink_shared = Arc::clone(&shared);
-        let sink: MessageSink = Box::new(move |msg| ingest(&sink_shared, msg));
+        // TERM-15/TERM-16 output tap: CLI modes forward each framed output
+        // chunk to the activity observer (BEL turn-complete detection +
+        // liveness). Shell terminals skip the tap entirely (`tapped` false):
+        // zero per-chunk overhead beyond one bool test.
+        let tapped = mode != "shell";
+        let tap_observer = Arc::clone(&self.activity_observer);
+        let tap_terminal_id = terminal_id.clone();
+        let sink: MessageSink = Box::new(move |msg| {
+            if tapped {
+                if let ServerMessage::TerminalOutput(frame) = &msg {
+                    let guard = tap_observer.read().expect("activity observer lock");
+                    if let Some(observer) = guard.as_ref() {
+                        observer(ActivityEvent::Output {
+                            terminal_id: tap_terminal_id.clone(),
+                            data: frame.data.clone(),
+                            at: now_ms(),
+                        });
+                    }
+                }
+            }
+            ingest(&sink_shared, msg)
+        });
 
         let pty = PtyTerminal::spawn_with_sink(
             spec,
@@ -593,6 +672,13 @@ impl TerminalRegistry {
             pid = pid.unwrap_or(0),
             "terminal.created"
         );
+        // TERM-15/TERM-16 tap: Created fires for every mode (the hub filters).
+        self.notify_activity(ActivityEvent::Created {
+            terminal_id,
+            mode: mode.to_string(),
+            resume_session_id: resume_session_id.map(str::to_string),
+            at: now,
+        });
         Ok(())
     }
 
@@ -769,16 +855,28 @@ impl TerminalRegistry {
     /// `terminal.input` write path (`terminal-registry.ts:3867-3894`): write bytes to
     /// the PTY; bump `lastActivityAt`. No wire reply.
     pub fn input(&self, terminal_id: &str, data: &[u8]) {
-        let mut inner = self.inner.lock().expect("registry lock");
-        if let Some(handle) = inner.terminals.get_mut(terminal_id) {
-            if let Some(pty) = handle.pty.as_mut() {
-                let _ = pty.write_input(data);
+        let tapped_mode = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get_mut(terminal_id) {
+                Some(handle) => {
+                    if let Some(pty) = handle.pty.as_mut() {
+                        let _ = pty.write_input(data);
+                    }
+                    let mut s = handle.shared.lock().expect("terminal lock");
+                    s.last_activity_at = now_ms();
+                    s.mode != "shell"
+                }
+                None => false,
             }
-            handle
-                .shared
-                .lock()
-                .expect("terminal lock")
-                .last_activity_at = now_ms();
+        };
+        // TERM-15/TERM-16 tap (outside the registry lock): CLI-mode input
+        // feeds submit detection. Shell terminals skip it entirely.
+        if tapped_mode {
+            self.notify_activity(ActivityEvent::Input {
+                terminal_id: terminal_id.to_string(),
+                data: String::from_utf8_lossy(data).into_owned(),
+                at: now_ms(),
+            });
         }
     }
 
@@ -868,6 +966,11 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, by = by, "terminal.killed");
+        // TERM-15/TERM-16 tap: a kill clears activity too — no stale blue.
+        self.notify_activity(ActivityEvent::Exit {
+            terminal_id: terminal_id.to_string(),
+            at: now_ms(),
+        });
         true
     }
 
@@ -950,6 +1053,12 @@ impl TerminalRegistry {
         s.subscribers.clear();
         drop(s);
         tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
+        // TERM-15/TERM-16 tap: natural exit clears activity (the hub removes
+        // the record — no stale blue after exit, TERM-18 semantics).
+        self.notify_activity(ActivityEvent::Exit {
+            terminal_id: terminal_id.to_string(),
+            at: now_ms(),
+        });
         true
     }
 
@@ -2431,6 +2540,190 @@ mod tests {
             "box-drawing fill must retain the SAME char count as ascii under an \
              identical char-denominated cap -- a byte-denominated cap would evict \
              one whole box-drawing frame that an equivalent ascii cap keeps"
+        );
+    }
+
+    // ── TERM-15/TERM-16 activity observer ───────────────────────────────────
+    //
+    // The registry-level tap the activity hub (freshell-ws) subscribes to:
+    // Created (all modes), Input/Output (CLI modes only — shell terminals
+    // never pay the tap cost), Exit (all removal paths). The observer runs on
+    // the caller's thread (Input/Created) or the PTY reader thread (Output/
+    // natural Exit), so it must be cheap and non-blocking — the hub forwards
+    // into an unbounded channel.
+
+    fn wait_for<F: Fn() -> bool>(deadline_ms: u64, f: F) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(deadline_ms) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        f()
+    }
+
+    #[test]
+    fn activity_observer_sees_created_output_input_and_exit_for_cli_modes() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf ready-marker; sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-act".to_string(),
+            "S-act".to_string(),
+            "claude",
+            Some("sess-act-1"),
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        // Created fires synchronously with the REAL mode + resume identity.
+        {
+            let events = seen.lock().unwrap();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ActivityEvent::Created { terminal_id, mode, resume_session_id, .. }
+                        if terminal_id == "T-act"
+                            && mode == "claude"
+                            && resume_session_id.as_deref() == Some("sess-act-1")
+                )),
+                "expected a Created event, got {events:?}"
+            );
+        }
+
+        // Output arrives from the PTY reader thread.
+        assert!(
+            wait_for(5_000, || {
+                seen.lock().unwrap().iter().any(|e| {
+                    matches!(
+                        e,
+                        ActivityEvent::Output { terminal_id, data, .. }
+                            if terminal_id == "T-act" && data.contains("ready-marker")
+                    )
+                })
+            }),
+            "expected an Output event carrying the PTY output"
+        );
+
+        // Input fires synchronously on write.
+        reg.input("T-act", b"\r");
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Input { terminal_id, data, .. }
+                    if terminal_id == "T-act" && data == "\r"
+            )),
+            "expected an Input event for the Enter write"
+        );
+
+        // Kill fires Exit.
+        reg.kill("T-act");
+        assert!(
+            wait_for(5_000, || {
+                seen.lock().unwrap().iter().any(|e| {
+                    matches!(
+                        e,
+                        ActivityEvent::Exit { terminal_id, .. } if terminal_id == "T-act"
+                    )
+                })
+            }),
+            "expected an Exit event after kill"
+        );
+    }
+
+    #[test]
+    fn activity_observer_skips_input_and_output_for_shell_terminals() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf shell-out; sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-shell".to_string(),
+            "S-shell".to_string(),
+            "shell",
+            None,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        // Give the PTY time to produce output; the tap must stay silent for
+        // Input/Output on a plain shell (zero per-chunk overhead).
+        reg.input("T-shell", b"\r");
+        assert!(
+            wait_for(2_000, || {
+                // Wait until the PTY produced SOMETHING (visible via replay),
+                // then check the tap saw none of it.
+                reg.is_running("T-shell")
+            }),
+            "shell must be running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let events = seen.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ActivityEvent::Created { mode, .. } if mode == "shell")),
+            "Created fires for every mode"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ActivityEvent::Input { .. } | ActivityEvent::Output { .. }
+            )),
+            "no Input/Output tap for shell terminals, got {events:?}"
+        );
+        drop(events);
+        reg.kill("T-shell");
+    }
+
+    #[test]
+    fn activity_observer_sees_exit_on_natural_pty_exit() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+        reg.insert_headless("T-nat", "S-nat");
+        assert!(reg.finish_pty_exit("T-nat", 0));
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Exit { terminal_id, .. } if terminal_id == "T-nat"
+            )),
+            "natural exit must fire the Exit tap"
         );
     }
 
