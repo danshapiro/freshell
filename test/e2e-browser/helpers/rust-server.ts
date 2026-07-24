@@ -328,6 +328,55 @@ export class RustServer implements E2eServerHandle {
     return this.boot(homeDir, priorInfo.port, priorInfo.token)
   }
 
+  /**
+   * ABRUPT-death restart (the WSL-restart-like compound mode from
+   * `docs/plans/2026-07-19-state-sync-resilience-assessment.md` §7): SIGKILL
+   * the server process group -- NO graceful shutdown, so the server's own
+   * PTY-reaping `Drop` path (see the class doc comment) never runs and no
+   * clean WS close frames are sent -- then boot a fresh process bound to the
+   * SAME home, port, and token (same disk state, same reconnect target).
+   *
+   * Because the graceful reap never ran, the fixture-side ownership-safe
+   * descendant sweep (`reapSurvivingChildren`) is the PRIMARY reap mechanism
+   * here, not a backstop -- it must run BEFORE the reboot so an orphaned PTY
+   * child can never linger past the fixture.
+   */
+  async restartAbrupt(): Promise<TestServerInfo> {
+    const homeDir = this.homeDir
+    const priorInfo = this._info
+    if (!homeDir || !priorInfo) throw new Error('RustServer not started; cannot restartAbrupt()')
+
+    const proc = this.process
+    const pid = proc?.pid
+    this.process = null
+
+    if (proc && pid) {
+      const childPidsBeforeKill = ownedDescendantPids(pid)
+
+      await new Promise<void>((resolve) => {
+        // SIGKILL delivery is effectively immediate, but keep a hard cap so a
+        // pathological wait can never hang the fixture.
+        const timeout = setTimeout(resolve, 5000)
+        proc.once('exit', () => {
+          clearTimeout(timeout)
+          resolve()
+        })
+        try {
+          // Negative pid targets the server's OWN process group only (see
+          // `killCurrentProcess` for the ownership rationale).
+          process.kill(-pid, 'SIGKILL')
+        } catch {
+          clearTimeout(timeout)
+          resolve()
+        }
+      })
+
+      await this.reapSurvivingChildren(childPidsBeforeKill)
+    }
+
+    return this.boot(homeDir, priorInfo.port, priorInfo.token)
+  }
+
   async stop(): Promise<void> {
     await this.stopProcess(!this.options.preserveHomeOnStop)
   }

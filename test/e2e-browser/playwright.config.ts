@@ -78,6 +78,9 @@ const RUST_ONLY_SPECS = [
   /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
+  // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
+  // an owned-fixture capability the default/legacy seam does not implement.
+  /compound-restart-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -179,6 +182,11 @@ export default defineConfig({
         // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
         // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
         /deploy-tab-diff-rust\.spec\.ts$/,
+        // COMPOUND-RESTART (state-sync resilience assessment §7's two
+        // never-tested modes): abrupt SIGKILL death + revival, and server +
+        // browser restarting together. Rust-only: requires the owned
+        // RustServer.restartAbrupt() fixture capability.
+        /compound-restart-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
