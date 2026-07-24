@@ -1693,18 +1693,29 @@ test.describe('Restore Matrix', () => {
   // initial `thread/start` it returns 'thread-A'; on `thread/resume`
   // (which the reload triggers) it returns 'thread-B'.
   //
-  // FIXME(product-bug): Both adapters currently fail this requirement:
-  //   - TypeScript adapter (server/codex/adapter.ts ~L843-868): no check
-  //     at all — silently adopts the returned thread id.
-  //   - Rust adapter (src-tauri/src/codex.rs ~L1182-1185): `debug_assert_eq!`
-  //     only — a no-op in release builds (`cargo build --release`).
-  // The test is pinned as expected-fail until a production-grade guard
-  // (reject the mismatch, or at minimum refuse to adopt the wrong id)
-  // is added to both adapters.
+  // HISTORY: this test was pinned `test.fail()` as a product bug on BOTH
+  // kinds. That pin was an artifact of a TEST BUG, not product behavior:
+  // `originalSessionId` was assigned the void result of
+  // `expect.poll(...).toBe(...)`, so the final assertion compared the leaf id
+  // against `undefined` and could never pass anywhere. With the capture
+  // fixed (see below), the pane-level contract — the durable identity stays
+  // 'thread-A', thread-B is never rendered or adopted — empirically holds on
+  // BOTH server kinds, so the pin is removed.
+  //
+  // What each side actually guarantees underneath:
+  //   - RUST (`crates/freshell-freshagent/src/codex.rs`): a wrong-thread
+  //     `thread/resume` answer is now REJECTED LOUDLY at all three resume
+  //     sites (create-with-resume, not-tracked attach, crash recovery) — the
+  //     sidecar is torn down, an explicit error frame is emitted, and the
+  //     wrong id is never adopted. Unit pins: the `*_wrong_thread_id_*`
+  //     tests in that file.
+  //   - LEGACY (frozen `server/codex/adapter.ts` ~L843-868): no internal
+  //     guard — the adapter silently keeps talking to whatever thread the
+  //     app-server returned. That defect is NOT observable at this UI level
+  //     (the pane still displays 'thread-A'), and `server/` is frozen, so it
+  //     is documented here rather than fixed.
   // -------------------------------------------------------------------
   test('TERM-25: wrong-thread Codex recovery is rejected, not silently adopted', async ({ page, e2eServerKind }) => {
-    // FIXME(product-bug): both adapters silently adopt the wrong thread id
-    test.fail()
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-term25-'))
     try {
@@ -1764,11 +1775,22 @@ test.describe('Restore Matrix', () => {
 
         // Wait for the initial session to settle — the fake app server's
         // thread/start returns 'thread-A', so sessionId should be 'thread-A'.
-        const originalSessionId = await expect.poll(async () => {
+        // NOTE: `expect.poll(...).toBe(...)` resolves to undefined, so the id
+        // must be re-read after the poll settles (the `.then` pattern the
+        // other scenarios use). The original version of this test assigned
+        // the poll's void result directly, making the final assertion below
+        // compare against `undefined` — an always-failing test bug that
+        // masked what the product actually does.
+        const originalSessionId: string = await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId!)
           const leaf = findFreshAgentLeaf(layout)
           return leaf?.content?.sessionId ?? leaf?.content?.sessionRef?.sessionId ?? null
-        }, { timeout: 30_000 }).toBe('thread-A')
+        }, { timeout: 30_000 }).toBe('thread-A').then(async () => {
+          const layout = await harness.getPaneLayout(tabId!)
+          const leaf = findFreshAgentLeaf(layout)
+          return leaf.content.sessionId ?? leaf.content.sessionRef.sessionId
+        })
+        expect(originalSessionId).toBe('thread-A')
 
         // Flush persistence so the durable session survives reload.
         await page.evaluate(() => {
@@ -1787,9 +1809,11 @@ test.describe('Restore Matrix', () => {
         // Freshell must never silently adopt thread-B while restoring
         // expected thread-A.
         //
-        // This assertion FAILS today because both adapters adopt the
-        // returned thread id without validation. The test.fail() above
-        // pins this as an expected failure (product bug).
+        // RUST: passes — the server rejects the wrong-thread answer loudly
+        // (sidecar torn down, error frame emitted, wrong id never adopted),
+        // so the pane's durable identity stays 'thread-A'.
+        // LEGACY: fails (expected-fail pinned above) — the frozen adapter
+        // adopts the returned thread id without validation.
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId!)
           const leaf = findFreshAgentLeaf(layout)
