@@ -78,6 +78,7 @@ async fn spawn_server(allowed_origins: Vec<String>) -> (String, String) {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };
 
     let router = freshell_ws::router(state);

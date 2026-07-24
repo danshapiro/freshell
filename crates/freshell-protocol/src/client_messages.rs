@@ -70,11 +70,13 @@ pub enum ClientMessage {
     FreshAgentKill(FreshAgentKill),
     #[serde(rename = "freshAgent.fork")]
     FreshAgentFork(FreshAgentFork),
+    #[serde(rename = "pane.reconcile.request")]
+    PaneReconcileRequest(PaneReconcileRequest),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 28] = [
     "claude.activity.list",
     "client.diagnostic",
     "codex.activity.list",
@@ -92,6 +94,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
     "freshAgent.send",
     "hello",
     "opencode.activity.list",
+    "pane.reconcile.request",
     "ping",
     "terminal.attach",
     "terminal.codex.candidate.persisted",
@@ -113,6 +116,11 @@ pub struct HelloCapabilities {
     pub terminal_output_batch_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_screenshot_v1: Option<bool>,
+    /// Reconciliation handshake opt-in (design §4.1). A client that sets this
+    /// MAY send `pane.reconcile.request` once the `ready` it receives
+    /// advertises the capability back (§4.2). Absent for the frozen client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -325,6 +333,57 @@ pub struct UiScreenshotResult {
     pub restored_focus: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<i64>,
+}
+
+// --- pane.reconcile.request ---------------------------------------------------
+
+/// One pane's identity claims, as presented by a reconciling client
+/// (reconciliation-handshake design §4.3). Every field is a HINT to be
+/// validated, never trusted. All fields are parse-tolerant: a malformed entry
+/// must still deserialize so the server can answer it with an `invalid`
+/// verdict (total cardinality, §8) instead of failing the whole frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcilePane {
+    /// OPAQUE to the server; echoed verbatim on the verdict. `""` when the
+    /// client omitted it (the entry is then `invalid`).
+    #[serde(default)]
+    pub pane_key: String,
+    /// v1: `"terminal"` only (fresh-agent extension deferred, §12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `TerminalMode` string as persisted (`"shell"`, `"claude"`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The pane's stable creation key — required by contract (§5.5); an entry
+    /// without one is `invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    /// Last known live handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Locality hint, informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_instance_id: Option<String>,
+    /// Optional identity claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    /// Optional legacy single-key claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+    /// Informational only — never trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneReconcileRequest {
+    /// Client-minted, echoed verbatim; correlation only.
+    pub reconcile_id: String,
+    /// Flat list — no tree, no tab structure. Cap: 200 entries (an over-cap
+    /// request is answered with `error{RECONCILE_TOO_LARGE}`).
+    pub panes: Vec<ReconcilePane>,
 }
 
 // --- codingcli.* ------------------------------------------------------------

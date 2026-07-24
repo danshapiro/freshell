@@ -66,6 +66,8 @@ pub enum ServerMessage {
     OpencodeActivityListResponse(OpencodeActivityListResponse),
     #[serde(rename = "opencode.activity.updated")]
     OpencodeActivityUpdated(OpencodeActivityUpdated),
+    #[serde(rename = "pane.reconcile.result")]
+    PaneReconcileResult(PaneReconcileResult),
     #[serde(rename = "perf.logging")]
     PerfLogging(PerfLogging),
     #[serde(rename = "pong")]
@@ -124,7 +126,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
@@ -150,6 +152,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
     "freshAgent.session.materialized",
     "opencode.activity.list.response",
     "opencode.activity.updated",
+    "pane.reconcile.result",
     "perf.logging",
     "pong",
     "ready",
@@ -592,6 +595,64 @@ pub struct FreshAgentSessionMaterialized {
     pub session_ref: Option<SessionLocator>,
 }
 
+// --- pane.reconcile.result ----------------------------------------------------
+
+/// Authoritative per-pane verdict (reconciliation-handshake design §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileVerdict {
+    Attach,
+    Respawn,
+    Fresh,
+    DeadSession,
+    Retry,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneVerdict {
+    /// Echoed verbatim, 1:1 with request order.
+    pub pane_key: String,
+    pub verdict: ReconcileVerdict,
+    /// `attach` only: the live terminal to attach to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// attach: authoritative identity; respawn: THE identity to resume with;
+    /// dead_session: the claimed-but-missing identity, for the error UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    /// Present iff the server overrode a differing client claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrected: Option<bool>,
+    /// fresh / dead_session / retry / invalid: machine-readable code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// retry only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<i64>,
+    /// Row 2b (invariant I6): a newer duplicate generation exists for the same
+    /// `createRequestId`; the client stays on its live attachment and this
+    /// merely flags the duplicate `terminalId`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<String>,
+}
+
+/// Sent ONLY in response to `pane.reconcile.request` — the server never
+/// volunteers it (frozen-client inertness gate 3, design §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneReconcileResult {
+    /// Echoed from the request.
+    pub reconcile_id: String,
+    /// This server process's boot.
+    pub boot_id: String,
+    pub server_instance_id: String,
+    /// Cardinality invariant: `verdicts.len() == panes.len()`, matched 1:1 by
+    /// `paneKey` — a malformed entry gets `invalid`, never omission.
+    pub verdicts: Vec<PaneVerdict>,
+}
+
 // --- lifecycle / misc -------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -604,6 +665,17 @@ pub struct Pong {
     pub timestamp: String,
 }
 
+/// Server capability advertisement on `ready` (reconciliation-handshake design
+/// §4.2). Populated **iff** the connection's `hello` carried the matching
+/// client capability — today's frozen client never opts in, so the emitted
+/// clean-boot handshake stays byte-for-byte unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_v1: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ready {
@@ -612,6 +684,12 @@ pub struct Ready {
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_instance_id: Option<String>,
+    /// Reconciliation-handshake advertisement (§4.2): `Some` only when the
+    /// client's `hello` opted in via `capabilities.paneReconcileV1`. A client
+    /// must not send `pane.reconcile.request` unless the `ready` it just
+    /// received advertised the capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ReadyCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

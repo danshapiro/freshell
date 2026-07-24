@@ -871,6 +871,9 @@ pub(crate) async fn spawn_terminal_pane(
         stream_id,
         &mode,
         resume_session_id.as_deref(),
+        // REST ingress mints no createRequestId (reconciliation design §5.5
+        // precondition 2 — booked for the Phase-3 adoption change).
+        None,
         None,
         on_exit,
     ) {

@@ -95,6 +95,7 @@ mod tests {
             status,
             created_at,
             resume_session_id: resume_session_id.map(str::to_string),
+            cwd: None,
         }
     }
 

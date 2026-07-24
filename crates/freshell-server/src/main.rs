@@ -19,6 +19,7 @@
 mod boot;
 mod checkpoints;
 mod diag;
+mod existence;
 mod extensions;
 mod files;
 mod instance_id;
@@ -350,10 +351,57 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
         .with_opencode_locator(opencode_locator.clone());
+    // Batch B: `session_directory` no longer re-walks + re-parses every
+    // transcript on every request -- it reads a cached, TTL-refreshed
+    // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
+    // `ClaudeSource`) and `OpencodeSource` (direct-listed from
+    // `opencode.db`) alongside claude. `None` home -> no index -> the prior
+    // empty-page behavior.
+    //
+    // FRESHELL_HOME root-alignment fix: provider transcript sources must
+    // resolve against the REAL home, never the (possibly `FRESHELL_HOME`-
+    // overridden) isolated config root `home` above -- see
+    // `session_directory::provider_home` for the full rationale.
+    //
+    // Fourth source: `AmplifierSource` (`crates/freshell-sessions/src/amplifier.rs`,
+    // a faithful port of `server/coding-cli/providers/amplifier.ts`'s
+    // discovery/parse -- file-based, same shape as `ClaudeSource`/`CodexSource`).
+    // `amplifier_home` lives in that module (not `session_directory.rs`, whose
+    // internals are out of scope for this change) but resolves the SAME
+    // `AMPLIFIER_HOME` env / `<home>/.amplifier` default convention
+    // `claude_home`/`codex_home` use, against the same `provider_home()` root.
+    let session_index = session_directory::provider_home().as_ref().map(|h| {
+        Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
+            Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                session_directory::claude_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::directory_index::CodexSource::new(
+                session_directory::codex_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::directory_index::OpencodeSource::new(
+                freshell_sessions::parse::default_opencode_data_home(),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+            Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
+                freshell_sessions::amplifier::amplifier_home(h),
+            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+        ]))
+    });
+
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
+        // Reconciliation handshake disk-truth probe (design §5.1): backed by
+        // the SAME shared session index the History surfaces read; the
+        // no-index fallback (honest `Unknown` on known providers) when no
+        // provider home resolves — mirrors `session_index`'s own `Option`
+        // convention.
+        session_existence: match &session_index {
+            Some(index) => std::sync::Arc::new(existence::IndexExistenceProbe::new(
+                std::sync::Arc::clone(index),
+            )),
+            None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        },
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -427,41 +475,6 @@ async fn main() -> ExitCode {
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
     //
-    // Batch B: `session_directory` no longer re-walks + re-parses every
-    // transcript on every request -- it reads a cached, TTL-refreshed
-    // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
-    // `ClaudeSource`) and `OpencodeSource` (direct-listed from
-    // `opencode.db`) alongside claude. `None` home -> no index -> the prior
-    // empty-page behavior.
-    //
-    // FRESHELL_HOME root-alignment fix: provider transcript sources must
-    // resolve against the REAL home, never the (possibly `FRESHELL_HOME`-
-    // overridden) isolated config root `home` above -- see
-    // `session_directory::provider_home` for the full rationale.
-    //
-    // Fourth source: `AmplifierSource` (`crates/freshell-sessions/src/amplifier.rs`,
-    // a faithful port of `server/coding-cli/providers/amplifier.ts`'s
-    // discovery/parse -- file-based, same shape as `ClaudeSource`/`CodexSource`).
-    // `amplifier_home` lives in that module (not `session_directory.rs`, whose
-    // internals are out of scope for this change) but resolves the SAME
-    // `AMPLIFIER_HOME` env / `<home>/.amplifier` default convention
-    // `claude_home`/`codex_home` use, against the same `provider_home()` root.
-    let session_index = session_directory::provider_home().as_ref().map(|h| {
-        Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
-            Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                session_directory::claude_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::directory_index::CodexSource::new(
-                session_directory::codex_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::directory_index::OpencodeSource::new(
-                freshell_sessions::parse::default_opencode_data_home(),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-            Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
-                freshell_sessions::amplifier::amplifier_home(h),
-            )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
-        ]))
-    });
     // Warm the cache in the background so the first real request never pays
     // the cold full-sweep cost. The scan itself runs in `spawn_blocking`
     // (inside `SessionIndex::snapshot`), so this never delays serving other

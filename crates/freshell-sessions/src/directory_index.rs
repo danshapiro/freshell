@@ -741,6 +741,23 @@ impl SessionIndex {
         }
     }
 
+    /// Sync, non-blocking read of the last PUBLISHED snapshot — fresh or
+    /// stale — or `None` when the cache is truly cold (nothing ever
+    /// published). This is the reconciliation handshake's disk-truth read
+    /// (`freshell-server`'s `SessionExistenceProbe` impl): a sync caller that
+    /// must never wait on a sweep. `None` is what makes the probe's `Unknown`
+    /// honest; pair with [`Self::is_fresh`] to decide whether to kick a
+    /// background `snapshot()` refresh.
+    pub fn peek(&self) -> Option<Arc<Vec<IndexedSession>>> {
+        self.any_cached()
+    }
+
+    /// Whether the published snapshot (if any) is within the TTL window —
+    /// the sync freshness companion to [`Self::peek`].
+    pub fn is_fresh(&self) -> bool {
+        self.fresh_cached().is_some()
+    }
+
     /// The cached snapshot, if present and within the TTL window. A brief,
     /// non-async lock: never held across an await point.
     fn fresh_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {

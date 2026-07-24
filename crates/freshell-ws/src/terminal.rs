@@ -103,12 +103,14 @@ fn map_shell(shell: Shell) -> ShellType {
 /// shared broadcast bus) until the socket closes. `socket` has already had the
 /// connect handshake written by the caller; `bcast_rx` is this connection's
 /// subscription to the server→client broadcast bus.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     socket: WebSocket,
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
+    pane_reconcile_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -238,6 +240,7 @@ pub async fn run(
                             conn_id,
                             &conn_sink,
                             terminal_output_batch_v1,
+                            pane_reconcile_v1,
                         )
                         .await
                         {
@@ -400,6 +403,7 @@ pub async fn run(
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_text(
     text: &str,
     ws_tx: &mut WsSink,
@@ -407,6 +411,7 @@ async fn handle_client_text(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    pane_reconcile_v1: bool,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -462,7 +467,9 @@ async fn handle_client_text(
             true
         }
         ClientMessage::ClientDiagnostic(_) => true,
-        ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
+        ClientMessage::TerminalCreate(create) => {
+            handle_create(create, ws_tx, state, pane_reconcile_v1).await
+        }
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
             true
@@ -628,6 +635,17 @@ async fn handle_client_text(
         // (`crate::now_iso`, the same clock `build_handshake`'s `ready.timestamp`
         // uses). No correlation id on either side -- the client matches by type,
         // not by request/response pairing.
+        ClientMessage::PaneReconcileRequest(request) => {
+            // Answered ONLY on a connection that negotiated the capability
+            // (§4.2's "may I send?" gate); anything else is accept-and-strip
+            // ignored, exactly like an unknown frame — the frozen client's
+            // byte-inertness does not depend on this, since it never sends
+            // the request at all (§3).
+            if pane_reconcile_v1 {
+                return handle_pane_reconcile(request, ws_tx, state).await;
+            }
+            true
+        }
         ClientMessage::Ping => {
             send(
                 ws_tx,
@@ -739,10 +757,83 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// RAII release of a §5.4 keyed-create reservation
+/// ([`freshell_terminal::TerminalRegistry::begin_keyed_create`]): dropped on
+/// EVERY exit path of `handle_create`'s spawn — success, spawn error, or the
+/// task being cancelled by a socket close.
+struct KeyedCreateGuard {
+    registry: freshell_terminal::TerminalRegistry,
+    key: String,
+}
+
+impl Drop for KeyedCreateGuard {
+    fn drop(&mut self) {
+        self.registry.end_keyed_create(&self.key);
+    }
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
-async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsState) -> bool {
+async fn handle_create(
+    create: TerminalCreate,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    pane_reconcile_v1: bool,
+) -> bool {
+    // Single-flight create-dedupe (reconciliation design §5.4, the council's
+    // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
+    // a create whose `createRequestId` already has a live terminal ADOPTS it —
+    // `terminal.created` names the EXISTING terminal and spawns nothing, so
+    // two reconciling connections that both received `respawn` for one key
+    // converge to one PTY (one JSONL writer per session file). The frozen
+    // client never negotiates the capability, so its create flow is
+    // byte-for-byte unchanged (§11 fence).
+    let mut keyed_create_guard: Option<KeyedCreateGuard> = None;
+    if pane_reconcile_v1 {
+        // Claim loop: adopt a live terminal if one exists; otherwise RESERVE
+        // the key before spawning (the spawn takes milliseconds and the row
+        // only becomes observable at insert, so check-then-spawn alone would
+        // let two truly concurrent creates both pass the check). A racing
+        // create that finds the key reserved waits briefly and re-checks —
+        // it then adopts the winner's terminal. Bounded: after ~5s it
+        // proceeds to spawn anyway (fail-open; the §5.4 backstop detector
+        // makes any residual duplicate loud).
+        for _ in 0..500u16 {
+            if let Some(existing) = state
+                .registry
+                .newest_live_by_create_request_id(&create.request_id)
+            {
+                tracing::info!(
+                    terminal_id = %existing,
+                    create_request_id = %create.request_id,
+                    "terminal.create.adopted"
+                );
+                let created = ServerMessage::TerminalCreated(TerminalCreated {
+                    created_at: now_ms(),
+                    request_id: create.request_id,
+                    terminal_id: existing.clone(),
+                    clear_codex_durability: None,
+                    cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
+                    restore_error: None,
+                    session_ref: state.identity.session_ref_for(&existing),
+                });
+                return send(ws_tx, &created).await;
+            }
+            if state.registry.begin_keyed_create(&create.request_id) {
+                keyed_create_guard = Some(KeyedCreateGuard {
+                    registry: state.registry.clone(),
+                    key: create.request_id.clone(),
+                });
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    // Released on EVERY exit path of the spawn below (RAII), success or error;
+    // the outcome itself is discoverable through the registry.
+    let _keyed_create_guard = keyed_create_guard;
+
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
     let terminal_id = Uuid::new_v4().simple().to_string();
@@ -1084,6 +1175,10 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         stream_id,
         &mode,
         resume_session_id.as_deref(),
+        // The pane's stable creation key, stamped atomically with the registry
+        // insert (reconciliation design §5.1) — capability-independent and
+        // inert on its own; only the §5.4 dedupe branch is gated.
+        Some(&create.request_id),
         None,
         on_exit,
     ) {
@@ -1383,6 +1478,60 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
+/// `pane.reconcile.request` (reconciliation design §5): a PURE READ over the
+/// terminal registry × identity registry × disk index — one verdict per
+/// presented pane. Safe to receive N times on N sockets (§7); the only error
+/// paths are the explicit `RECONCILE_TOO_LARGE` cap and the
+/// `RECONCILE_UNAVAILABLE` derivation-failure frame, both carrying the
+/// `reconcileId` for correlation.
+async fn handle_pane_reconcile(
+    request: freshell_protocol::PaneReconcileRequest,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+) -> bool {
+    if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
+        return send_create_error(
+            ws_tx,
+            ErrorCode::ReconcileTooLarge,
+            format!(
+                "pane.reconcile.request presented {} panes (cap {})",
+                request.panes.len(),
+                crate::reconcile::MAX_RECONCILE_PANES
+            ),
+            &request.reconcile_id,
+        )
+        .await;
+    }
+    let deps = crate::reconcile::ReconcileDeps {
+        registry: &state.registry,
+        identity: &state.identity,
+        existence: state.session_existence.as_ref(),
+    };
+    // §8 frame-level failure: a panicking derivation (poisoned lock) must
+    // surface as an explicit error frame, never silence.
+    let verdicts = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::reconcile::derive_verdicts(&deps, &request.panes)
+    })) {
+        Ok(verdicts) => verdicts,
+        Err(_) => {
+            return send_create_error(
+                ws_tx,
+                ErrorCode::ReconcileUnavailable,
+                "reconcile derivation failed; keep current state and re-send".to_string(),
+                &request.reconcile_id,
+            )
+            .await;
+        }
+    };
+    let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
+        reconcile_id: request.reconcile_id,
+        boot_id: state.boot_id.as_ref().clone(),
+        server_instance_id: state.server_instance_id.as_ref().clone(),
+        verdicts,
+    });
+    send(ws_tx, &result).await
+}
+
 async fn send_create_error(
     ws_tx: &mut WsSink,
     code: ErrorCode,
@@ -2277,6 +2426,7 @@ mod terminals_changed_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
         (state, rx)
     }
@@ -2479,6 +2629,7 @@ mod terminal_meta_created_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
         (state, rx)
     }
