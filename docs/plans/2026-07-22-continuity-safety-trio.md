@@ -11,9 +11,21 @@
 
 **Tech Stack:** Rust (axum, serde_json, tokio) in `crates/freshell-ws` + `crates/freshell-server` + `crates/freshell-freshagent`; Playwright (`test/e2e-browser/`, `RustServer` harness); bash + curl + jq operator scripts.
 
+## Current execution status
+
+All original implementation tasks in this plan are complete in the branch
+history. The checked steps and embedded code blocks below are retained as a
+historical implementation transcript; they are not instructions to overwrite
+the current source. From the current HEAD, use the shipped scripts under
+`scripts/` and run the final verification commands rather than replaying an
+obsolete red/green step or copying an embedded script body.
+
 ## Global Constraints
 
-- Integration branch is `feat/rust-tauri-port` (already on origin) — commit and push THERE. Do NOT create a PR to main and do NOT touch `origin/main`. This worktree branch (`feat/continuity-safety-trio`, based on `136b9e94`) lands back onto `feat/rust-tauri-port`.
+- Follow the repository branch model in `AGENTS.md`: start each behavior-change
+  feature branch from `origin/main`, prepare and push that feature branch, ask
+  for explicit approval before opening a PR, and target the PR at `main`.
+  Never push behavior changes directly to `origin/main`.
 - FROZEN read-only paths: `server/`, `shared/`, `src/`. NO edits to any file under these, ever. If a task appears to require a client change, STOP and surface it — do not edit.
 - Do NOT touch `dist/client` (the live production server serves it from disk).
 - NEVER touch ports 3001/3002 or any process you did not spawn (the user's production server + live tabs run on :3002). All testing on ephemeral ports with throwaway HOMEs (the `RustServer` harness does this by design). `scripts/deploy-tab-diff.sh` may only be TESTED against ephemeral servers.
@@ -130,7 +142,7 @@ Three deliverables, one plan: they share one subsystem (tabs-sync identity conti
   - `pub(crate) fn persist_generation(dir, server_instance_id, device_id, device_label, client_instance_id, snapshot_revision, open_records: &[Value], captured_at: i64)` — a FREE function (all args explicit incl. `captured_at`, so tests inject deterministic timestamps directly), called only within `freshell-ws` (from `tabs.rs` and these tests). Runs the ENTIRE read-plan-mutate filesystem cycle (orphan-`.tmp` sweep → cap accounting → atomic write → prune → eviction) under ONE process-wide persistence mutex (`:678`), so concurrent pushes to the same OR different devices can never race directory enumeration, eviction, or `remove_dir_all`. Enforces oversize/per-client/global-per-device/device-count caps; deletion/eviction failures are LOGGED (never `let _ =`-ignored); orphaned `.tmp` files are swept AND counted toward caps before cap math. Best-effort: a persistence failure WARNs, never fails the push. Called only from inside `tokio::task::spawn_blocking` (see Step 3b).
   - Generation file JSON: `{deviceId, deviceLabel, clientInstanceId, serverInstanceId, snapshotRevision, capturedAt, records: [...open records, verbatim, post-identity-stamping]}`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create the `#[cfg(test)] mod tests` at the bottom of the NEW `crates/freshell-ws/src/tabs_persist.rs` (it does NOT share `tabs.rs`'s test helpers, so define local ones). Tests that need to PIN `capturedAt` call the free `persist_generation` directly with an explicit `captured_at` (deterministic — no reliance on `now_ms()` producing distinct millis); tests that exercise the full push path use `TabsRegistry::with_persist_dir`.
 
@@ -519,12 +531,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-ws tabs_persist` (from the worktree root)
-Expected: FAIL to compile — `crates/freshell-ws/src/tabs_persist.rs` does not exist yet, and `with_persist_dir`, `list_generations`, `read_generation`, `read_generation_by_id`, `read_device_union`, `read_device_overview`, `list_snapshot_devices`, `encode_device_id`, `snapshot_content_id`, `persist_generation`, and the `MAX_SNAPSHOT_*` consts are undefined. First add the deps: `sha2 = "0.10"` under `[dependencies]` (mirror `crates/freshell-terminal/Cargo.toml:36`; the digest uses `sha2::Sha256`) and `tempfile = "3"` under `[dev-dependencies]` (NOT currently present — verified; mirror the version another workspace crate pins).
+Historical pre-implementation result: FAIL to compile — `crates/freshell-ws/src/tabs_persist.rs` does not exist yet, and `with_persist_dir`, `list_generations`, `read_generation`, `read_generation_by_id`, `read_device_union`, `read_device_overview`, `list_snapshot_devices`, `encode_device_id`, `snapshot_content_id`, `persist_generation`, and the `MAX_SNAPSHOT_*` consts are undefined. First add the deps: `sha2 = "0.10"` under `[dependencies]` (mirror `crates/freshell-terminal/Cargo.toml:36`; the digest uses `sha2::Sha256`) and `tempfile = "3"` under `[dev-dependencies]` (NOT currently present — verified; mirror the version another workspace crate pins).
 
-- [ ] **Step 3: Implement persistence**
+- [x] **Step 3: Implement persistence**
 
 Create `crates/freshell-ws/src/tabs_persist.rs` with the header below (all the free functions + `persist_generation` + tests). Add `pub mod tabs_persist;` to `crates/freshell-ws/src/lib.rs` (after `pub mod tabs;`). `freshell-ws` already depends on `tracing`; call it fully-qualified as `tracing::warn!` (no `use` needed).
 
@@ -1095,7 +1107,7 @@ fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
 }
 ```
 
-- [ ] **Step 3b: Run the WS push persistence OFF the async runtime (`:1480`)**
+- [x] **Step 3b: Run the WS push persistence OFF the async runtime (`:1480`)**
 
 `persist_generation` does blocking `read_dir`/`write`/`rename`/`remove_*` under
 `PERSIST_LOCK`, and `replace_client_snapshot` calls it inline. The WS push
@@ -1146,12 +1158,12 @@ wrap their filesystem reads/marker IO in `spawn_blocking`; a reviewer verifies n
 `async fn` body. Concurrency is naturally bounded: the WS push path is per
 connection and persistence is further serialized by `PERSIST_LOCK`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-ws`
 Expected: PASS (all new tests + every pre-existing `tabs.rs` test unchanged).
 
-- [ ] **Step 5: Wire the persist dir in `main.rs`**
+- [x] **Step 5: Wire the persist dir in `main.rs`**
 
 In `crates/freshell-server/src/main.rs` around line 272-274, replace
 `let tabs = freshell_ws::tabs::TabsRegistry::new();` with construction from
@@ -1175,13 +1187,13 @@ reuse that binding; a `None` home keeps the in-memory-only registry):
 (Adapt the exact `home` variable name/type to what `main.rs` already has — do
 NOT introduce a second, divergent home resolution.)
 
-- [ ] **Step 6: Verify build + full crate tests**
+- [x] **Step 6: Verify build + full crate tests**
 
 Run: `cargo test -p freshell-ws -p freshell-server && cargo build --release -p freshell-server`
 Expected: green; release binary rebuilt.
 Then run `rust_check`/`cargo fmt --all -- --check` and `cargo clippy -p freshell-ws -p freshell-server` — clean on touched files.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-ws/src/tabs_persist.rs crates/freshell-ws/src/tabs.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/Cargo.toml crates/freshell-server/src/main.rs
@@ -1215,7 +1227,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
   - `pub struct TabsSnapshotsState { pub auth_token: std::sync::Arc<String>, pub snapshots_dir: Option<std::path::PathBuf>, pub fresh_agent: freshell_freshagent::FreshAgentState, pub screenshots: freshell_ws::screenshot::ScreenshotBroker, pub terminals: freshell_terminal::TerminalRegistry, pub restore_lock: std::sync::Arc<tokio::sync::Mutex<()>>, pub restore_ack_timeout: std::time::Duration }` — `fresh_agent` drives Task 3's restore create pipeline (over the shared broadcast bus); `screenshots` is Task 3's connected-browser gate AND the delivery-ack round-trip; `terminals` is the SAME `TerminalRegistry` (`main.rs:246`) restore uses to reconcile write-ahead marker entries by `is_running(terminalId)`; `restore_lock` serializes concurrent restores (Task 3) so two in-flight requests can't both read an empty marker and duplicate; `restore_ack_timeout` bounds each delivery-ack wait (production ~5s; tests short). Construct all fields now so the router is built once.
   - `pub fn router(state: TabsSnapshotsState) -> axum::Router`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/freshell-server/src/tabs_snapshots.rs` with the module skeleton + a `#[cfg(test)] mod tests` first (mirror the axum `oneshot` test pattern from `crates/freshell-server/src/terminals.rs:1090-1110` / `sessions.rs:370-380`):
 
@@ -1373,12 +1385,12 @@ no `new_for_tests` helper is added. `freshell-server` already depends on
 `freshell-terminal`, `freshell-ws`, and `tokio` (with the `sync` feature), so
 these compile in `freshell-server`'s test target.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-server tabs_snapshots`
-Expected: FAIL to compile (`tabs_snapshots` module/`router`/`TabsSnapshotsState` missing). Add `mod tabs_snapshots;` to `main.rs` first so the module participates in the build.
+Historical pre-implementation result: FAIL to compile (`tabs_snapshots` module/`router`/`TabsSnapshotsState` missing). Add `mod tabs_snapshots;` to `main.rs` first so the module participates in the build.
 
-- [ ] **Step 3: Implement the read endpoints**
+- [x] **Step 3: Implement the read endpoints**
 
 `crates/freshell-server/src/tabs_snapshots.rs`:
 
@@ -1552,12 +1564,12 @@ async fn get_snapshot(
 
 **Auth note:** `is_authed` is `pub(crate)` in `boot.rs:686` — `use crate::boot::is_authed;` (same crate). If not reachable, raise its visibility to `pub(crate)`; do NOT copy the function.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-server tabs_snapshots`
 Expected: PASS.
 
-- [ ] **Step 5: Merge the router in `main.rs`**
+- [x] **Step 5: Merge the router in `main.rs`**
 
 In the `.merge(...)` chain (`main.rs:620-663`), after `boot::router(...)`:
 
@@ -1581,7 +1593,7 @@ exact local bindings `main.rs` already passes to neighboring routers —
 merged AFTER those bindings exist. The `snapshots_dir` here MUST match the
 `tabs-snapshots` dir Task 1 wired into the `TabsRegistry`.)
 
-- [ ] **Step 6: Full check + commit**
+- [x] **Step 6: Full check + commit**
 
 Run: `cargo test -p freshell-server && cargo clippy -p freshell-server && cargo fmt --all -- --check`
 
@@ -1627,7 +1639,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
   - `kind:"browser"` → `{"browser": payload.url, "name": tabName}`; `kind:"editor"` → `{"editor": payload.filePath, "name": tabName}`.
   - `kind:"fresh-agent"` and any other kind → `skipped` with `reason:"unsupported-kind"` (the REST create pipeline has no resume shape for agent chat panes — `create_tab` only accepts `agent:"opencode"` fresh creates, `lib.rs:1158-1171`). REPORTED loudly, never silent.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tabs_snapshots.rs` tests (the shell terminal spawn is real — the
 existing `terminal_tabs.rs` tests already spawn `mode:"shell"` PTYs in-crate,
@@ -1907,12 +1919,14 @@ the broker + registry are `Clone`/`Arc`-backed so the in-process browser task an
 the handler share the same `Arc<Inner>`. `TerminalRegistry::{is_running, kill}` are
 `pub`, `registry.rs:1099,813`.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Historical red-test checkpoint (already completed)**
 
-Run: `cargo test -p freshell-server tabs_snapshots`
-Expected: FAIL (route not registered → 404 / handler missing → compile error).
+Historical result before the route existed: `cargo test -p freshell-server
+tabs_snapshots` failed because the handler/router were missing. At the current
+HEAD the route is implemented, so do not attempt to reproduce this obsolete
+failure; run the same command expecting PASS as part of current verification.
 
-- [ ] **Step 3: Implement restore**
+- [x] **Step 3: Implement restore**
 
 In `terminal_tabs.rs`, change the visibility (and ONLY the visibility) of
 `create_terminal_or_content_tab` (`terminal_tabs.rs:189`) from `pub(crate)` to
@@ -2321,7 +2335,7 @@ fn marker_error(device_id: &str, snap: &Value, connected: i64, delivery_confirme
 
 </details>
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run TWO commands (a single `-p A -p B <filter>` would apply the `tabs_snapshots`
 name filter to BOTH crates and run NONE of `freshell-freshagent`'s tests — a
@@ -2332,16 +2346,16 @@ cargo test -p freshell-freshagent              # full suite -> proves the pub-vi
 ```
 Expected: both PASS.
 
-- [ ] **Step 5: Run fmt/clippy on touched crates**
+- [x] **Step 5: Run fmt/clippy on touched crates**
 
 Run: `cargo clippy -p freshell-server -p freshell-freshagent && cargo fmt --all -- --check && cargo build --release -p freshell-server`
 Expected: clean.
 
-- [ ] **Step 6: Confirm NO DEVIATIONS ledger entry is required**
+- [x] **Step 6: Confirm NO DEVIATIONS ledger entry is required**
 
 Do NOT touch `port/oracle/DEVIATIONS.md`. Per its own entry rules (`port/oracle/DEVIATIONS.md:9-16`, re-verified: "An entry may be added ONLY when the original is **objectively defective**"), a ledger entry requires an objective defect in a PORTED behavior. This work is PURELY ADDITIVE — new on-disk snapshot generations and new `/api/tabs-sync/snapshots[/{deviceId}]` + `/api/tabs-sync/restore` routes that do not exist in, and do not change, any ported surface. There is no old-vs-new divergence on any ported route, so there is no `objective_defect` to cite and an `objective_defect: n/a` entry would be rejected by the antagonist reviewer. The additive surface is documented in the module doc comments and this plan; that is the correct home for it. (This reverses the earlier plan's invalid ledger-entry step.)
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/freshell-server/src/tabs_snapshots.rs crates/freshell-freshagent/src/terminal_tabs.rs
@@ -2364,9 +2378,14 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 **Interfaces:**
 - Consumes: `GET /api/tabs-sync/snapshots`, `POST /api/tabs-sync/restore` (Tasks 2-3); auth header `x-auth-token`.
-- Produces: `scripts/restore-tabs.sh --url <base> --token <tok> --device <deviceId> [--components ID,ID | --generation-id ID | --generation N] [--dry-run]` and `--list`. **Default (no selector) restores the coherent all-clients UNION** — no single client's tabs are dropped. `--components ID,ID` (a comma-separated set of stable generation ids) restores the IMMUTABLE multi-client bundle the deploy capture recorded — this is what the deploy remediation prints (`:2621`), NEVER a single-client `--generation-id`. Exit 0 on success with 0 failed panes; exit 1 on any failed pane or HTTP error.
+- Produces: `scripts/restore-tabs.sh --url <base> --token <tok> --device <deviceId> [--components ID,ID | --generation-id ID | --generation N] [--pane KEY] [--force] [--dry-run]` and `--list`. **Default (no selector) restores the coherent all-clients UNION** — no single client's tabs are dropped. `--components ID,ID` (a comma-separated set of stable generation ids) restores the IMMUTABLE multi-client bundle the deploy capture recorded — this is what the deploy remediation prints (`:2621`), NEVER a single-client `--generation-id`. A targeted invocation succeeds only when at least one pane is restored; forced recovery additionally requires `deliveryConfirmed:true`. Any failed pane, unconfirmed delivery, all-skipped targeted result, or HTTP error exits 1.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Historical script draft (superseded; do not copy)**
+
+> The embedded block below predates the shipped `--force` passthrough and
+> delivery-confirmed/all-skipped success checks. It is retained only as
+> historical context. The executable source of truth is
+> `scripts/restore-tabs.sh`; never overwrite it from this block.
 
 ```bash
 #!/usr/bin/env bash
@@ -2477,7 +2496,7 @@ echo "-- restored=${restored} skipped=${skipped} failed=${failedn}"
 [[ "$failedn" == "0" ]] || exit 1
 ```
 
-- [ ] **Step 2: Verify the script standalone (no browser)**
+- [x] **Step 2: Verify the script standalone (no browser)**
 
 Manual smoke against an ephemeral server (NEVER :3001/:3002). SAFE by
 construction (`:1720`): the server is started in its OWN process group via
@@ -2536,7 +2555,7 @@ scripts/restore-tabs.sh --url "http://127.0.0.1:$PORT" --token "$TOK" --device d
 
 Expected: `--list` prints one `dev-1 gen=0 id=<digest>` line; `--dry-run` prints one RESTORED line with `tabId=null` and exits 0. Do NOT run a REAL (non-dry) restore here — with no browser connected the exactly-one-client gate returns 409 by design; the real create path (with a connected browser) is proven end-to-end in Task 5. (Confirm the binary's env names for port/token in `crates/freshell-server/src/main.rs` before running; the RustServer harness `boot()` shows the exact ones it passes. `FRESHELL_HOME` appears in the process's `/proc/<pid>/environ` — NOT its `cmdline`: `env` execs the server, so the assignment becomes part of the child's environment, not its argv — which is what cleanup greps (NUL-separated, hence `tr '\0' '\n'`); if your platform lacks `/proc`, use a process-group kill `kill -- -"$SRV"` on the setsid group instead, still gated on `kill -0`.)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 chmod +x scripts/restore-tabs.sh
@@ -2560,7 +2579,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `RustServer` (`../helpers/rust-server.js`, constructed DIRECTLY — ephemeral-only, never `createE2eServerHandle`) + `TestHarness` (`../helpers/test-harness.js`); `POST /api/tabs` (envelope `.data`), `GET /api/tabs-sync/snapshots[/{device}]`, `GET /api/terminals` (RAW array), `scripts/restore-tabs.sh`; the fake-codex argv-recorder wiring — copy it EXACTLY from `codex-terminal-bounce-rust.spec.ts` (fake CLI is correct here: deliverable 1 proves identity plumbing, deliverable 2 proves real CLIs). The recorded argv (`FAKE_CODEX_ARGV_LOG`) is the RESUME PROOF: after restore, the fake codex's argv MUST contain the adjacent pair `resume <sessionId>` (identical to how the sibling proves same-session — a Redux `sessionRef` echo alone does NOT prove the server passed resume args).
 - Produces: the committed acceptance test for deliverable 1.
 
-- [ ] **Step 1: Write the spec (failing only until Tasks 1-4 are in)**
+- [x] **Step 1: Write the spec (failing only until Tasks 1-4 are in)**
 
 Skeleton (fill the fake-codex install + `setupHome` config/session seeding by
 copying the exact blocks from `codex-terminal-bounce-rust.spec.ts:49-165` — do
@@ -2744,7 +2763,7 @@ Redux pane (`harness.getPaneLayout(tabId).content.sessionRef`), NOT via
 `/api/terminals`. The restore-tabs.sh output line `restored=N skipped=M
 failed=K` is what the assertions above key on.
 
-- [ ] **Step 2: Register the spec (`rust-chromium` testMatch + match-all testIgnore)**
+- [x] **Step 2: Register the spec (`rust-chromium` testMatch + match-all testIgnore)**
 
 In `playwright.config.ts`, append to the `rust-chromium` `testMatch` array:
 
@@ -2780,12 +2799,12 @@ and add `testIgnore: RUST_ONLY_SPECS` to `chromium` (and, inside the
 ```
 Verify: `npx playwright test --config test/e2e-browser/playwright.config.ts --list | grep snapshot-restore-rust` shows it ONLY under `[rust-chromium]`.
 
-- [ ] **Step 3: Run it twice**
+- [x] **Step 3: Run it twice**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium snapshot-restore-rust.spec.ts --repeat-each=2`
 Expected: 2 passed. (Build the release server first if needed: `cargo build --release -p freshell-server` — the harness also builds on demand.)
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add test/e2e-browser/specs/snapshot-restore-rust.spec.ts test/e2e-browser/playwright.config.ts
@@ -2811,7 +2830,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `RustServer.boot()` (`rust-server.ts:296`, calls `ensureRustServerBuilt()`).
 - Produces: env override `FRESHELL_E2E_RUST_SERVER_BIN` — when set, `boot()` uses that binary instead of building HEAD; when set but MISSING, a non-regular-file, or non-executable it ABORTS (fail-closed, `:2015`). Resolution is the exported pure `resolveRustServerBin(env, buildHead)` (unit-tested: missing→throw, non-exec→throw, valid→selected, unset→built) and `boot()` logs the resolved path + `sha256` so Task 8's evidence records exactly which binary ran. Needed by Task 8's historical-bug proof.
 
-- [ ] **Step 1: Add the fail-closed override as a UNIT-TESTABLE pure function (test infra, not frozen)**
+- [x] **Step 1: Add the fail-closed override as a UNIT-TESTABLE pure function (test infra, not frozen)**
 
 The override is a relied-upon regression gate, so the RESOLUTION logic is a pure,
 exported function (`resolveRustServerBin`) that `boot()` calls — this lets it be
@@ -2869,7 +2888,7 @@ In `boot()`, replace `const bin = ensureRustServerBuilt()` with:
     }
 ```
 
-- [ ] **Step 1b: Override self-tests (the fail-closed gate is itself tested)**
+- [x] **Step 1b: Override self-tests (the fail-closed gate is itself tested)**
 
 Add `test/e2e-browser/helpers/rust-server-bin.test.ts` (a helper-suite vitest,
 run by `npm run test:e2e:helpers`):
@@ -2910,7 +2929,7 @@ Run: `npm run test:e2e:helpers` (override self-tests PASS), then
 `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium harness-01-rust-server.spec.ts`
 Expected: both PASS (harness self-test unaffected when the env var is unset).
 
-- [ ] **Step 2: Probe — does each REAL CLI render seeded history offline?**
+- [x] **Step 2: Probe — does each REAL CLI render seeded history offline?**
 
 The smoke test's strongest assertion is "seeded MARKER text visible in the
 resumed pane" with NO API keys. Verify each CLI supports that before writing
@@ -3011,7 +3030,7 @@ binary may refuse to start unauthenticated; if so, the spec's `setupHome`
 copies ONLY the auth file from the real HOME (read-only copy, never written
 back).
 
-- [ ] **Step 3: Commit the harness knob**
+- [x] **Step 3: Commit the harness knob**
 
 ```bash
 git add test/e2e-browser/helpers/rust-server.ts test/e2e-browser/helpers/rust-server-bin.test.ts
@@ -3035,7 +3054,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `RustServer` (constructed DIRECTLY — `setupHome`, `server.restart()`, `server.stop()`; NEVER `createE2eServerHandle`) + `TestHarness` (`waitForHarness`/`waitForConnection`/`getWsReadyState`/`getPaneLayout`), sidebar interactions (mirror `sidebar-click-resume.spec.ts:215-235`), `POST /api/tabs` with `sessionRef` (envelope `.data`), `GET /api/terminals` (RAW array), `GET /api/terminals/{id}/search?query=<marker>` → `.matches` (**the handler reads the `query` param, verified `terminals.rs:176`; `?q=` returns HTTP 400**) (server-side scrollback mirror — the strongest render assertion), Task 6 probe findings.
 - Produces: `npm run smoke:continuity` — the pre-deploy gate. NOT run by `chromium`/`rust-chromium`/`legacy-chromium`.
 
-- [ ] **Step 1: Register the project + npm script FIRST (so the spec never leaks into the default matrix)**
+- [x] **Step 1: Register the project + npm script FIRST (so the spec never leaks into the default matrix)**
 
 `playwright.config.ts` — APPEND the smoke spec to the shared `RUST_ONLY_SPECS`
 list Task 5 already introduced (it is already applied as `testIgnore` on every
@@ -3112,7 +3131,7 @@ Neither listing may show any of the three under `[chromium]`, `[firefox]`, or `[
 "smoke:continuity": "cross-env FRESHELL_SMOKE=1 playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke"
 ```
 
-- [ ] **Step 2: Write the smoke spec**
+- [x] **Step 2: Write the smoke spec**
 
 One scenario, one server, one page. Constants: three MARKERs + three session
 ids as in the Task 6 probe. Structure (fill fixture-seeding bodies from the
@@ -3265,7 +3284,7 @@ writing):
 - Keep total runtime ≤ 5 min (the hard cap): single worker, no `--repeat-each`,
   tight polls.
 
-- [ ] **Step 3: Run to verify it fails/errors before fixture tuning, then passes**
+- [x] **Step 3: Run to verify it fails/errors before fixture tuning, then passes**
 
 Run: `npm run smoke:continuity`
 Iterate fixture shapes (per Task 6 probes) until: PASS with all three legs on
@@ -3274,7 +3293,7 @@ Record wall-clock (target ≤ 5 min — the single budget stated in the Goal, th
 `test.setTimeout(300_000)` cap, and the final checklist). If a run exceeds 5 min,
 tighten polls/worker rather than loosening any of those three numbers.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add test/e2e-browser/specs/continuity-smoke.spec.ts test/e2e-browser/playwright.config.ts package.json
@@ -3301,7 +3320,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `FRESHELL_E2E_RUST_SERVER_BIN` (Task 6), `npm run smoke:continuity` (Task 7), commit `136b9e94~1` (contains the real bug: codex terminal creates ignored `sessionRef`).
 - Produces: committed evidence — codex leg FAILS at `136b9e94~1`, full run PASSES at HEAD.
 
-- [ ] **Step 1: Build the pre-fix server binary in an ephemeral worktree**
+- [x] **Step 1: Build the pre-fix server binary in an ephemeral worktree**
 
 ```bash
 cd <worktree-root>
@@ -3312,7 +3331,7 @@ git worktree add /tmp/freshell-pre-136b9e94 136b9e94~1
 (Build is read-only w.r.t. this repo's frozen paths; the temp worktree is
 removed in Step 4.)
 
-- [ ] **Step 2: Run the smoke against the OLD binary — expect the codex leg to FAIL**
+- [x] **Step 2: Run the smoke against the OLD binary — expect the codex leg to FAIL**
 
 Exit-nonzero alone is INSUFFICIENT (`:2402`): a startup/auth/browser/env failure
 would also exit nonzero without proving the codex resume assertion regressed. So
@@ -3365,7 +3384,7 @@ pre-`136b9e94`, it shipped with `terminals.rs`; verify with
 the machine-check above ABORTS loudly; adjust the spec to only use surfaces
 present in both binaries, re-run Task 7's pass, then repeat this step.
 
-- [ ] **Step 3: Run at HEAD — expect PASS — and write the evidence file**
+- [x] **Step 3: Run at HEAD — expect PASS — and write the evidence file**
 
 ```bash
 set -o pipefail
@@ -3407,7 +3426,7 @@ and infra were NOT the failing assertion (asserted in Step 2).
 ```
 ```
 
-- [ ] **Step 4: Clean up + commit**
+- [x] **Step 4: Clean up + commit**
 
 ```bash
 git worktree remove /tmp/freshell-pre-136b9e94 --force
@@ -3435,7 +3454,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
   - `scripts/deploy-tab-diff.sh verify --url U --token T --before FILE [--after FILE]` → exit 0 when every previously-live identity pane came back with the SAME `sessionRef`; exit 1 with a loud pane-by-pane diff (`MISSING` / `FRESH (identity lost)` / `RE-POINTED` / `NOT RESPAWNED`) and, per diverged device, a TARGETED `restore-tabs.sh --components <bundle> --pane <tabKey#paneId>...` remediation (only the diverged panes, so healthy panes are never re-restored) otherwise. `--after FILE` (optional) feeds a synthetic after-state instead of fetching live — with `--after` supplied verify performs **ZERO network operations** (`:2619`): both the diff and the remediation read only local files. Used by the deterministic diff-engine test (Task 10); default fetches live.
   - Verify semantics (liveness gated on the BEFORE state, so no vacuous OK and no false red): **"live" means `status == "running"`** — the `/api/terminals` array includes `exited` terminals (verified `terminals.rs:704-708`), which are filtered OUT of both the before and after live sets so an exited id never causes a false `NOT RESPAWNED`. A pane is "counted" only if it had a `payload.sessionRef` OR its `payload.liveTerminal.terminalId` was ACTUALLY present-and-running in the before `/api/terminals` array. For each counted pane, find the same `(tabKey, paneId)` in the device's AFTER union snapshot: absent → `MISSING`; before had `sessionRef` and after doesn't → `FRESH`; both present but `sessionId`/`provider` differ → `RE-POINTED`; a genuinely-live-before pane whose after `liveTerminal.terminalId` is absent from the after RUNNING set → `NOT RESPAWNED`. **Coverage guard (full set-difference, `:2559`/`:2563`):** verify computes the COMPLETE set of running-at-capture terminals covered by NO persisted snapshot pane (binding the id to a jq variable before indexing — `. as $t | $covered | index($t)` — never `$covered | index(.)`, which would rebind `.` to the array) and FAILS loudly LISTING them if that set is nonempty (a PARTIAL-coverage gap fails too, not just all-or-none). Remediation prints, per diverged device, `restore-tabs.sh --components <bundle>` plus one `--pane <tabKey#paneId>` per diverged pane (the restore API's fail-closed selective mode) using the BEFORE file's `bundles[deviceId].components` — the immutable multi-client bundle (`:2621`), never a single-client `--generation-id`; if the before-file has no bundle for a device it FAILS LOUDLY for that device. The printed command is shell-quoted (`printf %q` for url/device/components) so a metacharacter id can't inject when copied.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 ```bash
 #!/usr/bin/env bash
@@ -3675,7 +3694,7 @@ case "$CMD" in
       done < <(jq -j --arg d "$dev" \
         '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
         <<<"$DIFF")
-      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s%s\n' \
+      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s --force%s\n' \
         "$URL" "$dev" "$comps" "$pane_args"
     done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$DIFF")
     cleanup; exit 1
@@ -3686,7 +3705,7 @@ case "$CMD" in
 esac
 ```
 
-- [ ] **Step 2: Syntax + lint check (ENFORCING — no `|| true`)**
+- [x] **Step 2: Syntax + lint check (ENFORCING — no `|| true`)**
 
 Run (both scripts; the `&&` chain fails the step if EITHER `bash -n` or ShellCheck fails):
 ```bash
@@ -3695,7 +3714,7 @@ bash -n scripts/deploy-tab-diff.sh && bash -n scripts/restore-tabs.sh \
 ```
 Expected: PASS (exit 0). Fix every real bug ShellCheck reports; for a deliberately-accepted style-only finding, silence it with an inline `# shellcheck disable=SCXXXX` + a one-line justification rather than masking the whole gate with `|| true` (which would let a genuine `bash -n`/ShellCheck failure pass as green).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 chmod +x scripts/deploy-tab-diff.sh
@@ -3719,7 +3738,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: everything above; fake-codex wiring copied from `codex-terminal-bounce-rust.spec.ts` (EPHEMERAL server via `new RustServer(...)`, per Global Constraints — never `createE2eServerHandle`). The fake-codex `FAKE_CODEX_ARGV_LOG` is the post-remediation resume proof.
 - Produces: committed acceptance for deliverable 3, in TWO tests: (1) a LIVE capture→restart→verify (OK) then identity-loss (MISSING) → loud fail → executed `--components` bundle remediation proven by the fake-CLI argv resume log; and (2) a DETERMINISTIC, FULLY OFFLINE diff-engine test (a fake `curl` aborts if the script makes any network call, `:2619`) driving `verify --before F --after F` over synthetic fixtures to exercise the `MISSING` / `FRESH (identity lost)` / `RE-POINTED` / `NOT RESPAWNED` verdicts, the PARTIAL-coverage set-difference guard (`:2559`), and the MULTI-CLIENT bundle remediation (`:2621`) — categories the live MISSING-only path cannot produce.
 
-- [ ] **Step 1: Write the live acceptance spec**
+- [x] **Step 1: Write the live acceptance spec**
 
 ```ts
 import { test, expect } from '../helpers/fixtures.js'
@@ -3958,7 +3977,7 @@ tab count to drop so the removal is proven. Do NOT use `DELETE /api/terminals/{i
 — it only writes a `{deleted:true}` settings override and neither kills the PTY
 nor closes the tab, so it cannot simulate pane loss.)
 
-- [ ] **Step 2: Register the spec — BOTH the `rust-chromium` `testMatch` AND the shared `RUST_ONLY_SPECS` testIgnore list**
+- [x] **Step 2: Register the spec — BOTH the `rust-chromium` `testMatch` AND the shared `RUST_ONLY_SPECS` testIgnore list**
 
 Append to `rust-chromium`'s `testMatch`:
 ```ts
@@ -3980,12 +3999,12 @@ const RUST_ONLY_SPECS = [
 Confirm the spec is NOT listed under `[chromium]`:
 `npx playwright test --config test/e2e-browser/playwright.config.ts --list | grep deploy-tab-diff-rust` (must show ONLY `[rust-chromium]`).
 
-- [ ] **Step 3: Run twice**
+- [x] **Step 3: Run twice**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium deploy-tab-diff-rust.spec.ts --repeat-each=2`
 Expected: 2 passed.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts test/e2e-browser/playwright.config.ts
@@ -4000,13 +4019,13 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ## Final verification (whole system, before handing to review)
 
-- [ ] `cargo test -p freshell-ws -p freshell-server -p freshell-freshagent -p freshell-terminal` — green
-- [ ] `cargo clippy --workspace` + `cargo fmt --all -- --check` — clean on touched files
-- [ ] `npm run test:status`, then `npm run test:vitest -- test/e2e-browser/vitest.config.ts` equivalent for helper tests if helpers changed (`npm run test:e2e:helpers`)
-- [ ] `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium snapshot-restore-rust.spec.ts deploy-tab-diff-rust.spec.ts codex-terminal-bounce-rust.spec.ts remote-tab-linkage-rust.spec.ts restore-matrix.spec.ts` — green (no regression in the neighboring identity specs)
-- [ ] `npm run smoke:continuity` — green, ≤5 min (the single budget shared by the Goal + `test.setTimeout(300_000)`)
-- [ ] `git log --oneline 136b9e94..HEAD` shows the three deliverables as ordered, focused series
-- [ ] `git diff 136b9e94..HEAD --stat -- server/ shared/ src/ dist/` is EMPTY (frozen paths untouched)
+- [x] `cargo test -p freshell-ws -p freshell-server -p freshell-freshagent -p freshell-terminal` — green
+- [x] `cargo clippy --workspace` + `cargo fmt --all -- --check` — clean on touched files
+- [x] `npm run test:status`, then `npm run test:vitest -- test/e2e-browser/vitest.config.ts` equivalent for helper tests if helpers changed (`npm run test:e2e:helpers`)
+- [x] `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium snapshot-restore-rust.spec.ts deploy-tab-diff-rust.spec.ts codex-terminal-bounce-rust.spec.ts remote-tab-linkage-rust.spec.ts restore-matrix.spec.ts` — green (no regression in the neighboring identity specs)
+- [x] `npm run smoke:continuity` — green, ≤5 min (the single budget shared by the Goal + `test.setTimeout(300_000)`)
+- [x] `git log --oneline 136b9e94..HEAD` shows the three deliverables as ordered, focused series
+- [x] `git diff 136b9e94..HEAD --stat -- server/ shared/ src/ dist/` is EMPTY (frozen paths untouched)
 
 ## Self-review record (spec vs plan)
 
