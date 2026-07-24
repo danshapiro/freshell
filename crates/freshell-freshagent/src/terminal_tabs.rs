@@ -30,6 +30,7 @@
 //!   case, a documented minor wording deviation.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -294,20 +295,6 @@ fn create_content_tab(
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
-    // Continuity trio (`tabs_snapshots.rs:632`): record BEFORE the broadcast,
-    // so by the time any client could have received the `tab.create`, a
-    // restore retry can already prove the create happened.
-    if let Some(key) = restore_key {
-        state.record_restore_key(
-            key,
-            crate::RestoreKeyEntry {
-                tab_id: tab_id.clone(),
-                pane_id: pane_id.clone(),
-                terminal_id: None,
-            },
-        );
-    }
-
     let command = ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(json!({
@@ -317,6 +304,20 @@ fn create_content_tab(
             "paneContent": pane_content,
         })),
     });
+    // Record the replayable command BEFORE any delivery. A restore retry can
+    // distinguish "created but never sent" from a send to its exact target.
+    if let Some(key) = restore_key {
+        state.record_restore_key(
+            key,
+            crate::RestoreKeyEntry {
+                tab_id: tab_id.clone(),
+                pane_id: pane_id.clone(),
+                terminal_id: None,
+                ui_command: command.clone(),
+                delivered_to: HashSet::new(),
+            },
+        );
+    }
     if broadcast {
         state.broadcast(&command);
     }
@@ -1042,20 +1043,6 @@ async fn create_terminal_tab(
             kind: "terminal".to_string(),
         },
     );
-    // Continuity trio (`tabs_snapshots.rs:632`): record the spawned terminal
-    // under the caller's restoreKey BEFORE the broadcast, so a restore retry
-    // can reconcile this create even if its marker promotion never lands.
-    if let Some(key) = restore_key {
-        state.record_restore_key(
-            key,
-            crate::RestoreKeyEntry {
-                tab_id: tab_id.clone(),
-                pane_id: pane_id.clone(),
-                terminal_id: Some(terminal_id.clone()),
-            },
-        );
-    }
-
     // `ui.command{tab.create}` payload (`router.ts:775-789`): id, title, mode,
     // shell, terminalId, initialCwd, then EITHER `resumeSessionId` OR
     // `sessionRef` (whichever `paneContent` carries -- mutually exclusive,
@@ -1105,6 +1092,19 @@ async fn create_terminal_tab(
         command: "tab.create".to_string(),
         payload: Some(payload),
     });
+    // Record the live process and replayable command before any delivery.
+    if let Some(key) = restore_key {
+        state.record_restore_key(
+            key,
+            crate::RestoreKeyEntry {
+                tab_id: tab_id.clone(),
+                pane_id: pane_id.clone(),
+                terminal_id: Some(terminal_id.clone()),
+                ui_command: command.clone(),
+                delivered_to: HashSet::new(),
+            },
+        );
+    }
     if broadcast {
         state.broadcast(&command);
     }

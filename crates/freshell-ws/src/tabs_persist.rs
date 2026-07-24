@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use serde_json::{json, Value};
 
@@ -92,114 +93,9 @@ fn corrupt_generation(path: &Path, why: impl std::fmt::Display) -> std::io::Erro
     )
 }
 
-/// Validate the persisted schema before any reader indexes, unions, or reports
-/// a generation. Snapshot files are recovery material: syntactically-valid JSON
-/// with missing/wrongly-typed identity, ordering, or record fields must fail
-/// loudly rather than defaulting to an empty/zero-valued successful restore.
-fn validate_generation(path: &Path, value: &Value) -> std::io::Result<()> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| corrupt_generation(path, "top-level value is not an object"))?;
-    let required_nonempty_string = |owner: &Value, field: &str| {
-        owner
-            .get(field)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|_| ())
-            .ok_or_else(|| {
-                corrupt_generation(path, format!("`{field}` must be a non-empty string"))
-            })
-    };
-    required_nonempty_string(value, "deviceId")?;
-    required_nonempty_string(value, "clientInstanceId")?;
-    required_nonempty_string(value, "serverInstanceId")?;
-    object
-        .get("deviceLabel")
-        .and_then(Value::as_str)
-        .ok_or_else(|| corrupt_generation(path, "`deviceLabel` must be a string"))?;
-    for field in ["capturedAt", "snapshotRevision"] {
-        object
-            .get(field)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| corrupt_generation(path, format!("`{field}` must be an integer")))?;
-    }
-    let records = object
-        .get("records")
-        .and_then(Value::as_array)
-        .ok_or_else(|| corrupt_generation(path, "`records` must be an array"))?;
-    for (record_index, record) in records.iter().enumerate() {
-        let record_object = record.as_object().ok_or_else(|| {
-            corrupt_generation(path, format!("`records[{record_index}]` must be an object"))
-        })?;
-        required_nonempty_string(record, "tabKey")?;
-        required_nonempty_string(record, "tabId")?;
-        record_object
-            .get("tabName")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                corrupt_generation(
-                    path,
-                    format!("`records[{record_index}].tabName` must be a string"),
-                )
-            })?;
-        if record_object.get("status").and_then(Value::as_str) != Some("open") {
-            return Err(corrupt_generation(
-                path,
-                format!("`records[{record_index}].status` must be `open`"),
-            ));
-        }
-        for field in ["revision", "updatedAt"] {
-            record_object
-                .get(field)
-                .and_then(Value::as_i64)
-                .ok_or_else(|| {
-                    corrupt_generation(
-                        path,
-                        format!("`records[{record_index}].{field}` must be an integer"),
-                    )
-                })?;
-        }
-        record_object
-            .get("paneCount")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                corrupt_generation(
-                    path,
-                    format!("`records[{record_index}].paneCount` must be an integer"),
-                )
-            })?;
-        let panes = record_object
-            .get("panes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                corrupt_generation(
-                    path,
-                    format!("`records[{record_index}].panes` must be an array"),
-                )
-            })?;
-        for (pane_index, pane) in panes.iter().enumerate() {
-            if !pane.is_object() {
-                return Err(corrupt_generation(
-                    path,
-                    format!("`records[{record_index}].panes[{pane_index}]` must be an object"),
-                ));
-            }
-            required_nonempty_string(pane, "paneId")?;
-            required_nonempty_string(pane, "kind")?;
-            pane.get("payload")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    corrupt_generation(
-                        path,
-                        format!(
-                            "`records[{record_index}].panes[{pane_index}].payload` must be an object"
-                        ),
-                    )
-                })?;
-        }
-    }
-    Ok(())
-}
+#[path = "tabs_persist_validation.rs"]
+mod validation;
+use validation::validate_generation;
 
 fn read_generation_file(path: &Path) -> std::io::Result<Value> {
     let text = std::fs::read_to_string(path)?;
@@ -590,9 +486,9 @@ fn read_device_overview_locked(
 /// this module. Held across the ENTIRE read-plan-mutate cycle, so concurrent
 /// pushes to the SAME or DIFFERENT devices can never race directory
 /// enumeration, eviction, or removal — the critical data-loss defect (`:678`)
-/// — and so a reader (restore's snapshot selection, the REST read surface)
-/// can never observe a half-pruned directory or race a device eviction's
-/// `remove_dir_all`. `Mutex::new(())` is `const`, so this needs no lazy init.
+/// — and so each reader cannot observe a half-pruned directory. A restore's
+/// eviction lease bridges its separately locked selection, marker, create,
+/// and acknowledgement operations. `Mutex::new(())` needs no lazy init.
 /// Restores/pushes are low-frequency and this lock guards only the filesystem
 /// cycle (in-memory registry work already dropped its own lock), so contention
 /// is negligible.
@@ -602,6 +498,49 @@ fn read_device_overview_locked(
 /// that acquires it (the pub readers self-lock and only call lock-free private
 /// helpers), so there is no nested acquisition to deadlock on.
 static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Device directories protected by a restore that spans multiple individually
+/// locked filesystem operations and async process/delivery work.
+static ACTIVE_RESTORE_DIRS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Restore-scoped eviction lease. It holds no mutex across await points; the
+/// eviction planner consults the counted directory set while holding its own
+/// short persistence lock.
+#[must_use]
+pub struct SnapshotRestoreLease {
+    device_dir: PathBuf,
+}
+
+pub fn protect_snapshot_device(root: &Path, device_id: &str) -> Option<SnapshotRestoreLease> {
+    let device_dir = device_dir_for(root, device_id)?;
+    let mut active = ACTIVE_RESTORE_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *active.entry(device_dir.clone()).or_default() += 1;
+    Some(SnapshotRestoreLease { device_dir })
+}
+
+impl Drop for SnapshotRestoreLease {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_RESTORE_DIRS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = active.get_mut(&self.device_dir) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.device_dir);
+            }
+        }
+    }
+}
+
+fn restore_protects(device_dir: &Path) -> bool {
+    ACTIVE_RESTORE_DIRS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(device_dir)
+}
 
 /// Run `f` under the process-wide snapshot-persistence lock. This is THE ONE
 /// way to acquire [`PERSIST_LOCK`], exported so `freshell-server`'s restore
@@ -829,13 +768,16 @@ fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
             (newest, p)
         })
         .collect();
-    while dirs.len() >= MAX_SNAPSHOT_DEVICES {
+    let mut device_count = dirs.len();
+    dirs.retain(|(_, path)| !restore_protects(path));
+    while device_count >= MAX_SNAPSHOT_DEVICES && !dirs.is_empty() {
         dirs.sort_by_key(|(c, _)| *c);
         let (_, victim) = dirs.remove(0);
         if let Err(err) = std::fs::remove_dir_all(&victim) {
             tracing::warn!(target: "freshell_ws::tabs", path = %victim.display(),
                 error = %err, "tabs_snapshot_evict_device_failed");
         }
+        device_count -= 1;
     }
     Ok(())
 }

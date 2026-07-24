@@ -795,66 +795,6 @@ fn union_by_ids_resolves_exact_generation_files_when_digests_repeat_across_clien
     assert_eq!(keys, vec!["dev:x", "dev:y"]);
 }
 
-#[test]
-fn persist_lock_excludes_device_eviction_from_concurrent_readers() {
-    // LOCK UNIFICATION (`tabs_persist.rs:421`): restore's marker IO and
-    // generation reads run under `with_persist_lock`, the SAME lock device
-    // eviction (`enforce_device_cap`'s `remove_dir_all`) requires. The
-    // interleaving below is deterministic BECAUSE of the lock (no sleeps):
-    // while thread A holds it, thread B's at-cap push CANNOT evict the victim
-    // device, so A's reads of the victim dir + marker file can never observe a
-    // half-removed directory.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    // Fill the root EXACTLY to the device cap; dev-000 (oldest capturedAt) is
-    // the deterministic eviction victim for the next NEW device.
-    for n in 0..MAX_SNAPSHOT_DEVICES {
-        let dev = format!("dev-{n:03}");
-        put(
-            &root,
-            &dev,
-            "c1",
-            1,
-            1000 + n as i64,
-            vec![open_record(&format!("{dev}:t"), "t", 1)],
-        );
-    }
-    let victim_dir = root.join(encode_device_id("dev-000").unwrap());
-    // A restore-style marker file lives in the victim's device dir.
-    std::fs::write(victim_dir.join("last-restore.marker"), b"{\"sources\":{}}").unwrap();
-    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-    let root_b = root.clone();
-    let evicted_after_release = with_persist_lock(|| {
-        // Thread B: an at-cap push for a NEW device -- would evict dev-000.
-        let handle = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            put(
-                &root_b,
-                "dev-new",
-                "c1",
-                1,
-                99_000,
-                vec![open_record("dev-new:t", "t", 1)],
-            );
-        });
-        started_rx.recv().unwrap(); // B is definitely running past this point
-                                    // B cannot have evicted: eviction requires the lock THIS closure holds.
-        assert!(
-            victim_dir.join("last-restore.marker").exists(),
-            "victim's marker vanished while the persistence lock was held"
-        );
-        assert!(victim_dir.exists(), "victim dir evicted under the lock");
-        handle
-    })
-    .join();
-    evicted_after_release.unwrap();
-    // After release B proceeded: the eviction really did happen (the test
-    // exercised a REAL at-cap eviction, not a vacuous no-op).
-    assert!(
-        !victim_dir.exists(),
-        "expected dev-000 to be evicted once the lock was released"
-    );
-}
 // Helper: the parsed generation owned by a given client (there is one each here).
 fn gen_by_id_scan(dir: &std::path::Path, device: &str, client: &str) -> Value {
     let path = list_generations(dir, device, client)
@@ -978,4 +918,61 @@ fn semantically_corrupt_generation_files_fail_loud() {
     assert_corrupt(|v| {
         v["records"][0]["panes"] = json!([{ "paneId": "p1", "kind": "terminal" }]);
     });
+
+    let assert_bad_pane = |pane: Value| {
+        assert_corrupt(|v| {
+            v["records"][0]["panes"] = json!([pane.clone()]);
+        });
+    };
+    assert_bad_pane(json!({ "paneId": "p1", "kind": "unknown", "payload": {} }));
+    assert_bad_pane(json!({ "paneId": "p1", "kind": "terminal", "payload": {} }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "terminal",
+        "payload": { "mode": "shell", "shell": "fish" }
+    }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "browser",
+        "payload": { "url": "https://example.com" }
+    }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "editor",
+        "payload": {
+            "filePath": "/tmp/a.md", "language": "markdown", "readOnly": false,
+            "viewMode": "rendered", "wordWrap": true
+        }
+    }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "fresh-agent",
+        "payload": { "sessionType": "freshcodex", "provider": "claude" }
+    }));
+    assert_bad_pane(json!({
+        "paneId": "p1", "kind": "extension",
+        "payload": { "extensionName": "demo" }
+    }));
+}
+
+#[test]
+fn every_supported_pane_kind_passes_semantic_generation_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = open_record("dev:t", "t", 1);
+    record["panes"] = json!([
+        { "paneId": "terminal", "kind": "terminal",
+          "payload": { "mode": "shell", "shell": "system" } },
+        { "paneId": "browser", "kind": "browser",
+          "payload": { "url": "https://example.com", "devToolsOpen": false } },
+        { "paneId": "editor", "kind": "editor",
+          "payload": { "filePath": "/tmp/a.md", "language": null, "readOnly": false,
+                       "viewMode": "preview", "wordWrap": true } },
+        { "paneId": "fresh", "kind": "fresh-agent",
+          "payload": { "sessionType": "freshclaude", "provider": "claude",
+                       "sandbox": "workspace-write", "style": "sans" } },
+        { "paneId": "extension", "kind": "extension",
+          "payload": { "extensionName": "demo", "props": {} } },
+        { "paneId": "picker", "kind": "picker", "payload": {} }
+    ]);
+    put(dir.path(), "dev", "c1", 1, 1000, vec![record]);
+    assert!(
+        read_device_union(dir.path(), "dev").unwrap().is_some(),
+        "all supported pane schemas should be readable"
+    );
 }

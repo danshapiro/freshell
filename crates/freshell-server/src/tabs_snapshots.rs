@@ -156,39 +156,11 @@ async fn get_snapshot(
 }
 
 // ── POST /api/tabs-sync/restore ─────────────────────────────────────────────
-//
-// Rebuilds a device's tabs from a persisted snapshot by driving the SAME
-// `POST /api/tabs` create pipeline per snapshot pane (one new tab per OPEN
-// pane — the layout tree is client-owned, not restorable server-side). Each
-// pane has a STABLE idempotency key `paneKey = "{tabKey}#{paneId}"`; combined
-// with the marker's per-source ledger the effective server-side create
-// identity is `(deviceId, sourceId/generationId, paneKey)`. Semantics:
-// - Target gate: EXACTLY ONE capable client (409 otherwise); `force`
-//   overrides, `dryRun` bypasses (creates nothing).
-// - Fail-closed selectors: malformed `generation`/`generationId`/`components`
-//   /`panes` are a 400, never a silent fallback to the broader union.
-// - Strict session-identity preflight: a present-but-invalid `sessionRef`
-//   fails the pane (`session-identity-mismatch`) BEFORE spawning.
-// - Verified delivery: after each create, a screenshot round-trip to the
-//   single target client acks receipt of the in-order `tab.create`; a timeout
-//   fails that pane (`delivery-unconfirmed`) and every remaining supported
-//   pane (`connection-dropped`). Ack request ids carry a per-attempt nonce so
-//   a stale reply from a timed-out attempt can never resolve a later one.
-// - Write-ahead per-source marker ledger (see `tabs_snapshots_marker.rs`):
-//   `in-progress` before the create (the create itself is tagged with a
-//   deterministic `restoreKey` so a retry can reconcile an unconfirmed
-//   create), `terminalId` recorded after it, promoted to `restored` on ack.
-//   Reruns skip `restored` panes (`already-restored`), reconcile `in-progress`
-//   panes against the live registry AND the restore-key ledger (never
-//   duplicate a still-live create), fail-loud on non-terminal panes they
-//   cannot prove undelivered (`in-progress-unconfirmed`), and retry dead
-//   ones. A failed marker write is a LOUD 500 (`markerError`); an unreadable
-//   or corrupt marker is a LOUD 409 (force overrides explicitly).
-// - `force` preserves history: it unions the prior marker into what it writes;
-//   it only bypasses the already-restored skip, the target gate, the
-//   corrupt-marker refusal, and the `in-progress-unconfirmed` refusal.
-// - `kind:"fresh-agent"` (and unknown kinds) are `skipped{unsupported-kind}` —
-//   reported loudly, never silent.
+// Rebuilds open panes through the normal create pipeline. A per-source
+// write-ahead ledger makes each `(device, source, tabKey, paneId)` idempotent;
+// targeted delivery plus a screenshot fence proves the selected connection
+// received each replayable tab.create. Selectors and marker corruption fail
+// closed, while unsupported pane kinds are reported as skips.
 
 #[path = "tabs_snapshots_marker.rs"]
 mod marker_mod;
@@ -198,19 +170,9 @@ use marker_mod::{
 #[cfg(test)]
 use marker_mod::{MAX_RESTORE_MARKER_SOURCES, RESTORE_MARKER, RESTORE_MARKER_TMP};
 
-/// Map one snapshot pane to its `POST /api/tabs` body, or Err(reason). A terminal
-/// pane whose `sessionRef` is present-but-invalid (not an object, missing a
-/// nonempty `sessionId`, or `provider != mode`) is rejected HERE (reason
-/// `"session-identity-mismatch"`) so the create pipeline can never mint a fresh
-/// identity-less session and call it restored. `"unsupported-kind"` is a SKIP;
-/// every other Err is a FAIL (classified by the caller).
-///
-/// FULL captured pane state round-trips (`:245`): everything the frozen
-/// client's `tab.create` handler folds (ui-commands.ts — `paneContent` is
-/// applied verbatim via initLayout) is passed through the create pipeline:
-/// terminal `shell` + `codexDurability`, browser `devToolsOpen`, editor
-/// `language`/`readOnly`/`viewMode`/`wordWrap` — so a restored PowerShell/WSL
-/// CLI pane comes back under its captured launch environment, not defaults.
+/// Map a snapshot pane to its `POST /api/tabs` body. Invalid session identity
+/// fails before spawn; unsupported kinds are skips. Captured terminal, browser,
+/// and editor options pass through to the restored pane.
 fn pane_to_create_body(tab_name: Option<&Value>, pane: &Value) -> Result<Value, &'static str> {
     let payload = pane.get("payload").cloned().unwrap_or_else(|| json!({}));
     let kind = pane.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -233,10 +195,7 @@ fn pane_to_create_body(tab_name: Option<&Value>, pane: &Value) -> Result<Value, 
                     b["codexDurability"] = cd.clone();
                 }
             }
-            // STRICT identity preflight: a NULL/absent sessionRef is fine (no
-            // identity to lose); a PRESENT one must be an object with a nonempty
-            // sessionId AND provider == mode, else the pane FAILS (never spawns
-            // fresh under a "restored" label).
+            // Present identity must be nonempty and match the terminal mode.
             if let Some(sref) = payload.get("sessionRef").filter(|v| !v.is_null()) {
                 let ok = sref.is_object()
                     && sref.get("provider").and_then(Value::as_str) == Some(mode)
@@ -289,19 +248,12 @@ fn pane_key(tab_key: &str, pane_id: &str) -> String {
     format!("{tab_key}#{pane_id}")
 }
 
-/// Deterministic idempotency key a restore-driven create is tagged with
-/// (`restoreKey` in the `POST /api/tabs` body). Derivable on RETRY from the
-/// same `(deviceId, sourceId, paneKey)` identity, so a rerun can query the
-/// fresh-agent restore-key ledger for a create whose marker promotion never
-/// landed (the crash window between the pre-create marker write and the
-/// post-create terminalId record — `:632`).
+/// Deterministic key for reconciling a create whose marker promotion did not land.
 fn restore_key_for(device_id: &str, source_id: &str, pane_key: &str) -> String {
     format!("restore:{device_id}:{source_id}:{pane_key}")
 }
 
-/// Read the WHOLE marker ledger off-runtime, under the SHARED persistence lock
-/// (mutually exclusive with generation writes/pruning and device eviction —
-/// `tabs_persist.rs:421`). `Err` = unreadable/corrupt (fail LOUD — `:306`).
+/// Read the whole marker ledger off-runtime under the persistence lock.
 async fn read_marker_doc_async(device_dir: &std::path::Path) -> std::io::Result<MarkerDoc> {
     let dd = device_dir.to_path_buf();
     match tokio::task::spawn_blocking(move || {
@@ -314,10 +266,7 @@ async fn read_marker_doc_async(device_dir: &std::path::Path) -> std::io::Result<
     }
 }
 
-/// Persist the marker ledger (our source's pane map folded in) when a device
-/// dir exists (`None` = nothing to write). ONE home for the write-ahead
-/// sequence the handler runs repeatedly. Runs under the SHARED persistence
-/// lock, like the read above.
+/// Persist the updated source ledger under the shared persistence lock.
 async fn persist_marker(
     device_dir: Option<&std::path::Path>,
     doc: &mut MarkerDoc,
@@ -339,14 +288,8 @@ async fn persist_marker(
     }
 }
 
-/// Delivery ack: send `screenshot.capture` to the selected target connection
-/// and await a reply from that same connection within `timeout`. A reply proves the client received every
-/// earlier in-order frame (incl. this pane's `tab.create`); a timeout means the
-/// connection dropped/stalled. The request id carries the caller's PER-ATTEMPT
-/// `nonce` (`restore-ack:{nonce}:{paneKey}`), so a stale reply from a
-/// timed-out earlier attempt (same paneKey, different nonce) can never resolve
-/// a later attempt's registration (`:403`). Returns `true` iff delivery was
-/// confirmed.
+/// Fence tab.create with a screenshot reply from the same selected connection.
+/// A per-attempt nonce prevents a stale response from confirming a retry.
 async fn confirm_delivery(
     state: &TabsSnapshotsState,
     target_client_id: u64,
@@ -420,14 +363,14 @@ async fn restore_tabs(
         )
             .into_response();
     };
-    // FAIL-CLOSED selection parsing (`:459`): malformed selectors are a 400,
-    // never a silent fall-through to the broader union. Priority when valid:
-    // components (immutable multi-client bundle, :2621) > generationId >
-    // generation > coherent union.
+    // Malformed selectors fail closed; components have highest priority.
     let selection = match parse_restore_selection(&body) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    // Protect the source generation and its write-ahead marker for the WHOLE
+    // restore, including async create and delivery waits between locked IO.
+    let _snapshot_lease = freshell_ws::tabs_persist::protect_snapshot_device(&dir, &device_id);
     let (generation_n, generation_id_req) = match &selection.selector {
         Selector::Index(n) => (Some(*n), None),
         Selector::Id(id) => (None, Some(id.clone())),
@@ -448,8 +391,7 @@ async fn restore_tabs(
     let read = tokio::task::spawn_blocking(move || -> std::io::Result<Read> {
         let (dir, device_id, comps, gid, gn) = sel;
         if !comps.is_empty() {
-            // EVERY unique requested component must resolve, else fail loudly
-            // (`tabs_persist.rs:232` — never a silent partial union).
+            // Every requested component must resolve; partial unions fail.
             return Ok(
                 match freshell_ws::tabs_persist::read_generations_union_by_ids(
                     &dir, &device_id, &comps,
@@ -495,9 +437,7 @@ async fn restore_tabs(
         Ok(Err(err)) => return snapshots_read_error(&dir, &err),
         Err(join) => return snapshots_read_error(&dir, &join),
     };
-    // Fail-closed `panes` preflight (`:175` targeted remediation): every
-    // requested pane key must exist among the snapshot's OPEN panes, BEFORE any
-    // side effect. Unknown keys are a 400 naming them, never silently ignored.
+    // Validate every targeted pane key before any side effect.
     if let Some(filter) = &selection.panes {
         let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in snap
@@ -540,20 +480,14 @@ async fn restore_tabs(
                 .into_response();
         }
     }
-    // STABLE content identity of the chosen snapshot -> the marker keys off this.
     let source_id = freshell_ws::tabs_persist::snapshot_content_id(&snap);
     let captured_at = snap.get("capturedAt").and_then(Value::as_i64).unwrap_or(0);
-    // Per-restore-attempt nonce for delivery-ack request ids (`:403`): a stale
-    // ack from a timed-out earlier attempt can never resolve this attempt's
-    // registration, because the ids differ in the nonce.
+    // Distinguish delivery fences from replies to earlier attempts.
     let nonce = uuid::Uuid::new_v4().to_string();
 
-    // Serialize: hold the lock across read-marker -> create -> ack -> write-marker.
     let _guard = state.restore_lock.lock().await;
 
-    // Bind the whole restore attempt to the exact connection selected while
-    // holding the restore lock. A later connection cannot receive its tab.create
-    // frames or satisfy its delivery acknowledgements.
+    // Bind all delivery and acknowledgements to this exact connection.
     let (connected, target_client_id) = state.screenshots.client_snapshot();
     if !dry_run && !force && target_client_id.is_none() {
         return (StatusCode::CONFLICT, Json(json!({
@@ -563,13 +497,8 @@ async fn restore_tabs(
     }
 
     let device_dir = freshell_ws::tabs_persist::encode_device_id(&device_id).map(|e| dir.join(e));
-    // ALWAYS load the prior marker LEDGER (force too, so history is preserved —
-    // :1497). It is kept per (deviceId, sourceId): restoring source A, then B,
-    // then A again still sees A's history and cannot duplicate A's panes
-    // (`:304`). An unreadable/corrupt marker is a LOUD 409 (`:306`) — the
-    // marker is the sole idempotency record, so "can't read it" must never be
-    // treated as "nothing restored yet". `force` is the explicit operator
-    // override: it discards the unreadable ledger and rebuilds it.
+    // Preserve per-source history, including under force. Corrupt idempotency
+    // state fails closed unless force explicitly rebuilds it.
     let mut doc: MarkerDoc = match &device_dir {
         Some(dd) => match read_marker_doc_async(dd).await {
             Ok(doc) => doc,
@@ -627,9 +556,7 @@ async fn restore_tabs(
             let kind_str = kind.as_str().unwrap_or("").to_string();
             let pk = pane_key(&tab_key_str, &pane_id_str);
 
-            // Targeted-restore filter (`:175`): when the caller named specific
-            // panes, everything else is REPORTED as skipped (never silently
-            // dropped) and never touches the marker or the connection.
+            // Report unselected panes without touching state or the connection.
             if selection
                 .panes
                 .as_ref()
@@ -640,8 +567,7 @@ async fn restore_tabs(
                 continue;
             }
 
-            // Preflight/kind classification first (a bad-kind pane never touches
-            // the marker or the connection).
+            // Classify before touching the marker or connection.
             let create_body = match pane_to_create_body(tab_name, pane) {
                 Err("unsupported-kind") => {
                     skipped.push(json!({ "tabKey": tab_key, "paneId": pane_id,
@@ -656,13 +582,8 @@ async fn restore_tabs(
                 Ok(b) => b,
             };
             let prior_mark = prior.get(&pk).cloned();
-            // (1) already-restored SKIP first when !force (:1623): a rerun over a
-            // fully-restored pane is a no-op and must REPORT as a skip, whether or
-            // not its terminal is still running (nothing is re-created either way;
-            // `marker` already carries the prior record via the `prior` clone).
-            // force bypasses this skip (re-creates a restored-but-dead pane) and
-            // falls through to reconciliation, which still prevents duplicating a
-            // live terminal (:1497).
+            // Ordinary reruns report restored panes as no-ops. Force bypasses
+            // that skip and either replaces the UI identity or recreates.
             if !force {
                 if let Some(pm) = &prior_mark {
                     if pm.state == "restored" {
@@ -672,28 +593,94 @@ async fn restore_tabs(
                     }
                 }
             }
-            // (2) Reconciliation for everything that got past the skip
-            // (crash-window `in-progress` panes always; `restored` panes only
-            // under force): a prior create that is STILL LIVE must NEVER be
-            // recreated (that is the duplicate the crash-window and blind
-            // force would cause). Sources of truth, in order:
-            //   (a) the marker's recorded terminalId against the live registry;
-            //   (b) the restore-key ledger (`:632`): the create was TAGGED with
-            //       a deterministic restoreKey before it ran, so even when the
-            //       post-create marker promotion never landed (crash/IO-error
-            //       window between the write-ahead entry and the terminalId
-            //       record), a same-process retry still finds what it made —
-            //       terminals by their live id, browser/editor panes by their
-            //       recorded tab.
-            //   (c) neither knows the pane: a terminal pane is safe to
-            //       re-create (in-process terminals die with the process); a
-            //       browser/editor pane is NOT (the client persists tabs
-            //       locally, so the earlier `tab.create` may have landed) —
-            //       it FAILS `in-progress-unconfirmed` for the operator unless
-            //       `force` explicitly recreates it.
+            if connection_dropped {
+                failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                    "reason": "connection-dropped" }));
+                continue;
+            }
+
+            // Reconcile a prior live process/tab through its replayable command.
+            // A new target receives tab.create before its fence. Force replaces
+            // no-process content tabs instead.
             let restore_key = restore_key_for(&device_id, &source_id, &pk);
             let ledger = state.fresh_agent.lookup_restore_key(&restore_key);
-            if let Some(pm) = &prior_mark {
+            let ledger_live_terminal = ledger
+                .as_ref()
+                .and_then(|entry| entry.terminal_id.clone())
+                .filter(|terminal_id| state.terminals.is_running(terminal_id));
+            if force && !dry_run && kind_str == "terminal" && ledger_live_terminal.is_some() {
+                let (old_tab_id, replacement) = state
+                    .fresh_agent
+                    .reissue_restore_key_terminal(&restore_key)
+                    .expect("live restore-key terminal has tab bookkeeping");
+                let close =
+                    freshell_protocol::ServerMessage::UiCommand(freshell_protocol::UiCommand {
+                        command: "tab.close".to_string(),
+                        payload: Some(json!({ "id": old_tab_id })),
+                    });
+                let delivered = target_client_id.is_some_and(|target| {
+                    state.screenshots.send_to_client(target, close)
+                        && state
+                            .screenshots
+                            .send_to_client(target, replacement.ui_command.clone())
+                });
+                if delivered {
+                    state
+                        .fresh_agent
+                        .mark_restore_key_delivered(&restore_key, target_client_id.unwrap());
+                }
+                let confirmed = delivered
+                    && confirm_delivery(
+                        &state,
+                        target_client_id.expect("delivered requires a target"),
+                        &nonce,
+                        &pk,
+                    )
+                    .await;
+                if confirmed {
+                    marker.insert(
+                        pk.clone(),
+                        PaneMark {
+                            state: "restored".into(),
+                            terminal_id: replacement.terminal_id.clone(),
+                        },
+                    );
+                    restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                        "terminalId": replacement.terminal_id, "tabId": replacement.tab_id,
+                        "forcedReplacement": true }));
+                } else if target_client_id.is_some() {
+                    delivery_confirmed = false;
+                    connection_dropped = true;
+                    failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                        "reason": "delivery-unconfirmed",
+                        "terminalId": replacement.terminal_id }));
+                } else {
+                    delivery_confirmed = false;
+                    restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                        "terminalId": replacement.terminal_id, "tabId": replacement.tab_id,
+                        "forcedReplacement": true }));
+                }
+                continue;
+            }
+            if force && !dry_run && kind_str != "terminal" {
+                if let Some(entry) = ledger.as_ref().filter(|e| e.terminal_id.is_none()) {
+                    let close =
+                        freshell_protocol::ServerMessage::UiCommand(freshell_protocol::UiCommand {
+                            command: "tab.close".to_string(),
+                            payload: Some(json!({ "id": entry.tab_id })),
+                        });
+                    if target_client_id
+                        .is_some_and(|target| !state.screenshots.send_to_client(target, close))
+                    {
+                        delivery_confirmed = false;
+                        connection_dropped = true;
+                        failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                            "reason": "delivery-unconfirmed" }));
+                        continue;
+                    }
+                    state.fresh_agent.retire_restore_key_content(&restore_key);
+                }
+            } else if let Some(pm) = &prior_mark {
                 let live_terminal_id = pm
                     .terminal_id
                     .clone()
@@ -716,21 +703,40 @@ async fn restore_tabs(
                             "reconciled": true, "dryRun": true }));
                         continue;
                     }
-                    // Re-ack only when a client is present (blind force has no target).
-                    let acked = target_client_id.is_some_and(|target| {
-                        !connection_dropped && state.screenshots.has_client(target)
-                    }) && confirm_delivery(
-                        &state,
-                        target_client_id.expect("checked Some"),
-                        &nonce,
-                        &pk,
-                    )
-                    .await;
+                    let ready_for_fence = target_client_id.is_some_and(|target| {
+                        if ledger
+                            .as_ref()
+                            .is_some_and(|entry| entry.delivered_to.contains(&target))
+                        {
+                            return true;
+                        }
+                        let sent = ledger.as_ref().is_some_and(|entry| {
+                            state
+                                .screenshots
+                                .send_to_client(target, entry.ui_command.clone())
+                        });
+                        if sent {
+                            state
+                                .fresh_agent
+                                .mark_restore_key_delivered(&restore_key, target);
+                        }
+                        sent
+                    });
+                    let acked = ready_for_fence
+                        && confirm_delivery(
+                            &state,
+                            target_client_id.expect("checked Some"),
+                            &nonce,
+                            &pk,
+                        )
+                        .await;
                     if !acked {
                         delivery_confirmed = false;
-                        marker.insert(pk.clone(), pm.clone()); // keep the prior record
-                        skipped.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
-                            "reason": "reconciled-live" }));
+                        connection_dropped = target_client_id.is_some();
+                        marker.insert(pk.clone(), pm.clone());
+                        failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
+                            "reason": "delivery-unconfirmed",
+                            "terminalId": live_terminal_id }));
                     } else {
                         marker.insert(
                             pk.clone(),
@@ -746,20 +752,13 @@ async fn restore_tabs(
                     }
                     continue;
                 }
-                // (c) unconfirmed non-terminal pane: fail loud, never silently
-                // recreate what the client may already have (`:632`).
                 if pm.state == "in-progress" && kind_str != "terminal" && !force {
-                    marker.insert(pk.clone(), pm.clone()); // keep the prior record
+                    marker.insert(pk.clone(), pm.clone());
                     failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
                         "reason": "in-progress-unconfirmed",
                         "hint": "an earlier attempt's tab.create may have reached the client; verify the pane in the target browser, then rerun with force:true to recreate it" }));
                     continue;
                 }
-            }
-            if connection_dropped {
-                failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
-                    "reason": "connection-dropped" }));
-                continue;
             }
             if dry_run {
                 restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
@@ -767,10 +766,7 @@ async fn restore_tabs(
                 continue;
             }
 
-            // WRITE-AHEAD: record in-progress BEFORE the side-effect (:1532).
-            // The create body carries the deterministic restoreKey recorded in
-            // the fresh-agent ledger, closing the crash window between THIS
-            // write and the post-create terminalId record (`:632`).
+            // Write ahead before create; restoreKey reconciles the crash window.
             marker.insert(
                 pk.clone(),
                 PaneMark {
@@ -814,9 +810,7 @@ async fn restore_tabs(
             if !(status.is_success()
                 && resp_body.get("status").and_then(Value::as_str) == Some("ok"))
             {
-                // Create failed -> no NEW side-effect. Restore the PRIOR marker entry
-                // (never DISCARD a previously-restored record — :1497); drop the
-                // write-ahead placeholder only when there was no prior entry.
+                // A failed create restores any prior marker entry.
                 match &prior_mark {
                     Some(pm) => {
                         marker.insert(pk.clone(), pm.clone());
@@ -837,10 +831,7 @@ async fn restore_tabs(
             let ui_command = data.get("uiCommand").cloned().and_then(|value| {
                 serde_json::from_value::<freshell_protocol::ServerMessage>(value).ok()
             });
-            // Record the terminalId (still in-progress until acked) and PERSIST it
-            // IMMEDIATELY — this shrinks the crash-between-create-and-marker window
-            // to a single fsync-rename, so a retry reconciles the live terminal by
-            // its recorded id instead of duplicating it (:1532).
+            // Persist the terminal id while it remains in-progress until acked.
             marker.insert(
                 pk.clone(),
                 PaneMark {
@@ -869,11 +860,18 @@ async fn restore_tabs(
                 );
             }
 
-            // Deliver and acknowledge on the exact target selected above. A
-            // newly-connected socket cannot receive or acknowledge this frame.
+            // Deliver and fence on the exact selected target.
             let delivered = target_client_id
                 .zip(ui_command)
-                .is_some_and(|(target, command)| state.screenshots.send_to_client(target, command));
+                .is_some_and(|(target, command)| {
+                    let sent = state.screenshots.send_to_client(target, command);
+                    if sent {
+                        state
+                            .fresh_agent
+                            .mark_restore_key_delivered(&restore_key, target);
+                    }
+                    sent
+                });
             let confirmed = if delivered {
                 confirm_delivery(
                     &state,
@@ -896,9 +894,7 @@ async fn restore_tabs(
                 restored.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,
                     "tabId": data.get("tabId").cloned().unwrap_or(Value::Null), "terminalId": terminal_id }));
             } else if target_client_id.is_some() {
-                // A real client that stopped answering == dropped mid-restore. The
-                // terminal WAS created (recorded in-progress with its id for the
-                // next run's reconciliation); it is reported failed, NOT restored.
+                // Keep the created terminal in-progress for a safe retry.
                 delivery_confirmed = false;
                 connection_dropped = true;
                 failed.push(json!({ "tabKey": tab_key, "paneId": pane_id, "kind": kind,

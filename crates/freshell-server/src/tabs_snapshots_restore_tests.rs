@@ -371,7 +371,7 @@ async fn restore_round_trips_non_default_pane_state_to_the_client() {
                 "t3",
                 "editor",
                 json!({ "filePath": "/tmp/x.md", "language": "markdown",
-                        "readOnly": true, "viewMode": "rendered", "wordWrap": false }),
+                        "readOnly": true, "viewMode": "preview", "wordWrap": false }),
             ),
         ],
     );
@@ -399,7 +399,7 @@ async fn restore_round_trips_non_default_pane_state_to_the_client() {
     let ed = by_kind("editor");
     assert_eq!(ed["paneContent"]["language"], "markdown");
     assert_eq!(ed["paneContent"]["readOnly"], true);
-    assert_eq!(ed["paneContent"]["viewMode"], "rendered");
+    assert_eq!(ed["paneContent"]["viewMode"], "preview");
     assert_eq!(ed["paneContent"]["wordWrap"], false);
 }
 
@@ -408,8 +408,9 @@ async fn crash_window_terminal_reconciles_via_restore_key_ledger() {
     // CRASH WINDOW (`:632`), terminal leg: the create succeeded but NEITHER
     // marker write after it landed (in-progress entry with NO terminalId on
     // disk). The create was tagged with the deterministic restoreKey, so a
-    // same-process retry finds the live terminal in the fresh-agent ledger
-    // and RECONCILES it instead of spawning a duplicate.
+    // same-process retry finds the live terminal and its DEFERRED tab.create
+    // in the fresh-agent ledger. The retry must deliver that command before
+    // accepting the screenshot fence, without spawning a duplicate.
     let dir = tempfile::tempdir().unwrap();
     seed_records(
         dir.path(),
@@ -426,8 +427,10 @@ async fn crash_window_terminal_reconciles_via_restore_key_ledger() {
     let source_id = union_source_id(dir.path(), "dev-1");
     let pk = pane_key("dev-1:t1", "p-t1");
     let key = restore_key_for("dev-1", &source_id, &pk);
-    // Simulate the crash-window state: the create ran (tagged with the key)...
-    let resp = freshell_freshagent::terminal_tabs::create_terminal_or_content_tab(
+    let mut rx = r.bus.subscribe();
+    // Exercise the production restore create path: the process was created,
+    // but the deferred tab.create was never sent.
+    let resp = freshell_freshagent::terminal_tabs::create_terminal_or_content_tab_deferred(
         r.state.fresh_agent.clone(),
         json!({ "mode": "shell", "cwd": "/tmp", "restoreKey": key }),
     )
@@ -463,6 +466,295 @@ async fn crash_window_terminal_reconciles_via_restore_key_ledger() {
     assert_eq!(rec0["reconciled"], true, "{body}");
     assert_eq!(rec0["terminalId"], tid.as_str(), "no duplicate: {body}");
     assert_eq!(body["failed"].as_array().unwrap().len(), 0);
+    let creates = tab_creates(&drain(&mut rx));
+    assert_eq!(
+        creates.len(),
+        1,
+        "retry must deliver deferred create: {body}"
+    );
+    assert_eq!(creates[0]["terminalId"], tid);
+}
+
+#[tokio::test]
+async fn reconciled_delivery_drop_fails_and_stops_before_later_panes() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![
+            rec(
+                "t1",
+                "terminal",
+                json!({ "mode": "shell", "initialCwd": "/tmp" }),
+            ),
+            rec(
+                "t2",
+                "terminal",
+                json!({ "mode": "shell", "initialCwd": "/tmp" }),
+            ),
+        ],
+    );
+    let r = rig(dir.path());
+    let source_id = union_source_id(dir.path(), "dev-1");
+    let first_pk = pane_key("dev-1:t1", "p-t1");
+    let key = restore_key_for("dev-1", &source_id, &first_pk);
+    let resp = freshell_freshagent::terminal_tabs::create_terminal_or_content_tab_deferred(
+        r.state.fresh_agent.clone(),
+        json!({ "mode": "shell", "cwd": "/tmp", "restoreKey": key }),
+    )
+    .await;
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let first_tid = created["data"]["terminalId"].as_str().unwrap().to_string();
+    let mut panes = Marker::new();
+    panes.insert(
+        first_pk,
+        PaneMark {
+            state: "in-progress".into(),
+            terminal_id: Some(first_tid.clone()),
+        },
+    );
+    let mut doc = MarkerDoc::new();
+    doc.insert(source_id, (0, panes));
+    write_marker_doc(&device_dir(dir.path(), "dev-1"), &doc).unwrap();
+
+    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let frames_for_sink = frames.clone();
+    r.state.screenshots.add_capable_client(
+        811,
+        std::sync::Arc::new(move |message| {
+            frames_for_sink
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(message).unwrap());
+        }),
+    );
+    let body = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await
+    .1;
+
+    assert_eq!(body["restored"].as_array().unwrap().len(), 0, "{body}");
+    assert_eq!(body["skipped"].as_array().unwrap().len(), 0, "{body}");
+    assert_eq!(
+        body["failed"][0]["reason"], "delivery-unconfirmed",
+        "{body}"
+    );
+    assert_eq!(body["failed"][0]["terminalId"], first_tid, "{body}");
+    assert_eq!(body["failed"][1]["reason"], "connection-dropped", "{body}");
+    let creates = tab_creates(&frames.lock().unwrap());
+    assert_eq!(creates.len(), 1, "later pane must not be created: {body}");
+    assert_eq!(
+        r.terminals.inventory().len(),
+        1,
+        "only reconciled terminal exists"
+    );
+}
+
+#[tokio::test]
+async fn retry_replays_create_when_target_connection_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "terminal",
+            json!({ "mode": "shell", "initialCwd": "/tmp" }),
+        )],
+    );
+    let r = rig(dir.path());
+    let first_on = std::sync::Arc::new(AtomicBool::new(false));
+    let first_client = spawn_browser(&r, first_on);
+    let first = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await
+    .1;
+    let terminal_id = first["failed"][0]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.state.screenshots.remove_capable_client(first_client);
+
+    let second_on = std::sync::Arc::new(AtomicBool::new(true));
+    let _second_client = spawn_browser(&r, second_on);
+    let mut rx = r.bus.subscribe();
+    let second = post(
+        router(r.state.clone()),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await
+    .1;
+
+    assert_eq!(second["restored"][0]["terminalId"], terminal_id, "{second}");
+    let creates = tab_creates(&drain(&mut rx));
+    assert_eq!(
+        creates.len(),
+        1,
+        "new target must receive the existing terminal's create: {second}"
+    );
+    assert_eq!(creates[0]["terminalId"], terminal_id);
+}
+
+#[tokio::test]
+async fn force_recreates_content_pane_in_same_server_process() {
+    for (kind, payload) in [
+        (
+            "browser",
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
+        ),
+        (
+            "editor",
+            json!({ "filePath": "/tmp/x.md", "language": "markdown", "readOnly": false,
+                    "viewMode": "preview", "wordWrap": true }),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        seed_records(dir.path(), "dev-1", "c1", 1, vec![rec("t1", kind, payload)]);
+        let (r, _on, _client) = connected(dir.path());
+        let first = post(
+            router(r.state.clone()),
+            "/api/tabs-sync/restore",
+            json!({ "deviceId": "dev-1" }),
+            true,
+        )
+        .await
+        .1;
+        let original_tab_id = first["restored"][0]["tabId"].as_str().unwrap().to_string();
+        let mut rx = r.bus.subscribe();
+        let forced = post(
+            router(r.state.clone()),
+            "/api/tabs-sync/restore",
+            json!({ "deviceId": "dev-1", "force": true }),
+            true,
+        )
+        .await
+        .1;
+
+        assert_eq!(forced["restored"].as_array().unwrap().len(), 1, "{forced}");
+        assert_ne!(forced["restored"][0]["tabId"], original_tab_id, "{forced}");
+        assert_ne!(forced["restored"][0]["reconciled"], true, "{forced}");
+        let frames = drain(&mut rx);
+        let closes: Vec<_> = frames
+            .iter()
+            .filter(|v| v["command"] == "tab.close")
+            .collect();
+        assert_eq!(closes.len(), 1, "{kind}: force should retire stale tab");
+        assert_eq!(closes[0]["payload"]["id"], original_tab_id);
+        assert_eq!(tab_creates(&frames).len(), 1, "{kind}: missing create");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_restore_survives_production_device_eviction_interleaving() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..freshell_ws::tabs_persist::MAX_SNAPSHOT_DEVICES {
+        let device = format!("dev-{n:03}");
+        seed_records(
+            dir.path(),
+            &device,
+            "c1",
+            1,
+            vec![rec(
+                "t1",
+                "terminal",
+                json!({ "mode": "shell", "initialCwd": "/tmp" }),
+            )],
+        );
+        let device_dir = device_dir(dir.path(), &device);
+        let generation = std::fs::read_dir(&device_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(&generation).unwrap()).unwrap();
+        value["capturedAt"] = json!(n as i64 + 1);
+        std::fs::write(generation, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+    let source_dir = device_dir(dir.path(), "dev-000");
+    let r = rig(dir.path());
+    let (fence_tx, fence_rx) = tokio::sync::oneshot::channel();
+    let fence_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(fence_tx)));
+    let fence_for_sink = fence_tx.clone();
+    r.state.screenshots.add_capable_client(
+        912,
+        std::sync::Arc::new(move |message| {
+            let value = serde_json::to_value(message).unwrap();
+            if value["command"] == "screenshot.capture" {
+                if let Some(tx) = fence_for_sink.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }),
+    );
+    let app = router(r.state.clone());
+    let restore = tokio::spawn(async move {
+        post(
+            app,
+            "/api/tabs-sync/restore",
+            json!({ "deviceId": "dev-000" }),
+            true,
+        )
+        .await
+        .1
+    });
+    fence_rx.await.expect("restore reached delivery fence");
+
+    seed_records(
+        dir.path(),
+        "dev-new-1",
+        "c1",
+        1,
+        vec![rec(
+            "new1",
+            "terminal",
+            json!({ "mode": "shell", "initialCwd": "/tmp" }),
+        )],
+    );
+    assert!(source_dir.exists(), "active restore source was evicted");
+    assert!(
+        source_dir.join(RESTORE_MARKER).exists(),
+        "active restore marker was evicted"
+    );
+    let body = restore.await.unwrap();
+    assert_eq!(
+        body["failed"][0]["reason"], "delivery-unconfirmed",
+        "{body}"
+    );
+
+    seed_records(
+        dir.path(),
+        "dev-new-2",
+        "c1",
+        1,
+        vec![rec(
+            "new2",
+            "terminal",
+            json!({ "mode": "shell", "initialCwd": "/tmp" }),
+        )],
+    );
+    assert!(
+        !source_dir.exists(),
+        "source should be evictable after restore lease release"
+    );
 }
 
 #[tokio::test]
@@ -480,7 +772,7 @@ async fn crash_window_content_pane_fails_needs_operator_not_silent_recreate() {
         vec![rec(
             "t2",
             "browser",
-            json!({ "url": "https://example.com" }),
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
         )],
     );
     let source_id = union_source_id(dir.path(), "dev-1");
@@ -600,7 +892,11 @@ async fn restore_panes_filter_restores_only_requested_and_rejects_unknown() {
                 "terminal",
                 json!({ "mode": "shell", "initialCwd": "/tmp" }),
             ),
-            rec("t2", "browser", json!({ "url": "https://example.com" })),
+            rec(
+                "t2",
+                "browser",
+                json!({ "url": "https://example.com", "devToolsOpen": false }),
+            ),
         ],
     );
     let (r, _on, _h) = connected(dir.path());

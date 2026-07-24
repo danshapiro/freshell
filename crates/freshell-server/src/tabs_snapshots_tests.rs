@@ -294,11 +294,15 @@ fn mixed_records() -> Vec<Value> {
             "terminal",
             json!({ "mode": "shell", "initialCwd": "/tmp" }),
         ),
-        rec("t2", "browser", json!({ "url": "https://example.com" })),
+        rec(
+            "t2",
+            "browser",
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
+        ),
         rec(
             "t3",
             "fresh-agent",
-            json!({ "provider": "claude",
+            json!({ "provider": "claude", "sessionType": "freshclaude",
                 "sessionRef": { "provider": "claude", "sessionId": "x" } }),
         ),
     ]
@@ -405,7 +409,7 @@ async fn restore_rejects_non_boolean_control_flags() {
         vec![rec(
             "t1",
             "browser",
-            json!({ "url": "https://example.com" }),
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
         )],
     );
     for (field, value) in [
@@ -445,7 +449,7 @@ async fn dry_run_reads_and_classifies_the_restore_marker() {
         vec![rec(
             "t1",
             "browser",
-            json!({ "url": "https://example.com" }),
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
         )],
     );
     let (connected_rig, _on, _client) = connected(dir.path());
@@ -538,7 +542,7 @@ async fn connection_churn_cannot_redirect_delivery_or_acknowledgement() {
         vec![rec(
             "t1",
             "browser",
-            json!({ "url": "https://example.com" }),
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
         )],
     );
     let r = rig(dir.path());
@@ -622,13 +626,12 @@ async fn restore_rejects_mismatched_or_malformed_session_ref_before_spawning() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["restored"].as_array().unwrap().len(), 0);
-    let failed = body["failed"].as_array().unwrap();
-    assert_eq!(failed.len(), 2);
-    assert!(failed
-        .iter()
-        .all(|f| f["reason"] == "session-identity-mismatch"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "snapshot store unreadable");
+    assert!(
+        r.terminals.inventory().is_empty(),
+        "semantic validation must fail before spawning"
+    );
 }
 
 #[tokio::test]
@@ -932,6 +935,7 @@ async fn force_preserves_prior_marker_and_never_duplicates_live_terminal() {
         .as_str()
         .unwrap()
         .to_string();
+    let first_tab_id = first["restored"][0]["tabId"].as_str().unwrap().to_string();
     let forced = post(
         router(r.state.clone()),
         "/api/tabs-sync/restore",
@@ -940,14 +944,12 @@ async fn force_preserves_prior_marker_and_never_duplicates_live_terminal() {
     )
     .await
     .1;
-    assert_eq!(
-        forced["restored"][0]["reconciled"], true,
-        "force must not recreate a live terminal"
-    );
+    assert_eq!(forced["restored"][0]["forcedReplacement"], true);
     assert_eq!(
         forced["restored"][0]["terminalId"], tid,
         "no duplicate under force"
     );
+    assert_ne!(forced["restored"][0]["tabId"], first_tab_id);
     // The marker STILL records t1 restored -- force did not discard prior history.
     assert_eq!(
         marker_panes(dir.path(), "dev-1")[pane_key("dev-1:t1", "p-t1").as_str()]["state"],
