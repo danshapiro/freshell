@@ -102,30 +102,24 @@ describe('countTrackerTurnCompleteSignals', () => {
 
 describe('turn-complete side-effect gating', () => {
   it('allows client-minted live turn completion only for non-server-authoritative modes', () => {
-    expect(shouldAllowTerminalOutputSideEffect({
-      source: 'live',
-      effect: 'turn_complete',
-      mode: 'opencode',
-    })).toBe(true)
+    // Truly-idle alerting: all four terminal CLIs are server-authoritative
+    // (terminal.idle broadcast) — the client must not mint completions for them.
+    for (const mode of ['claude', 'codex', 'opencode', 'amplifier'] as const) {
+      expect(shouldAllowTerminalOutputSideEffect({
+        source: 'live',
+        effect: 'turn_complete',
+        mode,
+      })).toBe(false)
+    }
     expect(shouldAllowTerminalOutputSideEffect({
       source: 'live',
       effect: 'turn_complete',
       mode: 'shell',
     })).toBe(true)
     expect(shouldAllowTerminalOutputSideEffect({
-      source: 'live',
-      effect: 'turn_complete',
-      mode: 'claude',
-    })).toBe(false)
-    expect(shouldAllowTerminalOutputSideEffect({
-      source: 'live',
-      effect: 'turn_complete',
-      mode: 'codex',
-    })).toBe(false)
-    expect(shouldAllowTerminalOutputSideEffect({
       source: 'replay',
       effect: 'turn_complete',
-      mode: 'opencode',
+      mode: 'shell',
     })).toBe(false)
   })
 })
