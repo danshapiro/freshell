@@ -23,6 +23,19 @@ describe('resolveRustServerBin (fail-closed override, :2015)', () => {
     expect(r).toEqual({ bin: f, source: 'override' })
     expect(rustServerBinSha256(f)).toMatch(/^[0-9a-f]{64}$/)
   })
+  it('resolves a slashless override once so validation and spawn select the same file', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ovr-relative-'))
+    const f = path.join(cwd, 'historical-server')
+    fs.writeFileSync(f, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const r = resolveRustServerBin(
+      { FRESHELL_E2E_RUST_SERVER_BIN: 'historical-server' },
+      buildHead,
+      cwd,
+    )
+    expect(r).toEqual({ bin: f, source: 'override' })
+    expect(path.isAbsolute(r.bin)).toBe(true)
+    expect(rustServerBinSha256(r.bin)).toMatch(/^[0-9a-f]{64}$/)
+  })
   it('falls back to the built HEAD binary when the override is UNSET', () => {
     expect(resolveRustServerBin({}, buildHead)).toEqual({ bin: '/BUILT/head/freshell-server', source: 'built' })
   })

@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import os from 'node:os'
 import path from 'node:path'
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { RustServer } from '../helpers/rust-server.js'
@@ -533,6 +534,69 @@ esac
       }
       expect(result.code).not.toBe(0)
       expect(result.out).toMatch(/generation index changed mid-capture|server too busy/i)
+      expect(await fs.readFile(out, 'utf8')).toBe('PRIOR_GOOD_ARTIFACT')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  test('capture aborts on a device-map rename failure and preserves the prior artifact', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-mv-fault-'))
+    try {
+      const binDir = path.join(tmp, 'bin')
+      const out = path.join(tmp, 'capture.json')
+      await fs.mkdir(binDir)
+      await fs.writeFile(out, 'PRIOR_GOOD_ARTIFACT')
+      await fs.writeFile(path.join(binDir, 'curl'), `#!/usr/bin/env bash
+set -euo pipefail
+url="\${!#}"
+case "$url" in
+  */api/tabs-sync/snapshots/dev-1)
+    printf '%s' '{"deviceId":"dev-1","deviceLabel":"Device","snapshotRevision":2,"capturedAt":20,"records":[]}'
+    ;;
+  */api/tabs-sync/snapshots)
+    printf '%s' '{"devices":[{"deviceId":"dev-1","capturedAt":20,"generations":[{"generation":0,"generationId":"digest-a","clientInstanceId":"client-a","capturedAt":20,"snapshotRevision":2}]}]}'
+    ;;
+  */api/terminals)
+    printf '%s' '[]'
+    ;;
+  *)
+    echo "unexpected URL: $url" >&2
+    exit 91
+    ;;
+esac
+`, { mode: 0o755 })
+      await fs.writeFile(path.join(binDir, 'mv'), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == *.new ]]; then
+  echo "injected per-device mv failure" >&2
+  exit 88
+fi
+exec "$REAL_MV" "$@"
+`, { mode: 0o755 })
+      const realMv = ['/usr/bin/mv', '/bin/mv'].find((candidate) => fsSync.existsSync(candidate))
+      if (!realMv) throw new Error('test requires a real mv binary')
+
+      let result: { code: number, out: string }
+      try {
+        const { stdout, stderr } = await run(
+          'scripts/deploy-tab-diff.sh',
+          ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out],
+          {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              PATH: `${binDir}:${process.env.PATH}`,
+              REAL_MV: realMv,
+            },
+          },
+        )
+        result = { code: 0, out: `${stdout}${stderr}` }
+      } catch (err: any) {
+        result = { code: err.code ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` }
+      }
+      expect(result.code).not.toBe(0)
+      expect(result.out).toMatch(/publishing device map entry failed/i)
       expect(await fs.readFile(out, 'utf8')).toBe('PRIOR_GOOD_ARTIFACT')
     } finally {
       await fs.rm(tmp, { recursive: true, force: true })

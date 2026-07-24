@@ -110,10 +110,14 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
 export function resolveRustServerBin(
   env: NodeJS.ProcessEnv,
   buildHead: () => string = ensureRustServerBuilt,
+  cwd: string = process.cwd(),
 ): { bin: string; source: 'override' | 'built' } {
   const overrideBin = env.FRESHELL_E2E_RUST_SERVER_BIN
   if (overrideBin !== undefined && overrideBin.trim() !== '') {
-    const p = overrideBin.trim()
+    // Resolve once, then use this exact absolute path for validation, hashing,
+    // and spawn. In particular, a slashless override must never be statted in
+    // cwd but later executed by PATH lookup as a different program.
+    const p = path.resolve(cwd, overrideBin.trim())
     let st: fs.Stats
     try {
       st = fs.statSync(p)

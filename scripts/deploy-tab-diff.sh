@@ -38,27 +38,42 @@ auth=(-H "x-auth-token: ${TOKEN}")
 # INCOHERENT and returns 3 so the caller can retry, never emitting an artifact
 # whose .devices and .bundles describe different generations.
 fetch_state() {
-  local snaps_tmp snaps2_tmp dev_tmp term_tmp out_tmp d enc snap_tmp
-  snaps_tmp=$(mktemp); snaps2_tmp=$(mktemp); dev_tmp=$(mktemp); term_tmp=$(mktemp); out_tmp=$(mktemp)
-  _cleanup_fetch() { rm -f "$snaps_tmp" "$snaps2_tmp" "$dev_tmp" "$term_tmp" "$out_tmp"; }
+  local snaps_tmp="" snaps2_tmp="" dev_tmp="" term_tmp="" out_tmp="" ids_tmp=""
+  local d enc snap_tmp proj_before proj_after
+  _cleanup_fetch() { rm -f -- "$snaps_tmp" "$snaps2_tmp" "$dev_tmp" "$term_tmp" "$out_tmp" "$ids_tmp"; }
+  snaps_tmp=$(mktemp) || { echo "ERROR: creating snapshots temp file failed" >&2; return 1; }
+  snaps2_tmp=$(mktemp) || { echo "ERROR: creating coherence temp file failed" >&2; _cleanup_fetch; return 1; }
+  dev_tmp=$(mktemp) || { echo "ERROR: creating device-map temp file failed" >&2; _cleanup_fetch; return 1; }
+  term_tmp=$(mktemp) || { echo "ERROR: creating terminal temp file failed" >&2; _cleanup_fetch; return 1; }
+  out_tmp=$(mktemp) || { echo "ERROR: creating output temp file failed" >&2; _cleanup_fetch; return 1; }
+  ids_tmp=$(mktemp) || { echo "ERROR: creating device-id temp file failed" >&2; _cleanup_fetch; return 1; }
   # EXPLICIT curl/jq status checks throughout (never rely on `set -e` propagating
   # through a function called in an `if`, nor through process substitution -- the
   # :2544 failure-masking hazard). Any failure -> return 1, no partial artifact.
   if ! curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots" > "$snaps_tmp"; then
     echo "ERROR: GET /api/tabs-sync/snapshots failed" >&2; _cleanup_fetch; return 1; fi
   jq -e . "$snaps_tmp" >/dev/null || { echo "ERROR: /snapshots not JSON" >&2; _cleanup_fetch; return 1; }
-  printf '{}' > "$dev_tmp"
+  if ! printf '{}' > "$dev_tmp"; then
+    echo "ERROR: initializing device map failed" >&2; _cleanup_fetch; return 1; fi
+  if ! jq -j '.devices[].deviceId | . + "\u0000"' "$snaps_tmp" > "$ids_tmp"; then
+    echo "ERROR: extracting device ids failed" >&2; _cleanup_fetch; return 1; fi
   while IFS= read -r -d '' d; do
     [[ -n "$d" ]] || continue
-    enc=$(jq -rn --arg d "$d" '$d|@uri')
-    snap_tmp=$(mktemp)
+    if ! enc=$(jq -ern --arg d "$d" '$d|@uri'); then
+      echo "ERROR: URL encoding device id failed" >&2; _cleanup_fetch; return 1; fi
+    if ! snap_tmp=$(mktemp); then
+      echo "ERROR: creating device snapshot temp file failed" >&2; _cleanup_fetch; return 1; fi
     if ! curl -fsS "${auth[@]}" "${URL}/api/tabs-sync/snapshots/${enc}" > "$snap_tmp"; then
       echo "ERROR: GET /snapshots/$d failed" >&2; rm -f "$snap_tmp"; _cleanup_fetch; return 1; fi
     if ! jq --arg d "$d" --slurpfile s "$snap_tmp" '. + {($d): $s[0]}' "$dev_tmp" > "${dev_tmp}.new"; then
       echo "ERROR: merge failed for device $d" >&2; rm -f "$snap_tmp"; _cleanup_fetch; return 1; fi
-    mv "${dev_tmp}.new" "$dev_tmp"
-    rm -f "$snap_tmp"
-  done < <(jq -j '.devices[].deviceId | . + "\u0000"' "$snaps_tmp")
+    if ! mv "${dev_tmp}.new" "$dev_tmp"; then
+      echo "ERROR: publishing device map entry failed for $d" >&2
+      rm -f "$snap_tmp" "${dev_tmp}.new"; _cleanup_fetch; return 1
+    fi
+    if ! rm -f "$snap_tmp"; then
+      echo "ERROR: removing device snapshot temp file failed" >&2; _cleanup_fetch; return 1; fi
+  done < "$ids_tmp"
   # GET /api/terminals with NO read-model query params returns a RAW ARRAY
   # (terminals.rs:414); `.items` would be null. Keep the array as-is.
   if ! curl -fsS "${auth[@]}" "${URL}/api/terminals" > "$term_tmp"; then
@@ -75,29 +90,31 @@ fetch_state() {
   local proj='[.devices[] | { deviceId, generations: [.generations[] | {
     generation, generationId, clientInstanceId, capturedAt, snapshotRevision
   }] }] | sort_by(.deviceId)'
-  if [[ "$(jq -cS "$proj" "$snaps_tmp")" != "$(jq -cS "$proj" "$snaps2_tmp")" ]]; then
+  if ! proj_before=$(jq -ecS "$proj" "$snaps_tmp"); then
+    echo "ERROR: projecting initial generation index failed" >&2; _cleanup_fetch; return 1; fi
+  if ! proj_after=$(jq -ecS "$proj" "$snaps2_tmp"); then
+    echo "ERROR: projecting coherence generation index failed" >&2; _cleanup_fetch; return 1; fi
+  if [[ "$proj_before" != "$proj_after" ]]; then
     echo "WARN: generation index changed mid-capture (concurrent tabs-sync push); capture incoherent" >&2
     _cleanup_fetch; return 3; fi
   # Assemble the capture doc INCLUDING the immutable per-device bundle: the exact
   # set of per-client component generation ids at capture (all clients), so
   # remediation restores the SAME coherent union, never a single client (:2621).
   # Both .devices and .bundles derive from the SAME pinned index snapshot.
-  # Newest-per-client tie-break MIRRORS the server's `newest_per_client`
-  # (crates/freshell-ws/src/tabs_persist.rs): higher capturedAt wins; an equal-
-  # millisecond tie is broken by the greater filename, which for one client's
-  # files (same encoded prefix) is exactly the greater zero-padded
-  # snapshotRevision -- so max_by([capturedAt, snapshotRevision]) is the exact
-  # mirror (:69), never max_by(capturedAt) alone.
+  # Newest-per-client tie-break MIRRORS the server's monotonic-first
+  # `newest_per_client`: snapshotRevision wins, capturedAt breaks a tie, and
+  # generationId makes the projection deterministic.
   if ! jq -n --arg url "$URL" --slurpfile devices "$dev_tmp" --slurpfile terminals "$term_tmp" \
        --slurpfile snaps "$snaps_tmp" '
        { capturedAt: (now * 1000 | floor), url: $url,
          devices: $devices[0], terminals: $terminals[0],
          bundles: ($snaps[0].devices | map({ key: .deviceId, value: {
            components: (.generations | group_by(.clientInstanceId)
-                        | map(max_by([.capturedAt, .snapshotRevision]) | .generationId)),
+                        | map(max_by([.snapshotRevision, .capturedAt, .generationId]) | .generationId)),
            capturedAt: (.capturedAt // 0) } }) | from_entries) }' > "$out_tmp"; then
     echo "ERROR: assembling capture JSON failed" >&2; _cleanup_fetch; return 1; fi
-  cat "$out_tmp"
+  if ! cat "$out_tmp"; then
+    echo "ERROR: emitting capture JSON failed" >&2; _cleanup_fetch; return 1; fi
   _cleanup_fetch
 }
 
@@ -123,19 +140,41 @@ case "$CMD" in
     # the expected shape, THEN rename over the final artifact -- a same-fs
     # rename is atomic. Any failure leaves a prior good $OUT UNTOUCHED and
     # exits nonzero.
-    tmp_out=$(mktemp "$(dirname "$OUT")/.$(basename "$OUT").XXXXXX")
+    out_dir=${OUT%/*}; [[ "$out_dir" != "$OUT" ]] || out_dir="."
+    out_base=${OUT##*/}
+    if ! tmp_out=$(mktemp "${out_dir}/.${out_base}.XXXXXX"); then
+      echo "ERROR: creating capture temp file beside $OUT failed" >&2; exit 1
+    fi
     if ! fetch_state_coherent > "$tmp_out"; then
       echo "ERROR: capture failed (server unreachable/invalid/incoherent); previous $OUT left UNTOUCHED" >&2
       rm -f "$tmp_out"; exit 1
     fi
-    if ! jq -e '(.devices|type=="object") and (.terminals|type=="array") and (.capturedAt|type=="number")' \
+    if ! jq -e '
+         (.devices|type=="object")
+         and (.bundles|type=="object")
+         and (.terminals|type=="array")
+         and (.capturedAt|type=="number")
+         and ((.devices|keys) == (.bundles|keys))
+         and all(.devices | to_entries[];
+                 (.value|type=="object") and .value.deviceId == .key)
+         and all(.bundles | to_entries[];
+                 (.value|type=="object")
+                 and (.value.components|type=="array")
+                 and (.value.components|length > 0)
+                 and all(.value.components[]; type=="string" and length > 0))
+       ' \
          "$tmp_out" >/dev/null; then
-      echo "ERROR: capture produced invalid/empty JSON; previous $OUT left UNTOUCHED" >&2
+      echo "ERROR: capture produced invalid/incomplete JSON; previous $OUT left UNTOUCHED" >&2
       rm -f "$tmp_out"; exit 1
     fi
-    mv "$tmp_out" "$OUT"   # atomic rename over the final artifact
-    ndev=$(jq '.devices | length' "$OUT")
-    nrun=$(jq '[.terminals[] | select(.status=="running")] | length' "$OUT")
+    if ! mv "$tmp_out" "$OUT"; then
+      echo "ERROR: publishing capture artifact failed; previous $OUT left UNTOUCHED" >&2
+      rm -f "$tmp_out"; exit 1
+    fi
+    if ! ndev=$(jq -e '.devices | length' "$OUT"); then
+      echo "ERROR: counting captured devices failed" >&2; exit 1; fi
+    if ! nrun=$(jq -e '[.terminals[] | select(.status=="running")] | length' "$OUT"); then
+      echo "ERROR: counting captured terminals failed" >&2; exit 1; fi
     echo "captured ${ndev} device snapshot(s), ${nrun} running terminal(s) -> $OUT"
     ;;
   verify)
