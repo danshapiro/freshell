@@ -86,6 +86,14 @@ pub enum ErrorCode {
     RateLimited,
     Unauthorized,
     ProtocolMismatch,
+    /// Reconciliation handshake (`pane.reconcile.request`, design §4.3): the
+    /// request presented more than the 200-pane cap — answered with this error
+    /// instead of ever being silently truncated.
+    ReconcileTooLarge,
+    /// Reconciliation handshake (design §8): the verdict derivation itself
+    /// failed (poisoned lock, index handle error). The client keeps its state
+    /// and may re-send.
+    ReconcileUnavailable,
 }
 
 /// The three coding-agent providers (`claude | codex | opencode`).
