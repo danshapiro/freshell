@@ -5,7 +5,7 @@
 #
 #   scripts/restore-tabs.sh --url http://127.0.0.1:PORT --token TOK --list
 #   scripts/restore-tabs.sh --url http://127.0.0.1:PORT --token TOK \
-#       --device <deviceId> [--generation N | --generation-id ID] [--dry-run]
+#       --device <deviceId> [--generation N | --generation-id ID] [--force] [--dry-run]
 #
 # DEFAULT (no --generation/--generation-id): restores the COHERENT all-clients
 # UNION for the device -- no single client's tabs are dropped. Pass
@@ -18,7 +18,7 @@
 # server you did not intend.
 set -euo pipefail
 
-URL="" TOKEN="${FRESHELL_TOKEN:-}" DEVICE="" GENERATION="" GENERATION_ID="" COMPONENTS="" DRY_RUN=false LIST=false
+URL="" TOKEN="${FRESHELL_TOKEN:-}" DEVICE="" GENERATION="" GENERATION_ID="" COMPONENTS="" DRY_RUN=false FORCE=false LIST=false
 PANES=()   # repeatable --pane "tabKey#paneId": restore ONLY these panes (targeted remediation)
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --components) COMPONENTS="$2"; shift 2 ;;   # comma-separated generation ids (the deploy bundle)
     --pane) PANES+=("$2"); shift 2 ;;           # repeatable; server rejects unknown keys fail-closed
     --dry-run) DRY_RUN=true; shift ;;
+    --force) FORCE=true; shift ;;
     --list) LIST=true; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -71,7 +72,8 @@ fi
 # Send a selector ONLY when explicitly asked; otherwise the server restores the
 # coherent union (the safe multi-client default). Priority mirrors the server:
 # --components (immutable multi-client bundle) > --generation-id > --generation.
-body=$(jq -n --arg d "$DEVICE" --argjson dry "$DRY_RUN" '{deviceId: $d, dryRun: $dry}')
+body=$(jq -n --arg d "$DEVICE" --argjson dry "$DRY_RUN" --argjson force "$FORCE" \
+  '{deviceId: $d, dryRun: $dry, force: $force}')
 sel="union"
 if [[ -n "$COMPONENTS" ]]; then
   # Split the CSV into a JSON string array (no single-client substitution).
@@ -102,5 +104,18 @@ echo "$resp" | jq -r '
 restored=$(echo "$resp" | jq '.restored | length')
 skipped=$(echo "$resp" | jq '.skipped | length')
 failedn=$(echo "$resp" | jq '.failed | length')
+confirmed=$(echo "$resp" | jq -r '.deliveryConfirmed == true')
 echo "-- restored=${restored} skipped=${skipped} failed=${failedn}"
 [[ "$failedn" == "0" ]] || exit 1
+if $FORCE && [[ "$confirmed" != "true" ]]; then
+  echo "ERROR: forced restore was not confirmed by the target browser" >&2
+  exit 1
+fi
+if $FORCE && [[ "$restored" == "0" ]]; then
+  echo "ERROR: forced restore created no panes" >&2
+  exit 1
+fi
+if [[ ${#PANES[@]} -gt 0 && "$restored" == "0" ]]; then
+  echo "ERROR: targeted restore created no panes; rerun with --force if they are missing" >&2
+  exit 1
+fi

@@ -77,14 +77,15 @@ async function tabDiff(args: string[]) {
 }
 
 // Provably remove the CURRENT codex pane: find the codex tab from Redux (NOT a
-// stale pre-restart terminalId) and click its tab-strip close button
-// (data-tab-id + role=button name=/close/, exactly as tab-management.spec.ts:61-70).
+// stale pre-restart terminalId) and click its tab-strip close button by its
+// exact accessible name — /close/i alone is ambiguous here because the tab's
+// content area also exposes a "Close pane" button under the same data-tab-id.
 async function closeCodexTab(page: import('@playwright/test').Page, harness: TestHarness) {
   const before = await harness.getTabCount()
   const st = await harness.getState()
   const codexTab = st.tabs.tabs.find((t: any) => t.mode === 'codex')
   expect(codexTab, 'a codex tab exists to close').toBeTruthy()
-  await page.locator(`[data-tab-id="${codexTab.id}"]`).getByRole('button', { name: /close/i }).click()
+  await page.locator(`[data-tab-id="${codexTab.id}"]`).getByRole('button', { name: /close \(shift\+click to kill\)/i }).click()
   await harness.waitForTabCount(before - 1) // proves the pane is gone
 }
 
@@ -218,6 +219,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       // are never re-restored.
       expect(bad.out).toMatch(/--components [0-9a-f,]+/)
       expect(bad.out).toMatch(/--pane \S+/)
+      expect(bad.out).toMatch(/--force/)
       expect(bad.out).not.toMatch(/--generation-id/)
       expect(bad.out).not.toMatch(/--generation \d/)
 
@@ -233,7 +235,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       expect(paneArgs.length).toBeGreaterThan(0)
       const argvBefore = (await readArgvLog(argLogPath)).length
       const rem = await run('scripts/restore-tabs.sh',
-        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, ...paneArgs],
+        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, '--force', ...paneArgs],
         { cwd: process.cwd() })
       expect(rem.stdout).toContain('failed=0')
       await expect(async () => {
@@ -254,6 +256,21 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         const shellTabs = st.tabs.tabs.filter((t: any) => t.title === 'sh' || t.name === 'sh')
         expect(shellTabs.length, 'surviving shell tab must not be duplicated').toBeLessThanOrEqual(1)
         expect(await harness.getTabCount()).toBe(tabCountBeforeRemediation + 1) // codex back, nothing else
+      }).toPass({ timeout: 20_000 })
+
+      // Repeat recovery: remove the pane AFTER its marker says restored, then
+      // execute the same forced remediation again in the same server process.
+      // This is the path that used to return only `already-restored`/a fence.
+      const tabCountBeforeRepeat = await harness.getTabCount()
+      await closeCodexTab(page, harness)
+      const repeat = await run('scripts/restore-tabs.sh',
+        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, '--force', ...paneArgs],
+        { cwd: process.cwd() })
+      expect(repeat.stdout).toContain('restored=1')
+      expect(repeat.stdout).toContain('failed=0')
+      await expect(async () => {
+        expect(await codexPaneSession(harness)).toBe(SESSION_ID)
+        expect(await harness.getTabCount()).toBe(tabCountBeforeRepeat)
       }).toPass({ timeout: 20_000 })
     } finally {
       await server.stop()
@@ -316,6 +333,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     // Remediation uses the immutable MULTI-CLIENT bundle (BOTH component ids), not
     // a single-client --generation-id (:2621).
     expect(d.out).toMatch(/--components aaaa1111,bbbb2222/)
+    expect(d.out).toMatch(/--force/)
     expect(d.out).not.toMatch(/--generation-id/)
     // ...and is TARGETED (:175): one --pane per diverged paneKey, so a restore
     // of the whole union (which would duplicate healthy panes) is never printed.
@@ -341,6 +359,100 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     expect(g.out).toContain('T-uncovered')            // names the uncovered terminal
     expect(g.out).not.toContain('T-covered')          // the covered one is NOT flagged
     await fs.rm(tmp, { recursive: true, force: true })
+  })
+
+  test('targeted restore fails on an all-skipped response and passes force through to the API', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'restore-tabs-contract-'))
+    try {
+      const binDir = path.join(tmp, 'bin')
+      const requestBody = path.join(tmp, 'request.json')
+      await fs.mkdir(binDir)
+      await fs.writeFile(path.join(binDir, 'curl'), `#!/usr/bin/env bash
+set -euo pipefail
+body=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-d" ]]; then
+    body="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+printf '%s' "$body" > "$FAKE_CURL_BODY"
+printf '%s' "$FAKE_CURL_RESPONSE"
+`, { mode: 0o755 })
+      const invoke = async (response: unknown, force = false) => {
+        const args = [
+          '--url', 'http://unused.invalid',
+          '--token', 't',
+          '--device', 'dev-1',
+          '--pane', 'dev-1:work#pane-1',
+          ...(force ? ['--force'] : []),
+        ]
+        try {
+          const { stdout, stderr } = await run('scripts/restore-tabs.sh', args, {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              PATH: `${binDir}:${process.env.PATH}`,
+              FAKE_CURL_BODY: requestBody,
+              FAKE_CURL_RESPONSE: JSON.stringify(response),
+            },
+          })
+          return { code: 0, out: `${stdout}${stderr}` }
+        } catch (err: any) {
+          return { code: err.code ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` }
+        }
+      }
+
+      const skipped = await invoke({
+        deliveryConfirmed: true,
+        restored: [],
+        skipped: [{
+          tabKey: 'dev-1:work',
+          paneId: 'pane-1',
+          kind: 'terminal',
+          reason: 'already-restored',
+        }],
+        failed: [],
+      })
+      expect(skipped.code).not.toBe(0)
+      expect(skipped.out).toContain('targeted restore created no panes')
+      expect(JSON.parse(await fs.readFile(requestBody, 'utf8')).force).toBe(false)
+
+      const unconfirmed = await invoke({
+        deliveryConfirmed: false,
+        restored: [{
+          tabKey: 'dev-1:work',
+          paneId: 'pane-1',
+          kind: 'terminal',
+          tabId: 'undelivered-tab',
+          terminalId: 'existing-terminal',
+        }],
+        skipped: [],
+        failed: [],
+      }, true)
+      expect(unconfirmed.code).not.toBe(0)
+      expect(unconfirmed.out).toContain('forced restore was not confirmed')
+
+      const forced = await invoke({
+        deliveryConfirmed: true,
+        restored: [{
+          tabKey: 'dev-1:work',
+          paneId: 'pane-1',
+          kind: 'terminal',
+          tabId: 'replacement-tab',
+          terminalId: 'existing-terminal',
+        }],
+        skipped: [],
+        failed: [],
+      }, true)
+      expect(forced.code).toBe(0)
+      expect(forced.out).toContain('restored=1')
+      expect(JSON.parse(await fs.readFile(requestBody, 'utf8')).force).toBe(true)
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
   })
 
   test('capture rejects same-digest generation churn and preserves the prior artifact', async () => {

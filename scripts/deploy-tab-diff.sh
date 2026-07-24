@@ -238,7 +238,7 @@ case "$CMD" in
       done < <(jq -j --arg d "$dev" \
         '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
         <<<"$DIFF")
-      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s%s\n' \
+      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s --force%s\n' \
         "$URL" "$dev" "$comps" "$pane_args"
     done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$DIFF")
     cleanup; exit 1
