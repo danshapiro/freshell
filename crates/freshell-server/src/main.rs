@@ -348,7 +348,27 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
         .with_opencode_locator(opencode_locator.clone());
+    // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
+    // registry tap (installed right below), broadcasts *.activity.updated /
+    // terminal.turn.complete / terminal.idle on the shared bus, and answers
+    // the *.activity.list requests. The resolver maps a RESUMED amplifier
+    // terminal's session id to its events.jsonl (one bounded projects walk at
+    // create time — fresh sessions instead get their path from the locator's
+    // association, see `amplifier_association`).
+    let activity_hub = {
+        let resolver: Option<freshell_ws::activity::AmplifierEventsPathResolver> =
+            session_directory::provider_home().map(|h| {
+                let projects_root =
+                    freshell_sessions::amplifier::amplifier_home(&h).join("projects");
+                Arc::new(move |session_id: &str| {
+                    resolve_amplifier_events_path(&projects_root, session_id)
+                }) as freshell_ws::activity::AmplifierEventsPathResolver
+            });
+        freshell_ws::activity::ActivityHub::new(Arc::clone(&broadcast_tx), resolver)
+    };
+    registry.set_activity_observer(activity_hub.registry_observer());
     let ws_state = WsState {
+        activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
@@ -975,6 +995,27 @@ fn resolve_bind_host() -> String {
 /// Resolve the isolated home whose `.freshell/config.json` supplies the network
 /// overlay. `FRESHELL_HOME` takes precedence over `HOME` (matches the harness,
 /// which sets both to the same temp dir).
+/// TERM-15: resolve a RESUMED amplifier terminal's session id to its
+/// `events.jsonl` — one bounded walk of `<amplifier_home>/projects/*/sessions/
+/// <id>/events.jsonl` at terminal-create time (the session dir already exists
+/// for a resume; fresh sessions get their path from the locator association
+/// instead). `None` when the dir/file doesn't exist — the activity hub then
+/// simply runs the PTY-only provisional lane for that terminal.
+fn resolve_amplifier_events_path(projects_root: &Path, session_id: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(projects_root).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry
+            .path()
+            .join("sessions")
+            .join(session_id)
+            .join("events.jsonl");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn resolve_home() -> Option<PathBuf> {
     std::env::var("FRESHELL_HOME")
         .ok()
