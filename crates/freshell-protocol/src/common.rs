@@ -88,13 +88,17 @@ pub enum ErrorCode {
     ProtocolMismatch,
 }
 
-/// The three coding-agent providers (`claude | codex | opencode`).
+/// The coding-agent providers (`claude | codex | opencode | amplifier`).
+/// `amplifier` matches the legacy `TerminalTurnCompleteSchema.provider` enum
+/// (`shared/ws-protocol.ts:192`) — required by the TERM-16 turn-complete
+/// broadcast for amplifier terminal panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
     Claude,
     Codex,
     Opencode,
+    Amplifier,
 }
 
 /// fresh-agent session flavour.
@@ -329,6 +333,28 @@ pub struct ClaudeActivityRecord {
 pub struct CodexActivityRecord {
     pub terminal_id: String,
     pub phase: CodexPhase,
+    pub updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// `AmplifierActivityRecordSchema.phase` (`shared/ws-protocol.ts:169`) —
+/// extension surface, see `tests/activity_extension.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AmplifierPhase {
+    Idle,
+    Busy,
+}
+
+/// `AmplifierActivityRecordSchema` (`shared/ws-protocol.ts:166-171`) —
+/// extension surface (the frozen T0 inventory predates the amplifier
+/// provider's activity family; the frozen client already consumes it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityRecord {
+    pub terminal_id: String,
+    pub phase: AmplifierPhase,
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,

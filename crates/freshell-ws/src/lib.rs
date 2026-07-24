@@ -20,6 +20,7 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
 pub mod identity;
@@ -217,6 +218,13 @@ pub struct WsState {
     /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
     /// provider-parameterized locator was explicitly rejected).
     pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// TERM-15/TERM-16: the terminal-mode CLI activity hub (claude/codex/
+    /// amplifier trackers + the truly-idle gate + the amplifier events
+    /// lanes). `None` in unit tests that never exercise activity; always
+    /// `Some` on a real boot (`freshell-server` constructs it and installs
+    /// its registry observer). `*.activity.list` requests answer with empty
+    /// lists when `None` — same wire shape as "no busy terminals".
+    pub activity: Option<crate::activity::ActivityHub>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -667,6 +675,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            activity: None,
         }
     }
 

@@ -88,6 +88,7 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        activity: None,
     };
 
     let router = freshell_ws::router(state);

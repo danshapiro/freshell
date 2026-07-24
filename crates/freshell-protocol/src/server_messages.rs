@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    AgentProvider, ClaudeActivityRecord, CodexActivityRecord, CodexDurability, ErrorCode,
-    OpencodeActivityRecord, SessionLocator, TerminalMetaRecord, TurnCompletionSnapshot,
+    AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
+    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
+    TurnCompletionSnapshot,
 };
 use crate::settings::ServerSettings;
 
@@ -16,6 +17,13 @@ use crate::settings::ServerSettings;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    // Extension surface (not in the frozen T0 inventory — see
+    // `EXTENSION_SERVER_MESSAGE_TYPES`): the amplifier activity family the
+    // frozen client already consumes, mirroring the legacy zod schemas.
+    #[serde(rename = "amplifier.activity.list.response")]
+    AmplifierActivityListResponse(AmplifierActivityListResponse),
+    #[serde(rename = "amplifier.activity.updated")]
+    AmplifierActivityUpdated(AmplifierActivityUpdated),
     #[serde(rename = "claude.activity.list.response")]
     ClaudeActivityListResponse(ClaudeActivityListResponse),
     #[serde(rename = "claude.activity.updated")]
@@ -94,6 +102,11 @@ pub enum ServerMessage {
     TerminalDetached(TerminalIdOnly),
     #[serde(rename = "terminal.exit")]
     TerminalExit(TerminalExit),
+    // Extension surface (TERM-16 follow-on, not in the frozen T0 inventory):
+    // the NEW truly-idle edge — `{ terminalId, at, reason }`, emitted ONCE per
+    // busy→truly-idle transition. See `EXTENSION_SERVER_MESSAGE_TYPES`.
+    #[serde(rename = "terminal.idle")]
+    TerminalIdle(TerminalIdle),
     #[serde(rename = "terminal.input.blocked")]
     TerminalInputBlocked(TerminalInputBlocked),
     #[serde(rename = "terminal.inventory")]
@@ -177,6 +190,19 @@ pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
     "terminal.turn.complete",
     "terminals.changed",
     "ui.command",
+];
+
+/// Extension server→client discriminants declared BEYOND the frozen T0
+/// inventory (`port/contract/ws-message-inventory.json`), which predates the
+/// legacy amplifier provider's activity family (`shared/ws-protocol.ts`
+/// `AmplifierActivity*Schema`) and the NEW `terminal.idle` capability
+/// (TERM-15/TERM-16 follow-on). Kept out of [`SERVER_MESSAGE_TYPES`] so
+/// `tests/inventory.rs` keeps pinning the frozen contract untouched; the
+/// extension shapes are pinned by `tests/activity_extension.rs`.
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 3] = [
+    "amplifier.activity.list.response",
+    "amplifier.activity.updated",
+    "terminal.idle",
 ];
 
 // ---------------------------------------------------------------------------
@@ -314,6 +340,51 @@ pub struct ExtensionServerNamed {
 }
 
 // --- activity families ------------------------------------------------------
+
+/// `AmplifierActivityListResponseSchema` (`shared/ws-protocol.ts:175-180`) —
+/// extension surface, see [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityListResponse {
+    pub request_id: String,
+    pub terminals: Vec<AmplifierActivityRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_turn_completions: Option<Vec<TurnCompletionSnapshot>>,
+}
+
+/// `AmplifierActivityUpdatedSchema` (`shared/ws-protocol.ts:182-186`) —
+/// extension surface, see [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityUpdated {
+    pub remove: Vec<String>,
+    pub upsert: Vec<AmplifierActivityRecord>,
+}
+
+/// `terminal.idle.reason` — why the server believes the terminal is truly
+/// idle: `grace` = a grace window passed with no new activity after the turn
+/// boundary; `queue-empty` = the provider positively reported no queued user
+/// prompt (reserved; every current CLI lane uses `grace`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalIdleReason {
+    #[serde(rename = "grace")]
+    Grace,
+    #[serde(rename = "queue-empty")]
+    QueueEmpty,
+}
+
+/// `terminal.idle` — the NEW truly-idle edge (pinned wire contract:
+/// `{ terminalId, at (server epoch ms), reason: 'grace' | 'queue-empty' }`),
+/// emitted ONCE per busy→truly-idle transition. Subagent/tool completions
+/// inside a running turn never produce it. Extension surface, see
+/// [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalIdle {
+    pub terminal_id: String,
+    pub at: i64,
+    pub reason: TerminalIdleReason,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

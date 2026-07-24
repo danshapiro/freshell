@@ -87,6 +87,7 @@ async fn spawn_server(hello_timeout_ms: u64) -> String {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        activity: None,
     };
 
     let router = freshell_ws::router(state);

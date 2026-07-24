@@ -56,5 +56,8 @@ pub use chunk_ring::{snapshot_seed_if_ring_empty, ChunkRingBuffer};
 pub use decode::Utf8StreamDecoder;
 pub use framing::{reassemble_stream, OutputFramer};
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};
-pub use registry::{compute_scrollback_max_bytes, AttachOutcome, FrameSink, TerminalRegistry};
+pub use registry::{
+    compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, FrameSink,
+    TerminalRegistry,
+};
 pub use replay_ring::{ReplayDeque, ReplayFrame, ReplayRing};

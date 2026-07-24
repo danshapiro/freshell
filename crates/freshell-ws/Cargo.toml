@@ -31,6 +31,15 @@ freshell-platform = { path = "../freshell-platform" }
 # across server restart, docs/plans/2026-07-18-amplifier-restore-spec.md) --
 # a pure/poll-based crate this crate arms/drains but doesn't own the fs logic of.
 freshell-sessions = { path = "../freshell-sessions" }
+# TERM-15/TERM-16: the terminal-mode CLI activity engine (claude/codex/amplifier
+# trackers, the amplifier events tailer/reducer, the truly-idle grace gate).
+# The hub in src/activity.rs drives these pure state machines.
+freshell-activity = { path = "../freshell-activity" }
+# TERM-15 amplifier events lane: inotify-based watcher on the associated
+# session's events.jsonl (same crate freshell-sessions' indexer uses; ADR
+# Decision 1.1). ZERO polling — reads happen only on change events or the
+# tracker's force-read failsafe.
+notify = "6"
 # The freshcodex WS fresh-agent slice (freshAgent.create/send → codex app-server). The
 # post-handshake loop dispatches the codex client→server messages to this shared state,
 # which spawns the app-server sidecar and broadcasts freshAgent.created/send.accepted/event.

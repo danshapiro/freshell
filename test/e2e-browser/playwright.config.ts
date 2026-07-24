@@ -132,6 +132,14 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
+        // TERM-15/TERM-16 — terminal-mode CLI activity (blue/busy), the
+        // server-authoritative terminal.turn.complete, and the NEW
+        // terminal.idle edge, all on the Rust activity engine
+        // (`crates/freshell-activity` + `crates/freshell-ws/src/activity.rs`).
+        // Rust-only: this is the Rust port's implementation of the legacy
+        // activity engine (and the amplifier scenario has the same absent-
+        // legacy-provider KNOWN DIVERGENCE as amplifier-restore-rust above).
+        /terminal-activity-rust\.spec\.ts$/,
         // CODEX-BOUNCE (2026-07-22 incident regression): a sidebar-resumed
         // codex pane must re-resume (`codex resume <id>` argv) across a
         // server restart WITHOUT a page reload. Rust-only: the bug was the
