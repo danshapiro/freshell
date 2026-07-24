@@ -22,10 +22,12 @@
 
 pub mod amplifier_association;
 pub mod backpressure;
+pub mod existence;
 pub mod identity;
 pub(crate) mod invariants;
 pub mod opencode_association;
 pub mod origin;
+pub mod reconcile;
 pub mod screenshot;
 pub mod tabs;
 pub mod tabs_persist;
@@ -206,6 +208,13 @@ pub struct WsState {
     /// `SessionDirectoryState::session_index`'s `Option` convention) -- every
     /// [`crate::amplifier_association`] entry point no-ops in that case.
     pub amplifier_locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
+    /// Reconciliation handshake (design §5.1): the disk-truth probe behind the
+    /// `pane.reconcile.request` verdict derivation — "does `provider:sessionId`
+    /// exist on disk?" with defined Present/Absent/Unknown semantics. Backed by
+    /// the shared session index in `freshell-server::main` (the exact precedent
+    /// of `identity` and the locator handles); [`crate::existence::NoIndexProbe`]
+    /// when no provider home resolves.
+    pub session_existence: crate::existence::SharedExistenceProbe,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -321,12 +330,27 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
+    build_handshake_with_capabilities(state, false)
+}
+
+/// [`build_handshake`], parameterized on the connection's negotiated
+/// `hello.capabilities.paneReconcileV1` (reconciliation design §4.2): the
+/// `ready.capabilities` advertisement is emitted **only when the client's
+/// `hello` opted in** — today's frozen client doesn't, so the emitted
+/// handshake stays byte-for-byte identical to the pinned clean-boot shape.
+pub fn build_handshake_with_capabilities(
+    state: &WsState,
+    pane_reconcile_v1: bool,
+) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
         ServerMessage::Ready(Ready {
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
+            capabilities: pane_reconcile_v1.then_some(freshell_protocol::ReadyCapabilities {
+                pane_reconcile_v1: Some(true),
+            }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.settings.as_ref().clone(),
@@ -509,8 +533,17 @@ async fn handle_socket(
         }
     }
 
+    // Reconciliation handshake negotiation (§4.1/§4.2): the `ready`
+    // advertisement is gated on the client's `hello` opt-in, so a frozen
+    // client's handshake stays byte-for-byte unchanged.
+    let pane_reconcile_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("paneReconcileV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake.
-    for msg in build_handshake(&state) {
+    for msg in build_handshake_with_capabilities(&state, pane_reconcile_v1) {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => return,
@@ -546,6 +579,7 @@ async fn handle_socket(
         bcast_rx,
         terminal_output_batch_v1,
         ui_screenshot_v1,
+        pane_reconcile_v1,
         origin_kind,
     )
     .await;
@@ -667,6 +701,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         }
     }
 
@@ -717,6 +752,32 @@ mod tests {
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::NotHello
         );
+    }
+
+    /// Reconciliation §4.2: the `ready.capabilities` advertisement is emitted
+    /// ONLY for a hello that opted in — the default handshake stays
+    /// byte-identical to the pinned clean-boot shape (frozen-client inertness
+    /// at the source).
+    #[test]
+    fn handshake_advertises_pane_reconcile_only_when_negotiated() {
+        let s = state();
+        let negotiated = build_handshake_with_capabilities(&s, true);
+        let ready = serde_json::to_value(&negotiated[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "paneReconcileV1": true })
+        );
+
+        let default = build_handshake(&s);
+        let ready = serde_json::to_value(&default[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "non-negotiating hello must not change ready's shape: {ready}"
+        );
+        // Same shape as an explicit `false` negotiation.
+        let unnegotiated = build_handshake_with_capabilities(&s, false);
+        let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
+        assert!(ready2.get("capabilities").is_none());
     }
 
     #[test]

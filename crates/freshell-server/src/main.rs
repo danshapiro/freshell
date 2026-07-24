@@ -352,6 +352,10 @@ async fn main() -> ExitCode {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
+        // Reconciliation handshake disk-truth probe: honest `Unknown` answers
+        // until the index-backed probe below replaces this (no provider home =>
+        // stays the no-index fallback).
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),

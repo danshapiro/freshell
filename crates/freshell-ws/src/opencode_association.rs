@@ -273,6 +273,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
         (state, rx)
     }

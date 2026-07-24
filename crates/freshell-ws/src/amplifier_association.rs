@@ -286,6 +286,7 @@ mod tests {
             term09: crate::backpressure::Term09Config::default(),
             config_fallback: None,
             amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             opencode_locator: None,
         };
         (state, rx)
