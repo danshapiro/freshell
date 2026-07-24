@@ -6,6 +6,7 @@ import reducer, {
   consumeTurnCompleteEvents,
   markTabAttention,
   markPaneAttention,
+  recordTerminalIdle,
   recordTurnComplete,
   resetCompletionDedupeBaselines,
   type TurnCompletionState,
@@ -14,7 +15,7 @@ import panesReducer from '@/store/panesSlice'
 import tabsReducer, { closePaneWithCleanup, closeTab } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import type { PaneNode } from '@/store/paneTypes'
-import { applyServerCompletion } from '@/store/turnCompletionThunks'
+import { applyServerIdle } from '@/store/turnCompletionThunks'
 
 describe('turnCompletionSlice', () => {
   it('records latest event with sequence id', () => {
@@ -78,92 +79,6 @@ describe('turnCompletionSlice', () => {
     expect(state.pendingEvents).toHaveLength(2)
   })
 
-  it('dedupes server completions by per-terminal completionSeq while keeping local pending-event seq separate', () => {
-    let state = reducer(
-      undefined,
-      recordTurnComplete({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        terminalId: 'term-1',
-        at: 1_000,
-        completionSeq: 7,
-      }),
-    )
-
-    expect(state.pendingEvents).toEqual([{
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      terminalId: 'term-1',
-      at: 1_000,
-      completionSeq: 7,
-      seq: 1,
-    }])
-    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(7)
-
-    state = reducer(
-      state,
-      recordTurnComplete({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        terminalId: 'term-1',
-        at: 1_100,
-        completionSeq: 7,
-      }),
-    )
-    state = reducer(
-      state,
-      recordTurnComplete({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        terminalId: 'term-1',
-        at: 1_200,
-        completionSeq: 6,
-      }),
-    )
-
-    expect(state.pendingEvents).toHaveLength(1)
-    expect(state.seq).toBe(1)
-
-    state = reducer(
-      state,
-      recordTurnComplete({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        terminalId: 'term-1',
-        at: 1_300,
-        completionSeq: 8,
-      }),
-    )
-
-    expect(state.pendingEvents).toHaveLength(2)
-    expect(state.pendingEvents[1]?.seq).toBe(2)
-    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(8)
-  })
-
-  it('drops a server completion that is already covered by rehydrated completionSeq state', () => {
-    const state = reducer(
-      {
-        seq: 0,
-        lastAtByTerminalId: {},
-        lastAppliedCompletionSeqByTerminalId: { 'term-1': 9 },
-        pendingEvents: [],
-        attentionByTab: {},
-        attentionByPane: {},
-      },
-      recordTurnComplete({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        terminalId: 'term-1',
-        at: 1_000,
-        completionSeq: 9,
-      }),
-    )
-
-    expect(state.pendingEvents).toEqual([])
-    expect(state.seq).toBe(0)
-    expect(state.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(9)
-  })
-
   it('resetCompletionDedupeBaselines clears the at baseline (so a post-restart lower at re-fires) but preserves attention', () => {
     // Across a real server restart the client store survives, but the fresh process may
     // stamp a lower wall-clock `at` than the (possibly clamp-inflated) pre-restart value.
@@ -219,7 +134,7 @@ describe('turnCompletionSlice', () => {
     const initial: TurnCompletionState = {
       seq: 0,
       lastAtByTerminalId: {},
-      lastAppliedCompletionSeqByTerminalId: {},
+      lastIdleAtByTerminalId: {},
       pendingEvents: [],
       attentionByTab: {},
       attentionByPane: {},
@@ -349,7 +264,7 @@ describe('turnCompletionSlice', () => {
     })
   })
 
-  describe('applyServerCompletion thunk', () => {
+  describe('applyServerIdle thunk', () => {
     function createTerminalStore(terminalId = 'term-1') {
       const now = Date.now()
       return configureStore({
@@ -392,7 +307,7 @@ describe('turnCompletionSlice', () => {
           turnCompletion: {
             seq: 0,
             lastAtByTerminalId: {},
-            lastAppliedCompletionSeqByTerminalId: {},
+            lastIdleAtByTerminalId: {},
             pendingEvents: [],
             attentionByTab: {},
             attentionByPane: {},
@@ -401,20 +316,19 @@ describe('turnCompletionSlice', () => {
       })
     }
 
-    it('resolves the owning pane and applies a newer server completion once', () => {
+    it('resolves the owning pane and applies a newer terminal.idle edge once', () => {
       const store = createTerminalStore()
 
-      store.dispatch(applyServerCompletion({
-        provider: 'opencode',
+      store.dispatch(applyServerIdle({
         terminalId: 'term-1',
         at: 1_000,
-        completionSeq: 3,
+        reason: 'grace',
       }) as any)
-      store.dispatch(applyServerCompletion({
-        provider: 'opencode',
+      // Replayed/stale edge with an older-or-equal at is dropped.
+      store.dispatch(applyServerIdle({
         terminalId: 'term-1',
-        at: 1_100,
-        completionSeq: 3,
+        at: 1_000,
+        reason: 'grace',
       }) as any)
 
       expect(store.getState().turnCompletion.pendingEvents).toEqual([{
@@ -422,24 +336,65 @@ describe('turnCompletionSlice', () => {
         paneId: 'pane-1',
         terminalId: 'term-1',
         at: 1_000,
-        completionSeq: 3,
         seq: 1,
       }])
-      expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-1']).toBe(3)
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-1']).toBe(1_000)
     })
 
-    it('does not consume server completionSeq when no pane owns the terminal yet', () => {
+    it('does not consume the idle baseline when no pane owns the terminal yet', () => {
       const store = createTerminalStore('term-owned')
 
-      store.dispatch(applyServerCompletion({
-        provider: 'codex',
+      store.dispatch(applyServerIdle({
         terminalId: 'term-missing',
         at: 1_000,
-        completionSeq: 1,
+        reason: 'grace',
       }) as any)
 
       expect(store.getState().turnCompletion.pendingEvents).toEqual([])
-      expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-missing']).toBeUndefined()
+      expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-missing']).toBeUndefined()
+    })
+  })
+
+  describe('recordTerminalIdle (truly-idle edge for terminal CLI panes)', () => {
+    it('records the idle edge with a pending-event sequence id', () => {
+      const state = reducer(
+        undefined,
+        recordTerminalIdle({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 't1', at: 1_000, reason: 'grace' })
+      )
+
+      expect(state.pendingEvents).toHaveLength(1)
+      expect(state.pendingEvents[0]).toMatchObject({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        terminalId: 't1',
+        at: 1_000,
+        seq: 1,
+      })
+      expect(state.lastIdleAtByTerminalId?.['t1']).toBe(1_000)
+    })
+
+    it('dedupes idle edges per terminal by monotonic at (reconnect replay cannot re-ring)', () => {
+      let state = reducer(undefined, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 5_000, reason: 'grace' }))
+      state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 5_000, reason: 'grace' }))
+      state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 4_000, reason: 'grace' }))
+      expect(state.pendingEvents).toHaveLength(1)
+
+      state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 6_000, reason: 'queue-empty' }))
+      expect(state.pendingEvents).toHaveLength(2)
+    })
+
+    it('keeps the idle dedupe namespace separate from turn-complete at baselines', () => {
+      let state = reducer(undefined, recordTurnComplete({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 9_000 }))
+      // A lower idle `at` for the same terminal must still land: different bucket.
+      state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 1_000, reason: 'grace' }))
+      expect(state.pendingEvents).toHaveLength(2)
+    })
+
+    it('resetCompletionDedupeBaselines clears the idle baseline too (server restart)', () => {
+      let state = reducer(undefined, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 5_000, reason: 'grace' }))
+      state = reducer(state, resetCompletionDedupeBaselines())
+      state = reducer(state, recordTerminalIdle({ tabId: 'tab-1', paneId: 'p1', terminalId: 't1', at: 1_000, reason: 'grace' }))
+      expect(state.pendingEvents).toHaveLength(2)
     })
   })
 })

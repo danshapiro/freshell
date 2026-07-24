@@ -1,34 +1,36 @@
-import type { TerminalTurnCompleteMessage } from '@shared/ws-protocol'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import type { FreshAgentPaneContent, PaneNode } from './paneTypes'
 import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
-import { recordTurnComplete } from './turnCompletionSlice'
+import { recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
 import type { AppDispatch, RootState } from './store'
 
-export type ApplyServerCompletionPayload = {
+export type ApplyServerIdlePayload = {
   terminalId: string
-  provider: TerminalTurnCompleteMessage['provider']
   at: number
-  completionSeq: number
+  reason: 'grace' | 'queue-empty'
 }
 
-export function applyServerCompletion(payload: ApplyServerCompletionPayload) {
+/**
+ * Server-authoritative truly-idle edge (`terminal.idle`) for terminal CLI panes.
+ * The ONLY event that rings the bell / shades the tab for claude/codex/opencode/
+ * amplifier terminal panes. Resolves the owning tab/pane by terminalId and folds
+ * the edge into the notification pipeline under the `at`-monotonic idle dedupe
+ * namespace (reconnect replay cannot re-ring).
+ */
+export function applyServerIdle(payload: ApplyServerIdlePayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
     const state = getState()
-    const lastApplied = state.turnCompletion?.lastAppliedCompletionSeqByTerminalId?.[payload.terminalId]
-    if (lastApplied !== undefined && payload.completionSeq <= lastApplied) return
-
     const location = selectTabPaneByTerminalId(state, payload.terminalId)
     if (!location) return
 
-    dispatch(recordTurnComplete({
+    dispatch(recordTerminalIdle({
       tabId: location.tabId,
       paneId: location.paneId,
       terminalId: payload.terminalId,
       at: payload.at,
-      completionSeq: payload.completionSeq,
+      reason: payload.reason,
     }))
   }
 }

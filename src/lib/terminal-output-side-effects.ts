@@ -32,8 +32,11 @@ const LIVE_EXTERNAL_EFFECTS = new Set<TerminalOutputSideEffect>([
   'local_xterm_notice',
 ])
 
+// Truly-idle alerting: green/sound edges for all four terminal CLIs are
+// server-emitted (terminal.idle broadcast). The client must never mint a
+// completion from output for them; other/custom CLI modes keep the BEL path.
 function isServerAuthoritativeTurnCompleteMode(mode: string | undefined): boolean {
-  return mode === 'claude' || mode === 'codex'
+  return mode === 'claude' || mode === 'codex' || mode === 'opencode' || mode === 'amplifier'
 }
 
 export function shouldAllowTerminalOutputSideEffect(

@@ -67,7 +67,7 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
-import { applyServerCompletion } from '@/store/turnCompletionThunks'
+import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
@@ -1063,14 +1063,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'codex',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'codex.activity.updated') {
           const mutationSeq = ++codexActivityOrderRef.current
@@ -1100,14 +1092,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'claude',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'claude.activity.updated') {
           const mutationSeq = ++claudeActivityOrderRef.current
@@ -1137,14 +1121,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'amplifier',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'amplifier.activity.updated') {
           const mutationSeq = ++amplifierActivityOrderRef.current
@@ -1174,14 +1150,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'opencode',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'opencode.activity.updated') {
           const mutationSeq = ++opencodeActivityOrderRef.current
@@ -1201,17 +1169,15 @@ export default function App() {
             }))
           }
         }
-        if (msg.type === 'terminal.turn.complete') {
+        // 'terminal.turn.complete' stays informational for terminal CLI panes:
+        // the client no longer rings/shades on it. The truly-idle edge below is
+        // the ONLY bell/shade trigger for claude/codex/opencode/amplifier panes.
+        if (msg.type === 'terminal.idle') {
           const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
           const at = typeof msg.at === 'number' ? msg.at : Date.now()
-          const completionSeq = typeof msg.completionSeq === 'number' ? msg.completionSeq : undefined
-          if (terminalId && completionSeq !== undefined) {
-            dispatch(applyServerCompletion({
-              provider: msg.provider,
-              terminalId,
-              at,
-              completionSeq,
-            }) as any)
+          const reason = msg.reason === 'queue-empty' ? 'queue-empty' : 'grace'
+          if (terminalId) {
+            dispatch(applyServerIdle({ terminalId, at, reason }) as any)
           }
         }
         if (msg.type === 'terminal.exit') {

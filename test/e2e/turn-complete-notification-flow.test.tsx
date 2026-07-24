@@ -12,7 +12,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
-import { applyServerCompletion } from '@/store/turnCompletionThunks'
+import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { getWsClient } from '@/lib/ws-client'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, AttentionDismiss } from '@/store/types'
@@ -124,6 +124,15 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
+function emitTerminalIdle(terminalId = 'term-2', at = 1000, reason: 'grace' | 'queue-empty' = 'grace') {
+  wsMocks.emitMessage({
+    type: 'terminal.idle',
+    terminalId,
+    at,
+    reason,
+  })
+}
+
 function emitCodexTurnComplete(terminalId = 'term-2', at = 1000, completionSeq = 1) {
   wsMocks.emitMessage({
     type: 'terminal.turn.complete',
@@ -138,18 +147,17 @@ function Harness() {
   const dispatch = useAppDispatch()
   useTurnCompletionNotifications()
 
+  // Mirrors App.tsx: the truly-idle edge is the ONLY bell/shade trigger for
+  // terminal CLI panes; terminal.turn.complete stays informational.
   useEffect(() => {
     return getWsClient().onMessage((msg: any) => {
-      if (msg.type !== 'terminal.turn.complete') return
+      if (msg.type !== 'terminal.idle') return
       const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
       if (!terminalId) return
-      const completionSeq = typeof msg.completionSeq === 'number' ? msg.completionSeq : undefined
-      if (completionSeq === undefined) return
-      dispatch(applyServerCompletion({
-        provider: msg.provider,
+      dispatch(applyServerIdle({
         terminalId,
         at: typeof msg.at === 'number' ? msg.at : Date.now(),
-        completionSeq,
+        reason: msg.reason === 'queue-empty' ? 'queue-empty' : 'grace',
       }) as any)
     })
   }, [dispatch])
@@ -264,6 +272,7 @@ function createStore(attentionDismiss: AttentionDismiss = 'click') {
       turnCompletion: {
         seq: 0,
         lastAtByTerminalId: {},
+        lastIdleAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
@@ -318,7 +327,7 @@ describe('turn complete notification flow (e2e)', () => {
     }
   })
 
-  it('bells and highlights on background completion, clears on tab click (default click mode)', async () => {
+  it('never bells or shades on terminal.turn.complete (informational only for terminal CLI panes)', async () => {
     const store = createStore()
 
     render(
@@ -333,6 +342,69 @@ describe('turn complete notification flow (e2e)', () => {
 
     act(() => {
       emitCodexTurnComplete()
+    })
+
+    // No sound, no shade, no pending events — only terminal.idle may alert.
+    expect(playSound).not.toHaveBeenCalled()
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+  })
+
+  it('rings exactly once when a reconnect replays the same terminal.idle edge', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <Harness />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.onMessage).toHaveBeenCalled()
+    })
+
+    act(() => {
+      emitTerminalIdle('term-2', 1000)
+    })
+
+    await waitFor(() => {
+      expect(playSound).toHaveBeenCalledTimes(1)
+    })
+
+    // Reconnect replay: same edge (same at) and an older edge must be dropped.
+    act(() => {
+      emitTerminalIdle('term-2', 1000)
+      emitTerminalIdle('term-2', 900)
+    })
+
+    expect(playSound).toHaveBeenCalledTimes(1)
+    expect(store.getState().turnCompletion.seq).toBe(1)
+
+    // A genuinely newer edge still rings.
+    act(() => {
+      emitTerminalIdle('term-2', 2000, 'queue-empty')
+    })
+    await waitFor(() => {
+      expect(playSound).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it('bells and highlights on background completion, clears on tab click (default click mode)', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <Harness />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.onMessage).toHaveBeenCalled()
+    })
+
+    act(() => {
+      emitTerminalIdle()
     })
 
     await waitFor(() => {
@@ -372,7 +444,7 @@ describe('turn complete notification flow (e2e)', () => {
 
     // Emit turn complete signal on background tab's terminal
     act(() => {
-      emitCodexTurnComplete()
+      emitTerminalIdle()
     })
 
     // Both tab and pane attention should be set
@@ -418,7 +490,7 @@ describe('turn complete notification flow (e2e)', () => {
 
     // Emit turn complete signal on tab-2 (the now-active tab)
     act(() => {
-      emitCodexTurnComplete()
+      emitTerminalIdle()
     })
 
     // Tab-2 should have attention
@@ -450,7 +522,7 @@ describe('turn complete notification flow (e2e)', () => {
 
     // Emit turn complete signal on background tab's terminal
     act(() => {
-      emitCodexTurnComplete()
+      emitTerminalIdle()
     })
 
     await waitFor(() => {

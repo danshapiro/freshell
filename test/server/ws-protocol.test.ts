@@ -13,6 +13,7 @@ import {
   TerminalAttachSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
+  TerminalIdleSchema,
   TerminalTurnCompleteSchema,
 } from '../../shared/ws-protocol.js'
 import {
@@ -2020,5 +2021,12 @@ describe('claude activity protocol', () => {
     expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1 }).success).toBe(false)
     expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'claude', at: 1, completionSeq: 1 }).success).toBe(true)
     expect(TerminalTurnCompleteSchema.safeParse({ type: 'terminal.turn.complete', terminalId: 't1', provider: 'opencode', sessionId: 's1', at: 1, completionSeq: 1 }).success).toBe(true)
+  })
+  it('terminal.idle carries terminalId, server-epoch at, and a grace/queue-empty reason', () => {
+    expect(TerminalIdleSchema.safeParse({ type: 'terminal.idle', terminalId: 't1', at: 1, reason: 'grace' }).success).toBe(true)
+    expect(TerminalIdleSchema.safeParse({ type: 'terminal.idle', terminalId: 't1', at: 1, reason: 'queue-empty' }).success).toBe(true)
+    expect(TerminalIdleSchema.safeParse({ type: 'terminal.idle', terminalId: 't1', at: 1, reason: 'exit' }).success).toBe(false)
+    expect(TerminalIdleSchema.safeParse({ type: 'terminal.idle', terminalId: 't1', reason: 'grace' }).success).toBe(false)
+    expect(TerminalIdleSchema.safeParse({ type: 'terminal.idle', terminalId: '', at: 1, reason: 'grace' }).success).toBe(false)
   })
 })

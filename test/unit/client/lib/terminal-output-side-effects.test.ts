@@ -82,7 +82,7 @@ describe('terminal output side-effect policy', () => {
         terminalInstanceId: 'surface-live-frame',
         source: 'live',
         effect: 'turn_complete',
-        mode: 'opencode',
+        mode: 'gemini',
       })).toBe(true)
       expect(shouldAllowTerminalOutputSideEffect({
         terminalInstanceId: 'surface-live-frame',
@@ -95,26 +95,26 @@ describe('terminal output side-effect policy', () => {
     }
   })
 
-  it('keeps server-authoritative turn completion for Claude and Codex', () => {
+  it('keeps server-authoritative turn completion for all four terminal CLIs', () => {
+    // Truly-idle alerting: claude/codex/opencode/amplifier green/sound edges are
+    // server-emitted (terminal.idle) — the client must not mint completions from
+    // output for any of them. Other modes (custom CLIs) keep the client BEL path.
+    for (const mode of ['claude', 'codex', 'opencode', 'amplifier'] as const) {
+      expect(shouldAllowTerminalOutputSideEffect({
+        source: 'live',
+        effect: 'turn_complete',
+        mode,
+      })).toBe(false)
+    }
     expect(shouldAllowTerminalOutputSideEffect({
       source: 'live',
       effect: 'turn_complete',
-      mode: 'opencode',
+      mode: 'gemini',
     })).toBe(true)
-    expect(shouldAllowTerminalOutputSideEffect({
-      source: 'live',
-      effect: 'turn_complete',
-      mode: 'claude',
-    })).toBe(false)
-    expect(shouldAllowTerminalOutputSideEffect({
-      source: 'live',
-      effect: 'turn_complete',
-      mode: 'codex',
-    })).toBe(false)
     expect(shouldAllowTerminalOutputSideEffect({
       source: 'replay',
       effect: 'turn_complete',
-      mode: 'opencode',
+      mode: 'gemini',
     })).toBe(false)
   })
 
