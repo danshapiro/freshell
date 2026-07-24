@@ -394,6 +394,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("spawn a real shell for the test PTY");
         state

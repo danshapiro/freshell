@@ -1084,6 +1084,10 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         stream_id,
         &mode,
         resume_session_id.as_deref(),
+        // The pane's stable creation key, stamped atomically with the registry
+        // insert (reconciliation design §5.1) — capability-independent and
+        // inert on its own; only the §5.4 dedupe branch is gated.
+        Some(&create.request_id),
         None,
         on_exit,
     ) {
