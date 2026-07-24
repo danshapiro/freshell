@@ -123,8 +123,8 @@ fn device_dir_for(dir: &Path, device_id: &str) -> Option<PathBuf> {
     Some(device_dir)
 }
 
-/// Monotonic-first generation ordering. Client clocks may move backwards, but
-/// `snapshotRevision` may not; wall-clock capture time is only a tie-breaker.
+/// Monotonic-first generation ordering within one client. Client clocks may
+/// move backwards, but `snapshotRevision` may not.
 fn generation_rank(value: &Value) -> (i64, i64) {
     (
         value
@@ -136,6 +136,81 @@ fn generation_rank(value: &Value) -> (i64, i64) {
             .and_then(Value::as_i64)
             .unwrap_or(i64::MIN),
     )
+}
+
+fn captured_at(value: &Value) -> i64 {
+    value
+        .get("capturedAt")
+        .and_then(Value::as_i64)
+        .unwrap_or(i64::MIN)
+}
+
+/// Ascending cross-client ordering. This is used only to merge the heads of
+/// per-client revision-ordered queues, never to compare two generations from
+/// the same client (mixing those comparison rules in one sort is non-transitive
+/// when a clock rolls back).
+fn cross_client_capture_order(
+    left_value: &Value,
+    left_path: &Path,
+    right_value: &Value,
+    right_path: &Path,
+) -> std::cmp::Ordering {
+    let left_client = left_value
+        .get("clientInstanceId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let right_client = right_value
+        .get("clientInstanceId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    captured_at(left_value)
+        .cmp(&captured_at(right_value))
+        .then_with(|| {
+            generation_rank(left_value)
+                .0
+                .cmp(&generation_rank(right_value).0)
+        })
+        .then_with(|| left_client.cmp(right_client))
+        .then_with(|| left_path.cmp(right_path))
+}
+
+fn order_generations_newest_first(files: Vec<(i64, PathBuf, Value)>) -> Vec<(i64, PathBuf, Value)> {
+    let mut by_client: HashMap<String, Vec<(i64, PathBuf, Value)>> = HashMap::new();
+    for generation in files {
+        let client_id = generation
+            .2
+            .get("clientInstanceId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        by_client.entry(client_id).or_default().push(generation);
+    }
+    let mut queues: Vec<Vec<(i64, PathBuf, Value)>> = by_client
+        .into_values()
+        .map(|mut generations| {
+            generations.sort_by(|left, right| {
+                generation_rank(&right.2)
+                    .cmp(&generation_rank(&left.2))
+                    .then_with(|| right.1.cmp(&left.1))
+            });
+            generations
+        })
+        .collect();
+    let mut ordered = Vec::new();
+    while !queues.is_empty() {
+        let newest_queue = (0..queues.len())
+            .max_by(|left, right| {
+                let left = &queues[*left][0];
+                let right = &queues[*right][0];
+                cross_client_capture_order(&left.2, &left.1, &right.2, &right.1)
+            })
+            .expect("nonempty queue collection");
+        ordered.push(queues[newest_queue].remove(0));
+        if queues[newest_queue].is_empty() {
+            queues.swap_remove(newest_queue);
+        }
+    }
+    ordered
 }
 
 fn generation_path_rank(path: &Path) -> (i64, i64, PathBuf) {
@@ -182,8 +257,8 @@ fn list_generations_locked(dir: &Path, device_id: &str, client_instance_id: &str
 
 /// Every generation file for a device across ALL clients, PARSED ONCE, newest
 /// first. The single scan behind read_generation/read_generation_by_id/overview
-/// (no per-index rescan). Sort: snapshotRevision desc, then capturedAt desc,
-/// then filename desc — monotonic under clock rollback and fully deterministic.
+/// (no per-index rescan). Within one client, sort by snapshotRevision; across
+/// clients, sort by server-generated capturedAt. Filename/revision break ties.
 /// FAIL-LOUD (`:480`): a MISSING device dir is absence (`Ok(empty)`); a `read_dir`
 /// failure on an existing dir, or a `*.json` file that exists but cannot be read
 /// or parsed, is an ERROR (`Err`) — a corrupt backup is never silently skipped.
@@ -212,12 +287,7 @@ fn all_generations_parsed(
             .expect("validated capturedAt");
         files.push((captured, path, v));
     }
-    files.sort_by(|a, b| {
-        generation_rank(&b.2)
-            .cmp(&generation_rank(&a.2))
-            .then_with(|| b.1.cmp(&a.1))
-    });
-    Ok(files)
+    Ok(order_generations_newest_first(files))
 }
 
 /// The RAW device ids that have at least one persisted generation (read from
@@ -388,9 +458,8 @@ fn newest_per_client(parsed: &[(i64, PathBuf, Value)]) -> HashMap<String, (i64, 
 /// does NOT, so it can never break a tie). Returns
 /// `(records, max_capturedAt, max_snapshotRevision, label_source)` or `None` when
 /// the device has no generations. `deviceId`/`deviceLabel` come from the client
-/// whose newest generation has the max
-/// `(snapshotRevision, capturedAt, generationId)` — never from arbitrary
-/// iteration order.
+/// whose newest generation has the max server-generated capturedAt, with
+/// revision/client/generation-id tie-breakers — never from arbitrary iteration.
 fn union_of_newest_per_client(
     parsed: &[(i64, PathBuf, Value)],
 ) -> Option<(Vec<Value>, i64, i64, Value)> {
@@ -401,8 +470,22 @@ fn union_of_newest_per_client(
     let label_src = newest
         .values()
         .max_by(|a, b| {
-            (generation_rank(&a.2), snapshot_generation_id(&a.2))
-                .cmp(&(generation_rank(&b.2), snapshot_generation_id(&b.2)))
+            (
+                captured_at(&a.2),
+                generation_rank(&a.2).0,
+                a.2.get("clientInstanceId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                snapshot_generation_id(&a.2),
+            )
+                .cmp(&(
+                    captured_at(&b.2),
+                    generation_rank(&b.2).0,
+                    b.2.get("clientInstanceId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    snapshot_generation_id(&b.2),
+                ))
         })
         .map(|(_, _, v)| v.clone())
         .unwrap_or(Value::Null);
@@ -796,11 +879,13 @@ fn remove_dir_all_logged(path: &Path) -> std::io::Result<()> {
 }
 
 /// Enforce MAX_SNAPSHOT_FILES_PER_DEVICE across ALL clients in one device dir.
-/// Removes the globally lowest `(snapshotRevision, capturedAt)` files until
-/// at/under the cap. Caller holds `PERSIST_LOCK`; the `.tmp` sweep already ran,
-/// so only real `*.json` generations are in view.
+/// Removes the globally oldest files until at/under the cap. Within one client,
+/// revision remains monotonic-first; across clients, server-generated
+/// `capturedAt` is authoritative. Caller holds `PERSIST_LOCK`; the `.tmp` sweep
+/// already ran, so only real `*.json` generations are in view.
 fn enforce_device_file_cap(device_dir: &Path) -> std::io::Result<()> {
-    let mut files: Vec<(i64, i64, PathBuf)> = Vec::new();
+    let mut by_client: HashMap<String, Vec<(PathBuf, Value)>> = HashMap::new();
+    let mut file_count = 0usize;
     for entry in std::fs::read_dir(device_dir)? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -814,17 +899,42 @@ fn enforce_device_file_cap(device_dir: &Path) -> std::io::Result<()> {
         let text = std::fs::read_to_string(&path)?;
         let value: Value =
             serde_json::from_str(&text).map_err(|error| corrupt_generation(&path, error))?;
-        let (revision, captured_at) = generation_rank(&value);
-        files.push((revision, captured_at, path));
+        let client_id = value
+            .get("clientInstanceId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        by_client.entry(client_id).or_default().push((path, value));
+        file_count += 1;
     }
-    if files.len() <= MAX_SNAPSHOT_FILES_PER_DEVICE {
+    if file_count <= MAX_SNAPSHOT_FILES_PER_DEVICE {
         return Ok(());
     }
-    files.sort();
-    while files.len() > MAX_SNAPSHOT_FILES_PER_DEVICE {
-        let victim = &files[0].2;
-        remove_file_logged(victim)?;
-        files.remove(0);
+    let mut queues: Vec<Vec<(PathBuf, Value)>> = by_client
+        .into_values()
+        .map(|mut generations| {
+            generations.sort_by(|left, right| {
+                generation_rank(&left.1)
+                    .cmp(&generation_rank(&right.1))
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            generations
+        })
+        .collect();
+    while file_count > MAX_SNAPSHOT_FILES_PER_DEVICE {
+        let oldest_queue = (0..queues.len())
+            .min_by(|left, right| {
+                let left = &queues[*left][0];
+                let right = &queues[*right][0];
+                cross_client_capture_order(&left.1, &left.0, &right.1, &right.0)
+            })
+            .expect("over-cap file set has a victim");
+        remove_file_logged(&queues[oldest_queue][0].0)?;
+        queues[oldest_queue].remove(0);
+        if queues[oldest_queue].is_empty() {
+            queues.swap_remove(oldest_queue);
+        }
+        file_count -= 1;
     }
     Ok(())
 }

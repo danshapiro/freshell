@@ -274,6 +274,31 @@ fn clock_rollback_keeps_highest_revision_newest_and_retained() {
 }
 
 #[test]
+fn generation_zero_uses_captured_at_across_different_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "old-long-lived-client",
+        100,
+        1_000,
+        vec![open_record("dev:old", "old", 1)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "new-client",
+        1,
+        2_000,
+        vec![open_record("dev:new", "new", 2)],
+    );
+
+    let newest = gen_n(dir.path(), "dev", 0).expect("newest generation");
+    assert_eq!(newest["clientInstanceId"], "new-client");
+    assert_eq!(newest["snapshotRevision"], 1);
+}
+
+#[test]
 fn content_id_is_key_order_independent_and_collision_distinct() {
     // `preserve_order` is enabled workspace-wide, so two records with the SAME
     // fields inserted in a DIFFERENT key order serialize to different bytes;
@@ -503,6 +528,51 @@ fn global_per_device_cap_holds_across_rotating_client_ids() {
     assert!(
         count <= MAX_SNAPSHOT_FILES_PER_DEVICE,
         "global-per-device file cap breached: {count} > {MAX_SNAPSHOT_FILES_PER_DEVICE}"
+    );
+}
+
+#[test]
+fn global_retention_evicts_oldest_captured_across_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..(MAX_SNAPSHOT_FILES_PER_DEVICE - 1) {
+        put(
+            dir.path(),
+            "dev",
+            &format!("old-client-{index:02}"),
+            100,
+            1_000 + index as i64,
+            vec![open_record(&format!("dev:old-{index:02}"), "old", 1)],
+        );
+    }
+    put(
+        dir.path(),
+        "dev",
+        "new-low-revision",
+        1,
+        10_000,
+        vec![open_record("dev:new-low", "new low", 2)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "newest-low-revision",
+        2,
+        11_000,
+        vec![open_record("dev:newest-low", "newest low", 3)],
+    );
+
+    assert!(
+        list_generations(dir.path(), "dev", "old-client-00").is_empty(),
+        "the genuinely oldest cross-client generation must be evicted"
+    );
+    assert_eq!(
+        list_generations(dir.path(), "dev", "new-low-revision").len(),
+        1,
+        "a newer low-revision client must not be evicted for an older high-revision client"
+    );
+    assert_eq!(
+        list_generations(dir.path(), "dev", "newest-low-revision").len(),
+        1
     );
 }
 
@@ -1119,7 +1189,7 @@ fn semantically_corrupt_generation_files_fail_loud() {
     }));
     assert_bad_pane(json!({
         "paneId": "p1", "kind": "terminal",
-        "payload": { "mode": "bogus", "shell": "system" }
+        "payload": { "mode": "", "shell": "system" }
     }));
     assert_bad_pane(json!({
         "paneId": "p1", "kind": "browser",

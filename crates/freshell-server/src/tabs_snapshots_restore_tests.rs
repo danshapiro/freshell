@@ -245,6 +245,202 @@ fn marker_ledger_retention_bounds_sources_and_keeps_the_newest() {
     assert!(with_active.contains_key("source-000"));
 }
 
+#[test]
+fn marker_serialized_byte_cap_accepts_boundary_and_rejects_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let dd = device_dir(dir.path(), "dev-1");
+    std::fs::create_dir_all(&dd).unwrap();
+    let mut bytes = br#"{"version":2,"sources":{}}"#.to_vec();
+    bytes.resize(MAX_RESTORE_MARKER_BYTES, b' ');
+    std::fs::write(dd.join(RESTORE_MARKER), &bytes).unwrap();
+    assert!(
+        read_marker_doc(&dd).is_ok(),
+        "a marker exactly at the byte cap must remain readable"
+    );
+
+    bytes.push(b' ');
+    std::fs::write(dd.join(RESTORE_MARKER), &bytes).unwrap();
+    let error = match read_marker_doc(&dd) {
+        Ok(_) => panic!("over-cap marker must fail loudly"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("byte limit"),
+        "clear byte-cap error: {error}"
+    );
+}
+
+#[test]
+fn marker_pane_count_cap_accepts_boundary_and_rejects_over() {
+    let path = std::path::Path::new("<marker-count-test>");
+    assert!(
+        validate_marker_pane_count(path, "source", MAX_RESTORE_MARKER_PANES_PER_SOURCE).is_ok()
+    );
+    let error = validate_marker_pane_count(path, "source", MAX_RESTORE_MARKER_PANES_PER_SOURCE + 1)
+        .expect_err("over-cap pane count must fail loudly");
+    assert!(
+        error.to_string().contains("pane-count limit"),
+        "clear pane-count error: {error}"
+    );
+}
+
+#[test]
+fn marker_identifier_caps_accept_boundaries_and_reject_over() {
+    fn doc(source: String, pane_key: String, terminal_id: String) -> MarkerDoc {
+        let mut panes = Marker::new();
+        panes.insert(
+            pane_key,
+            PaneMark {
+                state: "restored".into(),
+                terminal_id: Some(terminal_id),
+            },
+        );
+        MarkerDoc::from([(source, (1, panes))])
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let dd = device_dir(dir.path(), "dev-1");
+    write_marker_doc(
+        &dd,
+        &doc(
+            "s".repeat(MAX_RESTORE_MARKER_SOURCE_ID_BYTES),
+            "p".repeat(MAX_RESTORE_MARKER_PANE_KEY_BYTES),
+            "t".repeat(MAX_RESTORE_MARKER_TERMINAL_ID_BYTES),
+        ),
+    )
+    .expect("identifier lengths exactly at their caps are accepted");
+
+    for (name, over) in [
+        (
+            "source id",
+            doc(
+                "s".repeat(MAX_RESTORE_MARKER_SOURCE_ID_BYTES + 1),
+                "pane".into(),
+                "terminal".into(),
+            ),
+        ),
+        (
+            "pane key",
+            doc(
+                "source".into(),
+                "p".repeat(MAX_RESTORE_MARKER_PANE_KEY_BYTES + 1),
+                "terminal".into(),
+            ),
+        ),
+        (
+            "terminal id",
+            doc(
+                "source".into(),
+                "pane".into(),
+                "t".repeat(MAX_RESTORE_MARKER_TERMINAL_ID_BYTES + 1),
+            ),
+        ),
+    ] {
+        let error = match write_marker_doc(&dd, &over) {
+            Ok(()) => panic!("over-cap {name} must fail loudly"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("identifier length limit"),
+            "clear {name} error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_rejects_over_limit_marker_plan_before_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = rec(
+        "t1",
+        "browser",
+        json!({ "url": "https://example.com", "devToolsOpen": false }),
+    );
+    record["tabKey"] = json!("k".repeat(MAX_RESTORE_MARKER_PANE_KEY_BYTES + 1));
+    seed_records(dir.path(), "dev-1", "c1", 1, vec![record]);
+    let (r, _on, _client) = connected(dir.path());
+
+    let (status, body) = post(
+        router(r.state),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["markerError"], true, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("limit")),
+        "{body}"
+    );
+    assert!(
+        !device_dir(dir.path(), "dev-1")
+            .join(RESTORE_MARKER)
+            .exists(),
+        "preflight rejection must not write a marker or create a pane"
+    );
+}
+
+#[tokio::test]
+async fn write_ahead_marker_is_durable_before_tab_create_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "browser",
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
+        )],
+    );
+    let r = rig(dir.path());
+    let broker = r.state.screenshots.clone();
+    let dd = device_dir(dir.path(), "dev-1");
+    let saw_write_ahead = std::sync::Arc::new(AtomicBool::new(false));
+    let saw_write_ahead_in_sink = saw_write_ahead.clone();
+    let client_id = 9_001;
+    r.state.screenshots.add_capable_client(
+        client_id,
+        std::sync::Arc::new(move |message| {
+            let value = serde_json::to_value(message).unwrap();
+            if value["type"] == "ui.command" && value["command"] == "tab.create" {
+                let marker = read_marker_doc(&dd).expect("write-ahead marker is durable");
+                let panes = &marker.values().next().expect("source exists").1;
+                assert_eq!(
+                    panes.get("dev-1:t1#p-t1").map(|mark| mark.state.as_str()),
+                    Some("in-progress"),
+                    "tab.create must not be sent before its durable write-ahead entry"
+                );
+                saw_write_ahead_in_sink.store(true, Ordering::SeqCst);
+            }
+            if value["type"] == "ui.command" && value["command"] == "screenshot.capture" {
+                broker.resolve_from(
+                    client_id,
+                    value["payload"]["requestId"].as_str().unwrap(),
+                    freshell_ws::screenshot::ScreenshotResult {
+                        ok: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            true
+        }),
+    );
+
+    let (status, body) = post(
+        router(r.state),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(saw_write_ahead.load(Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn restore_rejects_malformed_body_selectors_with_400_never_broader_union() {
     // FAIL-CLOSED BODY SELECTORS (`:459`): every malformed shape is a 400 —

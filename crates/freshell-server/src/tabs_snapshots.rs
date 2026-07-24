@@ -165,10 +165,15 @@ async fn get_snapshot(
 #[path = "tabs_snapshots_marker.rs"]
 mod marker_mod;
 use marker_mod::{
-    prune_marker_doc, read_marker_doc, write_marker_doc, Marker, MarkerDoc, PaneMark,
+    prune_marker_doc, read_marker_doc, validate_restore_projection, write_marker_doc, Marker,
+    MarkerDoc, PaneMark, RESTORE_MARKER,
 };
 #[cfg(test)]
-use marker_mod::{MAX_RESTORE_MARKER_SOURCES, RESTORE_MARKER, RESTORE_MARKER_TMP};
+use marker_mod::{
+    validate_marker_pane_count, MAX_RESTORE_MARKER_BYTES, MAX_RESTORE_MARKER_PANES_PER_SOURCE,
+    MAX_RESTORE_MARKER_PANE_KEY_BYTES, MAX_RESTORE_MARKER_SOURCES,
+    MAX_RESTORE_MARKER_SOURCE_ID_BYTES, MAX_RESTORE_MARKER_TERMINAL_ID_BYTES, RESTORE_MARKER_TMP,
+};
 
 /// Map a snapshot pane to its `POST /api/tabs` body. Invalid session identity
 /// fails before spawn; unsupported kinds are skips. Captured terminal, browser,
@@ -525,17 +530,34 @@ async fn restore_tabs(
         .map(|(_, panes)| panes.clone())
         .unwrap_or_default();
     let mut marker: Marker = prior.clone(); // the union we will persist
+    let records = snap
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Preflight the projected ledger, including UUID-sized terminal ids.
+    if !dry_run {
+        if let Some(device_dir) = &device_dir {
+            if let Err(error) = validate_restore_projection(
+                &device_dir.join(RESTORE_MARKER),
+                &doc,
+                &source_id,
+                captured_at,
+                force,
+                selection.panes.as_ref(),
+                &records,
+            ) {
+                return marker_preflight_error(&device_id, &error);
+            }
+        }
+    }
 
     let mut restored = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
     let mut delivery_confirmed = true;
     let mut connection_dropped = false; // once true, remaining panes are FAILED
-    let records = snap
-        .get("records")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     for record in &records {
         if record.get("status").and_then(Value::as_str) != Some("open") {
             continue;
@@ -831,7 +853,8 @@ async fn restore_tabs(
             let ui_command = data.get("uiCommand").cloned().and_then(|value| {
                 serde_json::from_value::<freshell_protocol::ServerMessage>(value).ok()
             });
-            // Persist the terminal id while it remains in-progress until acked.
+            // The durable pre-create record preserves write-ahead safety. Batch
+            // this terminal id into the next write-ahead or final marker write.
             marker.insert(
                 pk.clone(),
                 PaneMark {
@@ -839,27 +862,6 @@ async fn restore_tabs(
                     terminal_id: terminal_id.clone(),
                 },
             );
-            if let Err(err) = persist_marker(
-                device_dir.as_deref(),
-                &mut doc,
-                &source_id,
-                &marker,
-                captured_at,
-            )
-            .await
-            {
-                return marker_error(
-                    &device_id,
-                    &snap,
-                    connected,
-                    delivery_confirmed,
-                    restored,
-                    skipped,
-                    failed,
-                    &err,
-                );
-            }
-
             // Deliver and fence on the exact selected target.
             let delivered = target_client_id
                 .zip(ui_command)
@@ -945,6 +947,19 @@ async fn restore_tabs(
         "failed": failed,
     }))
     .into_response()
+}
+
+fn marker_preflight_error(device_id: &str, error: &dyn std::fmt::Display) -> Response {
+    tracing::warn!(target: "freshell_server::tabs_snapshots", device_id = %device_id,
+        error = %error, "restore_marker_limit_rejected");
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!("restore refused: restore marker limit exceeded ({error})"),
+            "markerError": true,
+        })),
+    )
+        .into_response()
 }
 
 /// A marker write failed AFTER side-effects: 500, fail LOUDLY, echoing what was

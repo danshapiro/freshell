@@ -1796,7 +1796,7 @@ mod tabs_push_validation_tests {
     use super::*;
 
     #[tokio::test]
-    async fn malformed_websocket_push_is_rejected_without_touching_persistence() {
+    async fn empty_terminal_mode_is_rejected_without_touching_persistence() {
         let snapshots = tempfile::tempdir().unwrap();
         let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
         let raw = r#"{
@@ -1816,7 +1816,7 @@ mod tabs_push_validation_tests {
                 "panes":[{
                     "paneId":"pane-1",
                     "kind":"terminal",
-                    "payload":{"mode":"bogus","shell":"system"}
+                    "payload":{"mode":"","shell":"system"}
                 }]
             }]
         }"#;
@@ -1845,6 +1845,64 @@ mod tabs_push_validation_tests {
             tabs.query("dev-1", "client-1")["localOpen"],
             serde_json::json!([]),
             "rejected push must not mutate the in-memory registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_extension_mode_push_is_accepted_and_persisted() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": [{
+                "tabKey": "dev-1:tab-1",
+                "tabId": "tab-1",
+                "tabName": "custom extension",
+                "status": "open",
+                "revision": 1,
+                "updatedAt": 1,
+                "paneCount": 1,
+                "panes": [{
+                    "paneId": "pane-1",
+                    "kind": "terminal",
+                    "payload": {
+                        "mode": "acme-custom-cli",
+                        "shell": "system",
+                        "sessionRef": {
+                            "provider": "acme-custom-cli",
+                            "sessionId": "session-1"
+                        }
+                    }
+                }]
+            }]
+        });
+
+        match tabs_push_response(&frame, tabs.clone(), "srv-test".to_string()).await {
+            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(ack)) => {
+                assert!(ack.accepted);
+                assert_eq!(ack.open_records, 1);
+            }
+            TabsPushResponse::Ack(other) => panic!("unexpected acknowledgement frame: {other:?}"),
+            TabsPushResponse::Error(error) => {
+                panic!("registered extension mode push must be accepted: {error}")
+            }
+        }
+
+        let persisted = crate::tabs_persist::read_generation(snapshots.path(), "dev-1", 0)
+            .unwrap()
+            .expect("accepted push persisted");
+        assert_eq!(
+            persisted["records"][0]["panes"][0]["payload"]["mode"],
+            "acme-custom-cli"
+        );
+        assert_eq!(
+            tabs.query("dev-1", "client-1")["localOpen"][0]["tabKey"],
+            "dev-1:tab-1",
+            "accepted push must update the in-memory registry"
         );
     }
 }
