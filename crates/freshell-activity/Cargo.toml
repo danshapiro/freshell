@@ -1,0 +1,19 @@
+[package]
+name = "freshell-activity"
+version = "0.1.0"
+description = "Terminal-mode coding-CLI activity engine for the freshell Rust port (TERM-15/TERM-16 + the NEW terminal.idle capability). Pure, timer-free state machines: the BEL turn-complete signal parser (shared/turn-complete-signal.ts), the per-provider TurnCompletionLedger (server/coding-cli/turn-completion-ledger.ts), the Claude/Codex PTY-signal trackers (claude-activity-tracker.ts, codex-activity-tracker.ts PTY lane), the Amplifier events.jsonl reducer/tailer/tracker (amplifier-events-{reducer,tailer}.ts + amplifier-activity-tracker.ts), and the truly-idle grace gate. Deliberately tokio-free and I/O-free (the tailer takes injected reads): every timer is expressed as a next_deadline() the async hub in freshell-ws arms as a ONE-SHOT — zero polling, zero steady-state wakes."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The frozen wire types the trackers emit (activity records + snapshots).
+freshell-protocol = { path = "../freshell-protocol" }
+# Amplifier events.jsonl records are JSON lines.
+serde_json = { workspace = true }
+serde = { workspace = true }
+# Diagnostics (deadman warnings, lane-degrade) to the global subscriber.
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
