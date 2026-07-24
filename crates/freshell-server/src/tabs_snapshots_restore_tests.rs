@@ -442,6 +442,63 @@ async fn write_ahead_marker_is_durable_before_tab_create_is_sent() {
 }
 
 #[tokio::test]
+async fn dropped_ack_sender_is_not_delivery_confirmation() {
+    // A dropped oneshot sender (the pending ack entry was cancelled/purged
+    // before the client answered) resolves the receiver with `Err(RecvError)`.
+    // That is NOT a delivery ack: the pane must be reported failed
+    // (`delivery-unconfirmed`) and stay `in-progress` for a safe retry.
+    let dir = tempfile::tempdir().unwrap();
+    seed_records(
+        dir.path(),
+        "dev-1",
+        "c1",
+        1,
+        vec![rec(
+            "t1",
+            "browser",
+            json!({ "url": "https://example.com", "devToolsOpen": false }),
+        )],
+    );
+    let r = rig(dir.path());
+    let broker = r.state.screenshots.clone();
+    let client_id = 9_102;
+    r.state.screenshots.add_capable_client(
+        client_id,
+        std::sync::Arc::new(move |message| {
+            let value = serde_json::to_value(message).unwrap();
+            if value["type"] == "ui.command" && value["command"] == "screenshot.capture" {
+                // Simulate the pending ack being purged (sender dropped)
+                // instead of answered by the client.
+                broker.cancel(value["payload"]["requestId"].as_str().unwrap());
+            }
+            true
+        }),
+    );
+
+    let (status, body) = post(
+        router(r.state),
+        "/api/tabs-sync/restore",
+        json!({ "deviceId": "dev-1" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["deliveryConfirmed"], false,
+        "a dropped ack sender must not read as confirmation: {body}"
+    );
+    let failed = body["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{body}");
+    assert_eq!(failed[0]["reason"], "delivery-unconfirmed", "{body}");
+    assert_eq!(body["restored"].as_array().unwrap().len(), 0, "{body}");
+    assert_eq!(
+        marker_panes(dir.path(), "dev-1")["dev-1:t1#p-t1"]["state"],
+        "in-progress",
+        "unconfirmed delivery must keep the write-ahead entry for retry"
+    );
+}
+
+#[tokio::test]
 async fn restore_rejects_malformed_body_selectors_with_400_never_broader_union() {
     // FAIL-CLOSED BODY SELECTORS (`:459`): every malformed shape is a 400 —
     // never a silent fall-through to the broader coherent union. dryRun keeps

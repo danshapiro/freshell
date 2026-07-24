@@ -313,7 +313,10 @@ async fn confirm_delivery(
         return false;
     }
     match tokio::time::timeout(state.restore_ack_timeout, rx).await {
-        Ok(_) => true, // ANY resolve (ok OR error) == received
+        Ok(Ok(_)) => true, // ANY resolved result (ok OR error) == received
+        // A dropped sender (pending entry cancelled/purged before the client
+        // answered) is NOT an ack; its removal already dropped the entry.
+        Ok(Err(_)) => false,
         Err(_) => {
             state.screenshots.cancel(&request_id);
             false
