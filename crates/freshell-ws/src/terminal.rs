@@ -559,6 +559,12 @@ async fn handle_client_text(
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(async move { fresh_opencode.handle_send(send).await });
                 }
+                // `amplifier` exists on AgentProvider for the TERM-16
+                // terminal.turn.complete broadcast only — there is no
+                // amplifier FRESH-AGENT runtime, so a (contract-invalid)
+                // freshAgent.send naming it is dropped, same as legacy's
+                // zod parse rejecting it.
+                freshell_protocol::AgentProvider::Amplifier => {}
             }
             true
         }
@@ -634,6 +640,83 @@ async fn handle_client_text(
                 &ServerMessage::Pong(Pong {
                     timestamp: crate::now_iso(),
                 }),
+            )
+            .await
+        }
+        // TERM-15: activity-list request/response (reconnect seeding). The
+        // frozen client sends all four on every (re)connect (`src/App.tsx:
+        // 676-711`) and folds the responses into its activity slices, which
+        // is what re-seeds pane/tab/sidebar blue after a reload. Answered
+        // from live tracker state; the completions carry per-terminal
+        // `completionSeq` so the client dedupes green/sound across
+        // reconnects (TERM-16). When no hub is installed (unit tests), the
+        // response is the same wire shape as "no busy terminals".
+        ClientMessage::ClaudeActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.claude_list(),
+                None => (Vec::new(), Vec::new()),
+            };
+            send(
+                ws_tx,
+                &ServerMessage::ClaudeActivityListResponse(
+                    freshell_protocol::ClaudeActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals,
+                        latest_turn_completions: Some(latest),
+                    },
+                ),
+            )
+            .await
+        }
+        ClientMessage::CodexActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.codex_list(),
+                None => (Vec::new(), Vec::new()),
+            };
+            send(
+                ws_tx,
+                &ServerMessage::CodexActivityListResponse(
+                    freshell_protocol::CodexActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals,
+                        latest_turn_completions: Some(latest),
+                    },
+                ),
+            )
+            .await
+        }
+        ClientMessage::AmplifierActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.amplifier_list(),
+                None => (Vec::new(), Vec::new()),
+            };
+            send(
+                ws_tx,
+                &ServerMessage::AmplifierActivityListResponse(
+                    freshell_protocol::AmplifierActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals,
+                        latest_turn_completions: Some(latest),
+                    },
+                ),
+            )
+            .await
+        }
+        // OpenCode terminal-mode live tracking is deferred (the legacy lane
+        // is SSE-driven off the shared `opencode serve` sidecar, which
+        // terminal panes on this server do not run). The list contract is
+        // still answered — legacy's `OpencodePhase` only has `busy`, so "no
+        // records" IS the correct idle-state response shape.
+        ClientMessage::OpencodeActivityList(list) => {
+            send(
+                ws_tx,
+                &ServerMessage::OpencodeActivityListResponse(
+                    freshell_protocol::OpencodeActivityListResponse {
+                        request_id: list.request_id.clone(),
+                        terminals: Vec::new(),
+                        latest_turn_completions: Some(Vec::new()),
+                    },
+                ),
             )
             .await
         }
@@ -2277,6 +2360,7 @@ mod terminals_changed_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            activity: None,
         };
         (state, rx)
     }
@@ -2479,6 +2563,7 @@ mod terminal_meta_created_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            activity: None,
         };
         (state, rx)
     }

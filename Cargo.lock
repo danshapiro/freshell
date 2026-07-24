@@ -1422,6 +1422,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "freshell-activity",
  "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",
@@ -1430,6 +1431,7 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "futures-util",
+ "notify",
  "rusqlite",
  "serde_json",
  "sha2",

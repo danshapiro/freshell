@@ -174,6 +174,7 @@ async fn spawn_server() -> String {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        activity: None,
     };
 
     let router = freshell_ws::router(state);

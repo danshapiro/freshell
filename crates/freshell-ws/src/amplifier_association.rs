@@ -153,6 +153,17 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             &located.session_id,
             entry.cwd.clone(),
         );
+        // TERM-15/TERM-16: the resolved association also carries the session's
+        // events.jsonl path — attach the activity hub's events lane (inotify
+        // tailer) at Start, replaying the young file's history (the recorded
+        // `prompt:submit` is what confirms the tracker's provisional busy).
+        if let Some(hub) = &state.activity {
+            hub.attach_amplifier_association(
+                &located.terminal_id,
+                &located.session_id,
+                &located.events_path,
+            );
+        }
     }
 }
 
@@ -287,6 +298,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
             opencode_locator: None,
+            activity: None,
         };
         (state, rx)
     }

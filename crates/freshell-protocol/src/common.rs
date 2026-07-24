@@ -88,13 +88,17 @@ pub enum ErrorCode {
     ProtocolMismatch,
 }
 
-/// The three coding-agent providers (`claude | codex | opencode`).
+/// The coding-agent providers (`claude | codex | opencode | amplifier`).
+/// `amplifier` matches the legacy `TerminalTurnCompleteSchema.provider` enum
+/// (`shared/ws-protocol.ts:192`) — required by the TERM-16 turn-complete
+/// broadcast for amplifier terminal panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentProvider {
     Claude,
     Codex,
     Opencode,
+    Amplifier,
 }
 
 /// fresh-agent session flavour.

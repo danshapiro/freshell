@@ -81,6 +81,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        activity: None,
     };
 
     let router = freshell_ws::router(state);
