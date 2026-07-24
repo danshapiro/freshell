@@ -1,35 +1,43 @@
 import fs from 'fs/promises'
 import path from 'path'
 import { test as base, expect } from '../helpers/fixtures.js'
-import { TestServer } from '../helpers/test-server.js'
+import { createE2eServerHandle } from '../helpers/external-target.js'
 
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 
+// Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
+// SAME spec exercises the legacy Node server or the owned Rust server
+// depending on the active project's `e2eServerKind` option. `setupHome` is
+// part of the construction-options surface shared by both `TestServer` and
+// `RustServer`.
 const test = base.extend({
-  testServer: [async ({}, use) => {
-    const server = new TestServer({
-      setupHome: async (homeDir) => {
-        const freshellDir = path.join(homeDir, '.freshell')
-        await fs.mkdir(freshellDir, { recursive: true })
-        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
-          version: 1,
-          settings: {
-            network: {
-              configured: true,
-              host: '127.0.0.1',
-            },
-            codingCli: {
-              providers: {
-                claude: {
-                  cwd: homeDir,
+  testServer: [async ({ e2eServerKind }, use) => {
+    const server = await createE2eServerHandle(process.env, {
+      kind: e2eServerKind,
+      construct: {
+        setupHome: async (homeDir) => {
+          const freshellDir = path.join(homeDir, '.freshell')
+          await fs.mkdir(freshellDir, { recursive: true })
+          await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+            version: 1,
+            settings: {
+              network: {
+                configured: true,
+                host: '127.0.0.1',
+              },
+              codingCli: {
+                providers: {
+                  claude: {
+                    cwd: homeDir,
+                  },
                 },
               },
             },
-          },
-          legacyLocalSettingsSeed: {
-            theme: 'light',
-          },
-        }, null, 2))
+            legacyLocalSettingsSeed: {
+              theme: 'light',
+            },
+          }, null, 2))
+        },
       },
     })
     await server.start()
@@ -63,6 +71,27 @@ async function getBrowserPreferences(page: any) {
 }
 
 test.describe('Settings Persistence Split', () => {
+  // HARNESS-02 Finding 2 -- this scenario depends on `legacyLocalSettingsSeed`
+  // (seeded into `.freshell/config.json` by this file's `testServer`
+  // override above and asserted back out of the persisted config at the end
+  // of the test) round-tripping through the server's settings-load path. The
+  // Rust server does not implement `legacyLocalSettingsSeed` at all yet --
+  // grep evidence: `crates/freshell-server` has no match for
+  // `legacyLocalSettingsSeed` or `legacy_local_settings_seed` anywhere in the
+  // crate (confirmed via `grep -rn legacyLocalSettingsSeed crates/` and
+  // `grep -rn legacy_local_settings_seed crates/` both returning zero
+  // matches, whereas `server/config.ts`/`server/settings-router.ts` on the
+  // Node side load and merge it) -- tracked as CFG-04/SESSION-13. Scoped to
+  // the `rust` project via the `e2eServerKind` worker option so
+  // `legacy-chromium` continues to run and pass this spec normally, and a
+  // future Rust implementation of CFG-04/SESSION-13 will flip this back to
+  // an (expected) pass, which Playwright reports as an unexpected-pass
+  // failure that flags the annotation for removal.
+  test.fail(
+    ({ e2eServerKind }) => e2eServerKind === 'rust',
+    'CFG-04/SESSION-13: legacyLocalSettingsSeed not implemented in Rust',
+  )
+
   test('browser-local settings stay local while server-backed settings replicate', async ({ browser, serverInfo }) => {
     const contextA = await browser.newContext()
     const pageA = await contextA.newPage()

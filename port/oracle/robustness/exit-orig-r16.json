@@ -1,0 +1,156 @@
+{
+ "terminalId": "WqW5B4hKZmx885PTsZvth",
+ "frames": [
+  {
+   "type": "ready",
+   "timestamp": "2026-07-14T07:28:26.422Z",
+   "serverInstanceId": "srv-2b60ff91-bd79-4de5-8402-43f95937c809",
+   "bootId": "boot-c09b9506-9f6b-4c7e-8caf-e0688e783afc"
+  },
+  {
+   "type": "terminal.created",
+   "requestId": "x-1784014106410",
+   "terminalId": "WqW5B4hKZmx885PTsZvth",
+   "createdAt": 1784014106427,
+   "cwd": "/home/dan/.freshell-qa-007-orig"
+  },
+  {
+   "type": "terminals.changed",
+   "revision": 1
+  },
+  {
+   "type": "settings.updated",
+   "settings": {
+    "logging": {
+     "debug": false
+    },
+    "safety": {
+     "autoKillIdleMinutes": 15
+    },
+    "terminal": {
+     "scrollback": 10000
+    },
+    "panes": {
+     "defaultNewPane": "ask"
+    },
+    "sidebar": {
+     "excludeFirstChatSubstrings": [],
+     "excludeFirstChatMustStart": false,
+     "autoGenerateTitles": true
+    },
+    "ai": {},
+    "codingCli": {
+     "enabledProviders": [
+      "claude",
+      "codex",
+      "opencode"
+     ],
+     "providers": {
+      "claude": {
+       "permissionMode": "default"
+      },
+      "codex": {}
+     },
+     "mcpServer": true,
+     "knownProviders": [
+      "claude",
+      "codex",
+      "gemini",
+      "kimi",
+      "opencode"
+     ]
+    },
+    "editor": {
+     "externalEditor": "auto"
+    },
+    "freshAgent": {
+     "enabled": false,
+     "defaultPlugins": [],
+     "providers": {}
+    },
+    "extensions": {
+     "disabled": []
+    },
+    "network": {
+     "host": "127.0.0.1",
+     "configured": false
+    }
+   }
+  },
+  {
+   "type": "perf.logging",
+   "enabled": false
+  },
+  {
+   "type": "terminal.inventory",
+   "bootId": "boot-c09b9506-9f6b-4c7e-8caf-e0688e783afc",
+   "terminals": [
+    {
+     "terminalId": "WqW5B4hKZmx885PTsZvth",
+     "title": "Shell",
+     "mode": "shell",
+     "createdAt": 1784014106427,
+     "lastActivityAt": 1784014106427,
+     "status": "running",
+     "hasClients": false,
+     "cwd": "/home/dan/.freshell-qa-007-orig"
+    }
+   ],
+   "terminalMeta": []
+  },
+  {
+   "type": "terminal.attach.ready",
+   "terminalId": "WqW5B4hKZmx885PTsZvth",
+   "streamId": "7fd11a08-1e35-497d-b2da-9f2d1b38eeb6",
+   "geometryEpoch": 1,
+   "geometryAuthority": "single_client",
+   "requestedSinceSeq": 0,
+   "effectiveSinceSeq": 0,
+   "headSeq": 0,
+   "replayFromSeq": 1,
+   "replayToSeq": 0,
+   "attachRequestId": "att-x-1784014106410"
+  },
+  {
+   "type": "terminal.meta.updated",
+   "upsert": [
+    {
+     "terminalId": "WqW5B4hKZmx885PTsZvth",
+     "cwd": "/home/dan/.freshell-qa-007-orig",
+     "checkoutRoot": "/home/dan/.freshell-qa-007-orig",
+     "repoRoot": "/home/dan/.freshell-qa-007-orig",
+     "displaySubdir": ".freshell-qa-007-orig",
+     "updatedAt": 1784014106451
+    }
+   ],
+   "remove": []
+  },
+  {
+   "type": "terminal.exit",
+   "terminalId": "WqW5B4hKZmx885PTsZvth",
+   "exitCode": 0
+  },
+  {
+   "type": "terminal.meta.updated",
+   "upsert": [],
+   "remove": [
+    "WqW5B4hKZmx885PTsZvth"
+   ]
+  }
+ ],
+ "inventoryAfter": [
+  {
+   "terminalId": "WqW5B4hKZmx885PTsZvth",
+   "title": "Shell",
+   "mode": "shell",
+   "createdAt": 1784014106427,
+   "lastActivityAt": 1784014108941,
+   "status": "exited",
+   "hasClients": false,
+   "cwd": "/home/dan/.freshell-qa-007-orig",
+   "lastLine": "logout",
+   "last_line": "logout"
+  }
+ ],
+ "bufferTail": "oot\"), use \"sudo <command>\".\r\nSee \"man sudo_root\" for details.\r\n\r\n\u001b[?2004hdan@SurfaceBookPro9:~$ exit\r\n\u001b[?2004l\rlogout\r\n"
+}

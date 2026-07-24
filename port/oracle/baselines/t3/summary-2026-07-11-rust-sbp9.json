@@ -1,0 +1,137 @@
+{
+  "tier": "T3",
+  "title": "E2E UI + visual parity (Playwright e2e-browser) — RUST PORT graded against the ORIGINAL re-baseline on host SurfaceBookPro9 (POST-FIX re-grade)",
+  "generated": "2026-07-11T21:01:48.000Z",
+  "against": "RUST port (target/release/freshell-server, commit 984294fe + PORT-DEFECT fix in crates/freshell-ws/src/terminal.rs, uncommitted) run as an EXTERNAL target on 127.0.0.1:17872 with an isolated scratch $HOME; graded against port/oracle/baselines/t3/summary-2026-07-11-original-sbp9.json (117 pass / 9 fail)",
+  "worktree_commit": "984294fe + uncommitted fix (resolve_create_cwd in crates/freshell-ws/src/terminal.rs)",
+  "branch": "feat/rust-tauri-port",
+  "host": {
+    "name": "SurfaceBookPro9",
+    "os": "Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)",
+    "node": "v24.12.0",
+    "playwright": "1.58.2",
+    "chromium_rev": "145.0.7632.6",
+    "chromium_build": "chromium-1208",
+    "snapshot_platform": "chromium-linux"
+  },
+  "how_produced": {
+    "config": "port/oracle/t3/playwright.target.config.ts (external-target mode; the shared, unmodified spec suite)",
+    "command": "FRESHELL_E2E_TARGET_URL=http://127.0.0.1:17872 FRESHELL_E2E_TARGET_TOKEN=<token> FRESHELL_E2E_TARGET_HOME=<scratch> npx playwright test --config port/oracle/t3/playwright.target.config.ts --workers=1 --retries=0 --reporter=list,json",
+    "workers": 1,
+    "retries": 0,
+    "runs": 1,
+    "server": "PORT=17872 AUTH_TOKEN=<token> FRESHELL_BIND_HOST=127.0.0.1 HOME=<scratch> FRESHELL_HOME=<scratch> FRESHELL_CLIENT_DIR=<worktree>/dist/client ./target/release/freshell-server (rebuilt from the fixed source) — isolated scratch home pre-seeded with {version:1,settings:{network:{configured:true,host:\"127.0.0.1\"}}} (identical to what the E2E TestServer writes) so the setup wizard is bypassed",
+    "isolation": "Single external RUST server on 127.0.0.1:17872 with an isolated $HOME under the user home; reaped after the run. No live user server was touched.",
+    "flake_classification": "NOT performed this run — single pass at workers=1 retries=0 per the grading protocol (red is data). fresh-agent.spec.ts:98 was separately re-run 4x across BOTH servers outside this grading run purely to gather adjudication evidence (see notes); the grading run itself is this single untouched pass.",
+    "raw_report": "port/oracle/baselines/t3/playwright-report-2026-07-11-rust-sbp9.json"
+  },
+  "totals": {
+    "files": 25,
+    "tests": 126,
+    "passed": 118,
+    "failed": 8,
+    "flaky": 0,
+    "skipped": 0,
+    "duration_ms": 908213
+  },
+  "verdict": {
+    "equivalence_bar": "EXACT match to the original profile — no better, no worse",
+    "result": "NOT EQUIVALENT (1 residual delta: fresh-agent.spec.ts:98 — see adjudication note; all 4 PORT-DEFECTs fixed)",
+    "equivalent_red": 8,
+    "port_defects": [],
+    "port_defects_fixed_this_pass": [
+      "fresh-agent.spec.ts:183",
+      "fresh-agent.spec.ts:215",
+      "fresh-agent.spec.ts:502",
+      "fresh-agent.spec.ts:895"
+    ],
+    "force_green_candidates": [
+      "fresh-agent.spec.ts:98"
+    ],
+    "note": "Root cause of all 4 PORT-DEFECTs: crates/freshell-ws/src/terminal.rs's `handle_create` never resolved a default cwd for `terminal.create` messages sent with no explicit `cwd` (the SPA's default first pane) — unlike the original's `terminal-registry.ts:1565` (`opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())`). A cwd-less terminal reported no `cwd` in `terminal.created`, so `GET /api/files/candidate-dirs` (files.rs) never listed a directory for it, so the fresh-agent DirectoryPicker (src/components/panes/DirectoryPicker.tsx) rendered zero `role=\"option\"` suggestions and every spec waiting on `getByRole('option').first()` hung for the full 60s timeout. Fixed by adding `resolve_create_cwd` (explicit cwd -> live-boot-settings defaultCwd (validated reachable) -> $HOME/FRESHELL_HOME on non-Windows -> None), pinned by 6 new unit tests in crates/freshell-ws/src/terminal.rs. All 4 PORT-DEFECTs now GREEN, matching the original exactly. The single residual delta, fresh-agent.spec.ts:98 ('pane picker hides fresh clients by default'), is UNRELATED to this fix (it never touches candidate-dirs/DirectoryPicker) and was re-verified to be a flaky/host-dependent assertion: it passed 4/4 re-runs against BOTH the original and the Rust port in this session (this grading run's single pass also shows it GREEN on Rust), while the committed original baseline recorded it RED exactly once. This is flagged as an adjudication question, NOT force-fixed — see port/oracle/notes/t3-rust-vs-original-2026-07-11.md for full evidence."
+  },
+  "visual_baselines": {
+    "count": 7,
+    "matched": 6,
+    "mismatched": 1,
+    "results": [
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/default-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:4",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/settings-view-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:16",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/multiple-tabs-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:29",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/auth-modal-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:41",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/sidebar-collapsed-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:52",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/mobile-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:64",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "editor-pane.spec.ts-snapshots/editor-pane-loaded-chromium-linux.png",
+        "spec": "editor-pane.spec.ts:83",
+        "status": "MISMATCH"
+      }
+    ],
+    "note": "Same visual profile as the original re-baseline and as the pre-fix rust run: the 6 screenshot-baselines assertions (maxDiffPixelRatio 0.05) all MATCH against the fixed Rust server; editor-pane-loaded (NO tolerance) mismatches with 1625 pixels (ratio 0.01) — same baseline-strictness finding as the original (red on both), not a Rust regression. Unaffected by the terminal-cwd fix."
+  },
+  "per_file": [
+    { "file": "auth.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "browser-pane-screenshot.spec.ts", "pass": 2, "fail": 0, "externally_targetable": true },
+    { "file": "browser-pane.spec.ts", "pass": 5, "fail": 0, "externally_targetable": true },
+    { "file": "editor-pane.spec.ts", "pass": 5, "fail": 1, "externally_targetable": true },
+    { "file": "fresh-agent-centralization-smoke.spec.ts", "pass": 2, "fail": 2, "externally_targetable": true },
+    { "file": "fresh-agent-mobile.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "fresh-agent.spec.ts", "pass": 9, "fail": 0, "externally_targetable": true },
+    { "file": "freshopencode-model-picker.spec.ts", "pass": 0, "fail": 1, "externally_targetable": true },
+    { "file": "mobile-viewport.spec.ts", "pass": 6, "fail": 1, "externally_targetable": true },
+    { "file": "multi-client.spec.ts", "pass": 5, "fail": 1, "externally_targetable": true },
+    { "file": "multirow-tabs.spec.ts", "pass": 2, "fail": 1, "externally_targetable": true },
+    { "file": "opencode-replay-write-progression.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "pane-activity-indicator.spec.ts", "pass": 2, "fail": 1, "externally_targetable": true },
+    { "file": "pane-picker.spec.ts", "pass": 2, "fail": 0, "externally_targetable": true },
+    { "file": "pane-system.spec.ts", "pass": 10, "fail": 0, "externally_targetable": true },
+    { "file": "reconnection.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "screenshot-baselines.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "settings.spec.ts", "pass": 8, "fail": 0, "externally_targetable": true },
+    { "file": "sidebar.spec.ts", "pass": 8, "fail": 0, "externally_targetable": true },
+    { "file": "stress.spec.ts", "pass": 5, "fail": 0, "externally_targetable": true },
+    { "file": "tab-management.spec.ts", "pass": 11, "fail": 0, "externally_targetable": true },
+    { "file": "tab-recency-sync.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "tabs-client-retire.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "terminal-background-freeze-catchup.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "terminal-lifecycle.spec.ts", "pass": 13, "fail": 0, "externally_targetable": true }
+  ],
+  "targetable_seam": {
+    "purpose": "External-target run of the identical e2e specs against a running server (here: the RUST port on 127.0.0.1:17872) via FRESHELL_E2E_TARGET_URL.",
+    "helper": "test/e2e-browser/helpers/external-target.ts",
+    "oracle_config": "port/oracle/t3/playwright.target.config.ts",
+    "excluded_when_external": [
+      "server-restart-recovery.spec.ts",
+      "settings-persistence-split.spec.ts",
+      "freshopencode-restart-recovery.spec.ts",
+      "freshopencode-db-history.spec.ts",
+      "freshopencode-first-send-reload-repro.spec.ts",
+      "opencode-restart-recovery.spec.ts"
+    ],
+    "note": "126 = the 138-test full suite minus the 12 tests in the 6 server-owning spec files above."
+  }
+}

@@ -66,9 +66,10 @@ const wsHarness = vi.hoisted(() => {
     },
     consumeRestoreRequestId(id: string) {
       if (addedFreshRecoveryIds.has(id)) return false
-      if (!addedRestoreIds.has(id)) return false
+      return addedRestoreIds.has(id)
+    },
+    clearRestoreRequestId(id: string) {
       addedRestoreIds.delete(id)
-      return true
     },
     addFreshRecoveryRequestId(id: string, intent: string) {
       addedRestoreIds.delete(id)
@@ -103,6 +104,7 @@ vi.mock('@/lib/ws-client', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: (id: string) => wsHarness.addRestoreRequestId(id),
   consumeTerminalRestoreRequestId: (id: string) => wsHarness.consumeRestoreRequestId(id),
+  clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
   consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
 }))

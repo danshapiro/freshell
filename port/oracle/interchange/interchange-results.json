@@ -1,0 +1,36 @@
+{
+ "legs": {
+  "leg1-rustwsl-rustwin": {
+   "ok": true,
+   "detail": "A tabs 2->2, B tabs 2->2, marker replay A=true; URL-only change, same token"
+  },
+  "leg2-orig-rust": {
+   "ok": true,
+   "detail": "A tabs 2->2, B tabs 2->2, marker replay A=true; URL-only change, same token"
+  },
+  "leg3-differential": {
+   "ok": true,
+   "detail": "liveAppear orig=false rust=false; appearAfterReload orig=false rust=false; liveMirror orig=true rust=true; A==B bytes orig=true(338) rust=true(338)"
+  }
+ },
+ "leg3": {
+  "orig": {
+   "liveAppear": false,
+   "appearAfterReload": false,
+   "attachReplay": true,
+   "liveMirror": true,
+   "bytesEqual": true,
+   "bufLenA": 338,
+   "bufLenB": 338
+  },
+  "rust": {
+   "liveAppear": false,
+   "appearAfterReload": false,
+   "attachReplay": true,
+   "liveMirror": true,
+   "bytesEqual": true,
+   "bufLenA": 338,
+   "bufLenB": 338
+  }
+ }
+}

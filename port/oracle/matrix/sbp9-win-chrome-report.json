@@ -1,0 +1,84 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-cmd.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-02whhjub)",
+    "bufferExcerpt": "C:\\Users\\Public\\freshell-matrix-ws-02whhjub>echo freshell-matrix-OK | freshell-matrix-OK | C:\\Users\\Public\\freshell-matrix-ws-02whhjub>",
+    "terminalId": "850e611564414bcb8c2ebb9cd62f547c",
+    "tabId": "SUSMMGXRmPpldYpvYj--C"
+  },
+  {
+    "kind": "powershell",
+    "label": "PowerShell",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-powershell.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-02whhjub)",
+    "bufferExcerpt": "PS C:\\Users\\Public\\freshell-matrix-ws-02whhjub> echo freshell-matrix-OK | freshell-matrix-OK | PS C:\\Users\\Public\\freshell-matrix-ws-02whhjub> ",
+    "terminalId": "8ffd12a0290e4005ad98dacc5a853ced",
+    "tabId": "Tc3O7TTP8KIJtsHOIFnoU"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-02whhjub)",
+    "bufferExcerpt": "echo freshell-matrix-OK && uname -a | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-02whhjub$ echo freshell-matrix-OK && uname -a | freshell-matrix-OK | Linux SurfaceBookPro9 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x8 | 6_64 x86_64 GNU/Linux | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-02whhjub$ ",
+    "terminalId": "3d31d1b979c44d7a9d675704f98059c9",
+    "tabId": "5C9CtjR7aODC_Cf2Q-YeP"
+  },
+  {
+    "kind": "editor",
+    "label": "Editor",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-editor.png",
+    "status": "PASS",
+    "detail": "Monaco mounted + text visible · jsdelivr/monaco responses: 10 (10×2xx-3xx)",
+    "bufferExcerpt": "",
+    "tabId": "RONCAD_76TYUpRcMObW-6"
+  },
+  {
+    "kind": "browser",
+    "label": "Browser",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-browser.png",
+    "status": "PASS",
+    "detail": "navigated http://example.com → page content rendered",
+    "bufferExcerpt": "",
+    "tabId": "HyXok1WC80WhdTYZw-T-a"
+  },
+  {
+    "kind": "claude",
+    "label": "Claude CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-claude.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/\\? for shortcuts|for shortcuts|bypass permissions|╰─+|>\\s*$|try \"|esc to/i)",
+    "bufferExcerpt": " project, or work from your team). If not, take a moment to review what's in this folder first. |  Claude Code'll be able to read, edit, and execute files here. |  Security guide |  ❯ 1. Yes, I trust this folder |    2. No, exit |  Enter to confirm · Esc to cancel",
+    "terminalId": "0d4486f944ba4b45b25f49d5025532ad",
+    "tabId": "O9ZgRq7V1UH4oaNpPojll"
+  },
+  {
+    "kind": "codex",
+    "label": "Codex CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-win-chrome-codex.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/sign in with chatgpt|press enter to continue|provide your own api key|welcome to codex|to get started|describe a task|\\/status|model:|yes, continue/i)",
+    "bufferExcerpt": "> You are in C:\\Users\\Public\\freshell-matrix-ws-02whhjub |   Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt |   injection. Trusting the directory allows project-local config, hooks, and exec policies to load. | › 1. Yes, continue |   2. No, quit |   Press enter to continue and create a sandbox...",
+    "terminalId": "a4edfba6440240839dc12863f5d7acef",
+    "tabId": "UnC_m3EOBr0f3Kg8Tb7ut"
+  }
+]

@@ -1,0 +1,12 @@
+{
+ "scenario": "storm",
+ "opened": 20,
+ "postStormCreateOk": true,
+ "echoed": true,
+ "inventoryCount": 2,
+ "inventoryClients": [
+  true,
+  false
+ ],
+ "health": true
+}

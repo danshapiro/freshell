@@ -148,6 +148,7 @@ export function KilroyIcon(props: IconProps) {
   )
 }
 
+
 // Fallback for unknown providers
 export function DefaultProviderIcon(props: IconProps) {
   return (

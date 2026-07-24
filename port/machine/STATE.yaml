@@ -1,0 +1,268 @@
+# Autonomous port machine — state tracker.
+# The self-driving / dev-machine loop reads and updates this to resume safely.
+
+campaign: freshell-rust-tauri-port
+base_commit: 98ed121c            # frozen. origin/main has since advanced to 6e8b16d6;
+                                 # do NOT rebase unless the user asks.
+worktree: .worktrees/rust-tauri-port
+branch: feat/rust-tauri-port
+updated: 2026-07-14
+
+current_phase: 5                 # 0=oracle bootstrap, 1=understand, 2=architect, 3=port, 4=self-qa, 5=converge
+# PHASES 0-2 COMPLETE: oracle (T0/T1/T2/T3 + mutation 28/28), 4 ground-truth specs, frozen ADR.
+# PHASE 3 (port) — functionally COMPLETE for the equivalence thesis. 11 Rust crates + 1 Node sidecar
+#   (protocol, platform[+live-process], terminal[+registry], sessions, opencode, codex, freshagent,
+#   ws, api, server bin, tauri app; claude-sidecar=Node). The RETAINED React SPA runs unchanged on
+#   the Rust backend; the Tauri v2 desktop shell spawns the server + loads the SPA (xvfb-smoked).
+# PHASE 4 (self-QA) COMPLETE — port/oracle/EQUIVALENCE-REPORT.md. ALL FOUR TIERS deterministically
+#   original≡rust: T0 5/5 (handshake deep-equal), T1 10/10 (bytes sha256-identical), T2 matrix
+#   (opencode+codex+claude) structural deep-equal + 9/9 invariants each, T3 117/126 (+6/6 visual;
+#   8 EQUIVALENT red-on-original, 1 deferred PORT-GAP). Mutation 28/28. cargo workspace 400.
+#   [task-005c] full /api/terminals port landed (REST sweep 151/151 vs live original). PORT-GAP-002 open:
+#   GET /api/terminals/:id/{viewport,scrollback,search} unported (TerminalViewMirror) — council
+#   ACCEPT-WITH-CONDITIONS; 404-pin in sweep; follow-up task-005f (search path) is a HARD GATE for task-009.
+#   T2-opencode flake fixed (093c1050, harness determinism). One PORT_DEFECT found+fixed
+#   (attachRequestId, invisible to T1, caught by T3).
+# TASK-005 CLOSED 2026-07-12 (this-host matrix + REST parity convergence, restarts #6-#9):
+#   ALL matrix legs done+vision-verified: Chromium x3 (e19dfead, 26/26), Tauri leg A app-bound +
+#   leg B remote/provisioning.rs first live run (305eb7c6), Electron-from-source WSLg x 17872 +
+#   x native-Win 17873 (9866ec2a; app-bound SIGKILL + electron:build:win ENV-LIMITED w/ proof).
+#   [task-005e p1, eaf3fd16] owed T3 spot-check EQUIVALENT (suite-order artifact, no regression);
+#   spot-sweep vs native-Win found+fixed bootstrap shell.ready/tasks+perf and strict logs/client
+#   zod validation (byte-matched live). [task-005e p2, 24ecdb8e] knownProviders mechanism PINNED
+#   (prior "cwd-neutral 5 providers" observation was a cwd=repo launch artifact): builtin extension
+#   dir is cwd-relative, knownProviders is persisted/patchable state w/ seed+append+auto-enable
+#   startup migration - all ported, PATCH provider-name validation byte-matched (17/17 battery);
+#   compiled-in extension-dir fallback removed (cwd-neutral extensions/availableClis now match).
+#   [c5e23374] native-Win machineHostname (hostname.exe==os.hostname()) + lanIps (Up-adapter
+#   PowerShell enum == os.networkInterfaces ground truth) live-verified on 17873.
+#   REST sweep now 175/175; oracle 174 passed/6 T2-skipped; cargo workspace green; purity held.
+# TASK-006 CLOSED 2026-07-13 (CLI argv/env fidelity, spec cli-argv-fidelity.md rev 2.1; restarts #10-#13):
+#   [d60d22fc] resolve_cli_launch + generateMcpInjection (all 5 modes) + terminal.create wiring;
+#   goldens G-C1..G-K1 + G-X0; live /proc argv+environ differential: claude byte-identical,
+#   codex identical minus --remote 4-tuple (DEV-0006, council APPROVE, ledgered w/ G-X0 pin +
+#   EQUIVALENCE-REPORT disclosure owed at task-009), opencode identical modulo port w/ identical
+#   config merge/refcount/cleanup lifecycle. U1 ratified option (a); U6/U7 resolved.
+#   [2eae97dd] BLOCKER B1 discharged (DEV-0007, council option (a)): native-Windows live check on
+#   17873 - ORIGINAL's default cmd branch cannot launch claude at all (exact node-pty bytes replayed:
+#   'not recognized'); rust PORT-FIX launches claude, settings arrive still-escaped (strictly milder,
+#   scope-limited to this argv/quoting class); powershell branch flattened line BYTE-IDENTICAL and
+#   identically broken (PS 5.1 quote strip) = bug-for-bug EQUIVALENT. Windows ConPTY exit/kill wedge
+#   found+fixed in pty.rs (waiter thread owns child; master dropped on Windows at exit so the reader
+#   EOFs - kill no longer wedges the server; natural-exit registry fan-out parity deferred to task-007).
+#   [s7.D.4] per-provider pane rendering: claude/codex/opencode on rust-WSL 17872 vs original 17871,
+#   harness 3/3 PASS both legs, vision 6/6 PASS (opencode re-driven per s8.4; see
+#   port/oracle/matrix/vision-review-t6-2026-07-13.md). Windows opencode absent (ENV-LIMITED).
+#   s6 success criteria: (1) goldens byte-for-byte PASS (147 platform tests); (2) segment ordering
+#   pinned incl all-segments tests; (3) four throw conditions reference-exact via PTY_SPAWN_FAILED;
+#   (4) MCP side-effects integration-tested + live-verified, cleanup on exit+failed spawn; (5) FRESHELL*
+#   base env asserted (U6); (6) purity held, REDUCED-FIDELITY notes retired to the ledger (DEV-0006/0007);
+#   (7) all 5 injection modes + B1 resolved before native-Windows leg declared done.
+# TASK-007 CLOSED 2026-07-14 (natural-exit + robustness + indexer + interchange + Tauri window-state;
+#   restarts #13-#16):
+#   [b0133b97] natural-exit parity: finishTerminalPtyExit core ported (terminal.exit w/ real exit code
+#   from waiter rendezvous, fired at reader EOF; kill path no-ops it - tr:1760 parity).
+#   [9665acc6] s7.I robustness battery EQUIVALENT (storm/multi/scroll/kill-9; 100k-line scrollback
+#   replay byte-identical 689191) + SIGTERM 4009 'Server shutting down' close parity ported.
+#   [959e9d9b] s7.I.5 indexer seeded-home differential: found+fixed parse_claude_file invalid-UTF-8
+#   lossy-read parity (bug#7 class); 12 fixture variants + cursor chain EQUAL deep-key-sorted.
+#   [this commit] s7.F interchange: leg1 rust-WSL<->rust-native-win same-token URL-only switch (tabs
+#   2->2 both, marker replay, vision PASS incl C:\Users\dan> proof of 17873); leg2 orig<->rust ditto;
+#   leg3 cross-client differential EQUIVALENT (tabs client-local BOTH, live mirror BOTH, buffers
+#   byte-identical 338); leg4 Chromium+Tauri same server simultaneous (tab does NOT cross clients =
+#   original behavior; liveness control resize proves capture pipeline live; 9/9 vision PASS).
+#   s7.H.4 Tauri window-state: move/resize -> debounced save exact -> restart -> SIZE restored exact,
+#   off-screen clamp -5000,-4000 -> 320,180 live-verified (ledgered extra vs Electron verbatim
+#   restore); ENV-LIMITED: WSLg Weston applies +(6,27) to EVERY move request (xdotool control proves
+#   compositor-imposed, not port math) - position exact-restore unverifiable on this display server.
+#   terminals.changed WS-lifecycle wiring PORTED (shared monotonic revision w/ REST; create/kill; NOT
+#   plain exit) + invalid-kill INVALID_TERMINAL_ID error frame; live re-probes revision-match 1:1.
+#   terminal.meta.updated = DEV-0008 documented gap (council option (a), conditions discharged; closes
+#   w/ DEV-0006 coding-CLI sidecar-lifecycle scope). Reports: port/oracle/robustness/report-2026-07-13.md
+#   + port/oracle/interchange/report-2026-07-14.md. Gates: cargo 41 suites, oracle 174/6, 3 binaries
+#   rebuilt, purity empty, zero orphans.
+# TASK-008 CLOSED 2026-07-14 (T2 live on this host; restart #16, commit 969933ed):
+#   claude(haiku) PASS + codex(gpt-5.3-codex-spark) PASS - one live turn each through the RUST server,
+#   all FATAL T2 invariants, structural projections deep-equal to the original baselines; user auth
+#   stores untouched. opencode(umans kimi-k2.7) SKIPPED-AND-ESCALATED: ~/.local/share/opencode/auth.json
+#   ABSENT + opencode.jsonc has no umans provider config (proof in port/oracle/t2-live-rust-2026-07-14.md)
+#   - the ONE human dependency (run 'opencode auth login', then re-run the same driver, no dev owed).
+# TASK-009 CLOSED 2026-07-14 (campaign close-out; restart #16):
+#   EQUIVALENCE-REPORT s0.2 this-host addendum (tier counts, full client x server matrix w/ screenshot
+#   paths, DEV-0004..0008 user-facing disclosures verbatim, 11-item ENV-LIMITED enumeration).
+#   Campaign status: CONVERGED to the equivalence thesis within the documented this-host ceiling.
+#   Cross-links: DEV-0004 (bounded update-check, port-side fix), DEV-0005 (WSL cmd-pane cwd, original
+#   defect preserved bug-for-bug), DEV-0006 (codex --remote gap, disclosure carried), DEV-0007 (native-Win
+#   quoting, strictly-milder, disclosure carried), DEV-0008 (terminal.meta.updated documented gap;
+#   terminals.changed WS parity PORTED at aadd41a6). Open human dependency: T2-opencode credentials.
+# DEVIATIONS: DEV-0001 fixed+pinned (3/3), DEV-0002 fixed+pinned (4/4), DEV-0003 REJECTED (zero-tol).
+#   Open candidates CD-1..CD-8 + candidate-dirs (tracked in architecture-spec.md §8 / in-code notes).
+# DISCIPLINE HELD END-TO-END: original source NEVER mutated (git diff server/ shared/ empty at all
+#   ~25 commits); live :3001 / pid 1262455 never touched; 0 orphans; branch feat/rust-tauri-port pushed.
+# FOLLOW-UPS LANDED (2026-07-06, see EQUIVALENCE-REPORT §0.1 addendum):
+#   [DONE] 3.16 terminal batch framing (barrier scanner + UTF-16 offsets + char ring; batch_wire_golden
+#          2/2 + t1-batch 44/44 original≡rust, multibyte UTF-16 proven).
+#   [DONE] 3.17 Tauri desktop features (tray/hotkey/window-state/wizard/chooser/updater-config/recovery;
+#          89 unit tests + xvfb hotkey; display/signing-gated items flagged).
+#   [DONE] ENV-0001 raised+RESOLVED: live-node uppercasing was a stale dist build; clean rebuild restored
+#          byte-exact (t1 10/10 + t1-batch 44/44, 0 skips); antagonist rejected a case-fold weakening;
+#          port always correct; quarantine self-extinguished.
+#   [DONE] 3.18 REST breadth (browser-pane proxy + screenshots + files r/w) => external e2e 118/126;
+#          port matches the original's EXACT pass/fail profile (remaining 8 = EQUIVALENT red-on-original).
+# REMAINING (bounded; off-host ceiling — NOT doable on this WSL2 host, documented, not defects):
+#   macOS packaging/visual (unverified); live Windows-elevated netsh/UAC mutation (golden-string-only —
+#   must not touch DANDESKTOP); the 8 EQUIVALENT specs (red on the pristine original, CI-rotted upstream);
+#   a few deep endpoints no failing spec gates (sessions/history detail, network/LAN control UI, extensions).
+#   ENV-0001 deep mechanism (stale-build fold) — moot (artifact gone), left as an optional curiosity.
+
+# --- Confirmed user constraints (this run) ---------------------------------
+constraints:
+  vm_only: "SUPERSEDED 2026-07-10 (do NOT obey): the 2026-07-08 directive read
+            'the agent operates ONLY on the TauriDebugVM; do not execute anything
+            on DANDESKTOP'. On 2026-07-10 the user brought the session back to
+            DANDESKTOP WSL2 and rescinded it - execution on DANDESKTOP is
+            sanctioned again; the VM leg is closed (RESOLVED-BY-RELOCATION, see
+            blockers below). port/vm-bridge/ is retained DORMANT (security-hardened,
+            see its README) - do not start a watcher. The 'host:' constraint below
+            is authoritative again."
+  gemini: OUT of scope — not ported, not QA'd
+  languages: Rust only (Go dropped). JS/Node allowed ONLY as a spawned sidecar
+             when it is a massive net savings (no Rust equivalent); justify in ADR.
+  bug_posture: FIX bugs as found; do NOT replicate bug-for-bug. Every diff →
+               PORT_DEFECT | DELIBERATE_FIX (ledgered, antagonist-adjudicated) | EQUIVALENT
+  autonomy: left running unattended for ~1 week; no spend cap; no human gates
+  delivery: push branch periodically; NO PR (leave pushed branch for review)
+  windows: powershell.exe 5.1 + cmd.exe reachable → Windows integration is
+           partially LIVE-verifiable. macOS = spec/fixture only.
+  host: WSL2 Linux, 32 CPU / 62G RAM / 232G free, Docker up, Playwright browsers
+        installed, Tauri libs installed (webkit2gtk-4.1 2.52.3), Rust 1.96.
+
+# --- DO NOT TOUCH (user's live environment) --------------------------------
+do_not_touch:
+  freshell_server: { pid: 1262455, port: 3001, note: "user's live freshell + child ports; never bind 3001" }
+  freshell_mcp: { pid: 519533 }
+  live_codex_pids: [1131271, 1113784, 1263603, 2979002, 3145360]
+  live_opencode_pids: [2715495]
+  rule: my own server binds a unique high port; live-QA spawns its OWN codex/opencode
+        on unique ports and cleans up only what it spawned (ownership-safe cleanup).
+my_server_port: 3456             # my isolated server for browser-based validation
+
+phases:
+  0_oracle_bootstrap:
+    status: in_progress
+    done:
+      - laid down plan-of-record (README, bundle.yaml, AGENTS.md, oracle/DESIGN, DEVIATIONS, architecture-spec)
+      - confirmed base green + node-pty loads from shared node_modules
+      - FIXED prerequisite defect: test:real:coding-cli-contracts env var (regression test added)
+      - re-verified env post-reboot; baked in the 4 user constraints + deviation-ledger model
+    next:
+      - "DONE: froze ws-protocol → port/contract/ws-protocol.schema.json (v7, 55 schemas) + drift-guard (7/7, mutation-validated)"
+      - "DONE: closed T0 outbound gap — all 52 server→client messages schematized from the TS
+         unions via the TS compiler API (port/contract/ws-server-messages.schema.json); drift-guard
+         13/13, mutation-validated; zod-vs-TS cross-check clean on the 8 overlapping messages."
+      - "DONE: external-process capture harness + first LIVE T0 test — boots the ORIGINAL server
+         isolated (ephemeral loopback port, isolated HOME, ownership sentinels), captures the real
+         WS handshake, validates every server→client message against the frozen contract (5/5,
+         4/4 conformant), clean ownership-safe teardown, live :3001 never touched.
+         (port/oracle/harness/*, test:oracle)"
+      - "note: zod4 emits additionalProperties:false but runtime strips (accept-and-strip);
+         treat zod parse as inbound authority, JSON Schema as shape contract."
+      - "opaque blobs (model as serde_json::Value, exclude from byte-diff): Usage.passthrough,
+         record(string,unknown) layouts/tool_use.input/decision/fork.input, tool_result.content, codingcli/freshAgent event"
+      - "DONE: normalization layer (port/oracle/harness/normalize.ts) — stable per-family placeholders,
+         cross-ref-preserving, idempotent; 25 unit + LIVE two-boot determinism (handshake normalizes
+         deep-equal across fresh boots). Findings: added `token` opaque; bootId identical across
+         ready+terminal.inventory (port MUST preserve); ready.timestamp ISO; ready always emits srv+boot ids."
+      - "DONE: PTY byte-stream golden capture (T1) — real node-pty over WS, sentinel-bounded,
+         seq-reassembled; two-boot byte-identical for 4 scenarios; committed baselines under
+         port/oracle/baselines/pty/*.golden (sha256-pinned, host-specific /bin/bash -l). Oracle 21/21.
+         Safety check MUST be ownership-based (probe sentinel / isolated cwd) — naive pgrep self-matches."
+      - "PARTIAL: T2 scaffolding landed — invariants grader (port/oracle/harness/invariants.ts, 20/20 unit),
+         t2-live opencode/Kimi harness + auth-seeding (external-server setupHome passthrough), gated live test.
+         Live opencode/Kimi turn reached Kimi with SEEDED auth writing to an ISOLATED opencode.db (user store
+         untouched) — proving the cred-seed + isolation path works."
+      - "ANTAGONIST VERDICT (DEV-0001, session ...670a1870): the builder had patched the ORIGINAL
+         serve-manager.ts (un-timed cold-serve health probe) to get T2 green. REJECTED as a governance breach
+         (never mutate the reference baseline to pass a new harness) — REVERTED to pristine; original 49/49 green.
+         Defect classification ACCEPTED: the PORT will bound the health probe; ledgered as DEV-0001."
+      - "T2-opencode is BLOCKED, not done. Conditions (from DEV-0001): (1) original stays pristine [done];
+         (2) capture the T2 baseline via a WARM opencode-serve sidecar, not by mutating the original;
+         (3) PIN the real stall first (turnAccepted=false persisted even with the patch — the deeper
+         never-flips-to-idle / createSession stall must be proven, not masked by the health fix);
+         (4) implement the bounded probe in the PORT with a red→green pinning test.
+         Harden the live test to FAIL (not skip) on turnAccepted=false so it can never false-green."
+      - "DIAGNOSIS (debugger session ...45c78005, 2 live calls, notes: port/oracle/notes/t2-opencode-stall.md):
+         real stall PINNED = DEV-0001 alone (un-timed health probe, serve-manager.ts:286) → turnAccepted=false.
+         Antagonist's 'deeper stall' REFUTED: createSession+persist fine (532ms/2ms); 'never emits idle' is
+         FALSE — opencode 1.17.13 emits session.idle + session.status{idle} ~5s; adapter onceIdle handles it.
+         Exp5b GOLD: warming the serve via OPENCODE_CMD warm-proxy (ZERO source mutation) → full turn completes
+         through PRISTINE freshell (send-keys 200 {idle}, durable ses_, reply persisted). No 2nd deviation needed."
+      - "DONE: T2 opencode/Kimi GREEN (warm-proxy, idle-edge, baseline). Mutation-validation capstone DONE —
+         oracle PROVEN: 28/28 planted divergences caught, e2e RED→GREEN (dist-patched, restored), full 81/81.
+         T2 claude/Haiku GREEN (9/9, freshAgent.turn.complete edge, baseline)."
+      - "DEV-0002 ledgered (antagonist ...07e6276d): first freshclaude turn crashes the whole process via an
+         uncaught chokidar close-during-add race when ~/.claude exists but ~/.claude/projects doesn't. Real
+         latent robustness bug (fresh Claude-Code install trips it). Source PRISTINE; harness pre-creates
+         projects/ (env parity). NOT differ-whitelistable (both sides pre-create) → carried SOLELY by a
+         mandatory port-side liveness pinning test (guard the watcher: stay up, degrade, resume)."
+      - "DONE: T2 codex/GPT-mini GREEN (codex app-server JSON-RPC/WS; completion = turn/completed with
+         params.turn.status==='completed'; seed ~/.codex/auth.json + config.toml). DEV-0003 (codex effort) REJECTED
+         by antagonist. Cheapest-model matrix complete (Kimi/Haiku/GPT). Commit 700dcacd."
+      - "DONE: T3 e2e/visual baseline vs ORIGINAL on this host (WSL2 chromium-linux). Ran the shared unmodified
+         Playwright suite (test/e2e-browser, 138 tests, 4 workers, each worker its OWN isolated ephemeral-port
+         server; :3001 NEVER touched): 122 pass / 16 fail / 0 flaky; VISUAL 6/7 MATCH. Failure editor-pane-loaded
+         is a zero-tolerance 118px (0.01) Monaco-AA strictness finding; other 6 baselines match @0.05. All 16 fails
+         REPRODUCE against the pristine original (pre-existing red — CI runs none of these suites) → recorded as
+         FINDINGS, NOT force-greened, baselines NOT retaken; each classified hard-vs-flaky via isolated 1w re-runs
+         (editor-pane:120 is the only flaky-under-contention, in-baseline). Baseline semantics: port must keep the
+         122 green + 6 visual matching (else PORT_DEFECT); the 16 red==red are EQUIVALENT, fixing one = candidate
+         DELIBERATE_FIX. Source stayed PRISTINE (git diff server/ shared/ empty)."
+      - "DONE: T3 TARGETABLE SEAM (no shared spec rewritten). test/e2e-browser/helpers/external-target.ts +
+         a one-line fixtures.ts change (testServer worker fixture -> createE2eServerHandle): when
+         FRESHELL_E2E_TARGET_URL is set the specs point at an already-running EXTERNAL server (the Rust port),
+         ExternalServer.start()=health-check only, stop()=NO-OP (never kills a server it didn't spawn). Oracle
+         config port/oracle/t3/playwright.target.config.ts (workers=1, excludes the 6 server-owning specs when
+         external) + global-setup.target.ts (skips build when external). Default (unset) path is byte-identical —
+         proven: the whole 138-test baseline ran through the new code path in local mode. Artifacts:
+         port/oracle/baselines/t3/{summary.json,playwright-report.json}, port/oracle/notes/t3-e2e-visual.md,
+         port/oracle/t3/gen-summary.mjs. Grade the port later:
+         FRESHELL_E2E_TARGET_URL=http://127.0.0.1:PORT FRESHELL_E2E_TARGET_TOKEN=<tok>
+         npx playwright test --config port/oracle/t3/playwright.target.config.ts"
+      - capture + persist T0/T1 golden baselines FROM ORIGINAL (transcripts normalized)
+      - wire T2 live-invariant harness (Kimi/Haiku/GPT-mini) + make ORIGINAL's live provider suite pass
+      - validate whole oracle by mutation testing against ORIGINAL (must catch injected divergence)
+      - THEN (Phase 3 start): scaffold Cargo workspace + freshell-protocol crate (Rust types from frozen schema)
+    exit_criteria:
+      - oracle detects every injected mutation in the original
+      - original passes T0–T3 (T2 with cheapest-model matrix: Kimi/Haiku/GPT-mini)
+      - every old-vs-new diff resolves to EQUIVALENT or a ledgered DELIBERATE_FIX
+  1_understand:  { status: in_progress, bundle: parallax-discovery, targets: [terminal-registry(IN PROGRESS), coding-cli parsers, platform/windows glue, electron->tauri], output: port/machine/specs/*.md }
+  2_architect:   { status: pending, bundle: systems-design, output: port/machine/architecture-spec.md (freeze) }
+  3_port:        { status: pending, bundle: dev-machine, order: [protocol, terminal, api+ws, harness, llm+platform+tauri] }
+  4_self_qa:     { status: pending, bundle: self-driving }
+  5_converge:    { status: pending }
+
+blockers:                        # write here and STOP rather than guess on unrecoverable ambiguity
+  - id: ENV-VM-EXEC-2026-07-08
+    status: RESOLVED-BY-RELOCATION   # 2026-07-10: user moved the session back to
+                                     # DANDESKTOP WSL2 (working shell); the VM-only
+                                     # directive was rescinded. Nothing was fixed ON
+                                     # the VM - the blocker is moot, not solved.
+                                     # vm-bridge kept DORMANT; addendum in
+                                     # BLOCKER-2026-07-08-vm-session.md.
+    summary: >-
+      Session launched on the TauriDebugVM (Windows 11, user Admin) against the worktree
+      via \\tsclient\Z. The agent has NO command execution there: the amplifier bash tool
+      resolves bash -> C:\Windows\System32\bash.exe (WSL launcher) and the VM has no WSL
+      distro installed; the write sandbox is worktree-only, so the VM's PowerShell bridge
+      (C:\Scripts\console-inbox) is unreachable; no MCP/exec tools configured. Build, test,
+      run, screenshot, and git are all impossible from that sandbox. Full evidence and the
+      unblock playbook: port/machine/BLOCKER-2026-07-08-vm-session.md. Unblock scripts
+      staged in port/vm-bridge/ (start one watcher, or run the session on DANDESKTOP WSL2).
+
+guardrails:
+  equivalence: differential (T0 protocol, T1 deterministic, T2 live-invariant, T3 e2e/visual) + deviation ledger; never byte-identical LLM output
+  architecture: rust-only (JS sidecar only if massive savings); single cargo workspace; frontend unchanged; ws contract frozen
+  autonomy: recipes non-staged/auto-approve; antagonist review replaces human AND adjudicates ledger; self-driving owns crash/token; no cap
+  process_safety: never touch pid 1262455 / :3001; run own server on 3456; own-process-only cleanup; no PR
+  platform: Windows partially live-verifiable via powershell.exe/cmd.exe; macOS spec/fixture-only

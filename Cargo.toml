@@ -1,0 +1,33 @@
+# freshell → Rust/Tauri port: Cargo workspace root.
+#
+# Additive to the existing Node repo (never modifies server/ or shared/ source).
+# Crates live under crates/; this file and `target/` sit at the worktree root.
+# The frozen WS contract (port/contract/*.schema.json, WS_PROTOCOL_VERSION=7) is
+# the shared seam consumed by freshell-protocol.
+[profile.dev]
+# Keep file:line in OUR backtraces; drop full variable-level DWARF.
+# See docs/plans/2026-07-18-disk-usage-analysis.md (win #1: ~25-40 GB durable).
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+# Dependencies (incl. the huge tauri tree): no debuginfo at all.
+debug = false
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# freshell-claude-sidecar is a Node package (the ONE sanctioned JS sidecar, ADR
+# Decision 2), NOT a Rust crate — its @anthropic-ai/claude-agent-sdk is vendored
+# in its own node_modules. Exclude it so the `crates/*` glob never treats it as a
+# cargo member.
+exclude = ["crates/freshell-claude-sidecar"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

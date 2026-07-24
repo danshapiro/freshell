@@ -1,0 +1,13 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": false,
+    "asserted": false,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/recheck-orig-cmd-3-cmd.png",
+    "status": "FAIL",
+    "detail": "cwd assertion failed: did NOT land in workspace; FELL BACK to C:\\Windows",
+    "bufferExcerpt": "{\"type\":\"leaf\",\"id\":\"onhf0cnB0hHcepq68N-9d\",\"content\":{\"kind\":\"terminal\",\"terminalId\":\"8AtmVrUl6E09qx7CnG_dE\",\"createRequestId\":\"matrix-cmd-n2k9hn7h\",\"status\":\"running\",\"mode\":\"shell\",\"shell\":\"cmd\",\"serverInstanceId\":\"srv-4e6928bc-c8de-4eec-be4e-62b9b9ad0bd9\",\"streamId\":\"712b4484-a59b-4297-b05a-88f99e9bd34d\",\"initialCwd\":\"/mnt/c/Users/Public/freshell-matrix-ws-recheck-orig-cmd-3-wiz5wy2h\"}}",
+    "tabId": "yRwErOIGerfR6EICnGMjW"
+  }
+]

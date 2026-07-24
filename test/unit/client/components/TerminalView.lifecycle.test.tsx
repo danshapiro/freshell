@@ -42,6 +42,7 @@ const terminalThemeMocks = vi.hoisted(() => ({
 const restoreMocks = vi.hoisted(() => ({
   consumeTerminalRestoreRequestId: vi.fn(() => false),
   addTerminalRestoreRequestId: vi.fn(),
+  clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
 }))
@@ -66,6 +67,7 @@ vi.mock('@/lib/terminal-themes', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   consumeTerminalRestoreRequestId: restoreMocks.consumeTerminalRestoreRequestId,
   addTerminalRestoreRequestId: restoreMocks.addTerminalRestoreRequestId,
+  clearTerminalRestoreRequestId: restoreMocks.clearTerminalRestoreRequestId,
   consumeTerminalFreshRecoveryRequest: restoreMocks.consumeTerminalFreshRecoveryRequest,
   addTerminalFreshRecoveryRequestId: restoreMocks.addTerminalFreshRecoveryRequestId,
 }))

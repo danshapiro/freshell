@@ -1,0 +1,96 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-cmd.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-kjv25xfg)",
+    "bufferExcerpt": "C:\\Users\\Public\\freshell-matrix-ws-kjv25xfg>echo freshell-matrix-OK | freshell-matrix-OK | C:\\Users\\Public\\freshell-matrix-ws-kjv25xfg>",
+    "terminalId": "7acc990f86a74803853f21cb910e67a1",
+    "tabId": "_wCvYm7wGiP3bKZ43UfT9"
+  },
+  {
+    "kind": "powershell",
+    "label": "PowerShell",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-powershell.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-kjv25xfg)",
+    "bufferExcerpt": "PS C:\\Users\\Public\\freshell-matrix-ws-kjv25xfg> echo freshell-matrix-OK | freshell-matrix-OK | PS C:\\Users\\Public\\freshell-matrix-ws-kjv25xfg> ",
+    "terminalId": "d7b21d30a53d4823840fb84b2d537163",
+    "tabId": "kfNDfrd-3VUBSP9QIqjOe"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-kjv25xfg)",
+    "bufferExcerpt": "Linux DANDESKTOP 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64  | x86_64 GNU/Linux | dan@DANDESKTOP:/mnt/c/Users/Public/freshell-matrix-ws-kjv25xfg$ echo freshell-matrix-OK && pwd | freshell-matrix-OK | /mnt/c/Users/Public/freshell-matrix-ws-kjv25xfg | dan@DANDESKTOP:/mnt/c/Users/Public/freshell-matrix-ws-kjv25xfg$ ",
+    "terminalId": "cddec5a7a733445f883b49848dd91e7d",
+    "tabId": "BYw-eLBV2g_8o0bH180lx"
+  },
+  {
+    "kind": "editor",
+    "label": "Editor",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-editor.png",
+    "status": "PASS",
+    "detail": "Monaco mounted + text visible · jsdelivr/monaco responses: 13 (13×2xx-3xx)",
+    "bufferExcerpt": "",
+    "tabId": "u-6nCjN9ze5JANlKWY6Pt"
+  },
+  {
+    "kind": "browser",
+    "label": "Browser",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-browser.png",
+    "status": "PASS",
+    "detail": "navigated http://example.com → page content rendered",
+    "bufferExcerpt": "",
+    "tabId": "86B8v7oIIRZgtokQ9QQ8u"
+  },
+  {
+    "kind": "claude",
+    "label": "Claude CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-claude.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/\\? for shortcuts|for shortcuts|bypass permissions|╰─+|>\\s*$|try \"|/i)",
+    "bufferExcerpt": "  2 -  console.log(\"Hello, World!\");                                                                                 |   2 +  console.log(\"Hello, Claude!\");                                                                                |   3  } |  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ | ╌╌╌ |   Syntax theme: Monokai Exte",
+    "terminalId": "1f84019eb29f4014a1a978375a4852c2",
+    "tabId": "6IGGUY563UGpJh0P_hRP7"
+  },
+  {
+    "kind": "codex",
+    "label": "Codex CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-codex.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/sign in with chatgpt|press enter to continue|provide your own api key|welcome to codex|to get started|describe a task|\\/status|model:/i)",
+    "bufferExcerpt": "     Usage included with Plus, Pro, Business, and Enterprise plans |   2. Sign in with Device Code |      Sign in from another device with a one-time code |   3. Provide your own API key |      Pay for what you use |   Press enter to continue",
+    "terminalId": "267b206aca9948d081c410e1468d45ee",
+    "tabId": "Z_SvHdhQ7_AU5ZmgwDYsu"
+  },
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/.worktrees/rust-tauri-port/port/oracle/matrix/wsl-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/ask anything|esc\\s|ctrl\\+|\\/help|tab\\s+agents|▌|>_/i)",
+    "bufferExcerpt": "                       ┃                                                                                     |                        ┃  Build · Claude Sonnet 4.6 Anthropic                                                |                        ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           |                                                                    ",
+    "terminalId": "e4983272f4cf4e778fab7c99fcf63c0c",
+    "tabId": "hlqD7MU6C_6HftK4tU27L"
+  }
+]

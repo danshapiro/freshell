@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Freshell</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: #111827;
+        color: #e5e7eb;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        display: flex; align-items: center; justify-content: center;
+      }
+      main { text-align: center; opacity: 0.85; }
+      h1 { font-weight: 500; font-size: 1.1rem; letter-spacing: 0.02em; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Placeholder shell. The retained React SPA is served by the spawned
+      freshell-server and loaded as an External URL after the /api/health gate;
+      this embedded page is a build-time fallback only (Tauri requires a
+      frontendDist). It is intentionally minimal.
+    -->
+    <main><h1>Starting Freshell…</h1></main>
+  </body>
+</html>

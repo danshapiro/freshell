@@ -1,0 +1,20 @@
+{
+  "scenario": "seq-3",
+  "description": "multi-line numeric output from coreutils seq",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "seq 3"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 583,
+  "byteLength": 9,
+  "sha256": "2afa7715181f03b6fe5acd7c82b8e818303a5de567af1a83d8c283010af2db44",
+  "outputTypeCounts": {
+    "terminal.output.batch": 9
+  }
+}

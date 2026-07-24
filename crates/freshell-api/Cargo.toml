@@ -1,0 +1,18 @@
+# freshell-api — REST surface (port of server/*-router.ts).
+#
+# Phase 3.4a scope: only `GET /api/health` (the readiness endpoint the oracle
+# harness polls) plus the shared constant-time auth-token gate helper. The full
+# router surface (terminals, sessions, settings, files, network, fresh-agent,
+# proxy) is deferred to later steps. `/api/health` is intentionally
+# unauthenticated, matching `server/auth.ts#httpAuthMiddleware`.
+[package]
+name = "freshell-api"
+version = "0.1.0"
+description = "REST surface for the freshell Rust port. Phase 3.4a: GET /api/health readiness endpoint (oracle-polled) + the shared constant-time auth-token gate helper. Remaining routers are later-step stubs."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = "0.8"
+serde_json = { workspace = true }

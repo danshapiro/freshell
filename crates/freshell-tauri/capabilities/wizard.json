@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "wizard",
+  "description": "Capability for the setup-wizard window (electron/setup-wizard/**). Grants core IPC (invoke) so the window can call the app-local `complete_setup` command. Per-command trust is enforced in-command by window label (windows::is_allowed_window) — the Rust analog of the Electron webContents-id `isAllowedSender` gate (entry.ts:513) — since app-defined commands are not permission-gated in Tauri v2.",
+  "windows": ["wizard"],
+  "permissions": ["core:default"]
+}

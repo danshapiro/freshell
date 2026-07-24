@@ -1,0 +1,16 @@
+[package]
+name = "freshell-platform"
+version = "0.1.0"
+description = "OS/path/shell glue for the freshell Rust port: dual WSL/Windows/macOS/Linux detection, WSL<->Windows path conversion, and the shell SpawnSpec builder. Deterministic core (Phase 3.2, step 1); live-process pieces (firewall/netsh, elevated PowerShell, WSL port-forward, network bind) are deferred stubs. Identical port of server/{path-utils,platform,terminal-registry}.ts."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Deterministic core needs no external crates: pure std logic with injected IO.
+# The deferred live-process modules (tokio::process/reqwest for netsh/ipconfig/etc.)
+# will add deps when implemented in a later sub-step.
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

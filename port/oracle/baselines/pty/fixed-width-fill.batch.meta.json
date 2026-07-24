@@ -1,0 +1,20 @@
+{
+  "scenario": "fixed-width-fill",
+  "description": "fixed-width run of a single character (no wrap at 120 cols)",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 616,
+  "byteLength": 42,
+  "sha256": "b30b0d73ca0f44a67bb382ebe38eabb1f7b0867f49ca70955bd96a26ae7ac252",
+  "outputTypeCounts": {
+    "terminal.output.batch": 7
+  }
+}

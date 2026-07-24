@@ -1,0 +1,95 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": false,
+    "asserted": false,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-cmd.png",
+    "status": "FAIL",
+    "detail": "cwd assertion failed: did NOT land in workspace; FELL BACK to C:\\Windows",
+    "bufferExcerpt": "{\"type\":\"leaf\",\"id\":\"zsSasQ2UBgao4IJyO57UJ\",\"content\":{\"kind\":\"terminal\",\"terminalId\":\"6qm805hAiywm9NLRQr1AK\",\"createRequestId\":\"matrix-cmd-5vyzrn0x\",\"status\":\"running\",\"mode\":\"shell\",\"shell\":\"cmd\",\"serverInstanceId\":\"srv-82591f8b-2bac-4969-908c-a720a08885e2\",\"streamId\":\"4557d7a0-49da-4b03-bc8f-32343a34f915\",\"initialCwd\":\"/mnt/c/Users/Public/freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5\"}}",
+    "tabId": "iNeRthWW6YBwCf67Ftj9c"
+  },
+  {
+    "kind": "powershell",
+    "label": "PowerShell",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-powershell.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5)",
+    "bufferExcerpt": "PS C:\\Users\\Public\\freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5> echo freshell-matrix-OK | freshell-matrix-OK | PS C:\\Users\\Public\\freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5> ",
+    "terminalId": "eLANUpbvmMA5KExY2VzeM",
+    "tabId": "AOJTXuruYMTaEhW_dQePN"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5)",
+    "bufferExcerpt": "Linux SurfaceBookPro9 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x8 | 6_64 x86_64 GNU/Linux | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5$ echo freshell-matrix-OK && pwd | freshell-matrix-OK | /mnt/c/Users/Public/freshell-matrix-ws-sbp9-orig-chrome-uzvuk5a5 | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-m",
+    "terminalId": "wefEblK17th2xv22l7XFf",
+    "tabId": "eVbUKbqCpUmSxYDSCvgkB"
+  },
+  {
+    "kind": "editor",
+    "label": "Editor",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-editor.png",
+    "status": "PASS",
+    "detail": "Monaco mounted + text visible · jsdelivr/monaco responses: 13 (13×2xx-3xx)",
+    "bufferExcerpt": "",
+    "tabId": "POH-4dt1T1nwNevzAc9wZ"
+  },
+  {
+    "kind": "browser",
+    "label": "Browser",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-browser.png",
+    "status": "PASS",
+    "detail": "navigated http://example.com → page content rendered",
+    "bufferExcerpt": "",
+    "tabId": "kjGzdqfEFI-FhDKEH9oRt"
+  },
+  {
+    "kind": "claude",
+    "label": "Claude CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-claude.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/\\? for shortcuts|for shortcuts|bypass permissions|╰─+|>\\s*$|try \"|/i)",
+    "bufferExcerpt": "  1  function greet() { |   2 -  console.log(\"Hello, World!\");                                                                                |   2 +  console.log(\"Hello, Claude!\");                                                                               |   3  } |  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ |   Syntax th",
+    "terminalId": "RkrFm-30ZM1kYx2UPCN9R",
+    "tabId": "vDTAs_O92qH3l1S821Sqb"
+  },
+  {
+    "kind": "codex",
+    "label": "Codex CLI",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-codex.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/sign in with chatgpt|press enter to continue|provide your own api key|welcome to codex|to get started|describe a task|\\/status|model:|yes, continue/i)",
+    "bufferExcerpt": "     Usage included with Plus, Pro, Business, and Enterprise plans |   2. Sign in with Device Code |      Sign in from another device with a one-time code |   3. Provide your own API key |      Pay for what you use |   Press enter to continue",
+    "terminalId": "NjyMBxuKsL7aQami66I09",
+    "tabId": "Nn-Jl20m7jlSIKQT3HiCH"
+  },
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-orig-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/ask anything|esc\\s|ctrl\\+|\\/help|tab\\s+agents|▌|>_/i)",
+    "bufferExcerpt": "                 ┃  Ask anything... \"Fix broken tests\"                                                       |                  ┃                                                                                           |                  ┃  Build · GPT-5 OpenAI                                                                     |                  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+    "terminalId": "xN8OIUPN7X2GNHm3zZnRP",
+    "tabId": "K-7UIT-7C8hiO9Xt0Hoda"
+  }
+]

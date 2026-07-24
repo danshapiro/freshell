@@ -1,0 +1,224 @@
+{
+  "tier": "T3",
+  "title": "E2E UI + visual parity (Playwright e2e-browser) — ORIGINAL re-baseline on host SurfaceBookPro9",
+  "generated": "2026-07-11T16:45:00.000Z",
+  "against": "ORIGINAL (pristine TS freshell, dist/server/index.js built from this worktree) run as an EXTERNAL target on 127.0.0.1:17871 with an isolated scratch $HOME; this profile is the comparison target for the Rust port on THIS host",
+  "worktree_commit": "59a585ad",
+  "branch": "feat/rust-tauri-port",
+  "host": {
+    "name": "SurfaceBookPro9",
+    "os": "Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)",
+    "node": "v24.12.0",
+    "playwright": "1.58.2",
+    "chromium_rev": "145.0.7632.6",
+    "chromium_build": "chromium-1208",
+    "snapshot_platform": "chromium-linux"
+  },
+  "how_produced": {
+    "config": "port/oracle/t3/playwright.target.config.ts (external-target mode; the shared, unmodified spec suite)",
+    "command": "PLAYWRIGHT_JSON_OUTPUT_NAME=<raw> FRESHELL_E2E_TARGET_URL=http://127.0.0.1:17871 FRESHELL_E2E_TARGET_TOKEN=<token> FRESHELL_E2E_TARGET_HOME=<scratch> npx playwright test --config port/oracle/t3/playwright.target.config.ts --reporter=list,json",
+    "workers": 1,
+    "retries": 0,
+    "runs": 1,
+    "server": "PORT=17871 AUTH_TOKEN=<token> FRESHELL_BIND_HOST=127.0.0.1 HOME=<scratch> FRESHELL_HOME=<scratch> NODE_ENV=production node dist/server/index.js — isolated scratch home pre-seeded with {version:1,settings:{network:{configured:true,host:\"127.0.0.1\"}}} (identical to what the E2E TestServer writes) so the setup wizard is bypassed",
+    "isolation": "Single external ORIGINAL server on 127.0.0.1:17871 with an isolated $HOME under the user home; reaped after the run. No live user server was touched.",
+    "flake_classification": "NOT performed this run — single pass at workers=1 retries=0 per the re-baseline protocol (red is data). See the note for the prior host's hard/flaky classification of the 8 shared failures.",
+    "raw_report": "port/oracle/baselines/t3/playwright-report-2026-07-11-original-sbp9.json"
+  },
+  "totals": {
+    "files": 25,
+    "tests": 126,
+    "passed": 117,
+    "failed": 9,
+    "flaky": 0,
+    "skipped": 0,
+    "duration_ms": 963590
+  },
+  "flake_reclassifications": [
+    {
+      "spec": "fresh-agent.spec.ts:98",
+      "recorded": "RED (1 run)",
+      "classification": "FLAKY-on-original",
+      "evidence": "4/4 isolated re-runs GREEN against original :17871 same commit/host 2026-07-11; GREEN in prior-host full run and both rust full-suite runs",
+      "adjudicated": "2026-07-11, antagonist reviewer session 0000000000000000-58346ba0034d4442_self-driving-reviewer",
+      "effective_comparison_target": "118 green / 8 red"
+    }
+  ],
+  "visual_baselines": {
+    "count": 7,
+    "matched": 6,
+    "mismatched": 1,
+    "results": [
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/default-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:4",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/settings-view-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:16",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/multiple-tabs-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:29",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/auth-modal-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:41",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/sidebar-collapsed-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:52",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "screenshot-baselines.spec.ts-snapshots/mobile-layout-chromium-linux.png",
+        "spec": "screenshot-baselines.spec.ts:64",
+        "status": "MATCH"
+      },
+      {
+        "baseline": "editor-pane.spec.ts-snapshots/editor-pane-loaded-chromium-linux.png",
+        "spec": "editor-pane.spec.ts:83",
+        "status": "MISMATCH"
+      }
+    ],
+    "note": "Same visual profile as the prior host: the 6 screenshot-baselines assertions (maxDiffPixelRatio 0.05) all MATCH on this host's chromium-1208; editor-pane-loaded (NO tolerance) mismatches — baseline-strictness finding, not a functional regression."
+  },
+  "baseline_semantics": {
+    "reference": "This exact 117-pass / 9-fail set (126 externally-targetable tests) is the T3 comparison target for the Rust port on host SurfaceBookPro9.",
+    "port_must": "Keep all 117 currently-GREEN tests green on this host (a newly-RED test is a PORT_DEFECT) and keep the 6 matching visual baselines matching.",
+    "port_need_not": "Pass the 9 tests RED against the original on this host (red==red is EQUIVALENT). Making any of them green is a candidate DELIBERATE_FIX (antagonist-adjudicated, ledgered).",
+    "why_red": "All 9 reproduce against the PRISTINE original built from this worktree — 8 are the same EQUIVALENT-red set as the prior host; 1 (fresh-agent.spec.ts:98) is newly red on this host (see quarantined evidence)."
+  },
+  "delta_vs_prior_host": {
+    "prior_profile": "port/oracle/baselines/t3/summary.json (prior host): 118/126 externally-targetable pass after PORT-GAP closure; 8 EQUIVALENT-red fails (see EQUIVALENCE-REPORT.md §6).",
+    "shared_failures": 8,
+    "newly_red_on_this_host": [
+      "fresh-agent.spec.ts:98"
+    ],
+    "newly_green_on_this_host": [],
+    "note": "The 8 prior EQUIVALENT-red failures reproduce exactly on this host; fresh-agent.spec.ts:98 additionally fails here (pane picker shows a Freshclaude button where the spec expects none by default)."
+  },
+  "quarantined": {
+    "description": "Tests that FAIL against the pristine ORIGINAL on this host (findings, not port gates). Single run at workers=1 retries=0; not force-greened; baselines were not retaken.",
+    "count": 9,
+    "items": [
+      {
+        "id": "editor-pane.spec.ts:83",
+        "title": "loads the editor lazily and requests a new JS asset after the click",
+        "category": "visual_strictness",
+        "flaky_vs_hard": "unclassified(single-run); hard on prior host",
+        "externally_targetable": true,
+        "evidence": "toHaveScreenshot(editor-pane-loaded.png) failed on [data-testid=editor-pane]; this assertion has NO maxDiffPixelRatio tolerance, unlike the 6 screenshot-baselines (0.05) which all MATCH."
+      },
+      {
+        "id": "fresh-agent-centralization-smoke.spec.ts:402",
+        "title": "normalizes remote legacy layout sync before exposing server pane snapshots",
+        "category": "fresh_agent_centralization",
+        "flaky_vs_hard": "unclassified(single-run); hard(full-run) on prior host",
+        "externally_targetable": true,
+        "evidence": "expect(received).toBe(expected): Expected 422, Received 500."
+      },
+      {
+        "id": "fresh-agent-centralization-smoke.spec.ts:448",
+        "title": "keeps fresh-agent settings and routes while legacy settings and routes are removed",
+        "category": "fresh_agent_centralization",
+        "flaky_vs_hard": "unclassified(single-run); hard(full-run) on prior host",
+        "externally_targetable": true,
+        "evidence": "getByText('Fresh agent') toBeVisible failed: element(s) not found."
+      },
+      {
+        "id": "fresh-agent.spec.ts:98",
+        "title": "pane picker hides fresh clients by default even when their CLIs are enabled",
+        "category": "frontend_settings_ui",
+        "flaky_vs_hard": "unclassified(single-run); NEW on this host (passed on prior host)",
+        "externally_targetable": true,
+        "evidence": "getByRole('button', {name:/^Freshclaude$/i}) toHaveCount(0) failed: Received 1 (locator resolved to 1 element for the full 10s timeout) at fresh-agent.spec.ts:117. The pane picker on this host shows the Freshclaude tile where the spec expects fresh clients hidden by default."
+      },
+      {
+        "id": "freshopencode-model-picker.spec.ts:41",
+        "title": "shows MRU tiles, sorted modal sources, and client-side filtering",
+        "category": "provider_opencode",
+        "flaky_vs_hard": "unclassified(single-run); hard(full-run) on prior host",
+        "externally_targetable": true,
+        "evidence": "openFreshAgentSettings: getByRole('group').filter(hasText 'Freshopencode').last() toBeVisible failed: element(s) not found (needs the opencode model catalog)."
+      },
+      {
+        "id": "mobile-viewport.spec.ts:195",
+        "title": "permission banner buttons are visible and functional on mobile",
+        "category": "frontend_state_machine",
+        "flaky_vs_hard": "unclassified(single-run); hard on prior host",
+        "externally_targetable": true,
+        "evidence": "toContainText on getByRole('alert', {name:/permission request for bash/i}) failed."
+      },
+      {
+        "id": "multi-client.spec.ts:217",
+        "title": "reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output",
+        "category": "server_colocated",
+        "flaky_vs_hard": "unclassified(single-run); hard on prior host",
+        "externally_targetable": true,
+        "evidence": "page.waitForFunction: Timeout 20000ms exceeded (FRESHELL_E2E_TARGET_HOME was supplied, so serverInfo.homeDir was available)."
+      },
+      {
+        "id": "multirow-tabs.spec.ts:9",
+        "title": "enables multi-row tabs via settings toggle",
+        "category": "frontend_settings_ui",
+        "flaky_vs_hard": "unclassified(single-run); hard on prior host",
+        "externally_targetable": true,
+        "evidence": "getByRole('switch', {name:/multi-row tabs/i}) toBeVisible failed: element(s) not found after opening Settings."
+      },
+      {
+        "id": "pane-activity-indicator.spec.ts:79",
+        "title": "freshclaude panes transition from waiting to blue running and back to idle",
+        "category": "frontend_state_machine",
+        "flaky_vs_hard": "unclassified(single-run); hard on prior host",
+        "externally_targetable": true,
+        "evidence": "expectChromeBlue: pane icon toHaveClass(/text-blue-500/) failed (got 'lucide lucide-settings h-[18px] w-[18px] sm:h-3 sm:w-3') at pane-activity-indicator.spec.ts:24."
+      }
+    ]
+  },
+  "per_file": [
+    { "file": "auth.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "browser-pane-screenshot.spec.ts", "pass": 2, "fail": 0, "externally_targetable": true },
+    { "file": "browser-pane.spec.ts", "pass": 5, "fail": 0, "externally_targetable": true },
+    { "file": "editor-pane.spec.ts", "pass": 5, "fail": 1, "externally_targetable": true },
+    { "file": "fresh-agent-centralization-smoke.spec.ts", "pass": 2, "fail": 2, "externally_targetable": true },
+    { "file": "fresh-agent-mobile.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "fresh-agent.spec.ts", "pass": 8, "fail": 1, "externally_targetable": true },
+    { "file": "freshopencode-model-picker.spec.ts", "pass": 0, "fail": 1, "externally_targetable": true },
+    { "file": "mobile-viewport.spec.ts", "pass": 6, "fail": 1, "externally_targetable": true },
+    { "file": "multi-client.spec.ts", "pass": 5, "fail": 1, "externally_targetable": true },
+    { "file": "multirow-tabs.spec.ts", "pass": 2, "fail": 1, "externally_targetable": true },
+    { "file": "opencode-replay-write-progression.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "pane-activity-indicator.spec.ts", "pass": 2, "fail": 1, "externally_targetable": true },
+    { "file": "pane-picker.spec.ts", "pass": 2, "fail": 0, "externally_targetable": true },
+    { "file": "pane-system.spec.ts", "pass": 10, "fail": 0, "externally_targetable": true },
+    { "file": "reconnection.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "screenshot-baselines.spec.ts", "pass": 6, "fail": 0, "externally_targetable": true },
+    { "file": "settings.spec.ts", "pass": 8, "fail": 0, "externally_targetable": true },
+    { "file": "sidebar.spec.ts", "pass": 8, "fail": 0, "externally_targetable": true },
+    { "file": "stress.spec.ts", "pass": 5, "fail": 0, "externally_targetable": true },
+    { "file": "tab-management.spec.ts", "pass": 11, "fail": 0, "externally_targetable": true },
+    { "file": "tab-recency-sync.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "tabs-client-retire.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "terminal-background-freeze-catchup.spec.ts", "pass": 1, "fail": 0, "externally_targetable": true },
+    { "file": "terminal-lifecycle.spec.ts", "pass": 13, "fail": 0, "externally_targetable": true }
+  ],
+  "targetable_seam": {
+    "purpose": "External-target run of the identical e2e specs against a running server (here: the ORIGINAL on 127.0.0.1:17871) via FRESHELL_E2E_TARGET_URL.",
+    "helper": "test/e2e-browser/helpers/external-target.ts",
+    "oracle_config": "port/oracle/t3/playwright.target.config.ts",
+    "excluded_when_external": [
+      "server-restart-recovery.spec.ts",
+      "settings-persistence-split.spec.ts",
+      "freshopencode-restart-recovery.spec.ts",
+      "freshopencode-db-history.spec.ts",
+      "freshopencode-first-send-reload-repro.spec.ts",
+      "opencode-restart-recovery.spec.ts"
+    ],
+    "note": "126 = the 138-test full suite minus the 12 tests in the 6 server-owning spec files above."
+  }
+}

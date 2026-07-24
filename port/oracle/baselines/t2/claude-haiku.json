@@ -1,0 +1,126 @@
+{
+  "tier": "T2",
+  "provider": "claude",
+  "model": "haiku",
+  "sentinelToken": "freshell-t2-ok",
+  "assertedInvariants": [
+    "session.created",
+    "session.durable-id-shape",
+    "turn.accepted",
+    "turn.completed",
+    "assistant.replied-sentinel",
+    "transcript.persisted",
+    "transcript.parseable",
+    "ownership.cleanup",
+    "provider.emits-completion-signal"
+  ],
+  "informationalInvariants": [
+    "wire.session-materialized",
+    "cost.live-calls-bounded"
+  ],
+  "ok": true,
+  "passed": 9,
+  "failed": 0,
+  "invariantMatrix": [
+    {
+      "name": "session.created",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "session.durable-id-shape",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.accepted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "turn.completed",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "assistant.replied-sentinel",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.persisted",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "transcript.parseable",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "wire.session-materialized",
+      "ok": false,
+      "fatal": false
+    },
+    {
+      "name": "ownership.cleanup",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "provider.emits-completion-signal",
+      "ok": true,
+      "fatal": true
+    },
+    {
+      "name": "cost.live-calls-bounded",
+      "ok": true,
+      "fatal": false
+    }
+  ],
+  "shapes": {
+    "placeholderIdPattern": "^[A-Za-z0-9_-]{16,32}$",
+    "durableIdPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    "placeholderIdMatches": true,
+    "durableIdMatches": true,
+    "sessionCreated": true,
+    "turnAccepted": true,
+    "serverReportedIdle": false,
+    "turnCompleteEventObserved": true,
+    "turnCompleted": true,
+    "dbSessionRowPresent": true,
+    "dbMessageCount": 3,
+    "dbPartCount": 2,
+    "dbHasAssistantMessage": true,
+    "transcriptParseable": true,
+    "captureNonEmpty": true,
+    "captureContainsSentinel": true,
+    "wsServerMessageTypes": [
+      "freshAgent.assistant",
+      "freshAgent.created",
+      "freshAgent.event",
+      "freshAgent.result",
+      "freshAgent.send.accepted",
+      "freshAgent.session.init",
+      "freshAgent.stream",
+      "freshAgent.turn.complete",
+      "perf.logging",
+      "ready",
+      "settings.updated",
+      "terminal.inventory"
+    ],
+    "sessionMaterializedObserved": false,
+    "liveModelCalls": 1,
+    "ownedCleanupOk": true
+  },
+  "provenance": {
+    "capturedAt": "2026-07-05T05:39:57.497Z",
+    "capturedBy": "test/integration/port/oracle/t2-claude-haiku.test.ts",
+    "model": "haiku",
+    "claudeVersion": "2.1.201 (Claude Code)",
+    "completionSignal": "freshAgent.turn.complete/subtype=success",
+    "drivePath": "ws freshAgent.create + freshAgent.send",
+    "transcript": "isolated <CLAUDE_HOME>/.claude/projects/<cwd-hash>/<uuid>.jsonl",
+    "note": "Structural, LLM-text-free baseline. The Rust port drives the identical WS fresh-agent surface and its T2 observation is projected via summarizeT2ForBaseline() and diffed against this file. Claude is SDK-driven: completion is the discrete freshAgent.turn.complete edge, NOT opencode's idle poll; the durable id is the Claude session UUID (from session.init cliSessionId + the persisted .jsonl name); the placeholder is the SDK bridge's bare nanoid."
+  }
+}

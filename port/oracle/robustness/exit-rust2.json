@@ -1,0 +1,120 @@
+{
+ "terminalId": "6f134d868e204879883cc707dd0c6349",
+ "frames": [
+  {
+   "type": "ready",
+   "timestamp": "2026-07-13T04:35:07.142Z",
+   "bootId": "boot-30d44c57-4d80-473f-be15-82abb35b9c3c",
+   "serverInstanceId": "srv-31fa7d0c-6a1b-4cec-aa66-def3de994bd6"
+  },
+  {
+   "type": "settings.updated",
+   "settings": {
+    "ai": {},
+    "codingCli": {
+     "enabledProviders": [
+      "claude",
+      "codex",
+      "opencode"
+     ],
+     "mcpServer": true,
+     "providers": {
+      "claude": {
+       "permissionMode": "default"
+      },
+      "codex": {}
+     },
+     "knownProviders": [
+      "claude",
+      "codex",
+      "gemini",
+      "kimi",
+      "opencode"
+     ]
+    },
+    "editor": {
+     "externalEditor": "auto"
+    },
+    "extensions": {
+     "disabled": []
+    },
+    "freshAgent": {
+     "defaultPlugins": [],
+     "enabled": false,
+     "providers": {}
+    },
+    "logging": {
+     "debug": false
+    },
+    "network": {
+     "configured": false,
+     "host": "127.0.0.1"
+    },
+    "panes": {
+     "defaultNewPane": "ask"
+    },
+    "safety": {
+     "autoKillIdleMinutes": 15
+    },
+    "sidebar": {
+     "autoGenerateTitles": true,
+     "excludeFirstChatMustStart": false,
+     "excludeFirstChatSubstrings": []
+    },
+    "terminal": {
+     "scrollback": 10000
+    }
+   }
+  },
+  {
+   "type": "perf.logging",
+   "enabled": false
+  },
+  {
+   "type": "terminal.inventory",
+   "bootId": "boot-30d44c57-4d80-473f-be15-82abb35b9c3c",
+   "terminals": [],
+   "terminalMeta": []
+  },
+  {
+   "type": "terminal.created",
+   "createdAt": 1783917307145,
+   "requestId": "x-1783917307137",
+   "terminalId": "6f134d868e204879883cc707dd0c6349",
+   "cwd": "/home/dan/.freshell-qa-007-rust"
+  },
+  {
+   "type": "terminal.attach.ready",
+   "headSeq": 3,
+   "replayFromSeq": 1,
+   "replayToSeq": 3,
+   "streamId": "e6f395bf-c9a6-460e-a45a-ed73cc47cacc",
+   "terminalId": "6f134d868e204879883cc707dd0c6349",
+   "attachRequestId": "att-x-1783917307137",
+   "effectiveSinceSeq": 0,
+   "geometryAuthority": "single_client",
+   "geometryEpoch": 1,
+   "requestedSinceSeq": 0
+  },
+  {
+   "type": "terminal.exit",
+   "exitCode": 0,
+   "terminalId": "6f134d868e204879883cc707dd0c6349"
+  }
+ ],
+ "inventoryAfter": [
+  {
+   "terminalId": "6f134d868e204879883cc707dd0c6349",
+   "title": "Shell",
+   "mode": "shell",
+   "createdAt": 1783917307144,
+   "lastActivityAt": 1783917309690,
+   "status": "exited",
+   "hasClients": false,
+   "cwd": "/home/dan/.freshell-qa-007-rust",
+   "lastLine": "logout",
+   "last_line": "logout"
+  }
+ ],
+ "bufferTail": "oot\"), use \"sudo <command>\".\r\nSee \"man sudo_root\" for details.\r\n\r\n\u001b[?2004hdan@SurfaceBookPro9:~$ exit\r\n\u001b[?2004l\rlogout\r\n"
+}

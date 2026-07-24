@@ -52,7 +52,7 @@
     "test:unit": "tsx scripts/testing/test-coordinator.ts run test:unit",
     "test:integration": "tsx scripts/testing/test-coordinator.ts run test:integration",
     "test:client": "tsx scripts/testing/test-coordinator.ts run test:client",
-    "test:real:coding-cli-contracts": "cross-env FRESHELL_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/real/coding-cli-session-contract.test.ts --run --pool=forks --poolOptions.forks.singleFork=true",
+    "test:real:coding-cli-contracts": "cross-env FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/real/coding-cli-session-contract.test.ts --run --pool=forks --poolOptions.forks.singleFork=true",
     "test:visible-first:contract": "vitest run --config config/vitest/vitest.config.ts test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts test/unit/lib/visible-first-acceptance-report.test.ts",
     "test:all": "tsx scripts/testing/test-coordinator.ts run test:all",
     "test:status": "tsx scripts/testing/test-coordinator.ts status",
@@ -60,6 +60,7 @@
     "test:codex-real-provider-smoke": "vitest run --config config/vitest/vitest.codex-real-provider-smoke.config.ts",
     "test:opencode-serve-smoke": "vitest run --config config/vitest/vitest.opencode-serve-real-provider-smoke.config.ts",
     "smoke:browser-use": "python3 test/browser_use/smoke_freshell.py",
+    "smoke:continuity": "cross-env FRESHELL_SMOKE=1 playwright test --config test/e2e-browser/playwright.config.ts --project=continuity-smoke",
     "prepare:icons": "node assets/icons/prepare-icons.mjs",
     "lint": "eslint src --ext .js,.jsx,.ts,.tsx",
     "lint:fix": "eslint src --ext .js,.jsx,.ts,.tsx --fix",
@@ -73,7 +74,11 @@
     "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts",
     "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
-    "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts"
+    "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts",
+    "contract:generate": "tsx port/contract/generate-ws-contract.ts",
+    "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
+    "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts",
+    "test:sandbox": "bash scripts/sandbox-test.sh"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",

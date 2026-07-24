@@ -1,0 +1,21 @@
+{
+  "scenario": "multi-line",
+  "description": "two separate input lines producing two output lines in order",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf 'line-1\\n'",
+    "printf 'line-2\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 590,
+  "byteLength": 16,
+  "sha256": "6c9d63a3e00a5808d0eb00fabaf26f45d50c052062fd56f09d3437f37cc4fafc",
+  "outputTypeCounts": {
+    "terminal.output.batch": 8
+  }
+}

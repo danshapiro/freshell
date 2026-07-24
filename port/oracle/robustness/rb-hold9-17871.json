@@ -1,0 +1,10 @@
+{
+ "scenario": "holdclient",
+ "tid": "zNRusfKd5UCxDwRtZvwOe",
+ "closed": {
+  "code": 1006,
+  "reason": "",
+  "at": 1783918425576
+ },
+ "framesAfterHold": []
+}

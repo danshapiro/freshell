@@ -1,0 +1,14 @@
+[
+  {
+    "kind": "opencode",
+    "label": "OpenCode",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/t6-wsl-chrome-opencode.png",
+    "status": "PASS",
+    "detail": "launched + steady UI painted (/ask anything|esc\\s|ctrl\\+|\\/help|tab\\s+agents|▌|>_/i)",
+    "bufferExcerpt": "                       ┃                                                                                     |                        ┃  Build · GPT-5 OpenAI                                                               |                        ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           |                                                                    ",
+    "terminalId": "7b31cf7f50ef469f8632d94375e90f6d",
+    "tabId": "11WBC9f0rB42cp8msgUT5"
+  }
+]

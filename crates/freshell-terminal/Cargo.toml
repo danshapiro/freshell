@@ -1,0 +1,44 @@
+[package]
+name = "freshell-terminal"
+version = "0.1.0"
+description = "PTY core for the freshell Rust port: real pseudo-terminal spawn (portable-pty) driven by freshell-platform's SpawnSpec, the byte-measured seq-numbered ReplayRing/ReplayDeque authoritative buffer, and terminal.output framing (code-point budget splitter + UTF-8 stream decode). Reproduces the committed T1 PTY goldens byte-for-byte. Phase 3.3a CORE; the batch builder, VT barrier scanner, UTF-16 offsets, attach snapshot, gaps, resize/geometry, and coding-CLI turn.complete are 3.3b stubs. Identical port of server/terminal-stream/{output-fragments,replay-deque,replay-ring}.ts + the terminal-registry.ts shell spawn/onData path."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The SpawnSpec + shell resolution this crate consumes (Phase 3.2).
+freshell-platform = { path = "../freshell-platform" }
+# The frozen wire types this crate emits (terminal.output) — Phase 3.1.
+freshell-protocol = { path = "../freshell-protocol" }
+# JSON byte measurement for the fragment splitter's payload budget: the crate
+# measures Buffer.byteLength(JSON.stringify(payload),'utf8') exactly (matches
+# server/terminal-stream/serialized-budget.ts).
+serde_json = { workspace = true }
+# Real pseudo-terminal spawn/read/write/resize/kill (node-pty's role).
+portable-pty = "0.8"
+# DIAG-01 lifecycle events (terminal created/exited/killed, idle-reap sweep):
+# flows to the global `tracing` subscriber `freshell-server` installs
+# (`crates/freshell-server/src/logging.rs`) -- this crate stays tokio-free
+# (see module docs) and only emits events, never installs its own subscriber.
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+# SAFE-11/TERM-22: `PtyTerminal::kill` additionally SIGKILLs the whole process
+# GROUP (not just the pty's direct child), so a foreground command the shell
+# spawned (e.g. `sleep 300`) is reliably reaped too. Already resolved in the
+# workspace lock transitively (freshell-server/freshell-freshagent both
+# already depend on it directly), so this adds no new download.
+libc = "0.2"
+
+[dev-dependencies]
+# The T1 fidelity test asserts sha256-equality with the committed goldens.
+sha2 = "0.10"
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"
+# TERM-28: real tempdir PATH/cwd fixtures for the bare-command $PATH
+# resolution regression tests (a same-named shadowing directory + a real
+# executable fixture on a separate $PATH entry).
+tempfile = "3"

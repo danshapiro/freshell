@@ -1,0 +1,39 @@
+[package]
+name = "freshell-sessions"
+version = "0.1.0"
+description = "Layer C of the freshell Rust port: read-only coding-CLI transcript indexer + parsers. Faithful ports of the claude .jsonl (parseSessionContent), codex rollout .jsonl (parseCodexSessionContent), and opencode SQLite listing parsers, plus the notify-based session-indexer whose late-root watcher carries the DEV-0002 process-liveness fix (log + degrade + rescan, never abort). Identical port of server/coding-cli/{providers/{claude,codex,opencode},session-indexer}.ts. Read-only: never mutates provider data."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# JSON line parsing for the claude/codex JSONL transcripts (JSON.parse parity,
+# skip-on-error corruption tolerance). preserve_order matches the TS object model.
+serde_json = { workspace = true }
+# `derive` for `IndexedSession`/`FileEntry` (the persistent parse-cache format,
+# `directory_index.rs`'s `rust-session-cache.json`) -- the boot-time cold-scan
+# fix (5min -> seconds on a real 8.7GB+2.2GB corpus).
+serde = { workspace = true }
+# chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
+notify = "6"
+# node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
+# compiles the SQLite amalgamation so the parser is not coupled to the host's
+# libsqlite3 version (deterministic across dev/CI/Windows).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Batch B (`directory_index`): the refreshable session-directory cache. `sync`
+# for the refresh-serializing async Mutex, `rt`/`rt-multi-thread` for
+# `spawn_blocking` (the full-sweep scan runs off the async executor thread),
+# `time` for the TTL-expiry test, `macros` for `#[tokio::test]`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# The amplifier-locator's single warn on an ambiguous (never-guess) same-cwd
+# correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
+# equivalent) -- same version already used by `freshell-ws`.
+tracing = "0.1"
+
+[dev-dependencies]
+# The opencode SQLite parity test builds fixture databases with a writable connection
+# before the parser opens them read-only (same bundled engine, unified by cargo).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# SESSION-07: unique temp-file names for `search.rs`'s file-content search
+# tests (same version/feature set as every other crate's `uuid` dependency).
+uuid = { version = "1", features = ["v4"] }

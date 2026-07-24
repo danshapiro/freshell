@@ -1,0 +1,52 @@
+# Composed Amplifier bundle for the freshell → Rust/Tauri autonomous port.
+#
+# Selection is driven by ONE constraint: no human in the loop. Bundles that lean
+# on human approval gates (longbuilder, project-orchestrator) are deliberately
+# excluded; their gateless equivalents (dev-machine + self-driving) are used
+# instead. Understanding/architecture bundles are run with recipes in
+# NON-STAGED / auto-approve mode so they never block on a human.
+#
+# NOTE: branch names differ per repo (self-driving defaults to `master`).
+# Verify each ref before a long run; pin commits once validated.
+
+name: freshell-rust-tauri-port
+description: Autonomous, oracle-gated port of freshell's backend to Rust/Tauri.
+
+includes:
+  # --- Autonomous spine ------------------------------------------------------
+  # Executor: antagonistic zero-context review replaces the human; build/test
+  # gate every feature; disposable stateless sessions.
+  - bundle: dev-machine
+    source: git+https://github.com/ramparte/amplifier-bundle-dev-machine@main
+  # Resilience for long unattended runs: watchdog/heartbeat/token-tracker +
+  # crash recovery. This is the "no human awake to restart it" insurance.
+  - bundle: self-driving
+    source: git+https://github.com/ramparte/amplifier-bundle-self-driving@master
+
+  # --- Run once, gateless ----------------------------------------------------
+  # Phase 1: extract ground-truth behavior of the 4 risk areas.
+  - bundle: parallax-discovery
+    source: git+https://github.com/bkrabach/amplifier-bundle-parallax-discovery@main
+  # Phase 2: design + freeze the Rust/Tauri architecture (ADR).
+  - bundle: systems-design
+    source: git+https://github.com/bkrabach/amplifier-bundle-systems-design@main
+
+  # --- Execution & verification support -------------------------------------
+  # mass-change (fan out the mechanical port) + parallel code-review gate.
+  - bundle: skills
+    source: git+https://github.com/microsoft/amplifier-bundle-skills@main
+  # Isolated Docker/SSH envs for cargo build + Tauri bundling + test runs.
+  - bundle: execution-environments
+    source: git+https://github.com/microsoft/amplifier-bundle-execution-environments@main#subdirectory=behaviors/env-all.yaml
+
+# Reference repositories — vendored/read as implementation blueprints, NOT
+# installed as bundles:
+#   - github.com/bkrabach/amplifier-bundle-rust-example   (Rust Provider/Orchestrator/ContextManager + gRPC)
+#   - github.com/bkrabach/amplifier-bundle-unified-llm    (Rust multi-provider LLM layer)
+#   - github.com/ramparte/deployotron                     (working Tauri + Rust + React scaffold)
+#   - github.com/bkrabach/coding-agent-loop               (Rust agentic loop reference)
+
+# Autonomy configuration (applied by the machine, see port/AGENTS.md):
+#   recipes: non-staged / auto-approve (no human approval gates)
+#   review:  antagonist agents substitute for human review
+#   budget:  cheapest model per harness for QA (see port/oracle/DESIGN.md)

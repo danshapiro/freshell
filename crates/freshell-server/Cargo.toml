@@ -1,0 +1,109 @@
+# freshell-server — the standalone headless/daemon binary (the SYSTEM-UNDER-TEST).
+#
+# Phase 3.4a scope: boot fast + clean on an ephemeral loopback port, read the
+# env contract the oracle harness sets (PORT, AUTH_TOKEN, FRESHELL_BIND_HOST,
+# isolated HOME), wire ONE axum app serving `/api/health` (freshell-api) + `/ws`
+# (freshell-ws), and prove the connect handshake normalize-equals the original's
+# (oracle T0). Terminal-over-wire, the rest of REST, sessions, and the harness
+# providers are later steps.
+[package]
+name = "freshell-server"
+version = "0.1.0"
+description = "The standalone headless/daemon freshell server binary (the oracle system-under-test). Phase 3.4a: boots on an ephemeral loopback port under the harness env contract and serves /api/health + the connect-handshake /ws, normalize-equal to the original (oracle T0)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "freshell-server"
+path = "src/main.rs"
+
+[dependencies]
+freshell-protocol = { path = "../freshell-protocol" }
+freshell-ws = { path = "../freshell-ws" }
+freshell-api = { path = "../freshell-api" }
+# The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.
+freshell-freshagent = { path = "../freshell-freshagent" }
+# DEV-0006 S4 inc.2: the codex managed-launch lifecycle manager — main.rs calls its
+# shutdown() during graceful exit (mirrors legacy's close-time codexLaunchPlanner.shutdown(),
+# server/index.ts:981-1049). real-transport is already enabled transitively via
+# freshell-freshagent; declared so main.rs can name the launch_lifecycle path.
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
+# Platform detection (`/proc/version` → platform string) for the SPA boot payload.
+freshell-platform = { path = "../freshell-platform" }
+# Read-only coding-CLI transcript parsers, reused to back `GET /api/session-directory`
+# (Follow-up 3.19): list + summarize sessions from the isolated provider homes.
+freshell-sessions = { path = "../freshell-sessions" }
+# The shared terminal registry constructed into WsState (terminals owned by
+# terminalId across connections — the multi-client / reconnection backbone).
+freshell-terminal = { path = "../freshell-terminal" }
+# `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
+# reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+axum = "0.8"
+serde_json = { workspace = true }
+# Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
+uuid = { version = "1", features = ["v4"] }
+# The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a
+# loopback target and streams the response back over plain HTTP (`stream`).
+# `rustls-tls` additionally backs the R5 `GET /api/version` live GitHub update
+# check (`updater.rs`), the one caller in this crate that needs real TLS
+# (`https://api.github.com`) -- `rustls-tls` (not `-no-provider`) so a crypto
+# provider (`ring`) is actually installed; see freshell-protocol's Cargo.toml
+# for the `rustls-tls-no-provider` hazard this deliberately avoids.
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls"] }
+# Decode the base64 PNG the UI returns in `ui.screenshot.result` before writing it
+# (POST /api/screenshots). Already resolved in the workspace lock (no new download).
+base64 = "0.22"
+# `modifiedAt` ISO-8601 timestamps for the files read/stat/write responses
+# (`stat.mtime.toISOString()` shape). Same config freshell-ws already uses.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Query-param structs for the files read/stat/complete endpoints.
+serde = { version = "1", features = ["derive"] }
+dotenvy = "0.15.7"
+# Shadow-checkpoint-repo directory naming (`checkpoints.rs`): a stable, short
+# digest of the resolved cwd path, mirroring `checkpointGitDir`'s
+# `createHash('sha1')` (`fresh-agent-extras-router.ts:76`) -- not a security
+# use of SHA-1, just a deterministic per-cwd bucket name.
+sha1 = "0.10"
+# DIAG-01/DIAG-03: structured JSONL logging. `tracing` is the event/span API;
+# `tracing-subscriber`'s `registry` (default feature) gives the `Layer` +
+# `LookupSpan` machinery `logging.rs`'s custom formatter builds on, and
+# `env-filter` backs the RUST_LOG-compatible level control. We deliberately do
+# NOT pull in `tracing-subscriber`'s `fmt`/`json` formatting layer or
+# `tracing-appender`'s rolling writer -- `logging.rs` hand-rolls both the JSON
+# shape (exact `ts`/`level`/`target`/`msg` field names, not `fmt`'s
+# `timestamp`/`message`) and size-based rotation (`fmt`'s only rotation is
+# time-based), which is simpler than fighting either for this shape.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The from-the-first-byte redaction scrub (DIAG-03): matches `"...token...":"…"`
+# and `"cookie":"…"` JSON fields (and a raw `Cookie:`/`Set-Cookie:` header
+# fragment, belt-and-braces) regardless of which call site produced them.
+# Already a common transitive dependency in this workspace (pulled in by
+# `tracing-subscriber`'s own `env-filter` via `matchers`); declared directly
+# here because `logging.rs` uses it explicitly, not just transitively.
+regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+# `flock(2)` for `settings_store.rs`'s advisory cross-process config lock
+# (side-by-side bake-in with the legacy Node server on the same real home).
+# Already resolved in the workspace lock transitively (tokio/reqwest), so
+# this direct dependency adds no new download -- unix-only, matching the
+# lock's own unix-only implementation.
+libc = "0.2"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
+tower = { version = "0.5", features = ["util"] }
+# Isolated temp dirs for `session_metadata.rs`'s store round-trip tests.
+tempfile = "3"
+# Batch C: `session_directory.rs` tests build a fixture opencode.db with a
+# writable connection before `OpencodeSource` opens it read-only (same bundled
+# engine `freshell-sessions` uses, unified by cargo).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# SAFE-11/TERM-22: the shutdown-reaping outer test drives a REAL `/ws` client
+# against the compiled binary (same version freshell-ws's own tests already
+# use, `crates/freshell-ws/Cargo.toml`) — no mock, the actual wire protocol.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

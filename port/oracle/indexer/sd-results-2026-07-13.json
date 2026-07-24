@@ -1,0 +1,401 @@
+{
+ "counts": {
+  "orig": 3,
+  "rust": 3
+ },
+ "variants": {
+  "(none)": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_value",
+       "message": "Invalid option: expected one of \"visible\"|\"background\"",
+       "path": [
+        "priority"
+       ],
+       "values": [
+        "visible",
+        "background"
+       ]
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   },
+   "rust": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_value",
+       "message": "Invalid option: expected one of \"visible\"|\"background\"",
+       "path": [
+        "priority"
+       ],
+       "values": [
+        "visible",
+        "background"
+       ]
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   }
+  },
+  "?priority=visible": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=background": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=bogus": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_value",
+       "message": "Invalid option: expected one of \"visible\"|\"background\"",
+       "path": [
+        "priority"
+       ],
+       "values": [
+        "visible",
+        "background"
+       ]
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   },
+   "rust": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_value",
+       "message": "Invalid option: expected one of \"visible\"|\"background\"",
+       "path": [
+        "priority"
+       ],
+       "values": [
+        "visible",
+        "background"
+       ]
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   }
+  },
+  "?priority=visible&limit=1": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&limit=abc": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_type",
+       "expected": "number",
+       "message": "Invalid input: expected number, received NaN",
+       "path": [
+        "limit"
+       ],
+       "received": "NaN"
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   },
+   "rust": {
+    "body": {
+     "details": [
+      {
+       "code": "invalid_type",
+       "expected": "number",
+       "message": "Invalid input: expected number, received NaN",
+       "path": [
+        "limit"
+       ],
+       "received": "NaN"
+      }
+     ],
+     "error": "Invalid request"
+    },
+    "status": 400
+   }
+  },
+  "?priority=visible&query=hello": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&query=zzzznomatch": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&query=%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&query=%E3%83%9E%E3%83%AB%E3%83%81%E3%83%90%E3%82%A4%E3%83%88": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&includeSubagents=true&includeNonInteractive=true&includeEmpty=true": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "items": [
+      {
+       "archived": false,
+       "createdAt": 1769760000000,
+       "cwd": "/home/dan/code/testproj",
+       "firstUserMessage": "invalid utf8 follows �( � � end",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769760001000,
+       "projectPath": "/home/dan/code/testproj",
+       "provider": "claude",
+       "sessionId": "bbbb1111-2222-4333-8444-555566667777",
+       "title": "invalid utf8 follows �( � � end"
+      },
+      {
+       "archived": false,
+       "createdAt": 1769756400000,
+       "cwd": "/home/dan/code/testproj",
+       "firstUserMessage": "こんにちは、世界 🌏 マルチバイトのテストです。Ωμέγα ελληνικά. עברית. 𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𐍈 👨‍👩‍👧‍👦",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769756401000,
+       "projectPath": "/home/dan/code/testproj",
+       "provider": "claude",
+       "sessionId": "aaaa1111-2222-4333-8444-555566667777",
+       "summary": "マルチバイト・テスト 🌸 multibyte summary",
+       "title": "こんにちは、世界 🌏 マルチバイトのテストです。Ωμέγα ελληνικά. עברית. 𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𐍈 👨‍👩‍👧‍👦"
+      },
+      {
+       "archived": false,
+       "createdAt": 1769753756713,
+       "cwd": "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell",
+       "firstUserMessage": "Test session 1",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769753759234,
+       "projectPath": "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell",
+       "provider": "claude",
+       "sessionId": "b7936c10-4935-441c-837c-c1f33cafec2d",
+       "summary": "Test Session 1",
+       "title": "Test session 1"
+      }
+     ],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   },
+   "rust": {
+    "body": {
+     "items": [
+      {
+       "archived": false,
+       "createdAt": 1769760000000,
+       "cwd": "/home/dan/code/testproj",
+       "firstUserMessage": "invalid utf8 follows �( � � end",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769760001000,
+       "projectPath": "/home/dan/code/testproj",
+       "provider": "claude",
+       "sessionId": "bbbb1111-2222-4333-8444-555566667777",
+       "title": "invalid utf8 follows �( � � end"
+      },
+      {
+       "archived": false,
+       "createdAt": 1769756400000,
+       "cwd": "/home/dan/code/testproj",
+       "firstUserMessage": "こんにちは、世界 🌏 マルチバイトのテストです。Ωμέγα ελληνικά. עברית. 𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𐍈 👨‍👩‍👧‍👦",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769756401000,
+       "projectPath": "/home/dan/code/testproj",
+       "provider": "claude",
+       "sessionId": "aaaa1111-2222-4333-8444-555566667777",
+       "summary": "マルチバイト・テスト 🌸 multibyte summary",
+       "title": "こんにちは、世界 🌏 マルチバイトのテストです。Ωμέγα ελληνικά. עברית. 𝔘𝔫𝔦𝔠𝔬𝔡𝔢 𐍈 👨‍👩‍👧‍👦"
+      },
+      {
+       "archived": false,
+       "createdAt": 1769753756713,
+       "cwd": "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell",
+       "firstUserMessage": "Test session 1",
+       "isNonInteractive": true,
+       "isRunning": false,
+       "lastActivityAt": 1769753759234,
+       "projectPath": "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell",
+       "provider": "claude",
+       "sessionId": "b7936c10-4935-441c-837c-c1f33cafec2d",
+       "summary": "Test Session 1",
+       "title": "Test session 1"
+      }
+     ],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  },
+  "?priority=visible&cursor=garbage": {
+   "equal": true,
+   "orig": {
+    "body": {
+     "error": "Invalid session-directory cursor"
+    },
+    "status": 400
+   },
+   "rust": {
+    "body": {
+     "error": "Invalid session-directory cursor"
+    },
+    "status": 400
+   }
+  }
+ },
+ "cursorChain": {
+  "equal": true,
+  "orig": [
+   {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  ],
+  "rust": [
+   {
+    "body": {
+     "items": [],
+     "nextCursor": null,
+     "revision": 1769760001000
+    },
+    "status": 200
+   }
+  ]
+ }
+}

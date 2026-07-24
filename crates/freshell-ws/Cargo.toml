@@ -1,0 +1,102 @@
+# freshell-ws — WebSocket transport + connect-handshake dispatch (port of the
+# handshake path of server/ws-handler.ts).
+#
+# Phase 3.4a scope: the `/ws` endpoint, `hello` auth negotiation (protocolVersion
+# THEN constant-time token compare), and the exact ordered connect handshake the
+# original emits on a clean isolated boot: ready → settings.updated →
+# perf.logging → terminal.inventory (bootId byte-identical across ready and
+# inventory). Everything else (terminal.*, coding-cli, fresh-agent, backpressure,
+# ping/keepalive) is deferred to later steps.
+#
+# Uses axum's WebSocket upgrade (tokio-tungstenite-backed) per ADR Decision 3
+# (one axum app serves HTTP + the WS upgrade). Emits the frozen freshell-protocol
+# server message types.
+[package]
+name = "freshell-ws"
+version = "0.1.0"
+description = "WebSocket transport + connect-handshake dispatch for the freshell Rust port: /ws endpoint, hello auth (protocolVersion then constant-time token), and the exact ordered ready/settings.updated/perf.logging/terminal.inventory handshake. Emits frozen freshell-protocol types. Phase 3.4a (handshake only)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The frozen wire types this crate emits (ready/settings.updated/etc.) + the
+# client-message types it parses (terminal.create/attach/input/kill/…).
+freshell-protocol = { path = "../freshell-protocol" }
+# The PTY core (real pseudo-terminal spawn + seq'd output framing) the terminal
+# handlers drive, and the SpawnSpec builder that resolves the shell.
+freshell-terminal = { path = "../freshell-terminal" }
+freshell-platform = { path = "../freshell-platform" }
+# The amplifier session locator (Enter↔session-dir correlation for restore
+# across server restart, docs/plans/2026-07-18-amplifier-restore-spec.md) --
+# a pure/poll-based crate this crate arms/drains but doesn't own the fs logic of.
+freshell-sessions = { path = "../freshell-sessions" }
+# The freshcodex WS fresh-agent slice (freshAgent.create/send → codex app-server). The
+# post-handshake loop dispatches the codex client→server messages to this shared state,
+# which spawns the app-server sidecar and broadcasts freshAgent.created/send.accepted/event.
+freshell-freshagent = { path = "../freshell-freshagent" }
+# Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
+axum = { version = "0.8", features = ["ws"] }
+serde_json = { workspace = true }
+# ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Async select loop + the mpsc channel that bridges the PTY reader thread (sync)
+# to the WS send path (async). `time` is used only for the terminal.output flush.
+tokio = { version = "1", features = ["sync", "macros", "time", "rt"] }
+# Split the WS socket into an independent sink + stream for the select loop
+# (StreamExt::split needs the `sink` feature; default features carry std+alloc).
+futures-util = "0.3"
+# terminalId + streamId minting. The reference mints `terminalId` via nanoid()
+# (terminal-registry.ts:1560) and `streamId` via randomUUID() (stream-identity.ts:24).
+# A UUIDv4's [0-9a-f-] is a subset of the oracle's url-safe id alphabet, so it
+# satisfies BOTH the `nanoid` and `streamId` shape validators (normalize.ts:176).
+uuid = { version = "1", features = ["v4"] }
+# The opencode loopback control-endpoint allocator (`allocateLocalhostPort`,
+# server/local-port.ts) — task-006 §3.3 reuses the LoopbackPortAllocator seam
+# (freshell-opencode/src/transport.rs). real-transport is already enabled
+# transitively via freshell-freshagent.
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# DEV-0006 S4: the codex managed-launch lifecycle (launch planner + app-server sidecar +
+# remote proxy) the FLAG-GATED terminal.create codex branch wires through. real-transport
+# is already enabled transitively via freshell-freshagent; declared here so this crate can
+# name the launch_lifecycle/launch_plan paths.
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
+# DIAG-01 lifecycle events (connection established/closed, hello rejected,
+# keepalive termination): flow to the global `tracing` subscriber
+# `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --
+# this crate only emits events, it never installs its own subscriber.
+tracing = "0.1"
+# tabs-sync snapshot generation ids (continuity trio): SHA-256 over the
+# canonical `records` serialization, truncated to 128 bits. Same version the
+# workspace already resolves via crates/freshell-terminal/Cargo.toml:36.
+sha2 = "0.10"
+
+[dev-dependencies]
+# tabs_persist tests write snapshot generations into throwaway dirs. Same
+# version other workspace crates pin (e.g. crates/freshell-terminal).
+tempfile = "3"
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"
+# Real socket integration tests for the WS keepalive contract (ping/pong cadence,
+# broadcast-flood survival): a real axum server on an ephemeral loopback port +
+# a real WS client. `net`/`rt-multi-thread` let the test binary bind a listener
+# and run a multi-threaded runtime; the base `tokio` dep above only has `rt`
+# (current-thread), which the production select loop doesn't need but a test
+# server + concurrent client task does.
+tokio = { version = "1", features = ["net", "rt-multi-thread", "test-util"] }
+# Same version already pinned in the workspace lockfile via freshell-codex's
+# (default-off) `real-transport` feature — reused here as a plain WS test client.
+tokio-tungstenite = "0.24"
+# TERM-09 slow-client test: shrinks a test client's SO_RCVBUF to a few KB so a
+# non-reading peer creates GENUINE, deterministic TCP-level backpressure on
+# loopback (rather than relying on default OS buffer auto-tuning, which can
+# silently absorb a multi-MB flood and make the test flaky). `"0.6"` matches
+# the version already resolved in the workspace lockfile (a transitive dep
+# elsewhere), so this promotes it to a direct dev-dependency without pulling
+# in a second copy at a different version.
+socket2 = "0.6"
+# opencode_association tests seed a real opencode.db fixture (same bundled
+# engine freshell-sessions uses) before the locator opens it read-only.
+rusqlite = { version = "0.31", features = ["bundled"] }

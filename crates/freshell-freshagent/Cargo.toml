@@ -1,0 +1,91 @@
+# freshell-freshagent — the fresh-agent REST surface for the opencode provider.
+#
+# Additive Phase 3.7 wiring: the slice of server/agent-api/router.ts the oracle's
+# T2 opencode rung drives —
+#   POST /api/tabs {agent:'opencode',…}   -> placeholder `freshopencode-*` pane + ui.command(tab.create)
+#   POST /api/panes/:id/send-keys         -> COLD-START the opencode serve (via freshell-opencode
+#                                            real-transport; DEV-0001 fix means NO warm-proxy),
+#                                            create the durable `ses_*`, broadcast
+#                                            freshAgent.session.materialized + sessions.changed,
+#                                            drive one turn, complete on the IDLE edge
+#   GET  /api/panes/:id/capture           -> render the transcript (listMessages) as text
+#
+# Only enough of the surface to satisfy the opencode T2 invariant set + the structural
+# baseline (port/oracle/baselines/t2/opencode-kimi.json). Claude/codex adapters, the
+# full pane/tab lifecycle, and non-opencode REST are deferred. The isolated opencode.db
+# is written by the real `opencode serve` under the server's isolated HOME (never the
+# user's store). Broadcasts are pushed as pre-serialized frames onto a shared bus the
+# freshell-ws connections fan out (see freshell-server main).
+[package]
+name = "freshell-freshagent"
+version = "0.1.0"
+description = "Fresh-agent REST surface (opencode slice) for the freshell Rust port: POST /api/tabs, /panes/:id/send-keys, /panes/:id/capture wired to freshell-opencode (real-transport, cold-start via the DEV-0001 fix). Emits ui.command / freshAgent.session.materialized / sessions.changed over the shared WS broadcast bus. Phase 3.7 — the surface the oracle T2 opencode rung grades (original≡rust)."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The frozen wire types the broadcasts emit (ui.command / freshAgent.session.materialized
+# / sessions.changed) — contract-locked shapes.
+freshell-protocol = { path = "../freshell-protocol" }
+# The opencode serve client CORE + its real reqwest/process backends (real-transport):
+# spawn+bounded-health cold-start (DEV-0001), create_session, run_turn (idle edge),
+# list_messages (transcript capture), and the ownership-safe reaper.
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
+# The codex app-server JSON-RPC/WS client CORE + its real tokio-tungstenite backend +
+# the /proc ownership reaper (real-transport): initialize→thread/turn drive (effort VERBATIM,
+# DEV-0003), the status-guarded completion edge, model/effort normalization. The codex slice
+# drives a live freshcodex T2 turn through the Rust server (Phase 3.8b).
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
+# Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the SAME terminal
+# registry the WS `terminal.create` path uses, shared in from `freshell-server`'s
+# main.rs wiring -- Agent-API-created shell terminals live in ONE registry, no
+# orphan PTYs (spec §9 Risk 1).
+freshell-terminal = { path = "../freshell-terminal" }
+# Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): the SAME
+# amplifier/opencode session locators the WS `terminal.create` path arms
+# (freshell_ws::amplifier_association / opencode_association), shared in from
+# freshell-server's main.rs wiring -- a REST-created fresh amplifier/opencode
+# pane arms the SAME locator instance the periodic sweep (spawned once,
+# against WsState, at boot) already polls, so association/broadcast parity
+# falls out of the shared instance rather than a second, REST-owned sweep
+# loop. Does NOT depend on freshell-ws (that would be circular -- freshell-ws
+# already depends on THIS crate for its fresh-agent state fields).
+freshell-sessions = { path = "../freshell-sessions" }
+# Shell `SpawnSpec` construction for the terminal-mode `POST /api/tabs` path.
+freshell-platform = { path = "../freshell-platform" }
+# The REST router + JSON extraction.
+axum = "0.8"
+serde_json = { workspace = true }
+# `<think>`/`<thinking>` balanced-tag segmentation for opencode assistant text
+# (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, normalize.ts:100-189) needs a
+# backreference (`<(thinking|think)...>...</\1>`) to match only same-name open/close pairs --
+# the `regex` crate cannot express that (no backreference support, by design, for linear-time
+# guarantees). `fancy-regex` is already resolved in the workspace lockfile (a transitive dep of
+# `jsonschema`), so this adds no new dependency to the build graph, only a direct one.
+fancy-regex = "0.18"
+# The shared broadcast bus (String frames), the create/turn async orchestration, the codex
+# app-server sidecar spawn (`process`), and its stdio drain (`io-util`).
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
+# paneId / tabId / placeholder-suffix / submittedTurnId + claude-sidecar ownership-id minting.
+uuid = { version = "1", features = ["v4"] }
+# DIAG-01 lifecycle events (session created/send accepted/turn complete/crash
+# detected/crash recovery/sidecar spawn+reap): flows to the global `tracing`
+# subscriber `freshell-server` installs (`crates/freshell-server/src/logging.rs`)
+# -- this crate only emits events, it never installs its own subscriber.
+tracing = "0.1"
+
+# Linux /proc ownership reaper for the claude Node sidecar + its `claude` CLI grandchild
+# (SIGTERM anything carrying our FRESHELL_CLAUDE_SIDECAR_ID tag) — the claude analog of the
+# codex reaper, so a freshclaude T2 run leaves no orphan (the oracle `ownership.cleanup`
+# invariant). Linux-only (matches the reference's platform guard).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+# DIAG-01 test facility: a capturing `Layer` + `tracing::subscriber::set_default`
+# to assert lifecycle events fire, without depending on the global subscriber
+# `freshell-server` owns.
+tracing-subscriber = "0.3"

@@ -1,0 +1,81 @@
+# freshell-tauri — the Tauri v2 desktop shell (the "move to Tauri" deliverable).
+#
+# Phase 3.13 scope: the additive Tauri v2 app that reproduces the Electron shell's
+# APP-BOUND boot path — spawn the cargo-built `freshell-server` binary on an
+# ephemeral 127.0.0.1 port (generated AUTH_TOKEN, real/isolated HOME), health-poll
+# `/api/health`, then load `http://127.0.0.1:<port>/?token=<token>` in the webview
+# so the UNCHANGED React SPA runs. The Electron `preload.ts` contextBridge collapses
+# to a 2-property init-script shim (`window.freshellDesktop = { isElectron, openExternal }`),
+# the frontend seam the retained SPA actually touches (electron-tauri.md §7). Re-entrant
+# `main()` (electron/entry.ts:686) becomes an explicit window state-machine.
+#
+# Maps: electron/server-spawner.ts (spawn + health-poll + SIGTERM→SIGKILL),
+# electron/entry.ts app-bound path + electron/main.ts (single-instance + close/quit),
+# electron/external-url.ts (canonicalize + open in system browser),
+# electron/preload.ts (the freshellDesktop surface → the 2-property shim).
+#
+# DEFERRED to Phase 3.14 (stubbed/omitted cleanly here): tray, global-shortcut,
+# updater, window-state persistence, setup-wizard + launch-chooser windows,
+# renderer-crash-recovery, daemon managers.
+#
+# Additive only — never modifies server/ or shared/ source. The spawned server is
+# the SAME standalone `freshell-server` binary the oracle grades (crates/freshell-server).
+[package]
+name = "freshell-tauri"
+version = "0.1.0"
+description = "The Tauri v2 desktop shell for the freshell Rust port (Phase 3.13). Spawns the app-bound freshell-server on an ephemeral loopback port (generated AUTH_TOKEN + health-gate + SIGTERM→SIGKILL reap), loads the retained React SPA in the webview at ?token=<token>, and exposes the 2-property window.freshellDesktop shim (isElectron, openExternal) so the SPA runs byte-unchanged. Replaces Electron's re-entrant main() with an explicit window state-machine. Tray/hotkey/updater/window-state/wizard/chooser/daemon deferred to 3.14."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "freshell-tauri"
+path = "src/main.rs"
+
+[features]
+# The system-tray seam needs the tauri `tray-icon` feature; it is on by default so
+# the whole crate builds + the smoke exercises it. The PURE logic (accelerator
+# translator, window-state serde + clamp, updater decision, renderer-recovery state
+# machine, tray menu model, wizard/chooser validators/commands) compiles +
+# unit-tests regardless of this flag.
+default = ["tray"]
+tray = ["tauri/tray-icon"]
+
+[build-dependencies]
+# Reads tauri.conf.json + capabilities/ at compile time and generates the app
+# context (`tauri::generate_context!`). Required for a Tauri v2 crate to build.
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri v2 core (WRY webview). >=2.10 required transitively by tauri-plugin-opener.
+tauri = { version = "2", features = [] }
+# Open a canonicalized external URL in the system browser (electron shell.openExternal
+# → tauri-plugin-opener `open_url`). Maps electron/external-url.ts.
+tauri-plugin-opener = "2"
+# Single-instance lock + focus-first (electron/main.ts:24-28,63-70). Registered FIRST.
+tauri-plugin-single-instance = "2"
+# Global hotkey registration (electron/hotkey.ts + startup.ts:204-211). The
+# Electron→Tauri accelerator translation lives in src/hotkey.rs; live OS-keypress
+# capture is display/session-gated (electron-tauri.md §8 item 7).
+tauri-plugin-global-shortcut = "2"
+# Command args (open_external_url) + the shim/URL JSON-free plumbing.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# URL canonicalization for the external-url gate (mirrors `new URL(url)` semantics:
+# scheme/credential/host validation). Also parses the External webview load URL.
+url = "2"
+# Generated AUTH_TOKEN (srv-scoped random) minting for the app-bound spawn.
+uuid = { version = "1", features = ["v4"] }
+# Semver comparison for the auto-updater check-decision (src/updater.rs). Already in
+# the workspace lock (transitive via tauri); pinned here for the direct use.
+semver = "1"
+
+# SIGTERM→SIGKILL server reap on app exit (electron/server-spawner.ts:154-189).
+# Unix-only; on Windows the owned Child.kill() terminates. Matches the reference's
+# platform-guarded signal handling.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Isolated tmp dirs for the desktop.json config read/patch tests (src/config.rs).
+tempfile = "3"

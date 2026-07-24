@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "cmd",
+    "label": "CMD",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-tauriB-cmd.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-tauriB-poqk4d6a)",
+    "bufferExcerpt": "C:\\Users\\Public\\freshell-matrix-ws-sbp9-tauriB-poqk4d6a>echo freshell-matrix-OK | freshell-matrix-OK | C:\\Users\\Public\\freshell-matrix-ws-sbp9-tauriB-poqk4d6a>",
+    "tabId": "gheARezeMfnyq61eWmHt5",
+    "terminalId": "9a5acf1394f74232837002841c65a6d1"
+  },
+  {
+    "kind": "wsl",
+    "label": "WSL",
+    "created": true,
+    "asserted": true,
+    "screenshot": "/home/dan/code/freshell/port/oracle/matrix/sbp9-tauriB-wsl.png",
+    "status": "PASS",
+    "detail": "marker x>=2 · landed in workspace (freshell-matrix-ws-sbp9-tauriB-poqk4d6a)",
+    "bufferExcerpt": "Linux SurfaceBookPro9 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x8 | 6_64 x86_64 GNU/Linux | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-sbp9-tauriB-poqk4d6a$ echo freshell-matrix-OK && pwd | freshell-matrix-OK | /mnt/c/Users/Public/freshell-matrix-ws-sbp9-tauriB-poqk4d6a | dan@SurfaceBookPro9:/mnt/c/Users/Public/freshell-matrix-ws-s",
+    "tabId": "hxzN6-jPEKCv2Ee_knmiE",
+    "terminalId": "dbf96bbaa9564129b4bf217eb2514969"
+  }
+]

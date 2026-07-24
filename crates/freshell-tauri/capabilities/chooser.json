@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "chooser",
+  "description": "Capability for the launch-chooser window (electron/launch-chooser/**). Grants core IPC (invoke) so the window can call `get_launch_options` + `choose_launch_option`. Per-command trust is enforced in-command by window label (windows::is_allowed_window) — the Rust analog of the Electron chooserWebContentsId `isAllowedSender` gate (entry.ts:538-541) — since app-defined commands are not permission-gated in Tauri v2.",
+  "windows": ["chooser"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,20 @@
+{
+  "scenario": "merge-burst",
+  "description": "a four-line burst from one printf — contiguous transparent-ground frames coalesce",
+  "shell": "system",
+  "mode": "shell",
+  "inputLines": [
+    "printf 'aa\\nbb\\ncc\\ndd\\n'"
+  ],
+  "capabilities": {
+    "terminalOutputBatchV1": true
+  },
+  "cols": 120,
+  "rows": 30,
+  "reassembledLength": 590,
+  "byteLength": 16,
+  "sha256": "a0634a0f6061f23760de3178aeff44c840e82362b07d4babf1f0b9a9a9399675",
+  "outputTypeCounts": {
+    "terminal.output.batch": 7
+  }
+}
