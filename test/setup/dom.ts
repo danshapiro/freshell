@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
 import { resetWsClientForTests } from '@/lib/ws-client'
+import { resetTerminalReleaseMarks } from '@/lib/terminal-release-marks'
 
 enableMapSet()
 
@@ -123,6 +124,7 @@ beforeEach(() => {
 
 afterEach(() => {
   resetWsClientForTests()
+  resetTerminalReleaseMarks()
   errorSpy?.mockRestore()
   errorSpy = null
 
