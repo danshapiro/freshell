@@ -35,6 +35,10 @@
 
 **Why skip `clearDeadTerminals` / `clearTerminalLiveHandles`:** these two actions (src/store/panesSlice.ts:1724, :1754) strip terminalIds ONLY for terminals the server itself reported dead or unrecoverable (payloads come from `terminal.inventory` / `terminals.changed` handling in App.tsx:883-885, :1044-1049). There is no live subscription to release, and detaching would generate a server error frame per corpse. This is not a scope reduction: the spec's goal (server-side reapability) is vacuous for terminals the server already reaped. `repairCodexIdentityMismatch` is deliberately NOT skipped — its stale terminal is typically still live and leaked.
 
+**Close-during-create race (found in load-bearing validation):** the server does NOT auto-attach on `terminal.create` — the subscription is created only by the client's `terminal.created` handler (src/components/TerminalView.tsx:3754-3844), which writes the id into layouts via `updateContent` (:3799, synchronous dispatch) and then calls `attachTerminal` (:3842). If the pane is closed after the create is sent and `terminal.created` is processed in the dispatch→React-commit window, `updateContent` no-ops (pane node gone) yet `attachTerminal` still fires — a subscription for an id the layouts never contained, invisible to the middleware diff and leaked until disconnect. Task 11 closes this by gating `attachTerminal` on layout membership (`collectAllTerminalIds`); the same gate closes the sub-millisecond quarantine-repair re-attach race (TerminalView.tsx:797-819). Any residual acquisition leak is bounded to the connection lifetime: the server clears every subscription per-socket on close (server/ws-handler.ts:1219 `detachAllForSocket`).
+
+**Validated server semantics the design relies on** (load-bearing validation 2026-07-25; assumption ledger + evidence reports live in the workflow logs dir): subscriptions are a per-connection `Set` — one detach fully clears them and `hasClients` is `clients.size > 0` (server/terminal-registry.ts:584, :4302), so a sole-client detach makes the terminal reaper-eligible; detach for a live terminal that isn't attached (or was already detached) succeeds benignly — only unknown ids draw an error frame (server/ws-handler.ts:2820-2836), which the client consumes benignly (no `console.error`; at most a `clearTerminalLiveHandles` dispatch, itself skip-listed — so no detach feedback loop is possible); `recoverableTerminalIds` are emitted only for terminals with `clients.size === 0` (PTY-exit and idle-kill paths, terminal-registry.ts:1502, :1424-1432), confirming the skip-list is not a preserved leak; terminal ids are minted server-side (`nanoid()`, terminal-registry.ts:1570) and `TerminalCreateSchema` is `.strict()` with no client-supplied id, underwriting the release-marks design.
+
 ## File Structure
 
 | File | Action | Responsibility |
@@ -48,7 +52,7 @@
 | `src/components/TabBar.tsx` | Modify | Remove plain-close detach loop; shift-close uses `sendTerminalKill` |
 | `src/components/panes/PaneContainer.tsx` | Modify | Remove detach send in `handleClose` |
 | `src/components/context-menu/ContextMenuProvider.tsx` | Modify | Remove 3 detach sends; kill site uses `sendTerminalKill` |
-| `src/components/TerminalView.tsx` | Modify | Opencode self-heal kill (line 2910) uses `sendTerminalKill` |
+| `src/components/TerminalView.tsx` | Modify | Opencode self-heal kill (line 2910) uses `sendTerminalKill`; `attachTerminal` gated on layout membership (Task 11) |
 | `src/components/BackgroundSessions.tsx` | Modify | Kill button uses `sendTerminalKill` |
 | `test/unit/client/lib/collect-all-terminal-ids.test.ts` | Create | Helper tests |
 | `test/unit/client/lib/terminal-release-marks.test.ts` | Create | Marks module tests |
@@ -60,6 +64,7 @@
 | `test/unit/client/components/ContextMenuProvider.test.tsx` | Modify | Middleware in test store |
 | `test/e2e/tab-focus-behavior.test.tsx` | Modify | Middleware in test store (assertions unchanged) |
 | `test/e2e/replace-pane.test.tsx` | Modify | Convert tautological hand-rolled detach sends into real middleware-backed assertions |
+| `test/unit/client/components/TerminalView.lifecycle.test.tsx` | Modify | Close-during-create: no attach for a pane no longer in layouts (Task 11) |
 
 ---
 
@@ -1261,7 +1266,67 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ---
 
-### Task 11: full verification
+### Task 11: gate `attachTerminal` on layout membership (close-during-create fix)
+
+**Files:**
+- Modify: `src/components/TerminalView.tsx` (`attachTerminal()`, line ~2564)
+- Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+
+**Interfaces:**
+- Consumes: `collectAllTerminalIds` from `@/lib/pane-utils` (Task 1); the current Redux state read imperatively inside the component (use react-redux's `useStore()` — `const store = useStore()` — unless TerminalView already has an imperative state-access pattern; match the file's existing pattern if one exists).
+- Produces: `attachTerminal` becomes a silent no-op for any terminalId not currently referenced by `state.panes.layouts`.
+
+**Why (validated in the load-bearing stage, validator-G4):** the server does not auto-attach on create; the client's `terminal.created` handler writes the id into layouts (`updateContent`, :3799) and then attaches (:3842). If the pane's layout removal is dispatched after the create was sent but before `terminal.created` is processed, `updateContent` no-ops yet the attach still fires — a subscription for an id the layouts never contained, invisible to the middleware diff, leaked until the socket closes. Gating at `attachTerminal` (the single attach choke point, :2564) closes that race AND the sub-millisecond quarantine-repair re-attach race (:797-819). Every legitimate attach passes the gate: the created handler dispatches `updateContent` synchronously before attaching, and mount/refresh/hydration attaches use ids the layouts already reference.
+
+- [ ] **Step 1: Write the failing test**
+
+In `test/unit/client/components/TerminalView.lifecycle.test.tsx`, locate the existing test that exercises the create → `terminal.created` → attach flow (it delivers a `terminal.created` message and asserts a `terminal.attach` send for the new id). Add a sibling test reusing that test's setup verbatim: `it('does not attach when the pane was removed before terminal.created arrives')` — after the create request is sent but BEFORE delivering `terminal.created`, dispatch the layout removal for the pane's tab through the test store (`removeLayout`/`closeTab`, matching how the harness manipulates layouts), then deliver the `terminal.created` message and assert that NO `{ type: 'terminal.attach', terminalId: <newId> }` is ever sent:
+
+```ts
+    const attachMessages = sendMock.mock.calls
+      .map(([msg]) => msg as { type?: string; terminalId?: string })
+      .filter((msg) => msg?.type === 'terminal.attach' && msg.terminalId === newId)
+    expect(attachMessages).toHaveLength(0)
+```
+
+(`sendMock` = the file's actual hoisted ws send mock name.) If the harness cannot deliver a created message after a store change while the component is still mounted, fall back to any deterministic path through `attachTerminal` with the id absent from layouts (e.g. remove the layout via store dispatch, then trigger the component's refresh/re-attach path and assert no re-attach send).
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx --config config/vitest/vitest.config.ts` (timeout: this file is large — allow up to 10 minutes)
+Expected: the new test FAILS — attach is currently sent unconditionally.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `src/components/TerminalView.tsx`, add the imports (`collectAllTerminalIds` from `@/lib/pane-utils`; `useStore` from react-redux if no imperative state access exists yet) and, at the top of `attachTerminal()` (:2564) before any send:
+
+```ts
+    // Never attach a terminal the layouts no longer reference: the layout-diff
+    // middleware can only release subscriptions it saw acquired. Covers the
+    // close-during-create race and stale deferred re-attach timers.
+    const layouts = store.getState().panes.layouts
+    if (!collectAllTerminalIds(layouts).has(terminalId)) {
+      return
+    }
+```
+
+- [ ] **Step 4: Run to verify green**
+
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx --config config/vitest/vitest.config.ts` (allow up to 10 minutes)
+Expected: PASS — the new test plus every pre-existing lifecycle test. If a pre-existing test fails because its store genuinely lacks a layout entry for the terminal it attaches, fix that TEST's preloaded layouts to include the pane (matching production, where every mounted TerminalView has a layout node) — never weaken the gate.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
+git commit -m "fix(client): gate terminal attach on layout membership to close create-race leak" -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 12: full verification
 
 **Files:** none new.
 
@@ -1311,10 +1376,13 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 | TerminalView unmount | every unmount that drops the reference does so via a layouts change (restoreLayout/hydratePanes/removeLayout/closePane), caught by the diff; unmount WITHOUT a state change (tab switch) still references the terminal and must NOT detach — background attach is intentional (`registerForBackgroundHydration`) | Task 4 (all diff tests); "no layouts change ⇒ no send" test |
 | Multi-pane guard ("another pane still displays the same terminal") | set-diff over ALL layouts | Task 4 refcount test |
 | Explicit tab-close semantics unchanged | plain close ⇒ middleware emits detach on same dispatch; Shift ⇒ `sendTerminalKill` | Task 6 (pre-existing assertions kept passing + 2 new tests) |
+| Close-during-create race (subscription acquired for an id never present in layouts — found by load-bearing validation, falsified assumption A9) | `attachTerminal` gated on layout membership via `collectAllTerminalIds`; also closes the quarantine-repair re-attach timer race | Task 11 no-attach-after-removal test |
 | Scope guard: no server changes | no server/crates file appears in the File Structure | — |
 
 **1b. No silent deferrals** — the only mocked boundary is `@/lib/ws-client` in unit tests; the production wire path (`getWsClient().send`) is exercised unmocked in the app and the message shape matches the server's Zod schema (shared/ws-protocol.ts:348). No stub is left standing in for production behavior; the production store registration itself is behavior-tested (Task 5). The clearDead/clearLiveHandles skip is an explicit, documented design decision (dead terminals have no subscription), not a deferral.
 
 **2. Placeholder scan** — the two component-test steps (Tasks 6-8) intentionally reference the neighbouring test's setup by exact line number instead of duplicating unquotable file-local harness code; all assertions, all production code, and all new modules are given in full. No TBD/TODO items remain.
 
-**3. Type consistency** — `collectAllTerminalIds(layouts: Record<string, PaneNode | undefined>): Set<string>` (Task 1) matches its uses in Task 4; `markTerminalReleased`/`consumeTerminalReleaseMark`/`resetTerminalReleaseMarks` (Task 2) match Tasks 3-4 and the dom.ts wiring; `sendTerminalKill(terminalId: string): void` (Task 3) matches Tasks 6, 8, 9; `terminalDetachMiddleware: Middleware` (Task 4) matches every concat site (Tasks 5-8, 10).
+**3. Type consistency** — `collectAllTerminalIds(layouts: Record<string, PaneNode | undefined>): Set<string>` (Task 1) matches its uses in Task 4; `markTerminalReleased`/`consumeTerminalReleaseMark`/`resetTerminalReleaseMarks` (Task 2) match Tasks 3-4 and the dom.ts wiring; `sendTerminalKill(terminalId: string): void` (Task 3) matches Tasks 6, 8, 9; `terminalDetachMiddleware: Middleware` (Task 4) matches every concat site (Tasks 5-8, 10); `collectAllTerminalIds` (Task 1) is also consumed by the Task 11 attach gate with the same `Record<string, PaneNode | undefined> -> Set<string>` signature.
+
+**4. Load-bearing validation (2026-07-25)** — the plan's silent dependencies were verified against the actual server and client code (assumption ledger + evidence reports in the workflow logs dir). Verified: set-based per-connection subscriptions with one-detach-full-clear; benign detach of live-but-unattached terminals (covers the Task 5→8 transitional double-detach); benign client handling of the detach error frame (no console.error, no feedback loop — the only follow-on dispatch, `clearTerminalLiveHandles`, is skip-listed); `recoverableTerminalIds` emitted only at `clients.size === 0` (the skip-list preserves no leak); server-minted, never-reused terminal ids (release-marks safety); no transient drop-then-readd layout flow (immediate detach is safe); no re-attach path for dropped ids; per-socket cleanup on disconnect. Falsified: "every subscription's id appears in layouts" — the close-during-create race acquires an invisible subscription; fixed by Task 11's attach gate.
