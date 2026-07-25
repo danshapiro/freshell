@@ -871,14 +871,19 @@ and inside the `configureStore({...})` call:
 
 In `test/e2e/tab-focus-behavior.test.tsx`: same addition to its `createStore` (`configureStore` at ~line 78, currently no `middleware:` key).
 
-Run both suites — they must still be green (double-send is not asserted anywhere yet):
+Run both suites. Three pre-existing tests go RED here — they assert exact detach/kill counts, and the middleware now duplicates the component's sends:
 
 Run: `npm run test:vitest -- run test/unit/client/components/TabBar.test.tsx test/e2e/tab-focus-behavior.test.tsx --config config/vitest/vitest.config.ts`
-Expected: PASS.
+Expected: FAIL —
+- TabBar `'close button detaches every terminal in split pane layout'` (:671-707): `expect(mockSend).toHaveBeenCalledTimes(2)` at :698 now sees 4 calls (component + middleware each detach `term-a`/`term-b`);
+- TabBar `'shift+click kills every terminal in split pane layout'` (:709-746): `toHaveBeenCalledTimes(2)` at :737 now sees 4 calls (2 component kills + 2 middleware detaches — the component's raw `ws.send` kills set no release marks until Step 4);
+- e2e `'closing a split tab detaches all pane terminals'` (:237-336): the strict filtered `toEqual` at :332-335 now sees `['term-a','term-b','term-a','term-b']`.
+
+The single-terminal tests at :593 and :632 stay green (`toHaveBeenCalledWith` is count-insensitive), as does the `expect(mockSend).not.toHaveBeenCalled()` test at :765 (its layout never contains a terminal id, so the middleware diff is empty). This RED is exactly the double-send bug this task fixes — do NOT "fix" these three tests (their assertions are correct); they go green in Step 4 when the component's own sends are removed. Proceed to Step 2.
 
 - [ ] **Step 2: Write the failing tests**
 
-In `test/unit/client/components/TabBar.test.tsx`, inside the `describe('tab interactions')` block (starts ~:530), add two tests. Reuse the exact same store construction, render helper, and close-button interaction code as the existing test `'close button sends detach message when pane has terminalId'` at :593 (same preloaded layout with `terminalId: 'term-1'`, same `fireEvent.click` on the close button; the file's hoisted ws send mock is the `expect` target — match the local mock variable name used at :627):
+In `test/unit/client/components/TabBar.test.tsx`, inside the `describe('tab interactions')` block (starts ~:530), add two tests. For the first, reuse the exact same store construction, render helper, and close-button interaction code as the existing test `'close button sends detach message when pane has terminalId'` at :593 — its preloaded layout uses `terminalId: 'term-123'`, and the file's hoisted ws send mock is the `expect` target (match the local mock variable name used at :626). For the second, reuse the setup of `'shift+click on close button sends kill message'` at :632 — its fixture uses `terminalId: 'term-456'` and clicks the close button with `{ shiftKey: true }`:
 
 ```ts
   it('plain close sends exactly one terminal.detach per terminal', () => {
@@ -886,16 +891,16 @@ In `test/unit/client/components/TabBar.test.tsx`, inside the `describe('tab inte
     const detachMessages = sendMock.mock.calls
       .map(([msg]) => msg as { type?: string; terminalId?: string })
       .filter((msg) => msg?.type === 'terminal.detach')
-    expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-1' }])
+    expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-123' }])
   })
 
   it('shift close sends terminal.kill and no terminal.detach', () => {
-    // ...same setup, but close click with { shiftKey: true }...
+    // ...same setup + shift-click as the test at :632...
     const sentTypes = sendMock.mock.calls
       .map(([msg]) => (msg as { type?: string })?.type)
     expect(sentTypes).toContain('terminal.kill')
     expect(sentTypes).not.toContain('terminal.detach')
-    expect(sendMock).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-1' })
+    expect(sendMock).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-456' })
   })
 ```
 
@@ -906,7 +911,8 @@ In `test/unit/client/components/TabBar.test.tsx`, inside the `describe('tab inte
 Run: `npm run test:vitest -- run test/unit/client/components/TabBar.test.tsx --config config/vitest/vitest.config.ts`
 Expected: FAIL —
 - exactly-once test: TWO detach messages (component + middleware);
-- shift test: a `terminal.detach` appears (middleware fires because the raw kill send sets no release mark).
+- shift test: a `terminal.detach` appears (middleware fires because the raw kill send sets no release mark);
+- plus the two split-layout exact-count tests (:698, :737) still RED from Step 1 — they stay RED until Step 4.
 
 - [ ] **Step 4: Fix the component**
 
@@ -935,7 +941,7 @@ If `ws` (from `const ws = useMemo(() => getWsClient(), [])` at :182) is now unus
 - [ ] **Step 5: Run TabBar + e2e suites to verify green**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TabBar.test.tsx test/e2e/tab-focus-behavior.test.tsx --config config/vitest/vitest.config.ts`
-Expected: PASS — the pre-existing detach assertions (:593 single-terminal, :671 split-layout multi-terminal, e2e :330-334 ordered multi-terminal) now pass via the middleware, proving plain-close semantics are unchanged.
+Expected: PASS — the pre-existing detach assertions (:593 single-terminal, :671 split-layout multi-terminal, e2e :330-334 ordered multi-terminal), including the three exact-count tests that were RED from Step 1, now pass via the middleware alone, proving plain-close semantics are unchanged.
 
 - [ ] **Step 6: Commit**
 
@@ -1086,12 +1092,14 @@ Site D — close pane (~:1223-1229):
         },
 ```
 
-- [ ] **Step 1: Add the middleware to the test store**
+- [ ] **Step 1: Add the middleware to the target test store helper**
 
-In `test/unit/client/components/ContextMenuProvider.test.tsx`, extend the existing `configureStore` `middleware:` option (it currently only tunes `getDefaultMiddleware`) with `.concat(terminalDetachMiddleware)` and add the import, exactly as in Task 7 Step 1.
+`test/unit/client/components/ContextMenuProvider.test.tsx` has SIX store-creation helpers (`createTestStore` :93, `createStoreWithSession` :173, `createStoreWithSidebarWindowAgentSession` :247, `createStoreWithOverlappingSessionWindows` :365, `createStoreWithBrowserPane` :492, `createStoreWithTerminalPane` :556). Add the import and extend the `configureStore` `middleware:` option with `.concat(terminalDetachMiddleware)` (exactly as in Task 7 Step 1) in ONE helper only: `createStoreWithTerminalPane` (:556) — the helper backing the :2286 test that Step 2 extends.
+
+Do NOT add it to `createTestStore` or file-wide: the test `'does not kill or overwrite a pane that changes while reopen metadata is pending'` (:1275, built on `createTestStore`) dispatches `updatePaneContent` replacing a terminal pane with a browser pane and then asserts `expect(wsMocks.send).not.toHaveBeenCalled()` (:1343); the middleware would emit a `terminal.detach` for the replaced terminal and break that strict-zero assertion. (If Step 5's full-file run surfaces another test that relied on a component send removed in Step 4, extend that test's specific helper the same way rather than reverting the component change.)
 
 Run: `npm run test:vitest -- run test/unit/client/components/ContextMenuProvider.test.tsx --config config/vitest/vitest.config.ts`
-Expected: PASS.
+Expected: PASS — the :2286 test's `toHaveBeenCalledWith` detach assertion is count-insensitive, so the middleware's added (temporarily duplicate) send does not break it.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -1224,22 +1232,13 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 **Interfaces:**
 - Consumes: `terminalDetachMiddleware` (Task 4).
-- Produces: previously-tautological detach assertions (the test hand-rolled `wsMocks.send({ type: 'terminal.detach', ... })` itself at :107, :197, :276) become genuine proof that the store emits the detach.
+- Produces: the hand-rolled `wsMocks.send({ type: 'terminal.detach', ... })` calls (:107, :197, :276) are deleted; test 1's existing detach assertion (:112) plus NEW detach assertions added to tests 2 and 3 (which today assert only `tabs.tabs[0].terminalId`) become genuine proof that the store emits the detach.
 
 - [ ] **Step 1: Convert the tests (RED first)**
 
-In `test/e2e/replace-pane.test.tsx`:
+In `test/e2e/replace-pane.test.tsx` (three tests, at :88, :176, :238 — only the FIRST currently asserts on sends, at :112; the other two assert only `tabs.tabs[0].terminalId`, at :206 and :285):
 
-1. Add the middleware to `createStore` (the `configureStore` at ~:28 has no `middleware:` key):
-
-```ts
-import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
-```
-```ts
-    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
-```
-
-2. In each of the three tests (at :88, :176, :238), DELETE the hand-rolled send block, e.g. at ~:103-108:
+1. In each of the three tests, DELETE ONLY the hand-rolled `wsMocks.send({ type: 'terminal.detach', terminalId: ... })` call (:107, :197, :276). KEEP the rest of each simulate block — in the :176 and :238 tests the same `if`-block also dispatches `updateTab({ ... terminalId: undefined })` (:200, :279); nothing in the middleware replaces those (`terminalDetachMiddleware` never touches `tabs` state), so deleting them would permanently break the `tabs.tabs[0].terminalId` assertions. In the :88 test the `if`-block wraps only the send, so the whole `if` can go:
 
 ```ts
     // Simulate what ContextMenuProvider does: detach terminal, then dispatch replacePane
@@ -1257,16 +1256,32 @@ becomes:
     expect(paneContent?.kind).toBe('terminal')
 ```
 
-(keep the `replacePane` / `closePane` dispatch and the existing `expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })` assertions — they are now satisfied only if the middleware really emits).
+In the :176 and :238 tests, remove only the `wsMocks.send(...)` line inside the block and keep the surrounding `if` with its `updateTab` dispatch.
 
-To honor RED: make the deletions FIRST without adding the middleware, run the file, and confirm the three assertions fail; then add the middleware concat and re-run.
+2. ADD a detach assertion to the :176 and :238 tests (they have none today), mirroring the existing one at :112 and using each test's own preloaded terminal id from its layout fixture:
+
+```ts
+    // replace TERMINAL_ID with the terminalId string from this test's preloaded layout
+    expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: TERMINAL_ID })
+```
+
+3. Keep the `replacePane` / `closePane` dispatches and the existing assertion at :112 (`toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })`) — after this step, all three detach assertions can only be satisfied by the middleware.
+
+4. To honor RED: run the file now, BEFORE adding the middleware, and confirm all three detach assertions fail (nothing emits the detach any more). Then add the middleware to `createStore` (the `configureStore` at ~:28 has no `middleware:` key) and re-run:
+
+```ts
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
+```
+```ts
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
+```
 
 Caveat for the test at :238 ("closing pane with matching terminal"): if it dispatches `closePane` on a single-leaf layout, the reducer is a no-op and the middleware will not fire — in that case restructure that one test's preloaded layout to a two-pane split (mirror the split-layout literal already used elsewhere in the same file) so the close actually removes the pane.
 
 - [ ] **Step 2: Run RED then GREEN**
 
 Run: `npm run test:vitest -- run test/e2e/replace-pane.test.tsx --config config/vitest/vitest.config.ts`
-Expected: FAIL after deletions (3 tests), PASS after the middleware concat.
+Expected: FAIL before the middleware concat (three detach assertions: :112 plus the two added in item 2), PASS after the middleware concat.
 
 - [ ] **Step 3: Commit**
 
