@@ -41,6 +41,24 @@ export function collectTerminalIds(node: PaneNode): string[] {
   ]
 }
 
+/**
+ * Union of every terminalId referenced by any pane in any tab layout.
+ * This is the client's complete "terminals I currently reference" set —
+ * the primitive the detach middleware diffs to spot dropped references.
+ */
+export function collectAllTerminalIds(
+  layouts: Record<string, PaneNode | undefined>
+): Set<string> {
+  const ids = new Set<string>()
+  for (const layout of Object.values(layouts)) {
+    if (!layout) continue
+    for (const terminalId of collectTerminalIds(layout)) {
+      ids.add(terminalId)
+    }
+  }
+  return ids
+}
+
 export function collectPaneContents(node: PaneNode): PaneContent[] {
   if (node.type === 'leaf') {
     return [node.content]
