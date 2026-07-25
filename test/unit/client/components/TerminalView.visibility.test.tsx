@@ -7,7 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import type { TerminalPaneContent } from '@/store/paneTypes'
+import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -85,7 +85,7 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 // Must import after mocks
 import TerminalView from '@/components/TerminalView'
 
-function createStore() {
+function createStore(layouts: Record<string, PaneNode> = {}) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -106,7 +106,7 @@ function createStore() {
         activeTabId: 'tab-1',
       },
       panes: {
-        layouts: {},
+        layouts,
         activePane: {},
         paneTitles: {},
       },
@@ -190,8 +190,13 @@ describe('TerminalView visibility CSS classes', () => {
     const cancelRafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
 
     try {
-      const store = createStore()
       const content = { ...createTerminalContent(), terminalId: 'term-1' }
+      // The attach gate (layout-membership check) requires the terminal id to be
+      // referenced by the layouts, matching the production invariant that a
+      // rendered pane's terminal always appears in the layout tree.
+      const store = createStore({
+        'tab-1': { type: 'leaf', id: 'pane-1', content },
+      })
       const { rerender } = render(
         <Provider store={store}>
           <TerminalView tabId="tab-1" paneId="pane-1" paneContent={content} hidden={true} />
