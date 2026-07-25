@@ -16,6 +16,7 @@ import {
 } from '@/store/panesSlice'
 import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { api, setSessionMetadata } from '@/lib/api'
 import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
@@ -295,24 +296,12 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const replacePaneAction = useCallback((tabId: string, paneId: string) => {
-    if (!panes[tabId]) return
-    const content = findPaneContent(panes[tabId], paneId)
-    if (content?.kind === 'terminal' && content.terminalId) {
-      ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
-    }
     dispatch(replacePane({ tabId, paneId }))
-  }, [dispatch, panes, ws])
+  }, [dispatch])
 
   const closeTabById = useCallback((tabId: string) => {
-    const layout = panes[tabId]
-    if (layout) {
-      const terminalIds = collectTerminalIds(layout)
-      for (const terminalId of terminalIds) {
-        ws.send({ type: 'terminal.detach', terminalId })
-      }
-    }
     dispatch(closeTab(tabId))
-  }, [dispatch, panes, ws])
+  }, [dispatch])
 
   const reopenClosedTabAction = useCallback(() => {
     dispatch(reopenClosedTab())
@@ -927,7 +916,7 @@ export function ContextMenuProvider({
     )
 
     if (latest.content.kind === 'terminal' && latest.content.terminalId) {
-      ws.send({ type: 'terminal.kill', terminalId: latest.content.terminalId })
+      sendTerminalKill(latest.content.terminalId)
     } else if (latest.content.kind === 'fresh-agent' && latest.content.sessionId) {
       const cwd = getFreshOpenCodeRouteCwd(
         latest.content,
@@ -1221,10 +1210,6 @@ export function ContextMenuProvider({
         resetSplit: (tabId, splitId) => dispatch(resetSplit({ tabId, splitId })),
         swapSplit: (tabId, splitId) => dispatch(swapSplit({ tabId, splitId })),
         closePane: (tabId, paneId) => {
-          const content = panes[tabId] ? findPaneContent(panes[tabId], paneId) : null
-          if (content?.kind === 'terminal' && content.terminalId) {
-            ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
-          }
           dispatch(closePaneWithCleanup({ tabId, paneId }))
         },
         getTerminalActions: getTerminalActions,

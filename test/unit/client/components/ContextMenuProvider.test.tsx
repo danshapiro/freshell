@@ -12,6 +12,7 @@ import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -564,7 +565,7 @@ function createStoreWithTerminalPane() {
       extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({ serializableCheck: false }),
+      getDefaultMiddleware({ serializableCheck: false }).concat(terminalDetachMiddleware),
     preloadedState: {
       tabs: {
         tabs: [
@@ -2321,6 +2322,38 @@ describe('ContextMenuProvider', () => {
 
       // Verify pane content no longer has the old terminal
       // (tab.terminalId was removed; terminal ownership is in pane content only)
+    })
+
+    it('sends exactly one terminal.detach when replacing a pane via context menu', async () => {
+      const user = userEvent.setup()
+      wsMocks.send.mockClear()
+
+      const store = createStoreWithTerminalPane()
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+              Terminal Content
+            </div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Terminal Content'), keys: '[MouseRight]' })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
+
+      const detachMessages = wsMocks.send.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toHaveLength(1)
     })
 
   })
