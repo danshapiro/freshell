@@ -223,7 +223,7 @@ case "$CMD" in
         ($snap.records // [])[] | select(.status == "open") as $rec
         | ($rec.panes // [])[]
         | {device: $dev, tabKey: $rec.tabKey, tabName: $rec.tabName, paneId: .paneId,
-           kind: .kind, sessionRef: .payload.sessionRef,
+           kind: .kind, mode: .payload.mode, sessionRef: .payload.sessionRef,
            liveTerminalId: .payload.liveTerminal.terminalId};
       ($b[0].terminals | map(select(.status=="running") | .terminalId)) as $liveBefore
       | ($a[0].terminals | map(select(.status=="running") | .terminalId)) as $liveNow
@@ -237,6 +237,17 @@ case "$CMD" in
           | ($after | map(select(.tabKey == $bp.tabKey and .paneId == $bp.paneId)) | first) as $ap
           | if $ap == null then
               {verdict: "MISSING", pane: $bp}
+            # A LIVE coding-CLI pane with NO captured sessionRef is
+            # unverifiable BY CONSTRUCTION: restore can only ever produce a
+            # blank session for it, and "same identity" cannot be checked
+            # against an identity that was never captured. Silently passing
+            # these panes is how the 2026-07-25 blank-restore incident hid
+            # behind an "OK" verdict. Shell panes are stateless by design and
+            # are exempt; the session-capable mode list mirrors
+            # crates/freshell-ws/src/existence.rs.
+            elif ($bp.sessionRef == null
+                  and ((["claude", "codex", "opencode", "amplifier"] | index($bp.mode)) != null)) then
+              {verdict: "NO CAPTURED IDENTITY", pane: $bp}
             elif ($bp.sessionRef != null and $ap.sessionRef == null) then
               {verdict: "FRESH (identity lost)", pane: $bp}
             elif ($bp.sessionRef != null and $ap.sessionRef != null
@@ -264,22 +275,35 @@ case "$CMD" in
     # every still-healthy pane). Everything is read from the BEFORE file +
     # $DIFF, so verify performs ZERO network operations in --after/offline
     # mode (:2619).
-    echo "REMEDIATION (rebuild each diverged device's MISSING panes from its captured immutable bundle):"
-    while IFS= read -r -d '' dev; do
-      comps=$(jq -r --arg d "$dev" '(.bundles[$d].components // []) | join(",")' "$BEFORE")
-      if [[ -z "$comps" ]]; then
-        printf 'ERROR: no captured bundle for device %q in the before-file; cannot recommend a union-consistent restore.\n' "$dev" >&2
-        continue
-      fi
-      pane_args=""
-      while IFS= read -r -d '' pk; do
-        pane_args+=$(printf ' --pane %q' "$pk")
-      done < <(jq -j --arg d "$dev" \
-        '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
-        <<<"$DIFF")
-      printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s --force%s\n' \
-        "$URL" "$dev" "$comps" "$pane_args"
-    done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$DIFF")
+    # NO CAPTURED IDENTITY panes are NOT snapshot-remediable: no generation
+    # carries a sessionRef for them, so restore-tabs.sh could only rebuild a
+    # blank session (a duplicate of the loss). They get a manual-recovery
+    # note instead of a --pane entry.
+    UNVERIFIABLE=$(jq '[.[] | select(.verdict == "NO CAPTURED IDENTITY")]' <<<"$DIFF")
+    REMEDIABLE=$(jq '[.[] | select(.verdict != "NO CAPTURED IDENTITY")]' <<<"$DIFF")
+    if [[ "$(jq 'length' <<<"$UNVERIFIABLE")" != "0" ]]; then
+      echo "UNRECOVERABLE FROM SNAPSHOTS: identity was never captured for these live CLI panes, so restore-tabs.sh cannot rebuild them."
+      echo "Recover manually from the provider's own session store (e.g. 'amplifier resume', 'codex resume', 'claude --resume'), matching by cwd and last activity."
+      jq -r '.[] | "  NO-IDENTITY device=\(.pane.device)\ttab=\(.pane.tabName) (\(.pane.tabKey))\tpane=\(.pane.paneId)\tmode=\(.pane.mode // "-")"' <<<"$UNVERIFIABLE"
+    fi
+    if [[ "$(jq 'length' <<<"$REMEDIABLE")" != "0" ]]; then
+      echo "REMEDIATION (rebuild each diverged device's MISSING panes from its captured immutable bundle):"
+      while IFS= read -r -d '' dev; do
+        comps=$(jq -r --arg d "$dev" '(.bundles[$d].components // []) | join(",")' "$BEFORE")
+        if [[ -z "$comps" ]]; then
+          printf 'ERROR: no captured bundle for device %q in the before-file; cannot recommend a union-consistent restore.\n' "$dev" >&2
+          continue
+        fi
+        pane_args=""
+        while IFS= read -r -d '' pk; do
+          pane_args+=$(printf ' --pane %q' "$pk")
+        done < <(jq -j --arg d "$dev" \
+          '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
+          <<<"$REMEDIABLE")
+        printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s --force%s\n' \
+          "$URL" "$dev" "$comps" "$pane_args"
+      done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$REMEDIABLE")
+    fi
     cleanup; exit 1
     ;;
   *)

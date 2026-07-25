@@ -281,7 +281,7 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
   })
 
   // (2) DETERMINISTIC OFFLINE diff-engine coverage: drive `verify --before F
-  // --after F` over synthetic fixtures so ALL FOUR verdicts, the full-set-difference
+  // --after F` over synthetic fixtures so ALL FIVE verdicts, the full-set-difference
   // coverage guard, and the multi-client bundle remediation are exercised (the live
   // path can only produce MISSING). With --after supplied verify does ZERO network
   // ops (:2619) -- proven by prepending a fake `curl` that ABORTS if invoked.
@@ -316,13 +316,20 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       rec('dev-1:codexRepoint', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-old' } })]),
       rec('dev-1:codexFresh', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-fresh' } })]),
       rec('dev-1:sh', [pane('terminal', { mode: 'shell', liveTerminal: { terminalId: 'T-live' } })]),
-    ], [term('T-live', 'running'), term('T-exited', 'exited')],
+      // Live coding-CLI pane whose session identity was NEVER captured (no
+      // sessionRef in any snapshot -- the amplifier-locator gap). Restore can
+      // only ever produce a blank session for it, so verify must FAIL LOUDLY
+      // even though the pane respawns a running terminal.
+      rec('dev-1:cliNoId', [pane('terminal', { mode: 'amplifier', liveTerminal: { terminalId: 'T-cli' } })]),
+    ], [term('T-live', 'running'), term('T-exited', 'exited'), term('T-cli', 'running')],
     { 'dev-1': { components: ['aaaa1111', 'bbbb2222'], capturedAt: 1000 } })) // TWO-client bundle
     const after = await write('after.json', doc(2000, [
       rec('dev-1:codexRepoint', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-new' } })]),
       rec('dev-1:codexFresh', [pane('terminal', { mode: 'codex' })]),
       rec('dev-1:sh', [pane('terminal', { mode: 'shell', liveTerminal: { terminalId: 'T-gone' } })]),
-    ], []))
+      // ...respawned and running, yet unverifiable: still no identity.
+      rec('dev-1:cliNoId', [pane('terminal', { mode: 'amplifier', liveTerminal: { terminalId: 'T-cli2' } })]),
+    ], [term('T-cli2', 'running')]))
     const d = await runOffline(['verify', '--url', 'http://unused.invalid', '--token', 't', '--before', before, '--after', after])
     expect(d.code).not.toBe(0)
     expect(d.code).not.toBe(99)                       // curl was NEVER called (:2619)
@@ -331,6 +338,18 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     expect(d.out).toContain('RE-POINTED')
     expect(d.out).toContain('FRESH (identity lost)')
     expect(d.out).toContain('NOT RESPAWNED')
+    // The fifth verdict: a live coding-CLI pane whose identity was never
+    // captured is UNVERIFIABLE -- verify must name it, not silently pass it
+    // (the 2026-07-25 blank-restore incident). Exactly ONE pane qualifies:
+    // the shell pane is stateless by design and must NOT be flagged.
+    expect(d.out).toContain('NO CAPTURED IDENTITY')
+    expect(d.out).toContain('dev-1:cliNoId')
+    expect((d.out.match(/NO CAPTURED IDENTITY/g) ?? []).length).toBe(1)
+    // Snapshots carry no identity for it, so restore-tabs.sh CANNOT rebuild
+    // it -- it must be excluded from the --pane remediation and called out
+    // for manual provider-store recovery instead.
+    expect(d.out).not.toContain('--pane dev-1:cliNoId#p-terminal')
+    expect(d.out).toMatch(/identity was never captured/i)
     // Remediation uses the immutable MULTI-CLIENT bundle (BOTH component ids), not
     // a single-client --generation-id (:2621).
     expect(d.out).toMatch(/--components aaaa1111,bbbb2222/)
