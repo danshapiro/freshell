@@ -26,6 +26,7 @@ import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 import { browserPreferencesPersistenceMiddleware } from './browserPreferencesPersistence'
 import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
+import { terminalDetachMiddleware } from './terminalDetachMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
 import { tabFallbackIdentityMiddleware } from './tabFallbackIdentityMiddleware'
 import {
@@ -73,6 +74,7 @@ export const store = configureStore({
       serverSettingsSaveStateMiddleware,
       browserPreferencesPersistenceMiddleware,
       layoutMirrorMiddleware,
+      terminalDetachMiddleware,
       sessionActivityPersistMiddleware,
     ),
 })
