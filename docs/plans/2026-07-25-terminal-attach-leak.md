@@ -603,7 +603,20 @@ describe('terminalDetachMiddleware', () => {
 
   it('detaches the stale terminal on codex identity repair', () => {
     const store = createStore()
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('term-stale') }))
+    // The preloaded content MUST carry a sessionRef equal to the action's
+    // expectedSessionRef: repairCodexIdentityMismatch (panesSlice.ts:1778)
+    // guards on sessionRefsEqual(node.content.sessionRef, expectedSessionRef)
+    // and no-ops otherwise, so a bare terminalContent() would never trigger
+    // the repair (and therefore never drop the reference).
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        ...terminalContent('term-stale'),
+        mode: 'codex' as const,
+        sessionRef: { provider: 'codex' as const, sessionId: 'session-1' },
+      },
+    }))
     mockSend.mockClear()
     store.dispatch(repairCodexIdentityMismatch({
       tabId: 'tab-1',
@@ -1269,14 +1282,14 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 ### Task 11: gate `attachTerminal` on layout membership (close-during-create fix)
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx` (`attachTerminal()`, line ~2564)
+- Modify: `src/components/TerminalView.tsx` (`attachTerminal()`, declared at ~:2430; its `ws.send` is at ~:2564)
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 **Interfaces:**
 - Consumes: `collectAllTerminalIds` from `@/lib/pane-utils` (Task 1); the current Redux state read imperatively inside the component (use react-redux's `useStore()` — `const store = useStore()` — unless TerminalView already has an imperative state-access pattern; match the file's existing pattern if one exists).
 - Produces: `attachTerminal` becomes a silent no-op for any terminalId not currently referenced by `state.panes.layouts`.
 
-**Why (validated in the load-bearing stage, validator-G4):** the server does not auto-attach on create; the client's `terminal.created` handler writes the id into layouts (`updateContent`, :3799) and then attaches (:3842). If the pane's layout removal is dispatched after the create was sent but before `terminal.created` is processed, `updateContent` no-ops yet the attach still fires — a subscription for an id the layouts never contained, invisible to the middleware diff, leaked until the socket closes. Gating at `attachTerminal` (the single attach choke point, :2564) closes that race AND the sub-millisecond quarantine-repair re-attach race (:797-819). Every legitimate attach passes the gate: the created handler dispatches `updateContent` synchronously before attaching, and mount/refresh/hydration attaches use ids the layouts already reference.
+**Why (validated in the load-bearing stage, validator-G4):** the server does not auto-attach on create; the client's `terminal.created` handler writes the id into layouts (`updateContent`, :3799) and then attaches (:3842). If the pane's layout removal is dispatched after the create was sent but before `terminal.created` is processed, `updateContent` no-ops yet the attach still fires — a subscription for an id the layouts never contained, invisible to the middleware diff, leaked until the socket closes. Gating at `attachTerminal` (the single attach choke point, declared at :2430) closes that race AND the sub-millisecond quarantine-repair re-attach race (:797-819). Every legitimate attach passes the gate: the created handler dispatches `updateContent` synchronously before attaching, and mount/refresh/hydration attaches use ids the layouts already reference.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1298,14 +1311,14 @@ Expected: the new test FAILS — attach is currently sent unconditionally.
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `src/components/TerminalView.tsx`, add the imports (`collectAllTerminalIds` from `@/lib/pane-utils`; `useStore` from react-redux if no imperative state access exists yet) and, at the top of `attachTerminal()` (:2564) before any send:
+In `src/components/TerminalView.tsx`, add the import of `collectAllTerminalIds` from `@/lib/pane-utils` (no new store import is needed: the component already holds `const appStore = useAppStore()` at :517, used imperatively elsewhere, e.g. :3733) and, at the top of `attachTerminal()` (declared at :2430 — its terminal-id parameter is named `tid`; the `ws.send` it guards is at :2564) before any send:
 
 ```ts
     // Never attach a terminal the layouts no longer reference: the layout-diff
     // middleware can only release subscriptions it saw acquired. Covers the
     // close-during-create race and stale deferred re-attach timers.
-    const layouts = store.getState().panes.layouts
-    if (!collectAllTerminalIds(layouts).has(terminalId)) {
+    const layouts = appStore.getState().panes.layouts
+    if (!collectAllTerminalIds(layouts).has(tid)) {
       return
     }
 ```
