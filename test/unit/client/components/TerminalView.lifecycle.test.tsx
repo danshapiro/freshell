@@ -3,7 +3,7 @@ import { act, render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
-import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
+import panesReducer, { removeLayout, requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -3883,6 +3883,37 @@ describe('TerminalView lifecycle updates', () => {
         rows: expect.any(Number),
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('does not attach when the pane was removed before terminal.created arrives', async () => {
+      const { requestId, store, tabId } = await renderTerminalHarness({
+        status: 'creating',
+        hidden: false,
+        clearSends: false,
+        requestId: 'req-v2-close-race',
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId,
+      }))
+
+      // Pane closed after the create was sent but before terminal.created arrives:
+      // the tab's layout is removed, so the layouts never reference the new id.
+      act(() => {
+        store.dispatch(removeLayout({ tabId }))
+      })
+
+      wsMocks.send.mockClear()
+      const newId = 'term-close-race-1'
+      act(() => {
+        messageHandler!({ type: 'terminal.created', requestId, terminalId: newId, createdAt: Date.now() })
+      })
+
+      const attachMessages = wsMocks.send.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .filter((msg) => msg?.type === 'terminal.attach' && msg.terminalId === newId)
+      expect(attachMessages).toHaveLength(0)
     })
 
     it('terminal.created always triggers explicit attach with viewport', async () => {
