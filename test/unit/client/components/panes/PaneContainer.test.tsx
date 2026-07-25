@@ -20,6 +20,7 @@ import type { FreshAgentSessionState, FreshAgentState } from '@/store/freshAgent
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -323,7 +324,7 @@ function createStore(
         serializableCheck: {
           ignoredPaths: ['sessions.expandedProjects'],
         },
-      }),
+      }).concat(terminalDetachMiddleware),
     preloadedState: {
       panes: {
         layouts: {},
@@ -461,6 +462,50 @@ describe('PaneContainer', () => {
         type: 'terminal.detach',
         terminalId: terminalId,
       })
+    })
+
+    it('sends exactly one terminal.detach when closing a pane with terminalId', () => {
+      const pane1Id = 'pane-1'
+      const pane2Id = 'pane-2'
+      const terminalId = 'term-123'
+
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: pane1Id,
+            content: createTerminalContent({ terminalId }),
+          },
+          {
+            type: 'leaf',
+            id: pane2Id,
+            content: createTerminalContent({ terminalId: 'term-456' }),
+          },
+        ],
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': pane1Id },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      // Click the close button on the first pane
+      const closeButtons = screen.getAllByTitle('Close pane')
+      fireEvent.click(closeButtons[0])
+
+      const detachMessages = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toHaveLength(1)
     })
 
     it('does not send terminal.detach when closing a pane without terminalId', () => {

@@ -335,13 +335,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   }, [])
 
   const handleClose = useCallback((paneId: string, content: PaneContent) => {
-    // Clean up terminal process if this pane has one
-    if (content.kind === 'terminal' && content.terminalId) {
-      ws.send({
-        type: 'terminal.detach',
-        terminalId: content.terminalId,
-      })
-    }
+    // Terminal detach is handled by terminalDetachMiddleware, which reconciles
+    // dropped terminal references on the resulting layout change.
     if (content.kind === 'fresh-agent') {
       clearDraft(paneId)
       const pendingCreate = freshAgentPendingCreates[content.createRequestId]
