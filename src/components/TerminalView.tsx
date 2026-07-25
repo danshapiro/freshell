@@ -29,6 +29,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -2907,7 +2908,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
       writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      ws.send({ type: 'terminal.kill', terminalId })
+      sendTerminalKill(terminalId)
       return true
     }
 

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect } from 'react'
 import { nanoid } from 'nanoid'
-import { getWsClient } from '@/lib/ws-client'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -22,7 +22,6 @@ function formatAge(ms: number): string {
 
 export default function BackgroundSessions() {
   const dispatch = useAppDispatch()
-  const ws = useMemo(() => getWsClient(), [])
   const terminals = useAppSelector((state) => (
     (state as any).terminalDirectory?.windows?.background?.items ?? EMPTY_TERMINALS
   )) as BackgroundTerminal[]
@@ -117,7 +116,7 @@ export default function BackgroundSessions() {
                   <Button
                     size="sm"
                     variant="destructive"
-                    onClick={() => ws.send({ type: 'terminal.kill', terminalId: t.terminalId })}
+                    onClick={() => sendTerminalKill(t.terminalId)}
                   >
                     Kill
                   </Button>
