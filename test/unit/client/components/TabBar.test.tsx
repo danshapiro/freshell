@@ -9,6 +9,7 @@ import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/ope
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import {
@@ -149,6 +150,7 @@ function createStore(
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
     },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
     preloadedState: {
       tabs: {
         tabs: [],
@@ -666,6 +668,85 @@ describe('TabBar', () => {
         type: 'terminal.kill',
         terminalId: 'term-456',
       })
+    })
+
+    it('plain close sends exactly one terminal.detach per terminal', () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'shell',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-123',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton)
+
+      const detachMessages = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-123' }])
+    })
+
+    it('shift close sends terminal.kill and no terminal.detach', () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'shell',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-456',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      const sentTypes = mockSend.mock.calls
+        .map(([msg]) => (msg as { type?: string })?.type)
+      expect(sentTypes).toContain('terminal.kill')
+      expect(sentTypes).not.toContain('terminal.detach')
+      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-456' })
     })
 
     it('close button detaches every terminal in split pane layout', () => {

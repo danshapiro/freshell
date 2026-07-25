@@ -10,6 +10,7 @@ import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import TabBar from '@/components/TabBar'
 import TerminalView from '@/components/TerminalView'
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
 const wsMocks = vi.hoisted(() => ({
@@ -83,6 +84,7 @@ function createStore(activeTabId: string = 'tab-1') {
       connection: connectionReducer,
       turnCompletion: turnCompletionReducer,
     },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
     preloadedState: {
       tabs: {
         tabs: [
@@ -243,6 +245,7 @@ describe('tab focus behavior (e2e)', () => {
         connection: connectionReducer,
         turnCompletion: turnCompletionReducer,
       },
+      middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
       preloadedState: {
         tabs: {
           tabs: [

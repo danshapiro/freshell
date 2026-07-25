@@ -3,8 +3,8 @@ import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -179,8 +179,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
-  const ws = useMemo(() => getWsClient(), [])
-
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
@@ -310,14 +308,10 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           }
         }}
         onClose={(e) => {
-          const terminalIds = getTerminalIdsForTab(tab)
-          if (terminalIds.length > 0) {
-            const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
+          if (e.shiftKey) {
+            const terminalIds = getTerminalIdsForTab(tab)
             for (const terminalId of terminalIds) {
-              ws.send({
-                type: messageType,
-                terminalId,
-              })
+              sendTerminalKill(terminalId)
             }
           }
           dispatch(closeTab(tab.id))
@@ -350,7 +344,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     renameValue,
     renamingId,
     tabAttentionStyle,
-    ws,
   ])
 
   useEffect(() => {
