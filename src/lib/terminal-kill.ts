@@ -6,7 +6,8 @@ import { markTerminalReleased } from './terminal-release-marks'
  * detach middleware does not follow up with a redundant terminal.detach
  * when the pane reference disappears from the layouts.
  *
- * Every terminal.kill send in the client goes through here.
+ * Every production terminal.kill send in the client goes through here.
+ * (Test harness escape hatch sendWsMessage in App.tsx can bypass it.)
  */
 export function sendTerminalKill(terminalId: string): void {
   markTerminalReleased(terminalId)

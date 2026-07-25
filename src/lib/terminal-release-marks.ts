@@ -7,6 +7,9 @@
  *
  * Terminal ids are server-generated and never reused, so a stale mark can
  * only ever suppress a detach for a terminal that no longer needs one.
+ * Marks for terminals never referenced by any layout (e.g. background session
+ * kills) are intentionally left unconsumed — benign because terminal ids are
+ * never reused.
  */
 const releasedTerminalIds = new Set<string>()
 

@@ -189,7 +189,7 @@ describe('replace pane (e2e)', () => {
       // Verify tab.terminalId is set
       expect(store.getState().tabs.tabs[0].terminalId).toBe('term-1')
 
-      // Simulate what replacePaneAction does: detach + clear stale tab.terminalId + dispatch
+      // Simulate what replacePaneAction does: clear stale tab.terminalId + dispatch (terminalDetachMiddleware emits detach)
       const content = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
       if (content?.kind === 'terminal' && content.terminalId) {
         const tab = store.getState().tabs.tabs.find((t) => t.id === 'tab-1')
@@ -270,7 +270,7 @@ describe('replace pane (e2e)', () => {
       }
       const store = createStore(layout, { tabTerminalId: 'term-1' })
 
-      // Simulate PaneContainer.handleClose: detach + clear stale + dispatch closePane
+      // Simulate PaneContainer.handleClose: clear stale + dispatch closePane (terminalDetachMiddleware emits detach)
       const content = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
       if (content?.kind === 'terminal' && content.terminalId) {
         const tab = store.getState().tabs.tabs.find((t) => t.id === 'tab-1')
