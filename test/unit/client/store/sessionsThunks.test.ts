@@ -447,18 +447,35 @@ describe('sessionsThunks', () => {
       },
     })
 
-    await expect(store.dispatch(fetchSessionWindow({
+    const result = await store.dispatch(fetchSessionWindow({
       surface: 'sidebar',
       priority: 'visible',
       query: 'beta',
       searchTier: 'fullText',
-    }) as any)).rejects.toThrow('Search failed')
+    }) as any)
+
+    expect(result).toEqual({ ok: false, unauthorized: false })
 
     expect((store.getState().sessions.windows.sidebar as any).query).toBe('beta')
     expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('fullText')
     expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('alpha')
     expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
     expect((store.getState().sessions.windows.sidebar as any).error).toBe('Search failed')
+  })
+
+  it('resolves an unauthorized result without rejecting when the snapshot fetch returns 401', async () => {
+    fetchSidebarSessionsSnapshot.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }))
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    const result = await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(result).toEqual({ ok: false, unauthorized: true })
+    expect((store.getState().sessions.windows.sidebar as any).error).toBe('Unauthorized')
   })
 
   it('preserves the previous applied search context when a replacement request is aborted before new data lands', async () => {

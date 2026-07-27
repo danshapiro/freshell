@@ -1,5 +1,6 @@
 import {
   fetchSidebarSessionsSnapshot,
+  isApiUnauthorizedError,
   searchSessions,
   type SearchOptions,
   type SearchResult,
@@ -26,6 +27,13 @@ type FetchSessionWindowArgs = {
   query?: string
   searchTier?: SearchOptions['tier']
   append?: boolean
+}
+
+export type FetchSessionWindowResult = {
+  /** True when the window load committed (or the fetch was aborted/superseded); false on a real API failure. */
+  ok: boolean
+  /** True only when the failure was an authentication (HTTP 401) error. */
+  unauthorized: boolean
 }
 
 const controllers = new Map<string, AbortController>()
@@ -454,7 +462,7 @@ async function refreshVisibleSessionWindowSilently(args: {
 }
 
 export function fetchSessionWindow(args: FetchSessionWindowArgs) {
-  return async (dispatch: AppDispatch, getState: () => RootState) => {
+  return async (dispatch: AppDispatch, getState: () => RootState): Promise<FetchSessionWindowResult> => {
     const { surface, query = '', searchTier = 'title', append = false } = args
     const trimmedQuery = query.trim()
     const state = getState()
@@ -483,8 +491,8 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const controller = new AbortController()
     controllers.set(surface, controller)
 
-    let requestPromise!: Promise<void>
-    requestPromise = (async () => {
+    let settled!: Promise<void>
+    settled = (async () => {
       dispatch(setSessionWindowLoading({
         surface,
         loading: true,
@@ -636,14 +644,25 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
         if (controllers.get(surface) === controller) {
           controllers.delete(surface)
         }
-        if (inFlightRequests.get(surface) === requestPromise) {
+        if (inFlightRequests.get(surface) === settled) {
           inFlightRequests.delete(surface)
         }
       }
     })()
 
-    inFlightRequests.set(surface, requestPromise)
-    return requestPromise
+    inFlightRequests.set(surface, settled)
+    // The returned promise never rejects: success/abort -> ok:true, real failure ->
+    // ok:false. `settled` (the void promise stored for in-flight coalescing) still
+    // rejects internally — queueActiveSessionWindowRefresh awaits it only inside
+    // try/catch — but the .then below attaches a rejection handler to it, so a
+    // fire-and-forget caller can never leak an unhandled rejection.
+    return settled.then(
+      (): FetchSessionWindowResult => ({ ok: true, unauthorized: false }),
+      (error: unknown): FetchSessionWindowResult => ({
+        ok: false,
+        unauthorized: isApiUnauthorizedError(error),
+      }),
+    )
   }
 }
 
@@ -773,12 +792,12 @@ export function queueActiveSessionWindowRefresh() {
 }
 
 export function loadInitialSessionsWindow() {
-  return async (dispatch: AppDispatch) => {
+  return async (dispatch: AppDispatch): Promise<FetchSessionWindowResult> => {
     dispatch(activateSessionSurface('sidebar'))
-    await dispatch(fetchSessionWindow({
+    return dispatch(fetchSessionWindow({
       surface: 'sidebar',
       priority: 'visible',
-    }) as any)
+    }) as any) as Promise<FetchSessionWindowResult>
   }
 }
 
