@@ -605,6 +605,35 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
+  it('tears down the session and surfaces an auth failure when the sidebar window load returns 401', async () => {
+    const store = createStore()
+    // Bootstrap auth succeeds (beforeEach default apiGet), but the follow-up sidebar
+    // snapshot is unauthorized -> ensureSidebarSessionsWindow must perform the auth
+    // teardown even though fetchSessionWindow no longer throws.
+    fetchSidebarSessionsSnapshot.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }))
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      // Proves the thunk path actually ran and recorded the failure...
+      expect(store.getState().sessions.windows.sidebar?.error).toBe('Unauthorized')
+      // ...and that the 401 drove the full auth teardown.
+      expect(store.getState().connection.lastError).toBe('Authentication failed')
+      expect(store.getState().connection.status).toBe('disconnected')
+    })
+
+    // Residue-proof discriminator: the teardown makes ensureSidebarSessionsWindow
+    // return false, so bootstrap exits before the pre-connect clears and never
+    // connects the websocket. (Without the teardown, bootstrap proceeds and
+    // connect IS called — so this assertion alone keeps the test RED even if
+    // transient 'Authentication failed' residue were ever observable.)
+    expect(wsMocks.connect).not.toHaveBeenCalled()
+  })
+
   it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
     const store = createStore()
     let platformCalls = 0

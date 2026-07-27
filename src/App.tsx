@@ -14,6 +14,7 @@ import {
   fetchSessionWindow,
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
+  type FetchSessionWindowResult,
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
@@ -506,8 +507,7 @@ export default function App() {
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
-      const handleBootstrapAuthFailure = (err: unknown): boolean => {
-        if (!isApiUnauthorizedError(err)) return false
+      const performAuthFailureTeardown = () => {
         if (!cancelled) {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
@@ -520,6 +520,11 @@ export default function App() {
         // fetches (cleanup + stopTabRegistrySync are already assigned by now).
         cleanup?.()
         stopTabRegistrySync?.()
+      }
+
+      const handleBootstrapAuthFailure = (err: unknown): boolean => {
+        if (!isApiUnauthorizedError(err)) return false
+        performAuthFailureTeardown()
         return true
       }
 
@@ -779,18 +784,19 @@ export default function App() {
         sidebarWindowLoading = true
         try {
           const activeSurface = appStore.getState().sessions.activeSurface
-          if (activeSurface && activeSurface !== 'sidebar') {
-            await dispatch(fetchSessionWindow({
-              surface: 'sidebar',
-              priority: 'visible',
-            }) as any)
-          } else {
-            await dispatch(loadInitialSessionsWindow() as any)
+          const result = (activeSurface && activeSurface !== 'sidebar'
+            ? await dispatch(fetchSessionWindow({
+                surface: 'sidebar',
+                priority: 'visible',
+              }) as any)
+            : await dispatch(loadInitialSessionsWindow() as any)) as FetchSessionWindowResult | undefined
+          if (result?.unauthorized) {
+            performAuthFailureTeardown()
+            return false
           }
-          return true
-        } catch (err: unknown) {
-          if (handleBootstrapAuthFailure(err)) return false
-          log.warn('Failed to load initial sidebar session window', err)
+          if (!result?.ok) {
+            log.warn('Failed to load initial sidebar session window')
+          }
           return true
         } finally {
           sidebarWindowLoading = false
