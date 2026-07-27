@@ -2477,6 +2477,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     // close-during-create race and stale deferred re-attach timers.
     const layouts = appStore.getState().panes.layouts
     if (!collectAllTerminalIds(layouts).has(tid)) {
+      log.debug('attach gate declined: terminal not referenced by any layout', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+      })
       return
     }
     const term = termRef.current

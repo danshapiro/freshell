@@ -12,6 +12,15 @@ type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> 
  * reported dead or unrecoverable (terminal.inventory / terminals.changed).
  * There is no live subscription to release, and the server replies with an
  * error for terminal.detach on a non-existent terminal — so skip them.
+ *
+ * MAINTENANCE WARNING: this skip-list is maintained BY HAND. If you add a
+ * new reducer/action that removes terminalIds from layouts because the
+ * SERVER already reported those terminals dead, you MUST register it here —
+ * otherwise this middleware sends a redundant terminal.detach for each one
+ * and the server answers with an error (harmless but noisy). Conversely,
+ * never register an action that removes a LIVE terminal from the layouts:
+ * skipping it would leak the server-side subscription — the exact bug this
+ * middleware exists to prevent (see PR #534).
  */
 const skipDetachActionTypes = new Set<string>([
   clearDeadTerminals.type,
