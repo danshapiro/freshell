@@ -15,9 +15,10 @@
 
 - Work inside the worktree `/home/dan/code/freshell/.worktrees/fetchsessionwindow-non-throwing` on branch `fix/fetchsessionwindow-non-throwing`. Land as a normal standalone feature branch. Do NOT force-push anything, do NOT modify any existing PR, do NOT run `gh pr create` (needs explicit user approval per AGENTS.md).
 - Reference kata xxqj in every commit: put `(xxqj)` at the end of the commit subject line.
-- Line numbers below were verified on 2026-07-27 at HEAD `3f096412`. Treat them as hints — ALWAYS locate edit targets by the quoted code content, not by line number.
+- Line numbers below were verified on 2026-07-27 at HEAD `3f096412`, and every quoted snippet was re-verified matching at `9d716374`. Treat them as hints — ALWAYS locate edit targets by the quoted code content, not by line number.
 - Out of scope (deliberate — do NOT touch): `fetchTerminalDirectoryWindow` (`src/store/terminalDirectoryThunks.ts`) keeps throwing; its `.catch()` at the App `terminal.inventory` site and the terminal-invalidation handler's `onRefreshError` containment STAY. The internal `try { await activeRequest } catch {}` blocks inside `queueActiveSessionWindowRefresh` (sessionsThunks.ts ~704-712 and ~744-751) STAY — they await the stored *internal* promise, which still rejects by design.
 - Test commands: always `npm run test:vitest -- run ...` (coordinator passthrough). Never raw `npx vitest`. Broad runs (`npm run test:unit`) may wait on the coordinator gate; never kill a foreign gate holder.
+- `-t` gates: vitest exits 0 when a `-t` filter matches NO tests (all-skipped counts as pass — verified on this worktree's vitest 3.2.4). NEVER judge a `-t` run by exit code alone: a GREEN gate must show the named test(s) as passed in the output (e.g. `1 passed`), and a RED gate must show the named test actually ran and FAILED — `0 passed, N skipped` means the name filter matched nothing (typo/rename), not a verdict.
 - TDD RED→GREEN per task. Do not create any new markdown docs besides this plan.
 
 ---
@@ -265,6 +266,8 @@ Run: `npm run typecheck:client`
 Expected: no errors. (Note: every call site casts `as any`, so this catches only internal type errors — the contract is enforced by the tests, not the compiler.)
 Run: `npm run test:vitest -- run test/unit/client/store/sidebar-staleness.test.ts`
 Expected: all PASS (these `await` the thunks and ignore the return value).
+Run: `npm run test:vitest -- run test/unit/client/components/App.ws-bootstrap.test.tsx`
+Expected: all PASS. This guards the intermediate commit: the no-leak test (`contains a failing queued session-window refresh ...`, ~1944) depends on the failure still committing `windows.sidebar.error` and never committing window data — semantics this task preserves because the internal IIFE is unchanged; this run proves it before committing.
 
 - [ ] **Step 10: Commit**
 
@@ -299,7 +302,7 @@ Related-To: kata xxqj"
 
 In `test/unit/client/components/App.ws-bootstrap.test.tsx`, inside the `describe('App WS bootstrap recovery', ...)` block (currently starts line 265), add this test immediately after the closing `})` of the existing test `it('recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s', ...)` (currently ends at line 606, just before the `it('repairs missing bootstrap platform capabilities ...')` test).
 
-Context you need: this file's `vi.mock('@/lib/api', ...)` is a FULL replacement whose `isApiUnauthorizedError` is `(err) => !!err && typeof err === 'object' && err.status === 401`, so the rejection value MUST carry `status: 401`. The `beforeEach` defaults make `/api/bootstrap` succeed and `fetchSidebarSessionsSnapshot` resolve `[]`; App calls `ensureSidebarSessionsWindow` during initial bootstrap (pre-ready), so overriding the snapshot mock to reject 401 exercises the sidebar-load path directly — no `ready` message needed. `Sidebar` is mocked out, so assert against Redux state only. `createStore`, `render`, `Provider`, `App`, `waitFor` are all existing local helpers/imports.
+Context you need: this file's `vi.mock('@/lib/api', ...)` is a FULL replacement whose `isApiUnauthorizedError` is `(err) => !!err && typeof err === 'object' && err.status === 401`, so the rejection value MUST carry `status: 401`. The `beforeEach` defaults make `/api/bootstrap` succeed and `fetchSidebarSessionsSnapshot` resolve `[]`; App calls `ensureSidebarSessionsWindow` during initial bootstrap (pre-ready), so overriding the snapshot mock to reject 401 exercises the sidebar-load path directly — no `ready` message needed. `Sidebar` is mocked out, so assert against Redux state only. `createStore`, `render`, `Provider`, `App`, `waitFor` are all existing local helpers/imports; `wsMocks` is the file's module-scope websocket mock object (its `connect` is a reset `vi.fn()`, so bootstrap's `await ws.connect()` resolves).
 
 ```typescript
   it('tears down the session and surfaces an auth failure when the sidebar window load returns 401', async () => {
@@ -322,13 +325,20 @@ Context you need: this file's `vi.mock('@/lib/api', ...)` is a FULL replacement 
       expect(store.getState().connection.lastError).toBe('Authentication failed')
       expect(store.getState().connection.status).toBe('disconnected')
     })
+
+    // Residue-proof discriminator: the teardown makes ensureSidebarSessionsWindow
+    // return false, so bootstrap exits before the pre-connect clears and never
+    // connects the websocket. (Without the teardown, bootstrap proceeds and
+    // connect IS called — so this assertion alone keeps the test RED even if
+    // transient 'Authentication failed' residue were ever observable.)
+    expect(wsMocks.connect).not.toHaveBeenCalled()
   })
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `npm run test:vitest -- run test/unit/client/components/App.ws-bootstrap.test.tsx -t "sidebar window load returns 401"`
-Expected: FAIL — after Task 1, `ensureSidebarSessionsWindow`'s `catch` no longer fires (the throw is gone), so `connection.lastError` never becomes `'Authentication failed'` and `waitFor` times out (the `sessions.windows.sidebar?.error` assertion alone will be satisfied — the failure is specifically the missing teardown).
+Expected: FAIL — after Task 1, `ensureSidebarSessionsWindow`'s `catch` no longer fires (the throw is gone), so bootstrap proceeds past the failed sidebar load to the pre-connect block, which clears `connection.lastError` and drives status to `'ready'` via `ws.connect()`. Steady state therefore fails the teardown assertions and `waitFor` times out (the `sessions.windows.sidebar?.error` assertion alone will be satisfied — the failure is specifically the missing teardown); the final `wsMocks.connect` assertion also fails, since without the teardown bootstrap DOES connect. (An unmocked-`getAuthToken` branch sets `'Authentication failed'` transiently at bootstrap start in this file, but it is cleared on the same sequential path — the `connect` discriminator makes the RED gate immune to that residue regardless.)
 
 - [ ] **Step 3: Extract `performAuthFailureTeardown` in App.tsx**
 
@@ -674,4 +684,4 @@ Expected: all PASS (success-path behavior of the thunks is unchanged; `pane-acti
 
 **3. Type consistency.** `FetchSessionWindowResult = { ok: boolean; unauthorized: boolean }` is defined and exported once (Task 1 Step 4), used as the inner-thunk return type (Task 1 Steps 5a, 8), imported as `type FetchSessionWindowResult` in App.tsx (Task 2 Step 5), and consumed as `FetchSessionWindowResult | undefined` in `ensureSidebarSessionsWindow` (Task 2 Step 4). `performAuthFailureTeardown` is defined in Task 2 Step 3 with all four overlay resets and called in Task 2 Steps 3-4. `settled` replaces `requestPromise` consistently at all three references (Task 1 Step 5 a/b/c). `isApiUnauthorizedError` is imported in Task 1 Step 4 (verified exported at `src/lib/api.ts:110`, real predicate `status === 401`) and used in Task 1 Step 5c; the App test file's mocked predicate has the same `status === 401` semantics, and both new tests reject with `Object.assign(new Error('Unauthorized'), { status: 401 })`, satisfying both the real and mocked predicates plus the `error.message` extraction in `setSessionWindowError`.
 
-**4. Green-per-commit.** Task 1's commit leaves one untested path (sidebar-load 401 teardown) temporarily inert — explicitly noted — and the suite stays green (verified: no existing test covers that path). Task 2 restores it with a RED→GREEN regression test. Tasks 3 and 4 are fully green.
+**4. Green-per-commit.** Task 1's commit leaves one untested path (sidebar-load 401 teardown) temporarily inert — explicitly noted — and the suite stays green (verified: no existing test covers that path; Task 1 Step 9 additionally runs App.ws-bootstrap.test.tsx before the commit to prove the intermediate state empirically, since its no-leak test depends on the preserved error-commit/no-window-commit semantics). Task 2 restores it with a RED→GREEN regression test. Tasks 3 and 4 are fully green.
