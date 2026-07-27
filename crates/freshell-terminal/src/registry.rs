@@ -60,6 +60,7 @@ use crate::batch::{
     BatchInputFrame,
 };
 use crate::fragment::terminal_stream_batch_max_bytes;
+use crate::idle_noise::NoiseScanner;
 use crate::pty::{MessageSink, PtyTerminal};
 
 /// Deliver one server→client message to a single attached connection's socket.
@@ -197,6 +198,10 @@ struct TerminalShared {
     /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
     /// each ingested frame in order; its mode/CSI/string state persists across frames.
     scanner: BarrierScanner,
+    /// Per-terminal repaint-noise fingerprinter feeding
+    /// `last_meaningful_activity_at` (DEV-0009). Independent of the barrier
+    /// scanner: separate state, separate concern (reaping, not batching).
+    noise: NoiseScanner,
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
     head_seq: i64,
     status: TerminalRunStatus,
@@ -208,6 +213,14 @@ struct TerminalShared {
     exit_code: Option<i64>,
     created_at: i64,
     last_activity_at: i64,
+    /// The idle-kill reap clock (DEV-0009): last MEANINGFUL activity — user
+    /// input, or PTY output carrying genuinely new content per
+    /// [`NoiseScanner`]. Unlike `last_activity_at` (wire-visible via
+    /// `inventory()`/`DirectoryEntry` and spec-pinned to bump on EVERY
+    /// output frame, terminal-core.md §1.3), repaint noise (spinner frames,
+    /// ticking counters, status-bar redraws) does not refresh this.
+    /// Read ONLY by `enforce_idle_kills`.
+    last_meaningful_activity_at: i64,
     /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
     rows: u16,
@@ -719,6 +732,8 @@ impl TerminalRegistry {
     /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
     /// DETACHED **running** terminal idle beyond the configured threshold.
     /// `auto_kill_idle_minutes() <= 0` is legacy's disabled state -- a no-op.
+    /// Idleness is measured against `last_meaningful_activity_at` (DEV-0009):
+    /// self-generated repaint noise does not keep a detached terminal alive.
     /// "Detached" mirrors `term.clients.size > 0` continue-guard: any attached
     /// subscriber exempts the terminal regardless of idle time. Returns the
     /// killed terminal ids (empty when nothing was eligible), for callers that
@@ -748,7 +763,11 @@ impl TerminalRegistry {
                     if !s.subscribers.is_empty() {
                         return None; // only detached
                     }
-                    if now.saturating_sub(s.last_activity_at) < idle_threshold_ms {
+                    // DEV-0009: idleness is measured against the MEANINGFUL
+                    // activity clock, not the every-frame last_activity_at —
+                    // otherwise a detached animated TUI (spinner / ticking
+                    // counter) is exempt from this sweep forever.
+                    if now.saturating_sub(s.last_meaningful_activity_at) < idle_threshold_ms {
                         return None; // not idle long enough yet
                     }
                     Some(id.clone())
@@ -814,11 +833,13 @@ impl TerminalRegistry {
             // from `settings.terminal.scrollback` at boot).
             max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
+            noise: NoiseScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
             exit_code: None,
             created_at: now,
             last_activity_at: now,
+            last_meaningful_activity_at: now,
             cols: spec.cols,
             rows: spec.rows,
             geometry_epoch: 1,
@@ -1054,11 +1075,16 @@ impl TerminalRegistry {
                 .map(|h| Arc::clone(&h.shared))
         };
         if let Some(shared) = shared {
-            shared
-                .lock()
-                .expect("terminal lock")
-                .subscribers
-                .remove(&conn_id);
+            let mut s = shared.lock().expect("terminal lock");
+            if s.subscribers.remove(&conn_id).is_some()
+                && s.subscribers.is_empty()
+                && s.status == TerminalRunStatus::Running
+            {
+                // DEV-0009: a freshly-detached terminal gets a full idle
+                // threshold of grace — its meaningful clock may have expired
+                // while a watcher was attached (attached => reaper-exempt).
+                s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+            }
         }
     }
 
@@ -1075,11 +1101,20 @@ impl TerminalRegistry {
                 .collect()
         };
         for shared in shareds {
-            shared
-                .lock()
-                .expect("terminal lock")
-                .subscribers
-                .remove(&conn_id);
+            let mut s = shared.lock().expect("terminal lock");
+            if s.subscribers.remove(&conn_id).is_some()
+                && s.subscribers.is_empty()
+                && s.status == TerminalRunStatus::Running
+            {
+                // DEV-0009: a freshly-detached terminal gets a full idle
+                // threshold of grace — its meaningful clock may have expired
+                // while a watcher was attached (attached => reaper-exempt).
+                // The `.is_some()` gate is essential here: this sweep visits
+                // EVERY terminal, and an unconditional bump would reset the
+                // countdown of unrelated, already-detached terminals on
+                // every socket close.
+                s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+            }
         }
     }
 
@@ -1094,7 +1129,10 @@ impl TerminalRegistry {
                         let _ = pty.write_input(data);
                     }
                     let mut s = handle.shared.lock().expect("terminal lock");
-                    s.last_activity_at = now_ms();
+                    let now = now_ms();
+                    s.last_activity_at = now;
+                    // User keystrokes are always meaningful (DEV-0009).
+                    s.last_meaningful_activity_at = now;
                     s.mode != "shell"
                 }
                 None => false,
@@ -1383,6 +1421,7 @@ impl TerminalRegistry {
         s.status = TerminalRunStatus::Exited;
         s.exit_code = Some(exit_code);
         s.last_activity_at = now;
+        s.last_meaningful_activity_at = now;
         let respawn_key = s.create_request_id.clone();
         let lifetime_ms = now.saturating_sub(s.created_at);
         let exit = ServerMessage::TerminalExit(TerminalExit {
@@ -1574,11 +1613,13 @@ impl TerminalRegistry {
             replay_chars: 0,
             max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
+            noise: NoiseScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
             exit_code: None,
             created_at,
             last_activity_at: created_at,
+            last_meaningful_activity_at: created_at,
             cols: 120,
             rows: 30,
             geometry_epoch: 1,
@@ -2148,6 +2189,14 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     let mut s = shared.lock().expect("terminal lock");
     s.head_seq = s.head_seq.max(frame.seq_end);
     s.last_activity_at = now_ms();
+    // DEV-0009: only genuinely-new content refreshes the idle-kill reap
+    // clock. Spinner repaints / ticking counters / status-bar redraws still
+    // bump the wire-visible last_activity_at above (terminal-core.md §1.3
+    // holds for every consumer except the reaper) but must not exempt a
+    // detached terminal from enforce_idle_kills forever.
+    if s.noise.observe(&frame.data) {
+        s.last_meaningful_activity_at = s.last_activity_at;
+    }
 
     // Classify with the persistent per-terminal scanner (state persists across frames,
     // `replay-ring.ts:62-79`). Non-truncated frames (every graded chunk) classify by
@@ -2594,12 +2643,15 @@ mod tests {
             });
         }
 
-        /// Test-only: force a terminal's `lastActivityAt` to an arbitrary value so
-        /// idle-kill sweep tests don't need to sleep for real minutes.
+        /// Test-only: force a terminal's `lastActivityAt` AND its DEV-0009
+        /// meaningful-activity reap clock to an arbitrary value so idle-kill
+        /// sweep tests don't need to sleep for real minutes.
         fn backdate_last_activity(&self, terminal_id: &str, last_activity_at: i64) {
             let inner = self.inner.lock().unwrap();
             let handle = inner.terminals.get(terminal_id).unwrap();
-            handle.shared.lock().unwrap().last_activity_at = last_activity_at;
+            let mut s = handle.shared.lock().unwrap();
+            s.last_activity_at = last_activity_at;
+            s.last_meaningful_activity_at = last_activity_at;
         }
 
         /// Simulate the reader thread producing one frame (append + fan-out).
@@ -3449,6 +3501,133 @@ mod tests {
         let killed = reg.enforce_idle_kills();
 
         assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        // Warm-up: the FIRST paint of a status line is genuinely new content
+        // and legitimately counts as activity.
+        reg.feed("T", frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S"));
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        // Codex-style repaint noise after the backdate: same status line,
+        // only the braille glyph and the digits tick. Each frame still bumps
+        // the wire-visible last_activity_at (unchanged legacy semantics) but
+        // must NOT refresh the reap clock.
+        for (i, paint) in [
+            "\r\x1b[2K⠙ (2s • esc to interrupt)",
+            "\r\x1b[2K⠹ (3s • esc to interrupt)",
+            "\r\x1b[2K⠸ (14s • esc to interrupt)",
+            "\r\x1b[2K⠼ (65s • esc to interrupt)",
+        ]
+        .iter()
+        .enumerate()
+        {
+            reg.feed("T", frame(i as i64 + 2, paint, "S"));
+        }
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T".to_string()]);
+        assert!(reg.inventory().is_empty());
+    }
+
+    #[test]
+    fn enforce_idle_kills_spares_detached_terminal_streaming_genuine_output() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        // A long build streaming REAL new log lines: genuine work, must
+        // survive the sweep even while detached.
+        reg.feed(
+            "T",
+            frame(1, "   Compiling freshell-terminal v0.1.0\n", "S"),
+        );
+        reg.feed(
+            "T",
+            frame(2, "warning: unused variable `x` in registry.rs\n", "S"),
+        );
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn input_write_resets_the_idle_reap_clock() {
+        // User keystrokes are always activity (headless => the PTY write is
+        // skipped but the activity bump still happens, matching input()).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.input("T", b"ls\n");
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn detach_grants_full_idle_threshold_of_grace() {
+        // A user may WATCH a spinner-only terminal attached for hours: the
+        // attached exemption forbids reaping, but nothing refreshes the
+        // meaningful clock, so it pre-expires underneath them. Detaching
+        // must therefore grant one full threshold of grace (DEV-0009) —
+        // otherwise the very next 30s sweep kills a terminal the user
+        // deliberately backgrounded seconds earlier (legacy never reaped it;
+        // terminal-core.md A13: "terminal stays running").
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        assert!(outcome.found);
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.detach("T", 1);
+
+        // Freshly detached: the transition bump spares it a full threshold.
+        assert!(reg.enforce_idle_kills().is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+
+        // Once it goes stale again AFTER the detach, it is reaped normally.
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    #[test]
+    fn disconnect_grants_full_idle_threshold_of_grace() {
+        // Socket-close cleanup (remove_connection) is the other live
+        // transition-to-detached path and must grant the same grace as an
+        // explicit detach. The bump is gated on "this connection actually
+        // subscribed here AND the set became empty AND status is Running" —
+        // remove_connection iterates EVERY terminal, and an unconditional
+        // bump would reset unrelated detached terminals' countdowns on
+        // every socket close.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        assert!(outcome.found);
+        // A second, already-detached terminal whose countdown must NOT be
+        // disturbed by conn 1's disconnect.
+        reg.insert_headless("U", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.backdate_last_activity("U", now_ms() - 10 * 60_000);
+        reg.remove_connection(1);
+
+        let killed = reg.enforce_idle_kills();
+
+        // T was freshly detached by the disconnect => spared one threshold.
+        // U never had a subscriber => its stale countdown stands => reaped.
+        assert_eq!(killed, vec!["U".to_string()]);
         assert_eq!(reg.inventory().len(), 1);
     }
 
