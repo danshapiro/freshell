@@ -657,7 +657,7 @@ path itself is intact).
 - objective_defect: *resource leak* — `server/terminal-registry.ts:1684` bumps `lastActivityAt`
   on **every** PTY output frame, and `enforceIdleKills` (`terminal-registry.ts:1406-1425`) keys
   idleness on that stamp. Any detached terminal whose program merely repaints (codex's braille
-  spinner + ticking `(Ns • esc to interrupt)` counter, claude's ticking `⏻ Crunched for Ns` line,
+  spinner + ticking `(Ns • esc to interrupt)` counter, claude's ticking `✻ Crunched for Ns` line,
   any status-bar clock) refreshes the stamp continuously, so `settings.safety.autoKillIdleMinutes`
   can never reap it: the PTY, its child process tree, and its replay buffer are retained
   indefinitely — precisely the leak the setting exists to prevent. Observed in production
@@ -675,7 +675,7 @@ path itself is intact).
   terminals are reaper-exempt), and by output frames carrying genuinely new content per the
   stateful per-terminal `NoiseScanner` (`crates/freshell-terminal/src/idle_noise.rs`): a frame
   whose escape-stripped text — minus whitespace, ASCII digits, Braille spinner glyphs
-  (U+2800-U+28FF), and a small spinner-glyph set (`⏻`-family incl. `⏶`, `|/-\`, bullets
+  (U+2800-U+28FF), and a small spinner-glyph set (`✻`-family incl. `✶`, `|/-\`, bullets
   `·`/`•`/`◦`, geometric spinners) — is empty or fingerprint-identical to one of the 32 most
   recent distinct frames counts as repaint noise and does not refresh the reap clock (ring sized
   for codex's shimmer animation, which cycles ~13-16 letter-subset fingerprints; measured on

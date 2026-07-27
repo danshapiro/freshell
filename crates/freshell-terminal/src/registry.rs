@@ -1119,7 +1119,7 @@ impl TerminalRegistry {
     }
 
     /// `terminal.input` write path (`terminal-registry.ts:3867-3894`): write bytes to
-    /// the PTY; bump `lastActivityAt`. No wire reply.
+    /// the PTY; bump `lastActivityAt` and the DEV-0009 meaningful-activity reap clock. No wire reply.
     pub fn input(&self, terminal_id: &str, data: &[u8]) {
         let tapped_mode = {
             let mut inner = self.inner.lock().expect("registry lock");
