@@ -1971,17 +1971,17 @@ describe('App WS bootstrap recovery', () => {
   })
 
   it('contains a failing queued session-window refresh from a sessions.changed broadcast instead of leaking an unhandled rejection', async () => {
-    // Regression: the sessions.changed handler dispatched queueActiveSessionWindowRefresh()
-    // fire-and-forget with no .catch(). That thunk re-throws when it falls through to
-    // fetchSessionWindow() without committed window data (e.g. a sessions.changed before the
-    // sidebar window commits, or after a failed direct fetch retry), so a transient refresh
-    // failure leaked an unhandled rejection that fails the whole test run even though every
-    // test "passed" — the same failure class the terminal.inventory site already contains.
+    // Regression: the sessions.changed handler dispatches queueActiveSessionWindowRefresh()
+    // fire-and-forget with no .catch(). fetchSessionWindow used to re-throw on API failure,
+    // so a transient refresh failure leaked an unhandled rejection that failed the whole
+    // test run even though every test "passed". fetchSessionWindow now resolves a result
+    // instead of rejecting, so containment is provided at the source — this test proves the
+    // fire-and-forget dispatch can never leak, with no inline .catch present.
     const store = createStore()
 
     // Reject every snapshot fetch. The bootstrap sidebar load fails but is contained by
     // ensureSidebarSessionsWindow (so no window ever commits -> hasCommittedWindow stays
-    // false), and the queued refresh then takes the re-throwing fetchSessionWindow branch.
+    // false), and the queued refresh then exercises the failing fetchSessionWindow branch.
     fetchSidebarSessionsSnapshot.mockRejectedValue(new Error('window snapshot unavailable'))
 
     const unhandled: unknown[] = []

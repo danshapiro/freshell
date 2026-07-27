@@ -1137,9 +1137,9 @@ export default function App() {
           const rev = typeof msg.revision === 'number' ? msg.revision : -1
           if (rev > lastSessionsRevision) {
             lastSessionsRevision = rev
-            // Fire-and-forget refresh: the thunk re-throws on failure, so contain the
-            // rejection rather than leak an unhandled rejection (matches the inventory site).
-            void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
+            // Fire-and-forget refresh. queueActiveSessionWindowRefresh resolves even on
+            // failure (fetchSessionWindow records the error in Redux), so it cannot leak.
+            void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
           }
         }
         if (msg.type === 'settings.updated') {
@@ -1213,13 +1213,13 @@ export default function App() {
             upsert: terminalMeta,
             remove: removedTerminalMetaIds,
           }))
-          // Fire-and-forget refreshes: the thunks re-throw on failure, so
-          // contain the rejection rather than leak an unhandled rejection.
+          // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
+          // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({
             surface: 'sidebar',
             priority: 'visible',
           }) as any).catch((error: unknown) => log.debug('terminal directory background refresh failed', error))
-          void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
