@@ -654,9 +654,9 @@ path itself is intact).
 
 ### DEV-0009 — idle auto-kill reap clock ignores self-generated repaint noise (original never reaps an animated detached TUI)
 
-- objective_defect: *resource leak* — `server/terminal-registry.ts:1684` bumps `lastActivityAt`
-  on **every** PTY output frame, and `enforceIdleKills` (`terminal-registry.ts:1406-1425`) keys
-  idleness on that stamp. Any detached terminal whose program merely repaints (codex's braille
+- objective_defect: *resource leak* — `server/terminal-registry.ts:1705-1708` (the `onData`
+  handler) bumps `lastActivityAt` on **every** PTY output frame, and `enforceIdleKills`
+  (`terminal-registry.ts:1416-1435`) keys idleness on that stamp. Any detached terminal whose program merely repaints (codex's braille
   spinner + ticking `(Ns • esc to interrupt)` counter, claude's ticking `✻ Crunched for Ns` line,
   any status-bar clock) refreshes the stamp continuously, so `settings.safety.autoKillIdleMinutes`
   can never reap it: the PTY, its child process tree, and its replay buffer are retained
@@ -681,11 +681,15 @@ path itself is intact).
   for codex's shimmer animation, which cycles ~13-16 letter-subset fingerprints; measured on
   codex 0.145.0). Detection fails open (anything not provably a repeat counts as activity);
   attached terminals stay exempt and `autoKillIdleMinutes <= 0` stays disabled, both unchanged.
-  Known accepted limitation (deliberate): a detached workload whose ONLY output novelty is
-  numeric (curl/dd-style single-transfer meters, bare numeric step logs) fingerprints identically
-  and is reaped after the threshold despite being genuine work — at fingerprint level such output
-  is indistinguishable from the ticking counters this deviation exists to defeat; bar-style and
-  prose-emitting workloads are unaffected.
+  Known accepted limitation (deliberate, and a genuine regression vs legacy): the original
+  would NEVER reap a detached workload whose only output novelty is numeric (curl/dd-style
+  single-transfer meters, bare numeric step logs); the port WILL reap it after the threshold
+  despite it being genuine work — at fingerprint level such output is indistinguishable from
+  the ticking counters this deviation exists to defeat. Bar-style and prose-emitting workloads
+  are unaffected; unit rollovers (kB→MB→GB) reset the clock; the threshold is user-tunable and
+  `<= 0` disables the sweep entirely. Product-owner approval: explicitly accepted by the user
+  (AD-1) on 2026-07-27, reaffirming the 2026-07-26 plan-phase decision
+  (`docs/plans/2026-07-26-idle-repaint-noise.md`).
 - fingerprint: behavior/timing-only — no wire message, field, or schema change; the only
   observable divergence is that the port's idle sweep reaps a detached repaint-only terminal after
   the threshold where the original never would (surfaces as a `terminal.killed by=idle` /
@@ -697,8 +701,18 @@ path itself is intact).
   `disconnect_grants_full_idle_threshold_of_grace`, plus the `NoiseScanner`
   unit suite in `crates/freshell-terminal/src/idle_noise.rs` (split-escape statefulness, ring
   membership, digits-only ticks, codex shimmer letter-subset cycle, first-paint-counts semantics).
-- adjudicated_by: pending antagonist review.
-- status: proposed.
+- adjudicated_by: antagonist-reviewer session
+  `0000000000000000-577b1039e2984df1_foundation-zen-architect`, 2026-07-27 — **ACCEPT** with
+  three conditions (fix stale line refs to `:1705-1708`/`:1416-1435`; record the AD-1
+  product-owner approval in the entry body; state the numeric-only limitation as a legacy
+  regression explicitly), all incorporated above. Key finding: "a lifetime-bounding safety
+  control that cannot fire for the product's primary workload class, confirmed by a production
+  incident, is an objective defect — not scope creep." Reviewer independently re-verified the
+  legacy defect mechanism, the port's fail-open/exemption/grace semantics (including the
+  socket-close-must-not-reset-unrelated-terminals hole, pinned at `registry.rs:3646`), and ran
+  the pinning suites (157 passed, 0 failed). Implementer: the-usual recipe run
+  b7a1a8f0a0104fb3-20260726-232357 (distinct from adjudicating reviewer).
+- status: accepted.
 
 ## E2E-discovered intentional divergences (EDEV-xx)
 
