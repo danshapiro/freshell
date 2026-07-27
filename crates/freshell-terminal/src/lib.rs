@@ -40,6 +40,9 @@ pub mod chunk_ring;
 pub mod decode;
 pub mod fragment;
 pub mod framing;
+#[allow(dead_code)]
+// temporary: nothing uses the scanner until Task 2 wires it into registry.rs; Task 2 removes this attribute
+mod idle_noise;
 pub mod output_queue;
 pub mod pty;
 pub mod registry;
