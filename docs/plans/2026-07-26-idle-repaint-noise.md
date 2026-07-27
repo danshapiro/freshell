@@ -72,8 +72,11 @@ Line numbers throughout this plan are current as of branch creation and may drif
 Open `crates/freshell-terminal/src/lib.rs` and add, next to the line declaring the `barrier_scanner` module (note: the existing declarations there are all `pub mod …;` — this one is deliberately PRIVATE, since `NoiseScanner` is `pub(crate)` and has no external consumers):
 
 ```rust
+#[allow(dead_code)] // temporary: nothing uses the scanner until Task 2 wires it into registry.rs; Task 2 removes this attribute
 mod idle_noise;
 ```
+
+The `#[allow(dead_code)]` is required, not optional: the crate does not deny warnings, but without it `cargo test`/`cargo clippy` emit `dead_code` warnings for the not-yet-wired `pub(crate)` scanner, which would violate Step 6's "no new warnings" gate. Placing it on the module declaration covers the struct, its methods, and the module's constants in one place.
 
 Create `crates/freshell-terminal/src/idle_noise.rs` containing ONLY the skeleton below (so the failing tests compile-fail on missing behavior, not missing files):
 
@@ -461,12 +464,12 @@ impl NoiseScanner {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p freshell-terminal idle_noise`
-Expected: PASS — all 17 tests, 0 failures. (An `unused` warning for `NoiseScanner` outside tests is acceptable at this point; Task 2 wires it in. If the crate denies unused warnings, silence with `#[allow(dead_code)]` on the struct and remove that attribute in Task 2.)
+Expected: PASS — all 17 tests, 0 failures, and no `dead_code`/unused warnings (the module-level `#[allow(dead_code)]` added in Step 1 silences them while the scanner is unwired; Task 2 removes that attribute when `registry.rs` starts consuming the scanner).
 
 - [ ] **Step 6: Quality gates**
 
 Run: `cargo clippy -p freshell-terminal --all-targets`
-Expected: no new warnings from `idle_noise.rs`. If clippy raises `new_without_default`, satisfy it with exactly:
+Expected: no new warnings from `idle_noise.rs` (achievable because Step 1's module-level `#[allow(dead_code)]` covers the not-yet-wired scanner). If clippy raises `new_without_default`, satisfy it with exactly:
 
 ```rust
 impl Default for NoiseScanner {
@@ -505,6 +508,7 @@ Co-authored-by: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 **Files:**
 - Modify: `crates/freshell-terminal/src/registry.rs` — `TerminalShared` struct (~line 169), `enforce_idle_kills()` (~line 731), `input()` (~line 1086), `finish_pty_exit()` (~line 1382), `ingest()` (~line 2139), the two `TerminalShared { ... }` literal initializers (in `create()` ~line 821 and `register_headless()` ~line 1581), the two transition-to-detached paths `detach()` (~line 1048) and `remove_connection()` (~line 1067), the test helper `backdate_last_activity` (~line 2599), and new tests in the idle-kill test block (~line 3392).
+- Modify: `crates/freshell-terminal/src/lib.rs` — remove the temporary `#[allow(dead_code)]` attribute (and its comment) from the `mod idle_noise;` declaration added in Task 1 (the scanner now has a consumer).
 
 **Interfaces:**
 - Consumes (from Task 1): `crate::idle_noise::NoiseScanner` — `NoiseScanner::new() -> NoiseScanner`, `NoiseScanner::observe(&mut self, data: &str) -> bool` (true = meaningful).
@@ -651,6 +655,8 @@ All edits in `crates/freshell-terminal/src/registry.rs`.
 ```rust
 use crate::idle_noise::NoiseScanner;
 ```
+
+Also open `crates/freshell-terminal/src/lib.rs` and remove the temporary `#[allow(dead_code)]` attribute (and its trailing comment) from above `mod idle_noise;` — the scanner is now used, so the declaration returns to plain `mod idle_noise;`.
 
 3b. In `struct TerminalShared`, add two fields — the clock next to `last_activity_at`, the scanner next to `scanner: BarrierScanner`:
 
@@ -813,7 +819,7 @@ Run: `cargo fmt --all` then `git diff --stat` — revert any files you didn't to
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/idle-repaint-noise
-git add crates/freshell-terminal/src/registry.rs
+git add crates/freshell-terminal/src/registry.rs crates/freshell-terminal/src/lib.rs
 git commit -m "fix(terminal): key idle auto-kill on meaningful activity so repaint noise can't exempt detached terminals
 
 enforce_idle_kills now reads a new private last_meaningful_activity_at
@@ -832,6 +838,8 @@ just-backgrounded terminal must not be killed by the next 30s sweep.
 Wire-visible lastActivityAt semantics are unchanged: still bumped on
 every PTY output frame and every input write (terminal-core.md §1.3).
 Attached terminals stay exempt; autoKillIdleMinutes <= 0 stays a no-op.
+Also drops the temporary #[allow(dead_code)] on mod idle_noise now that
+the scanner has a consumer.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -851,8 +859,9 @@ Co-authored-by: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 - [ ] **Step 1: Verify the pinning tests exist and pass (the ledger references them)**
 
-Run: `cargo test -p freshell-terminal enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise enforce_idle_kills_spares_detached_terminal_streaming_genuine_output && cargo test -p freshell-terminal grants_full_idle_threshold`
-Expected: PASS (2 tests, then 2 tests). If any name errs, fix the entry text below to match reality — never reference a test that does not exist.
+Run: `cargo test -p freshell-terminal enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise && cargo test -p freshell-terminal enforce_idle_kills_spares_detached_terminal_streaming_genuine_output && cargo test -p freshell-terminal grants_full_idle_threshold`
+(Three separate invocations on purpose: cargo accepts only ONE positional TESTNAME filter per `cargo test` call — passing two positional names errors with `unexpected argument`.)
+Expected: PASS (1 test, 1 test, then 2 tests). If any name errs, fix the entry text below to match reality — never reference a test that does not exist.
 
 Note on entry format: the file's canonical schema (used by DEV-0006..0008 and the end-of-file template) is a `### DEV-NNNN — title` heading plus seven UNBOLDED dash fields in fixed order: objective_defect, original_behavior, port_behavior, fingerprint, pinning_test, adjudicated_by, status. The entry below follows it; keep the field names unbolded.
 
