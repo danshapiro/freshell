@@ -652,6 +652,54 @@ path itself is intact).
 - status: accepted (terminals.changed parity CLOSED; terminal.meta.updated open gap, tracked for
   closure with DEV-0006)
 
+### DEV-0009 — idle auto-kill reap clock ignores self-generated repaint noise (original never reaps an animated detached TUI)
+
+- objective_defect: *resource leak* — `server/terminal-registry.ts:1684` bumps `lastActivityAt`
+  on **every** PTY output frame, and `enforceIdleKills` (`terminal-registry.ts:1406-1425`) keys
+  idleness on that stamp. Any detached terminal whose program merely repaints (codex's braille
+  spinner + ticking `(Ns • esc to interrupt)` counter, claude's ticking `⏻ Crunched for Ns` line,
+  any status-bar clock) refreshes the stamp continuously, so `settings.safety.autoKillIdleMinutes`
+  can never reap it: the PTY, its child process tree, and its replay buffer are retained
+  indefinitely — precisely the leak the setting exists to prevent. Observed in production
+  2026-07-25: 10 detached CLIs alive 10-22h against a 3h threshold (the client-side half of that
+  incident was PR #534; this entry is the server-side half).
+- original_behavior: idleness = `now - lastActivityAt`, where `lastActivityAt` is refreshed by
+  every PTY output frame regardless of content; a detached animated TUI is exempt from the idle
+  sweep forever.
+- port_behavior: the port keeps `lastActivityAt`'s wire semantics identical (still bumped on
+  every output frame and every input write — terminal-core.md §1.3 holds for `inventory`, the
+  directory projection, and sorting) but gives `enforce_idle_kills` its own reap clock,
+  `last_meaningful_activity_at` (`crates/freshell-terminal/src/registry.rs`), refreshed by input
+  writes, by transition-to-detached (a freshly detached or socket-orphaned terminal gets one full
+  threshold of grace — its clock may have gone stale while a watcher was attached, since attached
+  terminals are reaper-exempt), and by output frames carrying genuinely new content per the
+  stateful per-terminal `NoiseScanner` (`crates/freshell-terminal/src/idle_noise.rs`): a frame
+  whose escape-stripped text — minus whitespace, ASCII digits, Braille spinner glyphs
+  (U+2800-U+28FF), and a small spinner-glyph set (`⏻`-family incl. `⏶`, `|/-\`, bullets
+  `·`/`•`/`◦`, geometric spinners) — is empty or fingerprint-identical to one of the 32 most
+  recent distinct frames counts as repaint noise and does not refresh the reap clock (ring sized
+  for codex's shimmer animation, which cycles ~13-16 letter-subset fingerprints; measured on
+  codex 0.145.0). Detection fails open (anything not provably a repeat counts as activity);
+  attached terminals stay exempt and `autoKillIdleMinutes <= 0` stays disabled, both unchanged.
+  Known accepted limitation (deliberate): a detached workload whose ONLY output novelty is
+  numeric (curl/dd-style single-transfer meters, bare numeric step logs) fingerprints identically
+  and is reaped after the threshold despite being genuine work — at fingerprint level such output
+  is indistinguishable from the ticking counters this deviation exists to defeat; bar-style and
+  prose-emitting workloads are unaffected.
+- fingerprint: behavior/timing-only — no wire message, field, or schema change; the only
+  observable divergence is that the port's idle sweep reaps a detached repaint-only terminal after
+  the threshold where the original never would (surfaces as a `terminal.killed by=idle` /
+  `terminal.exit` for such a terminal, and its absence from subsequent inventories).
+- pinning_test: `crates/freshell-terminal/src/registry.rs` tests
+  `enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise`,
+  `enforce_idle_kills_spares_detached_terminal_streaming_genuine_output`,
+  `detach_grants_full_idle_threshold_of_grace`, and
+  `disconnect_grants_full_idle_threshold_of_grace`, plus the `NoiseScanner`
+  unit suite in `crates/freshell-terminal/src/idle_noise.rs` (split-escape statefulness, ring
+  membership, digits-only ticks, codex shimmer letter-subset cycle, first-paint-counts semantics).
+- adjudicated_by: pending antagonist review.
+- status: proposed.
+
 ## E2E-discovered intentional divergences (EDEV-xx)
 
 **Scope — READ THIS FIRST.** This section is DELIBERATELY SEPARATE from the DEV-NNNN
