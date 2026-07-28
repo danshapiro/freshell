@@ -741,6 +741,60 @@ fn g_a3_amplifier_env_var_override() {
     assert_eq!(launch.command, "/custom/amplifier");
 }
 
+/// Builds the amplifier spec + inputs with the given `launch_intent` /
+/// `resume_session_id` and runs the resolver — the shared shape of the G-A4
+/// intent goldens. Flattens the mode-match `Option` (the amplifier spec is
+/// always pushed, so `Some` is guaranteed on the `Ok` path).
+fn resolve_amplifier_golden_with_intent(
+    launch_intent: LaunchIntent,
+    resume_session_id: Option<&str>,
+) -> Result<CliLaunch, CliLaunchError> {
+    let mut all_specs = specs();
+    all_specs.push(amplifier_spec());
+    let inputs = CliLaunchInputs {
+        launch_intent,
+        ..amplifier_inputs(resume_session_id)
+    };
+    resolve_coding_cli_command(&all_specs, &inputs, &env_of(&[]))
+        .map(|launch| launch.expect("amplifier spec is present"))
+}
+
+/// G-A4 (launcher-assigned amplifier identity): the amplifier spec has
+/// resumeArgs ONLY — `LaunchIntent::Start` with a preallocated session id
+/// is a hard StartIntentUnsupported error. The WS/REST pre-create paths
+/// therefore keep `LaunchIntent::Resume` for fresh amplifier panes
+/// (`amplifier resume <uuid>` of the pre-created stub IS the fresh
+/// launch). This golden pins that requirement so a future "make amplifier
+/// look like claude" refactor fails loudly here instead of at runtime.
+#[test]
+fn g_a4_amplifier_start_intent_without_create_session_args_is_rejected() {
+    let err = resolve_amplifier_golden_with_intent(
+        LaunchIntent::Start,
+        Some("11111111-2222-3333-4444-555555555555"),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("StartIntentUnsupported")
+            || format!("{err}").contains("createSessionArgs"),
+        "expected StartIntentUnsupported, got: {err:?}"
+    );
+}
+
+/// G-A4b: with Resume intent the SAME inputs resolve to
+/// `amplifier resume <id>` (the manifest resumeArgs template).
+#[test]
+fn g_a4b_amplifier_resume_intent_with_preallocated_id_resolves_resume_argv() {
+    let cli = resolve_amplifier_golden_with_intent(
+        LaunchIntent::Resume,
+        Some("11111111-2222-3333-4444-555555555555"),
+    )
+    .unwrap();
+    assert_eq!(
+        cli.args,
+        vec!["resume", "11111111-2222-3333-4444-555555555555"]
+    );
+}
+
 /// The amplifier extension manifest (`extensions/amplifier/freshell.json`) is
 /// the single source of truth for its launch behavior — this crate never
 /// hardcodes a `CliCommandSpec` for it; `freshell-server`'s
