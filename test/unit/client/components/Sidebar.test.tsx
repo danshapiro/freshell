@@ -2593,6 +2593,38 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Empty state names the repo filter as a possible cause.
       expect(screen.getByText('No sessions in selected repo')).toBeInTheDocument()
     })
+
+    it('never persists the selection: localStorage untouched and a fresh mount resets to All', async () => {
+      const snapshotLocalStorage = () => {
+        const entries: Record<string, string | null> = {}
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const key = window.localStorage.key(i) as string
+          entries[key] = window.localStorage.getItem(key)
+        }
+        return JSON.stringify(entries)
+      }
+
+      const store = createTestStore({ projects: repoProjects })
+      const first = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const before = snapshotLocalStorage()
+      fireEvent.change(first.getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+      expect(screen.queryByText('Beta session one')).not.toBeInTheDocument()
+      expect(snapshotLocalStorage()).toBe(before)
+
+      // Remount against the SAME store: client-side "browser refresh".
+      // If the selection leaked into Redux or storage, it would survive this.
+      cleanup()
+      const second = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(second.getByRole('combobox', { name: /repo filter/i })).toHaveValue('all')
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      expect(screen.getByText('Alpha session one')).toBeInTheDocument()
+    })
   })
 
   describe('Search loading state', () => {
