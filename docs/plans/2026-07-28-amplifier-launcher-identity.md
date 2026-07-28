@@ -13,6 +13,8 @@
 
 **Reference material (read, don't rebase):** the retired branch worktree at `/home/dan/code/freshell/.worktrees/amplifier-session-identity` (branch `feat/amplifier-session-identity`) contains the fully-designed prior implementation: plan doc `docs/plans/2026-07-24-amplifier-session-identity.md`, module `crates/freshell-sessions/src/amplifier_stub.rs`, and contract test `test/integration/real/amplifier-stub-adoption-contract.test.ts`. Its DESIGN is validated; its Rust integration code is STALE against current main. Code blocks in this plan were extracted from that branch and adapted to current main's anchors — trust this plan's text over the retired branch when they differ.
 
+**Stage-2 load-bearing validation (2026-07-28):** the external contracts this plan rests on were re-verified against the INSTALLED CLI (build `51194ef`) and current code: stub adoption, unknown-id rejection, zero-turn never-used signature, the `turn_count` write path (8793/8793 real-corpus metadata files carry it), the `prompt:submit` veto (synchronous emission verified in code + a live SIGHUP-kill test; 8490/8512 corpus prevalence), no-SIGHUP-persistence (static audit + 10s post-mortem write watch), downstream resume plumbing (all consumers fresh-vs-resume-indifferent), create-funnel atomicity, and a fresh 8961-session slug census (0 mismatches) — all VERIFIED. Two assumptions were FALSIFIED and the fixes are folded into this plan text: **A7** (e2e `AMPLIFIER_HOME` consumers — Task 14 now migrates the lane-resilience spec's 4 env pins + BOTH fake-CLI fixtures) and **A10** (effective-cwd corners — windows-like-arm reject + REST `resolve_unix_shell_cwd`, Tasks 8/11 + Global Constraints). Full evidence: `.worktrees/.the-usual-logs/amplifier-launcher-identity/load-bearing-ledger.md`.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
@@ -23,7 +25,7 @@ Every task's requirements implicitly include this section.
 - **ORDERING IS LOAD-BEARING:** the stub — including `events.jsonl` — MUST be written BEFORE `registry.create`, because the activity events-lane resolver attaches at create time (`ActivityEvent::Created`) and requires `events.jsonl` to already exist.
 - **Keep `LaunchIntent::Resume` for amplifier.** The amplifier manifest (`extensions/amplifier/freshell.json`) has `resumeArgs: ["resume", "{{sessionId}}"]` only; `LaunchIntent::Start` without `createSessionArgs` is a hard `StartIntentUnsupported` error (`crates/freshell-platform/src/cli_launch.rs:431-445`). No argv/manifest changes.
 - **GC never-used signature (validated F3/V4):** `metadata.json` lacks `turn_count` AND `transcript.jsonl` is empty/absent AND `events.jsonl` (if present) contains NO `prompt:submit` event (raw-BYTE scan — survives SIGHUP-truncated invalid UTF-8). Conservative on I/O errors: any error other than `NotFound` on transcript/events means the never-used signature cannot be PROVEN — keep. Missing/unparseable `metadata.json` ⇒ never deletable. GC only dirs the broker itself created (`created == true`).
-- **cwd is part of the identity contract (HARD INVARIANT):** `amplifier resume <id>` only searches the current cwd's project slug. One `effective_cwd` — computed once, existence-validated, taken AFTER any launch-cwd transformation the spawn spec applies — feeds BOTH the stub slug AND the PTY spawn spec. Resumes of sessions found under a different slug spawn at the session's own `working_dir` or reject loudly.
+- **cwd is part of the identity contract (HARD INVARIANT):** `amplifier resume <id>` only searches the current cwd's project slug. One `effective_cwd` — computed once, existence-validated, taken AFTER any launch-cwd transformation the spawn spec applies — feeds BOTH the stub slug AND the PTY spawn spec. Resumes of sessions found under a different slug spawn at the session's own `working_dir` or reject loudly. Two validated corners (falsified A10) both doors MUST close: (a) reject amplifier creates that would route to the windows-like spawn arm (`is_windows(host_os) || (is_wsl && effective_shell != System)` — a client-supplied `shell` reaches it, and its cwd handling is a DIFFERENT transformation than the one the stub slug is computed from); (b) run the effective cwd through `resolve_unix_shell_cwd` and reject `None` (REST's `is_dir` check admits RELATIVE paths, which the spawn layer resolves to `None` → the PTY inherits the broker's own cwd — silent divergence).
 - **Preserve PR #540 / #554 / #559 semantics exactly:** the cross-mode D7 liveness guard, the create-dedupe machinery, and the server-wide spawn gate (REST gates every create; WS restore-only per user decision c3268185) all live in the same create-path regions. Compose new amplifier guards as SEQUENTIAL, complementary blocks; never reorder or weaken theirs.
 - **Line anchors:** all `file:line` anchors in this plan were verified against `origin/main` @ `523d1e76`. Concurrent agents are active on this repo — re-verify each anchor (search for the quoted code) before editing, and check `git log` for surprises.
 - **Test isolation (validated F7/V9):** every broker test that can reach an amplifier create must set `FRESHELL_AMPLIFIER_HOME` at a choke point BEFORE any create runs (Tasks 8 and 11 add these). The workspace is edition 2021, so `std::env::set_var`-based helpers compile as safe fns.
@@ -34,7 +36,7 @@ Every task's requirements implicitly include this section.
 - **Scope clarifications (deliberate, from the kata — not silent deferrals):**
   - The frozen legacy Node tree (`server/coding-cli/amplifier-session-locator.ts`, `amplifier-session-controller.ts`, their unit tests, `server/index.ts:617`) is OUT of scope: the kata scopes deletion to the two Rust files. The legacy tree is frozen and does not compile-depend on the Rust code.
   - Legacy persisted panes with NO resume id and `restore: true` spawn a fresh identity-less amplifier (no preallocation on restore) — same accepted behavior as the retired design; the re-homed invariant sweep will WARN for them once, which is the designed loud signal.
-  - Accepted residuals (recorded in the retired design's self-review, re-accepted here): (a) broker crash before terminal exit leaks a never-used stub (recovered by ensure-after-GC on the next open); (b) `pty.rs` cwd-less spawn retry can inherit the broker's cwd in the tiny validate→spawn window (loud in-terminal); (c) the exit-hook GC's `has_other_live_resume` guard cannot see a concurrent re-resume that passed `ensure_session` but has not yet inserted its registry row (loud, one-click-recoverable, sub-second race).
+  - Accepted residuals (recorded in the retired design's self-review, re-accepted here): (a) broker crash before terminal exit leaks a never-used stub (recovered by ensure-after-GC on the next open); (b) `pty.rs` cwd-less spawn retry can inherit the broker's cwd in the tiny validate→spawn window (loud in-terminal); (c) the exit-hook GC's `has_other_live_resume` guard cannot see a concurrent re-resume that passed `ensure_session` but has not yet inserted its registry row (loud, one-click-recoverable, sub-second race); (d) the GC's `prompt:submit` veto is supplied by the hooks-logging MODULE — mounted by the default `anchors` bundle and the user's `foundation` bundle (validated live + 8490/8512 real-corpus prevalence), emitted synchronously before any provider call — so an exotic custom bundle that unmounts it, overrides its config, or denies `prompt:submit` via a higher-priority hook weakens the veto; accepted (the transcript-non-empty and `turn_count` vetoes still apply).
 
 ---
 
@@ -319,7 +321,7 @@ pub fn amplifier_home(home: &Path) -> PathBuf {
 }
 ```
 
-Accepted behavior change (validated): for users who export `AMPLIFIER_HOME`, the index/resolver now correctly scan `$HOME/.amplifier` (where sessions actually are). If existing tests in `amplifier.rs` set `AMPLIFIER_HOME` to isolate, update them to set `FRESHELL_AMPLIFIER_HOME` instead.
+Accepted behavior change (validated): for users who export `AMPLIFIER_HOME`, the index/resolver now correctly scan `$HOME/.amplifier` (where sessions actually are). If existing tests in `amplifier.rs` set `AMPLIFIER_HOME` to isolate, update them to set `FRESHELL_AMPLIFIER_HOME` instead. (Validated: no Rust unit test sets `AMPLIFIER_HOME` today.) NOTE (falsified A7): two e2e consumers DO pin `AMPLIFIER_HOME` for sandbox isolation — `test/e2e-browser/specs/amplifier-lane-resilience-rust.spec.ts` (4 env pins) and `test/e2e-browser/fixtures/fake-amplifier-activity-cli.mjs:31` — Task 14 migrates them to `FRESHELL_AMPLIFIER_HOME`. Between this task and Task 14 that spec would be red if run manually; no plan step runs it earlier.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -522,9 +524,10 @@ pub struct EnsuredSession {
 ///
 /// Stub shape (validated against the real CLI; see the Tier-1 contract
 /// test): `metadata.json` with `session_id`, `created` (ISO-8601 UTC),
-/// `working_dir` (canonical cwd), custom `freshell_terminal_id` (survives
-/// amplifier's saves — durable linkage bonus; Freshell's own registry stays
-/// primary), NO `bundle`; plus empty `transcript.jsonl` and empty
+/// `working_dir` (canonical cwd), custom `freshell_terminal_id` (best-effort
+/// durable-linkage bonus — validation observed a real turn's save REWRITE
+/// metadata.json and add `*.backup` files, so the field may not survive use;
+/// Freshell's own registry stays primary and nothing keys off it), NO `bundle`; plus empty `transcript.jsonl` and empty
 /// `events.jsonl` (the latter so the activity hub's create-time resolver
 /// attach finds a file — see the module design note).
 pub fn ensure_session(
@@ -1230,7 +1233,7 @@ Expected: FAIL — second create currently succeeds.
 
 - [ ] **Step 6: Implement the atomic enforcement inside `create`**
 
-Inside `TerminalRegistry::create`, BEFORE the spawn work begins (right after arguments are available), add — verify the keyed-create reservation method names against the `keyed_create_inflight` machinery documented at `registry.rs:446-452` and reuse them:
+Inside `TerminalRegistry::create`, BEFORE the spawn work begins (right after arguments are available), add the block below. IMPORTANT (validated V7 wrinkle — do NOT share the set): WS `handle_create` already claims client-supplied `createRequestId`s in the `keyed_create_inflight` `HashSet` itself (`terminal.rs:1355`), so a client could send a requestId shaped `resume:amplifier:<sid>` and collide with the guard's keys. Add a SIBLING field (`resume_create_inflight: Arc<Mutex<HashSet<String>>>`) with tiny `begin_resume_create`/`end_resume_create` helpers that mirror the `begin_keyed_create`/`end_keyed_create` semantics (`registry.rs:1789`/`:1798`; TOCTOU doc at `:446-452` applies identically):
 
 ```rust
         // Duplicate-live-resume enforcement (amplifier identity plan,
@@ -1247,7 +1250,7 @@ Inside `TerminalRegistry::create`, BEFORE the spawn work begins (right after arg
             None
         };
         if let Some(key) = &resume_guard_key {
-            let claimed = self.begin_keyed_create(key);
+            let claimed = self.begin_resume_create(key);
             let duplicate_live = self.identity_probe_rows().iter().any(|row| {
                 row.mode == mode
                     && row.status == TerminalRunStatus::Running
@@ -1255,7 +1258,7 @@ Inside `TerminalRegistry::create`, BEFORE the spawn work begins (right after arg
             });
             if !claimed || duplicate_live {
                 if claimed {
-                    self.end_keyed_create(key);
+                    self.end_resume_create(key);
                 }
                 // Distinguishable error contract consumed by the WS/REST
                 // handlers: ErrorKind::AlreadyExists ⇒ "session already
@@ -1275,11 +1278,11 @@ And release the reservation on BOTH exits: after the row insert succeeds, and on
 
 ```rust
         if let Some(key) = &resume_guard_key {
-            self.end_keyed_create(key);
+            self.end_resume_create(key);
         }
 ```
 
-(one copy after the successful insert, one in the error branch that returns the spawn failure). If the current machinery's names differ (`begin_keyed_create`/`end_keyed_create` vs something else), use the real ones — the semantics (claim → re-check → insert row → release; release on failure) are the contract.
+(one copy after the successful insert, one in the error branch that returns the spawn failure). The semantics (claim → re-check → insert row → release; release on failure) are the contract; V7 verified the row insert (`registry.rs:908-917`) strictly precedes any release point in this shape, leaving no observable gap, and that `create`'s existing error space (`io::Result`, OS spawn errors) cannot already produce `AlreadyExists` — the signal is unambiguous. NOTE: `identity_probe_rows()` can include HEADLESS rows (`register_headless` at `registry.rs:1624`, used by `reconcile.rs:405` / `identity.rs:336`); if such a row were ever Running+amplifier+resume-id the guard would reject — conservative (never admits a duplicate), loud, one-click-recoverable. Do not special-case it.
 
 - [ ] **Step 7: Run tests to verify they pass**
 
@@ -1313,7 +1316,7 @@ EOF
 
 - [ ] **Step 1: Isolate the WS test harness**
 
-In `crates/freshell-ws/tests/common/mod.rs`, at the choke point every integration test passes through to build its state/server (find the shared constructor — the function that builds `WsState`/registry for tests, used by e.g. `session_identity_frames.rs`), add BEFORE anything can reach an amplifier create:
+In `crates/freshell-ws/tests/common/mod.rs`, in `spawn_server_with_specs` (the constructor `spawn_server` delegates to, used by `session_identity_frames.rs` — validation V7 verified every EXISTING amplifier-creating ws test flows through it), add BEFORE anything can reach an amplifier create. CAVEAT (V7): common/mod.rs has several sibling constructors and 17 ws test files build `WsState` inline — none creates amplifier terminals today, but a future one would silently bypass this isolation. Therefore the new test file (Step 2) must ALSO set the var in its own setup (defense in depth), and new amplifier tests must use the common constructors:
 
 ```rust
     // Launcher-assigned amplifier identity (F7/V9): tests that create
@@ -1434,6 +1437,26 @@ and in the if/else chain:
     // passes through resolve_unix_shell_cwd unchanged).
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
     if mode == "amplifier" {
+        // A10/B1 guard (validated falsification — see the ledger): a
+        // client-supplied `shell` can route the spawn to
+        // build_windows_cli_spawn_spec (the `is_windows(host_os) || (is_wsl
+        // && effective_shell != System)` branch this file evaluates at the
+        // spawn-spec construction below — mirror that EXACT predicate and
+        // its variable names here), whose cwd handling is a DIFFERENT
+        // transformation than the one the stub slug is computed from.
+        // Reject that arm for amplifier instead of pre-creating a stub the
+        // spawn would silently diverge from. (Native-Windows amplifier was
+        // already unsupported on this path: resolve_amplifier_home() is
+        // HOME-based and the CLI stores sessions under a unix home.)
+        if would_take_windows_cli_arm {
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                "Amplifier terminals require the default system shell on a unix host (cwd is part of the session identity contract).".to_string(),
+                &create.request_id,
+            )
+            .await;
+        }
         if let Some(session_id) = resume_session_id.as_deref() {
             let Some(mut effective_cwd) =
                 resolve_unix_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl)
@@ -1525,6 +1548,7 @@ and in the if/else chain:
 Placement notes (verify against the live file):
 - `terminal_id` must already be minted at this point (it is — the exit-hook construction at `:1828` uses it; if the id is minted later than the D7 region, place this block right after the mint instead — the only hard ordering constraints are: after the final `resume_session_id` derivation, before `CliLaunchInputs`/spawn-spec cwd consumption, before `registry.create`).
 - `resolve_unix_shell_cwd`, `RealEnv`, `is_wsl`: mirror the exact import/usage pattern the spawn-spec construction in this file already uses (search the file for `resolve_unix_shell_cwd` or `build_cli_spawn_spec`'s cwd handling); if `handle_create` has no `is_wsl` local, hoist the same expression `build_cli_spawn_spec` uses.
+- `would_take_windows_cli_arm` is a stand-in: reuse the SAME branch condition the spawn-spec construction evaluates (around `terminal.rs:1789`/`:1794`, `is_windows(host_os) || (is_wsl && effective_shell != …System…)`) — hoist it into a local evaluated once and use that local in BOTH places so the guard and the spawn can never disagree.
 - Ledger sanity check: with `resume_session_id` now `Some(...)` for fresh amplifier panes, the create's pane-ledger branch (`:2054-2106`) must take the `record_binding` path, not the `MARKER_MODES` `record_pending` path (`:2091-2106`). Read that branch: the binding path is selected by `terminal_meta_record_for_create(...)` returning `Some` (it receives `resume_session_id`, `:2032-2038`), so this holds by construction — confirm, don't change `MARKER_MODES`.
 
 - [ ] **Step 5: Run tests to verify they pass**
@@ -1955,6 +1979,16 @@ All inside `spawn_terminal_pane` / `settle_gated_create`, composed with the exis
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
     let mut amplifier_effective_cwd: Option<String> = None;
     if mode == "amplifier" {
+        // A10/B1 guard — REST twin of the WS windows-arm reject: mirror the
+        // EXACT branch condition this file's spawn-spec construction
+        // evaluates (around terminal_tabs.rs:1111/:1116) via a hoisted local
+        // so guard and spawn can never disagree.
+        if would_take_windows_cli_arm {
+            return Err(fail_json(
+                StatusCode::BAD_REQUEST,
+                "Amplifier terminals require the default system shell on a unix host (cwd is part of the session identity contract).".to_string(),
+            ));
+        }
         if resume_session_id
             .as_deref()
             .is_some_and(|s| s.starts_with("terminal:"))
@@ -1991,7 +2025,7 @@ All inside `spawn_terminal_pane` / `settle_gated_create`, composed with the exis
             // effective cwd ONCE (explicit validated cwd, else $HOME),
             // verify it is a dir, slug the stub from it, and assign it back
             // so the spawn plumbing receives the SAME value.
-            let mut effective_cwd = match cwd
+            let raw_effective_cwd = match cwd
                 .clone()
                 .or_else(|| std::env::var("HOME").ok().filter(|v| !v.is_empty()))
             {
@@ -2002,6 +2036,23 @@ All inside `spawn_terminal_pane` / `settle_gated_create`, composed with the exis
                         "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
                     ));
                 }
+            };
+            // A10/B2 guard (validated falsification): REST's is_dir check
+            // ADMITS relative paths, but build_cli_spawn_spec resolves a
+            // relative cwd to None (resolve_unix_shell_cwd) and the PTY then
+            // inherits the BROKER's cwd while the stub slugs the
+            // canonicalized path — silent divergence. Run the SAME
+            // transformation the spawn layer applies (idempotent for
+            // absolute unix paths) and reject what it cannot represent.
+            let Some(mut effective_cwd) =
+                resolve_unix_shell_cwd(Some(raw_effective_cwd.as_str()), &RealEnv, is_wsl)
+            else {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Amplifier working directory \"{raw_effective_cwd}\" must be an absolute path."
+                    ),
+                ));
             };
             if !std::path::Path::new(&effective_cwd).is_dir() {
                 return Err(fail_json(
@@ -2063,6 +2114,7 @@ All inside `spawn_terminal_pane` / `settle_gated_create`, composed with the exis
 
 Adaptation notes (the implementer MUST reconcile with the live code, not paste blind):
 - The exact variable names (`cwd`, `resume_session_id`, `create_request_id`, `state.registry...`) come from the surrounding function — reuse them. `registry_or_bail()` stands for however this function already accesses the registry (it checks "registry wired?" at `:698-703`).
+- `would_take_windows_cli_arm` / `resolve_unix_shell_cwd` / `RealEnv` / `is_wsl`: hoist the SAME expressions this file's spawn-spec construction already evaluates (`is_wsl` around `:960`/`:981`; the windows-arm branch condition around `:1111`/`:1116`) into locals computed once, and use those locals in both the guard and the spawn — mirroring Task 8's WS pattern.
 - Ordering trade-off (deliberate): the stub is written BEFORE the spawn gate acquire (`:827-856`). A gate rejection therefore leaves a fresh stub — add to the gate's `Err` branch, right before `return Err(spawn_gate_error_response(err))`:
   ```rust
               if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
@@ -2306,16 +2358,18 @@ EOF
 
 **Files:**
 - Modify: `test/e2e-browser/fixtures/fake-amplifier-cli.mjs`
+- Modify: `test/e2e-browser/fixtures/fake-amplifier-activity-cli.mjs` (falsified A7: this is the fixture lane-resilience actually launches — spec `:28` — and it resolves `AMPLIFIER_HOME` first at `:31`; retarget like its sibling, and fix the stale `$AMPLIFIER_HOME` doc comment at `:9`)
+- Modify: `test/e2e-browser/specs/amplifier-lane-resilience-rust.spec.ts` (falsified A7 — was wrongly listed verify-only: its 4 env pins `AMPLIFIER_HOME:` at `:254`, `:339`, `:467`, `:471` must become `FRESHELL_AMPLIFIER_HOME:`; the spec's own comment at `:244-245` documents the shared-root invariant — "both the server and the fake CLI resolve the same root" — that Task 2's retarget breaks unless server env pin AND fixture move together; refresh that comment and the one near `:192`)
 - Modify: `test/e2e-browser/specs/amplifier-restore-rust.spec.ts` (rewrite, not delete — the SCENARIO is the feature's acceptance test)
-- Verify-only (must stay green, no edits expected): `test/e2e-browser/specs/amplifier-lane-resilience-rust.spec.ts` (events-lane canary), `compound-restart-rust.spec.ts:37,320,419` + `codex-terminal-bounce-rust.spec.ts:34,268,279` (`not.toContain('terminal_identity_unresolved')` pins over the re-homed sweep)
+- Verify-only (must stay green, no edits expected): `compound-restart-rust.spec.ts:37,320,419` + `codex-terminal-bounce-rust.spec.ts:34,268,279` (`not.toContain('terminal_identity_unresolved')` pins over the re-homed sweep)
 
 **Interfaces:**
 - Consumes: the whole feature (Tasks 8-13); the retired branch's reference versions of both files at `/home/dan/code/freshell/.worktrees/amplifier-session-identity/test/e2e-browser/{fixtures/fake-amplifier-cli.mjs,specs/amplifier-restore-rust.spec.ts}` (commits `2403faa8`, `6c0f33f0` there) — port their DESIGN onto the current files.
 - Produces: e2e proof of the end-user story: an amplifier pane restores across a server restart via `amplifier resume <id>`, and a never-submitted pane's stub is GC'd (restores fresh).
 
-- [ ] **Step 1: Retarget the fake CLI's home resolution**
+- [ ] **Step 1: Retarget BOTH fake CLIs' home resolution + the lane-resilience spec's env pins (falsified A7)**
 
-In `test/e2e-browser/fixtures/fake-amplifier-cli.mjs`, make the fixture resolve the SAME home as the broker (currently it may consult `AMPLIFIER_HOME` first — that must go):
+In `test/e2e-browser/fixtures/fake-amplifier-cli.mjs` AND `test/e2e-browser/fixtures/fake-amplifier-activity-cli.mjs` (`amplifierHome()` at `:31`; the activity fixture is what lane-resilience launches via `FAKE_AMPLIFIER_CLI`, spec `:28`), make the fixtures resolve the SAME home as the broker (both consult `AMPLIFIER_HOME` first today — that must go):
 
 ```js
 function amplifierHome() {
@@ -2328,6 +2382,8 @@ function amplifierHome() {
   return path.join(home, '.amplifier')
 }
 ```
+
+Then migrate the lane-resilience spec's server env pins in `test/e2e-browser/specs/amplifier-lane-resilience-rust.spec.ts`: `AMPLIFIER_HOME:` → `FRESHELL_AMPLIFIER_HOME:` at `:254` (truncation-recovery), `:339` (abrupt-restart re-attach), `:467`/`:471` (dual-server homeA/homeB), and refresh the shared-root comments (`:192`, `:244-245`). No other spec pins `AMPLIFIER_HOME` (validated inventory: everything else sets only `AMPLIFIER_CMD` and relies on the isolated `$HOME` fallback, which resolves identically before and after the retarget).
 
 And teach the fixture the launcher-assigned flow: `fake-amplifier resume <id>` must FIND the pre-created stub dir under `amplifierHome()/projects/*/sessions/<id>` and run against it (appending to its `events.jsonl` on simulated prompt submits, writing `turn_count` into `metadata.json` on a completed turn) instead of creating its own session dir on first submit. Compare against the retired branch's version of this file and port the diff, reconciling with any changes the current file has grown (it also serves the lane-resilience spec — keep those behaviors).
 
@@ -2349,7 +2405,7 @@ Expected: PASS (both specs).
 - [ ] **Step 4: Run the invariant-pin specs**
 
 Run: `npx playwright test test/e2e-browser/specs/compound-restart-rust.spec.ts test/e2e-browser/specs/codex-terminal-bounce-rust.spec.ts --project=rust 2>&1 | tail -20`
-Expected: PASS — proves the re-homed sweep neither spams nor goes silent.
+Expected: PASS — proves the re-homed sweep neither spams nor goes silent. (This run is the DESIGNED first check of deferred assumption A14 — the unconditional-sweep regime has never run anywhere before this task. If `terminal_identity_unresolved` shows up, do NOT edit the pins: tune the re-home instead — per-provider grace or arm-on-create bookkeeping — per the ledger's recorded contingency.)
 
 - [ ] **Step 5: Commit**
 
@@ -2426,3 +2482,11 @@ git status --short   # must be clean (or commit focused fixes)
 **2. Placeholder scan:** the elided bodies in Tasks 9/10/11/14 test sketches are harness plumbing explicitly sourced from named sibling files (`session_identity_frames.rs`, the old REST arm test, the retired branch's spec) with the assertions — the actual contract — given in full; every production code block is complete. No TBD/TODO remains.
 
 **3. Type consistency:** `EnsuredSession{session_dir, created, found_under_divergent_slug, working_dir_of_existing}` used identically in Tasks 3/8/10/11; `has_live_resume(rows, mode, sid)` / `has_other_live_resume(rows, mode, sid, excluding)` defined Task 7, consumed Tasks 9/10/11; `AmplifierStubGc{session_dir, session_id}` defined and consumed in Task 10 and mirrored (as a tuple) in Task 11's REST hook; `CanaryOutcome` defined Task 5, consumed Task 13; `resolve_amplifier_home() -> Option<PathBuf>` consistent across Tasks 2/8/10/11/13. `registry.create`'s exact signature is deliberately deferred to the live file (Task 7 Step 4 note) — the AlreadyExists contract is what Tasks 9/11 consume.
+
+**4. Stage-2 load-bearing validation addendum (2026-07-28)** — re-review of the tasks edited after validation (ledger: `.worktrees/.the-usual-logs/amplifier-launcher-identity/load-bearing-ledger.md`):
+- Falsified A7 folded in: Task 14 now Modifies `amplifier-lane-resilience-rust.spec.ts` (4 env pins) + BOTH fake-CLI fixtures; Task 2 cross-references the interim redness (no plan step runs that spec before Task 14). Coverage table row "restore-across-restart e2e" unchanged; lane-resilience remains proven by its own (now-migrated) spec run in Task 14 Step 3.
+- Falsified A10 folded in: Global Constraints gains the two cwd corners; Task 8 (WS) and Task 11 (REST) both gain the windows-arm reject, and Task 11's REST block now runs the effective cwd through `resolve_unix_shell_cwd` with a loud 400 on `None`. `would_take_windows_cli_arm` is a named stand-in with explicit hoist instructions (same convention as `registry_or_bail()`), not a placeholder to fill later.
+- Verified-with-wrinkle A11: Task 7 now uses a SEPARATE `resume_create_inflight` reservation set (client-controlled `createRequestId`s share the old namespace) and documents the headless-row conservatism. The claim→re-check→insert→release contract is unchanged; Tasks 9/11's AlreadyExists consumption is unaffected.
+- Verified-with-caveat A12: Task 8 Step 1 names the REAL choke point (`spawn_server_with_specs`) and adds defense-in-depth isolation in the new test file.
+- Deferred A14 recorded: Task 14 Step 4 is the designed first check of the re-homed unconditional sweep, with the contingency (per-provider grace / arm-on-create) named so a red pin is tuned, not papered over.
+- No silent deferrals introduced: every new guard lands in production code within Tasks 7-11 and is covered by the tasks' existing failing-test steps (the windows-arm reject and REST relative-cwd reject surface through the same error plumbing those tasks already test; implementers add assertions alongside the existing guard tests where natural).
