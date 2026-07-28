@@ -12,6 +12,8 @@
 mod common;
 use common::*;
 
+use std::time::Duration;
+
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -355,4 +357,265 @@ async fn amplifier_create_rejects_second_live_resume_of_same_session() {
     assert_eq!(owners[0].terminal_id, terminal_id);
 
     registry.kill(&terminal_id);
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: GC never-used stubs through the shared exit-hook contract.
+// ---------------------------------------------------------------------------
+
+/// An `amplifier` CLI spec whose process exits NATURALLY (exit 0) once the
+/// test touches `<marker_dir>/<FRESHELL_TERMINAL_ID>` — a controlled natural
+/// exit, so the PTY exit hook takes the `finish_pty_exit == true` path and
+/// sends a Lane-D1 CrashEvent AFTER the amplifier stub-GC block has run.
+/// Receiving that CrashEvent is the tests' deterministic "the GC decision
+/// has been made" signal (no sleeps, no polling theater).
+fn gated_exit_cli_spec(
+    name: &str,
+    test_tag: &str,
+    marker_dir: &std::path::Path,
+) -> freshell_platform::CliCommandSpec {
+    let script_path = std::env::temp_dir().join(format!(
+        "freshell-amp-gc-gated-{test_tag}-{}.sh",
+        std::process::id()
+    ));
+    std::fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nwhile [ ! -f \"{}/${{FRESHELL_TERMINAL_ID}}\" ]; do sleep 0.05; done\nexit 0\n",
+            marker_dir.display()
+        ),
+    )
+    .expect("write gated-exit script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+    freshell_platform::CliCommandSpec {
+        name: name.to_string(),
+        label: format!("{name}-label"),
+        env_var: None,
+        default_cmd: script_path.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: std::collections::BTreeMap::new(),
+        resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+        create_session_args: Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]),
+        model_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+/// Send a `terminal.create { mode: "amplifier" }` (optionally carrying a
+/// `sessionRef`) and return `(terminal_id, session_id)` from the
+/// `terminal.created` frame.
+async fn create_amplifier_terminal(
+    ws: &mut TestWs,
+    request_id: &str,
+    cwd: &std::path::Path,
+    session_ref_id: Option<&str>,
+) -> (String, String) {
+    let mut msg = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": request_id,
+        "mode": "amplifier",
+        "shell": "system",
+        "cwd": cwd.to_string_lossy(),
+    });
+    if let Some(sid) = session_ref_id {
+        msg["sessionRef"] = serde_json::json!({ "provider": "amplifier", "sessionId": sid });
+    }
+    ws.send(WsMessage::Text(msg.to_string()))
+        .await
+        .expect("send terminal.create");
+    let created = next_frame_of_type(ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = session_ref_of(&created)
+        .unwrap_or_else(|| panic!("amplifier terminal.created must carry sessionRef: {created}"))
+        ["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    (terminal_id, sid)
+}
+
+/// The stub dir for `sid` under the slug of `cwd` in the isolated home.
+fn stub_dir_for(
+    amp_home: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(cwd).unwrap();
+    amp_home
+        .join("projects")
+        .join(freshell_sessions::amplifier_stub::cwd_slug(
+            &canonical.to_string_lossy(),
+        ))
+        .join("sessions")
+        .join(sid)
+}
+
+/// Touch the exit marker for `terminal_id`, then await the exit hook's
+/// CrashEvent — the deterministic happens-after signal for the GC decision.
+async fn release_and_await_exit(
+    marker_dir: &std::path::Path,
+    terminal_id: &str,
+    crash_rx: &mut tokio::sync::mpsc::UnboundedReceiver<freshell_ws::auto_resume::CrashEvent>,
+) {
+    std::fs::write(marker_dir.join(terminal_id), "").expect("touch exit marker");
+    let event = tokio::time::timeout(Duration::from_secs(10), crash_rx.recv())
+        .await
+        .expect("CrashEvent within 10s")
+        .expect("crash channel open");
+    assert_eq!(event.terminal_id, terminal_id, "the terminal we released");
+}
+
+/// Task 10: a pre-created stub the user never typed into is pure litter —
+/// the terminal's own exit hook must GC it (else every never-used amplifier
+/// pane becomes a permanent '0 msgs' row in `amplifier session list`).
+#[tokio::test]
+async fn never_used_stub_is_gcd_when_the_terminal_exits() {
+    let amp_home = isolate_amplifier_home();
+    let marker_dir = std::env::temp_dir().join(format!(
+        "freshell-amp-gc-markers-exit-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+
+    let (url, _registry, mut crash_rx) =
+        spawn_server_with_specs_and_auto_resume_rx(vec![gated_exit_cli_spec(
+            "amplifier",
+            "gc-exit",
+            &marker_dir,
+        )])
+        .await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    let cwd = std::env::temp_dir().join(format!("freshell-amp-gc-exit-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+    let (terminal_id, sid) = create_amplifier_terminal(&mut ws, "req-amp-gc-1", &cwd, None).await;
+    let stub_dir = stub_dir_for(&amp_home, &cwd, &sid);
+    assert!(
+        stub_dir.join("metadata.json").is_file(),
+        "pre-created stub must exist before exit at {}",
+        stub_dir.display()
+    );
+
+    // Controlled NATURAL exit; the CrashEvent recv means the exit hook —
+    // including its GC block — has already run.
+    release_and_await_exit(&marker_dir, &terminal_id, &mut crash_rx).await;
+
+    // Bounded poll (belt and suspenders on top of the happens-after signal).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while stub_dir.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !stub_dir.exists(),
+        "never-used stub must be GC'd when the terminal exits: {}",
+        stub_dir.display()
+    );
+}
+
+/// Task 10: the GC's never-used predicate must veto deletion the moment the
+/// user has typed — a `prompt:submit` line in events.jsonl is the user's
+/// data (the CLI persists nothing else on a kill mid-FIRST-turn).
+#[tokio::test]
+async fn used_stub_survives_terminal_exit() {
+    let amp_home = isolate_amplifier_home();
+    let marker_dir = std::env::temp_dir().join(format!(
+        "freshell-amp-gc-markers-used-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+
+    let (url, _registry, mut crash_rx) =
+        spawn_server_with_specs_and_auto_resume_rx(vec![gated_exit_cli_spec(
+            "amplifier",
+            "gc-used",
+            &marker_dir,
+        )])
+        .await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    let cwd = std::env::temp_dir().join(format!("freshell-amp-gc-used-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+    let (terminal_id, sid) = create_amplifier_terminal(&mut ws, "req-amp-gc-2", &cwd, None).await;
+    let stub_dir = stub_dir_for(&amp_home, &cwd, &sid);
+    assert!(stub_dir.join("metadata.json").is_file());
+
+    // Simulate "the user typed": the hooks-logging module writes the
+    // prompt:submit event synchronously before any provider call.
+    std::fs::write(
+        stub_dir.join("events.jsonl"),
+        "{\"event\":\"prompt:submit\"}\n",
+    )
+    .expect("write prompt:submit event");
+
+    release_and_await_exit(&marker_dir, &terminal_id, &mut crash_rx).await;
+
+    assert!(
+        stub_dir.join("metadata.json").is_file(),
+        "a stub with a prompt:submit trace must SURVIVE terminal exit: {}",
+        stub_dir.display()
+    );
+}
+
+/// Task 10 ensure-after-GC pin: resuming a session whose never-used stub was
+/// GC'd re-stubs the SAME id before spawn, so restore keeps working.
+#[tokio::test]
+async fn resume_of_a_gcd_stub_is_restubbed_under_the_same_id() {
+    let amp_home = isolate_amplifier_home();
+    let marker_dir = std::env::temp_dir().join(format!(
+        "freshell-amp-gc-markers-restub-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+
+    let (url, registry, mut crash_rx) =
+        spawn_server_with_specs_and_auto_resume_rx(vec![gated_exit_cli_spec(
+            "amplifier",
+            "gc-restub",
+            &marker_dir,
+        )])
+        .await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    let cwd =
+        std::env::temp_dir().join(format!("freshell-amp-gc-restub-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+    // 1) Fresh create → exit → stub GC'd.
+    let (terminal_id, sid) = create_amplifier_terminal(&mut ws, "req-amp-gc-3a", &cwd, None).await;
+    let stub_dir = stub_dir_for(&amp_home, &cwd, &sid);
+    assert!(stub_dir.join("metadata.json").is_file());
+    release_and_await_exit(&marker_dir, &terminal_id, &mut crash_rx).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while stub_dir.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!stub_dir.exists(), "precondition: the stub was GC'd");
+
+    // 2) Create AGAIN with sessionRef {provider:"amplifier", sessionId: sid}:
+    //    SAME id on the created frame, stub dir re-created before spawn.
+    let (terminal_id2, sid2) =
+        create_amplifier_terminal(&mut ws, "req-amp-gc-3b", &cwd, Some(&sid)).await;
+    assert_eq!(sid2, sid, "resume keeps the requested identity");
+    assert!(
+        stub_dir.join("metadata.json").is_file(),
+        "a GC'd stub must be re-stubbed under the SAME id at {}",
+        stub_dir.display()
+    );
+
+    registry.kill(&terminal_id2);
 }

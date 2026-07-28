@@ -1205,6 +1205,16 @@ async fn send_session_reserved(
     out.send(&msg).await
 }
 
+/// Launcher-assigned amplifier identity: the stub this terminal's create
+/// pre-wrote (only when `EnsuredSession.created == true` — the broker only
+/// GCs litter it wrote itself). Threaded through the SHARED exit-hook
+/// contract so handle_create AND the auto-resume respawn seam behave
+/// identically (kata qmpk).
+pub(crate) struct AmplifierStubGc {
+    pub session_dir: std::path::PathBuf,
+    pub session_id: String,
+}
+
 /// Everything a PTY exit hook needs. Built once per spawned generation —
 /// by `handle_create` AND by the auto-resume respawn seam (Task 4), so
 /// respawned generations report their own crashes.
@@ -1234,6 +1244,10 @@ pub(crate) struct ExitHookDeps {
     pub codex_locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
     /// Lane D1: where genuine natural exits report their CrashEvent.
     pub auto_resume_tx: tokio::sync::mpsc::UnboundedSender<crate::auto_resume::CrashEvent>,
+    /// Task 10: the never-used-stub GC target for this generation — `Some`
+    /// only when the create/respawn pre-wrote the stub itself (see
+    /// [`AmplifierStubGc`]).
+    pub amplifier_stub_gc: Option<AmplifierStubGc>,
 }
 
 /// Exit hook (`tr:1479-1510` finishTerminalPtyExit): fires once when the PTY
@@ -1281,6 +1295,44 @@ pub(crate) fn build_pty_exit_hook(
         }
         if let Some(locator) = &deps.codex_locator {
             locator.disarm(&terminal_id);
+        }
+        // Launcher-assigned amplifier identity (Task 10): GC the never-used
+        // stub this create pre-wrote. Runs AFTER finish_pty_exit (our own
+        // row is no longer Running) and BEFORE the CrashEvent send below —
+        // the integration tests use the CrashEvent as their happens-after
+        // "the GC decision has been made" signal.
+        if let Some(gc) = &deps.amplifier_stub_gc {
+            // GC-vs-second-resume race (validated fix F5/V7): by the time
+            // this hook runs, our own row is already Exited (or removed by
+            // kill) — a NEW terminal may already be live on this same resume
+            // id, and deleting the dir out from under it would doom its
+            // resume. Skip GC in that case; the new terminal's own exit hook
+            // is not responsible either (`created == false` for it), which
+            // is correct: the dir is in use.
+            // ACCEPTED RESIDUAL: this guard reads registry rows, so a
+            // concurrent re-resume that has already passed `ensure_session`
+            // (found our stub) but has NOT yet inserted its registry row is
+            // invisible here — its dir can be GC'd in that sub-second window
+            // and its `amplifier resume <id>` then fails LOUDLY in-terminal;
+            // reopening the pane re-stubs the same id (ensure-after-GC).
+            if freshell_terminal::registry::has_other_live_resume(
+                &deps.registry.identity_probe_rows(),
+                "amplifier",
+                &gc.session_id,
+                &terminal_id,
+            ) {
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    session_id = %gc.session_id,
+                    "amplifier_stub_gc: skipped — another live terminal holds this resume id"
+                );
+            } else if freshell_sessions::amplifier_stub::gc_stub_if_unused(&gc.session_dir) {
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    dir = %gc.session_dir.display(),
+                    "amplifier_stub_gc: removed never-used pre-created session"
+                );
+            }
         }
         // Lane D1: genuine natural exits only (kill removed the row → false).
         if finished {
@@ -1863,10 +1915,6 @@ pub(crate) async fn handle_create(
             }
         }
     }
-    // Consumed by the exit-hook GC wiring (Tasks 9-10); the pre-create above
-    // is complete on its own for this slice.
-    let _ = &amplifier_stub;
-
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
     // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
     // app-server plan instead). Boot-snapshot settings (same documented caveat
@@ -2046,6 +2094,16 @@ pub(crate) async fn handle_create(
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
+            // Task 10: only a stub THIS create wrote (`created == true`) is
+            // ours to GC; found/existing sessions are never touched.
+            amplifier_stub_gc: amplifier_stub
+                .as_ref()
+                .filter(|s| s.created)
+                .zip(resume_session_id.as_ref())
+                .map(|(s, sid)| AmplifierStubGc {
+                    session_dir: s.session_dir.clone(),
+                    session_id: sid.clone(),
+                }),
         },
         terminal_id.clone(),
         mode.clone(),
@@ -2122,6 +2180,10 @@ pub(crate) async fn handle_create(
                 &create.request_id,
             )
             .await;
+        }
+        // A stub written for a spawn that never happened is pure litter.
+        if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+            let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
         }
         // Failed-spawn parity (`tr:1601-1610`): clean up MCP side-effects with the
         // mcpCwd (NOT procCwd), then surface `wrapTerminalSpawnError`'s message as
@@ -2620,6 +2682,42 @@ pub async fn respawn_agent_terminal(
     };
     let child_env = build_child_env_from_process(&spec);
 
+    // Launcher-assigned amplifier identity: a respawn resumes req.session_id
+    // unconditionally — make that resume guaranteed-resumable first
+    // (ensure-after-GC; existing/used sessions are found and left
+    // untouched). Best-effort: a failure here must not veto the respawn —
+    // the CLI itself will fail loudly in-terminal if the dir is truly gone.
+    let mut respawn_amplifier_stub_gc: Option<AmplifierStubGc> = None;
+    if req.mode == "amplifier" {
+        if let (Some(amp_home), Some(cwd)) = (
+            freshell_sessions::amplifier_stub::resolve_amplifier_home(),
+            req.cwd
+                .as_deref()
+                .filter(|c| std::path::Path::new(c).is_dir()),
+        ) {
+            match freshell_sessions::amplifier_stub::ensure_session(
+                &amp_home,
+                &req.session_id,
+                cwd,
+                &terminal_id,
+            ) {
+                Ok(ensured) if ensured.created => {
+                    respawn_amplifier_stub_gc = Some(AmplifierStubGc {
+                        session_dir: ensured.session_dir,
+                        session_id: req.session_id.clone(),
+                    });
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    terminal_id = %terminal_id,
+                    session_id = %req.session_id,
+                    error = %err,
+                    "amplifier respawn ensure_session failed; respawning anyway"
+                ),
+            }
+        }
+    }
+
     // The SAME exit hook `handle_create` builds — so respawned generations
     // report their own crashes (load-bearing for retry #2, Task 2).
     let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(build_pty_exit_hook(
@@ -2631,6 +2729,7 @@ pub async fn respawn_agent_terminal(
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
+            amplifier_stub_gc: respawn_amplifier_stub_gc,
         },
         terminal_id.clone(),
         mode.clone(),
