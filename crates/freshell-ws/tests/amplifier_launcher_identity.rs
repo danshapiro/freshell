@@ -212,3 +212,147 @@ async fn amplifier_create_with_vanished_cwd_is_rejected_before_spawn() {
         "no stub may be written for a rejected create"
     );
 }
+
+/// Task 9 guard 1: `terminal:<id>` is Freshell's own synthetic sidebar
+/// placeholder (the old correlation bug's poisoned persisted tab state) —
+/// never a resumable amplifier session. A create carrying one must be
+/// rejected LOUDLY before any stub is written, instead of spawning an
+/// `amplifier resume terminal:...` that hangs forever.
+#[tokio::test]
+async fn amplifier_create_rejects_synthetic_terminal_placeholder_refs() {
+    let amp_home = isolate_amplifier_home();
+
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    let cwd = std::env::temp_dir().join(format!(
+        "freshell-amp-launcher-identity-poisoned-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-amp-launcher-identity-4",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": cwd.to_string_lossy(),
+            "sessionRef": { "provider": "amplifier", "sessionId": "terminal:abc123" },
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "PTY_SPAWN_FAILED", "loud reject: {err}");
+    assert_eq!(err["requestId"], "req-amp-launcher-identity-4");
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("synthetic terminal placeholder"),
+        "message names the placeholder poisoning: {err}"
+    );
+
+    // The guard sits BEFORE the pre-create block: no stub litter for a
+    // poisoned id.
+    let canonical = std::fs::canonicalize(&cwd).unwrap();
+    let slug = freshell_sessions::amplifier_stub::cwd_slug(&canonical.to_string_lossy());
+    assert!(
+        !amp_home.join("projects").join(slug).exists(),
+        "no stub may be written for a rejected placeholder create"
+    );
+}
+
+/// Task 9 guard 2: amplifier has no upstream concurrency guard — a second
+/// create resuming a session id that a RUNNING terminal already owns must
+/// be rejected, never a second live PTY interleaving writes into one
+/// session dir.
+///
+/// The second create rides the legacy `resumeSessionId` carrier: the
+/// wire-`sessionRef` carrier is already intercepted by the cross-mode D7
+/// liveness guard (PR #540, "Session ... is still running on the server"),
+/// which this amplifier-specific guard composes AFTER — sequentially, never
+/// instead of. The message is asserted EXACTLY because the pre-Task-9 path
+/// already rejected via the wrapped registry error ("Could not restore ...:
+/// duplicate live resume: ..."), which contains the same substring — only
+/// the friendly guard produces this exact frame.
+#[tokio::test]
+async fn amplifier_create_rejects_second_live_resume_of_same_session() {
+    let _amp_home = isolate_amplifier_home();
+
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    let cwd = std::env::temp_dir().join(format!(
+        "freshell-amp-launcher-identity-double-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&cwd).expect("create test cwd");
+
+    // 1) Fresh amplifier create → launcher-assigned sid, terminal Running.
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-amp-launcher-identity-5",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": cwd.to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let sid = session_ref_of(&created).expect("fresh amplifier carries sessionRef")["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // 2) Second create resuming the SAME id while the first is still running.
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-amp-launcher-identity-6",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": cwd.to_string_lossy(),
+            "resumeSessionId": sid,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "PTY_SPAWN_FAILED", "loud reject: {err}");
+    assert_eq!(err["requestId"], "req-amp-launcher-identity-6");
+    assert_eq!(
+        err["message"],
+        serde_json::json!(format!(
+            "Amplifier session {sid} is already open in a live terminal."
+        )),
+        "the friendly guard frame, not the wrapped registry error: {err}"
+    );
+
+    // No duplicate spawn: exactly the original terminal owns sid.
+    let rows = registry.identity_probe_rows();
+    let owners: Vec<_> = rows
+        .iter()
+        .filter(|r| r.resume_session_id.as_deref() == Some(sid.as_str()))
+        .collect();
+    assert_eq!(
+        owners.len(),
+        1,
+        "exactly one terminal may own {sid}: {rows:?}"
+    );
+    assert_eq!(owners[0].terminal_id, terminal_id);
+
+    registry.kill(&terminal_id);
+}

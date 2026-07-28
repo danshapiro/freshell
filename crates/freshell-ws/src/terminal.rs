@@ -1704,6 +1704,51 @@ pub(crate) async fn handle_create(
     // passes through resolve_unix_shell_cwd unchanged).
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
     if mode == "amplifier" {
+        // Amplifier identity hardening (kata qmpk) — sequential, complementary
+        // to the cross-mode D7 liveness guard above (PR #540): D7 rejects
+        // cross-terminal session theft generically; these two are
+        // amplifier-specific input hygiene, evaluated on the FINAL derived
+        // resume id so both `sessionRef` and legacy `resumeSessionId`
+        // carriers are covered.
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("terminal:"))
+        {
+            // Defense-in-depth against the old correlation bug's poisoned
+            // persisted tab state: `terminal:<id>` is Freshell's own
+            // synthetic sidebar placeholder, never a resumable amplifier
+            // session — a resume of it hangs forever.
+            let poisoned = resume_session_id.clone().unwrap_or_default();
+            return send_create_error(
+                out,
+                ErrorCode::PtySpawnFailed,
+                format!(
+                    "Invalid amplifier sessionRef '{poisoned}': synthetic terminal placeholder ids are not resumable sessions."
+                ),
+                &create.request_id,
+            )
+            .await;
+        }
+        if let Some(requested) = resume_session_id.as_deref() {
+            // Same-id double-resume guard: amplifier has no upstream
+            // concurrency guard — never spawn two live PTYs resuming one
+            // session id. (Preallocated fresh UUIDs never collide.)
+            // Friendly fast-path only; race-free enforcement lives inside
+            // TerminalRegistry::create (Task 7).
+            if freshell_terminal::registry::has_live_resume(
+                &state.registry.identity_probe_rows(),
+                "amplifier",
+                requested,
+            ) {
+                return send_create_error(
+                    out,
+                    ErrorCode::PtySpawnFailed,
+                    format!("Amplifier session {requested} is already open in a live terminal."),
+                    &create.request_id,
+                )
+                .await;
+            }
+        }
         // A10/B1 guard (validated falsification): a client-supplied `shell`
         // can route the spawn to build_windows_cli_spawn_spec (the
         // `windows_like` arm of the spawn-spec `match` below), whose cwd
@@ -2055,6 +2100,29 @@ pub(crate) async fn handle_create(
         ))),
     };
     if let Err(err) = create_result {
+        // Task 7's race-free duplicate-live-resume enforcement inside
+        // registry.create (F5/V7): the pre-check above is a friendly fast
+        // path only — concurrent WS/REST creates can both pass it. Map the
+        // registry's distinguishable error to the SAME user-facing reject.
+        // ORDER IS LOAD-BEARING: this early-return must precede the stub GC
+        // in this failure branch (Task 10). `ensure_session` itself is not
+        // serialized, so two truly concurrent creates of one id can BOTH
+        // observe "no dir yet" and race the mkdir — the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir; GC'ing it here would delete the winner's session
+        // out from under it.
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return send_create_error(
+                out,
+                ErrorCode::PtySpawnFailed,
+                format!(
+                    "Amplifier session {} is already open in a live terminal.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+                &create.request_id,
+            )
+            .await;
+        }
         // Failed-spawn parity (`tr:1601-1610`): clean up MCP side-effects with the
         // mcpCwd (NOT procCwd), then surface `wrapTerminalSpawnError`'s message as
         // an `error{code:PTY_SPAWN_FAILED}` frame.
