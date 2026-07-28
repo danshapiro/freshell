@@ -18,6 +18,27 @@ use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Launcher-assigned amplifier identity (F7/V9): tests that create
+/// amplifier terminals now WRITE stub dirs into the amplifier home.
+/// Isolate eagerly at this choke point so no test ever touches the real
+/// `~/.amplifier`. `set_var` is process-global: use ONE shared value per
+/// test process. Called by [`spawn_server_with_specs`] (the constructor
+/// every existing amplifier-creating ws test flows through — V7) AND
+/// directly by amplifier test files (defense in depth: 17 ws test files
+/// build `WsState` inline and would silently bypass the constructor).
+pub fn isolate_amplifier_home() -> std::path::PathBuf {
+    static AMP_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    AMP_HOME
+        .get_or_init(|| {
+            let amp_home =
+                std::env::temp_dir().join(format!("freshell-ws-amp-home-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&amp_home);
+            std::env::set_var("FRESHELL_AMPLIFIER_HOME", &amp_home);
+            amp_home
+        })
+        .clone()
+}
+
 pub fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -91,6 +112,8 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
 pub async fn spawn_server_with_specs(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    // F7/V9 choke point: BEFORE anything can reach an amplifier create.
+    let _ = isolate_amplifier_home();
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
