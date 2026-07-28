@@ -2393,7 +2393,7 @@ Rewrite `test/e2e-browser/specs/amplifier-restore-rust.spec.ts` (header `:10-33`
 
 1. Open an amplifier pane → the pane has a sessionRef IMMEDIATELY at create (assert the sidebar/session identity WITHOUT typing anything — the payoff assertion the old mechanism could never make).
 2. Type a prompt (fake CLI records `prompt:submit` in the stub's events.jsonl and marks a turn) → restart the server (harness restart helper, NOT the self-hosted 3002 server) → the pane restores and the fake CLI is relaunched with `resume <same-id>` (assert on the fixture's recorded argv).
-3. Negative pane: open a second amplifier pane, type NOTHING, close it → its stub dir is GC'd from disk; after restart it restores fresh (new id) rather than resuming a ghost.
+3. Never-used pane: open a second amplifier pane, type NOTHING, and LEAVE IT OPEN → restart the server → its never-used stub dir is GC'd from disk at shutdown, but the pane's persisted sessionRef triggers Task 8's ensure-after-GC re-stub under the SAME id, so the pane restores and the fake CLI is relaunched with `resume <same-id>` (assert on the fixture's recorded argv; optionally also assert the stub dir was recreated). Port the retired spec's leg (b) (`amplifier-restore-rust.spec.ts:315-317`), which pins exactly this same-id behavior — consistent with Task 8's "re-stubbed under the SAME id" contract and Task 10's `resume_of_a_gcd_stub_is_restubbed_under_the_same_id` unit pin. Do NOT close the pane and do NOT assert a new id: a closed pane leaves the persisted layout and restores nothing, and a GC'd id is never reissued as a fresh one.
 4. `expect(serverLogs).not.toContain('terminal_identity_unresolved')` and `not.toContain('amplifier_layout_contract_broken')`.
 
 - [ ] **Step 3: Run the amplifier e2e specs**
