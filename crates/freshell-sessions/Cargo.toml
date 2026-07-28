@@ -14,6 +14,8 @@ serde_json = { workspace = true }
 # `directory_index.rs`'s `rust-session-cache.json`) -- the boot-time cold-scan
 # fix (5min -> seconds on a real 8.7GB+2.2GB corpus).
 serde = { workspace = true }
+# Timestamp serialization for amplifier stub metadata (ISO-8601 RFC-3339).
+chrono = { workspace = true }
 # chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
 notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
