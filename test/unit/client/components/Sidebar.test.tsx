@@ -4397,4 +4397,59 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
     })
   })
+
+  describe('Repo filter dropdown', () => {
+    const repoProjects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/repo-alpha',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: sessionId('Alpha session one'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: 30,
+            title: 'Alpha session one',
+          },
+        ],
+      },
+      {
+        projectPath: '/home/user/repo-beta',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: sessionId('Beta session one'),
+            projectPath: '/home/user/repo-beta',
+            lastActivityAt: 20,
+            title: 'Beta session one',
+          },
+        ],
+      },
+    ]
+
+    it('shows no clear button while the dropdown is on All', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByRole('button', { name: /clear repo filter/i })).not.toBeInTheDocument()
+    })
+
+    it('clear button resets the repo filter to All and restores the full list', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole, queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+      expect(screen.queryByText('Beta session one')).not.toBeInTheDocument()
+
+      fireEvent.click(getByRole('button', { name: /clear repo filter/i }))
+
+      expect(getByRole('combobox', { name: /repo filter/i })).toHaveValue('all')
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      expect(screen.getByText('Alpha session one')).toBeInTheDocument()
+      expect(queryByRole('button', { name: /clear repo filter/i })).not.toBeInTheDocument()
+    })
+  })
 })

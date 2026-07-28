@@ -725,6 +725,15 @@ export default function Sidebar({
                 </option>
               ))}
             </select>
+            {repoFilter !== ALL_REPOS ? (
+              <button
+                aria-label="Clear repo filter"
+                onClick={() => setRepoFilter(ALL_REPOS)}
+                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
           </div>
         )}
         {localQuery && (
