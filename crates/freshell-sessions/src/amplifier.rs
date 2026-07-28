@@ -41,13 +41,19 @@ use crate::time::parse_timestamp_ms;
 /// preview -- never the whole (potentially tens-of-MB) file.
 const FIRST_USER_MESSAGE_MAX_READ_BYTES: u64 = 64 * 1024;
 
-/// `defaultAmplifierHome()` (`providers/amplifier.ts:12-14`): `AMPLIFIER_HOME`
-/// env else `<home>/.amplifier`. Mirrors `claude_home`/`codex_home`
-/// (`crates/freshell-server/src/session_directory.rs:376-390`) but lives here
-/// since this module owns its own home resolution (that file's internals are
-/// out of scope for this change).
+/// Broker-side amplifier home ROOT — the SAME resolution as
+/// `amplifier_stub::resolve_amplifier_home` (ONE resolution shared by the
+/// stub writer, the session index, and the activity events-path resolver,
+/// so the create-time events-lane attach always finds the stub):
+/// `FRESHELL_AMPLIFIER_HOME` (freshell test/dev override, used as-is) else
+/// `<home>/.amplifier`. Deliberately RETARGETED away from the Node
+/// provider's `AMPLIFIER_HOME` mirror (`providers/amplifier.ts:12-14`): the
+/// real CLI stores sessions ONLY under `$HOME/.amplifier`
+/// (`session_store.py:96-98`) and honors `AMPLIFIER_HOME` for
+/// caches/`registry.json` only, so consulting it here scanned a dir
+/// sessions never live in whenever a user exported it.
 pub fn amplifier_home(home: &Path) -> PathBuf {
-    match std::env::var("AMPLIFIER_HOME") {
+    match std::env::var("FRESHELL_AMPLIFIER_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => home.join(".amplifier"),
     }
