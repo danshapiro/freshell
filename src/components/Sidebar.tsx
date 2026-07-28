@@ -804,7 +804,9 @@ export default function Sidebar({
             </div>
           ) : (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {visibleQuery && visibleSearchTier !== 'title'
+            {repoFilter !== ALL_REPOS
+              ? 'No sessions in selected repo'
+              : visibleQuery && visibleSearchTier !== 'title'
               ? 'No results found'
               : visibleQuery
               ? 'No matching sessions'

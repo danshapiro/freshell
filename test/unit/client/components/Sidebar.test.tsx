@@ -2499,6 +2499,100 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.getByText('Alpha session one')).toBeInTheDocument()
       expect(queryByRole('button', { name: /clear repo filter/i })).not.toBeInTheDocument()
     })
+
+    it('ANDs with visibility settings instead of replacing them', async () => {
+      const store = createTestStore({
+        sidebarSettings: { showSubagents: false },
+        projects: [
+          {
+            projectPath: '/home/user/repo-alpha',
+            sessions: [
+              {
+                sessionId: sessionId('alpha-main'),
+                projectPath: '/home/user/repo-alpha',
+                lastActivityAt: Date.now() - 1000,
+                title: 'Alpha main session',
+              },
+              {
+                sessionId: sessionId('alpha-sub'),
+                projectPath: '/home/user/repo-alpha',
+                lastActivityAt: Date.now() - 2000,
+                title: 'Alpha subagent session',
+                isSubagent: true,
+              },
+            ],
+          },
+          {
+            projectPath: '/home/user/repo-beta',
+            sessions: [
+              {
+                sessionId: sessionId('beta-main'),
+                projectPath: '/home/user/repo-beta',
+                lastActivityAt: Date.now() - 3000,
+                title: 'Beta main session',
+              },
+            ],
+          },
+        ],
+      })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      // Visibility setting hides the subagent before any repo filtering.
+      expect(screen.getByText('Alpha main session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha subagent session')).not.toBeInTheDocument()
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+
+      // Repo filter composes (AND): subagent stays hidden, other repo drops out.
+      expect(screen.getByText('Alpha main session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha subagent session')).not.toBeInTheDocument()
+      expect(screen.queryByText('Beta main session')).not.toBeInTheDocument()
+    })
+
+    it('coexists with the search tier dropdown while a query is active', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole, getByPlaceholderText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'alpha' } })
+
+      expect(getByRole('combobox', { name: /search tier/i })).toBeInTheDocument()
+      expect(getByRole('combobox', { name: /repo filter/i })).toBeInTheDocument()
+    })
+
+    it('keeps the selected repo option and shows a repo-aware empty state when a search empties the window', async () => {
+      const searchRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole, getByPlaceholderText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'zeta' } })
+      await act(async () => {
+        vi.advanceTimersByTime(300)
+        await Promise.resolve()
+      })
+      await act(async () => {
+        searchRequest.resolve({ results: [], tier: 'title', query: 'zeta', totalScanned: 0 })
+        await Promise.resolve()
+      })
+
+      // Selection survives the (empty) search commit and remains a valid option.
+      const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('/home/user/repo-alpha')
+      expect(Array.from(select.options).map((o) => o.value)).toContain('/home/user/repo-alpha')
+
+      // Empty state names the repo filter as a possible cause.
+      expect(screen.getByText('No sessions in selected repo')).toBeInTheDocument()
+    })
   })
 
   describe('Search loading state', () => {
