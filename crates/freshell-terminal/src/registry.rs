@@ -562,6 +562,15 @@ pub struct TerminalRegistry {
     /// one key could BOTH pass the `newest_live_by_create_request_id` check
     /// and both spawn — the exact duplicate-writer shape the dedupe closes.
     keyed_create_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Same-id double-resume guard (amplifier identity plan, F5/V7): resume
+    /// ids with an amplifier create currently in flight, keyed
+    /// `"resume:{mode}:{sid}"`. A SIBLING of `keyed_create_inflight`
+    /// (identical claim-before-spawn / release-after-insert semantics — the
+    /// §5.4 TOCTOU doc applies verbatim), deliberately NOT the same set: WS
+    /// `handle_create` claims client-supplied `createRequestId`s in
+    /// `keyed_create_inflight` itself, so a client could send a requestId
+    /// shaped `resume:amplifier:<sid>` and collide with the guard's keys.
+    resume_create_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Council rule 7 (D8): one in-flight create per sessionRef. Keyed
     /// `"provider\u{0}sessionId"` ([`session_ref_key`]); see
     /// [`SessionRefLease`] for the release/TTL/kill-before-release rules.
@@ -635,6 +644,7 @@ impl TerminalRegistry {
             )),
             respawn_generation_cap: Arc::new(AtomicI64::new(DEFAULT_RESPAWN_GENERATION_CAP)),
             keyed_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -831,6 +841,43 @@ impl TerminalRegistry {
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
+        // Duplicate-live-resume enforcement (amplifier identity plan,
+        // validated fix F5/V7): the callers' `has_live_resume` pre-check is
+        // check-then-act and can race across WS/REST tasks — this registry's
+        // own §5.4 doc (keyed_create_inflight) names the exact TOCTOU. Claim
+        // a resume-scoped reservation BEFORE the spawn and re-check live
+        // rows under it; the row itself is inserted before the reservation
+        // is released, so no observable gap remains. Scoped to amplifier:
+        // other modes keep their existing create semantics.
+        let resume_guard_key = if mode == "amplifier" {
+            resume_session_id.map(|sid| format!("resume:{mode}:{sid}"))
+        } else {
+            None
+        };
+        if let Some(key) = &resume_guard_key {
+            let claimed = self.begin_resume_create(key);
+            let duplicate_live = self.identity_probe_rows().iter().any(|row| {
+                row.mode == mode
+                    && row.status == TerminalRunStatus::Running
+                    && row.resume_session_id.as_deref() == resume_session_id
+            });
+            if !claimed || duplicate_live {
+                if claimed {
+                    self.end_resume_create(key);
+                }
+                // Distinguishable error contract consumed by the WS/REST
+                // handlers: ErrorKind::AlreadyExists ⇒ "session already
+                // open" reject.
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "duplicate live resume: {mode} session {} is already open in a live terminal",
+                        resume_session_id.unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+
         let now = now_ms();
         let shared = Arc::new(Mutex::new(TerminalShared {
             terminal_id: terminal_id.clone(),
@@ -890,7 +937,7 @@ impl TerminalRegistry {
             ingest(&sink_shared, msg)
         });
 
-        let pty = PtyTerminal::spawn_with_sink(
+        let pty = match PtyTerminal::spawn_with_sink(
             spec,
             env,
             terminal_id.clone(),
@@ -898,7 +945,17 @@ impl TerminalRegistry {
             ring_max_bytes,
             Some(sink),
             on_exit,
-        )?;
+        ) {
+            Ok(pty) => pty,
+            Err(err) => {
+                // Spawn failed: release the resume reservation so a retry
+                // isn't wedged behind a leaked claim (release-on-failure).
+                if let Some(key) = &resume_guard_key {
+                    self.end_resume_create(key);
+                }
+                return Err(err);
+            }
+        };
 
         // DIAG-01: terminal lifecycle event -- captured BEFORE `pty` is moved
         // into the registry, from the just-spawned PTY (so `pid` reflects
@@ -915,6 +972,13 @@ impl TerminalRegistry {
         );
         inner.revision += 1;
         drop(inner);
+
+        // The row is now observable (inserted above) — release the resume
+        // reservation. Insert-before-release means a concurrent create can
+        // never observe "no reservation AND no row" (release-on-success).
+        if let Some(key) = &resume_guard_key {
+            self.end_resume_create(key);
+        }
 
         // DIAG-01 + 2026-07-22 incident fix: log the REAL mode and whether a
         // resume id was applied. This line used to hardcode `mode = "shell"`,
@@ -1802,6 +1866,27 @@ impl TerminalRegistry {
             .remove(key);
     }
 
+    /// Same-id double-resume guard claim (see `resume_create_inflight`'s
+    /// field doc): reserve a `"resume:{mode}:{sid}"` key for an in-flight
+    /// amplifier resume create. `false` means another create currently holds
+    /// it. Mirrors [`Self::begin_keyed_create`]; pair with
+    /// [`Self::end_resume_create`].
+    fn begin_resume_create(&self, key: &str) -> bool {
+        self.resume_create_inflight
+            .lock()
+            .expect("resume-create inflight lock")
+            .insert(key.to_string())
+    }
+
+    /// Release a [`Self::begin_resume_create`] reservation (success OR
+    /// failure — mirrors [`Self::end_keyed_create`]).
+    fn end_resume_create(&self, key: &str) {
+        self.resume_create_inflight
+            .lock()
+            .expect("resume-create inflight lock")
+            .remove(key);
+    }
+
     /// Council rule 7 (D8): claim the one in-flight create slot for a
     /// sessionRef. Checks, in order:
     ///
@@ -2247,6 +2332,40 @@ impl TerminalRegistry {
         let s = shared.lock().expect("terminal lock");
         s.status == TerminalRunStatus::Running
     }
+}
+
+/// Same-id double-resume guard (launcher-assigned amplifier identity plan):
+/// does any RUNNING terminal of `mode` already carry `session_id` as its
+/// resume id? Amplifier has no upstream concurrency guard — two live PTYs
+/// resuming one session id would interleave writes into one session dir.
+/// Shared here so both the WS create path (`freshell-ws`) and the REST
+/// create path (`freshell-freshagent`) apply the identical predicate.
+/// NOTE: this is the friendly PRE-CHECK only — the race-free enforcement
+/// lives inside [`TerminalRegistry::create`] (validated fix F5).
+pub fn has_live_resume(rows: &[IdentityProbeRow], mode: &str, session_id: &str) -> bool {
+    rows.iter().any(|row| {
+        row.mode == mode
+            && row.status == TerminalRunStatus::Running
+            && row.resume_session_id.as_deref() == Some(session_id)
+    })
+}
+
+/// [`has_live_resume`] EXCLUDING one terminal id — the exit-hook stub-GC
+/// guard (validated fix F5/V7's GC-vs-second-resume race): "is another live
+/// terminal (not me) currently resuming this session id?" Used by both
+/// exit hooks before deleting a never-used stub.
+pub fn has_other_live_resume(
+    rows: &[IdentityProbeRow],
+    mode: &str,
+    session_id: &str,
+    excluding_terminal_id: &str,
+) -> bool {
+    rows.iter().any(|row| {
+        row.terminal_id != excluding_terminal_id
+            && row.mode == mode
+            && row.status == TerminalRunStatus::Running
+            && row.resume_session_id.as_deref() == Some(session_id)
+    })
 }
 
 /// The reader-thread sink body (`onTerminalOutputRaw` → append + live flush,
@@ -4770,5 +4889,192 @@ mod tests {
             None,
             "identity arm requires the owner terminal to probe Running"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Same-id double-resume guard (amplifier identity plan, F5/V7):
+    // shared predicates over identity-probe rows.
+    // ------------------------------------------------------------------
+
+    /// Build an [`IdentityProbeRow`] with the given identity-relevant fields
+    /// (remaining fields defaulted).
+    fn probe_row(
+        terminal_id: &str,
+        mode: &str,
+        status: TerminalRunStatus,
+        resume_session_id: Option<&str>,
+    ) -> IdentityProbeRow {
+        IdentityProbeRow {
+            terminal_id: terminal_id.to_string(),
+            mode: mode.to_string(),
+            status,
+            created_at: 0,
+            resume_session_id: resume_session_id.map(str::to_string),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn has_live_resume_matches_only_running_same_mode_same_id() {
+        let rows = vec![
+            probe_row("t1", "amplifier", TerminalRunStatus::Running, Some("sid-1")),
+            probe_row("t2", "amplifier", TerminalRunStatus::Exited, Some("sid-2")),
+            probe_row("t3", "codex", TerminalRunStatus::Running, Some("sid-3")),
+        ];
+        assert!(has_live_resume(&rows, "amplifier", "sid-1"));
+        assert!(!has_live_resume(&rows, "amplifier", "sid-2")); // exited
+        assert!(!has_live_resume(&rows, "amplifier", "sid-3")); // other mode
+        assert!(!has_live_resume(&rows, "amplifier", "sid-9")); // unknown
+    }
+
+    #[test]
+    fn has_other_live_resume_excludes_the_named_terminal() {
+        let rows = vec![probe_row(
+            "t1",
+            "amplifier",
+            TerminalRunStatus::Running,
+            Some("sid-1"),
+        )];
+        assert!(!has_other_live_resume(&rows, "amplifier", "sid-1", "t1")); // only me
+        assert!(has_other_live_resume(&rows, "amplifier", "sid-1", "t9")); // someone else
+    }
+
+    /// A long-lived spawn spec (stays Running for the test's lifetime) —
+    /// the same `/bin/sh -c 'sleep 30'` shape the DIAG-01 create tests use.
+    fn sleeper_spawn_spec() -> SpawnSpec {
+        SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// **RED (F5)**: two creates, same mode `"amplifier"`, same
+    /// `resume_session_id`, first still Running ⇒ the second must return
+    /// `ErrorKind::AlreadyExists` (the WS/REST handlers map this to the
+    /// "session already open" reject).
+    #[test]
+    fn amplifier_create_with_duplicate_live_resume_returns_already_exists() {
+        let registry = test_registry();
+        let spec = sleeper_spawn_spec();
+        let env = std::collections::BTreeMap::new();
+        registry
+            .create(
+                &spec,
+                &env,
+                "T-amp-dup-a".into(),
+                "S-amp-dup-a".into(),
+                "amplifier",
+                Some("sid-dup"),
+                Some("req-a"),
+                None,
+                None,
+            )
+            .expect("first create succeeds");
+        let err = registry
+            .create(
+                &spec,
+                &env,
+                "T-amp-dup-b".into(),
+                "S-amp-dup-b".into(),
+                "amplifier",
+                Some("sid-dup"),
+                Some("req-b"),
+                None,
+                None,
+            )
+            .expect_err("second live resume of the same amplifier session must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        registry.kill("T-amp-dup-a");
+    }
+
+    /// Release-on-success: once the first live resume is GONE (killed —
+    /// kill removes the row), a new create with the same session id must
+    /// succeed, proving the successful create released its reservation.
+    #[test]
+    fn amplifier_resume_reservation_is_released_after_successful_create() {
+        let registry = test_registry();
+        let spec = sleeper_spawn_spec();
+        let env = std::collections::BTreeMap::new();
+        registry
+            .create(
+                &spec,
+                &env,
+                "T-amp-rel-a".into(),
+                "S-amp-rel-a".into(),
+                "amplifier",
+                Some("sid-rel"),
+                Some("req-rel-a"),
+                None,
+                None,
+            )
+            .expect("first create succeeds");
+        registry.kill("T-amp-rel-a");
+        registry
+            .create(
+                &spec,
+                &env,
+                "T-amp-rel-b".into(),
+                "S-amp-rel-b".into(),
+                "amplifier",
+                Some("sid-rel"),
+                Some("req-rel-b"),
+                None,
+                None,
+            )
+            .expect("re-resume after the first terminal died must succeed");
+        registry.kill("T-amp-rel-b");
+    }
+
+    /// Release-on-failure: a spawn failure (bad program) must release the
+    /// reservation, so a subsequent valid create with the same session id
+    /// succeeds instead of being wedged behind a leaked claim.
+    #[test]
+    fn amplifier_resume_reservation_is_released_after_spawn_failure() {
+        let registry = test_registry();
+        let env = std::collections::BTreeMap::new();
+        let bad_spec = SpawnSpec {
+            program: "/nonexistent/definitely-not-a-program".into(),
+            args: vec![],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let err = registry
+            .create(
+                &bad_spec,
+                &env,
+                "T-amp-fail-a".into(),
+                "S-amp-fail-a".into(),
+                "amplifier",
+                Some("sid-fail"),
+                Some("req-fail-a"),
+                None,
+                None,
+            )
+            .expect_err("spawn of a nonexistent program must fail");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a spawn failure is not the duplicate-resume signal"
+        );
+        registry
+            .create(
+                &sleeper_spawn_spec(),
+                &env,
+                "T-amp-fail-b".into(),
+                "S-amp-fail-b".into(),
+                "amplifier",
+                Some("sid-fail"),
+                Some("req-fail-b"),
+                None,
+                None,
+            )
+            .expect("valid create after a failed spawn must succeed (reservation released)");
+        registry.kill("T-amp-fail-b");
     }
 }
