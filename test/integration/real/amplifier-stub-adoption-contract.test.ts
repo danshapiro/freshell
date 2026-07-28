@@ -18,10 +18,14 @@
 //
 // Isolation (VALIDATED, V1): the real CLI stores sessions ONLY under
 // $HOME/.amplifier (session_store.py:96-98 hardcodes Path.home();
-// AMPLIFIER_HOME moves ONLY caches/registry.json, never sessions), so the
-// CLI is sandboxed via HOME=<tmp>. NOTE: the first run in a fresh HOME
-// performs network bundle-prepare git clones (~30s observed) — the
-// per-run timeouts below are sized for that.
+// AMPLIFIER_HOME moves ONLY caches/registry.json, never sessions), so session
+// data is sandboxed via HOME=<tmp>. HOME alone does NOT isolate Amplifier's
+// Python environment: first-run provider activation installs editable packages
+// into sys.executable. We therefore clone the real CLI's complete Python
+// environment and run that private interpreter. Provider/module installs can
+// only mutate the disposable clone, never the user's shared Amplifier tool.
+// NOTE: the first run in a fresh HOME performs network bundle-prepare git
+// clones (~30s observed) — the per-run timeouts below are sized for that.
 //
 // Gates mirror amplifier-launch-smoke.test.ts: on-PATH probe (top-level
 // await), FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1, provider key for the
@@ -38,7 +42,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import { describe, it, expect } from 'vitest'
+import { afterAll, beforeAll, describe, it, expect } from 'vitest'
+import {
+  createIsolatedAmplifierCli,
+  type IsolatedAmplifierCli,
+} from '../../helpers/amplifier-cli-isolation.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -67,6 +75,21 @@ function cwdSlug(resolvedCwd: string): string {
   return slug.startsWith('-') ? slug : `-${slug}`
 }
 
+function isolatedAmplifierEnv(home: string): NodeJS.ProcessEnv {
+  const inherited = { ...process.env }
+  delete inherited.AMPLIFIER_HOME
+  delete inherited.PYTHONHOME
+  delete inherited.PYTHONPATH
+  delete inherited.VIRTUAL_ENV
+  return {
+    ...inherited,
+    HOME: home,
+    AMPLIFIER_HOME: path.join(home, '.amplifier'),
+    PROMPT_TOOLKIT_NO_CPR: '1',
+    PYTHONDONTWRITEBYTECODE: '1',
+  }
+}
+
 // The exact stub shape the Rust broker writes (plan Global Constraints).
 // `home` is the sandbox $HOME — the CLI hardcodes `$HOME/.amplifier` for
 // session storage (validated), hence the '.amplifier' segment here.
@@ -92,16 +115,17 @@ async function writeStub(home: string, resolvedCwd: string, sessionId: string): 
 // interactive until OUR SIGTERM. timeoutMs must absorb the first run's
 // network bundle-prepare git clones in a fresh HOME (~30s observed).
 function runResume(
+  cli: IsolatedAmplifierCli,
   sessionId: string,
   opts: { home: string; cwd: string; timeoutMs: number },
 ): Promise<{ output: string; exitedBeforeTimeout: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn('amplifier', ['resume', sessionId], {
+    const child = spawn(cli.command, [...cli.baseArgs, 'resume', sessionId], {
       cwd: opts.cwd,
       // VALIDATED (V1): HOME is the isolation lever — session storage is
       // hardcoded to $HOME/.amplifier; AMPLIFIER_HOME would isolate nothing
       // but caches.
-      env: { ...process.env, HOME: opts.home, PROMPT_TOOLKIT_NO_CPR: '1' },
+      env: isolatedAmplifierEnv(opts.home),
     })
     let output = ''
     let timedOut = false
@@ -122,9 +146,44 @@ function normalize(s: string): string {
 }
 
 describe('amplifier stub-adoption contract (real CLI)', () => {
+  let isolatedCli: IsolatedAmplifierCli | undefined
+  let isolatedHome: string | undefined
+
+  beforeAll(async () => {
+    if (onPath && realEnabled) {
+      isolatedHome = await fs.mkdtemp(path.join(os.tmpdir(), 'amp-contract-home-'))
+      try {
+        isolatedCli = await createIsolatedAmplifierCli()
+      } catch (error) {
+        await fs.rm(isolatedHome, { recursive: true, force: true })
+        isolatedHome = undefined
+        throw error
+      }
+    }
+  }, 60_000)
+
+  afterAll(async () => {
+    try {
+      await isolatedCli?.dispose()
+    } finally {
+      if (isolatedHome) {
+        await fs.rm(isolatedHome, { recursive: true, force: true })
+      }
+    }
+  })
+
+  function cli(): IsolatedAmplifierCli {
+    if (!isolatedCli) throw new Error('Isolated Amplifier CLI was not prepared')
+    return isolatedCli
+  }
+
+  function home(): string {
+    if (!isolatedHome) throw new Error('Isolated Amplifier HOME was not prepared')
+    return isolatedHome
+  }
+
   const itAdoption = onPath && realEnabled ? it : it.skip
   itAdoption('adopts a broker-shaped pre-created stub under the cwd slug', async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'amp-contract-home-'))
     const cwdRaw = await fs.mkdtemp(path.join(os.tmpdir(), 'amp-contract-cwd-'))
     const cwd = await fs.realpath(cwdRaw) // mirror Path.cwd().resolve()
     try {
@@ -133,8 +192,16 @@ describe('amplifier stub-adoption contract (real CLI)', () => {
       // signature must be id-independent — that CALIBRATES the signature and
       // makes the adoption comparison below non-vacuous (validated V3: raw
       // rejection outputs differ only by the echoed id).
-      const unknown1 = await runResume(randomUUID(), { home, cwd, timeoutMs: 60_000 })
-      const unknown2 = await runResume(randomUUID(), { home, cwd, timeoutMs: 60_000 })
+      const unknown1 = await runResume(cli(), randomUUID(), {
+        home: home(),
+        cwd,
+        timeoutMs: 60_000,
+      })
+      const unknown2 = await runResume(cli(), randomUUID(), {
+        home: home(),
+        cwd,
+        timeoutMs: 60_000,
+      })
       expect(normalize(unknown1.output)).toEqual(normalize(unknown2.output))
       // Rejections self-exit on their own (validated: exit 1 in ~1-2s,
       // before bundle/provider init) — never reach our SIGTERM.
@@ -142,8 +209,12 @@ describe('amplifier stub-adoption contract (real CLI)', () => {
       expect(unknown2.exitedBeforeTimeout).toBe(true)
 
       const sessionId = randomUUID()
-      const dir = await writeStub(home, cwd, sessionId)
-      const stub = await runResume(sessionId, { home, cwd, timeoutMs: 60_000 })
+      const dir = await writeStub(home(), cwd, sessionId)
+      const stub = await runResume(cli(), sessionId, {
+        home: home(),
+        cwd,
+        timeoutMs: 60_000,
+      })
 
       // Adoption signal 1: the id-normalized stub output must NOT match the
       // calibrated rejection signature.
@@ -160,34 +231,39 @@ describe('amplifier stub-adoption contract (real CLI)', () => {
       // Zero-turn adoption must not mark the session used (GC contract).
       expect(meta.turn_count).toBeUndefined()
     } finally {
-      await fs.rm(home, { recursive: true, force: true }).catch(() => {})
       await fs.rm(cwdRaw, { recursive: true, force: true }).catch(() => {})
     }
   }, 120_000)
 
   const itSlug = onPath && realEnabled && hasProviderKey ? it : it.skip
   itSlug('creates its own session dirs under exactly our computed slug, with turn_count', async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'amp-contract-slug-'))
     const cwdRaw = await fs.mkdtemp(path.join(os.tmpdir(), 'amp-contract-slugcwd-'))
     const cwd = await fs.realpath(cwdRaw)
     try {
       await execFileAsync(
-        'amplifier',
-        ['run', '--output-format', 'json', 'Reply with exactly: contract-ok'],
+        cli().command,
+        [
+          ...cli().baseArgs,
+          'run',
+          '--output-format',
+          'json',
+          'Reply with exactly: contract-ok',
+        ],
         {
           cwd,
-          // Same HOME isolation as the adoption test (sessions are
-          // hardcoded to $HOME/.amplifier — validated V1).
-          env: { ...process.env, HOME: home, PROMPT_TOOLKIT_NO_CPR: '1' },
+          // Same HOME isolation as the adoption test (sessions are hardcoded
+          // to $HOME/.amplifier — validated V1). AMPLIFIER_HOME is also pinned
+          // so an inherited value cannot redirect cache writes outside it.
+          env: isolatedAmplifierEnv(home()),
           timeout: 180_000,
           maxBuffer: 16 * 1024 * 1024,
         },
       )
-      const projectDirs = await fs.readdir(path.join(home, '.amplifier', 'projects'))
+      const projectDirs = await fs.readdir(path.join(home(), '.amplifier', 'projects'))
       // EXACT-match slug contract: a mismatch here fails silently in prod
       // (stub dir and amplifier's own dir diverge), so this must be strict.
       expect(projectDirs).toContain(cwdSlug(cwd))
-      const sessionsDir = path.join(home, '.amplifier', 'projects', cwdSlug(cwd), 'sessions')
+      const sessionsDir = path.join(home(), '.amplifier', 'projects', cwdSlug(cwd), 'sessions')
       const sessions = await fs.readdir(sessionsDir)
       expect(sessions.length).toBeGreaterThan(0)
       const meta = JSON.parse(
@@ -197,7 +273,6 @@ describe('amplifier stub-adoption contract (real CLI)', () => {
       expect(meta.turn_count).toBeDefined()
       expect(meta.working_dir).toBe(cwd)
     } finally {
-      await fs.rm(home, { recursive: true, force: true }).catch(() => {})
       await fs.rm(cwdRaw, { recursive: true, force: true }).catch(() => {})
     }
   }, 240_000)
