@@ -450,8 +450,15 @@ Pin additive JSON compatibility:
 - two Amplifier rows with the same textual ID and different validated project
   scopes coexist, survive reload, and resolve only with the matching cwd;
 - an old unscoped Amplifier row loads as legacy/unknown scope and cannot
-  authorize until an exact cwd-scoped proof disambiguates it; and
+  authorize until an exact cwd-scoped proof disambiguates it. A successful
+  launch writes a new scoped successor; the old row remains a read-only
+  compatibility alias, is ignored whenever a matching scoped row exists, and
+  is never deleted or treated as `Allocated`; and
 - the scoped filename/index migration never overwrites or deletes an old row.
+
+Simulate failure before/after the scoped successor write and reload the
+ledger: migration is idempotent, the alias never shadows an existing scoped
+row, and write failure remains retryable.
 
 Run:
 
@@ -489,6 +496,7 @@ cargo test -p freshell-ws pane_ledger -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile -- --nocapture
 cargo test -p freshell-server recovery_providers -- --nocapture
 cargo test -p freshell-protocol --test pane_reconcile -- --nocapture
+cargo check --workspace
 cargo fmt --check
 git diff --check
 git add Cargo.toml Cargo.lock crates/freshell-recovery crates/freshell-protocol \
@@ -617,6 +625,7 @@ cargo test -p freshell-freshagent claude_snapshot -- --nocapture
 cargo test -p freshell-platform cli_launch -- --nocapture
 cargo test -p freshell-sessions --test codex_exact -- --nocapture
 cargo test -p freshell-sessions codex -- --nocapture
+cargo check --workspace
 cargo fmt --check
 git diff --check
 git add Cargo.toml Cargo.lock crates/freshell-freshagent \
@@ -630,6 +639,7 @@ git commit -m "feat(recovery): prove exact claude and codex sessions"
 ### Task 3: Exact OpenCode and Cwd-Scoped Amplifier Proofs
 
 **Files:**
+- Modify `crates/freshell-sessions/Cargo.toml`
 - Add `crates/freshell-sessions/src/opencode_database.rs`
 - Modify `crates/freshell-sessions/src/parse/opencode.rs`
 - Modify `crates/freshell-sessions/src/parse/mod.rs`
@@ -753,11 +763,12 @@ cargo test -p freshell-sessions opencode_locator -- --nocapture
 cargo test -p freshell-sessions directory_index -- --nocapture
 cargo test -p freshell-sessions amplifier_stub -- --nocapture
 cargo test -p freshell-platform cli_launch -- --nocapture
-cargo test -p freshell-opencode serve -- --nocapture
-cargo test -p freshell-freshagent opencode -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-opencode serve -- --nocapture"
+scripts/sandbox-test.sh "cargo test -p freshell-freshagent opencode -- --nocapture"
 cargo test -p freshell-ws opencode_association -- --nocapture
-cargo test -p freshell-server --test opencode_database_alignment -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-server --test opencode_database_alignment -- --nocapture"
 cargo test -p freshell-server recovery_providers -- --nocapture
+cargo check --workspace
 cargo fmt --check
 git diff --check
 git add crates/freshell-sessions crates/freshell-platform \
@@ -774,6 +785,7 @@ git commit -m "feat(recovery): prove opencode and amplifier recovery identities"
 ### Task 4: Bounded Request-Local Reconciliation and One Cross-Kind Owner
 
 **Files:**
+- Modify `Cargo.lock`
 - Modify `crates/freshell-recovery/src/coordinator.rs`
 - Modify `crates/freshell-recovery/src/ownership.rs`
 - Modify `crates/freshell-ws/src/existence.rs`
@@ -953,7 +965,7 @@ Amplifier scopes live prove each pane selects only its own terminal.
 ```bash
 cargo test -p freshell-recovery ownership -- --nocapture
 scripts/sandbox-test.sh "cargo test -p freshell-ws --test session_ref_singleflight -- --nocapture"
-cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture"
 ```
 
 - [ ] **Step 5: Implement and inject the shared arbiter**
@@ -971,11 +983,12 @@ cargo test -p freshell-ws reconcile -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile_freshagent -- --nocapture
 scripts/sandbox-test.sh "cargo test -p freshell-ws --test session_ref_singleflight -- --nocapture"
-cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture"
 cargo test -p freshell-server existence -- --nocapture
+cargo check --workspace
 cargo fmt --check
 git diff --check
-git add crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
+git add Cargo.lock crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
   crates/freshell-terminal crates/freshell-server
 git commit -m "fix(recovery): reconcile exact sessions off thread without guessing"
 ```
@@ -1157,8 +1170,8 @@ forward-compatible deserialization by the frozen old-client fixture.
 
 ```bash
 cargo test -p freshell-protocol --test roundtrip restore_launch -- --nocapture
-cargo test -p freshell-ws launch_lifecycle -- --nocapture
-cargo test -p freshell-freshagent restore_identity -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws launch_lifecycle -- --nocapture"
+scripts/sandbox-test.sh "cargo test -p freshell-freshagent restore_identity -- --nocapture"
 cargo test -p freshell-platform cli_launch -- --nocapture
 npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --config config/vitest/vitest.config.ts
 ```
@@ -1214,8 +1227,8 @@ controls whether a new client may release durable creates.
 - [ ] **Step 6: Run focused checks and commit**
 
 ```bash
-cargo test -p freshell-ws launch_lifecycle -- --nocapture
-cargo test -p freshell-freshagent restore_identity -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws launch_lifecycle -- --nocapture"
+scripts/sandbox-test.sh "cargo test -p freshell-freshagent restore_identity -- --nocapture"
 cargo test -p freshell-platform cli_launch -- --nocapture
 cargo test -p freshell-protocol --test roundtrip restore_launch -- --nocapture
 cargo test -p freshell-ws capability_negotiation -- --nocapture
@@ -1223,7 +1236,8 @@ npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --con
 scripts/sandbox-test.sh "cargo test -p freshell-ws --test session_ref_singleflight -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-ws launch_owner_lifecycle -- --nocapture"
 scripts/sandbox-test.sh "cargo test --workspace --all-targets"
-cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture"
+cargo check --workspace
 cargo fmt --check
 git diff --check
 git add crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
@@ -1578,11 +1592,9 @@ cell in each direction.
 - [ ] **Step 5: Run browser verification and commit**
 
 ```bash
-npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-handshake-rust.spec.ts
-npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts
-npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 \
-  test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts \
-  -g "17 durable panes restore while History remains blocked"
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-handshake-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts -g "17 durable panes restore while History remains blocked"'
 git diff --check
 git add test/e2e-browser
 git commit -m "test(recovery): prove fast exact restore while history is blocked"
@@ -1613,9 +1625,9 @@ cargo test -p freshell-sessions amplifier_stub -- --nocapture
 cargo test -p freshell-recovery -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile_freshagent -- --nocapture
-cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture
-cargo test -p freshell-ws launch_lifecycle -- --nocapture
-cargo test -p freshell-freshagent restore_identity -- --nocapture
+scripts/sandbox-test.sh "cargo test -p freshell-ws --test cross_kind_liveness -- --nocapture"
+scripts/sandbox-test.sh "cargo test -p freshell-ws launch_lifecycle -- --nocapture"
+scripts/sandbox-test.sh "cargo test -p freshell-freshagent restore_identity -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-ws --test session_ref_singleflight -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-ws launch_owner_lifecycle -- --nocapture"
 scripts/sandbox-test.sh "cargo test --workspace --all-targets"
@@ -1630,13 +1642,8 @@ npm run test:vitest -- run \
   test/unit/client/components/DeadSessionPanel.test.tsx \
   --config config/vitest/vitest.config.ts
 
-npm run test:e2e -- --project=rust-chromium \
-  test/e2e-browser/specs/reconcile-handshake-rust.spec.ts \
-  test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts
-npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 \
-  --repeat-each=20 \
-  test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts \
-  -g "17 durable panes restore while History remains blocked"
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-handshake-rust.spec.ts test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts -g "17 durable panes restore while History remains blocked"'
 
 FRESHELL_TEST_SUMMARY='verify Item 1 exact automatic restart recovery' npm run check
 git status --short
