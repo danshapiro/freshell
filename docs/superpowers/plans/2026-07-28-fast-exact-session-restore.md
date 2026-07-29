@@ -284,7 +284,6 @@ snapshot fact maps to retry. That is the state-race fence.
 - `src/store/paneTypes.ts`
 - `src/store/panesSlice.ts`
 - `docs/index.html`
-- `docs/index.html`
 
 ### Tests
 
@@ -639,6 +638,7 @@ git commit -m "feat(recovery): prove exact claude and codex sessions"
 ### Task 3: Exact OpenCode and Cwd-Scoped Amplifier Proofs
 
 **Files:**
+- Modify `Cargo.lock`
 - Modify `crates/freshell-sessions/Cargo.toml`
 - Add `crates/freshell-sessions/src/opencode_database.rs`
 - Modify `crates/freshell-sessions/src/parse/opencode.rs`
@@ -771,7 +771,7 @@ cargo test -p freshell-server recovery_providers -- --nocapture
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add crates/freshell-sessions crates/freshell-platform \
+git add Cargo.lock crates/freshell-sessions crates/freshell-platform \
   crates/freshell-opencode crates/freshell-freshagent/src/lib.rs \
   crates/freshell-freshagent/src/opencode_ws.rs \
   crates/freshell-freshagent/src/terminal_tabs.rs \
