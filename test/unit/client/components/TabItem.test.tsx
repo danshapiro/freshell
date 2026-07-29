@@ -654,10 +654,10 @@ describe('TabItem', () => {
   })
 
   describe('fixed tab width', () => {
-    it('every tab is fixed at 180px (w-[180px]) and never flex-shrinks', () => {
+    it('every tab is fixed at 150px (w-[150px]) and never flex-shrinks', () => {
       render(<TabItem {...defaultProps} />)
       const el = getTabElement()
-      expect(el?.className).toContain('w-[180px]')
+      expect(el?.className).toContain('w-[150px]')
       expect(el?.className).toContain('shrink-0')
     })
 
