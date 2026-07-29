@@ -186,12 +186,13 @@ export default function TabItem({
   const tabContent = (
     <div
       className={cn(
-        'group relative flex items-center gap-2 h-8 w-60 shrink-0 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
+        'group relative flex items-center gap-2 h-8 w-[180px] shrink-0 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
-              visualState === 'working'
-                && 'border-t-[3px] border-t-zinc-500 dark:border-t-zinc-400',
+              // 'working' deliberately gets NO extra styling — a working tab
+              // looks exactly like a plain tab; data-visual-state still
+              // reports it for tests/automation.
               isGreen
                 && 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
               // NOTE (deliberate behavior change, decided during load-bearing
@@ -203,10 +204,10 @@ export default function TabItem({
             )
           : cn(
               'shadow-[inset_0_-1px_0_hsl(var(--muted-foreground)/0.45)]',
-              visualState === 'neutral'
+              // 'working' renders identically to 'neutral' (no darkening) —
+              // only data-visual-state distinguishes them.
+              (visualState === 'neutral' || visualState === 'working')
                 && 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90',
-              visualState === 'working'
-                && 'bg-zinc-300 text-zinc-800 hover:bg-zinc-300/80 dark:bg-zinc-600/70 dark:text-zinc-100 dark:hover:bg-zinc-600/60',
               // Mutually exclusive: darken REPLACES the emerald fill (plain-join
               // cn cannot safely stack conflicting bg-*/text-* utilities).
               isGreen

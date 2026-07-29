@@ -5,7 +5,9 @@ import type { PaneContent } from '@/store/paneTypes'
  * Canonical tab visual states (presentation layer ONLY — the underlying
  * server-authoritative status machinery is untouched):
  *
- * - 'working'       GREY tab. An agent is actively working (formerly blue/busy).
+ * - 'working'       An agent is actively working (formerly blue/busy). Renders
+ *                   IDENTICALLY to 'neutral' — no special styling — but is
+ *                   still exposed via data-visual-state for tests/automation.
  *                   Source: resolvePaneActivity via getBusyPaneIdsForTab.
  * - 'ready-unacked' GREEN tab + GREEN BAR. A turn completed (or the agent is
  *                   waiting for approval) and the user has not visited the tab

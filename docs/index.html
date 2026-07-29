@@ -105,7 +105,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   background: hsl(var(--muted-foreground) / .45); z-index: 0;
 }
 .tab {
-  width: 240px; flex: none;
+  width: 180px; flex: none;
   height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 8px;
   border: 1px solid hsl(var(--muted-foreground) / .45); border-bottom: 1px solid hsl(var(--muted-foreground) / .45);
   border-radius: 6px 6px 0 0; cursor: pointer; white-space: nowrap;
@@ -122,8 +122,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   content: ''; position: absolute; bottom: -1px; left: 0; right: 0;
   height: 2px; background: hsl(var(--background));
 }
-/* Canonical tab states: grey = working, green = ready, green + bar = ready & unacknowledged */
-.tab.working { background: #d4d4d8; color: #27272a; }
+/* Canonical tab states: working looks like a plain tab, green = ready, green + bar = ready & unacknowledged */
 .tab.ready { background: #d1fae5; color: #064e3b; }
 .tab.ready::before { content: none; }
 .tab.ready.unacked::before {

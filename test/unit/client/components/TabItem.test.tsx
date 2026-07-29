@@ -124,10 +124,11 @@ describe('TabItem', () => {
   })
 
   describe('canonical visual states', () => {
-    it('working: busy inactive tab renders GREY (not blue, not emerald)', () => {
+    it('working: busy inactive tab renders exactly like a NEUTRAL tab (no darkening)', () => {
       render(<TabItem {...defaultProps} busy={true} />)
       const el = getTabElement()
-      expect(el?.className).toContain('bg-zinc-300')
+      expect(el?.className).toContain('bg-muted')
+      expect(el?.className).not.toContain('bg-zinc-300')
       expect(el?.className).not.toContain('bg-emerald-100')
       expect(el?.className).not.toContain('blue-500')
       // Structural busy marker — the out-of-task suites in Step 4b re-target
@@ -163,11 +164,13 @@ describe('TabItem', () => {
       expect(el?.className).toContain('border-t-success')
     })
 
-    it('working takes precedence over ready/attention', () => {
+    it('working takes precedence over ready/attention (neutral look, no green)', () => {
       render(<TabItem {...defaultProps} busy={true} isReady={true} needsAttention={true} />)
       const el = getTabElement()
-      expect(el?.className).toContain('bg-zinc-300')
+      expect(el?.className).toContain('bg-muted')
+      expect(el?.className).not.toContain('bg-zinc-300')
       expect(el?.className).not.toContain('bg-emerald-100')
+      expect(el?.getAttribute('data-visual-state')).toBe('working')
       expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
     })
 
@@ -651,10 +654,10 @@ describe('TabItem', () => {
   })
 
   describe('fixed tab width', () => {
-    it('every tab is fixed at 240px (w-60) and never flex-shrinks', () => {
+    it('every tab is fixed at 180px (w-[180px]) and never flex-shrinks', () => {
       render(<TabItem {...defaultProps} />)
       const el = getTabElement()
-      expect(el?.className).toContain('w-60')
+      expect(el?.className).toContain('w-[180px]')
       expect(el?.className).toContain('shrink-0')
     })
 
