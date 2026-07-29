@@ -193,6 +193,31 @@ fn positive_result_matches_query(
     }
 }
 
+/// Address an invalid direct-registry query without inventing an identity.
+///
+/// A mode mismatch can still name a complete, valid locator for the provider
+/// carried by the session ref. Canonicalize that recognized identity so the
+/// invalid query poisons an equivalent valid duplicate before provider I/O.
+/// Unknown providers and invalid IDs remain under their raw keys: guessing a
+/// canonical identity for malformed input could poison an unrelated lookup.
+fn invalid_query_key(
+    query: &ExactRecoveryQuery,
+    issue: &ExactRecoveryIssue,
+) -> ExactRecoveryLookupKey {
+    if issue == &ExactRecoveryIssue::ProviderModeMismatch {
+        if let Some(provider) = DurableRecoveryProvider::parse(&query.key.session_ref.provider) {
+            if let Ok(session_ref) = validate_session_ref(provider.as_str(), &query.key.session_ref)
+            {
+                return ExactRecoveryLookupKey {
+                    session_ref,
+                    cwd: query.key.cwd.clone(),
+                };
+            }
+        }
+    }
+    query.key.clone()
+}
+
 impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
     fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot {
         // Request-local normalized dedupe. Materialization advances
@@ -206,8 +231,9 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
             {
                 Ok(session_ref) => session_ref,
                 Err(issue) => {
-                    invalid_keys.insert(query.key.clone());
-                    snapshot.insert(query.key.clone(), ExactRecoveryState::Invalid(issue));
+                    let key = invalid_query_key(query, &issue);
+                    invalid_keys.insert(key.clone());
+                    snapshot.insert(key, ExactRecoveryState::Invalid(issue));
                     continue;
                 }
             };
@@ -395,6 +421,156 @@ mod tests {
                 "an invalid duplicate must conservatively close the provider I/O door"
             );
         }
+    }
+
+    #[test]
+    fn registry_canonicalizes_a_case_variant_mode_mismatch_before_invalid_dominance() {
+        let uppercase = "550E8400-E29B-41D4-A716-446655440000";
+        let canonical = "550e8400-e29b-41d4-a716-446655440000";
+        let valid = query("claude", uppercase);
+        let mut mismatched = valid.clone();
+        mismatched.mode = DurableRecoveryProvider::Codex;
+        let canonical_key = ExactRecoveryLookupKey {
+            session_ref: SessionLocator {
+                provider: "claude".to_string(),
+                session_id: canonical.to_string(),
+            },
+            cwd: valid.key.cwd.clone(),
+        };
+
+        for queries in [
+            vec![valid.clone(), mismatched.clone()],
+            vec![mismatched.clone(), valid.clone()],
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = RecoveryProviderRegistry::new();
+            registry
+                .register(
+                    DurableRecoveryProvider::Claude,
+                    Arc::new(CountingProvider {
+                        calls: Arc::clone(&calls),
+                    }),
+                )
+                .unwrap();
+
+            assert_eq!(
+                registry.lookup_many_blocking(&queries),
+                ExactRecoverySnapshot::from([(
+                    canonical_key.clone(),
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::ProviderModeMismatch),
+                )]),
+                "valid and invalid case variants are one canonical poisoned identity"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a canonical invalid duplicate must close the provider I/O door in either order"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_does_not_let_an_unrelated_canonical_invalid_key_poison_a_valid_key() {
+        let valid = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        let mut unrelated = query("claude", "6BA7B810-9DAD-11D1-80B4-00C04FD430C8");
+        unrelated.mode = DurableRecoveryProvider::Codex;
+        let unrelated_key = ExactRecoveryLookupKey {
+            session_ref: SessionLocator {
+                provider: "claude".to_string(),
+                session_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+            },
+            cwd: unrelated.key.cwd.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CountingProvider {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.lookup_many_blocking(&[unrelated, valid.clone()]),
+            ExactRecoverySnapshot::from([
+                (
+                    unrelated_key,
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::ProviderModeMismatch),
+                ),
+                (
+                    valid.key,
+                    ExactRecoveryState::Retryable(ExactRecoveryIssue::Unproved),
+                ),
+            ])
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the distinct valid identity reaches its provider"
+        );
+    }
+
+    #[test]
+    fn registry_keeps_uncanonicalizable_invalid_identities_raw_and_closed() {
+        let unknown = ExactRecoveryQuery {
+            mode: DurableRecoveryProvider::Claude,
+            key: ExactRecoveryLookupKey {
+                session_ref: SessionLocator {
+                    provider: "future".to_string(),
+                    session_id: "550E8400-E29B-41D4-A716-446655440000".to_string(),
+                },
+                cwd: Some(PathBuf::from("/unknown")),
+            },
+            materialization: MaterializationState::Unknown,
+        };
+        let invalid_uuid = ExactRecoveryQuery {
+            mode: DurableRecoveryProvider::Claude,
+            key: ExactRecoveryLookupKey {
+                session_ref: SessionLocator {
+                    provider: "claude".to_string(),
+                    session_id: "not-a-uuid".to_string(),
+                },
+                cwd: Some(PathBuf::from("/invalid-uuid")),
+            },
+            materialization: MaterializationState::Unknown,
+        };
+        let traversal = ExactRecoveryQuery {
+            mode: DurableRecoveryProvider::Codex,
+            key: ExactRecoveryLookupKey {
+                session_ref: SessionLocator {
+                    provider: "amplifier".to_string(),
+                    session_id: "../escaped".to_string(),
+                },
+                cwd: Some(PathBuf::from("/traversal")),
+            },
+            materialization: MaterializationState::Unknown,
+        };
+        let registry = RecoveryProviderRegistry::new();
+
+        assert_eq!(
+            registry.lookup_many_blocking(&[
+                unknown.clone(),
+                invalid_uuid.clone(),
+                traversal.clone()
+            ]),
+            ExactRecoverySnapshot::from([
+                (
+                    unknown.key,
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::UnsupportedSessionProvider),
+                ),
+                (
+                    invalid_uuid.key,
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::InvalidSessionId),
+                ),
+                (
+                    traversal.key,
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::ProviderModeMismatch),
+                ),
+            ]),
+            "unknown or invalid identities remain raw failures instead of guessed canonical keys"
+        );
     }
 
     #[test]
@@ -636,6 +812,41 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn registry_dedupes_lowercase_and_uppercase_valid_queries_once() {
+        let mut lowercase = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        lowercase.materialization = MaterializationState::Allocated;
+        let mut uppercase = query("claude", "550E8400-E29B-41D4-A716-446655440000");
+        uppercase.materialization = MaterializationState::Observed;
+        let canonical_key = lowercase.key.clone();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.lookup_many_blocking(&[lowercase, uppercase]),
+            ExactRecoverySnapshot::from([(
+                canonical_key.clone(),
+                ExactRecoveryState::ProviderUnavailable,
+            )])
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "case variants are one provider query");
+        assert_eq!(captured[0].key, canonical_key);
+        assert_eq!(
+            captured[0].materialization,
+            MaterializationState::Observed,
+            "canonical dedupe keeps monotonic materialization"
+        );
     }
 
     #[test]
