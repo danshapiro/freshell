@@ -27,6 +27,9 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const FAKE_AMPLIFIER_CLI = path.resolve(__dirname, '../fixtures/fake-amplifier-activity-cli.mjs')
 
+/** Launcher-assigned amplifier identity: a broker-minted UUID (v4 shape). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 async function installFakeCli(binDir: string, name: string, source: string): Promise<string> {
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, name)
@@ -189,7 +192,7 @@ async function seedAmplifierProvider(homeDir: string): Promise<void> {
   )
 }
 
-/** Locate the single fake session's events.jsonl under a pinned AMPLIFIER_HOME. */
+/** Locate the single fake session's events.jsonl under a pinned FRESHELL_AMPLIFIER_HOME. */
 async function findEventsFile(amplifierHome: string): Promise<string> {
   const projectsRoot = path.join(amplifierHome, 'projects')
   for (const project of await fs.readdir(projectsRoot)) {
@@ -241,8 +244,11 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
   }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-lane-'))
-    // Pinned AMPLIFIER_HOME so this spec can find and mutate events.jsonl;
-    // both the server and the fake CLI resolve the same root.
+    // Pinned FRESHELL_AMPLIFIER_HOME so this spec can find and mutate
+    // events.jsonl; both the broker (resolve_amplifier_home, validated F1)
+    // and the fake CLI consult FRESHELL_AMPLIFIER_HOME first (else
+    // $HOME/.amplifier), so server and fixture resolve the SAME root. The
+    // real CLI's AMPLIFIER_HOME is caches-only and consulted by NEITHER side.
     const amplifierHome = path.join(sharedRoot, 'amplifier-home')
     let capture: WsCapture | null = null
     let server: RustServer | null = null
@@ -251,7 +257,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       server = new RustServer({
         env: {
           AMPLIFIER_CMD: fakeAmplifier,
-          AMPLIFIER_HOME: amplifierHome,
+          FRESHELL_AMPLIFIER_HOME: amplifierHome,
           FAKE_AMPLIFIER_TURN_MS: '3000',
         },
         setupHome: seedAmplifierProvider,
@@ -336,7 +342,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       server = new RustServer({
         env: {
           AMPLIFIER_CMD: fakeAmplifier,
-          AMPLIFIER_HOME: amplifierHome,
+          FRESHELL_AMPLIFIER_HOME: amplifierHome,
           // Turn far outlives the restart: the pane is provably BUSY at death.
           FAKE_AMPLIFIER_TURN_MS: '120000',
         },
@@ -356,9 +362,10 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
         .toBe(true)
 
       await typePromptIntoLastPane(page, 'long running turn')
-      // Wait for the LOCATOR ASSOCIATION to land (bind upsert carrying the
-      // fake session id), not just provisional busy: the association is what
-      // persists the sessionRef that restore resumes from.
+      // Wait for the bind upsert carrying the LAUNCHER-ASSIGNED session id
+      // (a broker-minted UUID, bound at create -- the old submit-time locator
+      // association is deleted), not just provisional busy: that bound
+      // identity is what persists the sessionRef restore resumes from.
       await capture.waitFor(
         (f) =>
           f.type === 'amplifier.activity.updated' &&
@@ -366,10 +373,10 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
             (r: any) =>
               r.terminalId === terminalId &&
               typeof r.sessionId === 'string' &&
-              r.sessionId.startsWith('fake-amp-'),
+              UUID_RE.test(r.sessionId),
           ),
         30_000,
-        'association bound before death',
+        'launcher-assigned identity bound before death',
       )
       // Durable-persistence gate (validated in Stage 2): the durable copy of
       // the association is CLIENT-side — the page's store flushes the layout
@@ -385,7 +392,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
           const amp = leaves.find((l: any) => l?.content?.terminalId === terminalId)
           const ref =
             amp?.content?.sessionRef?.sessionId ?? amp?.content?.resumeSessionId ?? ''
-          return typeof ref === 'string' && ref.startsWith('fake-amp-')
+          return typeof ref === 'string' && UUID_RE.test(ref)
         }, { timeout: 15_000 })
         .toBe(true)
       capture.close()
@@ -464,11 +471,11 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       const fakeA = await installFakeCli(path.join(rootA, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
       const fakeB = await installFakeCli(path.join(rootB, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
       serverA = new RustServer({
-        env: { AMPLIFIER_CMD: fakeA, AMPLIFIER_HOME: homeA, FAKE_AMPLIFIER_TURN_MS: '3000' },
+        env: { AMPLIFIER_CMD: fakeA, FRESHELL_AMPLIFIER_HOME: homeA, FAKE_AMPLIFIER_TURN_MS: '3000' },
         setupHome: seedAmplifierProvider,
       })
       serverB = new RustServer({
-        env: { AMPLIFIER_CMD: fakeB, AMPLIFIER_HOME: homeB, FAKE_AMPLIFIER_TURN_MS: '3000' },
+        env: { AMPLIFIER_CMD: fakeB, FRESHELL_AMPLIFIER_HOME: homeB, FAKE_AMPLIFIER_TURN_MS: '3000' },
         setupHome: seedAmplifierProvider,
       })
       const [infoA, infoB] = await Promise.all([serverA.start(), serverB.start()])

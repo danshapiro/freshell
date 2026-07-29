@@ -9,7 +9,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 
 /**
  * AMPLIFIER RESTORE -- restore-across-server-restart acceptance scenario for
- * the Rust port (`docs/plans/2026-07-18-amplifier-restore-spec.md`).
+ * the Rust port, on the LAUNCHER-ASSIGNED identity mechanism.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
  * `rust-chromium`-only `testMatch` entry for this file, and
@@ -22,21 +22,27 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * absent feature on this branch, and this spec is scoped to the Rust
  * project only rather than pretending legacy participates.
  *
- * The fix under test (spec §4.2, Slices A+B): a Rust-side
- * `AmplifierLocator` (`crates/freshell-sessions/src/amplifier_locator.rs`)
- * correlates a fresh amplifier PTY's first Enter/submit with the new
- * session dir amplifier lazily creates, binds the terminal's identity
- * (`crate::identity`), and broadcasts `terminal.session.associated` +
- * `terminal.meta.updated` -- the SAME wire messages the frozen client's
- * generic `reconcileTerminalSessionAssociation` + restore machinery already
- * handle for every other provider. No client/shared changes were needed;
- * this scenario is the proof.
+ * The mechanism under test: the Rust broker mints a UUID at amplifier
+ * terminal create, pre-creates the session stub dir under
+ * `<amplifier home>/projects/<cwd-slug>/sessions/<uuid>/` (metadata.json +
+ * empty transcript.jsonl/events.jsonl), and ALWAYS spawns
+ * `amplifier resume <uuid>` -- identity is launcher-assigned at create time
+ * and lands in the pane's `content.sessionRef` BEFORE any input. There is
+ * no submit-time correlation/association step anymore (the old
+ * `AmplifierLocator` path is deleted). Never-used stubs are GC'd at
+ * terminal exit/shutdown, and the broker re-stubs GC'd ids at create
+ * (ensure-after-GC), so even a never-typed pane restores by resuming its
+ * SAME id instead of hanging. Home resolution on BOTH sides (broker + fake
+ * CLI) is `$FRESHELL_AMPLIFIER_HOME` else `$HOME/.amplifier`.
  */
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const FAKE_AMPLIFIER_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-amplifier-cli.mjs')
+
+/** Launcher-assigned amplifier identity: a broker-minted UUID (v4 shape). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
  * Install the fake amplifier CLI as an executable named `amplifier` in a
@@ -149,7 +155,7 @@ async function openAmplifierPaneAndGetLeaf(
 test.describe('Amplifier Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
-  test('an amplifier pane restores across a server restart via `amplifier resume <id>`, and a never-submitted pane restores fresh', async ({ page, e2eServerKind }) => {
+  test('amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included', async ({ page, e2eServerKind }) => {
     // This spec is registered ONLY under the `rust-chromium` project
     // (`playwright.config.ts`), but assert the precondition explicitly so a
     // future accidental `MATRIX_SPECS` inclusion fails loudly instead of
@@ -167,6 +173,15 @@ test.describe('Amplifier Restore (Rust only)', () => {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
             FAKE_AMPLIFIER_ARGV_LOG: argLogPath,
+            // Pin the broker's amplifier home explicitly so server and fake
+            // CLI agree deterministically (validated F1: the broker never
+            // reads `AMPLIFIER_HOME`; this env is captured at server boot,
+            // BEFORE the events-path resolver's boot-time `amplifier_home()`
+            // snapshot). Belt-and-suspenders: even without it, the harness
+            // HOME sandbox (`rust-server.ts` ->
+            // `applyIsolatedHomeEnvironment`) makes the `$HOME/.amplifier`
+            // fallback land inside the isolated home (F7/V9).
+            FRESHELL_AMPLIFIER_HOME: path.join(sharedRoot, 'amplifier-home'),
           },
           // PanePicker only renders a CLI option when THREE conditions all
           // hold (`src/components/panes/PanePicker.tsx`'s `cliOptions`
@@ -213,65 +228,49 @@ test.describe('Amplifier Restore (Rust only)', () => {
         const tabId = await harness.getActiveTabId()
         expect(tabId).toBeTruthy()
 
-        // -------------------------------------------------------------
-        // Positive case: a fresh amplifier pane that DOES submit a prompt.
-        // -------------------------------------------------------------
-        const positiveLeaf = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
-        const terminalIdBefore: string = positiveLeaf.content.terminalId
-        const positivePaneId: string = positiveLeaf.id
-        expect(terminalIdBefore).toBeTruthy()
-
-        await expect.poll(async () => {
-          const buffer = await harness.getTerminalBuffer(terminalIdBefore)
-          return typeof buffer === 'string' && buffer.includes('amplifier> ')
-        }, { timeout: 15_000 }).toBe(true)
-
-        // The pane's first Enter/submit -- this is the locator's Enter<->
-        // session-dir correlation trigger (spec §2.2). Any prompt text
-        // works; the fixture doesn't inspect content. Only two `.xterm`
-        // containers exist at this point (the original WSL pane + this
-        // freshly-created one), and this one was just added, so `.last()`
-        // unambiguously targets it -- same pattern already proven by
-        // `restore-matrix.spec.ts`'s own terminal-restore scenario.
-        await page.locator('.xterm').last().click()
-        await page.keyboard.type('hello amplifier')
-        await page.keyboard.press('Enter')
-
-        // The fixture's session-created marker proves the CLI itself did
-        // its lazy session-dir write. The xterm buffer WRAPS long lines at
-        // the terminal's column width, which can split this marker's text
-        // across a row boundary (observed: "...fake-amp-123 st\narted");
-        // strip newlines before matching -- the wrap is a rendering
-        // artifact, not a content difference the assertion should care
-        // about.
-        await expect.poll(async () => {
-          const buffer = await harness.getTerminalBuffer(terminalIdBefore)
-          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
-          return /amplifier: session fake-amp-\S+ started/.test(unwrapped)
-        }, { timeout: 15_000 }).toBe(true)
-
         /** Re-read the (possibly reshuffled) leaf for a given pane id. */
         async function findLeafById(tid: string, paneId: string): Promise<any> {
           const layout = await harness.getPaneLayout(tid)
           return collectLeaves(layout).find((leaf) => leaf.id === paneId)
         }
 
-        // The association broadcast (`terminal.session.associated` +
-        // `terminal.meta.updated`, Slice B) must reach the client and be
-        // folded into the pane's persisted identity -- proven here via the
-        // SAME `pane.content.sessionRef`/`resumeSessionId` fields the
-        // frozen client's generic `reconcileTerminalSessionAssociation`
-        // writes for every other provider (spec §3.1).
-        const associatedSessionId: string = await expect.poll(async () => {
+        // ── Positive pane: identity is launcher-assigned AT CREATE — no submit needed.
+        // openAmplifierPaneAndGetLeaf returns the NEW pane-layout LEAF node
+        // (`{ id, type: 'leaf', content: { mode, terminalId, ... } }`),
+        // NOT a `{paneId, terminalId}` tuple — read its fields, don't destructure.
+        const positivePane = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+        const positivePaneId: string = positivePane.id
+        const terminalId: string = positivePane.content.terminalId
+        const sessionId: string = await expect.poll(async () => {
           const leaf = await findLeafById(tabId!, positivePaneId)
-          return leaf?.content?.sessionRef?.sessionId ?? leaf?.content?.resumeSessionId ?? null
+          return leaf?.content?.sessionRef?.sessionId ?? null
         }, { timeout: 15_000 }).not.toBeNull().then(async () => {
           const leaf = await findLeafById(tabId!, positivePaneId)
-          return leaf?.content?.sessionRef?.sessionId ?? leaf?.content?.resumeSessionId
+          return leaf!.content!.sessionRef!.sessionId as string
         })
-        expect(associatedSessionId).toMatch(/^fake-amp-/)
-        const positiveLeafAfterAssociation = await findLeafById(tabId!, positivePaneId)
-        expect(positiveLeafAfterAssociation?.content?.sessionRef?.provider).toBe('amplifier')
+        // Server-minted UUID — NOT a fake-amp-* id minted by the CLI, and
+        // present BEFORE any input (the payoff assertion the old submit-time
+        // correlation mechanism could never make).
+        expect(sessionId).toMatch(UUID_RE)
+        const positiveLeaf = await findLeafById(tabId!, positivePaneId)
+        expect(positiveLeaf?.content?.sessionRef?.provider).toBe('amplifier')
+
+        // The PTY was spawned as `resume <sessionId>` and the fake CLI adopted it.
+        // (The xterm buffer WRAPS long lines at the terminal's column width;
+        // strip newlines before matching -- the wrap is a rendering artifact.)
+        await expect.poll(async () =>
+          ((await harness.getTerminalBuffer(terminalId)) ?? '').replace(/\n/g, ''),
+        { timeout: 15_000 }).toContain(`amplifier: resumed session ${sessionId}`)
+
+        // Type a turn → the fake CLI stamps the "used" signature. Only two
+        // `.xterm` containers exist at this point (the original shell pane +
+        // this freshly-created one), so `.last()` unambiguously targets it.
+        await page.locator('.xterm').last().click()
+        await page.keyboard.type('hello amplifier')
+        await page.keyboard.press('Enter')
+        await expect.poll(async () =>
+          ((await harness.getTerminalBuffer(terminalId)) ?? '').replace(/\n/g, ''),
+        { timeout: 15_000 }).toContain(`amplifier: turn recorded ${sessionId}`)
 
         // Persisted across a reload too (the client's persist middleware +
         // localStorage round trip that the restore chain depends on).
@@ -279,26 +278,51 @@ test.describe('Amplifier Restore (Rust only)', () => {
           (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
         })
 
-        // -------------------------------------------------------------
-        // Negative control: a SECOND amplifier pane that never submits.
-        // Proves the locator never false-binds an un-submitted terminal
-        // (spec §5.2 step 5) -- opened alongside the positive-case pane so
-        // both restore in the SAME server restart below.
-        // -------------------------------------------------------------
-        const neverSubmittedLeaf = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
-        const neverSubmittedTerminalIdBefore: string = neverSubmittedLeaf.content.terminalId
-        const neverSubmittedPaneId: string = neverSubmittedLeaf.id
-        expect(neverSubmittedTerminalIdBefore).toBeTruthy()
-        expect(neverSubmittedPaneId).not.toBe(positivePaneId)
+        // ── Negative pane: never typed in, and LEFT OPEN across the restart.
+        // It ALSO gets create-time identity (the old "no identity until
+        // submit" behavior is gone by design). Its never-used stub is GC'd
+        // at shutdown, but the persisted sessionRef triggers ensure-after-GC
+        // re-stubbing under the SAME id on restore.
+        const negativePane = await openAmplifierPaneAndGetLeaf(page, harness, tabId!)
+        const negativePaneId: string = negativePane.id
+        const negativeTerminalId: string = negativePane.content.terminalId
+        const negativeSessionId: string = await expect.poll(async () => {
+          const leaf = await findLeafById(tabId!, negativePaneId)
+          return leaf?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 15_000 }).not.toBeNull().then(async () => {
+          const leaf = await findLeafById(tabId!, negativePaneId)
+          return leaf!.content!.sessionRef!.sessionId as string
+        })
+        expect(negativeSessionId).toMatch(UUID_RE)
+        expect(negativeSessionId).not.toBe(sessionId)
 
         await page.evaluate(() => {
           (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
         })
 
+        // The never-used stub dir exists on disk BEFORE the restart (the GC
+        // at shutdown is what removes it -- assert the precondition so the
+        // re-stub assertion below provably exercises ensure-after-GC).
+        const amplifierHome = path.join(sharedRoot, 'amplifier-home')
+        async function findStubDir(sid: string): Promise<string | null> {
+          const projectsDir = path.join(amplifierHome, 'projects')
+          const slugs = await fs.readdir(projectsDir).catch(() => [] as string[])
+          for (const slug of slugs) {
+            const dir = path.join(projectsDir, slug, 'sessions', sid)
+            try {
+              await fs.access(path.join(dir, 'metadata.json'))
+              return dir
+            } catch {
+              /* keep looking */
+            }
+          }
+          return null
+        }
+        expect(await findStubDir(negativeSessionId)).not.toBeNull()
+
         // -------------------------------------------------------------
         // Full server restart (not a client reload) -- PTYs are lost;
-        // amplifier must respawn with `resume <id>` for the associated
-        // pane, and fresh (no `resume`) for the never-submitted one.
+        // BOTH panes must respawn with `resume <their-id>`.
         // -------------------------------------------------------------
         if (!server.restart) {
           throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
@@ -314,76 +338,60 @@ test.describe('Amplifier Restore (Rust only)', () => {
           expect(status).toBe('ready')
         }).toPass({ timeout: 30_000 })
 
-        // Positive case: the restored pane's PTY receives `amplifier
-        // resume <id>` -- proven two independent ways: (1) the fixture's
-        // own greppable stdout marker, scoped to THIS pane's terminal, and
-        // (2) the argv log the fixture writes on every invocation
-        // (independent of terminal-buffer scraping).
-        // Wait for the pane to hold a NEW terminalId (the respawn's), not
+        // ── Restore proof, two independent ways, for BOTH panes:
+        // (a) used pane resumes the SAME id;
+        // (b) never-used pane (stub GC'd at shutdown) ALSO resumes its SAME
+        //     id — the broker re-stubs GC'd ids at create (ensure-after-GC;
+        //     Task 10's `resume_of_a_gcd_stub_is_restubbed_under_the_same_id`
+        //     unit pin), so a never-typed pane restores instead of hanging.
+        //     A GC'd id is never reissued as a fresh one.
+        // Wait for each pane to hold a NEW terminalId (the respawn's), not
         // the persisted pre-restart one. Under the adopted reconcile client
         // the pane is non-destructive on boot: it keeps its persisted
         // terminalId + status until the verdict folds, so a "status not
         // error && terminalId truthy" gate is satisfiable by the STALE
-        // pre-restart identity and racing it captured a dead terminal id
+        // pre-restart identity and racing it captures a dead terminal id
         // (the resume marker then lands in the NEW terminal's buffer,
         // invisible to a poll scoped to the stale one). Same pattern the
         // restore-contract wall's claude scenario uses: poll until the id
         // provably changed.
-        const restoredTerminalId: string = await expect
-          .poll(async () => {
-            const leaf = await findLeafById(tabId!, positivePaneId)
-            if (leaf?.content?.status === 'error') return null
-            const tid = leaf?.content?.terminalId
-            return tid && tid !== terminalIdBefore ? tid : null
-          }, { timeout: 30_000 })
-          .not.toBeNull()
-          .then(async () => (await findLeafById(tabId!, positivePaneId))!.content.terminalId)
-        expect(restoredTerminalId).toBeTruthy()
-        expect(restoredTerminalId).not.toBe(terminalIdBefore)
-        // Same xterm line-wrap caveat as the "session started" marker above
-        // -- strip newlines before matching.
-        await expect.poll(async () => {
-          const buffer = await harness.getTerminalBuffer(restoredTerminalId)
-          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
-          return unwrapped.includes(`amplifier: resumed session ${associatedSessionId}`)
-        }, { timeout: 20_000 }).toBe(true)
+        for (const [paneId, sid, oldTid] of [
+          [positivePaneId, sessionId, terminalId],
+          [negativePaneId, negativeSessionId, negativeTerminalId],
+        ] as const) {
+          const restoredTerminalId: string = await expect
+            .poll(async () => {
+              const leaf = await findLeafById(tabId!, paneId)
+              if (leaf?.content?.status === 'error') return null
+              const tid = leaf?.content?.terminalId
+              return tid && tid !== oldTid ? tid : null
+            }, { timeout: 30_000 })
+            .not.toBeNull()
+            .then(async () => (await findLeafById(tabId!, paneId))!.content.terminalId)
+          await expect.poll(async () =>
+            ((await harness.getTerminalBuffer(restoredTerminalId)) ?? '').replace(/\n/g, ''),
+          { timeout: 20_000 }).toContain(`amplifier: resumed session ${sid}`)
+        }
+        // The never-used pane's stub was re-created on disk under the SAME
+        // id by the ensure-after-GC path.
+        expect(await findStubDir(negativeSessionId)).not.toBeNull()
 
-        const recordedArgvLines: string[] = await expect.poll(async () => {
-          const raw = await fs.readFile(argLogPath, 'utf8').catch(() => '')
-          return raw ? raw.trim().split('\n') : []
-        }, { timeout: 20_000 }).not.toEqual([]).then(async () => {
-          const raw = await fs.readFile(argLogPath, 'utf8')
-          return raw.trim().split('\n')
-        })
-        const resumeInvocations = recordedArgvLines
-          .map((line) => JSON.parse(line) as { argv: string[] })
-          .filter((entry) => entry.argv[0] === 'resume')
-        expect(resumeInvocations.some((entry) => entry.argv[1] === associatedSessionId)).toBe(true)
+        // argv log: every amplifier spawn in this scenario was a resume, and
+        // both ids appear as `resume <id>` invocations post-restart.
+        const entries = (await fs.readFile(argLogPath, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as { argv: string[] })
+        const resumes = entries.filter((e) => e.argv[0] === 'resume')
+        expect(resumes.some((e) => e.argv[1] === sessionId)).toBe(true)
+        expect(resumes.some((e) => e.argv[1] === negativeSessionId)).toBe(true)
+        expect(entries.every((e) => e.argv[0] === 'resume')).toBe(true)
 
-        // Negative case: the never-submitted pane restores FRESH -- no
-        // `resume` argv naming its (nonexistent) session, never a blank
-        // error state either. This is the `zero candidates -> keep
-        // watching, no bind` guarantee proven end-to-end.
-        await expect(async () => {
-          const leaf = await findLeafById(tabId!, neverSubmittedPaneId)
-          expect(leaf?.content?.status).not.toBe('error')
-          expect(leaf?.content?.terminalId).toBeTruthy()
-          // A fresh (non-resuming) amplifier launch never carries a
-          // sessionRef/resumeSessionId -- this pane never submitted, so the
-          // locator never armed a Located association for it.
-          expect(leaf?.content?.sessionRef).toBeUndefined()
-          expect(leaf?.content?.resumeSessionId).toBeUndefined()
-        }).toPass({ timeout: 30_000 })
-
-        const restoredNeverSubmittedTerminalId: string | undefined =
-          (await findLeafById(tabId!, neverSubmittedPaneId))?.content?.terminalId
-        expect(restoredNeverSubmittedTerminalId).toBeTruthy()
-        await expect.poll(async () => {
-          const buffer = await page.evaluate((id: string) => {
-            return (window as any).__FRESHELL_TEST_HARNESS__?.getTerminalBuffer(id)
-          }, restoredNeverSubmittedTerminalId!)
-          return typeof buffer === 'string' && buffer.includes('amplifier> ')
-        }, { timeout: 15_000 }).toBe(true)
+        // Invariant pins: the re-homed identity sweep never fires for these
+        // launcher-assigned panes, and the boot layout canary stayed quiet.
+        // The Rust tracing sink is `rust-server.jsonl` under `info.logsDir`
+        // (`crates/freshell-server/src/logging.rs`; `info.debugLogPath` is a
+        // constructed path NOTHING writes for the Rust fixture).
+        const serverLogs = await fs.readFile(path.join(info.logsDir, 'rust-server.jsonl'), 'utf8').catch(() => '')
+        expect(serverLogs).not.toContain('terminal_identity_unresolved')
+        expect(serverLogs).not.toContain('amplifier_layout_contract_broken')
       } finally {
         await server.stop().catch(() => {})
       }
