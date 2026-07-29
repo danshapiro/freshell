@@ -71,6 +71,11 @@ zstd), React 18, Redux Toolkit, TypeScript, Vitest, Playwright.
   server—whether it advertises only the legacy capability or none—it sends
   zero durable creates and shows “Server update required to restore saved
   sessions.” Stateless panes still start.
+- This is a deliberate WebSocket protocol v8 revision. A v8 client that
+  receives v7’s pre-auth `PROTOCOL_MISMATCH` reconnects once with v7, then
+  applies the exact-capability fail-closed rule above. A v8 server accepts
+  both v8 and frozen v7 hellos; it never advertises the exact capability on a
+  v7 connection. No other version is accepted.
 - The broad History scan can remain blocked for the whole successful restore.
 - Port 3002 is neither restarted nor deployed during implementation.
 
@@ -237,9 +242,16 @@ snapshot fact maps to retry. That is the state-race fence.
 - `crates/freshell-freshagent/src/identity_sink.rs`
 - `crates/freshell-freshagent/src/session_lease.rs`
 - `shared/ws-protocol.ts`
+- `shared/ws-version.ts`
 - `crates/freshell-protocol/src/common.rs`
+- `crates/freshell-protocol/src/lib.rs`
 - `crates/freshell-protocol/src/client_messages.rs`
 - `crates/freshell-protocol/src/server_messages.rs`
+- `crates/freshell-protocol/Cargo.toml`
+- `port/contract/ws-protocol.schema.json`
+- `port/contract/ws-server-messages.schema.json`
+- `port/contract/ws-message-inventory.json`
+- `port/contract/README.md`
 
 ### Provider proofs
 
@@ -263,6 +275,7 @@ snapshot fact maps to retry. That is the state-race fence.
 - `crates/freshell-ws/src/opencode_association.rs`
 - `crates/freshell-ws/src/codex_association.rs`
 - `crates/freshell-platform/src/cli_launch.rs`
+- `crates/freshell-platform/src/opencode_plugin.rs`
 - `crates/freshell-terminal/src/registry.rs`
 - `crates/freshell-codex/src/launch_lifecycle.rs`
 - `crates/freshell-codex/src/remote_proxy.rs`
@@ -302,6 +315,8 @@ snapshot fact maps to retry. That is the state-race fence.
 - New: `crates/freshell-server/tests/opencode_database_alignment.rs`
 - `crates/freshell-protocol/tests/roundtrip.rs`
 - `crates/freshell-protocol/tests/inventory.rs`
+- `crates/freshell-protocol/tests/version.rs`
+- `test/unit/port/ws-contract-freeze.test.ts`
 - `test/unit/client/lib/pane-reconcile.test.ts`
 - New: `test/unit/client/lib/pane-reconcile-controller.test.ts`
 - `test/unit/client/lib/ws-client.reconcile.test.ts`
@@ -311,6 +326,19 @@ snapshot fact maps to retry. That is the state-race fence.
 - `test/unit/client/components/DeadSessionPanel.test.tsx`
 - `test/e2e-browser/specs/reconcile-handshake-rust.spec.ts`
 - `test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts`
+- `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`
+- `test/e2e-browser/specs/restore-matrix.spec.ts`
+- `test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts`
+- `test/e2e-browser/specs/codex-terminal-restore-rust.spec.ts`
+- `test/e2e-browser/specs/amplifier-restore-rust.spec.ts`
+- `test/e2e-browser/specs/opencode-restart-recovery.spec.ts`
+- `test/e2e-browser/specs/freshopencode-db-history.spec.ts`
+- `test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts`
+- `test/e2e-browser/fixtures/fake-claude-cli.mjs`
+- `test/e2e-browser/fixtures/fake-codex-terminal.mjs`
+- `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`
+- `test/e2e-browser/fixtures/fake-opencode.cjs`
+- `test/e2e-browser/fixtures/fake-amplifier-cli.mjs`
 - `test/e2e-browser/playwright.config.ts`
 
 ---
@@ -326,6 +354,7 @@ snapshot fact maps to retry. That is the state-race fence.
 - Modify `crates/freshell-freshagent/Cargo.toml`
 - Modify `crates/freshell-ws/Cargo.toml`
 - Modify `crates/freshell-server/Cargo.toml`
+- Modify `crates/freshell-protocol/Cargo.toml`
 - Modify `crates/freshell-ws/src/existence.rs`
 - Modify `crates/freshell-ws/src/reconcile.rs`
 - Modify `crates/freshell-ws/src/reconcile_freshagent.rs`
@@ -346,10 +375,20 @@ snapshot fact maps to retry. That is the state-race fence.
 - Modify `crates/freshell-server/src/recovery_inventory_tests.rs`
 - Modify `crates/freshell-freshagent/src/identity_sink.rs`
 - Modify `shared/ws-protocol.ts`
+- Modify `shared/ws-version.ts`
 - Modify `crates/freshell-protocol/src/common.rs`
+- Modify `crates/freshell-protocol/src/lib.rs`
 - Modify `crates/freshell-protocol/src/client_messages.rs`
 - Modify `crates/freshell-protocol/src/server_messages.rs`
 - Modify `crates/freshell-protocol/tests/inventory.rs`
+- Modify `crates/freshell-protocol/tests/version.rs`
+- Regenerate `port/contract/ws-protocol.schema.json`
+- Regenerate `port/contract/ws-server-messages.schema.json`
+- Regenerate `port/contract/ws-message-inventory.json`
+- Modify `port/contract/README.md`
+- Modify `test/unit/port/ws-contract-freeze.test.ts`
+- Modify `src/lib/ws-client.ts`
+- Modify `test/unit/client/lib/ws-client.reconcile.test.ts`
 - Modify focused protocol/reconcile tests
 
 **Interfaces:**
@@ -359,6 +398,8 @@ snapshot fact maps to retry. That is the state-race fence.
 - `RecoveryOwnerKey` with provider-defined global/project scope
 - `MaterializationState::{Allocated, Observed, Unknown}`
 - provider-aware `validate_session_ref(mode, session_ref)`
+- additive optional `cwd` on each terminal/fresh pane reconciliation entry,
+  populated from the pane’s persisted initial cwd
 - additive negotiated capability `paneReconcileExactV1`
 - additive client messages `restore.launch.cancel{requestId}` and
   `restore.launch.ack{requestId}`, accepted only for a launch owned by that
@@ -445,10 +486,36 @@ exists. Task 5 adds the first positive real-handshake test when it constructs
 that aggregate runtime. A server may echo the capability only when the client
 offered it and the complete runtime is installed; otherwise it is omitted
 while legacy `paneReconcileV1` remains unchanged. The capability is additive.
-Do not change the request/result discriminants, the 200-pane limit, or the
-frozen verdict enum. Also pin the additive cancel/ack frames; an old server
-never receives them because a new client sends them only after exact
-capability acknowledgement.
+Do not change the reconcile request/result discriminants, the 200-pane limit,
+or the frozen verdict enum. Add an optional `cwd` to both terminal and
+fresh-agent reconcile pane entries; old v7 entries deserialize with it absent,
+and a new client sends the pane’s persisted initial cwd. Also pin the additive
+cancel/ack frames; an old server never receives them because a new client sends
+them only after exact capability acknowledgement.
+
+Treat this as protocol v8, not an incidental edit to the frozen v7 contract:
+
+- bump TypeScript and Rust `WS_PROTOCOL_VERSION` constants and descriptions
+  to 8;
+- preserve 7 as the one explicit legacy handshake version;
+- the server accepts 7 or 8 but exact capability negotiation is v8-only;
+- the client normally sends 8 and, only after an actual pre-auth
+  `PROTOCOL_MISMATCH`, retries that connection once with 7. On v7 it withholds
+  all durable creates and shows the server-update state once Task 6 installs
+  the exact sender gate; Task 1 implements the one-shot transport fallback so
+  the intermediate commit preserves legacy connectivity. Preserve queued
+  messages without sending them between handshakes, then use the existing
+  legacy flush only after v7 `ready`; Task 6 replaces that flush for durable
+  entries. The retry sends a frozen-v7-compatible hello and omits the exact
+  capability. It never oscillates versions or downgrades after any other
+  failure;
+- update the version tests to require contract version 8 and a Hello schema
+  that accepts exactly 7 or 8;
+- update the contract README’s counts and “out of scope” note to record this
+  deliberate v8 product revision and its frozen-v7 compatibility lane;
+- run `npm run contract:generate`, review and commit all three generated JSON
+  artifacts, update Rust inventory counts from 29/86 to 31/88, and prove a
+  second generation produces no diff.
 
 The client behavior and real four-cell old/new matrix are implemented in
 Tasks 6 and 7, after both sides exist.
@@ -457,7 +524,15 @@ Run:
 
 ```bash
 cargo test -p freshell-protocol --test pane_reconcile -- --nocapture
+cargo test -p freshell-protocol --test inventory -- --nocapture
+cargo test -p freshell-protocol --test version -- --nocapture
 cargo test -p freshell-ws capability_negotiation -- --nocapture
+npm run contract:generate
+git add port/contract
+npm run contract:generate
+git diff --exit-code -- port/contract
+npm run test:port
+npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts --config config/vitest/vitest.config.ts
 ```
 
 - [ ] **Step 4: Write RED ledger tests for allocated versus observed**
@@ -477,7 +552,11 @@ Pin additive JSON compatibility:
   launch writes a new scoped successor; the old row remains a read-only
   compatibility alias, is ignored whenever a matching scoped row exists, and
   is never deleted or treated as `Allocated`; and
-- the scoped filename/index migration never overwrites or deletes an old row.
+- the scoped filename/index migration never overwrites or deletes an old row;
+  and
+- a maximum-length Unicode Amplifier ID plus a long normalized project scope
+  persists on ordinary 255-byte-name filesystems without a raw/percent-encoded
+  owner component in its filename.
 
 Simulate failure before/after the scoped successor write and reload the
 ledger: migration is idempotent, the alias never shadows an existing scoped
@@ -497,6 +576,17 @@ old rows remain readable in place. Add durable
 `mark_materialized(owner_key)` using the ledger’s existing atomic write
 discipline. Claude preallocation writes `Allocated`; exact provider positives
 and authoritative association write `Observed`.
+
+Use a domain-separated, length-framed SHA-256 digest of the complete canonical
+`RecoveryOwnerKey` for every new filename
+(`owner-v2-<64 lowercase hex>.json`). Retain the complete owner inside the row
+and verify it after every read and before replacing an existing digest path;
+a mismatched row is a collision/corruption error and is never overwritten.
+Never place the raw or percent-encoded session ID/scope in a v2 filename.
+Keep legacy paths read-only for compatibility and write scoped successors only
+to the v2 path. Tests cover the maximum UTF-8/UTF-16-valid ID, a long scope,
+stable digest derivation, synthetic mismatched-row collision, and migration
+reload on a filesystem with a 255-byte component limit.
 
 For a row currently marked `Allocated`, persisting the monotonic `Observed`
 transition is part of making an artifact-positive verdict actionable. If that
@@ -519,13 +609,18 @@ cargo test -p freshell-ws pane_ledger -- --nocapture
 cargo test -p freshell-ws --test pane_reconcile -- --nocapture
 cargo test -p freshell-server recovery_providers -- --nocapture
 cargo test -p freshell-protocol --test pane_reconcile -- --nocapture
+cargo test -p freshell-protocol --test inventory -- --nocapture
+cargo test -p freshell-protocol --test version -- --nocapture
+npm run test:port
 cargo check --workspace
 cargo fmt --check
 git diff --check
 git add Cargo.toml Cargo.lock crates/freshell-recovery crates/freshell-protocol \
   crates/freshell-ws crates/freshell-freshagent/Cargo.toml \
   crates/freshell-freshagent/src/identity_sink.rs \
-  crates/freshell-server shared/ws-protocol.ts
+  crates/freshell-server shared/ws-protocol.ts shared/ws-version.ts \
+  port/contract test/unit/port/ws-contract-freeze.test.ts \
+  src/lib/ws-client.ts test/unit/client/lib/ws-client.reconcile.test.ts
 git commit -m "feat(recovery): close durable provider and materialization contracts"
 ```
 
@@ -960,7 +1055,10 @@ cargo test -p freshell-ws --test pane_reconcile invalid_authority_carriers -- --
 - [ ] **Step 3: Implement request-local exact gathering**
 
 Remove the blind two-second sleep. Preserve the 200-entry per-frame cap and
-unchanged request/result JSON vocabulary. Keep `paneReconcileExactV1`
+the existing request/result discriminants and verdict vocabulary; Task 1’s
+v8-only optional pane `cwd` is the sole payload addition. Read it from each
+terminal/fresh pane entry and include it in normalized exact queries; never
+substitute History cwd or a different pane’s cwd. Keep `paneReconcileExactV1`
 unadvertised in this intermediate commit: an exact positive is not a complete
 restore guarantee until Task 5 installs every create-time proof/identity
 fence. Keep the production handler on its existing legacy engine in this
@@ -1040,6 +1138,7 @@ git commit -m "fix(recovery): reconcile exact sessions off thread without guessi
 - Modify `crates/freshell-ws/src/opencode_association.rs`
 - Modify `crates/freshell-ws/src/codex_association.rs`
 - Modify `crates/freshell-platform/src/cli_launch.rs`
+- Modify `crates/freshell-platform/src/opencode_plugin.rs`
 - Modify `crates/freshell-terminal/src/registry.rs`
 - Modify `crates/freshell-sessions/src/amplifier_stub.rs`
 - Modify `crates/freshell-codex/src/launch_lifecycle.rs`
@@ -1054,6 +1153,9 @@ git commit -m "fix(recovery): reconcile exact sessions off thread without guessi
 - Modify `crates/freshell-server/src/main.rs`
 - Modify provider launch and lifecycle tests
 - Modify `test/unit/server/opencode-rebind-plugin.test.ts`
+- Regenerate `port/contract/ws-protocol.schema.json`
+- Regenerate `port/contract/ws-server-messages.schema.json`
+- Regenerate `port/contract/ws-message-inventory.json`
 
 **Launch transaction:**
 
@@ -1096,7 +1198,15 @@ blindly frees the claim; the arbiter remains `Cleaning` until that supervisor
 reports the resource gone.
 
 Before a WebSocket launch waits for the spawn permit, register it under
-`(connectionId, requestId)`. On an exact-capability connection,
+`(connectionId, requestId)` in one connection-wide registry shared by
+terminal and fresh-agent surfaces. Reservation is atomic: while any
+transaction for that request ID is active or awaiting client ack, a second
+terminal or fresh-agent create with the same ID receives the existing
+`INVALID_CREATE_REQUEST` error before proof/setup/spawn, cannot replace the
+entry, and leaves the original transaction cancelable/acknowledgeable. This
+global active-ID rule is what makes requestId-only ack/cancel unambiguous; the
+client already mints a new ID for every new episode and never deliberately
+reuses one. On an exact-capability connection,
 `restore.launch.cancel{requestId}` aborts only that connection’s matching
 transaction and enters the same supervised cleanup; it is idempotent and
 cannot cancel another connection’s request. After sending the matching
@@ -1144,6 +1254,17 @@ Codex app-server or proxy planning/`ensure_ready`, OpenCode manager
 startup/config/MCP writes, or PTY spawn. Exact launch must never call
 Amplifier’s global compatibility `ensure_session`.
 
+OpenCode reporter installation is one provider-global, keyed single-flight per
+effective plugin/config target, shared by all launch claims. Replace the
+current fixed `.tmp` writer with a unique create-new temp file in the target
+directory, fsync it, atomically rename it, and clean it on every failure.
+Concurrent distinct OpenCode owners may wait on that setup but may not race
+the same temp pathname or each perform incompatible writes. A static plugin
+reads the per-launch nonce from that child’s environment; no launch rewrites a
+shared plugin with its nonce. Tests drive 17 concurrent owners through one
+target, require one valid final plugin, zero `ENOENT`, no leftover temps, and
+successful nonce-bound reports for every launch.
+
 **Provider acknowledgement contract:**
 
 - terminal Claude: register expected ID plus nonce before spawn; the first
@@ -1158,7 +1279,8 @@ Amplifier’s global compatibility `ensure_session`.
   and bring attach/crash recovery under the same owner transaction;
 - terminal OpenCode: install a mandatory nonce-bound restore reporter before
   launch. If the provider configuration cannot guarantee it, fail closed;
-  only later authenticated route signals may rebind;
+  installation uses the provider-global single-flight above, and only later
+  authenticated route signals may rebind;
 - fresh OpenCode: `GET /session/{requested}` must return an object whose
   embedded `id` exactly matches; checking only that it is an object is not
   sufficient; and
@@ -1192,7 +1314,9 @@ mismatch, missing acknowledgement timeout, stale nonce, duplicate signal, and
 a later authenticated rebind where supported. Assert that mismatch/timeout
 never persists or adopts the reported identity. Amplifier fixtures split and
 ANSI-decorate the acknowledgement, include prefix-collision IDs, and exceed
-the scan bound without a match.
+the scan bound without a match. OpenCode tests run 17 concurrent distinct
+owner launches against one plugin target and prove the keyed single-flight,
+unique-temp atomic install, temp cleanup, and per-child nonce behavior.
 
 Add protocol round trips proving every `restoreReason`, omission on ordinary
 errors, request correlation for terminal and fresh-agent launches, and
@@ -1203,6 +1327,7 @@ cargo test -p freshell-protocol --test roundtrip restore_launch -- --nocapture
 scripts/sandbox-test.sh "cargo test -p freshell-ws launch_lifecycle -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-freshagent restore_identity -- --nocapture"
 cargo test -p freshell-platform cli_launch -- --nocapture
+cargo test -p freshell-platform opencode_plugin -- --nocapture
 npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --config config/vitest/vitest.config.ts
 ```
 
@@ -1218,7 +1343,10 @@ prove cancellation hands cleanup to the supervisor; and prove the OpenCode
 shared-sidecar exception removes only the failed logical route. Race
 `restore.launch.cancel` before permit acquisition, during setup, after spawn,
 and against the created-frame commit; verify same-connection idempotence and
-cross-connection isolation. Verify created remains cancellable until a
+cross-connection isolation. Race terminal→terminal, fresh→fresh, and
+terminal↔fresh creates with one request ID on the same connection; exactly the
+first registry reservation survives, the loser has zero side effects, and the
+winner’s ack/cancel still targets it. Verify created remains cancellable until a
 same-connection `restore.launch.ack`, ack makes subsequent cancel a no-op, a
 stale/wrong-connection ack cannot disarm cancellation, and disconnect after
 created preserves one attachable background owner rather than killing or
@@ -1251,7 +1379,8 @@ identity reporters, ledger, and cleanup supervisor; callers cannot set a
 free-floating readiness bool. Add a handshake/integration assertion that
 constructing server state without the aggregate keeps the capability omitted.
 With the aggregate present, an offered exact capability is echoed; an
-unoffered capability remains omitted.
+unoffered capability remains omitted. A v7 connection never receives the
+exact capability even if it injects the new field.
 When the aggregate is present, route both exact-capability and legacy
 `paneReconcileV1` requests through the exact engine; only the capability echo
 controls whether a new client may release durable creates.
@@ -1262,9 +1391,15 @@ controls whether a new client may release durable creates.
 scripts/sandbox-test.sh "cargo test -p freshell-ws launch_lifecycle -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-freshagent restore_identity -- --nocapture"
 cargo test -p freshell-platform cli_launch -- --nocapture
+cargo test -p freshell-platform opencode_plugin -- --nocapture
 cargo test -p freshell-protocol --test roundtrip restore_launch -- --nocapture
 cargo test -p freshell-ws capability_negotiation -- --nocapture
 npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --config config/vitest/vitest.config.ts
+npm run contract:generate
+git add port/contract
+npm run contract:generate
+git diff --exit-code -- port/contract
+npm run test:port
 scripts/sandbox-test.sh "cargo test -p freshell-ws --test session_ref_singleflight -- --nocapture"
 scripts/sandbox-test.sh "cargo test -p freshell-ws launch_owner_lifecycle -- --nocapture"
 scripts/sandbox-test.sh "cargo test --workspace --all-targets"
@@ -1276,7 +1411,7 @@ git add crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
   crates/freshell-platform crates/freshell-terminal crates/freshell-sessions \
   crates/freshell-codex \
   crates/freshell-server extensions/opencode \
-  crates/freshell-protocol shared/ws-protocol.ts \
+  crates/freshell-protocol shared/ws-protocol.ts port/contract \
   test/unit/server/opencode-rebind-plugin.test.ts
 git commit -m "fix(recovery): fence restore launch identity across every surface"
 ```
@@ -1304,6 +1439,11 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
 - One connection generation owns boot, auto retry, manual retry, and reconnect.
 - WsClient offers additive `paneReconcileExactV1` alongside the existing
   legacy capabilities; only the echoed ready capability changes behavior.
+- WsClient begins with protocol v8. If and only if that socket receives the
+  pre-auth `PROTOCOL_MISMATCH`, it reconnects once using frozen v7. It exposes
+  the negotiated version in the same ready snapshot, does not replay any
+  queued message before the fallback handshake settles, never falls back
+  after auth/network/parse errors, and never retries v8↔v7 in a loop.
 - Durable restore authority requires the server to echo
   `paneReconcileExactV1`. If it is absent—with or without legacy
   `paneReconcileV1`—hold then discard every durable create without sending it
@@ -1327,7 +1467,8 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
   current capability/ready snapshot and start the same generation; do not wait
   for another `ready` frame.
 - `buildReconcileRequests` returns deterministic chunks of at most 200; it
-  never truncates.
+  never truncates. Every durable terminal and fresh-agent entry carries its
+  own persisted initial cwd when present; missing cwd stays missing.
 - All requested create IDs enter one sender hold before the first chunk sends.
 - Each pane records generation, first-seen time, attempt, next retry, and
   terminal/pending state.
@@ -1401,7 +1542,8 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
 For 201 and 417 panes assert stable chunk order, unique reconcile IDs, full
 coverage, no console-error truncation, all create IDs installed in the sender
 hold before the first chunk is sent, and out-of-order chunk replies releasing
-only their own panes.
+only their own panes. Include two identical Amplifier IDs with distinct
+persisted cwds and prove each wire entry preserves its own cwd.
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/pane-reconcile.test.ts --config config/vitest/vitest.config.ts
@@ -1427,6 +1569,9 @@ Use fake clocks and fixed IDs. Cover:
 - exact-capability absent (both no capability and legacy-only): zero durable
   creates before and after App handles `ready`, explicit server-update UX,
   stateless creates unaffected;
+- v8 protocol mismatch → one v7 reconnect → legacy ready: no message flush
+  between handshakes, zero durable creates/reconcile requests, one stateless
+  create, and no downgrade loop; auth/network/parse errors never downgrade;
 - boot → manual Retry → late boot result within one connection generation;
 - retry exhaustion cancels rather than flushes;
 - permanent conflict/unavailable/invalid;
@@ -1525,9 +1670,23 @@ git commit -m "fix(recovery): restore panes through one automatic reconcile cont
 - Modify `test/e2e-browser/playwright.config.ts`
 - Modify `test/e2e-browser/specs/reconcile-handshake-rust.spec.ts`
 - Modify `test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts`
+- Modify `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`
+- Modify `test/e2e-browser/specs/restore-matrix.spec.ts`
+- Modify `test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts`
+- Modify `test/e2e-browser/specs/codex-terminal-restore-rust.spec.ts`
+- Modify `test/e2e-browser/specs/amplifier-restore-rust.spec.ts`
+- Modify `test/e2e-browser/specs/opencode-restart-recovery.spec.ts`
+- Modify `test/e2e-browser/specs/freshopencode-db-history.spec.ts`
+- Modify `test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts`
+- Modify `test/e2e-browser/fixtures/fake-claude-cli.mjs`
+- Modify `test/e2e-browser/fixtures/fake-codex-terminal.mjs`
+- Modify `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`
+- Modify `test/e2e-browser/fixtures/fake-opencode.cjs`
+- Modify `test/e2e-browser/fixtures/fake-amplifier-cli.mjs`
 - Modify `test/e2e-browser/helpers/rust-server.ts` only if cleanup support is
   shared there
 - Add a small Node FIFO-holder fixture under `test/e2e-browser/fixtures/`
+- Add `test/e2e-browser/helpers/fifo-holder.test.ts`
 
 - [ ] **Step 1: Add raw-wire provider and scale coverage**
 
@@ -1535,6 +1694,26 @@ First add `reconcile-handshake-rust.spec.ts` to both `RUST_ONLY_SPECS` and the
 `rust-chromium` project’s `testMatch`; add a configuration test/assertion that
 the project actually enumerates it. The named verification command must fail
 if Playwright selects zero tests.
+
+Upgrade the shared fake providers before enabling the acknowledgement fence in
+browser tests:
+
+- fake Claude invokes the injected `SessionStart` hook with the exact session
+  ID and launch nonce;
+- fake terminal Codex emits the managed `ThreadStarted` identity;
+- fake terminal OpenCode invokes the installed nonce reporter;
+- fake Amplifier emits the exact
+  `Resuming session: <resolved-id>` acknowledgement, including selectable
+  split/ANSI test modes; and
+- every generated OpenCode ID is `ses_` plus ASCII alphanumerics only. Add a
+  fixture-contract assertion that passes every generated ID through the real
+  validator so underscore-containing regressions cannot return.
+
+Run the existing restore contract wall, matrix, and provider-specific restore
+specs against the upgraded fixtures. Rust legs keep their prior restore
+behavioral assertions in addition to the new acknowledgement assertions; the
+legacy matrix leg pins the deliberate server-update-required fail-closed UX
+while retaining its stateless controls.
 
 Seed disposable exact stores for Claude, Codex active/archive/zstd, OpenCode,
 and Amplifier. Cover HOME-unset provider overrides, terminal/fresh-agent
@@ -1584,6 +1763,14 @@ disconnect, `SIGTERM`, or `SIGINT`. Cleanup is deterministic: request close,
 wait at most one second, then `SIGTERM`, then `SIGKILL` if needed, and always
 reap the child. An uncancellable timed-out `fs.open` promise is forbidden.
 
+Extract the helper lifecycle into a platform-neutral state machine with
+injected open/timer/signal operations and cover it in
+`helpers/fifo-holder.test.ts`: `ENXIO` retry, one `OPENED`, IPC close,
+disconnect, `SIGTERM`/`SIGINT`, one-second escalation, `SIGKILL`, descriptor
+close, timer disposal, and exactly-once child reap. These unit tests do not
+create a FIFO and run on every platform through `npm run test:e2e:helpers`;
+the real `mkfifo` causal proof remains Linux/WSL-only.
+
 - [ ] **Step 3: Add the 17-pane user-experience test**
 
 Use 17 durable panes and disposable fake providers. Measure:
@@ -1605,12 +1792,15 @@ hashes, and verify those hashes before each compatibility cell so candidate
 sources cannot leak into the base bundle. Exercise:
 
 - candidate client + candidate server: exact capability acknowledged and
-  successful durable restore;
-- candidate client + base server: exact capability absent, zero durable
-  reconcile requests/creates, explicit server-update UX, stateless pane still
+  successful durable restore over v8;
+- candidate client + base server: the initial v8 hello receives
+  `PROTOCOL_MISMATCH`, exactly one v7 fallback connects, exact capability is
+  absent, zero durable reconcile requests/creates are sent before/between/
+  after handshakes, explicit server-update UX appears, a stateless pane still
   starts, and even a fixture-injected unsolicited legacy
   `fresh`/`dead_session`/`respawn` frame is ignored;
-- base client + candidate server: legacy capability/result shape only;
+- base client + candidate server: the candidate accepts its v7 hello and
+  returns legacy capability/result shape only;
   immediate present restores, while `session_check_pending` becomes the base
   client’s safe restore error and cancels its held create; and
 - base client + base server: recorded two-second warming behavior remains the
@@ -1624,6 +1814,11 @@ cell in each direction.
 - [ ] **Step 5: Run browser verification and commit**
 
 ```bash
+npm run test:e2e:helpers
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/restore-contract-wall-rust.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts test/e2e-browser/specs/codex-terminal-restore-rust.spec.ts test/e2e-browser/specs/amplifier-restore-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=chromium test/e2e-browser/specs/opencode-restart-recovery.spec.ts test/e2e-browser/specs/freshopencode-db-history.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=legacy-chromium test/e2e-browser/specs/restore-matrix.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-handshake-rust.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts -g "17 durable panes restore while History remains blocked"'
@@ -1648,6 +1843,7 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 npm run typecheck
 npm run lint
+npm run test:port
 PORT=39482 npm run build
 
 cargo test -p freshell-freshagent claude_snapshot -- --nocapture
@@ -1674,6 +1870,11 @@ npm run test:vitest -- run \
   test/unit/client/components/DeadSessionPanel.test.tsx \
   --config config/vitest/vitest.config.ts
 
+npm run test:e2e:helpers
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/restore-contract-wall-rust.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts test/e2e-browser/specs/codex-terminal-restore-rust.spec.ts test/e2e-browser/specs/amplifier-restore-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=chromium test/e2e-browser/specs/opencode-restart-recovery.spec.ts test/e2e-browser/specs/freshopencode-db-history.spec.ts'
+scripts/sandbox-test.sh 'npm run test:e2e -- --project=legacy-chromium test/e2e-browser/specs/restore-matrix.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-handshake-rust.spec.ts test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts -g "17 durable panes restore while History remains blocked"'
 
