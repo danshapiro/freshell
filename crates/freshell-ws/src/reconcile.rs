@@ -290,6 +290,31 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
             }
         }
         SessionExistence::Absent => {
+            // Launcher-assigned amplifier identity: a missing session dir is
+            // never a dead state for amplifier. The broker guarantees a
+            // resume of this id is viable again — both spawn doors run
+            // `amplifier_stub::ensure_session` (ensure-after-GC) before
+            // spawning, re-stubbing the SAME id. Without this arm, the
+            // DESIGNED never-used-stub GC at terminal exit/shutdown would
+            // park every never-typed pane in the dead-sessions dialog on the
+            // next boot instead of restoring it. §7.5's respawn_exhausted
+            // convergence still applies — a respawn ↔ instant-exit loop ends
+            // in an actionable dead_session, never thrash.
+            if sref.provider == "amplifier" {
+                if deps.registry.respawn_exhausted(&key) {
+                    return PaneVerdict {
+                        session_ref: Some(sref),
+                        reason: Some("respawn_exhausted".to_string()),
+                        ..base(pane, ReconcileVerdict::DeadSession)
+                    };
+                }
+                let corrected = corrected_flag(pane.session_ref.as_ref(), Some(&sref));
+                return PaneVerdict {
+                    session_ref: Some(sref),
+                    corrected,
+                    ..base(pane, ReconcileVerdict::Respawn)
+                };
+            }
             // dead_session is gated on the identity having been SEEN on disk
             // at least once — never a data-loss-shaped verdict for an
             // identity disk has no memory of (§5.3 rows 4/4b).
@@ -545,6 +570,25 @@ mod tests {
             Some(sref("claude", "s-gone")),
             "dead_session carries the claimed-but-missing identity for the error UI"
         );
+    }
+
+    /// Launcher-assigned amplifier identity: a missing session dir is never
+    /// a dead state for amplifier — the respawn door re-stubs the SAME id
+    /// before spawning (`amplifier_stub::ensure_session`, ensure-after-GC,
+    /// `terminal.rs`), so Absent (even ever-observed: the DESIGNED
+    /// never-used-stub GC at terminal exit/shutdown removes the dir while
+    /// the pane's persisted sessionRef lives on) yields Respawn, never
+    /// dead_session.
+    #[test]
+    fn amplifier_absent_even_observed_yields_respawn_not_dead_session() {
+        let f = Fixture::new();
+        f.probe.mark_observed("amplifier", "s-gcd");
+        let mut p = pane("cr-amp");
+        p.mode = Some("amplifier".to_string());
+        p.session_ref = Some(sref("amplifier", "s-gcd"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(v.session_ref, Some(sref("amplifier", "s-gcd")));
     }
 
     /// Row 5 (§9.1 test 6): cold index on a known provider → honest
