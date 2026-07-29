@@ -8,6 +8,7 @@
       "DOM.Iterable"
     ],
     "module": "ESNext",
+    "allowJs": true,
     "skipLibCheck": true,
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
@@ -37,6 +38,7 @@
   "include": [
     "src",
     "shared",
+    "scripts/deployment-compatibility.mjs",
     "config/vite/vite.config.ts"
   ]
 }

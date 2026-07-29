@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1",
+  "client": {
+    "version": "0.7.5",
+    "supportsServer": {
+      "minInclusive": "0.7.0",
+      "maxExclusive": "0.7.1"
+    }
+  },
+  "server": {
+    "version": "0.7.0",
+    "supportsClient": {
+      "minInclusive": "0.7.5",
+      "maxExclusive": "0.7.6"
+    }
+  }
+}

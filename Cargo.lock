@@ -1292,6 +1292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-deployment"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [

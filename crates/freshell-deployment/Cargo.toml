@@ -1,0 +1,12 @@
+[package]
+name = "freshell-deployment"
+version = "0.1.0"
+description = "Canonical cross-language deployment compatibility contract"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
