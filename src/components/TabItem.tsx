@@ -186,7 +186,7 @@ export default function TabItem({
   const tabContent = (
     <div
       className={cn(
-        'group relative flex items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
+        'group relative flex items-center gap-2 h-8 w-60 shrink-0 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
@@ -237,7 +237,7 @@ export default function TabItem({
       {isRenaming ? (
         <input
           ref={inputRef}
-          className="bg-transparent outline-none w-32 text-sm"
+          className="bg-transparent outline-none flex-1 min-w-0 text-sm"
           value={renameValue}
           onChange={(e) => onRenameChange(e.target.value)}
           onBlur={onRenameBlur}
@@ -245,7 +245,7 @@ export default function TabItem({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span className="whitespace-nowrap truncate text-sm max-w-[5rem]">
+        <span className="whitespace-nowrap truncate text-sm flex-1 min-w-0">
           {tab.title}
         </span>
       )}

@@ -123,7 +123,7 @@ function SortableTab({
   )
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div ref={setNodeRef} style={style} className="shrink-0" {...attributes} {...listeners}>
       <TabItem
         tab={tabWithDisplayTitle}
         isActive={isActive}

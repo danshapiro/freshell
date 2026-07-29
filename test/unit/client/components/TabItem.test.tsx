@@ -426,11 +426,13 @@ describe('TabItem', () => {
   it('uses the same title width class for active and inactive tabs', () => {
     const { rerender } = render(<TabItem {...defaultProps} isActive={false} />)
     let title = screen.getByText('Test Tab')
-    expect(title.className).toContain('max-w-[5rem]')
+    expect(title.className).toContain('flex-1')
+    expect(title.className).toContain('min-w-0')
 
     rerender(<TabItem {...defaultProps} isActive={true} />)
     title = screen.getByText('Test Tab')
-    expect(title.className).toContain('max-w-[5rem]')
+    expect(title.className).toContain('flex-1')
+    expect(title.className).toContain('min-w-0')
   })
 
   it('does not vertically offset inactive tabs', () => {
@@ -645,6 +647,32 @@ describe('TabItem', () => {
       expect(screen.getAllByTestId('repo-icon')).toHaveLength(3)
       expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
       expect(screen.queryByText(/^\+\d+$/)).toBeNull()
+    })
+  })
+
+  describe('fixed tab width', () => {
+    it('every tab is fixed at 240px (w-60) and never flex-shrinks', () => {
+      render(<TabItem {...defaultProps} />)
+      const el = getTabElement()
+      expect(el?.className).toContain('w-60')
+      expect(el?.className).toContain('shrink-0')
+    })
+
+    it('the label fills the fixed width and truncates with ellipsis', () => {
+      render(<TabItem {...defaultProps} tab={createTab({ title: 'Test Tab' })} />)
+      const label = screen.getByText('Test Tab')
+      expect(label.className).toContain('truncate')
+      expect(label.className).toContain('flex-1')
+      expect(label.className).toContain('min-w-0')
+      expect(label.className).not.toContain('max-w-[5rem]')
+    })
+
+    it('the rename input fills the same space (no width jump on rename)', () => {
+      render(<TabItem {...defaultProps} isRenaming={true} renameValue="abc" />)
+      const input = screen.getByDisplayValue('abc')
+      expect(input.className).toContain('flex-1')
+      expect(input.className).toContain('min-w-0')
+      expect(input.className).not.toContain('w-32')
     })
   })
 })
