@@ -136,17 +136,12 @@ describe('TabItem', () => {
       expect(el?.getAttribute('data-visual-state')).toBe('working')
     })
 
-    it('ready: isReady inactive tab renders GREEN without the bar', () => {
-      render(<TabItem {...defaultProps} isReady={true} />)
+    it('ready is the resting state: a plain live inactive tab renders GREEN without the bar', () => {
+      render(<TabItem {...defaultProps} />)
       const el = getTabElement()
       expect(el?.className).toContain('bg-emerald-100')
       expect(el?.getAttribute('data-visual-state')).toBe('ready')
       expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
-    })
-
-    it('idle: a plain inactive tab exposes the neutral structural state', () => {
-      render(<TabItem {...defaultProps} />)
-      expect(getTabElement()?.getAttribute('data-visual-state')).toBe('neutral')
     })
 
     it('ready-unacked: attention on an inactive tab renders GREEN with the GREEN BAR', () => {
@@ -165,7 +160,7 @@ describe('TabItem', () => {
     })
 
     it('working takes precedence over ready/attention (neutral look, no green)', () => {
-      render(<TabItem {...defaultProps} busy={true} isReady={true} needsAttention={true} />)
+      render(<TabItem {...defaultProps} busy={true} needsAttention={true} />)
       const el = getTabElement()
       expect(el?.className).toContain('bg-muted')
       expect(el?.className).not.toContain('bg-zinc-300')
@@ -174,17 +169,29 @@ describe('TabItem', () => {
       expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
     })
 
-    it('a tab whose panes all exited is neutral even when flagged ready', () => {
+    it('a tab whose panes all exited is neutral (plain), never green', () => {
       render(
         <TabItem
           {...defaultProps}
           tab={createTab({ status: 'exited' })}
-          isReady={true}
         />
       )
       const el = getTabElement()
       expect(el?.className).toContain('bg-muted')
       expect(el?.className).not.toContain('bg-emerald-100')
+      expect(el?.getAttribute('data-visual-state')).toBe('neutral')
+    })
+
+    it('a still-creating tab is neutral (not yet ready for input)', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          tab={createTab({ status: 'creating' })}
+        />
+      )
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-muted')
+      expect(el?.getAttribute('data-visual-state')).toBe('neutral')
     })
 
     it('tabAttentionStyle none suppresses the bar but keeps the green base', () => {

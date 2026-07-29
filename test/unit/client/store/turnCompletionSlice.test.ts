@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import reducer, {
   clearTabAttention,
-  clearTabReady,
   clearPaneAttention,
   consumeTurnCompleteEvents,
   markTabAttention,
@@ -139,7 +138,6 @@ describe('turnCompletionSlice', () => {
       pendingEvents: [],
       attentionByTab: {},
       attentionByPane: {},
-      readyByTab: {},
     }
     // Should return exact same state reference — no draft modification
     expect(state).toEqual(initial)
@@ -168,30 +166,6 @@ describe('turnCompletionSlice', () => {
     // Should return exact same state reference — no draft modification
     const next = reducer(state, clearPaneAttention({ paneId: 'pane-1' }))
     expect(next).toBe(state)
-  })
-
-  describe('readyByTab (persistent ready flag)', () => {
-    it('markTabAttention also marks the tab ready', () => {
-      const state = reducer(undefined, markTabAttention({ tabId: 'T1' }))
-      expect(state.attentionByTab['T1']).toBe(true)
-      expect(state.readyByTab['T1']).toBe(true)
-    })
-
-    it('clearTabAttention does NOT clear ready (acknowledged tab stays green)', () => {
-      let state = reducer(undefined, markTabAttention({ tabId: 'T1' }))
-      state = reducer(state, clearTabAttention({ tabId: 'T1' }))
-      expect(state.attentionByTab['T1']).toBeUndefined()
-      expect(state.readyByTab['T1']).toBe(true)
-    })
-
-    it('clearTabReady removes the ready flag and is a no-op when absent', () => {
-      let state = reducer(undefined, markTabAttention({ tabId: 'T1' }))
-      state = reducer(state, clearTabReady({ tabId: 'T1' }))
-      expect(state.readyByTab['T1']).toBeUndefined()
-      // no-op path must not throw
-      state = reducer(state, clearTabReady({ tabId: 'nope' }))
-      expect(state.readyByTab['nope']).toBeUndefined()
-    })
   })
 
   describe('attention cleanup on pane/tab close (thunks)', () => {
@@ -272,24 +246,6 @@ describe('turnCompletionSlice', () => {
       expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
       expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
       expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
-    })
-
-    it('closeTab clears readyByTab for the closed tab', async () => {
-      const store = createFullStore()
-      store.dispatch(markTabAttention({ tabId: 'tab-1' }))
-      expect(store.getState().turnCompletion.readyByTab['tab-1']).toBe(true)
-      const result = await store.dispatch(closeTab('tab-1'))
-      expect(result.type).toBe(closeTab.fulfilled.type)
-      expect(store.getState().turnCompletion.readyByTab['tab-1']).toBeUndefined()
-    })
-
-    it('closing the pane that earned readiness clears readyByTab', async () => {
-      const store = createFullStore()
-      store.dispatch(markTabAttention({ tabId: 'tab-1' }))
-      expect(store.getState().turnCompletion.readyByTab['tab-1']).toBe(true)
-      await store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
-      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
-      expect(store.getState().turnCompletion.readyByTab['tab-1']).toBeUndefined()
     })
 
     it('closeTab on a tab without attention is a no-op for attention state', async () => {

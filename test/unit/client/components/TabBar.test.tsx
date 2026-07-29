@@ -489,8 +489,8 @@ describe('TabBar', () => {
       expect(activeTabElement?.className).toContain('border-b-background')
       expect(activeTabElement?.className).not.toContain('-mb-px')
 
-      // Inactive tabs should be slightly off-background gray
-      expect(inactiveTabElement?.className).toContain('bg-muted')
+      // Inactive live tabs rest GREEN (ready is the resting state)
+      expect(inactiveTabElement?.className).toContain('bg-emerald-100')
       expect(inactiveTabElement?.className).not.toContain('border-b')
     })
 
@@ -524,7 +524,8 @@ describe('TabBar', () => {
       tab1Element = screen.getByText('Tab 1').closest('div[class*="group"]')
 
       expect(tab2Element?.className).toContain('bg-background')
-      expect(tab1Element?.className).toContain('bg-muted')
+      // Deactivated live tab rests GREEN
+      expect(tab1Element?.className).toContain('bg-emerald-100')
     })
 
     it('highlights inactive tabs that need attention', () => {
@@ -570,11 +571,11 @@ describe('TabBar', () => {
       // Click tab-2 (attentionDismiss defaults to 'click').
       fireEvent.click(screen.getByText('Tab 2'))
 
-      // Attention cleared -> bar gone; readyByTab persists -> still green.
+      // Attention cleared -> bar gone; green persists because ready is the
+      // resting state (derived from liveness, no persistent flag needed).
       // NOTE: after the click tab-2 is the ACTIVE tab, so "green" renders as the
       // active-ready style (green top border), not the inactive emerald fill.
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
-      expect(store.getState().turnCompletion.readyByTab['tab-2']).toBe(true)
       expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
       const tabEl = screen.getByText('Tab 2').closest('div[class*="group"]')
       expect(tabEl?.className).toContain('border-t-success')

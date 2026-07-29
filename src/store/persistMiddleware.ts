@@ -650,20 +650,10 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       if (turnCompletionDirty) {
-        // Prune readyByTab to live tabs at the write site: multi-window closes
-        // remove tabs via the hydrateTabs tombstone merge without dispatching
-        // closeTab, so a permanent flag with no pruning would grow localStorage
-        // without bound (and other windows' whole-map flushes would resurrect
-        // deleted entries).
-        const readyByTab = state.turnCompletion?.readyByTab ?? {}
-        const liveTabIds = state.tabs ? new Set(state.tabs.tabs.map((tab) => tab.id)) : null
         const rawTurnCompletion = JSON.stringify({
           version: 1,
           attentionByTab: state.turnCompletion?.attentionByTab ?? {},
           attentionByPane: state.turnCompletion?.attentionByPane ?? {},
-          readyByTab: liveTabIds
-            ? Object.fromEntries(Object.entries(readyByTab).filter(([tabId]) => liveTabIds.has(tabId)))
-            : readyByTab,
         })
         localStorage.setItem(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
         broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
@@ -715,9 +705,6 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       const turnCompletionChanged = (
         state.turnCompletion?.attentionByTab !== previousState.turnCompletion?.attentionByTab
         || state.turnCompletion?.attentionByPane !== previousState.turnCompletion?.attentionByPane
-        // Without this, a readyByTab-only mutation (e.g. clearTabReady on a tab
-        // whose attention was already acknowledged) would never flush.
-        || state.turnCompletion?.readyByTab !== previousState.turnCompletion?.readyByTab
       )
 
       if (a.type.startsWith('tabs/') && tabsChanged) {

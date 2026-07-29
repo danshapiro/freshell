@@ -26,13 +26,6 @@ export interface TurnCompletionState {
   pendingEvents: TurnCompleteEvent[]
   attentionByTab: Record<string, boolean>
   attentionByPane: Record<string, boolean>
-  /**
-   * Presentation-only: tab has turned ready (turn complete / idle / waiting) at
-   * least once. Unlike attentionByTab this SURVIVES acknowledgement — it keeps
-   * the tab green after the user clicks; only the green BAR (attention) clears.
-   * Cleared on tab close. Never consulted by dedupe or event machinery.
-   */
-  readyByTab: Record<string, boolean>
 }
 
 function readBooleanRecord(value: unknown): Record<string, boolean> {
@@ -46,12 +39,11 @@ function readBooleanRecord(value: unknown): Record<string, boolean> {
 
 export function loadPersistedTurnCompletionState(): Pick<
   TurnCompletionState,
-  'attentionByTab' | 'attentionByPane' | 'readyByTab'
+  'attentionByTab' | 'attentionByPane'
 > {
   const empty = {
     attentionByTab: {},
     attentionByPane: {},
-    readyByTab: {},
   }
   if (typeof localStorage === 'undefined') return empty
 
@@ -61,10 +53,9 @@ export function loadPersistedTurnCompletionState(): Pick<
     const parsed = JSON.parse(raw) as Record<string, unknown>
     if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) return empty
     return {
+      // Legacy fields written by older builds (e.g. readyByTab) are ignored.
       attentionByTab: readBooleanRecord(parsed.attentionByTab),
       attentionByPane: readBooleanRecord(parsed.attentionByPane),
-      // Absent in payloads written by pre-readyByTab builds (still version 1).
-      readyByTab: readBooleanRecord(parsed.readyByTab),
     }
   } catch {
     return empty
@@ -80,7 +71,6 @@ const initialState: TurnCompletionState = {
   pendingEvents: [],
   attentionByTab: persistedTurnCompletion.attentionByTab,
   attentionByPane: persistedTurnCompletion.attentionByPane,
-  readyByTab: persistedTurnCompletion.readyByTab,
 }
 
 const turnCompletionSlice = createSlice({
@@ -137,14 +127,8 @@ const turnCompletionSlice = createSlice({
       state.pendingEvents = state.pendingEvents.filter((event) => event.seq > throughSeq)
     },
     markTabAttention(state, action: PayloadAction<{ tabId: string }>) {
-      state.readyByTab ??= {}
-      state.readyByTab[action.payload.tabId] = true
       if (state.attentionByTab[action.payload.tabId]) return
       state.attentionByTab[action.payload.tabId] = true
-    },
-    clearTabReady(state, action: PayloadAction<{ tabId: string }>) {
-      if (!state.readyByTab?.[action.payload.tabId]) return
-      delete state.readyByTab[action.payload.tabId]
     },
     clearTabAttention(state, action: PayloadAction<{ tabId: string }>) {
       if (!state.attentionByTab[action.payload.tabId]) return
@@ -168,7 +152,6 @@ export const {
   consumeTurnCompleteEvents,
   markTabAttention,
   clearTabAttention,
-  clearTabReady,
   markPaneAttention,
   clearPaneAttention,
 } = turnCompletionSlice.actions

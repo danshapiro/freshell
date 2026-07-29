@@ -50,8 +50,6 @@ export interface TabItemProps {
   needsAttention: boolean
   busy?: boolean
   busyPaneIds?: string[]
-  /** Tab has turned ready at least once (turnCompletion.readyByTab). */
-  isReady?: boolean
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -74,7 +72,6 @@ export default function TabItem({
   needsAttention,
   busy,
   busyPaneIds = [],
-  isReady = false,
   isDragging,
   isRenaming,
   renameValue,
@@ -101,7 +98,6 @@ export default function TabItem({
   const visualState = resolveTabVisualState({
     isBusy: !!busy,
     hasAttention: needsAttention,
-    isReady,
     isActive,
     hasLivePane: tabHasLivePane(tab, paneEntries),
   })

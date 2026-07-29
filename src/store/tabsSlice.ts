@@ -2,7 +2,7 @@ import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
-import { clearTabAttention, clearTabReady, clearPaneAttention } from './turnCompletionSlice.js'
+import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
@@ -473,9 +473,6 @@ export const closePaneWithCleanup = createAsyncThunk(
       clearDraft(paneId)
       dispatch(clearPaneAttention({ paneId }))
       dispatch(clearTabAttention({ tabId }))
-      // Pane departure invalidates tab-level readiness exactly as it already
-      // invalidates tab-level attention (no permanently green shell-only tab).
-      dispatch(clearTabReady({ tabId }))
     }
   }
 )
@@ -529,9 +526,8 @@ export const closeTab = createAsyncThunk(
     dispatch(removeTab(tabId))
     dispatch(removeLayout({ tabId }))
 
-    // Clean up attention, readiness, and drafts for the tab and all its panes
+    // Clean up attention and drafts for the tab and all its panes
     dispatch(clearTabAttention({ tabId }))
-    dispatch(clearTabReady({ tabId }))
     for (const paneId of paneIds) {
       dispatch(clearPaneAttention({ paneId }))
       clearDraft(paneId)
