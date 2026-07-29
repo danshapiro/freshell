@@ -545,7 +545,7 @@ Current status-relevant code in `TabItem.tsx` (for orientation; line numbers fro
 **Files:**
 - Modify: `src/components/TabItem.tsx`
 - Test: `test/unit/client/components/TabItem.test.tsx`
-- Test: `test/e2e/pane-activity-indicator-flow.test.tsx` + `test/e2e/codex-activity-indicator-flow.test.tsx` (tab-scoped `text-blue-500` assertions → grey; see Step 4b)
+- Test: `test/e2e/pane-activity-indicator-flow.test.tsx` + `test/e2e/codex-activity-indicator-flow.test.tsx` + `test/e2e/busy-indicator-color-flow.test.tsx` (tab-scoped state-color assertions → re-target per Step 4b)
 - Test: `test/e2e-browser/specs/pane-activity-indicator.spec.ts`, `truly-idle-alerting.spec.ts`, `terminal-activity-rust.spec.ts`, `codex-status-completeness-rust.spec.ts` (browser-suite locators; see Step 4b)
 
 **Interfaces:**
@@ -558,7 +558,7 @@ Current status-relevant code in `TabItem.tsx` (for orientation; line numbers fro
 
 In `test/unit/client/components/TabItem.test.tsx` (it mocks `lucide-react`, `PaneIcon`, `RepoIcon` and has `defaultProps`/`createTab`/`getTabElement` helpers — reuse them):
 
-a) Update the existing blue-assertion tests (three of them) to expect grey. Find these `it` blocks and change the assertions (keep the scenarios):
+a) Update the existing blue-assertion tests (four of them — a fresh sweep found `text-blue-500`/`fill-blue-500` POSITIVE assertions in exactly four `it` blocks: ~lines 122, 179, 216, 240) to expect grey. Find these `it` blocks and change the assertions (keep the scenarios):
 
 - `'shows a blue single dot when a pane is busy even if the aggregate tab.status is not running'` → rename to `'shows a grey single dot when a pane is busy even if the aggregate tab.status is not running'`; replace `expect(dot.getAttribute('class')).toContain('fill-blue-500')` with:
 
@@ -585,6 +585,15 @@ a) Update the existing blue-assertion tests (three of them) to expect grey. Find
     expect(screen.getByText('+4').getAttribute('class')).not.toContain('text-blue-500')
 ```
 
+- `'shows blue icon for a single unnamed terminal during the exact tab-terminal fallback'` (~line 216, positive `text-blue-500` at ~line 237) → rename to `'shows grey icon for a single unnamed terminal during the exact tab-terminal fallback'`; keep the scenario and replace the color assertion with:
+
+```tsx
+    expect(icon.getAttribute('class')).toContain('text-zinc-600')
+    expect(icon.getAttribute('class')).not.toContain('text-blue-500')
+```
+
+(The three pre-existing NEGATIVE `text-blue-500`/`fill-blue-500` assertions in this file — ~lines 135, 213, 277 — remain true under the new scheme; leave them.)
+
 b) Add new tests for the canonical states:
 
 ```tsx
@@ -595,13 +604,22 @@ b) Add new tests for the canonical states:
       expect(el?.className).toContain('bg-zinc-300')
       expect(el?.className).not.toContain('bg-emerald-100')
       expect(el?.className).not.toContain('blue-500')
+      // Structural busy marker — the out-of-task suites in Step 4b re-target
+      // their busy/idle assertions and Playwright locators to this attribute.
+      expect(el?.getAttribute('data-visual-state')).toBe('working')
     })
 
     it('ready: isReady inactive tab renders GREEN without the bar', () => {
       render(<TabItem {...defaultProps} isReady={true} />)
       const el = getTabElement()
       expect(el?.className).toContain('bg-emerald-100')
+      expect(el?.getAttribute('data-visual-state')).toBe('ready')
       expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+    })
+
+    it('idle: a plain inactive tab exposes the neutral structural state', () => {
+      render(<TabItem {...defaultProps} />)
+      expect(getTabElement()?.getAttribute('data-visual-state')).toBe('neutral')
     })
 
     it('ready-unacked: attention on an inactive tab renders GREEN with the GREEN BAR', () => {
@@ -663,7 +681,7 @@ c) Reconcile the four pre-existing attention-style tests with the new scheme (sa
 - [ ] **Step 2: Run tests to verify the new ones fail**
 
 Run: `npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx --config config/vitest/vitest.config.ts`
-Expected: FAIL — new tests fail (`bg-zinc-300` absent, `tab-attention-bar` missing, `isReady` prop unknown); the updated blue→grey tests fail on class assertions.
+Expected: FAIL — new tests fail (`bg-zinc-300` absent, `data-visual-state` attribute missing, `tab-attention-bar` missing, `isReady` prop unknown); the updated blue→grey tests fail on class assertions.
 
 - [ ] **Step 3: Implement**
 
@@ -704,7 +722,7 @@ function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean })
 }
 ```
 
-d) Provider logos in tabs — always dark grey (spec: no color in tabs; sidebar untouched because it never renders through this call site). Replace the `PaneIcon` call (currently `isBusy ? 'text-blue-500' : getTerminalStatusIconClassName(status)`):
+d) Provider logos in tabs — always dark grey (spec: no color in tabs; sidebar untouched because it never renders through this call site). **RECORDED DECISION (deliberate behavior change):** this removes ALL per-status coloring from tab icons, not just busy-blue — errored panes lose `text-destructive` red, creating panes lose `text-muted-foreground`, recovering panes lose amber, and running panes lose `text-success` green on the tab strip. The state signal moves to the tab CONTAINER (grey working / green ready), the `StatusDot` keeps its non-busy status colors, and only exited dimming is preserved on icons via `opacity-40`. Alternative considered — keeping `getTerminalStatusIconClassName(status)` for non-busy icons — was rejected because the spec is "no color in tabs": mixed grey-container + colored-icon states would reintroduce the visual noise this overhaul removes. This is why the TabBar/e2e suites listed in Steps 4-4b that assert per-status icon colors must be updated. Replace the `PaneIcon` call (currently `isBusy ? 'text-blue-500' : getTerminalStatusIconClassName(status)`):
 
 ```tsx
               <PaneIcon
@@ -782,6 +800,14 @@ g) Replace the container `className={cn(...)}` block with the following. **Struc
       )}
 ```
 
+g2) Expose the structural state marker on the same container `<div>` (the one whose `className` was replaced in (g); it already carries `data-context={ContextIds.Tab}` and `data-tab-id={tab.id}` at ~lines 188-189) — add alongside those attributes:
+
+```tsx
+      data-visual-state={visualState}
+```
+
+This is load-bearing for verification, not decoration: with icons unconditionally grey, class-based assertions can no longer distinguish busy from idle tabs, so every out-of-task suite in Step 4b re-targets its busy/idle assertions and Playwright locators to `data-visual-state="working"`. The attribute is always present with one of `neutral | working | ready | ready-unacked`.
+
 h) Render the bar inside the container `<div>`, immediately after the close `</button>`:
 
 ```tsx
@@ -800,36 +826,44 @@ h) Render the bar inside the container `<div>`, immediately after the close `</b
 npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx --config config/vitest/vitest.config.ts
 npm run test:vitest -- run test/unit/client/components/TabBar.test.tsx --config config/vitest/vitest.config.ts
 ```
-Expected: TabItem PASS. If TabBar tests assert old blue/emerald classnames, update those assertions to the new scheme (same substitutions as Step 1a; do not delete scenarios).
+Expected: TabItem PASS. TabBar WILL fail before its updates: its `describe('terminal status indicator')` block (lines ~915-1022, selecting icons via `screen.getAllByTestId('pane-icon')` with a local `getClassString` helper) positively asserts the per-status icon colors that Step 3d removes — `text-muted-foreground/40` (exited, ~951 and ~1014), `text-destructive` (error, ~968 and ~1019), `text-muted-foreground` (creating, ~985), `text-success` (running, ~1009; also ~934). Update every per-status PANE-ICON color assertion in that block to the new unconditional scheme — icon class contains `text-zinc-600` and does NOT contain the old status color; keep the `opacity-40` assertion for exited (still applied); keep every scenario. Do NOT touch `StatusDot` assertions — the non-busy status dot keeps `getTerminalStatusDotClassName` colors. Also update any other TabBar assertions on old blue/emerald tab classnames (same substitutions as Step 1a). Then re-run both commands. Expected: both PASS.
 
-- [ ] **Step 4b: Update out-of-task suites that assert tab-icon blue (validated inventory — exactly these)**
+- [ ] **Step 4b: Re-target out-of-task suites that assert tab-icon state colors (validated inventory — exactly these)**
 
-A grep sweep of the whole test tree found six files OUTSIDE this plan's unit-test list that hard-assert `text-blue-500` on TAB-scoped icons (pane-scoped blue assertions are untouched — pane headers keep their coloring):
+**Why a blind class substitution is WRONG here:** after Step 3d, `text-zinc-600` is UNCONDITIONAL on every tab icon. Rewriting a busy assertion from `text-blue-500` to `text-zinc-600` would make it pass whether or not busy propagation works (vacuous), and rewriting a NEGATIVE (idle) assertion the same way would make it fail forever. The busy/idle signal on the tab now lives on the CONTAINER, so every tab-scoped busy/idle expectation re-targets to the structural marker added in Step 3g2: `data-visual-state="working"` (present when busy, absent → `neutral`/`ready`/... when not). Pane-header-scoped blue assertions are untouched — pane headers keep their coloring.
 
-- `test/e2e/pane-activity-indicator-flow.test.tsx` (lines ~287, 347, 381, 466, 483, 535, 600 — positive tab-icon assertions)
-- `test/e2e/codex-activity-indicator-flow.test.tsx` (line ~160 — `tabButton` assertion)
-- `test/e2e-browser/specs/pane-activity-indicator.spec.ts` (~line 23)
-- `test/e2e-browser/specs/truly-idle-alerting.spec.ts` (~line 141)
-- `test/e2e-browser/specs/terminal-activity-rust.spec.ts` (~line 189 — busy-tab locator helper)
-- `test/e2e-browser/specs/codex-status-completeness-rust.spec.ts` (~line 180 — same helper)
+A full sweep (positives AND negatives, all status-color classes removed by 3d) found seven files outside this plan's unit-test list:
 
-In each, update only the TAB-scoped expectations: `text-blue-500` → `text-zinc-600` (and where a locator selects busy tabs by the blue class, select by the new grey class or a structural attribute instead). Keep every scenario. Then verify the two vitest e2e suites:
+1. `test/e2e/pane-activity-indicator-flow.test.tsx` — tab scope is `within(getVisibleSinglePaneTab())` (helper ~lines 240-246, filters `data-context === 'tab'`; it returns the tab container, so the attribute can be read off it directly).
+   - POSITIVE tab-icon blue assertions (~287, 347, 381, 466, 483, 535, 600) → replace each icon-class assertion with `expect(<tab container>.getAttribute('data-visual-state')).toBe('working')`.
+   - NEGATIVE tab-icon blue assertions (~294, 335, 372, 390, 515, 525, 545, 588) → replace with `expect(<tab container>.getAttribute('data-visual-state')).not.toBe('working')`.
+   - Pane-header twins (pos ~286, 380, 465, 482, 534; neg ~293, 371, 389, 514, 524, 544; helper-internal ~252/254) stay EXACTLY as they are.
+2. `test/e2e/codex-activity-indicator-flow.test.tsx` — `tabButton` positive at ~160 → `data-visual-state === 'working'`; negatives at ~180 and ~224 → `!== 'working'`. Pane-header twins (~157, 177, 221) untouched.
+3. `test/e2e/busy-indicator-color-flow.test.tsx` — its only `it` (`'renders creating icons as muted in both tab and pane chrome'`, ~line 77) loops over BOTH the tab icon and the pane-header icon (~lines 104-106) asserting `text-muted-foreground` + not-blue. Task 3d removes creating-muted from TAB icons only. Split the loop: the PANE-HEADER icon keeps `toContain('text-muted-foreground')`; the TAB icon now asserts `toContain('text-zinc-600')` and `not.toContain('text-blue-500')`. Keep the scenario.
+4. `test/e2e-browser/specs/pane-activity-indicator.spec.ts` — all four blue assertions live in `expectChromeBlue` (~lines 19-30): tab positive ~23 / tab negative ~28 re-target to `expect(tab).toHaveAttribute('data-visual-state', 'working')` / `not.toHaveAttribute(...)` using the existing tab-container locator (~lines 11-13, drop the `.locator('svg').first()` hop for the tab half); pane positive ~24 / negative ~29 untouched.
+5. `test/e2e-browser/specs/truly-idle-alerting.spec.ts` — `claudeTabIcon` (~lines 134-135, positional `svg.first()`): replace with a tab-container locator and assert `data-visual-state` `=== 'working'` at ~141 / `!== 'working'` at ~150.
+6. `test/e2e-browser/specs/terminal-activity-rust.spec.ts` — helper `tabBlueIcons` (~lines 188-190) locates `[data-context="tab"][data-tab-id="${tabId}"] svg.text-blue-500`. Rename to `workingTab` returning `page.locator(`[data-context="tab"][data-tab-id="${tabId}"][data-visual-state="working"]`)`. Both directions keep their exact count semantics: busy `.not.toHaveCount(0)` at ~248, 294, 354, 436 and idle `.toHaveCount(0)` at ~256, 302, 362, 455 remain meaningful because the attribute value is conditional on busy.
+7. `test/e2e-browser/specs/codex-status-completeness-rust.spec.ts` — same `tabBlueIcons` helper (~lines 179-181), busy non-zero ~465, idle zero ~483: same `workingTab` rename and re-target.
+
+Keep every scenario; do not delete or skip tests. Then verify the three vitest e2e suites:
 
 ```bash
 npm run test:vitest -- run test/e2e/pane-activity-indicator-flow.test.tsx --config config/vitest/vitest.config.ts
 npm run test:vitest -- run test/e2e/codex-activity-indicator-flow.test.tsx --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/e2e/busy-indicator-color-flow.test.tsx --config config/vitest/vitest.config.ts
 ```
 
-Expected: PASS. (The `test/e2e-browser/specs/*` Playwright specs are not runnable in this environment — update the locators for consistency; they run in the browser-suite pipeline.)
+Expected: PASS. (The `test/e2e-browser/specs/*` Playwright specs are not runnable in this environment — update the locators as specified; they run in the browser-suite pipeline, and the `data-visual-state` re-target keeps both their non-zero and zero-count assertions non-vacuous there.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/components/TabItem.tsx test/unit/client/components/TabItem.test.tsx test/unit/client/components/TabBar.test.tsx \
   test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/codex-activity-indicator-flow.test.tsx \
+  test/e2e/busy-indicator-color-flow.test.tsx \
   test/e2e-browser/specs/pane-activity-indicator.spec.ts test/e2e-browser/specs/truly-idle-alerting.spec.ts \
   test/e2e-browser/specs/terminal-activity-rust.spec.ts test/e2e-browser/specs/codex-status-completeness-rust.spec.ts
-git commit -m "feat(tabs): grey working / green ready / green-bar unacked states; dark-grey tab icons"
+git commit -m "feat(tabs): grey working / green ready / green-bar unacked states; uncolored dark-grey tab icons with data-visual-state marker"
 ```
 
 ---
