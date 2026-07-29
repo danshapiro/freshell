@@ -857,7 +857,7 @@ describe('Component Edge Cases', () => {
     })
 
     describe('TabBar with error status', () => {
-      it('displays error indicator for tabs with error status', () => {
+      it('renders dark-grey pane icons (no error coloring) for tabs with error status', () => {
         const errorTab = createTab({ status: 'error', title: 'Error Tab' })
 
         const store = createTestStore({
@@ -866,10 +866,13 @@ describe('Component Edge Cases', () => {
 
         renderWithStore(<TabBar />, store)
 
-        // With iconsOnTabs=true (default), tabs with mode render PaneIcon with status class
+        // With iconsOnTabs=true (default), tabs with mode render PaneIcon.
+        // Tab icons are unconditionally dark grey — the tab container carries
+        // the state color, so no per-status coloring on the icon itself.
         const icons = screen.getAllByTestId('pane-icon')
-        const hasError = icons.some((c) => c.getAttribute('class')?.includes('text-destructive'))
-        expect(hasError).toBe(true)
+        const greyIcon = icons.find((c) => c.getAttribute('class')?.includes('text-zinc-600'))
+        expect(greyIcon).toBeDefined()
+        expect(greyIcon!.getAttribute('class')).not.toContain('text-destructive')
       })
     })
 
