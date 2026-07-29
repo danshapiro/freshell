@@ -72,7 +72,8 @@ use std::sync::Mutex;
 
 use crate::parse::opencode::{OpencodeProvider, OpencodeSessionRow};
 
-/// `WINDOW_MS` (mirrors `AMPLIFIER_DIR_APPEAR_WINDOW_MS`): how long after the
+/// `WINDOW_MS` (mirrors the deleted `AMPLIFIER_DIR_APPEAR_WINDOW_MS`, kata
+/// qmpk): how long after the
 /// first Enter/submit a candidate session row may still appear and correlate.
 /// Also reused (spec §4.4) as the spawn-anchored fallback duration when no
 /// Enter has been observed yet.
@@ -137,7 +138,8 @@ pub struct OpencodeLocator {
     /// Counts every bounded `list_sessions_since` read this locator issues —
     /// test/diagnostic hook proving the idle short-circuit in
     /// [`OpencodeLocator::tick`] performs literally zero further DB reads
-    /// while no terminal is armed (mirrors `AmplifierLocator::fs_scan_count`).
+    /// while no terminal is armed (mirrors the deleted
+    /// `AmplifierLocator::fs_scan_count`, kata qmpk).
     db_scan_count: AtomicU64,
 }
 
@@ -168,7 +170,8 @@ impl OpencodeLocator {
     }
 
     /// How many bounded `list_sessions_since` reads have run so far
-    /// (test/diagnostic hook, mirrors `AmplifierLocator::fs_scan_count`).
+    /// (test/diagnostic hook, mirrors the deleted
+    /// `AmplifierLocator::fs_scan_count`, kata qmpk).
     pub fn db_scan_count(&self) -> u64 {
         self.db_scan_count.load(Ordering::SeqCst)
     }

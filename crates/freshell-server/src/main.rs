@@ -425,9 +425,11 @@ async fn main() -> ExitCode {
     // a faithful port of `server/coding-cli/providers/amplifier.ts`'s
     // discovery/parse -- file-based, same shape as `ClaudeSource`/`CodexSource`).
     // `amplifier_home` lives in that module (not `session_directory.rs`, whose
-    // internals are out of scope for this change) but resolves the SAME
-    // `AMPLIFIER_HOME` env / `<home>/.amplifier` default convention
-    // `claude_home`/`codex_home` use, against the same `provider_home()` root.
+    // internals are out of scope for this change) and resolves
+    // `$FRESHELL_AMPLIFIER_HOME` (used as-is when set and non-empty) else
+    // `<home>/.amplifier`, against the same `provider_home()` root
+    // `claude_home`/`codex_home` use. `AMPLIFIER_HOME` is deliberately NOT
+    // consulted anywhere broker-side.
     let session_index = session_directory::provider_home().as_ref().map(|h| {
         Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
             Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
@@ -1433,9 +1435,10 @@ fn transcript_definitively_absent(
         "amplifier" => {
             // <amplifier_home>/projects/<slug>/sessions/<session_id>/ — the
             // session dir named by session id. Mirrors the SAME
-            // `amplifier_home` resolution (`AMPLIFIER_HOME` env /
-            // `<home>/.amplifier`) main.rs already computes for the
-            // `AmplifierSource` construction above.
+            // `amplifier_home` resolution (`$FRESHELL_AMPLIFIER_HOME` used
+            // as-is when set and non-empty, else `<home>/.amplifier`;
+            // `AMPLIFIER_HOME` is never consulted broker-side) main.rs
+            // already computes for the `AmplifierSource` construction above.
             let projects = freshell_sessions::amplifier::amplifier_home(home).join("projects");
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
