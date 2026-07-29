@@ -9,6 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
   startServerProcess,
   stopProcess,
+  waitForFileContent,
   type LoggerServerProcess,
 } from './logger.separation.harness.js'
 
@@ -24,14 +25,12 @@ const SOURCE_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'server/index.ts']",
   "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
   '})()',
 ].join('\n')
 const DIST_LOGGER_PROBE = [
   '(async () => {',
   "  process.argv = ['node', 'dist/server/index.js']",
   "  await import('./server/logger.ts')",
-  '  setTimeout(() => process.exit(0), 25)',
   '})()',
 ].join('\n')
 const LOG_LEVEL_PROBE = [
@@ -41,7 +40,6 @@ const LOG_LEVEL_PROBE = [
   "  logger.info('info-level file only')",
   "  logger.warn('warn-level file only')",
   "  logger.error('error-level console and file')",
-  '  setTimeout(() => process.exit(0), 50)',
   '})()',
 ].join('\n')
 
@@ -130,23 +128,6 @@ async function startDistLoggerProcess(env: NodeJS.ProcessEnv) {
   )
 }
 
-async function waitForFileContent(filePath: string, pattern: RegExp, timeoutMs = FILE_CONTENT_TIMEOUT_MS): Promise<string> {
-  const deadline = Date.now() + timeoutMs
-  let lastContent = ''
-
-  while (Date.now() < deadline) {
-    const content = await fsp.readFile(filePath, 'utf8').catch(() => '')
-    if (content) {
-      lastContent = content
-      if (pattern.test(content)) return content
-    }
-
-    await new Promise<void>((resolve) => setTimeout(resolve, 120))
-  }
-
-  throw new Error(`Timed out waiting for ${pattern} in ${filePath}. Log: ${lastContent}`)
-}
-
 describe('debug log separation', () => {
   it(
     'keeps stdout and stderr error-only while preserving debug file verbosity',
@@ -164,7 +145,12 @@ describe('debug log separation', () => {
         )
         activeProcesses.push(proc)
 
-        const fileContent = await waitForFileContent(debugLogPath, /error-level console and file/)
+        const fileContent = await waitForFileContent(
+          proc,
+          debugLogPath,
+          /error-level console and file/,
+          FILE_CONTENT_TIMEOUT_MS,
+        )
         const processOutput = readFileSync(proc.stderrLogPath, 'utf8')
 
         expect(processOutput).toContain('error-level console and file')
@@ -204,8 +190,8 @@ describe('debug log separation', () => {
 
         const devPath = path.join(logDir, 'server-debug.development.source-mode.jsonl')
         const distPath = path.join(logDir, 'server-debug.production.dist-mode.jsonl')
-        await waitForFileContent(devPath, /Resolved debug log path/)
-        await waitForFileContent(distPath, /Resolved debug log path/)
+        await waitForFileContent(devProc, devPath, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
+        await waitForFileContent(distProc, distPath, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
 
         expect(devPath).toContain('server-debug.development.source-mode.jsonl')
         expect(distPath).toContain('server-debug.production.dist-mode.jsonl')
@@ -237,8 +223,8 @@ describe('debug log separation', () => {
 
         const pathA = path.join(logDir, 'server-debug.development.concurrent-a.jsonl')
         const pathB = path.join(logDir, 'server-debug.development.concurrent-b.jsonl')
-        await waitForFileContent(pathA, /Resolved debug log path/)
-        await waitForFileContent(pathB, /Resolved debug log path/)
+        await waitForFileContent(processA, pathA, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
+        await waitForFileContent(processB, pathB, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
 
         expect(pathA).toContain('server-debug.development.concurrent-a.jsonl')
         expect(pathB).toContain('server-debug.development.concurrent-b.jsonl')
@@ -270,8 +256,8 @@ describe('debug log separation', () => {
 
         const pathA = path.join(logDir, 'server-debug.development.alpha.jsonl')
         const pathB = path.join(logDir, 'server-debug.production.ci-run-beta.jsonl')
-        await waitForFileContent(pathA, /Resolved debug log path/)
-        await waitForFileContent(pathB, /Resolved debug log path/)
+        await waitForFileContent(procA, pathA, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
+        await waitForFileContent(procB, pathB, /Resolved debug log path/, FILE_CONTENT_TIMEOUT_MS)
         expect(pathA).toContain('server-debug.development.alpha.jsonl')
         expect(pathB).toContain('server-debug.production.ci-run-beta.jsonl')
       })
@@ -294,7 +280,12 @@ describe('debug log separation', () => {
         activeProcesses.push(proc)
 
         const resolvedPath = path.join(logDir, 'server-debug.production.ci-run-1.jsonl')
-        await waitForFileContent(resolvedPath, /Resolved debug log path/)
+        await waitForFileContent(
+          proc,
+          resolvedPath,
+          /Resolved debug log path/,
+          FILE_CONTENT_TIMEOUT_MS,
+        )
         expect(resolvedPath).toContain('server-debug.production.ci-run-1.jsonl')
 
         const startupLog = readFileSync(resolvedPath, 'utf8')

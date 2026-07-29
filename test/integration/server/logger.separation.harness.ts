@@ -10,6 +10,10 @@ export type LoggerServerProcess = {
   stderrLogPath: string
   stderrLogDir: string
   readOutput: () => string
+  closed: Promise<{
+    exitCode: number | null
+    signal: NodeJS.Signals | null
+  }>
 }
 
 const PARENT_LOG_ENV_KEYS = [
@@ -80,10 +84,17 @@ export async function startServerProcess(
   child.stdout?.on('data', appendOutput)
   child.stderr?.on('data', appendOutput)
 
-  child.once('error', () => {
-    logStream.end()
+  const closed = new Promise<{
+    exitCode: number | null
+    signal: NodeJS.Signals | null
+  }>((resolve) => {
+    child.once('close', (exitCode, signal) => {
+      logStream.end()
+      resolve({ exitCode, signal })
+    })
   })
-  child.once('exit', () => {
+
+  child.once('error', () => {
     logStream.end()
   })
 
@@ -92,12 +103,54 @@ export async function startServerProcess(
     stderrLogPath: logPath,
     stderrLogDir,
     readOutput: () => combinedOutput,
+    closed,
   }
 }
 
 async function readCombinedOutput(handle: LoggerServerProcess): Promise<string> {
   const fileContent = await fsp.readFile(handle.stderrLogPath, 'utf8').catch(() => '')
   return `${handle.readOutput()}\n${fileContent}`
+}
+
+export async function waitForFileContent(
+  handle: LoggerServerProcess,
+  filePath: string,
+  pattern: RegExp,
+  timeoutMs = 5000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  let lastContent = ''
+
+  while (Date.now() < deadline) {
+    const content = await fsp.readFile(filePath, 'utf8').catch(() => '')
+    if (content) {
+      lastContent = content
+      if (pattern.test(content)) return content
+    }
+
+    if (handle.process.exitCode !== null || handle.process.signalCode !== null) {
+      const result = await handle.closed
+      const finalContent = await fsp.readFile(filePath, 'utf8').catch(() => '')
+      if (finalContent && pattern.test(finalContent)) return finalContent
+
+      const output = await readCombinedOutput(handle)
+      const exitDescription = result.signal
+        ? `signal ${result.signal}`
+        : `exit code ${result.exitCode}`
+      throw new Error(
+        `Process exited with ${exitDescription} before ${pattern} appeared in ${filePath}. `
+        + `File content: ${finalContent || lastContent}. stdout/stderr: ${output}`,
+      )
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 120))
+  }
+
+  const output = await readCombinedOutput(handle)
+  throw new Error(
+    `Timed out waiting for ${pattern} in ${filePath}. `
+    + `File content: ${lastContent}. stdout/stderr: ${output}`,
+  )
 }
 
 export async function waitForResolvedPath(
