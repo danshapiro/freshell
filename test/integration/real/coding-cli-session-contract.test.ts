@@ -47,9 +47,16 @@ import {
   waitForOpencodeDbSession,
 } from '../../helpers/coding-cli/real-session-contract-harness.js'
 
+const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
 const note = await loadCodingCliSessionContractNote()
 const noteMarkdown = await readCodingCliSessionContractMarkdown()
-const providerBinaries = await resolveProviderBinaries(['codex', 'claude', 'opencode'] as const)
+const providerBinaries = realProviderContractsEnabled
+  ? await resolveProviderBinaries(['codex', 'claude', 'opencode'] as const)
+  : {
+      codex: { executable: 'codex', resolvedPath: null, version: null },
+      claude: { executable: 'claude', resolvedPath: null, version: null },
+      opencode: { executable: 'opencode', resolvedPath: null, version: null },
+    }
 
 const codexBinary = providerBinaries.codex
 const claudeBinary = providerBinaries.claude
@@ -156,15 +163,16 @@ function expectClaudeSuccessOrAuthFailure(input: {
   expect(claudeAuthFailed(input.stdout, input.stderr)).toBe(true)
 }
 
-const codexProbe = await codexAvailability()
-const claudeProbe = await claudeAvailability()
-const opencodeProbe = opencodeAvailability()
+const codexProbe: ProviderProbeAvailability = realProviderContractsEnabled
+  ? await codexAvailability()
+  : { ready: false }
+const claudeProbe: ProviderProbeAvailability = realProviderContractsEnabled
+  ? await claudeAvailability()
+  : { ready: false }
+const opencodeProbe: ProviderProbeAvailability = realProviderContractsEnabled
+  ? opencodeAvailability()
+  : { ready: false }
 const itWithProcOwnership = process.platform === 'linux' ? it : it.skip
-
-const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
-const realProviderSkipReason = realProviderContractsEnabled
-  ? ''
-  : 'Skipping external provider contract tests: set FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 to run them.'
 
 describe.sequential('coding cli real provider session contract', () => {
   it('loads the checked-in lab note facts and date rationale', async () => {
@@ -207,7 +215,7 @@ describe.sequential('coding cli real provider session contract', () => {
   }, 30_000)
 
   const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
-  describeCodex(`codex${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
+  describeCodex(`codex${realProviderContractsEnabled && !codexProbe.ready ? ` (${codexProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and uses the expected remote bootstrap forms', async () => {
       const codexPath = requireAvailableBinary(codexBinary, codexProbe)
       expectLocalBinary(codexBinary)
@@ -292,7 +300,7 @@ describe.sequential('coding cli real provider session contract', () => {
   })
 
   const describeClaude = (claudeProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
-  describeClaude(`claude${claudeProbe.ready ? '' : ` (${claudeProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
+  describeClaude(`claude${realProviderContractsEnabled && !claudeProbe.ready ? ` (${claudeProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and version', async () => {
       requireAvailableBinary(claudeBinary, claudeProbe)
       expectLocalBinary(claudeBinary)
@@ -610,7 +618,7 @@ describe.sequential('coding cli real provider session contract', () => {
   })
 
   const describeOpencode = (opencodeProbe.ready && realProviderContractsEnabled) ? describe.sequential : describe.skip
-  describeOpencode(`opencode${opencodeProbe.ready ? '' : ` (${opencodeProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
+  describeOpencode(`opencode${realProviderContractsEnabled && !opencodeProbe.ready ? ` (${opencodeProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
     it('detects a local binary and version', async () => {
       requireAvailableBinary(opencodeBinary, opencodeProbe)
       expectLocalBinary(opencodeBinary)

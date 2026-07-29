@@ -223,11 +223,13 @@ function presentPathLikeFields(thread: Record<string, unknown>): Array<{ field: 
     })
 }
 
-const codexProbe = await codexAvailability()
 const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+const codexProbe: ProbeAvailability = realProviderContractsEnabled
+  ? await codexAvailability()
+  : { ready: false }
 const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe : describe.skip
 
-describeCodex(`real Codex app-server fork-shape contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ' (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)'}`, () => {
+describeCodex(`real Codex app-server fork-shape contract${realProviderContractsEnabled && !codexProbe.ready ? ` (${codexProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ' (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)'}`, () => {
   it('returns result.thread.path for compact thread/fork responses', async () => {
     const { codexHome, root } = await seedIsolatedCodexHome()
     const runtime = new CodexAppServerRuntime({

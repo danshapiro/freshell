@@ -162,11 +162,13 @@ async function waitForStillRunning(remote: TrackedPtyProcess, durationMs: number
   expect(exited).toBe(false)
 }
 
-const codexProbe = await codexAvailability()
 const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+const codexProbe: ProviderProbeAvailability = realProviderContractsEnabled
+  ? await codexAvailability()
+  : { ready: false }
 const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe : describe.skip
 
-describeCodex(`real Codex TUI remote fork contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ' (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)'}`, () => {
+describeCodex(`real Codex TUI remote fork contract${realProviderContractsEnabled && !codexProbe.ready ? ` (${codexProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ' (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)'}`, () => {
   it('continues after a compact thread/fork response with an empty turns array', async () => {
     const codexPath = codexProbe.codexPath
     if (!codexPath) throw new Error(codexProbe.reason ?? 'Codex binary unavailable.')

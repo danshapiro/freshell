@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { execFile } from 'node:child_process'
 import fsp from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 // The real-provider contract tests under test/integration/real/ gate on
 // process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1' (see AGENTS.md and
@@ -24,12 +29,50 @@ describe('real-provider coding-cli contract launcher script', () => {
     expect(script).toContain('test/integration/real/coding-cli-session-contract.test.ts')
   })
 
-  it('stays consistent with the env gate asserted by the contract test', async () => {
+  it('collects opted-out contracts without executing provider discovery', async () => {
     const root = process.cwd()
-    const testFile = await fsp.readFile(
-      path.join(root, 'test/integration/real/coding-cli-session-contract.test.ts'),
-      'utf8',
-    )
-    expect(testFile).toContain("process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'")
-  })
+    const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-provider-discovery-trap-'))
+    const trapBin = path.join(tempRoot, 'bin')
+    const discoveryLog = path.join(tempRoot, 'provider-discovery.log')
+
+    try {
+      await fsp.mkdir(trapBin)
+      await Promise.all(['bash', 'codex', 'claude', 'opencode'].map(async (executable) => {
+        await fsp.writeFile(
+          path.join(trapBin, executable),
+          `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(executable)} >> ${JSON.stringify(discoveryLog)}\nexit 97\n`,
+          { mode: 0o755 },
+        )
+      }))
+
+      const env = {
+        ...process.env,
+        PATH: `${trapBin}${path.delimiter}${process.env.PATH ?? ''}`,
+      }
+      delete env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
+
+      const { stdout } = await execFileAsync(process.execPath, [
+        path.join(root, 'node_modules/vitest/vitest.mjs'),
+        'run',
+        '--config',
+        'config/vitest/vitest.server.config.ts',
+        'test/integration/real/coding-cli-session-contract.test.ts',
+        'test/integration/real/codex-app-server-readiness-contract.test.ts',
+        'test/integration/real/codex-app-server-fork-shape-contract.test.ts',
+        'test/integration/real/codex-remote-fork-contract.test.ts',
+        '-t',
+        'loads the checked-in lab note facts',
+        '--reporter=dot',
+      ], {
+        cwd: root,
+        env,
+        timeout: 60_000,
+      })
+
+      expect(stdout).toContain('1 passed')
+      await expect(fsp.readFile(discoveryLog, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await fsp.rm(tempRoot, { recursive: true, force: true })
+    }
+  }, 60_000)
 })

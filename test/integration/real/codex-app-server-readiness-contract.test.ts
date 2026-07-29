@@ -222,8 +222,10 @@ function isDurableReadinessEvidence(event: CodexThreadLifecycleEvent, threadId: 
     && event.status.type === 'idle'
 }
 
-const codexProbe = await codexAvailability()
 const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
+const codexProbe: ProbeAvailability = realProviderContractsEnabled
+  ? await codexAvailability()
+  : { ready: false }
 const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? describe : describe.skip
 
 function readUserMessageTexts(item: Record<string, unknown>): string[] {
@@ -278,7 +280,7 @@ async function waitForSessionArtifact(codexHome: string, threadId: string, timeo
   throw new Error('Timed out waiting for the durable Codex session artifact.')
 }
 
-describeCodex(`real Codex app-server durable readiness contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
+describeCodex(`real Codex app-server durable readiness contract${realProviderContractsEnabled && !codexProbe.ready ? ` (${codexProbe.reason})` : ''}${realProviderContractsEnabled ? '' : ` (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)`}`, () => {
   it('emits current-generation lifecycle evidence when a durable thread is resumed', async () => {
     const { codexHome, root } = await seedIsolatedCodexHome()
     const promptNonce = `freshell-readiness-contract-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
