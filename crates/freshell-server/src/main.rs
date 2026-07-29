@@ -794,6 +794,29 @@ async fn main() -> ExitCode {
         ws_state.clone(),
         IDENTITY_INVARIANT_SWEEP_INTERVAL,
     );
+    // Version canary (kata qmpk): the pre-create path rests on amplifier's
+    // undocumented on-disk layout (upstream microsoft/amplifier#315/#316
+    // track a --session-id flag that would collapse this layer into a
+    // flag). Verify our slug/layout assumptions against sessions amplifier
+    // ITSELF wrote — loud on breakage, never blocking broker start.
+    tokio::task::spawn_blocking(|| {
+        use freshell_sessions::amplifier_stub::{
+            resolve_amplifier_home, verify_amplifier_layout_contract, CanaryOutcome,
+        };
+        let Some(amp_home) = resolve_amplifier_home() else {
+            return;
+        };
+        match verify_amplifier_layout_contract(&amp_home) {
+            CanaryOutcome::Broken { detail } => tracing::error!(
+                target: "freshell_ws::invariants",
+                %detail,
+                "amplifier_layout_contract_broken: amplifier's on-disk session layout no \
+                 longer matches the broker's stub pre-create assumptions — pre-created \
+                 identities may silently diverge from the CLI's own sessions"
+            ),
+            outcome => tracing::debug!(?outcome, "amplifier layout canary"),
+        }
+    });
     // OpenCode terminal-pane restore fix: the opencode locator's polling
     // cycle (its Enter/spawn<->session-row correlation is entirely
     // poll-driven -- see `freshell_sessions::opencode_locator`'s module doc).
