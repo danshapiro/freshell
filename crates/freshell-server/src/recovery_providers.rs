@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use freshell_recovery::{
-    DurableRecoveryProvider, ExactRecoveryProvider, ExactRecoveryQuery, ExactRecoverySnapshot,
-    ExactRecoveryState, RecoveryProviderRegistry, RegistryRegistrationError,
+    DurableRecoveryProvider, ExactRecoveryProvider, ExactRecoveryProviderResult,
+    ExactRecoveryProviderSnapshot, ExactRecoveryQuery, ExactRecoveryState,
+    RecoveryProviderRegistry, RegistryRegistrationError,
 };
 
 /// Explicit provider-store locations. Missing entries stay unregistered; this
@@ -56,7 +57,10 @@ struct ConfiguredRecoveryProvider {
 }
 
 impl ExactRecoveryProvider for ConfiguredRecoveryProvider {
-    fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot {
+    fn lookup_many_blocking(
+        &self,
+        queries: &[ExactRecoveryQuery],
+    ) -> ExactRecoveryProviderSnapshot {
         let _resolved_location = match self.source.resolve() {
             Ok(location) => location,
             Err(_) => {
@@ -65,9 +69,9 @@ impl ExactRecoveryProvider for ConfiguredRecoveryProvider {
                     .map(|query| {
                         (
                             query.key.clone(),
-                            ExactRecoveryState::Retryable(
+                            ExactRecoveryProviderResult::unscoped(ExactRecoveryState::Retryable(
                                 freshell_recovery::ExactRecoveryIssue::StoreReadFailed,
-                            ),
+                            )),
                         )
                     })
                     .collect();
@@ -78,7 +82,12 @@ impl ExactRecoveryProvider for ConfiguredRecoveryProvider {
         // provider task before the aggregate runtime can be constructed.
         queries
             .iter()
-            .map(|query| (query.key.clone(), ExactRecoveryState::ProviderUnavailable))
+            .map(|query| {
+                (
+                    query.key.clone(),
+                    ExactRecoveryProviderResult::unscoped(ExactRecoveryState::ProviderUnavailable),
+                )
+            })
             .collect()
     }
 }
@@ -131,8 +140,8 @@ mod tests {
 
     use freshell_protocol::SessionLocator;
     use freshell_recovery::{
-        BlockingExactRecoveryProbe, DurableRecoveryProvider, ExactRecoveryLookupKey,
-        ExactRecoveryQuery, ExactRecoveryState, MaterializationState,
+        prepare_exact_recovery_query, BlockingExactRecoveryProbe, DurableRecoveryProvider,
+        ExactRecoveryState, MaterializationState,
     };
 
     use super::{
@@ -251,16 +260,16 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let query = ExactRecoveryQuery {
-            key: ExactRecoveryLookupKey {
-                session_ref: SessionLocator {
-                    provider: "claude".to_string(),
-                    session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                },
-                cwd: None,
+        let query = prepare_exact_recovery_query(
+            "claude",
+            &SessionLocator {
+                provider: "claude".to_string(),
+                session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             },
-            materialization: MaterializationState::Unknown,
-        };
+            None,
+            MaterializationState::Unknown,
+        )
+        .unwrap();
 
         let first = registry.lookup_many_blocking(std::slice::from_ref(&query));
         resolver.set("/second/claude");

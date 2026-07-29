@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 27 discriminants).
+//! Client → server messages (`ClientMessage`, 31 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.

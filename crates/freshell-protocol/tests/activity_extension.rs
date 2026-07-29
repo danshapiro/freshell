@@ -2,7 +2,7 @@
 //! `terminal.idle` truly-idle edge.
 //!
 //! The generated T0 inventory (`port/contract/ws-message-inventory.json`,
-//! 29+56) is generated-current as of the 2026-07-26 contract reconciliation:
+//! 31+57) is generated-current as of the 2026-07-26 contract reconciliation:
 //! the legacy amplifier provider's activity family (`shared/ws-protocol.ts`
 //! `AmplifierActivity*Schema`) and the `terminal.idle` capability are now
 //! part of the frozen surface (`CLIENT_MESSAGE_TYPES` /

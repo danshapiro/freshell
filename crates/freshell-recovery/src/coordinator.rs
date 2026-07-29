@@ -21,6 +21,10 @@ pub struct ExactRecoveryLookupKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactRecoveryQuery {
+    /// Typed mode retained from the validated caller input. It is deliberately
+    /// not part of the stable lookup key, but the registry revalidates it
+    /// before any provider can perform I/O.
+    pub mode: DurableRecoveryProvider,
     pub key: ExactRecoveryLookupKey,
     pub materialization: MaterializationState,
 }
@@ -37,13 +41,61 @@ pub enum ExactRecoveryState {
     Invalid(ExactRecoveryIssue),
 }
 
+/// Provider-owned normalization of one project-scoped query. This response
+/// context is kept outside [`ExactRecoveryLookupKey`]: raw cwd spelling stays
+/// stable for request addressing while the registry can still bind a
+/// positive Amplifier result to the scope and cwd the provider actually
+/// resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderNormalizedProject {
+    pub provider_scope: String,
+    pub resolved_cwd: PathBuf,
+}
+
+/// One provider result plus the normalization context used to obtain it.
+///
+/// A project context must be derived from the input query before artifact
+/// selection. Copying scope/cwd back out of a selected proof would make the
+/// registry's independent ownership check tautological.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactRecoveryProviderResult {
+    pub state: ExactRecoveryState,
+    pub normalized_project: Option<ProviderNormalizedProject>,
+}
+
+impl ExactRecoveryProviderResult {
+    pub fn unscoped(state: ExactRecoveryState) -> Self {
+        Self {
+            state,
+            normalized_project: None,
+        }
+    }
+
+    pub fn project(
+        state: ExactRecoveryState,
+        provider_scope: impl Into<String>,
+        resolved_cwd: PathBuf,
+    ) -> Self {
+        Self {
+            state,
+            normalized_project: Some(ProviderNormalizedProject {
+                provider_scope: provider_scope.into(),
+                resolved_cwd,
+            }),
+        }
+    }
+}
+
 pub type ExactRecoverySnapshot = HashMap<ExactRecoveryLookupKey, ExactRecoveryState>;
+pub type ExactRecoveryProviderSnapshot =
+    HashMap<ExactRecoveryLookupKey, ExactRecoveryProviderResult>;
 
 /// Provider adapters are synchronous because callers execute a complete batch
 /// inside one admitted blocking job. Each involved provider receives at most
 /// one call per registry batch.
 pub trait ExactRecoveryProvider: Send + Sync {
-    fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot;
+    fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery])
+        -> ExactRecoveryProviderSnapshot;
 }
 
 /// The only store-I/O route exposed to the future async coordinator.
@@ -99,13 +151,46 @@ fn positive_owner(state: &ExactRecoveryState) -> Option<&RecoveryOwnerKey> {
     }
 }
 
-fn owner_matches_query(owner: &RecoveryOwnerKey, query: &ExactRecoveryLookupKey) -> bool {
-    if owner.provider != query.session_ref.provider
-        || owner.session_id != query.session_ref.session_id
+fn owner_matches_query(
+    owner: &RecoveryOwnerKey,
+    query: &ExactRecoveryQuery,
+    normalized_project: Option<&ProviderNormalizedProject>,
+) -> bool {
+    if owner.provider != query.key.session_ref.provider
+        || owner.session_id != query.key.session_ref.session_id
     {
         return false;
     }
-    owner.has_canonical_provider_scope()
+    if !owner.has_canonical_provider_scope() {
+        return false;
+    }
+    if query.mode != DurableRecoveryProvider::Amplifier {
+        return true;
+    }
+    let Some(project) = normalized_project else {
+        return false;
+    };
+    !project.provider_scope.is_empty()
+        && owner.provider_scope.as_deref() == Some(project.provider_scope.as_str())
+}
+
+fn positive_result_matches_query(
+    result: &ExactRecoveryProviderResult,
+    query: &ExactRecoveryQuery,
+) -> bool {
+    let Some(owner) = positive_owner(&result.state) else {
+        return true;
+    };
+    if !owner_matches_query(owner, query, result.normalized_project.as_ref()) {
+        return false;
+    }
+    match (&result.state, query.mode) {
+        (ExactRecoveryState::Present(proof), DurableRecoveryProvider::Amplifier) => result
+            .normalized_project
+            .as_ref()
+            .is_some_and(|project| proof.resolved_cwd.as_ref() == Some(&project.resolved_cwd)),
+        _ => true,
+    }
 }
 
 impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
@@ -115,16 +200,17 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
         let mut normalized = Vec::<ExactRecoveryQuery>::new();
         let mut normalized_positions = HashMap::<ExactRecoveryLookupKey, usize>::new();
         let mut snapshot = ExactRecoverySnapshot::new();
+        let mut invalid_keys = HashSet::<ExactRecoveryLookupKey>::new();
         for query in queries {
-            let canonical =
-                match validate_session_ref(&query.key.session_ref.provider, &query.key.session_ref)
-                {
-                    Ok(session_ref) => session_ref,
-                    Err(issue) => {
-                        snapshot.insert(query.key.clone(), ExactRecoveryState::Invalid(issue));
-                        continue;
-                    }
-                };
+            let canonical = match validate_session_ref(query.mode.as_str(), &query.key.session_ref)
+            {
+                Ok(session_ref) => session_ref,
+                Err(issue) => {
+                    invalid_keys.insert(query.key.clone());
+                    snapshot.insert(query.key.clone(), ExactRecoveryState::Invalid(issue));
+                    continue;
+                }
+            };
             let key = ExactRecoveryLookupKey {
                 session_ref: canonical,
                 cwd: query.key.cwd.clone(),
@@ -135,6 +221,7 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
             } else {
                 normalized_positions.insert(key.clone(), normalized.len());
                 normalized.push(ExactRecoveryQuery {
+                    mode: query.mode,
                     key,
                     materialization: query.materialization,
                 });
@@ -143,15 +230,10 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
 
         let mut grouped: HashMap<DurableRecoveryProvider, Vec<ExactRecoveryQuery>> = HashMap::new();
         for query in normalized {
-            let Some(provider) = DurableRecoveryProvider::parse(&query.key.session_ref.provider)
-            else {
-                snapshot.insert(
-                    query.key,
-                    ExactRecoveryState::Invalid(ExactRecoveryIssue::UnsupportedSessionProvider),
-                );
+            if invalid_keys.contains(&query.key) {
                 continue;
-            };
-            grouped.entry(provider).or_default().push(query);
+            }
+            grouped.entry(query.mode).or_default().push(query);
         }
 
         for provider_kind in DurableRecoveryProvider::ALL {
@@ -174,15 +256,15 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
             let mut provider_snapshot = provider.lookup_many_blocking(&provider_queries);
             provider_snapshot.retain(|key, _| requested.contains(key));
             for query in provider_queries {
-                let state = provider_snapshot
-                    .remove(&query.key)
-                    .unwrap_or(ExactRecoveryState::Retryable(ExactRecoveryIssue::Unproved));
-                let state = if positive_owner(&state)
-                    .is_some_and(|owner| !owner_matches_query(owner, &query.key))
-                {
+                let result = provider_snapshot.remove(&query.key).unwrap_or_else(|| {
+                    ExactRecoveryProviderResult::unscoped(ExactRecoveryState::Retryable(
+                        ExactRecoveryIssue::Unproved,
+                    ))
+                });
+                let state = if !positive_result_matches_query(&result, &query) {
                     ExactRecoveryState::Conflict
                 } else {
-                    state
+                    result.state
                 };
                 snapshot.insert(query.key, state);
             }
@@ -194,22 +276,27 @@ impl BlockingExactRecoveryProbe for RecoveryProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FixedStateProvider {
-        state: ExactRecoveryState,
+        result: ExactRecoveryProviderResult,
     }
 
     impl ExactRecoveryProvider for FixedStateProvider {
-        fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot {
+        fn lookup_many_blocking(
+            &self,
+            queries: &[ExactRecoveryQuery],
+        ) -> ExactRecoveryProviderSnapshot {
             queries
                 .iter()
-                .map(|query| (query.key.clone(), self.state.clone()))
+                .map(|query| (query.key.clone(), self.result.clone()))
                 .collect()
         }
     }
 
     fn query(provider: &str, session_id: &str) -> ExactRecoveryQuery {
         ExactRecoveryQuery {
+            mode: DurableRecoveryProvider::parse(provider).unwrap(),
             key: ExactRecoveryLookupKey {
                 session_ref: SessionLocator {
                     provider: provider.to_string(),
@@ -218,6 +305,95 @@ mod tests {
                 cwd: Some(PathBuf::from("/project")),
             },
             materialization: MaterializationState::Unknown,
+        }
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExactRecoveryProvider for CountingProvider {
+        fn lookup_many_blocking(
+            &self,
+            _queries: &[ExactRecoveryQuery],
+        ) -> ExactRecoveryProviderSnapshot {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ExactRecoveryProviderSnapshot::new()
+        }
+    }
+
+    #[test]
+    fn registry_rejects_a_direct_mode_mismatch_before_provider_io() {
+        let requested = ExactRecoveryQuery {
+            mode: DurableRecoveryProvider::Codex,
+            key: ExactRecoveryLookupKey {
+                session_ref: SessionLocator {
+                    provider: "claude".to_string(),
+                    session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                },
+                cwd: Some(PathBuf::from("/project")),
+            },
+            materialization: MaterializationState::Unknown,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CountingProvider {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .lookup_many_blocking(std::slice::from_ref(&requested))
+                .remove(&requested.key),
+            Some(ExactRecoveryState::Invalid(
+                ExactRecoveryIssue::ProviderModeMismatch
+            ))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "invalid direct-registry input must never reach provider root/filesystem/SQLite I/O"
+        );
+    }
+
+    #[test]
+    fn registry_invalid_mode_dominates_a_same_key_valid_duplicate_in_any_order() {
+        let valid = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        let mut mismatched = valid.clone();
+        mismatched.mode = DurableRecoveryProvider::Codex;
+
+        for queries in [
+            vec![valid.clone(), mismatched.clone()],
+            vec![mismatched.clone(), valid.clone()],
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = RecoveryProviderRegistry::new();
+            registry
+                .register(
+                    DurableRecoveryProvider::Claude,
+                    Arc::new(CountingProvider {
+                        calls: Arc::clone(&calls),
+                    }),
+                )
+                .unwrap();
+
+            assert_eq!(
+                registry.lookup_many_blocking(&queries),
+                ExactRecoverySnapshot::from([(
+                    valid.key.clone(),
+                    ExactRecoveryState::Invalid(ExactRecoveryIssue::ProviderModeMismatch),
+                )])
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "an invalid duplicate must conservatively close the provider I/O door"
+            );
         }
     }
 
@@ -234,11 +410,13 @@ mod tests {
             .register(
                 DurableRecoveryProvider::Claude,
                 Arc::new(FixedStateProvider {
-                    state: ExactRecoveryState::Present(ExactRecoveryProof {
-                        owner_key: foreign,
-                        artifact_fingerprint: "foreign".to_string(),
-                        resolved_cwd: None,
-                    }),
+                    result: ExactRecoveryProviderResult::unscoped(ExactRecoveryState::Present(
+                        ExactRecoveryProof {
+                            owner_key: foreign,
+                            artifact_fingerprint: "foreign".to_string(),
+                            resolved_cwd: None,
+                        },
+                    )),
                 }),
             )
             .unwrap();
@@ -264,7 +442,9 @@ mod tests {
             .register(
                 DurableRecoveryProvider::Codex,
                 Arc::new(FixedStateProvider {
-                    state: ExactRecoveryState::AllocatedUnmaterialized(illegally_scoped),
+                    result: ExactRecoveryProviderResult::unscoped(
+                        ExactRecoveryState::AllocatedUnmaterialized(illegally_scoped),
+                    ),
                 }),
             )
             .unwrap();
@@ -275,5 +455,217 @@ mod tests {
                 .remove(&requested.key),
             Some(ExactRecoveryState::Conflict)
         );
+    }
+
+    #[test]
+    fn registry_rejects_an_amplifier_positive_from_a_foreign_scope() {
+        let requested = query("amplifier", "shared_id");
+        let context_scope = "/store/projects/a";
+        let resolved_cwd = PathBuf::from("/workspace/a");
+        let foreign_owner =
+            RecoveryOwnerKey::project(&requested.key.session_ref, "/store/projects/b").unwrap();
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Amplifier,
+                Arc::new(FixedStateProvider {
+                    result: ExactRecoveryProviderResult::project(
+                        ExactRecoveryState::Present(ExactRecoveryProof {
+                            owner_key: foreign_owner,
+                            artifact_fingerprint: "foreign-scope".to_string(),
+                            resolved_cwd: Some(resolved_cwd.clone()),
+                        }),
+                        context_scope,
+                        resolved_cwd,
+                    ),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .lookup_many_blocking(std::slice::from_ref(&requested))
+                .remove(&requested.key),
+            Some(ExactRecoveryState::Conflict)
+        );
+    }
+
+    #[test]
+    fn registry_rejects_an_amplifier_allocation_from_a_foreign_scope() {
+        let requested = query("amplifier", "shared_id");
+        let foreign_owner =
+            RecoveryOwnerKey::project(&requested.key.session_ref, "/store/projects/b").unwrap();
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Amplifier,
+                Arc::new(FixedStateProvider {
+                    result: ExactRecoveryProviderResult::project(
+                        ExactRecoveryState::AllocatedUnmaterialized(foreign_owner),
+                        "/store/projects/a",
+                        PathBuf::from("/workspace/a"),
+                    ),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .lookup_many_blocking(std::slice::from_ref(&requested))
+                .remove(&requested.key),
+            Some(ExactRecoveryState::Conflict)
+        );
+    }
+
+    #[test]
+    fn registry_rejects_an_amplifier_positive_with_a_foreign_resolved_cwd() {
+        let requested = query("amplifier", "shared_id");
+        let context_scope = "/store/projects/a";
+        let owner = RecoveryOwnerKey::project(&requested.key.session_ref, context_scope).unwrap();
+
+        for proof_cwd in [None, Some(PathBuf::from("/workspace/foreign"))] {
+            let mut registry = RecoveryProviderRegistry::new();
+            registry
+                .register(
+                    DurableRecoveryProvider::Amplifier,
+                    Arc::new(FixedStateProvider {
+                        result: ExactRecoveryProviderResult::project(
+                            ExactRecoveryState::Present(ExactRecoveryProof {
+                                owner_key: owner.clone(),
+                                artifact_fingerprint: "foreign-cwd".to_string(),
+                                resolved_cwd: proof_cwd,
+                            }),
+                            context_scope,
+                            PathBuf::from("/workspace/a"),
+                        ),
+                    }),
+                )
+                .unwrap();
+
+            assert_eq!(
+                registry
+                    .lookup_many_blocking(std::slice::from_ref(&requested))
+                    .remove(&requested.key),
+                Some(ExactRecoveryState::Conflict)
+            );
+        }
+    }
+
+    #[test]
+    fn registry_accepts_provider_normalized_amplifier_cwd_without_rekeying_raw_cwd() {
+        let mut requested = query("amplifier", "shared_id");
+        requested.key.cwd = Some(PathBuf::from("/workspace/link/../project"));
+        let context_scope = "/store/projects/project";
+        let resolved_cwd = PathBuf::from("/workspace/project");
+        let proof = ExactRecoveryProof {
+            owner_key: RecoveryOwnerKey::project(&requested.key.session_ref, context_scope)
+                .unwrap(),
+            artifact_fingerprint: "owned".to_string(),
+            resolved_cwd: Some(resolved_cwd.clone()),
+        };
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Amplifier,
+                Arc::new(FixedStateProvider {
+                    result: ExactRecoveryProviderResult::project(
+                        ExactRecoveryState::Present(proof.clone()),
+                        context_scope,
+                        resolved_cwd,
+                    ),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .lookup_many_blocking(std::slice::from_ref(&requested))
+                .remove(&requested.key),
+            Some(ExactRecoveryState::Present(proof)),
+            "provider normalization is response context; the stable key retains the raw cwd"
+        );
+    }
+
+    #[test]
+    fn registry_keeps_global_positive_cwd_behavior_unchanged() {
+        let requested = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        let proof = ExactRecoveryProof {
+            owner_key: RecoveryOwnerKey::global(&requested.key.session_ref).unwrap(),
+            artifact_fingerprint: "owned".to_string(),
+            resolved_cwd: Some(PathBuf::from("/provider/resolved")),
+        };
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(FixedStateProvider {
+                    result: ExactRecoveryProviderResult::unscoped(ExactRecoveryState::Present(
+                        proof.clone(),
+                    )),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .lookup_many_blocking(std::slice::from_ref(&requested))
+                .remove(&requested.key),
+            Some(ExactRecoveryState::Present(proof))
+        );
+    }
+
+    struct CapturingProvider {
+        queries: Arc<std::sync::Mutex<Vec<ExactRecoveryQuery>>>,
+    }
+
+    impl ExactRecoveryProvider for CapturingProvider {
+        fn lookup_many_blocking(
+            &self,
+            queries: &[ExactRecoveryQuery],
+        ) -> ExactRecoveryProviderSnapshot {
+            self.queries.lock().unwrap().extend_from_slice(queries);
+            queries
+                .iter()
+                .map(|query| {
+                    (
+                        query.key.clone(),
+                        ExactRecoveryProviderResult::unscoped(
+                            ExactRecoveryState::ProviderUnavailable,
+                        ),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn registry_dedupes_by_stable_key_and_advances_materialization() {
+        let mut allocated = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        allocated.materialization = MaterializationState::Allocated;
+        let mut observed = allocated.clone();
+        observed.materialization = MaterializationState::Observed;
+        assert_eq!(allocated.key, observed.key);
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        let snapshot = registry.lookup_many_blocking(&[allocated.clone(), observed]);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot.get(&allocated.key),
+            Some(&ExactRecoveryState::ProviderUnavailable)
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].key, allocated.key);
+        assert_eq!(captured[0].materialization, MaterializationState::Observed);
     }
 }

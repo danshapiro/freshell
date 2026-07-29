@@ -31,8 +31,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use freshell_protocol::SessionLocator;
 use freshell_recovery::{
     prepare_exact_recovery_query, BlockingExactRecoveryProbe, DurableRecoveryProvider,
-    ExactRecoveryIssue, ExactRecoveryProvider, ExactRecoveryQuery, ExactRecoverySnapshot,
-    ExactRecoveryState, MaterializationState, RecoveryOwnerKey, RecoveryProviderRegistry,
+    ExactRecoveryIssue, ExactRecoveryProvider, ExactRecoveryProviderResult,
+    ExactRecoveryProviderSnapshot, ExactRecoveryQuery, ExactRecoveryState, MaterializationState,
+    RecoveryOwnerKey, RecoveryProviderRegistry,
 };
 use freshell_ws::WsState;
 
@@ -47,7 +48,10 @@ struct InstrumentedExactProvider {
 }
 
 impl ExactRecoveryProvider for InstrumentedExactProvider {
-    fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot {
+    fn lookup_many_blocking(
+        &self,
+        queries: &[ExactRecoveryQuery],
+    ) -> ExactRecoveryProviderSnapshot {
         use std::sync::atomic::Ordering;
 
         self.root_calls.fetch_add(1, Ordering::SeqCst);
@@ -56,7 +60,12 @@ impl ExactRecoveryProvider for InstrumentedExactProvider {
         self.queries.lock().unwrap().extend_from_slice(queries);
         queries
             .iter()
-            .map(|query| (query.key.clone(), ExactRecoveryState::ProviderUnavailable))
+            .map(|query| {
+                (
+                    query.key.clone(),
+                    ExactRecoveryProviderResult::unscoped(ExactRecoveryState::ProviderUnavailable),
+                )
+            })
             .collect()
     }
 }

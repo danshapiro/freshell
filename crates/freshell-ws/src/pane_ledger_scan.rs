@@ -41,8 +41,8 @@ pub struct BootScanReport {
     pub stale_markers_removed: Vec<String>,
     /// (retired old ref, winning new ref) pairs from the crash-window repair.
     pub supersession_repairs: Vec<(RecoveryOwnerKey, RecoveryOwnerKey)>,
-    pub gc_tombstoned: Vec<SessionLocator>,
-    pub tombstones_deleted: Vec<SessionLocator>,
+    pub gc_tombstoned: Vec<RecoveryOwnerKey>,
+    pub tombstones_deleted: Vec<RecoveryOwnerKey>,
 }
 
 impl PaneLedger {
@@ -53,7 +53,7 @@ impl PaneLedger {
     pub fn boot_scan(
         &self,
         now_ms: i64,
-        transcript_absent: &dyn Fn(&str, &str) -> bool,
+        transcript_absent: &dyn Fn(&RecoveryOwnerKey) -> bool,
     ) -> BootScanReport {
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
@@ -116,19 +116,19 @@ impl PaneLedger {
 
         // 3. Supersession crash-window repair: two bound rows on one pane
         //    lineage — newer updatedAt wins, older auto-retired, loud.
-        let mut by_terminal: std::collections::HashMap<String, Vec<BindingRow>> =
+        let mut by_terminal: std::collections::HashMap<(String, String), Vec<BindingRow>> =
             std::collections::HashMap::new();
         for row in index.bindings.values() {
             if row.state == RowState::Bound {
                 if let Some(tid) = &row.live_terminal_id {
                     by_terminal
-                        .entry(tid.clone())
+                        .entry((row.provider.clone(), tid.clone()))
                         .or_default()
                         .push(row.clone());
                 }
             }
         }
-        for (terminal_id, mut rows) in by_terminal {
+        for ((_provider, terminal_id), mut rows) in by_terminal {
             if rows.len() < 2 {
                 continue;
             }
@@ -206,7 +206,7 @@ impl PaneLedger {
     pub fn gc(
         &self,
         now_ms: i64,
-        transcript_absent: &dyn Fn(&str, &str) -> bool,
+        transcript_absent: &dyn Fn(&RecoveryOwnerKey) -> bool,
         live_terminal_ids: Option<&HashSet<String>>,
     ) -> BootScanReport {
         let Some(root) = self.root.clone() else {
@@ -257,7 +257,7 @@ impl PaneLedger {
         root: &Path,
         index: &mut LedgerIndex,
         now_ms: i64,
-        transcript_absent: &dyn Fn(&str, &str) -> bool,
+        transcript_absent: &dyn Fn(&RecoveryOwnerKey) -> bool,
     ) -> BootScanReport {
         let mut report = BootScanReport::default();
         let marker_ids: Vec<String> = index.pending.keys().cloned().collect();
@@ -347,16 +347,13 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         key: &RecoveryOwnerKey,
         now_ms: i64,
-        transcript_absent: &dyn Fn(&str, &str) -> bool,
+        transcript_absent: &dyn Fn(&RecoveryOwnerKey) -> bool,
         report: &mut BootScanReport,
     ) {
         let Some(mut row) = index.bindings.get(key).cloned() else {
             return; // deleted since the snapshot — no longer qualifies
         };
-        let sref = SessionLocator {
-            provider: row.provider.clone(),
-            session_id: row.session_id.clone(),
-        };
+        let owner = row.owner_key();
         match row.state {
             RowState::Bound => {
                 if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
@@ -365,19 +362,21 @@ impl PaneLedger {
                     row.updated_at = now_ms;
                     tracing::info!(
                         target: "freshell_ws::pane_ledger",
-                        provider = %sref.provider,
-                        session_id = %sref.session_id,
+                        provider = %owner.provider,
+                        session_id = %owner.session_id,
+                        provider_scope = ?owner.provider_scope,
                         "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
                     );
                     match self.write_binding(root, index, &row) {
-                        Ok(()) => report.gc_tombstoned.push(sref),
+                        Ok(()) => report.gc_tombstoned.push(owner),
                         Err(err) => {
                             // Fail loud, never silent: the row stays
                             // bound on disk; the next GC pass retries.
                             tracing::error!(
                                 target: "freshell_ws::pane_ledger",
-                                provider = %sref.provider,
-                                session_id = %sref.session_id,
+                                provider = %owner.provider,
+                                session_id = %owner.session_id,
+                                provider_scope = ?owner.provider_scope,
                                 error = %err,
                                 "pane_ledger_gc_tombstone_failed: tombstone write failed; row left bound"
                             );
@@ -387,13 +386,13 @@ impl PaneLedger {
             }
             RowState::Retired => {
                 let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
-                if old_enough && transcript_absent(&row.provider, &row.session_id) {
-                    let owner = row.owner_key();
+                if old_enough && transcript_absent(&owner) {
                     if Self::has_shadowed_legacy_alias(index, &owner) {
                         tracing::info!(
                             target: "freshell_ws::pane_ledger",
-                            provider = %sref.provider,
-                            session_id = %sref.session_id,
+                            provider = %owner.provider,
+                            session_id = %owner.session_id,
+                            provider_scope = ?owner.provider_scope,
                             "pane_ledger_tombstone_retained: v2 suppressor protects a read-only legacy alias"
                         );
                         return;
@@ -405,19 +404,21 @@ impl PaneLedger {
                             index.bindings.remove(&owner);
                             tracing::info!(
                                 target: "freshell_ws::pane_ledger",
-                                provider = %sref.provider,
-                                session_id = %sref.session_id,
+                                provider = %owner.provider,
+                                session_id = %owner.session_id,
+                                provider_scope = ?owner.provider_scope,
                                 "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
                             );
-                            report.tombstones_deleted.push(sref);
+                            report.tombstones_deleted.push(owner);
                         }
                         Err(err) => {
                             // Fail loud, never silent: the tombstone
                             // stays; the next GC pass retries naturally.
                             tracing::warn!(
                                 target: "freshell_ws::pane_ledger",
-                                provider = %sref.provider,
-                                session_id = %sref.session_id,
+                                provider = %owner.provider,
+                                session_id = %owner.session_id,
+                                provider_scope = ?owner.provider_scope,
                                 error = %err,
                                 "pane_ledger_tombstone_delete_failed: tombstone file removal failed; will retry next pass"
                             );
@@ -471,14 +472,31 @@ impl PaneLedger {
                         } else {
                             serde_json::from_value::<BindingRow>(value)
                                 .ok()
-                                .is_some_and(|row| {
-                                    if path.parent() != Some(Self::v2_bindings_dir(root).as_path())
-                                    {
-                                        return true;
+                                .is_some_and(|mut row| {
+                                    let is_v2 = path.parent()
+                                        == Some(Self::v2_bindings_dir(root).as_path());
+                                    if !is_v2 {
+                                        // Match load_index's legacy
+                                        // compatibility normalization before
+                                        // validating. Legacy paths never
+                                        // carry authoritative scope.
+                                        let legacy_amplifier = row.provider == "amplifier";
+                                        row.provider_scope = None;
+                                        if let Some(successor) = &mut row.superseded_by {
+                                            successor.provider_scope = None;
+                                        }
+                                        if legacy_amplifier {
+                                            row.materialization = MaterializationState::Unknown;
+                                        }
                                     }
                                     Self::validate_row_owner_scopes(&row).is_ok()
-                                        && path.file_name().and_then(|filename| filename.to_str())
-                                            == Some(owner_v2_filename(&row.owner_key()).as_str())
+                                        && (!is_v2
+                                            || path
+                                                .file_name()
+                                                .and_then(|filename| filename.to_str())
+                                                == Some(
+                                                    owner_v2_filename(&row.owner_key()).as_str(),
+                                                ))
                                 })
                         };
                         if typed_ok {

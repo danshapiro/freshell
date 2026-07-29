@@ -659,10 +659,10 @@ async fn main() -> ExitCode {
         // root was derived from. No home => the ledger is disabled and the
         // closure is never consulted; answering false (defer) is still safe.
         let scan_home = home.clone();
-        let report = pane_ledger.boot_scan(now, &move |provider, session_id| {
+        let report = pane_ledger.boot_scan(now, &move |owner| {
             scan_home
                 .as_deref()
-                .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
+                .is_some_and(|h| transcript_definitively_absent(h, owner))
         });
         if !report.quarantined.is_empty() {
             tracing::error!(
@@ -703,10 +703,9 @@ async fn main() -> ExitCode {
                     // no home => defer (false) — never the destructive branch.
                     ledger.gc(
                         now,
-                        &|provider, session_id| {
-                            home.as_deref().is_some_and(|h| {
-                                transcript_definitively_absent(h, provider, session_id)
-                            })
+                        &|owner| {
+                            home.as_deref()
+                                .is_some_and(|h| transcript_definitively_absent(h, owner))
                         },
                         Some(&live),
                     );
@@ -1439,10 +1438,10 @@ fn resolve_home() -> Option<PathBuf> {
 /// `false` — deletion deferred, never risked. Unknown providers: `false`.
 fn transcript_definitively_absent(
     home: &std::path::Path,
-    provider: &str,
-    session_id: &str,
+    owner: &freshell_recovery::RecoveryOwnerKey,
 ) -> bool {
-    match provider {
+    let session_id = owner.session_id.as_str();
+    match owner.provider.as_str() {
         "claude" => {
             // ~/.claude/projects/<proj>/<session_id>.jsonl — any match means present.
             let projects = home.join(".claude").join("projects");
@@ -1473,29 +1472,29 @@ fn transcript_definitively_absent(
             !walk_contains_filename_fragment(&root, session_id)
         }
         "amplifier" => {
-            // <amplifier_home>/projects/<slug>/sessions/<session_id>/ — the
-            // session dir named by session id. Mirrors the SAME
-            // `amplifier_home` resolution (`$FRESHELL_AMPLIFIER_HOME` used
-            // as-is when set and non-empty, else `<home>/.amplifier`;
-            // `AMPLIFIER_HOME` is never consulted broker-side) main.rs
-            // already computes for the `AmplifierSource` construction above.
-            let projects = freshell_sessions::amplifier::amplifier_home(home).join("projects");
-            let Ok(dirs) = std::fs::read_dir(&projects) else {
-                return false; // unreadable => defer
+            // Amplifier IDs are project-scoped. The durable owner records
+            // the provider-normalized project store selected when ownership
+            // was proved; a later config/root change must not redirect GC to
+            // another project tree. Legacy unscoped aliases remain
+            // ambiguous and therefore can never authorize deletion.
+            let Some(scope) = owner.provider_scope.as_deref().filter(|s| !s.is_empty()) else {
+                return false;
             };
-            for entry in dirs {
-                let Ok(entry) = entry else {
-                    return false; // per-entry read error => defer
-                };
-                let candidate = entry.path().join("sessions").join(session_id);
-                match std::fs::metadata(&candidate) {
-                    Ok(meta) if meta.is_dir() => return false, // present => never delete
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // definitely not here
-                    Err(_) => return false, // couldn't tell (e.g. unreadable subdir) => defer
-                }
+            let Ok(session_id) =
+                freshell_recovery::validate_amplifier_session_id(owner.session_id.as_str())
+            else {
+                return false;
+            };
+            let sessions = Path::new(scope).join("sessions");
+            if std::fs::read_dir(&sessions).is_err() {
+                return false; // missing/unreadable scope => defer
             }
-            true
+            match std::fs::metadata(sessions.join(session_id)) {
+                Ok(meta) if meta.is_dir() => false, // present => never delete
+                Ok(_) => false,                     // malformed/uncertain => defer
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false, // couldn't tell => defer
+            }
         }
         _ => false, // opencode (sqlite) + unknown providers: defer deletion
     }
@@ -2043,6 +2042,14 @@ mod tests {
     use super::*;
     use freshell_platform::MapEnv;
 
+    fn recovery_owner(provider: &str, session_id: &str) -> freshell_recovery::RecoveryOwnerKey {
+        freshell_recovery::RecoveryOwnerKey {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            provider_scope: None,
+        }
+    }
+
     // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
     // (V10.md). Deletion is the destructive branch, so every uncertain path
     // must answer `false` (present => defer); only a readable tree with NO
@@ -2055,7 +2062,7 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
         std::fs::write(proj.join("sess-1.jsonl"), "{}\n").expect("write transcript");
         assert!(
-            !transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            !transcript_definitively_absent(home.path(), &recovery_owner("claude", "sess-1")),
             "an existing <proj>/<sessionId>.jsonl means PRESENT (never delete)"
         );
     }
@@ -2066,7 +2073,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".claude").join("projects"))
             .expect("mkdir empty projects");
         assert!(
-            transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            transcript_definitively_absent(home.path(), &recovery_owner("claude", "sess-1")),
             "a readable projects tree with no match is DEFINITIVELY absent"
         );
     }
@@ -2080,7 +2087,8 @@ mod tests {
         std::fs::create_dir_all(&projects).expect("mkdir projects");
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000");
-        let verdict = transcript_definitively_absent(home.path(), "claude", "sess-1");
+        let verdict =
+            transcript_definitively_absent(home.path(), &recovery_owner("claude", "sess-1"));
         // Restore so the tempdir can be cleaned up regardless of the assert.
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755))
             .expect("chmod 755");
@@ -2100,7 +2108,8 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
         std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000 subdir");
-        let verdict = transcript_definitively_absent(home.path(), "claude", "sess-1");
+        let verdict =
+            transcript_definitively_absent(home.path(), &recovery_owner("claude", "sess-1"));
         // Restore so the tempdir can be cleaned up regardless of the assert.
         std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o755))
             .expect("chmod 755 subdir");
@@ -2115,7 +2124,7 @@ mod tests {
     fn missing_projects_root_defers() {
         let home = tempfile::tempdir().expect("tempdir");
         assert!(
-            !transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            !transcript_definitively_absent(home.path(), &recovery_owner("claude", "sess-1")),
             "no ~/.claude/projects at all => defer (read error branch)"
         );
     }
@@ -2125,10 +2134,81 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         assert!(!transcript_definitively_absent(
             home.path(),
-            "opencode",
-            "s"
+            &recovery_owner("opencode", "s")
         ));
-        assert!(!transcript_definitively_absent(home.path(), "no-such", "s"));
+        assert!(!transcript_definitively_absent(
+            home.path(),
+            &recovery_owner("no-such", "s")
+        ));
+    }
+
+    #[test]
+    fn amplifier_gc_uses_the_recorded_scope_after_the_current_root_changes() {
+        let recorded_root = tempfile::tempdir().expect("recorded root");
+        let recorded_scope = recorded_root.path().join("projects").join("project-a");
+        std::fs::create_dir_all(recorded_scope.join("sessions").join("shared-id"))
+            .expect("recorded transcript directory");
+        let current_home = tempfile::tempdir().expect("current home");
+        std::fs::create_dir_all(
+            current_home
+                .path()
+                .join(".amplifier/projects/current/sessions/shared-id"),
+        )
+        .expect("current-root transcript directory");
+        let recorded_owner = freshell_recovery::RecoveryOwnerKey {
+            provider: "amplifier".to_string(),
+            session_id: "shared-id".to_string(),
+            provider_scope: Some(recorded_scope.to_string_lossy().into_owned()),
+        };
+
+        assert!(
+            !transcript_definitively_absent(current_home.path(), &recorded_owner),
+            "a mutable Amplifier root must not hide a transcript in the durable owner scope"
+        );
+
+        let empty_scope = recorded_root.path().join("projects").join("project-b");
+        std::fs::create_dir_all(empty_scope.join("sessions")).expect("empty recorded scope");
+        let empty_owner = freshell_recovery::RecoveryOwnerKey {
+            provider: "amplifier".to_string(),
+            session_id: "shared-id".to_string(),
+            provider_scope: Some(empty_scope.to_string_lossy().into_owned()),
+        };
+        assert!(
+            transcript_definitively_absent(current_home.path(), &empty_owner),
+            "a same-ID transcript in the current root cannot keep a different recorded scope alive"
+        );
+    }
+
+    #[test]
+    fn amplifier_gc_defers_for_a_legacy_unscoped_owner() {
+        let home = tempfile::tempdir().expect("home");
+        let owner = freshell_recovery::RecoveryOwnerKey {
+            provider: "amplifier".to_string(),
+            session_id: "shared-id".to_string(),
+            provider_scope: None,
+        };
+
+        assert!(
+            !transcript_definitively_absent(home.path(), &owner),
+            "an ambiguous legacy/global Amplifier identity is never safe to delete"
+        );
+    }
+
+    #[test]
+    fn amplifier_gc_rejects_an_invalid_session_component_before_path_join() {
+        let home = tempfile::tempdir().expect("home");
+        let scope = home.path().join("recorded-project");
+        std::fs::create_dir_all(scope.join("sessions")).expect("readable sessions directory");
+        let owner = freshell_recovery::RecoveryOwnerKey {
+            provider: "amplifier".to_string(),
+            session_id: "../escaped".to_string(),
+            provider_scope: Some(scope.to_string_lossy().into_owned()),
+        };
+
+        assert!(
+            !transcript_definitively_absent(home.path(), &owner),
+            "an unvalidated ledger ID must defer before it can be joined to the recorded scope"
+        );
     }
 
     // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):

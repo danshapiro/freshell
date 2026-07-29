@@ -522,11 +522,11 @@ impl PaneLedger {
 
     fn successor_scope_is_ledger_compatible(row: &BindingRow) -> bool {
         row.superseded_by.as_ref().is_none_or(|successor| {
-            successor.has_canonical_provider_scope()
-                || (row.provider == "amplifier"
-                    && row.provider_scope.is_none()
-                    && successor.provider == "amplifier"
-                    && successor.provider_scope.is_none())
+            successor.provider == row.provider
+                && (successor.has_canonical_provider_scope()
+                    || (row.provider == "amplifier"
+                        && row.provider_scope.is_none()
+                        && successor.provider_scope.is_none()))
         })
     }
 
@@ -625,16 +625,36 @@ impl PaneLedger {
             );
             return Ok(());
         }
+        let unscoped_alias = Self::unscoped_amplifier_alias(&owner);
+        let is_predecessor = |row: &BindingRow| {
+            row.state == RowState::Bound
+                && row.live_terminal_id.as_deref() == Some(w.terminal_id)
+                && row.owner_key() != owner
+                && unscoped_alias
+                    .as_ref()
+                    .is_none_or(|alias| row.owner_key() != *alias)
+        };
+        // Preflight the provider boundary across every same-terminal row.
+        // Selecting one HashMap predecessor first would make rejection depend
+        // on randomized iteration order whenever crash residue contains both
+        // same-provider and foreign-provider rows.
+        if index
+            .bindings
+            .values()
+            .any(|row| is_predecessor(row) && row.provider != owner.provider)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "pane ledger terminal {} cannot supersede across providers",
+                    w.terminal_id
+                ),
+            ));
+        }
         let previous = index
             .bindings
             .values()
-            .find(|r| {
-                r.state == RowState::Bound
-                    && r.live_terminal_id.as_deref() == Some(w.terminal_id)
-                    && r.owner_key() != owner
-                    && Self::unscoped_amplifier_alias(&owner)
-                        .is_none_or(|alias| r.owner_key() != alias)
-            })
+            .find(|row| is_predecessor(row) && row.provider == owner.provider)
             .cloned();
 
         let existing = index.bindings.get(&owner);
@@ -703,6 +723,15 @@ impl PaneLedger {
         now_ms: i64,
         terminal_id: Option<&str>,
     ) -> std::io::Result<()> {
+        if old.provider != superseded_by.provider {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "pane ledger owner {}/{} cannot be superseded by provider {}",
+                    old.provider, old.session_id, superseded_by.provider
+                ),
+            ));
+        }
         old.state = RowState::Retired;
         old.retired_reason = Some(RetiredReason::Superseded);
         old.updated_at = now_ms;

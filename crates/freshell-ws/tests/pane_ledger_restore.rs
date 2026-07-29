@@ -883,7 +883,7 @@ fn pane_ledger_rejects_illegal_provider_scope_shapes_on_write_and_v2_load() {
             "a forged noncanonical owner must not enter the effective index"
         );
     }
-    let report = reloaded.boot_scan(2, &|_, _| false);
+    let report = reloaded.boot_scan(2, &|_| false);
     assert_eq!(
         report.quarantined.len(),
         illegal_owners.len(),
@@ -915,9 +915,9 @@ fn pane_ledger_gc_never_resurrects_a_shadowed_legacy_binding() {
         ))
         .unwrap();
     let expire_at = 2 + freshell_ws::pane_ledger::BOUND_GC_TTL_MS + 1;
-    ledger.gc(expire_at, &|_, _| false, None);
+    ledger.gc(expire_at, &|_| false, None);
     let delete_at = expire_at + freshell_ws::pane_ledger::TOMBSTONE_GC_TTL_MS + 1;
-    let report = ledger.gc(delete_at, &|_, _| true, None);
+    let report = ledger.gc(delete_at, &|_| true, None);
 
     assert!(
         report.tombstones_deleted.is_empty(),
@@ -979,11 +979,11 @@ fn pane_ledger_gc_never_reexposes_a_shadowed_unscoped_v2_amplifier_row() {
     assert!(ledger.load_binding_for_owner(&alias).is_none());
 
     let expire_at = 2 + freshell_ws::pane_ledger::BOUND_GC_TTL_MS + 1;
-    ledger.gc(expire_at, &|_, _| false, None);
+    ledger.gc(expire_at, &|_| false, None);
     let delete_at = expire_at + freshell_ws::pane_ledger::TOMBSTONE_GC_TTL_MS + 1;
     assert!(
         ledger
-            .gc(delete_at, &|_, _| true, None)
+            .gc(delete_at, &|_| true, None)
             .tombstones_deleted
             .is_empty(),
         "the scoped suppressor must remain while an unscoped v2 alias exists"
@@ -1198,6 +1198,197 @@ fn pane_ledger_owner_digest_collision_or_corruption_is_never_overwritten() {
         std::fs::read(&a_path).unwrap(),
         b_bytes,
         "collision/corruption evidence is never overwritten"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pane_ledger_scoped_gc_retains_and_deletes_same_id_owners_independently() {
+    let dir = unique_ledger_dir("scoped-gc");
+    let owner_a = owner("amplifier", "shared-id", Some("/scope/a"));
+    let owner_b = owner("amplifier", "shared-id", Some("/scope/b"));
+    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    ledger
+        .record_binding(&durable_write(
+            &owner_a,
+            "terminal-a",
+            Some("/raw/a"),
+            MaterializationState::Observed,
+            1,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&durable_write(
+            &owner_b,
+            "terminal-b",
+            Some("/raw/b"),
+            MaterializationState::Observed,
+            1,
+        ))
+        .unwrap();
+
+    let expire_at = 1 + freshell_ws::pane_ledger::BOUND_GC_TTL_MS + 1;
+    let tombstone_report = ledger.gc(expire_at, &|_| false, None);
+    assert_eq!(
+        tombstone_report
+            .gc_tombstoned
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([owner_a.clone(), owner_b.clone()]),
+        "GC reports must retain the complete scoped recovery identity"
+    );
+
+    let delete_at = expire_at + freshell_ws::pane_ledger::TOMBSTONE_GC_TTL_MS + 1;
+    drop(ledger);
+    let reloaded = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    let probed = std::sync::Mutex::new(Vec::new());
+    let deletion_report = reloaded.boot_scan(delete_at, &|candidate| {
+        probed.lock().unwrap().push(candidate.clone());
+        candidate == &owner_b
+    });
+    assert_eq!(
+        probed
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([owner_a.clone(), owner_b.clone()]),
+        "boot-scan deletion probes must receive each complete scoped owner"
+    );
+    assert_eq!(
+        deletion_report.tombstones_deleted,
+        vec![owner_b.clone()],
+        "only the scope whose transcript is definitively absent may be deleted"
+    );
+    assert_eq!(
+        reloaded.load_binding_for_owner(&owner_a).unwrap().state,
+        freshell_ws::pane_ledger::RowState::Retired,
+        "a recoverable owner is never deleted by elapsed time alone"
+    );
+    assert!(reloaded.load_binding_for_owner(&owner_b).is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pane_ledger_rejects_cross_provider_terminal_supersession_without_partial_write() {
+    let dir = unique_ledger_dir("cross-provider-write");
+    let old = owner("claude", "old-id", None);
+    let foreign = owner("codex", "new-id", None);
+    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    ledger
+        .record_binding(&durable_write(
+            &old,
+            "terminal-1",
+            Some("/project"),
+            MaterializationState::Observed,
+            1,
+        ))
+        .unwrap();
+
+    let error = ledger
+        .record_binding(&durable_write(
+            &foreign,
+            "terminal-1",
+            Some("/project"),
+            MaterializationState::Observed,
+            2,
+        ))
+        .expect_err("one terminal lineage cannot supersede across providers");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        ledger.load_binding_for_owner(&foreign).is_none(),
+        "rejection must happen before the foreign successor is persisted"
+    );
+    let predecessor = ledger.load_binding_for_owner(&old).unwrap();
+    assert_eq!(predecessor.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert!(
+        predecessor.superseded_by.is_none(),
+        "the original provider owner must remain unchanged"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pane_ledger_quarantines_forged_cross_provider_supersession_links() {
+    let dir = unique_ledger_dir("cross-provider-forged");
+    let predecessor = owner("claude", "old-id", None);
+    let v2_dir = dir.join("bindings").join("v2");
+    std::fs::create_dir_all(&v2_dir).unwrap();
+    std::fs::write(
+        v2_dir.join(owner_v2_filename(&predecessor)),
+        serde_json::to_vec(&serde_json::json!({
+            "ledgerVersion": 1,
+            "provider": "claude",
+            "sessionId": "old-id",
+            "materialization": "observed",
+            "mode": "claude",
+            "cwd": "/project",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "lastObservedAt": 1,
+            "state": "retired",
+            "retiredReason": "superseded",
+            "supersededBy": {
+                "provider": "codex",
+                "sessionId": "new-id"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    assert!(
+        ledger.load_binding_for_owner(&predecessor).is_none(),
+        "a forged cross-provider chain must not enter the effective index"
+    );
+    let report = ledger.boot_scan(3, &|_| false);
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the persisted corruption must be renamed aside for diagnosis"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pane_ledger_quarantines_legacy_cross_provider_supersession_links() {
+    let dir = unique_ledger_dir("cross-provider-forged-legacy");
+    let provider_dir = dir.join("bindings").join("claude");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    std::fs::write(
+        provider_dir.join("old-id.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "ledgerVersion": 1,
+            "provider": "claude",
+            "sessionId": "old-id",
+            "materialization": "unknown",
+            "mode": "claude",
+            "cwd": "/project",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "lastObservedAt": 1,
+            "state": "retired",
+            "retiredReason": "superseded",
+            "supersededBy": {
+                "provider": "codex",
+                "sessionId": "new-id"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    assert!(
+        ledger.load_binding("claude", "old-id").is_none(),
+        "legacy corruption must not enter the effective index"
+    );
+    let report = ledger.boot_scan(3, &|_| false);
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "legacy corruption must be renamed aside just like a forged v2 row"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

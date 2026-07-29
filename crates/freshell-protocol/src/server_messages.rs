@@ -1085,9 +1085,7 @@ pub struct TerminalSessionAssociated {
     pub session_ref: SessionLocator,
     pub terminal_id: String,
     /// Present only on a server-authoritative mid-session rebind; names the
-    /// session id this association supersedes. Optional+additive on the wire
-    /// (WS_PROTOCOL_VERSION deliberately not bumped -- see plan
-    /// 2026-07-28-stale-resume-identity.md, Task 1).
+    /// session id this association supersedes. Optional+additive on the wire.
     #[serde(
         rename = "previousSessionId",
         skip_serializing_if = "Option::is_none",

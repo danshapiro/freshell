@@ -9,8 +9,10 @@ mod coordinator;
 mod ownership;
 
 pub use coordinator::{
-    BlockingExactRecoveryProbe, ExactRecoveryLookupKey, ExactRecoveryProvider, ExactRecoveryQuery,
-    ExactRecoverySnapshot, ExactRecoveryState, RecoveryProviderRegistry, RegistryRegistrationError,
+    BlockingExactRecoveryProbe, ExactRecoveryLookupKey, ExactRecoveryProvider,
+    ExactRecoveryProviderResult, ExactRecoveryProviderSnapshot, ExactRecoveryQuery,
+    ExactRecoverySnapshot, ExactRecoveryState, ProviderNormalizedProject, RecoveryProviderRegistry,
+    RegistryRegistrationError,
 };
 pub use ownership::RecoveryOwnerKey;
 
@@ -154,11 +156,12 @@ pub fn prepare_exact_recovery_query(
     cwd: Option<PathBuf>,
     materialization: MaterializationState,
 ) -> Result<ExactRecoveryQuery, ExactRecoveryIssue> {
+    let session_ref = validate_session_ref(mode, session_ref)?;
+    let mode = DurableRecoveryProvider::parse(mode)
+        .ok_or(ExactRecoveryIssue::UnsupportedSessionProvider)?;
     Ok(ExactRecoveryQuery {
-        key: ExactRecoveryLookupKey {
-            session_ref: validate_session_ref(mode, session_ref)?,
-            cwd,
-        },
+        mode,
+        key: ExactRecoveryLookupKey { session_ref, cwd },
         materialization,
     })
 }

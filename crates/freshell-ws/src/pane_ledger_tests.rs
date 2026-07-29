@@ -84,6 +84,101 @@ fn rewrite_preserves_created_at_and_bumps_updated_at() {
 }
 
 #[test]
+fn terminal_rebind_rejects_a_foreign_provider_after_any_same_provider_predecessor() {
+    let root = temp_root("cross-provider-preflight");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let terminal_id = "shared-terminal";
+
+    // Arrange the actual HashMap so the old first-match implementation sees
+    // a same-provider predecessor before a foreign one: whichever consistent
+    // row happens to iterate first defines the target provider.
+    let (same_provider, foreign_provider) = {
+        let mut index = ledger.guard();
+        let owners = [
+            RecoveryOwnerKey {
+                provider: "codex".into(),
+                session_id: "codex-predecessor".into(),
+                provider_scope: None,
+            },
+            RecoveryOwnerKey {
+                provider: "claude".into(),
+                session_id: "claude-predecessor".into(),
+                provider_scope: None,
+            },
+        ];
+        for (owner, at) in owners.iter().zip([1_000, 2_000]) {
+            index.bindings.insert(
+                owner.clone(),
+                BindingRow {
+                    ledger_version: LEDGER_VERSION,
+                    provider: owner.provider.clone(),
+                    session_id: owner.session_id.clone(),
+                    provider_scope: None,
+                    materialization: MaterializationState::Observed,
+                    mode: owner.provider.clone(),
+                    cwd: Some("/tmp/proj".into()),
+                    live_terminal_id: Some(terminal_id.into()),
+                    create_request_id: None,
+                    created_at: at,
+                    updated_at: at,
+                    last_observed_at: at,
+                    state: RowState::Bound,
+                    retired_reason: None,
+                    superseded_by: None,
+                    pane_kind: None,
+                    model: None,
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: None,
+                },
+            );
+        }
+        let same_provider = index
+            .bindings
+            .values()
+            .next()
+            .expect("two predecessor rows")
+            .owner_key();
+        let foreign_provider = owners
+            .into_iter()
+            .find(|owner| owner != &same_provider)
+            .expect("the other provider row");
+        (same_provider, foreign_provider)
+    };
+    let target = RecoveryOwnerKey {
+        provider: same_provider.provider.clone(),
+        session_id: "target".into(),
+        provider_scope: None,
+    };
+
+    let error = ledger
+        .record_binding(&write(
+            &same_provider.provider,
+            "target",
+            terminal_id,
+            3_000,
+        ))
+        .expect_err("every same-terminal row must pass the provider preflight");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(ledger.load_binding_for_owner(&target).is_none());
+    assert_eq!(
+        ledger
+            .load_binding_for_owner(&same_provider)
+            .expect("same-provider predecessor remains")
+            .state,
+        RowState::Bound
+    );
+    assert_eq!(
+        ledger
+            .load_binding_for_owner(&foreign_provider)
+            .expect("foreign-provider predecessor remains")
+            .state,
+        RowState::Bound
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn disabled_ledger_is_a_silent_noop() {
     let ledger = PaneLedger::disabled();
     ledger
@@ -464,7 +559,7 @@ fn delete_pending_is_a_noop_when_missing() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-fn never_absent(_p: &str, _s: &str) -> bool {
+fn never_absent(_owner: &RecoveryOwnerKey) -> bool {
     false
 }
 
@@ -713,6 +808,63 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
 }
 
 #[test]
+fn boot_scan_never_repairs_same_terminal_rows_from_different_providers() {
+    let root = temp_root("two-bound-cross-provider");
+    let owners = [
+        RecoveryOwnerKey {
+            provider: "claude".into(),
+            session_id: "claude-session".into(),
+            provider_scope: None,
+        },
+        RecoveryOwnerKey {
+            provider: "codex".into(),
+            session_id: "codex-session".into(),
+            provider_scope: None,
+        },
+    ];
+    for (owner, at) in owners.iter().zip([1_000i64, 2_000]) {
+        let row = BindingRow {
+            ledger_version: LEDGER_VERSION,
+            provider: owner.provider.clone(),
+            session_id: owner.session_id.clone(),
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
+            mode: owner.provider.clone(),
+            cwd: None,
+            live_terminal_id: Some("shared-terminal".into()),
+            create_request_id: None,
+            created_at: at,
+            updated_at: at,
+            last_observed_at: at,
+            state: RowState::Bound,
+            retired_reason: None,
+            superseded_by: None,
+            pane_kind: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+        };
+        write_row_atomic(&PaneLedger::owner_v2_path(&root, owner), &row).unwrap();
+    }
+
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let report = ledger.boot_scan(3_000, &never_absent);
+    assert!(
+        report.supersession_repairs.is_empty(),
+        "provider boundaries split terminal lineages before boot repair"
+    );
+    for owner in owners {
+        let row = ledger
+            .load_binding_for_owner(&owner)
+            .expect("each provider owner remains indexed");
+        assert_eq!(row.state, RowState::Bound);
+        assert!(row.superseded_by.is_none());
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn crash_mid_cross_scope_supersession_repairs_to_the_complete_winner_owner() {
     let root = temp_root("two-bound-cross-scope");
     let old_owner = RecoveryOwnerKey {
@@ -805,7 +957,7 @@ fn tombstone_deletion_is_conditioned_on_transcript_absence() {
     assert!(ledger.ever_bound("claude", "sess-x"));
 
     // Definitively absent -> deletion is finally allowed.
-    let report = ledger.gc(delete_at, &|_p, _s| true, None);
+    let report = ledger.gc(delete_at, &|_| true, None);
     assert_eq!(report.tombstones_deleted.len(), 1);
     assert!(!ledger.ever_bound("claude", "sess-x"));
     std::fs::remove_dir_all(&root).ok();
