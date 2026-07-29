@@ -13,7 +13,10 @@ import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
-import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
+import {
+  resetSnapshotSchedulerForTests,
+  SNAPSHOT_DEBOUNCE_MS,
+} from '@/lib/fresh-agent-snapshot-scheduler'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -6093,31 +6096,47 @@ describe('snapshot scheduler integration (zrrj)', () => {
   })
 
   it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {
-    const store = createStore()
-    const broadcast = captureWsBroadcast()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const broadcast = captureWsBroadcast()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
 
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await screen.findByText('hello world')
-    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
 
-    broadcast(sessionChanged())
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
-    await flushMs(50)
-    // Last good transcript stays visible; no load-error banner.
-    expect(screen.getByText('hello world')).toBeInTheDocument()
-    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
+      broadcast(sessionChanged())
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)
+      })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      // Last good transcript stays visible; no load-error banner.
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
 
-    // Further invalidations during backoff are suppressed without network.
-    broadcast(sessionChanged())
-    await flushMs(400)
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
-    expect(screen.getByText('hello world')).toBeInTheDocument()
+      // Further invalidations during backoff are suppressed without network.
+      broadcast(sessionChanged())
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)
+      })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+    } finally {
+      // Unmount while fake timers are still active so the component clears its
+      // 60s rate-limit retry before the test restores the real clock.
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   it('does not refetch when another session sends (send.accepted for a foreign request)', async () => {
