@@ -48,7 +48,8 @@ New pure function (Task 2) — the single source of truth for tab visuals:
 3. **Disconnected/exited panes:** a tab whose terminal panes are ALL `exited`/`error` renders `neutral` (never green/grey), regardless of stale ready/attention flags. Fresh-agent and browser panes count as "live" (their lifecycle is session-managed; an exited SDK session still shows its transcript and can be resumed).
 4. **Acknowledgement:** clicking a tab already dispatches `dismissTabGreen` (in `attentionDismiss === 'click'` mode) which deletes `attentionByTab[tabId]` → bar clears; `readyByTab[tabId]` remains → plain green tab. In `'type'` mode keystrokes dismiss — same mapping applies with zero changes.
 5. **Grey again after ready:** when a new turn starts, busy takes precedence over ready — tab goes grey; when the turn completes, attention + ready are set again → green + bar. `readyByTab` never needs busy-edge clearing.
-6. **`tabAttentionStyle` setting** (`'highlight' | 'pulse' | 'darken' | 'none'`) now controls only the *unacknowledged emphasis*: `highlight` (default) → green bar; `pulse` → green bar + `animate-pulse`; `darken` → the existing darken treatment instead of the bar; `none` → no unacked emphasis (renders as plain `ready`). The grey/green base states are unconditional.
+6. **`tabAttentionStyle` setting** (`'highlight' | 'pulse' | 'darken' | 'none'`) now controls only the *unacknowledged emphasis*: `highlight` (default) → green bar; `pulse` → green bar + `animate-pulse`; `darken` → the darken treatment *instead of* the green fill AND instead of the bar (mutually exclusive — this codebase's `cn` is a plain join with no tailwind-merge, so conflicting `bg-*`/`text-*` utilities must never co-fire); `none` → no unacked emphasis (renders as plain `ready`). The grey/green base states are unconditional. **Explicit consequence (decided):** since `ready-unacked` never occurs on the ACTIVE tab, no emphasis (including `darken`) ever applies to the active tab — with `darken` selected, an active tab holding attention now renders plain green, where the old code darkened it. Deliberate behavior change, consistent with edge case 1.
+7. **Validated edge-firing scope:** the ready/attention edges are mode-gated at every layer (client BEL signal extraction, Node tracker wiring, Rust activity engine) — plain-shell panes can never receive `markTabAttention`, so `readyByTab` needs no mode gating. (The client BEL dispatch in `TerminalView.tsx` was found to be dead code for all modes; do not treat it as a live input.)
 
 ---
 
@@ -60,9 +61,12 @@ New pure function (Task 2) — the single source of truth for tab visuals:
 | `test/unit/client/lib/tab-visual-state.test.ts` | Create | Exhaustive unit tests for the mapping incl. all edge cases |
 | `src/components/icons/RepoIcon.tsx` | Modify | Optically center the placeholder letter |
 | `test/unit/client/components/icons/RepoIcon.test.tsx` | Modify | Lock the letter geometry |
-| `src/store/turnCompletionSlice.ts` | Modify | Add `readyByTab` (set in `markTabAttention`, new `clearTabReady`, persisted) |
+| `src/store/turnCompletionSlice.ts` | Modify | Add `readyByTab` (set in `markTabAttention`, new `clearTabReady`, rehydrated) |
+| `src/store/persistMiddleware.ts` | Modify | Persist pruned `readyByTab`; extend the dirty check to `readyByTab` refs |
 | `test/unit/client/store/turnCompletionSlice.test.ts` | Modify | Tests for `readyByTab` lifecycle |
-| `src/store/tabsSlice.ts` | Modify | `closeTab` also clears `readyByTab` |
+| `test/unit/client/store/turnCompletionPersistence.test.ts` | Modify | Dirty-check flush + prune-to-live-tabs tests |
+| `src/store/tabsSlice.ts` | Modify | `closeTab` AND `closePaneWithCleanup` also clear `readyByTab` |
+| `test/e2e/*.test.tsx` (2 files) + `test/e2e-browser/specs/*` (4 files) | Modify | Tab-scoped `text-blue-500` assertions/locators → grey (Task 4 Step 4b) |
 | `src/components/TabItem.tsx` | Modify | Consume `resolveTabVisualState`; grey/green/bar styling; grey icons; fixed width; label flex |
 | `test/unit/client/components/TabItem.test.tsx` | Modify | Rewrite literal-className assertions for the new scheme |
 | `src/components/TabBar.tsx` | Modify | Pass `isReady` to tabs; `shrink-0` on dnd wrapper |
@@ -369,12 +373,20 @@ git commit -m "feat(tabs): add canonical tab visual state mapping (grey/green/gr
 
 ### Task 3: `readyByTab` store field (persistent "has turned ready")
 
-The green tab must persist after the user clicks (only the BAR clears). Today green is keyed solely off `attentionByTab`, which is deleted on acknowledgement. Add a presentation-only `readyByTab` record to `turnCompletionSlice`: set wherever attention is marked (which is the single funnel for ALL three server edges — turn-complete, terminal-idle, waiting), cleared only on tab close, persisted to localStorage alongside the attention maps. No event edges or dedupe baselines are touched.
+The green tab must persist after the user clicks (only the BAR clears). Today green is keyed solely off `attentionByTab`, which is deleted on acknowledgement. Add a presentation-only `readyByTab` record to `turnCompletionSlice`: set wherever attention is marked (which is the single funnel for ALL three server edges — turn-complete, terminal-idle, waiting), cleared on tab close AND on the closePane cleanup path (see below), persisted to localStorage alongside the attention maps. No event edges or dedupe baselines are touched.
+
+**Validated persistence/lifecycle facts this task must honor (load-bearing validation findings):**
+1. The persistence WRITE site is `src/store/persistMiddleware.ts:652-660` (payload `{ version: 1, attentionByTab, attentionByPane }`), but the **dirty check at `persistMiddleware.ts:705-708` compares only `attentionByTab`/`attentionByPane` references** — a `readyByTab`-only mutation (e.g. `clearTabReady` on a tab whose attention was already acknowledged) would never flush. The dirty check MUST also compare `readyByTab` references (verified: there is NO cross-window turn-completion receive path — `crossTabSync.ts:34-38` handles only LAYOUT/BROWSER_PREFERENCES/TAB_RECENCY — so send-side is the only broadcast change needed, and it comes free with the payload).
+2. `closeTab` is NOT the only tab-death path: multi-window closes remove tabs via the `hydrateTabs` tombstone merge (`tabsSlice.ts:360-413`) without dispatching `closeTab`, and a permanent flag with no pruning grows localStorage without bound. Therefore the persisted `readyByTab` payload is **pruned to live tab ids at the write site** (filter against `state.tabs.tabs`), which also stops other windows' whole-map flushes from resurrecting deleted entries.
+3. `closePaneWithCleanup` (`tabsSlice.ts:462-478`) already treats agent-pane departure as invalidating tab-level attention (`clearTabAttention` at :475). `readyByTab` gets the same treatment there — otherwise closing the agent pane leaves a permanently green shell-only tab. (This is what keeps tab-level granularity correct; verified there is no cross-tab pane-move flow, `panesSlice.ts:2195-2224`.)
+4. Verified safe: the ready/attention edges are mode-gated at every layer (client `shared/turn-complete-signal.ts:129-147`, Node tracker wiring `server/index.ts:539-546` + `activity-wiring-factory.ts:65-68`, Rust `crates/freshell-ws/src/activity.rs:518-548`) — plain-shell panes can NEVER receive `markTabAttention`, so setting `readyByTab` unconditionally in `markTabAttention` needs no mode gating.
 
 **Files:**
-- Modify: `src/store/turnCompletionSlice.ts` (state shape, `markTabAttention`, new `clearTabReady`, persistence read; also the persistence WRITE site — find it with `grep -rn "TURN_COMPLETION_STORAGE_KEY" src/` and add `readyByTab` to the persisted payload the same way `attentionByTab` is written)
-- Modify: `src/store/tabsSlice.ts` (`closeTab` thunk — where it already dispatches `clearTabAttention`, around lines 529-534)
+- Modify: `src/store/turnCompletionSlice.ts` (state shape, `markTabAttention`, new `clearTabReady`, persistence read)
+- Modify: `src/store/persistMiddleware.ts` (write payload ~lines 652-660: add pruned `readyByTab`; dirty check ~lines 705-708: also compare `readyByTab` references)
+- Modify: `src/store/tabsSlice.ts` (`closeTab` thunk — where it already dispatches `clearTabAttention`, around lines 529-534; AND `closePaneWithCleanup` — the `clearTabAttention` dispatch at ~line 475)
 - Test: `test/unit/client/store/turnCompletionSlice.test.ts`
+- Test: `test/unit/client/store/turnCompletionPersistence.test.ts` (dirty-check + prune coverage)
 
 **Interfaces:**
 - Consumes: existing `markTabAttention` / `clearTabAttention` reducers and the `closeTab` cleanup path.
@@ -419,6 +431,24 @@ Also cover the close-path: this file already contains a `closeTab` cleanup test 
 ```
 
 (where `tabId` is whatever tab id the copied test uses). The store setup MUST be the byte-identical copy of the neighboring test — copy it, don't invent it.
+
+Do the same for the closePane cleanup path: this file (or `test/unit/client/store/turnCompletionAttention.test.ts` — whichever holds the existing closePane/`clearTabAttention` coverage; find it with `grep -rln "closePaneWithCleanup\|closePane" test/unit/client/store/`) has a test asserting attention is cleared when the relevant pane closes. Duplicate it the same way, renamed `'closing the pane that earned readiness clears readyByTab'`, asserting `readyByTab[tabId]` is `undefined` after the pane close. If no such test exists, write one against the real thunk (`closePaneWithCleanup`) with a two-pane tab: mark attention, close the agent pane, assert both `attentionByTab[tabId]` and `readyByTab[tabId]` are cleared.
+
+And the persistence behaviors, in `test/unit/client/store/turnCompletionPersistence.test.ts` (reuse its existing localStorage/store harness — read the file's helpers first):
+
+```ts
+  it('flushes a readyByTab-only change (clearTabReady after attention already cleared)', () => {
+    // markTabAttention -> clearTabAttention (flush happens; ready persists)
+    // then clearTabReady alone -> the persisted payload must lose the entry.
+  })
+
+  it('prunes persisted readyByTab to live tabs (no unbounded growth / cross-window resurrection)', () => {
+    // Seed readyByTab with an id absent from state.tabs.tabs; trigger a flush;
+    // assert the persisted payload contains only live tab ids.
+  })
+```
+
+(Write real assertions against the file's actual harness — the comments above are the contract.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -469,9 +499,15 @@ c) Update `markTabAttention` and add `clearTabReady`:
 
 Export `clearTabReady` from the slice's action exports alongside `clearTabAttention`.
 
-d) Persistence write: `grep -rn "TURN_COMPLETION_STORAGE_KEY" src/` — wherever the persisted payload `{ version: 1, attentionByTab, attentionByPane }` is written, include `readyByTab` the same way. Keep `version: 1` (additive field, backward-compatible read per (b)).
+d) Persistence — in `src/store/persistMiddleware.ts` (three coordinated edits, per the validated facts above):
 
-e) In `src/store/tabsSlice.ts`, in the `closeTab` flow where `clearTabAttention({ tabId })` is dispatched (~lines 529-534), also dispatch `clearTabReady({ tabId })` (import it from `./turnCompletionSlice`).
+- **Write payload** (~lines 652-660): where `{ version: 1, attentionByTab, attentionByPane }` is built, include `readyByTab` — but **pruned to live tabs**: filter its keys against the current tab ids from `state.tabs.tabs` (e.g. `Object.fromEntries(Object.entries(readyByTab).filter(([id]) => liveTabIds.has(id)))`). Keep `version: 1` (additive field, backward-compatible read per (b)). The cross-window broadcast send picks this up for free; there is no turn-completion receive path to change.
+- **Dirty check** (~lines 705-708): extend the reference comparison that sets `turnCompletionDirty` to also compare `prev.turnCompletion.readyByTab !== next.turnCompletion.readyByTab` — without this, `readyByTab`-only mutations (e.g. `clearTabReady` on an already-acknowledged tab) never flush.
+
+e) In `src/store/tabsSlice.ts`, dispatch `clearTabReady({ tabId })` (import it from `./turnCompletionSlice`) at BOTH attention-cleanup sites:
+
+- the `closeTab` flow where `clearTabAttention({ tabId })` is dispatched (~lines 529-534), and
+- `closePaneWithCleanup` (~lines 462-478), next to its existing `clearTabAttention` dispatch at ~line 475 — pane departure invalidates tab-level readiness exactly as it already invalidates tab-level attention.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -488,9 +524,11 @@ Expected: PASS (all).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/turnCompletionSlice.ts src/store/tabsSlice.ts test/unit/client/store/turnCompletionSlice.test.ts
+git add src/store/turnCompletionSlice.ts src/store/persistMiddleware.ts src/store/tabsSlice.ts test/unit/client/store/turnCompletionSlice.test.ts test/unit/client/store/turnCompletionPersistence.test.ts
 git commit -m "feat(tabs): persistent readyByTab flag (green survives acknowledgement)"
 ```
+
+(Also `git add test/unit/client/store/turnCompletionAttention.test.ts` if the closePane test landed there.)
 
 ---
 
@@ -507,6 +545,8 @@ Current status-relevant code in `TabItem.tsx` (for orientation; line numbers fro
 **Files:**
 - Modify: `src/components/TabItem.tsx`
 - Test: `test/unit/client/components/TabItem.test.tsx`
+- Test: `test/e2e/pane-activity-indicator-flow.test.tsx` + `test/e2e/codex-activity-indicator-flow.test.tsx` (tab-scoped `text-blue-500` assertions → grey; see Step 4b)
+- Test: `test/e2e-browser/specs/pane-activity-indicator.spec.ts`, `truly-idle-alerting.spec.ts`, `terminal-activity-rust.spec.ts`, `codex-status-completeness-rust.spec.ts` (browser-suite locators; see Step 4b)
 
 **Interfaces:**
 - Consumes: `resolveTabVisualState`, `tabHasLivePane`, `TabVisualState` from `@/lib/tab-visual-state` (Task 2).
@@ -705,7 +745,7 @@ f) Compute the visual state at the top of the component body (after the `useEffe
   const showAttentionBar = attentionEmphasis && tabAttentionStyle !== 'darken'
 ```
 
-g) Replace the container `className={cn(...)}` block with:
+g) Replace the container `className={cn(...)}` block with the following. **Structural constraint (load-bearing, validated):** this codebase's `cn` (`src/lib/utils.ts`) is a plain `filter(Boolean).join(' ')` — there is NO tailwind-merge — so two conflicting same-group utilities (`bg-*`, `text-*`, `hover:bg-*`) in one class list resolve by generated-stylesheet order, which is unspecified. Branches that can co-fire MUST be mutually exclusive (the current production code uses an exclusive ternary; keep that property). That is why the darken treatment below is the ternary ALTERNATIVE to the emerald classes, never additive:
 
 ```tsx
       className={cn(
@@ -716,10 +756,13 @@ g) Replace the container `className={cn(...)}` block with:
               visualState === 'working'
                 && 'border-t-[3px] border-t-zinc-500 dark:border-t-zinc-400',
               isGreen
-                && 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]',
-              attentionEmphasis && tabAttentionStyle === 'darken'
-                && 'border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]',
-              attentionEmphasis && tabAttentionStyle === 'pulse' && 'animate-pulse'
+                && 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
+              // NOTE (deliberate behavior change, decided during load-bearing
+              // validation): `ready-unacked` is unreachable on the ACTIVE tab
+              // (Task 2 mapping), so no darken/pulse emphasis ever applies here.
+              // With tabAttentionStyle='darken', an active tab with attention now
+              // renders plain GREEN (previously it was darkened). Base states are
+              // unconditional; the style setting governs only unacked emphasis.
             )
           : cn(
               'shadow-[inset_0_-1px_0_hsl(var(--muted-foreground)/0.45)]',
@@ -727,10 +770,12 @@ g) Replace the container `className={cn(...)}` block with:
                 && 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90',
               visualState === 'working'
                 && 'bg-zinc-300 text-zinc-800 hover:bg-zinc-300/80 dark:bg-zinc-600/70 dark:text-zinc-100 dark:hover:bg-zinc-600/60',
+              // Mutually exclusive: darken REPLACES the emerald fill (plain-join
+              // cn cannot safely stack conflicting bg-*/text-* utilities).
               isGreen
-                && 'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
-              attentionEmphasis && tabAttentionStyle === 'darken'
-                && 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25',
+                && (attentionEmphasis && tabAttentionStyle === 'darken'
+                  ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
+                  : 'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'),
               attentionEmphasis && tabAttentionStyle === 'pulse' && 'animate-pulse'
             ),
         isDragging && 'opacity-50'
@@ -757,10 +802,33 @@ npm run test:vitest -- run test/unit/client/components/TabBar.test.tsx --config 
 ```
 Expected: TabItem PASS. If TabBar tests assert old blue/emerald classnames, update those assertions to the new scheme (same substitutions as Step 1a; do not delete scenarios).
 
+- [ ] **Step 4b: Update out-of-task suites that assert tab-icon blue (validated inventory — exactly these)**
+
+A grep sweep of the whole test tree found six files OUTSIDE this plan's unit-test list that hard-assert `text-blue-500` on TAB-scoped icons (pane-scoped blue assertions are untouched — pane headers keep their coloring):
+
+- `test/e2e/pane-activity-indicator-flow.test.tsx` (lines ~287, 347, 381, 466, 483, 535, 600 — positive tab-icon assertions)
+- `test/e2e/codex-activity-indicator-flow.test.tsx` (line ~160 — `tabButton` assertion)
+- `test/e2e-browser/specs/pane-activity-indicator.spec.ts` (~line 23)
+- `test/e2e-browser/specs/truly-idle-alerting.spec.ts` (~line 141)
+- `test/e2e-browser/specs/terminal-activity-rust.spec.ts` (~line 189 — busy-tab locator helper)
+- `test/e2e-browser/specs/codex-status-completeness-rust.spec.ts` (~line 180 — same helper)
+
+In each, update only the TAB-scoped expectations: `text-blue-500` → `text-zinc-600` (and where a locator selects busy tabs by the blue class, select by the new grey class or a structural attribute instead). Keep every scenario. Then verify the two vitest e2e suites:
+
+```bash
+npm run test:vitest -- run test/e2e/pane-activity-indicator-flow.test.tsx --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/e2e/codex-activity-indicator-flow.test.tsx --config config/vitest/vitest.config.ts
+```
+
+Expected: PASS. (The `test/e2e-browser/specs/*` Playwright specs are not runnable in this environment — update the locators for consistency; they run in the browser-suite pipeline.)
+
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/TabItem.tsx test/unit/client/components/TabItem.test.tsx test/unit/client/components/TabBar.test.tsx
+git add src/components/TabItem.tsx test/unit/client/components/TabItem.test.tsx test/unit/client/components/TabBar.test.tsx \
+  test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/codex-activity-indicator-flow.test.tsx \
+  test/e2e-browser/specs/pane-activity-indicator.spec.ts test/e2e-browser/specs/truly-idle-alerting.spec.ts \
+  test/e2e-browser/specs/terminal-activity-rust.spec.ts test/e2e-browser/specs/codex-status-completeness-rust.spec.ts
 git commit -m "feat(tabs): grey working / green ready / green-bar unacked states; dark-grey tab icons"
 ```
 
@@ -958,7 +1026,9 @@ npm run test:vitest -- run test/unit/client/components/TabBar.overflow.test.tsx 
 npm run test:vitest -- run test/unit/client/components/TabBar.multirow.test.tsx --config config/vitest/vitest.config.ts
 npm run test:vitest -- run test/unit/client/components/TabBar.mobile.test.tsx --config config/vitest/vitest.config.ts
 ```
-Expected: PASS (jsdom does no real layout — the overflow suites mock scroll geometry, so class changes should be inert; if any assert the old label cap or wrapper classlist, update them to the new classes).
+Expected: PASS (jsdom does no real layout — the overflow suites mock scroll geometry, so class changes should be inert; if any assert the old label cap or wrapper classlist, update them to the new classes). Known concretely (validated by grep): `test/unit/client/components/TabItem.test.tsx` lines ~342 and ~346 POSITIVELY assert the old `max-w-[5rem]` cap — update those two to the new `flex-1 min-w-0` contract.
+
+Validated (load-bearing check, code-level): TabBar's scroll/overflow/multirow JS needs NO logic changes — `useTabBarScroll` is entirely live-measurement-based (`scrollWidth`/`clientWidth`/rects, no width assumptions), the multirow strip contains only tab wrappers (arrows hidden in multirow; + button outside), and dnd-kit uses measured rects (DragOverlay inherits `w-60` from the TabItem class). At the live-server review stage, eyeball: inter-row `gap-0.5` aesthetics in multirow, and hold-scroll speed feel with wider tabs.
 
 Note: `MobileTabStrip.tsx` is intentionally untouched — mobile shows only the active tab title, no tab chips, so fixed width does not apply there.
 
@@ -1170,4 +1240,5 @@ Report in the final summary (no commit needed):
 
 1. **Spec coverage:** (1) placeholder letter ~1px low → Task 1 (root-cause fix, not a blind nudge); (2) uniform fixed ~240px tabs with truncation, clean multirow rows → Task 6; (3) tab provider logos dark grey only, sidebar icons untouched → Task 4 (d), constrained to `TabItem.tsx`; sidebar highlight slightly darker → Task 7; (4) canonical grey/green/green+bar states with explicit mapping, unit tests, edge cases (active-tab completion, waiting, exited panes), no machinery changes → Tasks 2, 3, 4, 5; docs/index.html major-UI update → Task 8; TDD + client-only build + no-push → all tasks + Task 9; branch based on origin/main with PR #572 → verified (`02f862a7`).
 2. **No silent deferrals:** every requirement has a production code path and a test; the only untested artifact is the static `docs/index.html` mock (eyeball step, Task 8 Step 3 — it is a nonfunctional mock by design). `readyByTab` is real store state wired end-to-end (Task 3 store → Task 5 UI → TabBar integration test proving click-clears-bar-keeps-green).
-3. **Type consistency:** `TabVisualState`/`resolveTabVisualState`/`tabHasLivePane` (Task 2) are consumed with identical names/signatures in Task 4; `isReady?: boolean` (Task 4 TabItemProps) matches Task 5's `SortableTabProps.isReady: boolean` and `isReady={!!readyByTab[tab.id]}`; `clearTabReady({ tabId })` (Task 3) matches its dispatch in `tabsSlice`; `data-testid="tab-attention-bar"` is used consistently in Tasks 4, 5.
+3. **Type consistency:** `TabVisualState`/`resolveTabVisualState`/`tabHasLivePane` (Task 2) are consumed with identical names/signatures in Task 4; `isReady?: boolean` (Task 4 TabItemProps) matches Task 5's `SortableTabProps.isReady: boolean` and `isReady={!!readyByTab[tab.id]}`; `clearTabReady({ tabId })` (Task 3) matches its dispatches in `tabsSlice` (closeTab AND closePaneWithCleanup); `data-testid="tab-attention-bar"` is used consistently in Tasks 4, 5.
+4. **Load-bearing validation pass (post-planning):** 12 assumptions were surfaced and validated (ledger: `.worktrees/.the-usual-logs/tab-bar-visual-overhaul/load-bearing-ledger.md`). Verified: mode-gated edges (shells can never turn green — no gating needed in new code), baseline suites green (143/143), TabBar scroll/overflow JS width-agnostic (Task 6 stays CSS-only), theme color arithmetic exact, `hasLivePane` fallback fail-safe. Falsified & fixed in this plan: persistence dirty check must include `readyByTab` (Task 3d), `closePaneWithCleanup` must clear `readyByTab` + persisted map pruned to live tabs (Task 3d/e — covers multi-window tombstone removal), `cn` has no tailwind-merge so darken/green branches are now mutually exclusive (Task 4g, incl. the recorded decision that no emphasis applies to the active tab), and six out-of-plan e2e suites assert tab-icon blue (Task 4 Step 4b). Accepted residual risks: tab-vs-pane-header green split-brain (deliberate tab-bar-only scope) and the `y=11.15` cap-height constant (verifiable only in the live-server visual review).
