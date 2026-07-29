@@ -50,11 +50,18 @@ export default function RepoIcon({ info, className }: RepoIconProps) {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" className={cn('shrink-0', className)}>
       <circle cx="8" cy="8" r="8" fill={`hsl(${hue}, 60%, 42%)`} />
+      {/*
+        Optical centering: place the alphabetic baseline so the CAP box (the
+        uppercase glyph spans baseline..cap-height ≈ 0.70em) is centered on the
+        circle: y = 8 + (0.70 * 9) / 2 = 11.15. dominant-baseline="central" is
+        deliberately NOT used — it centers the em box (which reserves empty
+        descender space below a capital), rendering the letter ~1px low, and
+        has cross-browser interop quirks.
+      */}
       <text
         x="8"
-        y="8.5"
+        y="11.15"
         textAnchor="middle"
-        dominantBaseline="central"
         fontSize="9"
         fontWeight="600"
         fill="white"

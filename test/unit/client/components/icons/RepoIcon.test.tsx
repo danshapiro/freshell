@@ -40,4 +40,16 @@ describe('RepoIcon', () => {
     render(<RepoIcon info={{ repoKey: '/r', repoName: '' }} />)
     expect(screen.getByText('?')).toBeTruthy()
   })
+
+  it('optically centers the letter (alphabetic baseline at cap-height/2 below center, no dominant-baseline)', () => {
+    render(<RepoIcon info={{ repoKey: '/r', repoName: 'freshell' }} />)
+    const text = document.querySelector('svg text')!
+    expect(text).toBeTruthy()
+    // Cap-centered placement: y = 8 (circle center) + (0.70 * 9)/2 = 11.15.
+    expect(text.getAttribute('y')).toBe('11.15')
+    // dominant-baseline must be gone: 'central' centers the em box, which sits
+    // ~0.05em below a capital glyph's optical center and is a browser-interop hazard.
+    expect(text.getAttribute('dominant-baseline')).toBeNull()
+    expect(text.getAttribute('text-anchor')).toBe('middle')
+  })
 })
