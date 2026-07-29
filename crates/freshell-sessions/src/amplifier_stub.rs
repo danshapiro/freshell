@@ -154,6 +154,24 @@ pub fn ensure_session(
                 } else {
                     None
                 };
+                // A dir at this exact leaf path with no parseable
+                // metadata.json is rare and worth a loud signal (unlike the
+                // ordinary re-stub path, which is INFO-logged elsewhere):
+                // it's the wedged-id shape a rollback bug (or an external
+                // process racing this one) would produce -- this function
+                // silently ADOPTS it as "found" either way, so this is the
+                // only place that surfaces the anomaly.
+                if std::fs::read_to_string(candidate.join("metadata.json"))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .is_none()
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        session_dir = %candidate.display(),
+                        "amplifier_stub: adopting an existing session dir with missing or unparseable metadata.json"
+                    );
+                }
                 return Ok(EnsuredSession {
                     session_dir: candidate,
                     created: false,
@@ -175,12 +193,29 @@ pub fn ensure_session(
         "working_dir": resolved.to_string_lossy(),
         "freshell_terminal_id": terminal_id,
     });
-    std::fs::write(
-        dir.join("metadata.json"),
-        serde_json::to_string_pretty(&metadata)?,
-    )?;
-    std::fs::write(dir.join("transcript.jsonl"), "")?;
-    std::fs::write(dir.join("events.jsonl"), "")?;
+    // The three stub-file writes below can fail partway through (ENOSPC,
+    // permissions, ...) after create_dir_all already succeeded. On that
+    // path, best-effort roll back the directory rather than leaving a
+    // metadata-less dir behind: such a dir has no parseable metadata.json,
+    // so `stub_is_unused` conservatively KEEPS it forever (never GC-able),
+    // and a later `ensure_session` call for the same id would silently
+    // ADOPT it via the bare `candidate.is_dir()` check above, treating a
+    // half-written stub as a legitimate find. Council-scoped: ONE
+    // best-effort `remove_dir_all` — no atomic-write/rollback scaffolding.
+    // The rollback's own error is ignored; the original write error wins.
+    let write_result: std::io::Result<()> = (|| {
+        std::fs::write(
+            dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata)?,
+        )?;
+        std::fs::write(dir.join("transcript.jsonl"), "")?;
+        std::fs::write(dir.join("events.jsonl"), "")?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     Ok(EnsuredSession {
         session_dir: dir,
         created: true,
@@ -491,6 +526,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta2["freshell_terminal_id"], "term-1");
+    }
+
+    #[test]
+    fn ensure_session_rolls_back_the_directory_on_a_partial_write_failure() {
+        // FIX (council-mandated rollback): a partial write failure (e.g.
+        // ENOSPC/permissions) after create_dir_all succeeded must not leave
+        // a metadata-less directory behind -- `stub_is_unused` conservatively
+        // KEEPS an unparseable/missing metadata.json forever (never
+        // GC-able), and a LATER `ensure_session` call for the same id would
+        // silently ADOPT such a half-written dir via the bare
+        // `candidate.is_dir()` "found" check above, treating broker litter
+        // as a legitimate session.
+        //
+        // Injection: this function's "found" check treats ANY pre-existing
+        // directory at the session leaf as legitimate (see the test above),
+        // so the write failure can only be injected via the mode the LEAF
+        // gets at creation time -- not via any pre-arranged file/dir at that
+        // exact path. We pre-create every ancestor NORMALLY (writable) up to
+        // (not including) the leaf, then run just the `ensure_session` call
+        // on a DEDICATED thread with `unshare(CLONE_FS)` + a restrictive
+        // umask: `unshare(CLONE_FS)` gives that one thread its own private
+        // fs_struct (root/cwd/umask) per `man 2 unshare`, so the umask flip
+        // cannot leak into the process-wide umask and flake unrelated
+        // concurrent tests. umask 0o222 makes the freshly-created leaf
+        // directory mode 0o555 (r-xr-xr-x): create_dir_all still succeeds
+        // (mkdir only needs write+execute on the PARENT, which stays
+        // normal), but writing metadata.json into the new leaf fails
+        // (EACCES -- the leaf itself now lacks the write bit), while the
+        // leaf remains readable+executable so the rollback's own
+        // `remove_dir_all` (which must read_dir an empty leaf before
+        // rmdir-ing it) can still succeed.
+        let home = unique_temp_home("rollback");
+        let cwd_dir = home.join("workdir");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let canonical = std::fs::canonicalize(&cwd_dir).unwrap();
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let slug = cwd_slug(&canonical.to_string_lossy());
+
+        let sessions_dir = home.join("projects").join(&slug).join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let expected_dir = sessions_dir.join(session_id);
+        assert!(
+            !expected_dir.exists(),
+            "precondition: the session leaf must not pre-exist"
+        );
+
+        let home_for_thread = home.clone();
+        let cwd_str = cwd_dir.to_str().unwrap().to_string();
+        let session_id_owned = session_id.to_string();
+        let result = std::thread::spawn(move || {
+            // SAFETY: unshare(CLONE_FS) only detaches THIS thread's
+            // fs_struct (root/cwd/umask) from the rest of the process, per
+            // `man 2 unshare`; it takes no pointers and cannot violate
+            // memory safety. Scoped to this one throwaway test thread,
+            // which exits immediately after, so no isolation is left
+            // dangling either.
+            let rc = unsafe { libc::unshare(libc::CLONE_FS) };
+            assert_eq!(
+                rc,
+                0,
+                "unshare(CLONE_FS) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: umask() only reads/writes this (now-private) thread's
+            // umask and returns the prior value; no pointers involved.
+            let prior = unsafe { libc::umask(0o222) };
+            let outcome = ensure_session(&home_for_thread, &session_id_owned, &cwd_str, "term-rollback");
+            unsafe { libc::umask(prior) };
+            outcome
+        })
+        .join()
+        .expect("rollback-injection thread panicked");
+
+        let err = result.expect_err("a write into a mode-555 leaf must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !expected_dir.exists(),
+            "the partial-write leaf must be rolled back, not left behind un-GC-able"
+        );
+
+        // A subsequent ensure_session for the SAME id/cwd, under the
+        // process's normal umask, must succeed cleanly -- proving the
+        // rollback left no residue that corrupts the next attempt.
+        let retried =
+            ensure_session(&home, session_id, cwd_dir.to_str().unwrap(), "term-retry").unwrap();
+        assert!(retried.created);
+        assert_eq!(retried.session_dir, expected_dir);
+        assert!(expected_dir.join("metadata.json").is_file());
+        assert!(expected_dir.join("transcript.jsonl").is_file());
+        assert!(expected_dir.join("events.jsonl").is_file());
     }
 
     #[test]

@@ -2679,6 +2679,22 @@ pub async fn respawn_agent_terminal(
                 &terminal_id,
             ) {
                 Ok(ensured) if ensured.created => {
+                    // INFO (not WARN): this fires on the DESIGNED
+                    // GC-re-stub path -- any never-typed-in amplifier pane
+                    // that gets auto-resumed after a reboot/crash lands
+                    // here every time, since its stub was already GC'd on
+                    // clean exit. WARN here would cry wolf on a routine,
+                    // expected lifecycle event; this line exists so the
+                    // (rarer) case of a MANUALLY-deleted session with real
+                    // history being silently re-stubbed empty is at least
+                    // visible in logs (accepted residual (e)).
+                    tracing::info!(
+                        target: "freshell_ws::terminal",
+                        session_id = %req.session_id,
+                        cwd = %cwd,
+                        created = ensured.created,
+                        "amplifier_stub_ensured: respawn re-stubbed an absent-on-disk session"
+                    );
                     respawn_amplifier_stub_gc = Some(AmplifierStubGc {
                         session_dir: ensured.session_dir,
                         session_id: req.session_id.clone(),

@@ -39,3 +39,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # SESSION-07: unique temp-file names for `search.rs`'s file-content search
 # tests (same version/feature set as every other crate's `uuid` dependency).
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# amplifier_stub's rollback-on-partial-write test needs a deterministic,
+# thread-scoped (not process-global) permission-denied write failure:
+# `unshare(CLONE_FS)` + `umask()`. Same version freshell-ws already pins
+# directly for `pane_ledger`'s `flock(2)`.
+libc = "0.2"
