@@ -589,6 +589,8 @@ impl FreshOpencodeState {
                     .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                         provider: PROVIDER.into(),
                         session_id: durable_id.clone(),
+                        provider_scope: None,
+                        materialization: freshell_recovery::MaterializationState::Observed,
                         mode: SESSION_TYPE.into(),
                         create_request_id: request_id.clone(),
                         resolves_pending: Some(session.placeholder_id.clone()),
@@ -650,6 +652,8 @@ impl FreshOpencodeState {
                     .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                         provider: PROVIDER.into(),
                         session_id: acked_session_id.clone(),
+                        provider_scope: None,
+                        materialization: freshell_recovery::MaterializationState::Observed,
                         mode: SESSION_TYPE.into(),
                         create_request_id: None,
                         resolves_pending: None,
@@ -1116,6 +1120,8 @@ impl FreshOpencodeState {
                     .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                         provider: PROVIDER.into(),
                         session_id: session_id.to_string(),
+                        provider_scope: None,
+                        materialization: freshell_recovery::MaterializationState::Observed,
                         mode: SESSION_TYPE.into(),
                         create_request_id: None,
                         resolves_pending: None,

@@ -31,12 +31,12 @@ fn client_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["clientToServer"]["count"].as_u64(),
-        Some(29),
-        "inventory declares 29 client→server types"
+        Some(31),
+        "inventory declares 31 client→server types"
     );
     let expected = json_type_set(&inv["clientToServer"]["types"]);
     let actual: BTreeSet<String> = CLIENT_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 29, "crate declares 29 client types (no dups)");
+    assert_eq!(actual.len(), 31, "crate declares 31 client types (no dups)");
     assert_eq!(
         actual, expected,
         "CLIENT_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_86() {
+fn combined_surface_is_88() {
     let all = all_message_types();
-    assert_eq!(all.len(), 86, "29 client + 57 server = 86 discriminants");
+    assert_eq!(all.len(), 88, "31 client + 57 server = 88 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        86,
+        88,
         "no discriminant collides across directions"
     );
 }

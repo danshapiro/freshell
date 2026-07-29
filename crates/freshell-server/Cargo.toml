@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 freshell-protocol = { path = "../freshell-protocol" }
+freshell-recovery = { path = "../freshell-recovery" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
 # The fresh-agent REST surface (opencode slice) wired for the oracle T2 rung.

@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use freshell_recovery::MaterializationState;
+
 /// Resume-invocation record (campaign plan §4.2): exactly what the
 /// provider-native resume command needs.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -23,6 +25,8 @@ pub struct FreshAgentSettings {
 pub struct FreshAgentBindingUpsert {
     pub provider: String,
     pub session_id: String,
+    pub provider_scope: Option<String>,
+    pub materialization: MaterializationState,
     pub mode: String,
     pub create_request_id: Option<String>,
     pub resolves_pending: Option<String>,
@@ -158,6 +162,8 @@ mod tests {
         fake.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_1".into(),
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             mode: "freshopencode".into(),
             create_request_id: Some("r1".into()),
             resolves_pending: Some("freshopencode-r1".into()),

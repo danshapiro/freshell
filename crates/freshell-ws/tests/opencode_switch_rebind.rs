@@ -379,9 +379,10 @@ fn assert_ledger_superseded(
     );
     assert_eq!(
         old.superseded_by,
-        Some(freshell_protocol::SessionLocator {
+        Some(freshell_recovery::RecoveryOwnerKey {
             provider: "opencode".to_string(),
             session_id: new_session_id.to_string(),
+            provider_scope: None,
         }),
         "[{label}] the superseded row must link to the new session"
     );

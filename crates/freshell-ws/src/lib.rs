@@ -4,7 +4,8 @@
 //! A faithful port of the **handshake path** of `server/ws-handler.ts`:
 //!
 //! * mount `/ws` (an axum WebSocket upgrade — tokio-tungstenite-backed);
-//! * read the first `hello`, validate `protocolVersion == 7` **first**, then the
+//! * read the first `hello`, validate `protocolVersion` is current v8 or the
+//!   explicit v7 compatibility version **first**, then the
 //!   token with a **constant-time** compare (mirrors `auth.ts#timingSafeCompare`
 //!   and the `ws-handler.ts` ordering: version check precedes auth);
 //! * on success emit, IN ORDER, exactly what the original sends on a clean
@@ -61,7 +62,7 @@ use axum::{
 };
 use freshell_protocol::{
     ConfigFallback, ErrorCode, ErrorMsg, PerfLogging, Ready, ServerMessage, ServerSettings,
-    SettingsUpdated, TerminalInventory, WS_PROTOCOL_VERSION,
+    SettingsUpdated, TerminalInventory, WS_LEGACY_PROTOCOL_VERSION, WS_PROTOCOL_VERSION,
 };
 
 /// Shared, cheaply-cloneable state the `/ws` handler needs. Boot-scoped ids are
@@ -422,6 +423,7 @@ pub fn build_handshake_with_capabilities(
                 freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
+                    pane_reconcile_exact_v1: None,
                 },
             ),
         }),
@@ -477,7 +479,8 @@ pub enum HelloOutcome {
     Accept,
     /// Not a `hello` frame, or unparseable — the original closes NOT_AUTHENTICATED.
     NotHello,
-    /// `protocolVersion != 7` — checked BEFORE the token (matches ws-handler.ts).
+    /// Any version except current v8 or compatibility v7 — checked BEFORE the
+    /// token (matches ws-handler.ts).
     ProtocolMismatch,
     /// Bad/missing token (constant-time compared).
     BadToken,
@@ -491,7 +494,13 @@ pub fn evaluate_hello(value: &serde_json::Value, expected_token: &str) -> HelloO
         return HelloOutcome::NotHello;
     }
     // protocolVersion FIRST — a mismatch is reported before we ever look at auth.
-    if value.get("protocolVersion").and_then(|v| v.as_u64()) != Some(WS_PROTOCOL_VERSION as u64) {
+    let protocol_version = value.get("protocolVersion").and_then(|v| v.as_u64());
+    if !matches!(
+        protocol_version,
+        Some(version)
+            if version == WS_PROTOCOL_VERSION as u64
+                || version == WS_LEGACY_PROTOCOL_VERSION as u64
+    ) {
         return HelloOutcome::ProtocolMismatch;
     }
     let token = value.get("token").and_then(|v| v.as_str()).unwrap_or("");
@@ -587,8 +596,9 @@ async fn handle_socket(
         }
         HelloOutcome::ProtocolMismatch => {
             tracing::warn!(reason = "protocol_mismatch", "ws.hello.rejected");
-            let msg =
-                format!("Expected protocol version {WS_PROTOCOL_VERSION}. Please reload the page.");
+            let msg = format!(
+                "Expected protocol version {WS_PROTOCOL_VERSION} or {WS_LEGACY_PROTOCOL_VERSION}. Please reload the page."
+            );
             let _ = send_error(&mut socket, ErrorCode::ProtocolMismatch, &msg).await;
             // S3: the original closes with a real WS close frame (code 4010,
             // reason "Protocol version mismatch") \u2014 without it the client only
@@ -881,6 +891,46 @@ mod tests {
         let unnegotiated = build_handshake_with_capabilities(&s, false, false);
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn capability_negotiation_accepts_only_v7_v8_and_omits_exact_without_runtime() {
+        let s = state();
+        for version in [7, 8] {
+            let hello = json!({
+                "type": "hello",
+                "protocolVersion": version,
+                "token": "secret",
+                "capabilities": {
+                    "paneReconcileV1": true,
+                    "paneReconcileFreshAgentV1": true,
+                    "paneReconcileExactV1": true,
+                }
+            });
+            assert_eq!(evaluate_hello(&hello, "secret"), HelloOutcome::Accept);
+
+            // Task 1 has no complete ExactRestoreRuntime. Even an offered v8
+            // capability is omitted while the two legacy capabilities remain.
+            let handshake = build_handshake_with_capabilities(&s, true, true);
+            let ready = serde_json::to_value(&handshake[0]).unwrap();
+            assert_eq!(ready["capabilities"]["paneReconcileV1"], true);
+            assert_eq!(ready["capabilities"]["paneReconcileFreshAgentV1"], true);
+            assert!(ready["capabilities"].get("paneReconcileExactV1").is_none());
+        }
+
+        for version in [6, 9] {
+            assert_eq!(
+                evaluate_hello(
+                    &json!({
+                        "type": "hello",
+                        "protocolVersion": version,
+                        "token": "secret",
+                    }),
+                    "secret",
+                ),
+                HelloOutcome::ProtocolMismatch
+            );
+        }
     }
 
     #[test]

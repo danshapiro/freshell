@@ -1,20 +1,25 @@
 //! Tests for the pure recovery-inventory builder (B3/P1.9 Task 1).
 
 use super::*;
-use freshell_protocol::SessionLocator;
+use freshell_recovery::RecoveryOwnerKey;
 use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState, LEDGER_VERSION};
 use serde_json::json;
 use std::collections::HashSet;
 
-fn no_live() -> HashSet<(String, String)> {
+fn owner(provider: &str, session_id: &str, provider_scope: Option<&str>) -> RecoveryOwnerKey {
+    RecoveryOwnerKey {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        provider_scope: provider_scope.map(str::to_string),
+    }
+}
+
+fn no_live() -> HashSet<RecoveryOwnerKey> {
     HashSet::new()
 }
 
-fn live(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
-    pairs
-        .iter()
-        .map(|(p, s)| (p.to_string(), s.to_string()))
-        .collect()
+fn live(pairs: &[(&str, &str)]) -> HashSet<RecoveryOwnerKey> {
+    pairs.iter().map(|(p, s)| owner(p, s, None)).collect()
 }
 
 fn union_doc(device: &str, captured_at: u64, panes: serde_json::Value) -> serde_json::Value {
@@ -26,7 +31,7 @@ fn union_doc(device: &str, captured_at: u64, panes: serde_json::Value) -> serde_
 }
 
 /// (state, retired_reason, superseded_by) parts for constructing a `BindingRow`.
-type StateParts = (RowState, Option<RetiredReason>, Option<SessionLocator>);
+type StateParts = (RowState, Option<RetiredReason>, Option<RecoveryOwnerKey>);
 
 fn bound() -> StateParts {
     (RowState::Bound, None, None)
@@ -44,9 +49,10 @@ fn retired_superseded_by(provider: &str, session_id: &str) -> StateParts {
     (
         RowState::Retired,
         Some(RetiredReason::Superseded),
-        Some(SessionLocator {
+        Some(RecoveryOwnerKey {
             provider: provider.to_string(),
             session_id: session_id.to_string(),
+            provider_scope: None,
         }),
     )
 }
@@ -62,6 +68,8 @@ fn binding_row_at(
         ledger_version: LEDGER_VERSION,
         provider: provider.to_string(),
         session_id: session_id.to_string(),
+        provider_scope: None,
+        materialization: freshell_recovery::MaterializationState::Unknown,
         mode: provider.to_string(),
         cwd: Some("/x".to_string()),
         live_terminal_id: None,
@@ -82,6 +90,17 @@ fn binding_row_at(
 
 fn binding_row(provider: &str, session_id: &str, state_parts: StateParts) -> BindingRow {
     binding_row_at(provider, session_id, state_parts, 1000)
+}
+
+fn scoped_binding_row(
+    provider: &str,
+    session_id: &str,
+    provider_scope: &str,
+    state_parts: StateParts,
+) -> BindingRow {
+    let mut row = binding_row(provider, session_id, state_parts);
+    row.provider_scope = Some(provider_scope.to_string());
+    row
 }
 
 /// WAVE-B fast-follow (B3 lane review): the inventory's D7 liveness join must
@@ -105,9 +124,9 @@ fn live_session_keys_includes_identity_registry_bound_sessions() {
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
     identity.upsert("t-live", Some("codex"), Some("sess-live-1"), None, 0);
 
-    let keys = live_session_keys(&registry, &identity);
+    let keys = live_session_keys(&registry, &identity, &[]);
     assert!(
-        keys.contains(&("codex".to_string(), "sess-live-1".to_string())),
+        keys.contains(&owner("codex", "sess-live-1", None)),
         "identity-registry-bound session of a Running terminal must be live"
     );
 }
@@ -132,9 +151,9 @@ fn live_session_keys_ignores_retired_and_dead_identity_entries() {
     identity.upsert("t-retired", Some("claude"), Some("sess-retired"), None, 0);
     assert!(identity.retire("t-retired"));
 
-    let keys = live_session_keys(&registry, &identity);
-    assert!(!keys.contains(&("codex".to_string(), "sess-gone".to_string())));
-    assert!(!keys.contains(&("claude".to_string(), "sess-retired".to_string())));
+    let keys = live_session_keys(&registry, &identity, &[]);
+    assert!(!keys.contains(&owner("codex", "sess-gone", None)));
+    assert!(!keys.contains(&owner("claude", "sess-retired", None)));
 }
 
 #[test]
@@ -293,6 +312,143 @@ fn live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only() {
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
         "live bound rows are excluded from ledgerOnly"
+    );
+}
+
+#[test]
+fn amplifier_supersession_uses_the_successors_complete_scoped_owner() {
+    let scope = "/normalized/project";
+    let predecessor = BindingRow {
+        ledger_version: LEDGER_VERSION,
+        provider: "amplifier".to_string(),
+        session_id: "legacy-id".to_string(),
+        provider_scope: None,
+        materialization: freshell_recovery::MaterializationState::Unknown,
+        mode: "amplifier".to_string(),
+        cwd: Some("/old/raw".to_string()),
+        live_terminal_id: None,
+        create_request_id: None,
+        created_at: 1,
+        updated_at: 2,
+        last_observed_at: 1,
+        state: RowState::Retired,
+        retired_reason: Some(RetiredReason::Superseded),
+        superseded_by: Some(
+            serde_json::from_value(json!({
+                "provider": "amplifier",
+                "sessionId": "scoped-id",
+                "providerScope": scope,
+            }))
+            .unwrap(),
+        ),
+        pane_kind: None,
+        model: None,
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+    };
+    let successor = scoped_binding_row("amplifier", "scoped-id", scope, bound());
+    let snapshot = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{
+                "paneId": "p1",
+                "kind": "terminal",
+                "payload": {
+                    "mode": "amplifier",
+                    "sessionRef": {
+                        "provider": "amplifier",
+                        "sessionId": "legacy-id"
+                    }
+                }
+            }]),
+        ),
+    };
+    let mut live_owners = HashSet::new();
+    live_owners.insert(owner("amplifier", "scoped-id", Some(scope)));
+
+    let out = build_inventory(vec![snapshot], vec![predecessor, successor], live_owners);
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "bound");
+    assert_eq!(pane["sessionRef"]["sessionId"], "scoped-id");
+    assert_eq!(pane["live"], true);
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "the referenced scoped successor must not be re-offered as ledger-only"
+    );
+}
+
+#[test]
+fn amplifier_inventory_keeps_reference_liveness_and_content_scoped() {
+    let scope_a = "/normalized/project-a";
+    let scope_b = "/normalized/project-b";
+    let rows = vec![
+        scoped_binding_row("amplifier", "shared-id", scope_a, bound()),
+        scoped_binding_row("amplifier", "shared-id", scope_b, bound()),
+    ];
+    let mut live_owners = HashSet::new();
+    live_owners.insert(owner("amplifier", "shared-id", Some(scope_a)));
+
+    let live_out = build_inventory(vec![], rows.clone(), live_owners);
+    assert_eq!(
+        live_out["ledgerOnly"].as_array().unwrap(),
+        &[json!({
+            "provider": "amplifier",
+            "sessionId": "shared-id",
+            "providerScope": scope_b,
+            "mode": "amplifier",
+            "cwd": "/x",
+        })],
+        "liveness in one Amplifier project must not suppress another project"
+    );
+
+    let unscoped_snapshot = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{
+                "paneId": "p1",
+                "kind": "terminal",
+                "payload": {
+                    "mode": "amplifier",
+                    "initialCwd": "/raw/project-a",
+                    "sessionRef": {"provider": "amplifier", "sessionId": "shared-id"}
+                }
+            }]),
+        ),
+    };
+    let referenced_out = build_inventory(vec![unscoped_snapshot], rows.clone(), no_live());
+    assert_eq!(
+        referenced_out["ledgerOnly"].as_array().unwrap(),
+        &[
+            json!({
+                "provider": "amplifier",
+                "sessionId": "shared-id",
+                "providerScope": scope_a,
+                "mode": "amplifier",
+                "cwd": "/x",
+            }),
+            json!({
+                "provider": "amplifier",
+                "sessionId": "shared-id",
+                "providerScope": scope_b,
+                "mode": "amplifier",
+                "cwd": "/x",
+            }),
+        ],
+        "raw pane cwd is not a provider-resolved scope and must not suppress either owner"
+    );
+
+    let only_scope_b = build_inventory(vec![], vec![rows[1].clone()], no_live());
+    let mut scope_c = rows[1].clone();
+    scope_c.provider_scope = Some("/normalized/project-c".to_string());
+    let only_scope_c = build_inventory(vec![], vec![scope_c], no_live());
+    assert_ne!(
+        only_scope_b["contentId"], only_scope_c["contentId"],
+        "provider scope is recovery substance and must affect dismissal identity"
     );
 }
 

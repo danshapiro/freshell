@@ -55,6 +55,8 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 let w = FreshAgentBindingWrite {
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
+                    provider_scope: upsert.provider_scope.as_deref(),
+                    materialization: upsert.materialization,
                     mode: &upsert.mode,
                     cwd: upsert.settings.cwd.as_deref(),
                     create_request_id: upsert.create_request_id.as_deref(),
@@ -129,6 +131,8 @@ mod tests {
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "codex".into(),
             session_id: "t1".into(),
+            provider_scope: None,
+            materialization: freshell_recovery::MaterializationState::Observed,
             mode: "freshcodex".into(),
             create_request_id: None,
             resolves_pending: None,

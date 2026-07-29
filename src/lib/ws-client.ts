@@ -6,7 +6,7 @@ import {
 } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
-import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
+import { WS_LEGACY_PROTOCOL_VERSION, WS_PROTOCOL_VERSION } from '@shared/ws-version'
 import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
@@ -116,6 +116,8 @@ export class WsClient {
   private pendingMessages: unknown[] = []
   private intentionalClose = false
   private helloExtensionProvider?: HelloExtensionProvider
+  private protocolVersion: typeof WS_PROTOCOL_VERSION | typeof WS_LEGACY_PROTOCOL_VERSION = WS_PROTOCOL_VERSION
+  private legacyFallbackAttempted = false
 
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
@@ -154,13 +156,6 @@ export class WsClient {
     this.inFlightCreates.delete(requestId)
     this.preReadyCreateQueue.delete(requestId)
     this.heldCreates.delete(requestId)
-  }
-
-  private clearQueuedMessagesAfterProtocolMismatch(): void {
-    this.pendingMessages = []
-    this.inFlightCreates.clear()
-    this.preReadyCreateQueue.clear()
-    this.resetReconcileHold({ requeueHeld: false })
   }
 
   cancelCreate(requestId: string): void {
@@ -350,8 +345,6 @@ export class WsClient {
 
     if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
       this.clearReadyTimeout()
-      this.clearQueuedMessagesAfterProtocolMismatch()
-      this.intentionalClose = true
       return
     }
 
@@ -436,153 +429,201 @@ export class WsClient {
         }
       }
 
-      this.readyTimeout = window.setTimeout(() => {
-        finishReject(new Error('Connection timeout: ready not received'))
-        this.ws?.close()
-      }, CONNECTION_TIMEOUT_MS)
-
-      this.ws = new WebSocket(this.url)
-
-      this.ws.onopen = () => {
-        this._state = 'connected'
-        this.reconnectAttempts = 0
-        this.fastReconnectMode = false
-        this.slowRetryAnnounced = false
-
-        // Send hello with token in message body (not URL).
-        const token = getAuthToken()
-        const extensions = this.helloExtensionProvider?.() || {}
-        const helloExtensions = {
-          ...extensions,
-          ...(extensions.sidebarOpenSessions !== undefined
-            ? { sidebarOpenSessions: sanitizeSessionLocators(extensions.sidebarOpenSessions) }
-            : {}),
-        }
-        this.sendNow({
-          type: 'hello',
-          token,
-          protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
-          ...helloExtensions,
-        })
-      }
-
-      this.ws.onmessage = (event) => {
-        let msg: ServerMessage
-        try {
-          msg = JSON.parse(event.data) as ServerMessage
-        } catch {
-          // Ignore invalid JSON
-          return
-        }
-        this.handleIncomingMessage(msg)
-        if (msg.type === 'ready') {
-          finishResolve()
-          return
-        }
-        if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
-          const err = new Error('Authentication failed')
-          ;(err as any).wsCloseCode = 4001
-          finishReject(err)
-          return
-        }
-        if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
-          this.clearReadyTimeout()
-          this.intentionalClose = true
-          const err = new Error(typeof msg.message === 'string' && msg.message
-            ? msg.message
-            : 'Protocol version mismatch. Reload this Freshell browser tab to use the latest client bundle.')
-          ;(err as any).wsCloseCode = 4010
-          finishReject(err)
-        }
-      }
-
-      this.ws.onclose = (event) => {
+      const openAttempt = (
+        protocolVersion: typeof WS_PROTOCOL_VERSION | typeof WS_LEGACY_PROTOCOL_VERSION,
+      ) => {
         this.clearReadyTimeout()
-        const wasReady = this._state === 'ready'
-        const closedBeforeReady = !wasReady
-        this._state = 'disconnected'
-        this.ws = null
-        // Capabilities are per-connection: reset so a downgraded server (next
-        // ready without the ack) is honored.
-        this.serverCapabilities = {}
-        // Hold state is per-connection too: held creates were never on the
-        // wire, so re-queue them for the next connection's pre-ready path.
-        this.resetReconcileHold({ requeueHeld: true })
-        this.disconnectHandlers.forEach((handler) => handler())
+        this._state = 'connecting'
+        const socket = new WebSocket(this.url)
+        this.ws = socket
 
-        // Close codes:
-        // 4001 NOT_AUTHENTICATED: fatal, do not reconnect.
-        // 4002 HELLO_TIMEOUT: transient (handshake timeout), do reconnect.
-        if (event.code === 4001) {
-          this.intentionalClose = true
-          const err = new Error(`Authentication failed (code ${event.code})`)
-          ;(err as any).wsCloseCode = 4001
-          finishReject(err)
-          return
-        }
-        if (event.code === 4002) {
-          finishReject(new Error('Handshake timeout'))
-          this.scheduleReconnect()
-          return
-        }
+        this.readyTimeout = window.setTimeout(() => {
+          if (this.ws !== socket) return
+          finishReject(new Error('Connection timeout: ready not received'))
+          socket.close()
+        }, CONNECTION_TIMEOUT_MS)
 
-        if (event.code === 4003) {
-          this.intentionalClose = true
-          const err = new Error('Server busy: max connections reached')
-          ;(err as any).wsCloseCode = 4003
-          finishReject(err)
-          return
-        }
-
-        if (event.code === 4010) {
-          this.intentionalClose = true
-          const err = new Error('Protocol version mismatch')
-          ;(err as any).wsCloseCode = 4010
-          finishReject(err)
-          return
-        }
-
-        if (event.code === 4008) {
-          // Backpressure close - surface as warning, but don't reconnect aggressively.
-          finishReject(new Error('Connection too slow (backpressure)'))
-          this.scheduleReconnect({ minDelayMs: 5000 })
-          return
-        }
-
-        if (event.code === 4009) {
-          // SERVER_SHUTDOWN — server is rebinding and will be back shortly.
-          // Reset backoff and use faster base delay for quick recovery.
+        socket.onopen = () => {
+          if (this.ws !== socket) return
+          this._state = 'connected'
           this.reconnectAttempts = 0
-          this.fastReconnectMode = true
-          finishReject(new Error('Server restarting (rebind)'))
-          this.scheduleReconnect()
-          return
+          this.fastReconnectMode = false
+          this.slowRetryAnnounced = false
+
+          // Send hello with token in message body (not URL). Exact recovery is
+          // a v8-only offer; the fallback hello remains frozen-v7-compatible.
+          const token = getAuthToken()
+          const extensions = this.helloExtensionProvider?.() || {}
+          const helloExtensions = {
+            ...extensions,
+            ...(extensions.sidebarOpenSessions !== undefined
+              ? { sidebarOpenSessions: sanitizeSessionLocators(extensions.sidebarOpenSessions) }
+              : {}),
+          }
+          socket.send(JSON.stringify({
+            type: 'hello',
+            token,
+            protocolVersion,
+            capabilities: {
+              uiScreenshotV1: true,
+              terminalOutputBatchV1: true,
+              paneReconcileV1: true,
+              paneReconcileFreshAgentV1: true,
+              ...(protocolVersion === WS_PROTOCOL_VERSION ? { paneReconcileExactV1: true } : {}),
+            },
+            ...helloExtensions,
+          }))
+          this.outboundMessageObserver?.({
+            type: 'hello',
+            token,
+            protocolVersion,
+            capabilities: {
+              uiScreenshotV1: true,
+              terminalOutputBatchV1: true,
+              paneReconcileV1: true,
+              paneReconcileFreshAgentV1: true,
+              ...(protocolVersion === WS_PROTOCOL_VERSION ? { paneReconcileExactV1: true } : {}),
+            },
+            ...helloExtensions,
+          })
         }
 
-        if (closedBeforeReady) {
-          finishReject(new Error('Connection closed before ready'))
+        socket.onmessage = (event) => {
+          if (this.ws !== socket) return
+          let msg: ServerMessage
+          try {
+            msg = JSON.parse(event.data) as ServerMessage
+          } catch {
+            // Ignore invalid JSON
+            return
+          }
+          this.handleIncomingMessage(msg)
+          if (msg.type === 'ready') {
+            this.protocolVersion = protocolVersion
+            finishResolve()
+            return
+          }
+          if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
+            const err = new Error('Authentication failed')
+            ;(err as any).wsCloseCode = 4001
+            finishReject(err)
+            return
+          }
+          if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
+            this.clearReadyTimeout()
+            if (
+              this._state !== 'ready'
+              && protocolVersion === WS_PROTOCOL_VERSION
+              && !this.legacyFallbackAttempted
+            ) {
+              this.legacyFallbackAttempted = true
+              this.protocolVersion = WS_LEGACY_PROTOCOL_VERSION
+              openAttempt(WS_LEGACY_PROTOCOL_VERSION)
+              socket.close()
+              return
+            }
+            this.intentionalClose = true
+            const err = new Error(typeof msg.message === 'string' && msg.message
+              ? msg.message
+              : 'Protocol version mismatch. Reload this Freshell browser tab to use the latest client bundle.')
+            ;(err as any).wsCloseCode = 4010
+            finishReject(err)
+          }
         }
 
-        if (perfConfig.enabled) {
-          logClientPerf('perf.ws_closed', {
-            code: event.code,
-            reason: event.reason,
-            closedBeforeReady,
-          }, 'warn')
+        socket.onclose = (event) => {
+          // A superseded v8 socket may close after its v7 replacement exists.
+          // Its callbacks have no authority over the current connection.
+          if (this.ws !== socket) return
+          this.clearReadyTimeout()
+          const wasReady = this._state === 'ready'
+          const closedBeforeReady = !wasReady
+          this._state = 'disconnected'
+          this.ws = null
+          // Capabilities are per-connection: reset so a downgraded server (next
+          // ready without the ack) is honored.
+          this.serverCapabilities = {}
+          // Hold state is per-connection too: held creates were never on the
+          // wire, so re-queue them for the next connection's pre-ready path.
+          this.resetReconcileHold({ requeueHeld: true })
+          this.disconnectHandlers.forEach((handler) => handler())
+
+          // Close codes:
+          // 4001 NOT_AUTHENTICATED: fatal, do not reconnect.
+          // 4002 HELLO_TIMEOUT: transient (handshake timeout), do reconnect.
+          if (event.code === 4001) {
+            this.intentionalClose = true
+            const err = new Error(`Authentication failed (code ${event.code})`)
+            ;(err as any).wsCloseCode = 4001
+            finishReject(err)
+            return
+          }
+          if (event.code === 4002) {
+            finishReject(new Error('Handshake timeout'))
+            this.scheduleReconnect()
+            return
+          }
+
+          if (event.code === 4003) {
+            this.intentionalClose = true
+            const err = new Error('Server busy: max connections reached')
+            ;(err as any).wsCloseCode = 4003
+            finishReject(err)
+            return
+          }
+
+          if (event.code === 4010) {
+            this.intentionalClose = true
+            const err = new Error('Protocol version mismatch')
+            ;(err as any).wsCloseCode = 4010
+            finishReject(err)
+            return
+          }
+
+          if (event.code === 4008) {
+            // Backpressure close - surface as warning, but don't reconnect aggressively.
+            finishReject(new Error('Connection too slow (backpressure)'))
+            this.scheduleReconnect({ minDelayMs: 5000 })
+            return
+          }
+
+          if (event.code === 4009) {
+            // SERVER_SHUTDOWN — server is rebinding and will be back shortly.
+            // Reset backoff and use faster base delay for quick recovery.
+            this.reconnectAttempts = 0
+            this.fastReconnectMode = true
+            finishReject(new Error('Server restarting (rebind)'))
+            this.scheduleReconnect()
+            return
+          }
+
+          if (closedBeforeReady) {
+            finishReject(new Error('Connection closed before ready'))
+          }
+
+          if (perfConfig.enabled) {
+            logClientPerf('perf.ws_closed', {
+              code: event.code,
+              reason: event.reason,
+              closedBeforeReady,
+            }, 'warn')
+          }
+
+          if (!this.intentionalClose) {
+            this.scheduleReconnect()
+          }
         }
 
-        if (!this.intentionalClose) {
-          this.scheduleReconnect()
+        socket.onerror = () => {
+          if (this.ws !== socket) return
+          // onclose will fire with details; if still connecting, reject quickly.
+          if (this._state === 'connecting') {
+            finishReject(new Error('WebSocket error'))
+          }
         }
       }
 
-      this.ws.onerror = () => {
-        // onclose will fire with details; if still connecting, reject quickly.
-        if (this._state === 'connecting') {
-          finishReject(new Error('WebSocket error'))
-        }
-      }
+      openAttempt(this.protocolVersion)
     })
 
     this.connectPromise = promise

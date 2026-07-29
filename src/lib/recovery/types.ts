@@ -47,6 +47,8 @@ export interface RecoveryOtherDevice {
 /** Ledger-bound session with no snapshot pane referencing it (live rows are excluded server-side, D7). */
 export interface LedgerOnlyEntry {
   provider: string
+  /** Canonical provider-owned namespace for providers whose session IDs are only locally unique. */
+  providerScope?: string
   sessionId: string
   mode: string
   cwd: string | null

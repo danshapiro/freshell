@@ -52,7 +52,7 @@ describe('WsClient protocol reload mismatch handling', () => {
     vi.useRealTimers()
   })
 
-  it('does not flush queued legacy, fresh-agent, or layout messages after protocol mismatch', async () => {
+  it('preserves queued traffic between handshakes and flushes it only after v7 ready', async () => {
     const client = new WsClient('ws://example/ws')
     client.send({ type: 'sdk.create', requestId: 'stale-sdk-create' } as any)
     client.send({
@@ -63,25 +63,31 @@ describe('WsClient protocol reload mismatch handling', () => {
     } as any)
     client.send({ type: 'ui.layout.sync', layout: { tabs: [] } } as any)
 
-    await expect((async () => {
-      const pending = client.connect()
-      MockWebSocket.instances[0]._open()
-      MockWebSocket.instances[0]._message({
-        type: 'error',
-        code: 'PROTOCOL_MISMATCH',
-        message: 'Reload required',
-        timestamp: new Date().toISOString(),
-      })
-      MockWebSocket.instances[0]._close(4010, 'Protocol mismatch')
-      await pending
-    })()).rejects.toThrow('Reload required')
+    const pending = client.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({
+      type: 'error',
+      code: 'PROTOCOL_MISMATCH',
+      message: 'Use protocol v7',
+      timestamp: new Date().toISOString(),
+    })
 
-    const retry = client.connect()
+    expect(MockWebSocket.instances).toHaveLength(2)
     MockWebSocket.instances[1]._open()
+    expect(MockWebSocket.instances[1].sent.map((raw) => JSON.parse(raw).type)).toEqual(['hello'])
     MockWebSocket.instances[1]._message({ type: 'ready' })
-    await retry
+    await pending
 
-    const retriedTypes = MockWebSocket.instances[1].sent.map((raw) => JSON.parse(raw).type)
-    expect(retriedTypes).toEqual(['hello'])
+    const fallbackMessages = MockWebSocket.instances[1].sent.map((raw) => JSON.parse(raw))
+    expect(fallbackMessages[0]).toMatchObject({
+      type: 'hello',
+      protocolVersion: 7,
+    })
+    expect(fallbackMessages[0].capabilities.paneReconcileExactV1).toBeUndefined()
+    expect(fallbackMessages.slice(1).map((message) => message.type)).toEqual([
+      'freshAgent.create',
+      'sdk.create',
+      'ui.layout.sync',
+    ])
   })
 })

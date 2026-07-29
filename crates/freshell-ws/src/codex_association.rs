@@ -728,6 +728,8 @@ mod tests {
             .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
                 provider: "codex",
                 session_id: TID,
+                provider_scope: None,
+                materialization: freshell_recovery::MaterializationState::Observed,
                 mode: "freshcodex",
                 cwd: Some("/tmp"),
                 create_request_id: None,

@@ -813,6 +813,13 @@ async fn handle_client_text(
             }
             true
         }
+        ClientMessage::RestoreLaunchCancel(_) | ClientMessage::RestoreLaunchAck(_) => {
+            // The exact runtime is deliberately dormant in Task 1, so this
+            // authenticated connection owns no restore launch. The frames are
+            // wire-compatible but cannot mutate another connection's (or any)
+            // launch. Task 5 installs the connection-owned transaction table.
+            true
+        }
         ClientMessage::Ping => {
             send(
                 ws_tx,
@@ -1584,6 +1591,7 @@ pub(crate) async fn handle_create(
     // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
     let mut launch_intent = LaunchIntent::Resume;
     let mut resume_session_id: Option<String> = None;
+    let mut initial_materialization = freshell_recovery::MaterializationState::Unknown;
     if mode != "shell" {
         let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
         let should_preallocate_fresh_claude = mode == "claude"
@@ -1616,6 +1624,7 @@ pub(crate) async fn handle_create(
             // handler does not have.
             resume_session_id = Some(Uuid::new_v4().to_string());
             launch_intent = LaunchIntent::Start;
+            initial_materialization = freshell_recovery::MaterializationState::Allocated;
         } else if should_preallocate_fresh_amplifier {
             resume_session_id = Some(Uuid::new_v4().to_string());
         } else {
@@ -2403,6 +2412,8 @@ pub(crate) async fn handle_create(
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
+                    provider_scope: None,
+                    materialization: initial_materialization,
                     terminal_id: &write_terminal_id,
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
@@ -2954,6 +2965,8 @@ pub async fn respawn_agent_terminal(
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
                     provider: &provider,
                     session_id: &session_id,
+                    provider_scope: None,
+                    materialization: freshell_recovery::MaterializationState::Unknown,
                     terminal_id: &write_terminal_id,
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),

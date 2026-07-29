@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 29,
+    "count": 31,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -22,6 +22,8 @@
       "opencode.activity.list",
       "pane.reconcile.request",
       "ping",
+      "restore.launch.ack",
+      "restore.launch.cancel",
       "terminal.attach",
       "terminal.codex.candidate.persisted",
       "terminal.create",
@@ -99,5 +101,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket message inventory — T0 conformance surface",
-  "wsProtocolVersion": 7
+  "wsProtocolVersion": 8
 }

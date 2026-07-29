@@ -1,18 +1,19 @@
-# WebSocket wire contract — frozen
+# WebSocket wire contract — versioned freeze
 
-This directory is the **immutable source of truth for the freshell WebSocket wire
-protocol**, expressed in a language-neutral form. It is the first oracle
-deliverable of the Rust/Tauri port: everything downstream — the Rust
-`freshell-protocol` crate, the TypeScript server/client, and the equivalence
-oracle — is measured against these files.
+This directory is the **reviewed source of truth for the current freshell
+WebSocket wire protocol**, expressed in a language-neutral form. Each committed
+protocol revision is frozen until another deliberate version bump. It is the
+first oracle deliverable of the Rust/Tauri port: everything downstream — the
+Rust `freshell-protocol` crate, the TypeScript server/client, and the
+equivalence oracle — is measured against these files.
 
 ## Files
 
 | File | What it is |
 |------|------------|
 | `ws-protocol.schema.json` | JSON Schema bundle (draft 2020-12) covering **every exported Zod schema** in `shared/ws-protocol.ts`, keyed by export name, plus `wsProtocolVersion`. This is the **inbound (client→server) runtime authority**. |
-| `ws-server-messages.schema.json` | JSON Schema for **every server→client message shape** (all 56), keyed by `type` discriminant, plus `wsProtocolVersion`. Synthesized from the `ServerMessage` union via the TypeScript type checker — the **outbound shape contract** for the oracle. |
-| `ws-message-inventory.json` | The **T0 conformance surface**: the `type` discriminants of every client→server and server→client message. |
+| `ws-server-messages.schema.json` | JSON Schema for **every server→client message shape** (all 57), keyed by `type` discriminant, plus `wsProtocolVersion`. Synthesized from the `ServerMessage` union via the TypeScript type checker — the **outbound shape contract** for the oracle. |
+| `ws-message-inventory.json` | The **T0 conformance surface**: all 31 client→server and 57 server→client `type` discriminants (88 total). |
 | `generate-ws-contract.ts` | The generator. Reads `shared/ws-protocol.ts` and emits the three JSON files deterministically. |
 | `nondeterministic-fields.md` | Enumeration of runtime-nondeterministic fields (ids, timestamps, ports, paths, blobs) — the input to the oracle's normalization layer. |
 
@@ -50,6 +51,13 @@ that the committed `wsProtocolVersion` equals `WS_PROTOCOL_VERSION`). If anyone
 edits `shared/ws-protocol.ts` (or a sibling schema module) without regenerating,
 that test fails. That is the "frozen contract": the wire format cannot drift
 silently.
+
+The current contract version is **8**. Version **7** remains one explicit,
+frozen compatibility lane: servers accept v7 and v8 hellos, while a current
+client tries v8 first and retries once with a frozen-v7-compatible hello only
+after receiving a pre-authentication `PROTOCOL_MISMATCH`. The v7 retry omits
+`paneReconcileExactV1` and never sends durable-launch traffic. This lane is a
+transport compatibility boundary, not a second mutable schema.
 
 The server→client shapes carry two extra guards:
 
@@ -91,7 +99,7 @@ commit the regenerated `port/contract/*.json` in the same PR.
   `zod-to-json-schema` only if native conversion ever throws. Schemas are detected
   *structurally* (every exported `ZodType`), not by a `*Schema` name pattern, so
   first-class wire enums that break the convention — notably `ErrorCode` — are not
-  dropped. As of this writing all 66 exported schemas convert natively.
+  dropped. As of this writing all exported schemas convert natively.
 - **Message inventory:** discriminants are resolved from the two canonical union
   types, `ClientMessage` and `ServerMessage`, via the **TypeScript type checker**.
   This is authoritative for both the Zod-validated client surface and the
@@ -118,9 +126,16 @@ commit the regenerated `port/contract/*.json` in the same PR.
 
 ## Out of scope
 
-**Changing the wire contract is out of scope for the port.** The Rust port must
-speak protocol version **7** exactly as defined here. If a wire change is ever
-required, it is a separate, deliberate protocol revision (bump
-`WS_PROTOCOL_VERSION`, regenerate, and review the diff) — never an incidental
-side effect of porting. The bug-fix directive for the port applies to *behavior*,
-not to the wire format frozen in these files.
+Protocol version **8** is a deliberate product revision. It adds the
+`paneReconcileExactV1` capability, optional reconciliation cwd fields, and
+durable-launch cancel/ack frames while retaining the frozen-v7 compatibility
+lane above. The exact capability remains dormant during the initial contract
+work: a real server omits it even when offered until the complete exact-restore
+runtime and launch fences are installed. Old servers never receive the new
+launch frames because clients send them only after exact capability
+acknowledgement.
+
+Any further wire change is out of scope for the port unless it is another
+separate, deliberate protocol revision: bump `WS_PROTOCOL_VERSION`, regenerate,
+and review the diff. Wire changes must never be an incidental side effect of
+porting.

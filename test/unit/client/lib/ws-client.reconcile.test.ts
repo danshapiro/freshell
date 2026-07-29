@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RECONCILE_VERDICT_WAIT_MS, WsClient, getWsClient, resetWsClientForTests } from '../../../../src/lib/ws-client'
+import { WS_PROTOCOL_VERSION } from '../../../../shared/ws-version'
 
 class MockWebSocket {
   static OPEN = 1
@@ -77,14 +78,119 @@ describe('WsClient pane-reconcile capability', () => {
 
     const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
     expect(hello.type).toBe('hello')
+    expect(hello.protocolVersion).toBe(8)
     expect(hello.capabilities).toMatchObject({
       uiScreenshotV1: true,
       terminalOutputBatchV1: true,
       paneReconcileV1: true,
+      paneReconcileExactV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p
+  })
+
+  describe('v8 to frozen-v7 transport fallback', () => {
+    it('retries once only after a pre-ready PROTOCOL_MISMATCH and preserves queues until v7 ready', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'queued-create', mode: 'claude' } as any)
+      c.send({ type: 'ping' })
+
+      const connected = c.connect()
+      const v8 = MockWebSocket.instances[0]
+      v8._open()
+      expect(framesOf(v8)[0]).toMatchObject({
+        type: 'hello',
+        protocolVersion: 8,
+        capabilities: { paneReconcileExactV1: true },
+      })
+      expect(framesOf(v8).filter((frame) => frame.type !== 'hello')).toEqual([])
+
+      v8._message({
+        type: 'error',
+        code: 'PROTOCOL_MISMATCH',
+        message: 'expected v7',
+        timestamp: '2026-07-29T00:00:00.000Z',
+      })
+      expect(MockWebSocket.instances).toHaveLength(2)
+
+      const v7 = MockWebSocket.instances[1]
+      // A late close callback from the superseded socket must not clobber the
+      // replacement socket or reject the shared connect promise.
+      v8._close(4010, 'Protocol version mismatch')
+      v7._open()
+      const v7Hello = framesOf(v7)[0]
+      expect(v7Hello.protocolVersion).toBe(7)
+      expect(v7Hello.capabilities?.paneReconcileExactV1).toBeUndefined()
+      expect(framesOf(v7).filter((frame) => frame.type !== 'hello')).toEqual([])
+
+      v7._message({ type: 'ready' })
+      await expect(connected).resolves.toBeUndefined()
+      expect(framesOf(v7).filter((frame) => frame.type !== 'hello')).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'queued-create' }),
+        { type: 'ping' },
+      ])
+    })
+
+    it('never oscillates after the one v7 retry', async () => {
+      const c = new WsClient('ws://example/ws')
+      const result = c.connect().then(
+        () => 'resolved',
+        () => 'rejected',
+      )
+      const v8 = MockWebSocket.instances[0]
+      v8._open()
+      v8._message({
+        type: 'error',
+        code: 'PROTOCOL_MISMATCH',
+        message: 'expected v7',
+        timestamp: '2026-07-29T00:00:00.000Z',
+      })
+
+      const v7 = MockWebSocket.instances[1]
+      v7._open()
+      v7._message({
+        type: 'error',
+        code: 'PROTOCOL_MISMATCH',
+        message: 'still mismatched',
+        timestamp: '2026-07-29T00:00:00.000Z',
+      })
+      expect(await result).toBe('rejected')
+      expect(MockWebSocket.instances).toHaveLength(2)
+    })
+
+    it('does not downgrade on a close code without the actual mismatch frame', async () => {
+      const c = new WsClient('ws://example/ws')
+      const result = c.connect().then(
+        () => 'resolved',
+        () => 'rejected',
+      )
+      const socket = MockWebSocket.instances[0]
+      socket._open()
+      socket._close(4010, 'Protocol version mismatch')
+
+      expect(await result).toBe('rejected')
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
+
+    it('does not downgrade after authentication failure', async () => {
+      const c = new WsClient('ws://example/ws')
+      const result = c.connect().then(
+        () => 'resolved',
+        () => 'rejected',
+      )
+      const socket = MockWebSocket.instances[0]
+      socket._open()
+      socket._message({
+        type: 'error',
+        code: 'NOT_AUTHENTICATED',
+        message: 'no',
+        timestamp: '2026-07-29T00:00:00.000Z',
+      })
+
+      expect(await result).toBe('rejected')
+      expect(MockWebSocket.instances).toHaveLength(1)
+    })
   })
 
   it('surfaces ready.capabilities and resets them on disconnect', async () => {
@@ -267,6 +373,8 @@ describe('WsClient pane-reconcile capability', () => {
     const sentMessages = framesOf(MockWebSocket.instances[0])
     const hello = sentMessages.find((m) => m.type === 'hello') as { capabilities?: Record<string, unknown> }
     expect(hello?.capabilities?.paneReconcileFreshAgentV1).toBe(true)
+    expect(hello?.capabilities?.paneReconcileExactV1).toBe(true)
+    expect(WS_PROTOCOL_VERSION).toBe(8)
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p

@@ -19,7 +19,10 @@ vi.mock('@/store/tabRegistrySync', async (importOriginal) => ({
 }))
 
 import { getRecoveryInventory } from '@/lib/api'
-import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
+import {
+  RecoveryOfferPanel,
+  recoveryLedgerOnlyEntryKey,
+} from '@/components/RecoveryOfferPanel'
 import { getPendingOffer, setPendingOffer, isDismissed, recordDismissal } from '@/lib/recovery/dismissal'
 import { consumeTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import type { RecoveryInventory } from '@/lib/recovery/types'
@@ -83,6 +86,32 @@ describe('RecoveryOfferPanel', () => {
   })
 
   afterEach(() => cleanup())
+
+  it('uses provider scope in scoped ledger-only identities while preserving legacy identities', () => {
+    expect(recoveryLedgerOnlyEntryKey({
+      provider: 'codex',
+      sessionId: 'C9',
+      mode: 'codex',
+      cwd: null,
+    })).toBe('codex:C9')
+
+    const firstScope = recoveryLedgerOnlyEntryKey({
+      provider: 'amplifier',
+      providerScope: '/workspace/one',
+      sessionId: 'shared',
+      mode: 'amplifier',
+      cwd: '/workspace/one',
+    })
+    const secondScope = recoveryLedgerOnlyEntryKey({
+      provider: 'amplifier',
+      providerScope: '/workspace/two',
+      sessionId: 'shared',
+      mode: 'amplifier',
+      cwd: '/workspace/two',
+    })
+
+    expect(firstScope).not.toBe(secondScope)
+  })
 
   it('offers when eligible and inventory is recoverable, recording the pending offer', async () => {
     vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)

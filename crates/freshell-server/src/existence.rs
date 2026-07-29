@@ -397,6 +397,8 @@ mod tests {
             .record_binding(&freshell_ws::pane_ledger::BindingWrite {
                 provider: "claude",
                 session_id: "11111111-2222-3333-4444-555555555555",
+                provider_scope: None,
+                materialization: freshell_recovery::MaterializationState::Observed,
                 terminal_id: "t1",
                 mode: "claude",
                 cwd: None,

@@ -98,12 +98,13 @@ function asRootState(panes: PanesState): RootState {
   return { panes } as unknown as RootState
 }
 
-function stateWithBothKinds(): RootState {
+function stateWithBothKinds(freshInitialCwd?: string): RootState {
   let panes = emptyPanesState()
   panes = addTerminalPane(panes, 'tab1', 'p1', { terminalId: 't-1', status: 'running' })
   panes = addFreshAgentPane(panes, 'tab9', 'p9', {
     createRequestId: FA_CREATE_REQUEST_ID,
     sessionRef: { provider: 'claude', sessionId: DURABLE },
+    ...(freshInitialCwd ? { initialCwd: freshInitialCwd } : {}),
   })
   return asRootState(panes)
 }
@@ -184,12 +185,16 @@ describe('buildReconcileRequest with fresh-agent panes', () => {
   })
 
   it('includes fresh-agent panes when includeFreshAgent is true', () => {
-    const req = buildReconcileRequest(stateWithBothKinds(), { includeFreshAgent: true })
+    const req = buildReconcileRequest(
+      stateWithBothKinds('/persisted/fresh-project'),
+      { includeFreshAgent: true },
+    )
     expect(req!.panes).toHaveLength(2)
     const fa = req!.panes.find((p) => p.kind === 'fresh-agent')!
     expect(fa.mode).toBe('claude')
     expect(fa.createRequestId).toBe(FA_CREATE_REQUEST_ID)
     expect(fa.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(fa.cwd).toBe('/persisted/fresh-project')
   })
 
   it('skips fresh-agent panes without createRequestId', () => {

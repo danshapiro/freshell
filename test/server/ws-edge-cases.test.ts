@@ -564,7 +564,7 @@ describe('WebSocket edge cases', () => {
       ws.send(JSON.stringify({
         type: 'hello',
         token: 'testtoken-testtoken',
-        protocolVersion: WS_PROTOCOL_VERSION - 1,
+        protocolVersion: WS_PROTOCOL_VERSION + 1,
       }))
 
       const error = await waitForMessage(ws, (m) => m.type === 'error')

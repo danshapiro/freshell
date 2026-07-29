@@ -40,7 +40,7 @@ pub struct BootScanReport {
     pub quarantined: Vec<QuarantinedRow>,
     pub stale_markers_removed: Vec<String>,
     /// (retired old ref, winning new ref) pairs from the crash-window repair.
-    pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>,
+    pub supersession_repairs: Vec<(RecoveryOwnerKey, RecoveryOwnerKey)>,
     pub gc_tombstoned: Vec<SessionLocator>,
     pub tombstones_deleted: Vec<SessionLocator>,
 }
@@ -139,10 +139,7 @@ impl PaneLedger {
             // bites, stamp an in-process AtomicU64 sequence into rows as a
             // secondary tiebreak (schema addition, P1.13-compatible).
             rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
-            let winner = SessionLocator {
-                provider: rows[0].provider.clone(),
-                session_id: rows[0].session_id.clone(),
-            };
+            let winner = rows[0].owner_key();
             for mut loser in rows.into_iter().skip(1) {
                 loser.state = RowState::Retired;
                 loser.retired_reason = Some(RetiredReason::Superseded);
@@ -155,10 +152,7 @@ impl PaneLedger {
                     winner_session_id = %winner.session_id,
                     "pane_ledger_supersession_repair: two bound rows on one lineage; newer updatedAt wins"
                 );
-                let loser_ref = SessionLocator {
-                    provider: loser.provider.clone(),
-                    session_id: loser.session_id.clone(),
-                };
+                let loser_ref = loser.owner_key();
                 match self.write_binding(&root, &mut index, &loser) {
                     Ok(()) => {
                         report
@@ -227,7 +221,7 @@ impl PaneLedger {
                     .bindings
                     .keys()
                     .cloned()
-                    .collect::<Vec<(String, String)>>(),
+                    .collect::<Vec<RecoveryOwnerKey>>(),
             )
         };
         for terminal_id in marker_ids {
@@ -274,7 +268,7 @@ impl PaneLedger {
             // orphan rule here would sweep EVERY old marker at EVERY boot.
             self.gc_marker_locked(root, index, &terminal_id, now_ms, None, &mut report);
         }
-        let row_keys: Vec<(String, String)> = index.bindings.keys().cloned().collect();
+        let row_keys: Vec<RecoveryOwnerKey> = index.bindings.keys().cloned().collect();
         for key in row_keys {
             self.gc_row_locked(root, index, &key, now_ms, transcript_absent, &mut report);
         }
@@ -351,7 +345,7 @@ impl PaneLedger {
         &self,
         root: &Path,
         index: &mut LedgerIndex,
-        key: &(String, String),
+        key: &RecoveryOwnerKey,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
         report: &mut BootScanReport,
@@ -394,12 +388,21 @@ impl PaneLedger {
             RowState::Retired => {
                 let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
                 if old_enough && transcript_absent(&row.provider, &row.session_id) {
-                    let path = Self::binding_path(root, &row.provider, &row.session_id);
+                    let owner = row.owner_key();
+                    if Self::has_shadowed_legacy_alias(index, &owner) {
+                        tracing::info!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %sref.provider,
+                            session_id = %sref.session_id,
+                            "pane_ledger_tombstone_retained: v2 suppressor protects a read-only legacy alias"
+                        );
+                        return;
+                    }
+                    let path = Self::owner_v2_path(root, &owner);
                     match std::fs::remove_file(&path) {
                         Ok(()) => {
-                            index
-                                .bindings
-                                .remove(&(row.provider.clone(), row.session_id.clone()));
+                            index.v2_owners.remove(&owner);
+                            index.bindings.remove(&owner);
                             tracing::info!(
                                 target: "freshell_ws::pane_ledger",
                                 provider = %sref.provider,
@@ -466,7 +469,17 @@ impl PaneLedger {
                         let typed_ok = if is_pending {
                             serde_json::from_value::<PendingMarker>(value).is_ok()
                         } else {
-                            serde_json::from_value::<BindingRow>(value).is_ok()
+                            serde_json::from_value::<BindingRow>(value)
+                                .ok()
+                                .is_some_and(|row| {
+                                    if path.parent() != Some(Self::v2_bindings_dir(root).as_path())
+                                    {
+                                        return true;
+                                    }
+                                    Self::validate_row_owner_scopes(&row).is_ok()
+                                        && path.file_name().and_then(|filename| filename.to_str())
+                                            == Some(owner_v2_filename(&row.owner_key()).as_str())
+                                })
                         };
                         if typed_ok {
                             continue; // healthy

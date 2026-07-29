@@ -1161,6 +1161,9 @@ impl FreshClaudeState {
                                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                                     provider: PROVIDER.into(),
                                     session_id: cli_id.to_string(),
+                                    provider_scope: None,
+                                    materialization:
+                                        freshell_recovery::MaterializationState::Observed,
                                     mode: session_type.clone(),
                                     create_request_id: None,
                                     resolves_pending: None,

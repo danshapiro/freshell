@@ -365,6 +365,8 @@ impl FreshCodexState {
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: "codex".into(),
                 session_id: session_id.into(),
+                provider_scope: None,
+                materialization: freshell_recovery::MaterializationState::Observed,
                 mode: "freshcodex".into(),
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,

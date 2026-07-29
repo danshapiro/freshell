@@ -7,7 +7,7 @@
  * Client MUST use `import type` to avoid bundling Zod runtime code.
  */
 import { z } from 'zod'
-import { WS_PROTOCOL_VERSION } from './ws-version.js'
+import { WS_LEGACY_PROTOCOL_VERSION, WS_PROTOCOL_VERSION } from './ws-version.js'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
@@ -38,7 +38,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export { WS_PROTOCOL_VERSION }
+export { WS_LEGACY_PROTOCOL_VERSION, WS_PROTOCOL_VERSION }
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -269,7 +269,10 @@ export type Usage = z.infer<typeof UsageSchema>
 export const HelloSchema = z.object({
   type: z.literal('hello'),
   token: z.string().optional(),
-  protocolVersion: z.literal(WS_PROTOCOL_VERSION),
+  protocolVersion: z.union([
+    z.literal(WS_LEGACY_PROTOCOL_VERSION),
+    z.literal(WS_PROTOCOL_VERSION),
+  ]),
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
     terminalOutputBatchV1: z.boolean().optional(),
@@ -277,6 +280,7 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    paneReconcileExactV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -581,6 +585,8 @@ export const ReconcilePaneSchema = z.object({
   kind: z.enum(['terminal', 'fresh-agent']),
   /** TerminalMode string as persisted ('shell', 'claude', …). */
   mode: z.string().min(1),
+  /** Persisted initial cwd used by exact provider lookup and scoped ownership. */
+  cwd: z.string().optional(),
   /** The pane's stable creation key — required by contract. */
   createRequestId: z.string().min(1),
   /** Last known live handle. */
@@ -605,6 +611,19 @@ export const PaneReconcileRequestSchema = z.object({
 
 export type ReconcilePane = z.infer<typeof ReconcilePaneSchema>
 export type PaneReconcileRequest = z.infer<typeof PaneReconcileRequestSchema>
+
+export const RestoreLaunchCancelSchema = z.object({
+  type: z.literal('restore.launch.cancel'),
+  requestId: z.string().min(1),
+})
+
+export const RestoreLaunchAckSchema = z.object({
+  type: z.literal('restore.launch.ack'),
+  requestId: z.string().min(1),
+})
+
+export type RestoreLaunchCancel = z.infer<typeof RestoreLaunchCancelSchema>
+export type RestoreLaunchAck = z.infer<typeof RestoreLaunchAckSchema>
 
 export const PaneVerdictSchema = z.object({
   /** Echoed verbatim, 1:1 with request order. */
@@ -644,6 +663,7 @@ export const ReadyCapabilitiesSchema = z
   .object({
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    paneReconcileExactV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -653,6 +673,8 @@ export type ReadyCapabilities = z.infer<typeof ReadyCapabilitiesSchema>
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
   PaneReconcileRequestSchema,
+  RestoreLaunchCancelSchema,
+  RestoreLaunchAckSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,

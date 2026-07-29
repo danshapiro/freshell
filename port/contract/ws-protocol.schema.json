@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 66,
+  "schemaCount": 68,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -441,6 +441,9 @@
                     "minLength": 1,
                     "type": "string"
                   },
+                  "cwd": {
+                    "type": "string"
+                  },
                   "kind": {
                     "enum": [
                       "terminal",
@@ -519,9 +522,49 @@
         {
           "additionalProperties": false,
           "properties": {
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "restore.launch.cancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "restore.launch.ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "paneReconcileExactV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -549,8 +592,16 @@
               "type": "object"
             },
             "protocolVersion": {
-              "const": 7,
-              "type": "number"
+              "anyOf": [
+                {
+                  "const": 7,
+                  "type": "number"
+                },
+                {
+                  "const": 8,
+                  "type": "number"
+                }
+              ]
             },
             "sessions": {
               "additionalProperties": false,
@@ -3641,6 +3692,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "paneReconcileExactV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -3668,8 +3723,16 @@
           "type": "object"
         },
         "protocolVersion": {
-          "const": 7,
-          "type": "number"
+          "anyOf": [
+            {
+              "const": 7,
+              "type": "number"
+            },
+            {
+              "const": 8,
+              "type": "number"
+            }
+          ]
         },
         "sessions": {
           "additionalProperties": false,
@@ -3917,6 +3980,9 @@
                 "minLength": 1,
                 "type": "string"
               },
+              "cwd": {
+                "type": "string"
+              },
               "kind": {
                 "enum": [
                   "terminal",
@@ -4158,6 +4224,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "paneReconcileExactV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"
@@ -4175,6 +4245,9 @@
       "properties": {
         "createRequestId": {
           "minLength": 1,
+          "type": "string"
+        },
+        "cwd": {
           "type": "string"
         },
         "kind": {
@@ -4249,6 +4322,44 @@
       "required": [
         "provider",
         "sessionId"
+      ],
+      "type": "object"
+    },
+    "RestoreLaunchAckSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "restore.launch.ack",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "RestoreLaunchCancelSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "restore.launch.cancel",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId"
       ],
       "type": "object"
     },
@@ -5417,5 +5528,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket wire protocol — frozen contract",
-  "wsProtocolVersion": 7
+  "wsProtocolVersion": 8
 }

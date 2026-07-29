@@ -1300,6 +1300,7 @@ dependencies = [
  "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-recovery",
  "freshell-sessions",
  "freshell-terminal",
  "libc",
@@ -1341,6 +1342,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-recovery"
+version = "0.1.0"
+dependencies = [
+ "freshell-protocol",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "freshell-server"
 version = "0.1.0"
 dependencies = [
@@ -1353,6 +1363,7 @@ dependencies = [
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-recovery",
  "freshell-sessions",
  "freshell-terminal",
  "freshell-ws",
@@ -1434,6 +1445,7 @@ dependencies = [
  "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-recovery",
  "freshell-sessions",
  "freshell-terminal",
  "futures-util",

@@ -12,7 +12,7 @@ import {
   recordDismissal,
 } from '@/lib/recovery/dismissal'
 import { buildRecoveryPlan, countRecoverablePanes } from '@/lib/recovery/build-recovery-plan'
-import type { RecoveryInventory } from '@/lib/recovery/types'
+import type { LedgerOnlyEntry, RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { addTab } from '@/store/tabsSlice'
 import { restoreLayout } from '@/store/panesSlice'
@@ -22,6 +22,22 @@ import { OVERLAY_Z } from '@/components/ui/overlay'
 import { Button } from '@/components/ui/button'
 
 const HEADING_ID = 'recovery-offer-heading'
+
+/**
+ * Stable list/action identity for a ledger-only recovery owner.
+ *
+ * Preserve the historical key for global providers, while scoped providers
+ * include their canonical scope so equal provider/session pairs remain
+ * distinct.
+ */
+export function recoveryLedgerOnlyEntryKey(
+  entry: Pick<LedgerOnlyEntry, 'provider' | 'providerScope' | 'sessionId'>
+): string {
+  if (entry.providerScope === undefined) {
+    return `${entry.provider}:${entry.sessionId}`
+  }
+  return `scoped:${JSON.stringify([entry.provider, entry.sessionId, entry.providerScope])}`
+}
 
 // Focus pattern shared with src/components/ui/confirm-modal.tsx
 function getFocusable(container: HTMLElement): HTMLElement[] {
@@ -227,7 +243,7 @@ export function RecoveryOfferPanel(): JSX.Element | null {
             ))
           )}
           {inventory.ledgerOnly.map((entry) => (
-            <li key={`${entry.provider}:${entry.sessionId}`}>
+            <li key={recoveryLedgerOnlyEntryKey(entry)}>
               {entry.mode} session — {entry.cwd ?? 'unknown directory'}
             </li>
           ))}

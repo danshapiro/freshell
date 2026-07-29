@@ -3,12 +3,12 @@
 //!
 //! Additive protocol surface only: `pane.reconcile.request` (client→server),
 //! `pane.reconcile.result` (server→client), the `paneReconcileV1` capability on
-//! `hello` + its advertisement on `ready`, and the two reconcile error codes.
-//! `protocolVersion` stays 7 (§4.5 / fence "No protocolVersion bump").
+//! `hello` + its advertisement on `ready`, the v8 exact-recovery additions,
+//! and the two reconcile error codes.
 
 use freshell_protocol::{
     ClientMessage, ErrorCode, PaneReconcileResult, PaneVerdict, ReadyCapabilities,
-    ReconcileVerdict, ServerMessage, SessionLocator,
+    ReconcileVerdict, RestoreLaunchAck, RestoreLaunchCancel, ServerMessage, SessionLocator,
 };
 use serde_json::json;
 
@@ -30,6 +30,40 @@ fn hello_capabilities_parse_pane_reconcile_v1() {
         hello.capabilities.and_then(|c| c.pane_reconcile_v1),
         Some(true)
     );
+}
+
+#[test]
+fn exact_reconcile_capability_round_trips_when_offered_and_omits_when_absent() {
+    let offered = json!({
+        "type": "hello",
+        "protocolVersion": 8,
+        "token": "t",
+        "capabilities": { "paneReconcileExactV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(offered.clone()).expect("v8 hello parses");
+    let ClientMessage::Hello(hello) = &msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.pane_reconcile_exact_v1),
+        Some(true)
+    );
+    assert_eq!(serde_json::to_value(msg).unwrap(), offered);
+
+    let omitted = json!({
+        "type": "hello",
+        "protocolVersion": 7,
+        "token": "t",
+        "capabilities": { "paneReconcileV1": true }
+    });
+    let back = serde_json::to_value(
+        serde_json::from_value::<ClientMessage>(omitted.clone()).expect("legacy hello parses"),
+    )
+    .unwrap();
+    assert_eq!(back, omitted);
 }
 
 #[test]
@@ -75,10 +109,34 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
         capabilities: Some(ReadyCapabilities {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,
+            pane_reconcile_exact_v1: None,
         }),
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert_eq!(wire["capabilities"], json!({ "paneReconcileV1": true }));
+}
+
+#[test]
+fn ready_exact_capability_round_trips_and_can_be_omitted() {
+    let exact = freshell_protocol::Ready {
+        timestamp: "2026-07-22T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        capabilities: Some(ReadyCapabilities {
+            pane_reconcile_v1: Some(true),
+            pane_reconcile_fresh_agent_v1: Some(true),
+            pane_reconcile_exact_v1: Some(true),
+        }),
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(exact)).unwrap();
+    assert_eq!(
+        wire["capabilities"],
+        json!({
+            "paneReconcileV1": true,
+            "paneReconcileFreshAgentV1": true,
+            "paneReconcileExactV1": true,
+        })
+    );
 }
 
 // --- pane.reconcile.request --------------------------------------------------
@@ -93,6 +151,7 @@ fn reconcile_request_parses_full_pane_claims() {
                 "paneKey": "tab3:paneA",
                 "kind": "terminal",
                 "mode": "amplifier",
+                "cwd": "/persisted/project",
                 "createRequestId": "cr-1",
                 "terminalId": "term-1",
                 "serverInstanceId": "srv-old",
@@ -112,6 +171,7 @@ fn reconcile_request_parses_full_pane_claims() {
     assert_eq!(pane.pane_key, "tab3:paneA");
     assert_eq!(pane.kind.as_deref(), Some("terminal"));
     assert_eq!(pane.mode.as_deref(), Some("amplifier"));
+    assert_eq!(pane.cwd.as_deref(), Some("/persisted/project"));
     assert_eq!(pane.create_request_id.as_deref(), Some("cr-1"));
     assert_eq!(pane.terminal_id.as_deref(), Some("term-1"));
     assert_eq!(pane.server_instance_id.as_deref(), Some("srv-old"));
@@ -124,6 +184,77 @@ fn reconcile_request_parses_full_pane_claims() {
     );
     assert_eq!(pane.resume_session_id.as_deref(), Some("s-1"));
     assert_eq!(pane.status.as_deref(), Some("running"));
+}
+
+#[test]
+fn reconcile_cwd_is_additive_for_terminal_and_fresh_agent_entries() {
+    let wire = json!({
+        "type": "pane.reconcile.request",
+        "reconcileId": "rec-cwd",
+        "panes": [
+            {
+                "paneKey": "terminal",
+                "kind": "terminal",
+                "mode": "claude",
+                "createRequestId": "terminal-create",
+                "cwd": "/terminal/project"
+            },
+            {
+                "paneKey": "fresh",
+                "kind": "fresh-agent",
+                "mode": "opencode",
+                "createRequestId": "fresh-create",
+                "cwd": "/fresh/project"
+            },
+            {
+                "paneKey": "legacy-v7",
+                "kind": "terminal",
+                "mode": "shell",
+                "createRequestId": "legacy-create"
+            }
+        ]
+    });
+    let ClientMessage::PaneReconcileRequest(request) =
+        serde_json::from_value::<ClientMessage>(wire).expect("request parses")
+    else {
+        panic!("expected reconcile request");
+    };
+    assert_eq!(request.panes[0].cwd.as_deref(), Some("/terminal/project"));
+    assert_eq!(request.panes[1].cwd.as_deref(), Some("/fresh/project"));
+    assert_eq!(request.panes[2].cwd, None);
+}
+
+#[test]
+fn restore_launch_cancel_and_ack_round_trip() {
+    let cancel = ClientMessage::RestoreLaunchCancel(RestoreLaunchCancel {
+        request_id: "launch-1".to_string(),
+    });
+    let ack = ClientMessage::RestoreLaunchAck(RestoreLaunchAck {
+        request_id: "launch-1".to_string(),
+    });
+    assert_eq!(
+        serde_json::to_value(cancel).unwrap(),
+        json!({"type": "restore.launch.cancel", "requestId": "launch-1"})
+    );
+    assert_eq!(
+        serde_json::to_value(ack).unwrap(),
+        json!({"type": "restore.launch.ack", "requestId": "launch-1"})
+    );
+
+    assert!(matches!(
+        serde_json::from_value::<ClientMessage>(
+            json!({"type": "restore.launch.cancel", "requestId": "launch-2"})
+        )
+        .unwrap(),
+        ClientMessage::RestoreLaunchCancel(_)
+    ));
+    assert!(matches!(
+        serde_json::from_value::<ClientMessage>(
+            json!({"type": "restore.launch.ack", "requestId": "launch-2"})
+        )
+        .unwrap(),
+        ClientMessage::RestoreLaunchAck(_)
+    ));
 }
 
 #[test]

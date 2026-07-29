@@ -2,7 +2,7 @@
 //! server→client message families.
 //!
 //! Faithfully models the frozen contract (`port/contract/*.schema.json`,
-//! `WS_PROTOCOL_VERSION = 7`). Modeling conventions:
+//! `WS_PROTOCOL_VERSION = 8`, plus v7 compatibility). Modeling conventions:
 //!
 //! * All numeric wire fields are integers on the real wire, so they are typed
 //!   `i64` (a few version discriminants are `u32`). Using `f64` would corrupt
@@ -174,7 +174,7 @@ pub enum TerminalAttachPriority {
 // ---- session sub-record ----------------------------------------------------
 
 /// `{ provider, sessionId }` (SessionLocator) — used for every `*sessionRef`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionLocator {
     pub provider: String,

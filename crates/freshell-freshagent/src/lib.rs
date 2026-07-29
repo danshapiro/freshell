@@ -1623,6 +1623,8 @@ async fn send_keys(
                 .record_binding(identity_sink::FreshAgentBindingUpsert {
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
+                    provider_scope: None,
+                    materialization: freshell_recovery::MaterializationState::Observed,
                     mode: SESSION_TYPE.into(),
                     create_request_id: None,
                     resolves_pending: Some(pane.placeholder_id.clone()),

@@ -30,7 +30,7 @@ layer can be built field-by-field.
 | Field | Kind | Appears in (`type`) |
 |-------|------|---------------------|
 | `terminalId` | nanoid | terminal.create, terminal.attach, terminal.detach, terminal.input, terminal.resize, terminal.kill, terminal.codex.candidate.persisted, terminal.created, terminal.attach.ready, terminal.stream.changed, terminal.detached, terminal.exit, terminal.status, terminal.output, terminal.output.batch, terminal.output.gap, terminal.title.updated, terminal.session.associated, terminal.codex.durability.updated, terminal.input.blocked, terminal.meta.updated, terminal.turn.complete, terminal.idle, terminal.inventory, terminals.changed (`recoverableTerminalIds[]`), pane.reconcile.result (`verdicts[].terminalId`, `verdicts[].duplicate`), {codex,opencode,claude,amplifier}.activity.updated / .list.response |
-| `requestId` | correlation id | terminal.create, {codex,opencode,claude,amplifier}.activity.list(+.response), ui.screenshot.result, codingcli.create/.created, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), tabs.sync.snapshot, error |
+| `requestId` | correlation id | terminal.create, {codex,opencode,claude,amplifier}.activity.list(+.response), ui.screenshot.result, codingcli.create/.created, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), restore.launch.cancel/.ack, tabs.sync.snapshot, error |
 | `sessionId` | provider session id (`ses_…`, Claude UUID, opencode id) | codingcli.input/.kill/.created/.event/.exit/.stderr/.killed, freshAgent.* (attach/send/interrupt/compact/approval.respond/question.respond/kill/fork + created/.event/.materialized/.forked/.killed/.send.accepted), session.status, session.repair.activity, terminal.turn.complete, terminal metadata, pane.reconcile.result (`verdicts[].sessionRef.sessionId`), {codex,opencode,claude,amplifier} activity records |
 | `resumeSessionId` | references a prior session id | codingcli.create, freshAgent.create/.attach |
 | `streamId` | pty stream id | terminal.attach.ready, terminal.stream.changed, terminal.output, terminal.output.batch, terminal.output.gap |
@@ -85,7 +85,7 @@ layer can be built field-by-field.
 
 | Field | Appears in |
 |-------|------------|
-| `cwd` | terminal.create, codingcli.create, freshAgent.* , terminal.created, terminal metadata, terminal.inventory |
+| `cwd` | terminal.create, codingcli.create, freshAgent.*, pane.reconcile.request (`panes[].cwd`), terminal.created, terminal metadata, terminal.inventory |
 | `rolloutPath` | terminal.codex.candidate.persisted, terminal.codex.durability.updated (`durability.candidate.rolloutPath`) |
 | `checkoutRoot`, `repoRoot`, `displaySubdir` | terminal.meta.updated (`upsert[]`) |
 | `defaultCwd`, `allowedFilePaths[]` | settings.updated (`settings`) |
@@ -106,8 +106,13 @@ layer can be built field-by-field.
 ## Deterministic (do NOT normalize — must match exactly)
 
 These are part of the contract's fixed surface and any diff is a real divergence:
-`type` discriminants, `protocolVersion` / `wsProtocolVersion` (= 7), enum values
+`type` discriminants, `wsProtocolVersion` (= 8), `protocolVersion` (= 8 for the
+current handshake or exactly 7 for the explicit compatibility retry), enum values
 (`ErrorCode`, `phase`, `reason`, `status`, `barrier`, `intent`, `priority`,
 `sandbox`, `permissionMode`, `sessionType`, `provider`, …), `code`, booleans like
 `ok`/`success`/`accepted`/`enabled`, and fixed literals (`mimeType: 'image/png'`,
 `RESTORE_UNAVAILABLE`).
+
+Capability presence is also deterministic. In particular,
+`paneReconcileExactV1` remains absent from real server `ready` messages until
+the complete exact-restore runtime is installed; do not normalize that omission.

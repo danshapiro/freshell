@@ -481,6 +481,8 @@ mod tests {
                 .resolve_pending(&crate::pane_ledger::BindingWrite {
                     provider,
                     session_id,
+                    provider_scope: None,
+                    materialization: freshell_recovery::MaterializationState::Observed,
                     terminal_id,
                     mode: provider,
                     cwd: None,
@@ -513,6 +515,7 @@ mod tests {
             pane_key: format!("pk-{key}"),
             kind: Some("terminal".to_string()),
             mode: Some("claude".to_string()),
+            cwd: None,
             create_request_id: Some(key.to_string()),
             terminal_id: None,
             server_instance_id: None,

@@ -30,6 +30,8 @@ fn write(
     BindingWrite {
         provider: Box::leak(provider.to_string().into_boxed_str()),
         session_id: Box::leak(session_id.to_string().into_boxed_str()),
+        provider_scope: None,
+        materialization: MaterializationState::Observed,
         terminal_id: Box::leak(terminal_id.to_string().into_boxed_str()),
         mode: Box::leak(provider.to_string().into_boxed_str()),
         cwd: Some("/tmp/proj"),
@@ -95,18 +97,25 @@ fn disabled_ledger_is_a_silent_noop() {
 #[test]
 fn writes_are_atomic_sibling_temp_plus_rename() {
     // After a successful write no *.tmp-* residue remains, and the row file
-    // is a direct child of bindings/<provider>/.
+    // is a direct child of the bounded v2 owner directory.
     let root = temp_root("atomic");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_binding(&write("claude", "sess-a", "t1", 1_000))
         .unwrap();
-    let provider_dir = root.join("bindings").join("claude");
-    let entries: Vec<String> = std::fs::read_dir(&provider_dir)
+    let v2_dir = root.join("bindings").join("v2");
+    let entries: Vec<String> = std::fs::read_dir(&v2_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(entries, vec!["sess-a.json".to_string()]);
+    assert_eq!(
+        entries,
+        vec![owner_v2_filename(&RecoveryOwnerKey {
+            provider: "claude".to_string(),
+            session_id: "sess-a".to_string(),
+            provider_scope: None,
+        })]
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -170,13 +179,26 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         .record_binding(&write("claude", "s2", "t2", 2))
         .expect("disabled no-op");
     assert!(!loser.ever_bound("claude", "s2"), "loser is disabled");
+    assert_eq!(
+        loser.materialization_for_owner(&RecoveryOwnerKey {
+            provider: "claude".to_string(),
+            session_id: "s1".to_string(),
+            provider_scope: None,
+        }),
+        MaterializationState::Unknown,
+        "a lock-failed ledger cannot borrow the other process's observation"
+    );
     drop(holder);
 
     // Evidence probe 1: the on-disk truth the fossils always showed.
     let s1_on_disk = root
         .join("bindings")
-        .join("claude")
-        .join("s1.json")
+        .join("v2")
+        .join(owner_v2_filename(&RecoveryOwnerKey {
+            provider: "claude".to_string(),
+            session_id: "s1".to_string(),
+            provider_scope: None,
+        }))
         .exists();
     assert!(
         s1_on_disk,
@@ -456,11 +478,13 @@ fn corrupt_ledger_boot_quarantines_per_row_never_per_store() {
     ledger
         .record_binding(&write("claude", "sess-good", "t1", 1_000))
         .unwrap();
-    let bad = root.join("bindings").join("claude").join("sess-bad.json");
+    let provider_dir = root.join("bindings").join("claude");
+    std::fs::create_dir_all(&provider_dir).unwrap();
+    let bad = provider_dir.join("sess-bad.json");
     std::fs::write(&bad, b"{ not json").unwrap();
     // A future-versioned row is also quarantined (ledgerVersion gates
     // migration), never silently reinterpreted.
-    let vnext = root.join("bindings").join("claude").join("sess-vnext.json");
+    let vnext = provider_dir.join("sess-vnext.json");
     std::fs::write(
         &vnext,
         br#"{"ledgerVersion": 999, "someFutureShape": true}"#,
@@ -471,7 +495,6 @@ fn corrupt_ledger_boot_quarantines_per_row_never_per_store() {
     assert_eq!(report.quarantined.len(), 2);
     assert!(!bad.exists(), "corrupt row renamed aside");
     assert!(!vnext.exists(), "future-version row renamed aside");
-    let provider_dir = root.join("bindings").join("claude");
     let quarantined: Vec<String> = std::fs::read_dir(&provider_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -648,6 +671,8 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             ledger_version: LEDGER_VERSION,
             provider: "codex".into(),
             session_id: sid.into(),
+            provider_scope: None,
+            materialization: MaterializationState::Unknown,
             mode: "codex".into(),
             cwd: None,
             live_terminal_id: Some("t1".into()),
@@ -684,6 +709,64 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
     assert_eq!(old.superseded_by.as_ref().unwrap().session_id, "th-new");
     let new = ledger.load_binding("codex", "th-new").unwrap();
     assert_eq!(new.state, RowState::Bound);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn crash_mid_cross_scope_supersession_repairs_to_the_complete_winner_owner() {
+    let root = temp_root("two-bound-cross-scope");
+    let old_owner = RecoveryOwnerKey {
+        provider: "amplifier".into(),
+        session_id: "same-id".into(),
+        provider_scope: Some("/normalized/project-a".into()),
+    };
+    let new_owner = RecoveryOwnerKey {
+        provider: "amplifier".into(),
+        session_id: "same-id".into(),
+        provider_scope: Some("/normalized/project-b".into()),
+    };
+    for (owner, at) in [(&old_owner, 1_000i64), (&new_owner, 2_000i64)] {
+        let row = BindingRow {
+            ledger_version: LEDGER_VERSION,
+            provider: owner.provider.clone(),
+            session_id: owner.session_id.clone(),
+            provider_scope: owner.provider_scope.clone(),
+            materialization: MaterializationState::Observed,
+            mode: "amplifier".into(),
+            cwd: None,
+            live_terminal_id: Some("t1".into()),
+            create_request_id: None,
+            created_at: at,
+            updated_at: at,
+            last_observed_at: at,
+            state: RowState::Bound,
+            retired_reason: None,
+            superseded_by: None,
+            pane_kind: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+        };
+        write_row_atomic(&PaneLedger::owner_v2_path(&root, owner), &row).unwrap();
+    }
+
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let report = ledger.boot_scan(3_000, &never_absent);
+    assert_eq!(report.supersession_repairs.len(), 1);
+    let resolution = ledger
+        .lookup_by_owner(&old_owner)
+        .expect("the repaired cross-scope chain resolves");
+    assert!(resolution.corrected);
+    assert_eq!(resolution.row.owner_key(), new_owner);
+    drop(ledger);
+
+    let reloaded = PaneLedger::new(Some(root.clone()));
+    let resolution = reloaded
+        .lookup_by_owner(&old_owner)
+        .expect("the repaired complete owner survives reload");
+    assert!(resolution.corrected);
+    assert_eq!(resolution.row.owner_key(), new_owner);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -763,6 +846,8 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provider: "codex",
             session_id: "thread-1",
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             mode: "freshcodex",
             cwd: Some("/home/u/proj"),
             create_request_id: Some("req-1"),
@@ -792,6 +877,8 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
     let base = FreshAgentBindingWrite {
         provider: "opencode",
         session_id: "ses_abc",
+        provider_scope: None,
+        materialization: MaterializationState::Observed,
         mode: "freshopencode",
         cwd: Some("/w"),
         create_request_id: None,
@@ -831,6 +918,8 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
     let base = FreshAgentBindingWrite {
         provider: "codex",
         session_id: "old-thread",
+        provider_scope: None,
+        materialization: MaterializationState::Observed,
         mode: "freshcodex",
         cwd: Some("/w"),
         create_request_id: None,
@@ -886,6 +975,8 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
     let base = FreshAgentBindingWrite {
         provider: "codex",
         session_id: "thread-1",
+        provider_scope: None,
+        materialization: MaterializationState::Observed,
         mode: "freshcodex",
         cwd: None,
         create_request_id: Some("req-1"),
@@ -917,6 +1008,8 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provider: "codex",
             session_id: "new-thread",
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             mode: "freshcodex",
             cwd: None,
             create_request_id: None,

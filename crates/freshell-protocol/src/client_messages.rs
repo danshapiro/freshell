@@ -77,11 +77,15 @@ pub enum ClientMessage {
     FreshAgentFork(FreshAgentFork),
     #[serde(rename = "pane.reconcile.request")]
     PaneReconcileRequest(PaneReconcileRequest),
+    #[serde(rename = "restore.launch.cancel")]
+    RestoreLaunchCancel(RestoreLaunchCancel),
+    #[serde(rename = "restore.launch.ack")]
+    RestoreLaunchAck(RestoreLaunchAck),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -102,6 +106,8 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
     "opencode.activity.list",
     "pane.reconcile.request",
     "ping",
+    "restore.launch.ack",
+    "restore.launch.cancel",
     "terminal.attach",
     "terminal.codex.candidate.persisted",
     "terminal.create",
@@ -133,6 +139,10 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_exact_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,7 +164,7 @@ pub struct HelloSessions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hello {
-    /// const `7`.
+    /// Current `8`, or the explicit compatibility version `7`.
     pub protocol_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -381,6 +391,9 @@ pub struct ReconcilePane {
     /// `TerminalMode` string as persisted (`"shell"`, `"claude"`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Pane's persisted initial cwd. Added in protocol v8; absent on v7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// The pane's stable creation key — required by contract (§5.5); an entry
     /// without one is `invalid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,6 +423,18 @@ pub struct PaneReconcileRequest {
     /// Flat list — no tree, no tab structure. Cap: 200 entries (an over-cap
     /// request is answered with `error{RECONCILE_TOO_LARGE}`).
     pub panes: Vec<ReconcilePane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLaunchCancel {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLaunchAck {
+    pub request_id: String,
 }
 
 // --- codingcli.* ------------------------------------------------------------

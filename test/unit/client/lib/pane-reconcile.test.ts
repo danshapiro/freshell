@@ -178,6 +178,16 @@ describe('buildReconcileRequest', () => {
     expect(buildReconcileRequest(emptyState())).toBeNull()
   })
 
+  it('sends the terminal pane persisted initial cwd and omits cwd when absent', () => {
+    let panes = emptyPanesState()
+    panes = addTerminalPane(panes, 'tab1', 'with-cwd', { initialCwd: '/persisted/project' })
+    panes = addTerminalPane(panes, 'tab2', 'without-cwd')
+    const req = buildReconcileRequest(asRootState(panes))!
+
+    expect(req.panes[0].cwd).toBe('/persisted/project')
+    expect(req.panes[1]).not.toHaveProperty('cwd')
+  })
+
   it('caps at 200 panes with a console.error breadcrumb', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     let panes = emptyPanesState()

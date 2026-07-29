@@ -127,16 +127,33 @@ describe('ws tabs registry protocol', () => {
     delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })
 
-  it('uses protocol version 7 and rejects version 6 clients with reload-required mismatch', async () => {
-    expect(WS_PROTOCOL_VERSION).toBe(7)
+  it('uses current v8, accepts exactly v7/v8, and rejects v6/v9', async () => {
+    expect(WS_PROTOCOL_VERSION).toBe(8)
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: WS_PROTOCOL_VERSION - 1 }))
-    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH')
-    expect(error.message).toMatch(new RegExp(`expected protocol version ${WS_PROTOCOL_VERSION}`, 'i'))
-    expect(error.message).toMatch(/reload/i)
-    ws.close()
+
+    for (const version of [7, 8]) {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: 'tabs-sync-token',
+        protocolVersion: version,
+        capabilities: { paneReconcileExactV1: true },
+      }))
+      const ready = await waitForMessage(ws, (msg) => msg.type === 'ready')
+      expect(ready.capabilities?.paneReconcileExactV1).toBeUndefined()
+      ws.close()
+    }
+
+    for (const version of [6, 9]) {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: version }))
+      const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH')
+      expect(error.message).toMatch(/expected protocol version/i)
+      expect(error.message).toMatch(/reload/i)
+      ws.close()
+    }
   })
 
   it('accepts v7 push/query, returns same-device/devices, and rejects invalid retention', async () => {

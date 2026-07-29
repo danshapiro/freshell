@@ -767,6 +767,11 @@ pub struct ReadyCapabilities {
     /// omitted from the wire entirely otherwise (frozen-client inertness).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    /// Exact durable reconciliation. Only a complete ExactRestoreRuntime may
+    /// advertise this; Task 1 wire types can represent it while production
+    /// handshakes deliberately omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_exact_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

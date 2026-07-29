@@ -94,6 +94,7 @@ import {
   FreshAgentKillSchema,
   FreshAgentForkSchema,
   UiScreenshotResultSchema,
+  WS_LEGACY_PROTOCOL_VERSION,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
 import { LiveTerminalHandleSchema, sanitizeSessionRef, type RestoreError } from '../shared/session-contract.js'
@@ -1899,10 +1900,14 @@ export class WsHandler {
         }
       }
 
-      if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
+      if (
+        msg?.type === 'hello'
+        && msg?.protocolVersion !== WS_PROTOCOL_VERSION
+        && msg?.protocolVersion !== WS_LEGACY_PROTOCOL_VERSION
+      ) {
         this.sendError(ws, {
           code: 'PROTOCOL_MISMATCH',
-          message: `Expected protocol version ${WS_PROTOCOL_VERSION}. Please reload the page.`,
+          message: `Expected protocol version ${WS_PROTOCOL_VERSION} or ${WS_LEGACY_PROTOCOL_VERSION}. Please reload the page.`,
         })
         ws.close(CLOSE_CODES.PROTOCOL_MISMATCH, 'Protocol version mismatch')
         return

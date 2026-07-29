@@ -4,6 +4,7 @@
 //! snapshot store, the ledger, and the terminal registry, and consumes
 //! `select_foreign_recent_generation_ids` when composing each device's union.
 
+use freshell_recovery::RecoveryOwnerKey;
 use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -63,12 +64,18 @@ pub fn select_foreign_recent_generation_ids(
         .collect()
 }
 
-fn ref_key(provider: &str, session_id: &str) -> String {
-    format!("{provider}\u{1}{session_id}")
+fn owner_key(provider: &str, session_id: &str, provider_scope: Option<&str>) -> RecoveryOwnerKey {
+    RecoveryOwnerKey {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        provider_scope: (provider == "amplifier")
+            .then(|| provider_scope.map(str::to_string))
+            .flatten(),
+    }
 }
 
 enum Verdict {
-    Bound(String, String),
+    Bound(RecoveryOwnerKey),
     Closed,
     GcExpired,
     Unknown,
@@ -77,25 +84,20 @@ enum Verdict {
 /// Resolve a snapshot's sessionRef claim to its EFFECTIVE identity per D4 by
 /// walking the ledger's superseded chain (bounded — a cycle degrades to
 /// `GcExpired`, never loops).
-fn resolve(provider: &str, session_id: &str, by_key: &HashMap<String, &BindingRow>) -> Verdict {
-    let (mut p, mut s) = (provider.to_string(), session_id.to_string());
+fn resolve(initial: &RecoveryOwnerKey, by_key: &HashMap<RecoveryOwnerKey, &BindingRow>) -> Verdict {
+    let mut owner = initial.clone();
     for _ in 0..10 {
-        match by_key.get(&ref_key(&p, &s)) {
+        match by_key.get(&owner) {
             None => {
-                return if (p.as_str(), s.as_str()) == (provider, session_id) {
+                return if &owner == initial {
                     Verdict::Unknown
                 } else {
                     Verdict::GcExpired
                 }
             }
-            Some(row) if row_is_bound(row) => {
-                return Verdict::Bound(row_provider(row), row_session_id(row))
-            }
+            Some(row) if row_is_bound(row) => return Verdict::Bound(row_owner(row)),
             Some(row) => match row_successor(row) {
-                Some((np, ns)) => {
-                    p = np;
-                    s = ns;
-                }
+                Some(next) => owner = next,
                 None => {
                     return if row_reason_is_closed(row) {
                         Verdict::Closed
@@ -112,13 +114,10 @@ fn resolve(provider: &str, session_id: &str, by_key: &HashMap<String, &BindingRo
 pub fn build_inventory(
     device_unions: Vec<DeviceUnion>,
     bindings: Vec<BindingRow>,
-    live_session_keys: HashSet<(String, String)>,
+    live_session_keys: HashSet<RecoveryOwnerKey>,
 ) -> Value {
-    let by_key: HashMap<String, &BindingRow> = bindings
-        .iter()
-        .map(|r| (ref_key(&row_provider(r), &row_session_id(r)), r))
-        .collect();
-    let is_live = |p: &str, s: &str| live_session_keys.contains(&(p.to_string(), s.to_string()));
+    let by_key: HashMap<RecoveryOwnerKey, &BindingRow> =
+        bindings.iter().map(|r| (row_owner(r), r)).collect();
 
     // sort newest-first; primary device = greatest capturedAt with >=1 record
     let mut unions = device_unions;
@@ -127,7 +126,7 @@ pub fn build_inventory(
     // Pass 1 - resolve EVERY pane in EVERY union (not just the primary): effective refs
     // feed the cross-device ledgerOnly rule (A4) and the contentId substance (A5/A6);
     // the primary union's tabs feed `device`.
-    let mut referenced: HashSet<String> = HashSet::new();
+    let mut referenced: HashSet<RecoveryOwnerKey> = HashSet::new();
     let mut substance: Vec<String> = Vec::new();
     let mut tabs_per_union: Vec<Vec<Value>> = Vec::new();
     for d in &unions {
@@ -147,47 +146,39 @@ pub fn build_inventory(
                     .map(|pane| {
                         let payload = &pane["payload"];
                         let snap_ref = payload.get("sessionRef").filter(|v| !v.is_null()).cloned();
-                        let (ledger_state, eff_ref) = match &snap_ref {
-                            None => ("unknown", None),
+                        let (ledger_state, eff_owner, eff_ref) = match &snap_ref {
+                            None => ("unknown", None, None),
                             Some(r) => {
-                                let (p, s) = (
+                                let claimed_owner = owner_key(
                                     r["provider"].as_str().unwrap_or(""),
                                     r["sessionId"].as_str().unwrap_or(""),
+                                    None,
                                 );
-                                match resolve(p, s, &by_key) {
-                                    Verdict::Bound(bp, bs) => {
-                                        ("bound", Some(json!({"provider": bp, "sessionId": bs})))
+                                match resolve(&claimed_owner, &by_key) {
+                                    Verdict::Bound(owner) => {
+                                        let session_ref = owner_session_ref(&owner);
+                                        ("bound", Some(owner), Some(session_ref))
                                     }
-                                    Verdict::Closed => ("closed", None),
-                                    Verdict::GcExpired => ("gc_expired", Some(r.clone())),
-                                    Verdict::Unknown => ("unknown", Some(r.clone())),
+                                    Verdict::Closed => ("closed", None, None),
+                                    Verdict::GcExpired => {
+                                        ("gc_expired", Some(claimed_owner), Some(r.clone()))
+                                    }
+                                    Verdict::Unknown => {
+                                        ("unknown", Some(claimed_owner), Some(r.clone()))
+                                    }
                                 }
                             }
                         };
-                        let eff_str = eff_ref
+                        let eff_str = eff_owner
                             .as_ref()
-                            .map(|r| {
-                                format!(
-                                    "{}:{}",
-                                    r["provider"].as_str().unwrap_or(""),
-                                    r["sessionId"].as_str().unwrap_or("")
-                                )
-                            })
+                            .map(owner_substance)
                             .unwrap_or_else(|| "-".into());
-                        let live = eff_ref
+                        let live = eff_owner
                             .as_ref()
-                            .map(|r| {
-                                is_live(
-                                    r["provider"].as_str().unwrap_or(""),
-                                    r["sessionId"].as_str().unwrap_or(""),
-                                )
-                            })
+                            .map(|owner| live_session_keys.contains(owner))
                             .unwrap_or(false);
-                        if let Some(er) = &eff_ref {
-                            referenced.insert(ref_key(
-                                er["provider"].as_str().unwrap_or(""),
-                                er["sessionId"].as_str().unwrap_or(""),
-                            ));
+                        if let Some(owner) = eff_owner {
+                            referenced.insert(owner);
                         }
                         // TIMESTAMP-FREE substance line: capturedAt/updatedAt deliberately absent (D3)
                         substance.push(format!(
@@ -255,22 +246,26 @@ pub fn build_inventory(
         .iter()
         .filter(|r| row_is_bound(r))
         // vs effective refs across ALL unions (A4), not just the primary device
-        .filter(|r| !referenced.contains(&ref_key(&row_provider(r), &row_session_id(r))))
+        .filter(|r| !referenced.contains(&row_owner(r)))
         // live rows are excluded: sessions still running are never offered for resume (D7)
-        .filter(|r| !is_live(&row_provider(r), &row_session_id(r)))
+        .filter(|r| !live_session_keys.contains(&row_owner(r)))
         .map(|r| {
-            json!({"provider": row_provider(r), "sessionId": row_session_id(r),
-                   "mode": row_mode(r), "cwd": row_cwd(r)})
+            let mut entry = json!({"provider": row_provider(r), "sessionId": row_session_id(r),
+                                   "mode": row_mode(r), "cwd": row_cwd(r)});
+            if let Some(scope) = &row_owner(r).provider_scope {
+                entry["providerScope"] = Value::String(scope.clone());
+            }
+            entry
         })
         .collect();
 
     // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)
     substance.extend(ledger_only.iter().map(|e| {
-        format!(
-            "{}:{}",
+        owner_substance(&owner_key(
             e["provider"].as_str().unwrap_or(""),
-            e["sessionId"].as_str().unwrap_or("")
-        )
+            e["sessionId"].as_str().unwrap_or(""),
+            e.get("providerScope").and_then(Value::as_str),
+        ))
     }));
     substance.sort();
     let content_id = digest16(&substance);
@@ -292,6 +287,29 @@ fn row_session_id(r: &BindingRow) -> String {
     r.session_id.clone()
 }
 
+fn row_owner(r: &BindingRow) -> RecoveryOwnerKey {
+    owner_key(&r.provider, &r.session_id, r.provider_scope.as_deref())
+}
+
+fn owner_session_ref(owner: &RecoveryOwnerKey) -> Value {
+    json!({"provider": owner.provider, "sessionId": owner.session_id})
+}
+
+fn owner_substance(owner: &RecoveryOwnerKey) -> String {
+    let scope = owner
+        .provider_scope
+        .as_deref()
+        .map(|scope| format!("1{}:{scope}", scope.len()))
+        .unwrap_or_else(|| "0".to_string());
+    format!(
+        "{}:{}{}:{}{scope}",
+        owner.provider.len(),
+        owner.provider,
+        owner.session_id.len(),
+        owner.session_id,
+    )
+}
+
 fn row_is_bound(r: &BindingRow) -> bool {
     r.state == RowState::Bound
 }
@@ -300,10 +318,8 @@ fn row_reason_is_closed(r: &BindingRow) -> bool {
     r.retired_reason == Some(RetiredReason::Closed)
 }
 
-fn row_successor(r: &BindingRow) -> Option<(String, String)> {
-    r.superseded_by
-        .as_ref()
-        .map(|l| (l.provider.clone(), l.session_id.clone()))
+fn row_successor(r: &BindingRow) -> Option<RecoveryOwnerKey> {
+    r.superseded_by.clone()
 }
 
 fn row_mode(r: &BindingRow) -> String {
@@ -415,14 +431,14 @@ async fn inventory_handler(
             }
         }
     };
-    let live = live_session_keys(&state.registry, &state.identity);
-    Json(build_inventory(unions, state.ledger.list_bindings(), live)).into_response()
+    let bindings = state.ledger.list_bindings();
+    let live = live_session_keys(&state.registry, &state.identity, &bindings);
+    Json(build_inventory(unions, bindings, live)).into_response()
 }
 
-/// Read-only liveness join (D7): `(provider = mode, sessionId)` for every
-/// currently-Running terminal row — the same row fields the ladder's A13 guard
-/// reads (`terminal.rs:1690-1745`: mode + resume session id, status ==
-/// `TerminalRunStatus::Running`).
+/// Read-only liveness join (D7), keyed by the same complete recovery owner as
+/// the ledger. Global providers can fall back to `(mode, sessionId)`;
+/// Amplifier needs a ledger row carrying its provider-normalized scope.
 ///
 /// WAVE-B widening (B3 lane review): the D7 create-rung server guard checks
 /// BOTH stores — the identity-registry owner (probed Running) AND the
@@ -435,17 +451,40 @@ async fn inventory_handler(
 fn live_session_keys(
     registry: &freshell_terminal::TerminalRegistry,
     identity: &freshell_ws::identity::TerminalIdentityRegistry,
-) -> HashSet<(String, String)> {
-    let mut keys: HashSet<(String, String)> = registry
+    bindings: &[BindingRow],
+) -> HashSet<RecoveryOwnerKey> {
+    let running_rows = registry
         .directory()
         .into_iter()
         .filter(|row| row.status == freshell_protocol::TerminalRunStatus::Running)
-        .filter_map(|row| {
-            row.resume_session_id
-                .filter(|s| !s.is_empty())
-                .map(|sid| (row.mode, sid))
+        .collect::<Vec<_>>();
+    let running_terminal_ids = running_rows
+        .iter()
+        .map(|row| row.terminal_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut keys = bindings
+        .iter()
+        .filter(|row| row_is_bound(row))
+        .filter(|row| {
+            row.live_terminal_id
+                .as_deref()
+                .is_some_and(|terminal_id| running_terminal_ids.contains(terminal_id))
         })
-        .collect();
+        .map(row_owner)
+        .collect::<HashSet<_>>();
+
+    for row in running_rows {
+        let Some(session_id) = row
+            .resume_session_id
+            .filter(|session_id| !session_id.is_empty())
+        else {
+            continue;
+        };
+        if row.mode != "amplifier" {
+            keys.insert(owner_key(&row.mode, &session_id, None));
+        }
+    }
+
     // Identity-registry side of the join: live (non-retired) entries whose
     // owning terminal probes Running — mirrors the guard's
     // `identity_owner_live` arm.
@@ -459,8 +498,8 @@ fn live_session_keys(
         let owner_running = registry
             .probe(&entry.terminal_id)
             .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running);
-        if owner_running {
-            keys.insert((provider, session_id));
+        if owner_running && provider != "amplifier" {
+            keys.insert(owner_key(&provider, &session_id, None));
         }
     }
     keys

@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
+import {
+  WS_LEGACY_PROTOCOL_VERSION,
+  WS_PROTOCOL_VERSION,
+} from '../../../shared/ws-version.js'
+import { HelloSchema } from '../../../shared/ws-protocol.js'
 import {
   buildSchemaBundle,
   buildMessageInventory,
@@ -87,6 +91,27 @@ describe('ws contract freeze', () => {
       inventory.serverToClient.types.includes(type),
     )
     expect(overlap).toEqual([])
+  })
+
+  it('pins the deliberate v8 surface and its one frozen-v7 handshake lane', () => {
+    const inventory = buildMessageInventory()
+    expect(WS_PROTOCOL_VERSION).toBe(8)
+    expect(WS_LEGACY_PROTOCOL_VERSION).toBe(7)
+    expect(inventory.clientToServer.count).toBe(31)
+    expect(inventory.serverToClient.count).toBe(57)
+    expect(inventory.clientToServer.count + inventory.serverToClient.count).toBe(88)
+    expect(inventory.clientToServer.types).toContain('restore.launch.cancel')
+    expect(inventory.clientToServer.types).toContain('restore.launch.ack')
+
+    const hello = {
+      type: 'hello',
+      token: 'test-token',
+      capabilities: { paneReconcileExactV1: true },
+    }
+    expect(HelloSchema.safeParse({ ...hello, protocolVersion: 7 }).success).toBe(true)
+    expect(HelloSchema.safeParse({ ...hello, protocolVersion: 8 }).success).toBe(true)
+    expect(HelloSchema.safeParse({ ...hello, protocolVersion: 6 }).success).toBe(false)
+    expect(HelloSchema.safeParse({ ...hello, protocolVersion: 9 }).success).toBe(false)
   })
 
   it('message-type discriminants are unique and sorted within each direction', () => {

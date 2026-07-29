@@ -301,6 +301,7 @@ mod tests {
             pane_key: key.to_string(),
             kind: Some("fresh-agent".into()),
             mode: None,
+            cwd: None,
             create_request_id: None,
             terminal_id: None,
             server_instance_id: None,

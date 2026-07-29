@@ -5,12 +5,14 @@
 //!
 //! Two row types with different keys and different rights:
 //!
-//! * **Binding rows** — durable identity facts, keyed on the server-minted
-//!   `sessionRef` (provider, sessionId), with `terminalId` as a secondary
-//!   index. A binding row is *the resume-invocation record*: it stores
-//!   exactly what re-issuing the provider's resume needs (for terminal panes:
-//!   provider, sessionId, mode, cwd). Layout:
-//!   `bindings/<enc(provider)>/<enc(sessionId)>.json`.
+//! * **Binding rows** — durable identity facts, keyed by the complete
+//!   [`RecoveryOwnerKey`], with `terminalId` as a secondary index. A binding
+//!   row is *the resume-invocation record*: it stores exactly what re-issuing
+//!   the provider's resume needs (for terminal panes: provider, sessionId,
+//!   mode, cwd). New rows use bounded, collision-verified v2 names:
+//!   `bindings/v2/owner-v2-<sha256>.json`. Pre-v2
+//!   `bindings/<enc(provider)>/<enc(sessionId)>.json` rows remain read-only
+//!   compatibility aliases.
 //! * **Pending markers** — evidence that identity establishment was in
 //!   flight, keyed on `terminalId` (the only stable server-minted id that
 //!   exists pre-identity). NEVER promoted, never joined (G1): resolution
@@ -27,9 +29,11 @@
 //! is quarantined (renamed aside + logged), never silently dropped, and never
 //! causes healthy rows to be skipped.
 //!
-//! Write-failure policy: a ledger write failure never blocks the
-//! create/identity event, but it is never silent — see
-//! [`surface_write_failure`].
+//! Write-failure policy: legacy create/identity events surface degradation and
+//! proceed — see [`surface_write_failure`]. Exact recovery is stricter:
+//! persisting an Allocated→Observed transition is part of the positive proof,
+//! so [`PaneLedger::mark_materialized_many`] propagates failure for the caller
+//! to return retry.
 //!
 //! Read/scan policy (V1.md / A15): a write-through in-memory index, loaded
 //! ONCE at construction by a single directory scan, answers ALL steady-state
@@ -46,7 +50,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 use freshell_protocol::SessionLocator;
+use freshell_recovery::{MaterializationState, RecoveryOwnerKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[path = "pane_ledger_scan.rs"]
 mod pane_ledger_scan;
@@ -94,6 +100,14 @@ pub struct BindingRow {
     pub ledger_version: u32,
     pub provider: String,
     pub session_id: String,
+    /// Provider-normalized owner scope. Global providers leave this absent;
+    /// Amplifier exact recovery supplies the normalized project-store scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_scope: Option<String>,
+    /// Positive provider observation is monotonic. Rows written before this
+    /// field existed load as Unknown and never fabricate recovery authority.
+    #[serde(default)]
+    pub materialization: MaterializationState,
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -111,7 +125,7 @@ pub struct BindingRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retired_reason: Option<RetiredReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub superseded_by: Option<SessionLocator>,
+    pub superseded_by: Option<RecoveryOwnerKey>,
     /// "fresh-agent" for fresh-agent rows (P1.13); absent on terminal rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_kind: Option<String>,
@@ -126,6 +140,16 @@ pub struct BindingRow {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+}
+
+impl BindingRow {
+    fn owner_key(&self) -> RecoveryOwnerKey {
+        RecoveryOwnerKey {
+            provider: self.provider.clone(),
+            session_id: self.session_id.clone(),
+            provider_scope: self.provider_scope.clone(),
+        }
+    }
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
@@ -144,6 +168,8 @@ pub struct PendingMarker {
 pub struct BindingWrite<'a> {
     pub provider: &'a str,
     pub session_id: &'a str,
+    pub provider_scope: Option<&'a str>,
+    pub materialization: MaterializationState,
     pub terminal_id: &'a str,
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
@@ -158,6 +184,8 @@ pub struct BindingWrite<'a> {
 pub struct FreshAgentBindingWrite<'a> {
     pub provider: &'a str,
     pub session_id: &'a str,
+    pub provider_scope: Option<&'a str>,
+    pub materialization: MaterializationState,
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
     pub create_request_id: Option<&'a str>,
@@ -187,8 +215,15 @@ pub struct Resolution {
 /// them loudly.
 #[derive(Default)]
 struct LedgerIndex {
-    /// (provider, session_id) -> row. Bound AND retired (tombstones stay).
-    bindings: std::collections::HashMap<(String, String), BindingRow>,
+    /// Complete provider owner -> effective row. Bound AND retired
+    /// (tombstones stay). A v2 row replaces an equal legacy key in memory,
+    /// but the legacy file remains untouched on disk.
+    bindings: std::collections::HashMap<RecoveryOwnerKey, BindingRow>,
+    /// Read-only compatibility rows shadowed by a v2 successor. Retained so
+    /// deleting a future v2 tombstone cannot mutate or lose the old file.
+    legacy_bindings: std::collections::HashMap<RecoveryOwnerKey, BindingRow>,
+    /// Owners whose effective row came from the verified v2 digest path.
+    v2_owners: std::collections::HashSet<RecoveryOwnerKey>,
     /// terminal_id -> marker.
     pending: std::collections::HashMap<String, PendingMarker>,
 }
@@ -208,6 +243,35 @@ pub struct PaneLedger {
     /// Rows quarantined by the boot scan, retained for API surfacing.
     #[allow(dead_code)] // populated + read by the boot scan (Task 4)
     quarantined: RwLock<Vec<QuarantinedRow>>,
+}
+
+const OWNER_V2_DIGEST_DOMAIN: &[u8] = b"freshell-recovery-owner-v2\0";
+
+fn digest_frame(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+/// Stable, bounded filename for a complete canonical recovery owner.
+///
+/// The digest is domain-separated and every variable-length component is
+/// length-framed. The optional scope also carries an explicit presence byte,
+/// so no concatenation or None/empty ambiguity can collide structurally.
+pub fn owner_v2_filename(owner: &RecoveryOwnerKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(OWNER_V2_DIGEST_DOMAIN);
+    digest_frame(&mut hasher, owner.provider.as_bytes());
+    digest_frame(&mut hasher, owner.session_id.as_bytes());
+    match &owner.provider_scope {
+        Some(scope) => {
+            hasher.update([1]);
+            digest_frame(&mut hasher, scope.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("owner-v2-{hex}.json")
 }
 
 impl PaneLedger {
@@ -299,14 +363,16 @@ impl PaneLedger {
         root.join("bindings")
     }
 
+    fn v2_bindings_dir(root: &Path) -> PathBuf {
+        Self::bindings_dir(root).join("v2")
+    }
+
     fn pending_dir(root: &Path) -> PathBuf {
         root.join("pending")
     }
 
-    fn binding_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
-        Self::bindings_dir(root)
-            .join(encode_segment(provider))
-            .join(format!("{}.json", encode_segment(session_id)))
+    fn owner_v2_path(root: &Path, owner: &RecoveryOwnerKey) -> PathBuf {
+        Self::v2_bindings_dir(root).join(owner_v2_filename(owner))
     }
 
     /// The ONE directory scan — construction-time only (V1.md).
@@ -314,6 +380,9 @@ impl PaneLedger {
         let mut index = LedgerIndex::default();
         if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
             for provider in providers.flatten() {
+                if provider.file_name() == "v2" {
+                    continue;
+                }
                 let Ok(files) = std::fs::read_dir(provider.path()) else {
                     continue;
                 };
@@ -322,15 +391,82 @@ impl PaneLedger {
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue; // *.tmp-* and *.quarantined-* residue
                     }
-                    if let Ok(row) = load_row::<BindingRow>(&path) {
+                    if let Ok(mut row) = load_row::<BindingRow>(&path) {
                         if row.ledger_version == LEDGER_VERSION {
-                            index
-                                .bindings
-                                .insert((row.provider.clone(), row.session_id.clone()), row);
+                            // A legacy Amplifier row has no trustworthy
+                            // provider-normalized scope, even if a manually
+                            // edited JSON file claims one. It remains a
+                            // read-only, Unknown compatibility alias.
+                            let legacy_amplifier = row.provider == "amplifier";
+                            row.provider_scope = None;
+                            if let Some(successor) = &mut row.superseded_by {
+                                successor.provider_scope = None;
+                            }
+                            if legacy_amplifier {
+                                row.materialization = MaterializationState::Unknown;
+                            }
+                            // Global providers never had a meaningful scope
+                            // in the legacy path. Canonicalizing it away above
+                            // cannot manufacture a second owner.
+                            if Self::validate_row_owner_scopes(&row).is_err() {
+                                continue;
+                            }
+                            let owner = row.owner_key();
+                            index.legacy_bindings.insert(owner.clone(), row.clone());
+                            index.bindings.entry(owner).or_insert(row);
                         }
                     }
                 }
             }
+        }
+        if let Ok(files) = std::fs::read_dir(Self::v2_bindings_dir(root)) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(mut row) = load_row::<BindingRow>(&path) else {
+                    continue;
+                };
+                if row.ledger_version != LEDGER_VERSION {
+                    continue;
+                }
+                let owner = row.owner_key();
+                let expected_name = owner_v2_filename(&owner);
+                if path.file_name().and_then(|name| name.to_str()) != Some(&expected_name) {
+                    continue;
+                }
+                if Self::validate_row_owner_scopes(&row).is_err() {
+                    tracing::warn!(
+                        target: "freshell_ws::pane_ledger",
+                        path = %path.display(),
+                        provider = %row.provider,
+                        session_id = %row.session_id,
+                        "pane_ledger_noncanonical_owner_scope_ignored: v2 row cannot enter the effective index"
+                    );
+                    continue;
+                }
+                if row.provider == "amplifier" && row.provider_scope.is_none() {
+                    tracing::warn!(
+                        target: "freshell_ws::pane_ledger",
+                        path = %path.display(),
+                        session_id = %row.session_id,
+                        "pane_ledger_unscoped_amplifier_v2_degraded: v2 row cannot grant project-scoped authority"
+                    );
+                    row.materialization = MaterializationState::Unknown;
+                }
+                index.bindings.insert(owner.clone(), row);
+                index.v2_owners.insert(owner);
+            }
+        }
+        let scoped_amplifier_owners = index
+            .bindings
+            .keys()
+            .filter(|owner| owner.provider == "amplifier" && owner.provider_scope.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        for owner in scoped_amplifier_owners {
+            Self::suppress_unscoped_amplifier_alias(&mut index, &owner);
         }
         if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
             for file in files.flatten() {
@@ -354,8 +490,113 @@ impl PaneLedger {
         self.index.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn write_owner(
+        provider: &str,
+        session_id: &str,
+        provider_scope: Option<&str>,
+    ) -> RecoveryOwnerKey {
+        RecoveryOwnerKey {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            provider_scope: provider_scope.map(str::to_string),
+        }
+    }
+
+    fn owner_scope_is_ledger_compatible(owner: &RecoveryOwnerKey) -> bool {
+        owner.has_canonical_provider_scope()
+            || (owner.provider == "amplifier" && owner.provider_scope.is_none())
+    }
+
+    fn validate_owner_scope(owner: &RecoveryOwnerKey) -> std::io::Result<()> {
+        if Self::owner_scope_is_ledger_compatible(owner) {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "noncanonical pane ledger provider scope for {}/{}",
+                owner.provider, owner.session_id
+            ),
+        ))
+    }
+
+    fn successor_scope_is_ledger_compatible(row: &BindingRow) -> bool {
+        row.superseded_by.as_ref().is_none_or(|successor| {
+            successor.has_canonical_provider_scope()
+                || (row.provider == "amplifier"
+                    && row.provider_scope.is_none()
+                    && successor.provider == "amplifier"
+                    && successor.provider_scope.is_none())
+        })
+    }
+
+    fn validate_row_owner_scopes(row: &BindingRow) -> std::io::Result<()> {
+        Self::validate_owner_scope(&row.owner_key())?;
+        if Self::successor_scope_is_ledger_compatible(row) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "noncanonical pane ledger successor scope for {}/{}",
+                    row.provider, row.session_id
+                ),
+            ))
+        }
+    }
+
+    fn unscoped_amplifier_alias(owner: &RecoveryOwnerKey) -> Option<RecoveryOwnerKey> {
+        (owner.provider == "amplifier" && owner.provider_scope.is_some())
+            .then(|| Self::write_owner(&owner.provider, &owner.session_id, None))
+    }
+
+    fn suppress_unscoped_amplifier_alias(index: &mut LedgerIndex, owner: &RecoveryOwnerKey) {
+        if let Some(alias) = Self::unscoped_amplifier_alias(owner) {
+            index.bindings.remove(&alias);
+        }
+    }
+
+    fn has_scoped_amplifier_successor(index: &LedgerIndex, owner: &RecoveryOwnerKey) -> bool {
+        owner.provider == "amplifier"
+            && owner.provider_scope.is_none()
+            && index.bindings.keys().any(|candidate| {
+                candidate.provider == owner.provider
+                    && candidate.session_id == owner.session_id
+                    && candidate.provider_scope.is_some()
+            })
+    }
+
+    fn has_shadowed_legacy_alias(index: &LedgerIndex, owner: &RecoveryOwnerKey) -> bool {
+        index.legacy_bindings.contains_key(owner)
+            || Self::unscoped_amplifier_alias(owner).is_some_and(|alias| {
+                index.legacy_bindings.contains_key(&alias) || index.v2_owners.contains(&alias)
+            })
+    }
+
+    fn advanced_materialization(
+        owner: &RecoveryOwnerKey,
+        existing: Option<&BindingRow>,
+        requested: MaterializationState,
+    ) -> MaterializationState {
+        // Until an exact provider resolves a project scope, an unscoped
+        // Amplifier identity is only a compatibility alias. It cannot become
+        // allocation or observation authority.
+        if owner.provider == "amplifier" && owner.provider_scope.is_none() {
+            return MaterializationState::Unknown;
+        }
+        existing
+            .map(|row| row.materialization)
+            .unwrap_or_default()
+            .advance(requested)
+    }
+
     /// Record (or refresh) a `bound` row for this identity event.
     pub fn record_binding(&self, w: &BindingWrite<'_>) -> std::io::Result<()> {
+        Self::validate_owner_scope(&Self::write_owner(
+            w.provider,
+            w.session_id,
+            w.provider_scope,
+        ))?;
         let Some(root) = &self.root else {
             return Ok(());
         };
@@ -374,19 +615,31 @@ impl PaneLedger {
         // new `bound` row FIRST, then retire the old. A crash between the
         // two leaves two bound rows; the boot-scan repair (Task 4) closes
         // that window. Detection is a memory scan over the index (V1.md).
+        let owner = Self::write_owner(w.provider, w.session_id, w.provider_scope);
+        if Self::has_scoped_amplifier_successor(index, &owner) {
+            tracing::warn!(
+                target: "freshell_ws::pane_ledger",
+                terminal_id = %w.terminal_id,
+                session_id = %w.session_id,
+                "pane_ledger_unscoped_amplifier_write_ignored: scoped owner already exists"
+            );
+            return Ok(());
+        }
         let previous = index
             .bindings
             .values()
             .find(|r| {
                 r.state == RowState::Bound
                     && r.live_terminal_id.as_deref() == Some(w.terminal_id)
-                    && (r.provider != w.provider || r.session_id != w.session_id)
+                    && r.owner_key() != owner
+                    && Self::unscoped_amplifier_alias(&owner)
+                        .is_none_or(|alias| r.owner_key() != alias)
             })
             .cloned();
 
-        let key = (w.provider.to_string(), w.session_id.to_string());
-        let existing = index.bindings.get(&key);
+        let existing = index.bindings.get(&owner);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        let materialization = Self::advanced_materialization(&owner, existing, w.materialization);
         if existing.is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired)) {
             tracing::info!(
                 target: "freshell_ws::pane_ledger",
@@ -399,6 +652,8 @@ impl PaneLedger {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
             session_id: w.session_id.to_string(),
+            provider_scope: owner.provider_scope.clone(),
+            materialization,
             mode: w.mode.to_string(),
             cwd: w.cwd.map(str::to_string),
             live_terminal_id: Some(w.terminal_id.to_string()),
@@ -422,10 +677,7 @@ impl PaneLedger {
                 root,
                 index,
                 old,
-                SessionLocator {
-                    provider: w.provider.to_string(),
-                    session_id: w.session_id.to_string(),
-                },
+                owner.clone(),
                 w.now_ms,
                 Some(w.terminal_id),
             )?;
@@ -437,7 +689,7 @@ impl PaneLedger {
     /// (G3 retire-never-defend; the ONE supersession block shared by
     /// [`Self::record_binding_locked`] and [`Self::record_fresh_agent_binding`]
     /// so the two sites can never drift): state→Retired,
-    /// retired_reason→Superseded, superseded_by→the new session's locator,
+    /// retired_reason→Superseded, superseded_by→the complete new owner,
     /// updated_at→now, one info log, then persist. Callers write the new bound
     /// row FIRST and call this AFTER (order pinned). `terminal_id` is `Some`
     /// for terminal-pane rows (logged) and `None` for fresh-agent rows (which
@@ -447,7 +699,7 @@ impl PaneLedger {
         root: &Path,
         index: &mut LedgerIndex,
         mut old: BindingRow,
-        superseded_by: SessionLocator,
+        superseded_by: RecoveryOwnerKey,
         now_ms: i64,
         terminal_id: Option<&str>,
     ) -> std::io::Result<()> {
@@ -484,14 +736,28 @@ impl PaneLedger {
         &self,
         w: &FreshAgentBindingWrite<'_>,
     ) -> std::io::Result<()> {
+        Self::validate_owner_scope(&Self::write_owner(
+            w.provider,
+            w.session_id,
+            w.provider_scope,
+        ))?;
         let Some(root) = &self.root else {
             return Ok(());
         };
         let mut index = self.guard();
 
-        let key = (w.provider.to_string(), w.session_id.to_string());
-        let existing = index.bindings.get(&key);
+        let owner = Self::write_owner(w.provider, w.session_id, w.provider_scope);
+        if Self::has_scoped_amplifier_successor(&index, &owner) {
+            tracing::warn!(
+                target: "freshell_ws::pane_ledger",
+                session_id = %w.session_id,
+                "pane_ledger_unscoped_amplifier_write_ignored: scoped fresh-agent owner already exists"
+            );
+            return Ok(());
+        }
+        let existing = index.bindings.get(&owner);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        let materialization = Self::advanced_materialization(&owner, existing, w.materialization);
         // Advisory field: keep the existing row's value when the new write
         // has none (latest-observed semantics, D4).
         let create_request_id = w
@@ -502,6 +768,8 @@ impl PaneLedger {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
             session_id: w.session_id.to_string(),
+            provider_scope: owner.provider_scope.clone(),
+            materialization,
             mode: w.mode.to_string(),
             cwd: w.cwd.map(str::to_string),
             live_terminal_id: None, // fresh-agent panes have no terminal
@@ -522,16 +790,13 @@ impl PaneLedger {
 
         if let Some(old_id) = w.supersedes {
             if old_id != w.session_id {
-                let old_key = (w.provider.to_string(), old_id.to_string());
+                let old_key = Self::write_owner(w.provider, old_id, w.provider_scope);
                 if let Some(old) = index.bindings.get(&old_key).cloned() {
                     self.retire_and_link_locked(
                         root,
                         &mut index,
                         old,
-                        SessionLocator {
-                            provider: w.provider.to_string(),
-                            session_id: w.session_id.to_string(),
-                        },
+                        owner.clone(),
                         w.now_ms,
                         None, // fresh-agent rows own no terminal
                     )?;
@@ -550,11 +815,53 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         row: &BindingRow,
     ) -> std::io::Result<()> {
-        let dest = Self::binding_path(root, &row.provider, &row.session_id);
+        Self::validate_row_owner_scopes(row)?;
+        let owner = row.owner_key();
+        let dest = Self::owner_v2_path(root, &owner);
+        if dest.exists() {
+            let stored = load_row::<BindingRow>(&dest).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cannot verify pane ledger owner at {}: {error}",
+                        dest.display()
+                    ),
+                )
+            })?;
+            if stored.ledger_version != LEDGER_VERSION || stored.owner_key() != owner {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "pane ledger owner digest collision/corruption at {}",
+                        dest.display()
+                    ),
+                ));
+            }
+            Self::validate_row_owner_scopes(&stored).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cannot verify pane ledger row at {}: {error}",
+                        dest.display()
+                    ),
+                )
+            })?;
+        }
         write_row_atomic(&dest, row)?;
-        index
-            .bindings
-            .insert((row.provider.clone(), row.session_id.clone()), row.clone());
+        index.bindings.insert(owner.clone(), row.clone());
+        index.v2_owners.insert(owner.clone());
+        if owner.provider_scope.is_some() {
+            Self::suppress_unscoped_amplifier_alias(index, &owner);
+        } else if owner.provider == "amplifier" {
+            let has_scoped_successor = index.bindings.keys().any(|candidate| {
+                candidate.provider == owner.provider
+                    && candidate.session_id == owner.session_id
+                    && candidate.provider_scope.is_some()
+            });
+            if has_scoped_successor {
+                index.bindings.remove(&owner);
+            }
+        }
         Ok(())
     }
 
@@ -566,15 +873,21 @@ impl PaneLedger {
         session_id: &str,
         now_ms: i64,
     ) -> std::io::Result<()> {
+        self.retire_closed_owner(&Self::write_owner(provider, session_id, None), now_ms)
+    }
+
+    /// Scope-aware close transition for exact recovery owners.
+    pub fn retire_closed_owner(
+        &self,
+        owner: &RecoveryOwnerKey,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        Self::validate_owner_scope(owner)?;
         let Some(root) = &self.root else {
             return Ok(());
         };
         let mut index = self.guard();
-        let Some(mut row) = index
-            .bindings
-            .get(&(provider.to_string(), session_id.to_string()))
-            .cloned()
-        else {
+        let Some(mut row) = index.bindings.get(owner).cloned() else {
             return Ok(());
         };
         if row.state != RowState::Bound {
@@ -589,11 +902,99 @@ impl PaneLedger {
     /// Raw single-row read from the index (no chain following — that is
     /// `lookup_by_session`, Task 2). Memory-only (V1.md read policy).
     pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow> {
+        self.load_binding_for_owner(&Self::write_owner(provider, session_id, None))
+    }
+
+    /// Exact owner read. In particular, a scoped Amplifier request never
+    /// falls back to an unscoped compatibility alias.
+    pub fn load_binding_for_owner(&self, owner: &RecoveryOwnerKey) -> Option<BindingRow> {
         self.root.as_ref()?;
-        self.guard()
-            .bindings
-            .get(&(provider.to_string(), session_id.to_string()))
-            .cloned()
+        self.guard().bindings.get(owner).cloned()
+    }
+
+    /// One-lock materialization lookup for a complete reconcile request.
+    /// Results preserve request order and duplicate cardinality.
+    pub fn materializations_for_owners(
+        &self,
+        owners: &[RecoveryOwnerKey],
+    ) -> Vec<MaterializationState> {
+        if self.root.is_none() {
+            return vec![MaterializationState::Unknown; owners.len()];
+        }
+        let index = self.guard();
+        owners
+            .iter()
+            .map(|owner| {
+                if owner.provider == "amplifier" && owner.provider_scope.is_none() {
+                    return MaterializationState::Unknown;
+                }
+                index
+                    .bindings
+                    .get(owner)
+                    .map(|row| row.materialization)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    pub fn materialization_for_owner(&self, owner: &RecoveryOwnerKey) -> MaterializationState {
+        self.materializations_for_owners(std::slice::from_ref(owner))[0]
+    }
+
+    /// Persist provider-owned positive evidence. Missing rows fail rather
+    /// than manufacturing incomplete resume metadata.
+    pub fn mark_materialized(&self, owner: &RecoveryOwnerKey, now_ms: i64) -> std::io::Result<()> {
+        self.mark_materialized_many(std::slice::from_ref(owner), now_ms)
+    }
+
+    /// One serialized ledger transaction for all positive proofs in a
+    /// reconcile batch. Each row retains the store's atomic file discipline;
+    /// a partial I/O failure is safe to retry because Observed is monotonic.
+    pub fn mark_materialized_many(
+        &self,
+        owners: &[RecoveryOwnerKey],
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        if owners.is_empty() {
+            return Ok(());
+        }
+        let Some(root) = &self.root else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "pane ledger is disabled; materialization cannot be persisted",
+            ));
+        };
+        let mut index = self.guard();
+        let mut seen = std::collections::HashSet::new();
+        for owner in owners {
+            if !seen.insert(owner) {
+                continue;
+            }
+            Self::validate_owner_scope(owner)?;
+            let Some(mut row) = index.bindings.get(owner).cloned() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "no pane ledger row for recovery owner {}/{}",
+                        owner.provider, owner.session_id
+                    ),
+                ));
+            };
+            if owner.provider == "amplifier" && owner.provider_scope.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unscoped Amplifier aliases cannot be marked materialized",
+                ));
+            }
+            if row.materialization == MaterializationState::Observed {
+                continue;
+            }
+            row.materialization = MaterializationState::Observed;
+            row.updated_at = now_ms;
+            row.last_observed_at = now_ms;
+            self.write_binding(root, &mut index, &row)?;
+        }
+        Ok(())
     }
 
     /// Follow the `supersededBy` chain from a claimed ref to its terminus.
@@ -601,12 +1002,14 @@ impl PaneLedger {
     /// and retires its predecessor in the same act) — the hop cap is a
     /// corruption backstop, loud when hit.
     pub fn lookup_by_session(&self, provider: &str, session_id: &str) -> Option<Resolution> {
+        self.lookup_by_owner(&Self::write_owner(provider, session_id, None))
+    }
+
+    /// Scope-aware supersession-chain lookup for exact recovery owners.
+    pub fn lookup_by_owner(&self, initial_owner: &RecoveryOwnerKey) -> Option<Resolution> {
         self.root.as_ref()?;
         let index = self.guard(); // memory-only chain walk (V1.md read policy)
-        let mut row = index
-            .bindings
-            .get(&(provider.to_string(), session_id.to_string()))
-            .cloned()?;
+        let mut row = index.bindings.get(initial_owner).cloned()?;
         let mut corrected = false;
         let mut hops = 0u32;
         while row.state == RowState::Retired {
@@ -617,17 +1020,13 @@ impl PaneLedger {
             if hops > 32 {
                 tracing::error!(
                     target: "freshell_ws::pane_ledger",
-                    provider = %provider,
-                    session_id = %session_id,
+                    provider = %initial_owner.provider,
+                    session_id = %initial_owner.session_id,
                     "pane_ledger_chain_overflow: supersession chain exceeded 32 hops (corruption?)"
                 );
                 return None;
             }
-            let Some(next_row) = index
-                .bindings
-                .get(&(next.provider.clone(), next.session_id.clone()))
-                .cloned()
-            else {
+            let Some(next_row) = index.bindings.get(&next).cloned() else {
                 break;
             };
             row = next_row;
@@ -640,12 +1039,15 @@ impl PaneLedger {
     /// retired, tombstones included. This is the ledger-backed
     /// `ever_observed` input (spec §4.2 reads). Memory-only.
     pub fn ever_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ever_bound_owner(&Self::write_owner(provider, session_id, None))
+    }
+
+    /// Scope-aware durable-observation lookup for exact recovery owners.
+    pub fn ever_bound_owner(&self, owner: &RecoveryOwnerKey) -> bool {
         if self.root.is_none() {
             return false;
         }
-        self.guard()
-            .bindings
-            .contains_key(&(provider.to_string(), session_id.to_string()))
+        self.guard().bindings.contains_key(owner)
     }
 
     /// All indexed binding rows (bound AND retired). Memory-only.
@@ -866,6 +1268,8 @@ pub(crate) async fn ledger_resolve_identity(
         ledger.resolve_pending(&BindingWrite {
             provider: &provider_owned,
             session_id: &session_id_owned,
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             terminal_id: &terminal_id_owned,
             mode: &provider_owned,
             cwd: cwd_owned.as_deref(),

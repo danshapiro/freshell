@@ -2,7 +2,7 @@
 //!
 //! The Rust constant must equal the version pinned in every committed contract
 //! artifact and in `shared/ws-version.ts`. This is the compile-time half of the
-//! T0 gate ("`WS_PROTOCOL_VERSION == 7`").
+//! T0 gate ("`WS_PROTOCOL_VERSION == 8`").
 
 use std::path::PathBuf;
 
@@ -22,8 +22,8 @@ fn read_json(rel: &str) -> serde_json::Value {
 }
 
 #[test]
-fn rust_const_is_seven() {
-    assert_eq!(WS_PROTOCOL_VERSION, 7);
+fn rust_const_is_eight() {
+    assert_eq!(WS_PROTOCOL_VERSION, 8);
 }
 
 #[test]
@@ -43,12 +43,29 @@ fn matches_inbound_schema_bundle() {
         schema["wsProtocolVersion"].as_u64(),
         Some(WS_PROTOCOL_VERSION as u64)
     );
-    // The frozen Hello schema pins the on-wire `protocolVersion` const; it must
-    // match the Rust const the server will emit/accept.
+    // v8 is current and v7 is the one explicit compatibility handshake.
+    let version_schema = &schema["schemas"]["HelloSchema"]["properties"]["protocolVersion"];
+    let mut accepted = std::collections::BTreeSet::new();
+    fn collect_consts(node: &serde_json::Value, accepted: &mut std::collections::BTreeSet<u64>) {
+        if let Some(value) = node.get("const").and_then(|value| value.as_u64()) {
+            accepted.insert(value);
+        }
+        if let Some(values) = node.get("enum").and_then(|value| value.as_array()) {
+            accepted.extend(values.iter().filter_map(|value| value.as_u64()));
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(branches) = node.get(keyword).and_then(|value| value.as_array()) {
+                for branch in branches {
+                    collect_consts(branch, accepted);
+                }
+            }
+        }
+    }
+    collect_consts(version_schema, &mut accepted);
     assert_eq!(
-        schema["schemas"]["HelloSchema"]["properties"]["protocolVersion"]["const"].as_u64(),
-        Some(WS_PROTOCOL_VERSION as u64),
-        "HelloSchema.protocolVersion const must equal the Rust const"
+        accepted,
+        std::collections::BTreeSet::from([7, 8]),
+        "HelloSchema accepts exactly current v8 and compatibility v7"
     );
 }
 
@@ -64,7 +81,7 @@ fn matches_outbound_schema_bundle() {
 #[test]
 fn matches_shared_ws_version_ts() {
     // `shared/ws-version.ts` is the TypeScript authoring source:
-    //   export const WS_PROTOCOL_VERSION = 7 as const
+    //   export const WS_PROTOCOL_VERSION = 8 as const
     let text = std::fs::read_to_string(repo_path("shared/ws-version.ts"))
         .expect("read shared/ws-version.ts");
     let after_eq = text

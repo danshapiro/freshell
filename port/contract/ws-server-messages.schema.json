@@ -1380,6 +1380,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "paneReconcileExactV1": {
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "type": "boolean"
             },
@@ -3178,5 +3181,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell server→client message shapes — frozen contract",
-  "wsProtocolVersion": 7
+  "wsProtocolVersion": 8
 }

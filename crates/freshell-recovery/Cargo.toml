@@ -1,0 +1,12 @@
+[package]
+name = "freshell-recovery"
+version = "0.1.0"
+description = "I/O-free durable recovery contracts shared by Freshell transports and provider adapters."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+freshell-protocol = { path = "../freshell-protocol" }
+serde = { workspace = true }
+uuid = "1"

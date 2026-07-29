@@ -14,6 +14,7 @@
 //!   supersession-chain reader rule end-to-end through the real ledger.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,11 +23,332 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use freshell_protocol::SessionLocator;
+use freshell_recovery::{
+    prepare_exact_recovery_query, BlockingExactRecoveryProbe, DurableRecoveryProvider,
+    ExactRecoveryIssue, ExactRecoveryProvider, ExactRecoveryQuery, ExactRecoverySnapshot,
+    ExactRecoveryState, MaterializationState, RecoveryOwnerKey, RecoveryProviderRegistry,
+};
 use freshell_ws::existence::SessionExistence;
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
+
+#[derive(Default)]
+struct InstrumentedExactProvider {
+    root_calls: std::sync::atomic::AtomicUsize,
+    filesystem_calls: std::sync::atomic::AtomicUsize,
+    sqlite_calls: std::sync::atomic::AtomicUsize,
+    queries: std::sync::Mutex<Vec<ExactRecoveryQuery>>,
+}
+
+impl ExactRecoveryProvider for InstrumentedExactProvider {
+    fn lookup_many_blocking(&self, queries: &[ExactRecoveryQuery]) -> ExactRecoverySnapshot {
+        use std::sync::atomic::Ordering;
+
+        self.root_calls.fetch_add(1, Ordering::SeqCst);
+        self.filesystem_calls.fetch_add(1, Ordering::SeqCst);
+        self.sqlite_calls.fetch_add(1, Ordering::SeqCst);
+        self.queries.lock().unwrap().extend_from_slice(queries);
+        queries
+            .iter()
+            .map(|query| (query.key.clone(), ExactRecoveryState::ProviderUnavailable))
+            .collect()
+    }
+}
+
+fn instrumented_exact_registry() -> (RecoveryProviderRegistry, Arc<InstrumentedExactProvider>) {
+    let provider = Arc::new(InstrumentedExactProvider::default());
+    let mut registry = RecoveryProviderRegistry::new();
+    for kind in [
+        DurableRecoveryProvider::Claude,
+        DurableRecoveryProvider::Codex,
+        DurableRecoveryProvider::Opencode,
+        DurableRecoveryProvider::Amplifier,
+    ] {
+        registry
+            .register(kind, provider.clone())
+            .expect("one test provider per durable kind");
+    }
+    (registry, provider)
+}
+
+fn exact_state(
+    registry: &RecoveryProviderRegistry,
+    mode: &str,
+    provider: &str,
+    session_id: &str,
+) -> ExactRecoveryState {
+    let raw = SessionLocator {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+    };
+    match prepare_exact_recovery_query(
+        mode,
+        &raw,
+        Some(PathBuf::from("/tmp/project")),
+        MaterializationState::Unknown,
+    ) {
+        Err(issue) => ExactRecoveryState::Invalid(issue),
+        Ok(query) => registry
+            .lookup_many_blocking(std::slice::from_ref(&query))
+            .remove(&query.key)
+            .expect("registry returns one state per query"),
+    }
+}
+
+fn prepared_query(
+    mode: &str,
+    provider: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> ExactRecoveryQuery {
+    prepare_exact_recovery_query(
+        mode,
+        &SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        },
+        cwd.map(PathBuf::from),
+        MaterializationState::Unknown,
+    )
+    .expect("valid exact query")
+}
+
+#[test]
+fn invalid_session_refs_do_zero_store_io() {
+    let (registry, provider) = instrumented_exact_registry();
+    let oversized_opencode = format!("ses_{}", "a".repeat(125));
+    let oversized_amplifier = "é".repeat(128);
+    let invalid = vec![
+        (
+            "custom",
+            "custom",
+            "anything",
+            ExactRecoveryIssue::UnsupportedSessionProvider,
+        ),
+        (
+            "gemini",
+            "gemini",
+            "anything",
+            ExactRecoveryIssue::UnsupportedSessionProvider,
+        ),
+        (
+            "kimi",
+            "kimi",
+            "anything",
+            ExactRecoveryIssue::UnsupportedSessionProvider,
+        ),
+        (
+            "custom",
+            "claude",
+            "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+            ExactRecoveryIssue::ProviderModeMismatch,
+        ),
+        (
+            "opencode",
+            "claude",
+            "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
+            ExactRecoveryIssue::ProviderModeMismatch,
+        ),
+        (
+            "claude",
+            "claude",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "codex",
+            "codex",
+            "{01890f18-6a3f-7cc2-98c8-72a7381f4d3a}",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "codex",
+            "codex",
+            "01890f18-6a3f-7cc2-18c8-72a7381f4d3a",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "opencode",
+            "opencode",
+            "session",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "opencode",
+            "opencode",
+            "ses_non_ascii_é",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "opencode",
+            "opencode",
+            &oversized_opencode,
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            ".",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "..",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "dir/name",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            r"dir\name",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            r"D:relative",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            r"\\.\pipe\device",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "name:stream",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "AUX",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "NUL.data",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "CLOCK$",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "COM³",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "LPT³.txt",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "trailing.",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "trailing ",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "bad\nname",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            "bad*name",
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+        (
+            "amplifier",
+            "amplifier",
+            &oversized_amplifier,
+            ExactRecoveryIssue::InvalidSessionId,
+        ),
+    ];
+
+    for (mode, provider_name, session_id, issue) in invalid {
+        assert_eq!(
+            exact_state(&registry, mode, provider_name, session_id),
+            ExactRecoveryState::Invalid(issue),
+            "wrong invalid classification for {mode}/{provider_name}/{session_id:?}"
+        );
+    }
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(provider.root_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.filesystem_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.sqlite_calls.load(Ordering::SeqCst), 0);
+    assert!(provider.queries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn valid_fresh_agent_session_refs_preserve_portable_ids_and_scope_ownership() {
+    let (registry, provider) = instrumented_exact_registry();
+    let max_amplifier_id = format!("{}a", "é".repeat(127));
+    let cases = [
+        ("opencode", "ses_CasePreserved019".to_string()),
+        ("amplifier", "real_world_id_with_underscores".to_string()),
+        ("amplifier", "日本語-session_42".to_string()),
+        ("amplifier", "COM⁴".to_string()),
+        ("amplifier", "LPT10".to_string()),
+        ("amplifier", max_amplifier_id),
+    ];
+
+    let mut queries: Vec<_> = cases
+        .iter()
+        .map(|(mode, session_id)| prepared_query(mode, mode, session_id, Some("/tmp/project")))
+        .collect();
+    // Missing cwd is still a valid Amplifier query; its provider may uniquely
+    // enumerate or return Conflict, but validation must not fabricate invalid.
+    queries.push(prepared_query(
+        "amplifier",
+        "amplifier",
+        "no_cwd_is_valid",
+        None,
+    ));
+    let snapshot = registry.lookup_many_blocking(&queries);
+    assert_eq!(snapshot.len(), queries.len());
+    let captured = provider.queries.lock().unwrap();
+    for ((mode, session_id), query) in cases.iter().zip(captured.iter()) {
+        assert_eq!(query.key.session_ref.session_id, *session_id);
+        let owner = if *mode == "amplifier" {
+            RecoveryOwnerKey::project(&query.key.session_ref, "/normalized/project").unwrap()
+        } else {
+            RecoveryOwnerKey::global(&query.key.session_ref).unwrap()
+        };
+        assert_eq!(owner.session_id, *session_id);
+        assert_eq!(
+            owner.provider_scope.as_deref(),
+            (*mode == "amplifier").then_some("/normalized/project")
+        );
+    }
+}
 
 /// Serializes every test in this file that mutates the process-global
 /// `FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` / `CLAUDE_CONFIG_DIR`
@@ -706,6 +1028,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provider: "codex",
             session_id: "old-t",
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             mode: "freshcodex",
             cwd: Some("/w"),
             create_request_id: None,
@@ -722,6 +1046,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provider: "codex",
             session_id: "new-t",
+            provider_scope: None,
+            materialization: MaterializationState::Observed,
             mode: "freshcodex",
             cwd: Some("/w"),
             create_request_id: None,
