@@ -45,6 +45,9 @@ const __dirname = path.dirname(__filename)
 const FAKE_BEL_CLI = path.resolve(__dirname, '../fixtures/fake-bel-cli.mjs')
 const FAKE_AMPLIFIER_CLI = path.resolve(__dirname, '../fixtures/fake-amplifier-activity-cli.mjs')
 
+/** Launcher-assigned amplifier identity: a broker-minted UUID (v4 shape). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
 async function installFakeCli(binDir: string, name: string, source: string): Promise<string> {
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, name)
@@ -391,9 +394,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     const server = await createE2eServerHandle(process.env, {
       kind: e2eServerKind,
       construct: {
-        // 15s fake turn: long enough that the locator association (sweep-
-        // driven, a few seconds) lands and the events lane confirms busy
-        // while the turn is provably still running.
+        // 15s fake turn: long enough that the events lane (attached at
+        // create to the broker's pre-created stub -- identity is
+        // launcher-assigned, no sweep/association step anymore) confirms
+        // busy while the turn is provably still running.
         env: { AMPLIFIER_CMD: fakeAmplifier, FAKE_AMPLIFIER_TURN_MS: '15000' },
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -431,9 +435,11 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       )
       await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
-      // …then the events lane finishes the turn: the locator associates the
-      // session (sweep-driven, a few seconds), the tailer attaches, and the
-      // fixture's prompt:complete record produces idle + the completion.
+      // …then the events lane finishes the turn: the tailer is already
+      // attached to the broker's pre-created stub (identity was
+      // launcher-assigned at create; the old sweep-driven locator
+      // association is deleted), and the fixture's prompt:complete record
+      // produces idle + the completion.
       const complete = await capture.waitFor(
         (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
         45_000,
@@ -441,7 +447,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       )
       expect(complete.provider).toBe('amplifier')
       expect(complete.completionSeq).toBe(1)
-      expect(String(complete.sessionId ?? '')).toMatch(/^fake-amp-/)
+      // The completion carries the BROKER-MINTED session id (launcher-
+      // assigned identity: the pane was spawned `resume <uuid>` against the
+      // pre-created stub), never a fixture-invented `fake-amp-*` id.
+      expect(String(complete.sessionId ?? '')).toMatch(UUID_RE)
 
       await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
 

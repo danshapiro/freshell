@@ -326,12 +326,19 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
           expect(String(response.message)).not.toContain('fatal runtime error')
           expect(String(response.message)).not.toContain('assertion failed')
 
-          // The legacy-compatible, reference-exact `wrap_terminal_spawn_error`
-          // ENOENT message (`crates/freshell-ws/src/terminal.rs`, mirroring
+          // The reference-exact `wrap_terminal_spawn_error` ENOENT message
+          // (`crates/freshell-ws/src/terminal.rs`, mirroring
           // `server/terminal-registry.ts:465-472`'s `wrapTerminalSpawnError`).
+          // LAUNCHER-ASSIGNED identity: every amplifier create carries a
+          // broker-minted resume session id (the pane is spawned
+          // `amplifier resume <uuid>`), so the resume-flavored prefix
+          // ("Could not restore") is the one this path produces now -- the
+          // same flavor a fresh claude create (server-preallocated
+          // `--session-id`, upstream `should_preallocate_fresh_claude`)
+          // already produces on origin/main. The ENOENT body is unchanged.
           expect(response.message).toMatch(
             new RegExp(
-              `Could not start Amplifier: "${missingCommandName}" could not be started because the executable or working directory was not found on the server\\. Reinstall it or set AMPLIFIER_CMD to the correct executable\\.`,
+              `Could not restore Amplifier: "${missingCommandName}" could not be started because the executable or working directory was not found on the server\\. Reinstall it or set AMPLIFIER_CMD to the correct executable\\.`,
             ),
           )
         } finally {
