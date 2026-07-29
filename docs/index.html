@@ -105,6 +105,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   background: hsl(var(--muted-foreground) / .45); z-index: 0;
 }
 .tab {
+  width: 240px; flex: none;
   height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 8px;
   border: 1px solid hsl(var(--muted-foreground) / .45); border-bottom: 1px solid hsl(var(--muted-foreground) / .45);
   border-radius: 6px 6px 0 0; cursor: pointer; white-space: nowrap;
@@ -121,15 +122,22 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   content: ''; position: absolute; bottom: -1px; left: 0; right: 0;
   height: 2px; background: hsl(var(--background));
 }
+/* Canonical tab states: grey = working, green = ready, green + bar = ready & unacknowledged */
+.tab.working { background: #d4d4d8; color: #27272a; }
+.tab.ready { background: #d1fae5; color: #064e3b; }
+.tab.ready::before { content: none; }
+.tab.ready.unacked::before {
+  content: ''; position: absolute; left: 6px; right: 6px; bottom: 3px;
+  height: 3px; border-radius: 9999px; background: #10b981;
+}
 .tab-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.tab-dot.busy, .tab-dot.running { background: var(--t-blue); }
+.tab-dot.busy, .tab-dot.running { background: #71717a; }
 .tab-dot.attention { background: hsl(var(--success)); }
 .tab-dot.idle { background: hsl(var(--muted-foreground) / .4); }
 .tab-icons { display: flex; gap: 2px; align-items: center; }
-.tab-icons .icon-xs { width: 12px; height: 12px; color: hsl(var(--muted-foreground)); }
-.tab.active .tab-icons .icon-xs { color: hsl(var(--success)); }
-.tab-label { max-width: 5rem; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
-.tab.active .tab-label { max-width: 10rem; }
+.tab-icons .icon-xs { width: 12px; height: 12px; color: #52525b; }
+.tab.active .tab-icons .icon-xs { color: #52525b; }
+.tab-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
 .tab-close {
   padding: 2px; border-radius: 3px; line-height: 0;
   opacity: 0; transition: opacity .1s, background .1s; margin-left: 2px;
@@ -654,12 +662,12 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-label">freshell</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
-        <div class="tab" data-tab="claude">
+        <div class="tab working" data-tab="claude">
           <span class="tab-dot busy"></span>
           <span class="tab-label">Claude Code</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
-        <div class="tab" data-tab="workspace">
+        <div class="tab ready unacked" data-tab="workspace">
           <span class="tab-icons">
             <i data-lucide="terminal" class="icon-xs"></i>
             <i data-lucide="terminal" class="icon-xs"></i>
