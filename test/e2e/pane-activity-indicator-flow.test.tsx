@@ -284,14 +284,14 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
 
     act(() => {
       store.dispatch(clearPaneRuntimeActivity({ paneId: 'pane-activity' }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
   })
 
   it('treats freshclaude waits as non-blue but running work as blue', () => {
@@ -332,7 +332,7 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
     expectFreshAgentHeaderBusy(paneHeader, false)
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
 
     act(() => {
       store.dispatch(removePermission({
@@ -344,7 +344,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expectFreshAgentHeaderBusy(paneHeader, true)
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
   })
 
   it('keeps claude terminals non-blue when idle and blue while the server marks them busy', () => {
@@ -369,7 +369,7 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
 
     act(() => {
       store.dispatch(upsertClaudeActivity({
@@ -378,7 +378,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
 
     act(() => {
       store.dispatch(upsertClaudeActivity({
@@ -387,7 +387,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
   })
 
   it('shows persistent idle green on a claude pane header whenever the session is known and not busy', () => {
@@ -463,7 +463,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
 
     // Transport reconnect: the App clears the overlay (resetClaudeActivityOverlay ->
     // resetClaudeActivity) then re-requests claude.activity.list and applies the
@@ -480,7 +480,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
   })
 
   it('shows OpenCode terminals blue only for exact terminal busy activity and clears on removal', () => {
@@ -512,7 +512,7 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
 
     act(() => {
       store.dispatch(upsertOpencodeActivity({
@@ -522,7 +522,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
 
     act(() => {
       store.dispatch(upsertOpencodeActivity({
@@ -532,7 +532,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
 
     act(() => {
       store.dispatch(removeOpencodeActivity({
@@ -542,7 +542,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
   })
 
   it('restores pane and tab activity from historySessionId when only the canonical durable id is known', () => {
@@ -585,7 +585,7 @@ describe('pane activity indicator flow (e2e)', () => {
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
     expectFreshAgentHeaderBusy(paneHeader, false)
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).not.toBe('working')
 
     act(() => {
       store.dispatch(removePermission({
@@ -597,7 +597,7 @@ describe('pane activity indicator flow (e2e)', () => {
     })
 
     expectFreshAgentHeaderBusy(paneHeader, true)
-    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(getVisibleSinglePaneTab().getAttribute('data-visual-state')).toBe('working')
   })
 
 })

@@ -180,13 +180,14 @@ async function openCliPaneAndGetTerminalId(
 }
 
 /**
- * The blue pane icons inside a tab strip item. With `iconsOnTabs`, a split
- * tab renders ONE icon PER pane (`TabItem.renderIcons()`), so "the tab shows
- * blue" means "at least one pane icon in the tab carries text-blue-500" —
- * asserting on `.first()` would pin the sibling shell pane's icon instead.
+ * The tab strip item in its working (busy) visual state. Tab icons are
+ * unconditionally dark grey now, so busy is signalled structurally via the
+ * `data-visual-state="working"` marker on the tab container. The attribute
+ * value is conditional on busy, so both `.toHaveCount(0)` (idle) and
+ * `.not.toHaveCount(0)` (busy) assertions stay meaningful.
  */
-function tabBlueIcons(page: import('@playwright/test').Page, tabId: string) {
-  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"] svg.text-blue-500`)
+function workingTab(page: import('@playwright/test').Page, tabId: string) {
+  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"][data-visual-state="working"]`)
 }
 
 async function typePromptIntoLastPane(page: import('@playwright/test').Page, text: string): Promise<void> {
@@ -245,7 +246,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       // The frozen client renders that exact frame as blue chrome. (The
       // prompt asked for a 6s "slow" turn so the busy window is stable to
       // observe — a sub-second turn can complete between DOM polls.)
-      await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
       await capture.waitFor(
         (f) => f.type === 'claude.activity.updated'
@@ -253,7 +254,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
         15_000,
         'claude idle upsert (BEL)',
       )
-      await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
 
       const complete1 = await capture.waitFor(
         (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
@@ -291,7 +292,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       await harness2.waitForConnection()
       // Re-seeded blue, from claude.activity.list.response — the turn is
       // still running server-side (6s fake turn).
-      await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
       const complete2 = await capture.waitFor(
         (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId && f.completionSeq === 2,
@@ -299,7 +300,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
         'terminal.turn.complete #2 (seq 2 after reload)',
       )
       expect(complete2.provider).toBe('claude')
-      await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
     } finally {
       capture.close()
       await server.stop().catch(() => {})
@@ -351,7 +352,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
         10_000,
         'codex pending upsert',
       )
-      await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
       await capture.waitFor(
         (f) => f.type === 'codex.activity.updated'
@@ -359,7 +360,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
         15_000,
         'codex idle upsert (BEL)',
       )
-      await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
 
       const complete = await capture.waitFor(
         (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
@@ -433,7 +434,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
         10_000,
         'amplifier busy upsert',
       )
-      await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
 
       // …then the events lane finishes the turn: the tailer is already
       // attached to the broker's pre-created stub (identity was
@@ -452,7 +453,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       // pre-created stub), never a fixture-invented `fake-amp-*` id.
       expect(String(complete.sessionId ?? '')).toMatch(UUID_RE)
 
-      await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+      await expect(workingTab(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
 
       const idleEdge = await capture.waitFor(
         (f) => f.type === 'terminal.idle' && f.terminalId === terminalId,

@@ -132,13 +132,13 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       const terminalId = findTerminalLeaf(layout)!.content.terminalId as string
 
       const claudeTab = page.locator(`[data-context="tab"][data-tab-id="${claudeTabId}"]`)
-      const claudeTabIcon = claudeTab.locator('svg').first()
 
-      // Submit a prompt: PTY submit -> tracker busy -> BLUE.
+      // Submit a prompt: PTY submit -> tracker busy -> WORKING (grey tab; the
+      // structural data-visual-state marker is the tab-side busy signal).
       await page.locator('.xterm').first().click()
       await page.keyboard.type('hello fake claude')
       await page.keyboard.press('Enter')
-      await expect(claudeTabIcon).toHaveClass(/text-blue-500/, { timeout: 10_000 })
+      await expect(claudeTab).toHaveAttribute('data-visual-state', 'working', { timeout: 10_000 })
 
       // Move away so the claude tab is a background tab when the turn ends.
       await page.getByRole('button', { name: 'New shell tab' }).click()
@@ -146,8 +146,8 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       const shellTabId = await harness.getActiveTabId()
       expect(shellTabId).not.toBe(claudeTabId)
 
-      // Turn end (BEL) clears busy well before the truly-idle edge: blue off.
-      await expect(claudeTabIcon).not.toHaveClass(/text-blue-500/, { timeout: FAKE_TURN_MS + 10_000 })
+      // Turn end (BEL) clears busy well before the truly-idle edge: working off.
+      await expect(claudeTab).not.toHaveAttribute('data-visual-state', 'working', { timeout: FAKE_TURN_MS + 10_000 })
 
       // After the quiet 2s grace the server broadcasts terminal.idle: exactly
       // one alert edge lands (bell + shade pipeline), keyed to this terminal.

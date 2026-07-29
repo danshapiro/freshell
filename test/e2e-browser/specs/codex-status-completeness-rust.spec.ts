@@ -171,13 +171,14 @@ async function openCliPaneAndGetTerminalId(
 }
 
 /**
- * The blue pane icons inside a tab strip item. With `iconsOnTabs`, a split
- * tab renders ONE icon PER pane (`TabItem.renderIcons()`), so "the tab shows
- * blue" means "at least one pane icon in the tab carries text-blue-500" —
- * asserting on `.first()` would pin the sibling shell pane's icon instead.
+ * The tab strip item in its working (busy) visual state. Tab icons are
+ * unconditionally dark grey now, so busy is signalled structurally via the
+ * `data-visual-state="working"` marker on the tab container. The attribute
+ * value is conditional on busy, so both `.toHaveCount(0)` (idle) and
+ * `.not.toHaveCount(0)` (busy) assertions stay meaningful.
  */
-function tabBlueIcons(page: import('@playwright/test').Page, tabId: string) {
-  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"] svg.text-blue-500`)
+function workingTab(page: import('@playwright/test').Page, tabId: string) {
+  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"][data-visual-state="working"]`)
 }
 
 async function typePromptIntoLastPane(page: import('@playwright/test').Page, text: string): Promise<void> {
@@ -462,7 +463,7 @@ test.describe('Codex status completeness (Rust only)', () => {
           20_000,
           'resume-busy seeding after abrupt restart',
         )
-        await expect(tabBlueIcons(page, resumeTabId)).not.toHaveCount(0, { timeout: 10_000 })
+        await expect(workingTab(page, resumeTabId)).not.toHaveCount(0, { timeout: 10_000 })
 
         // The (dead) turn's completion arrives on disk -> lane clears it.
         await fs.appendFile(rolloutPath, `${taskEventLine('task_complete', '2026-07-25T09:05:00.000Z')}\n`)
@@ -480,7 +481,7 @@ test.describe('Codex status completeness (Rust only)', () => {
         )
         expect(complete.provider).toBe('codex')
         expect(complete.sessionId).toBe(THREAD_A)
-        await expect(tabBlueIcons(page, resumeTabId)).toHaveCount(0, { timeout: 10_000 })
+        await expect(workingTab(page, resumeTabId)).toHaveCount(0, { timeout: 10_000 })
       } finally {
         capture.close()
       }

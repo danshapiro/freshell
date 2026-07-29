@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '@/components/TabBar'
@@ -101,9 +101,14 @@ describe('busy indicator color flow (e2e)', () => {
     const icons = screen.getAllByTestId('pane-icon')
     expect(icons).toHaveLength(2)
 
-    for (const icon of icons) {
-      expect(icon.getAttribute('class')).toContain('text-muted-foreground')
-      expect(icon.getAttribute('class')).not.toContain('text-blue-500')
-    }
+    // Tab icons are unconditionally dark grey — the creating-muted treatment
+    // now applies only to pane chrome.
+    const tabIcon = within(screen.getByLabelText('Creating Tab')).getByTestId('pane-icon')
+    expect(tabIcon.getAttribute('class')).toContain('text-zinc-600')
+    expect(tabIcon.getAttribute('class')).not.toContain('text-blue-500')
+
+    const paneHeaderIcon = icons.find((icon) => icon !== tabIcon)
+    expect(paneHeaderIcon?.getAttribute('class')).toContain('text-muted-foreground')
+    expect(paneHeaderIcon?.getAttribute('class')).not.toContain('text-blue-500')
   })
 })

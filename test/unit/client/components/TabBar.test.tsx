@@ -317,7 +317,7 @@ describe('TabBar', () => {
       expect(scrollContainer).toBeNull()
     })
 
-    it('shows blue icon on the exact busy terminal in a tab', () => {
+    it('marks the tab as working when the exact terminal is busy', () => {
       const tab = createTab({
         id: 'tab-codex',
         title: 'Codex Tab',
@@ -341,15 +341,17 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('Codex Tab')
+      // Icons are unconditionally dark grey now; the busy signal lives on the
+      // tab container via the structural data-visual-state marker.
+      expect(tabElement.getAttribute('data-visual-state')).toBe('working')
       const icons = within(tabElement).getAllByTestId('pane-icon')
-      const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
-      const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
-
-      expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
-      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
+      for (const icon of icons) {
+        expect(icon.getAttribute('class')).toContain('text-zinc-600')
+        expect(icon.getAttribute('class')).not.toContain('text-blue-500')
+      }
     })
 
-    it('shows blue icon when the exact record is pending', () => {
+    it('marks the tab as working when the exact record is pending', () => {
       const tab = createTab({
         id: 'tab-codex',
         title: 'Codex Pending',
@@ -388,10 +390,7 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('Codex Pending')
-      const blueIcons = within(tabElement).getAllByTestId('pane-icon')
-        .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
-
-      expect(blueIcons).toHaveLength(1)
+      expect(tabElement.getAttribute('data-visual-state')).toBe('working')
     })
 
     it('shows no activity when pane has no terminalId during rehydrate gap', () => {
@@ -432,13 +431,10 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('Rehydrate Gap')
-      const blueIcons = within(tabElement).getAllByTestId('pane-icon')
-        .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
-
-      expect(blueIcons).toHaveLength(0)
+      expect(tabElement.getAttribute('data-visual-state')).not.toBe('working')
     })
 
-    it('shows blue icon on the exact busy OpenCode terminal in a tab', () => {
+    it('marks the tab as working when the exact OpenCode terminal is busy', () => {
       const tab = createTab({
         id: 'tab-opencode',
         title: 'OpenCode Tab',
@@ -463,12 +459,12 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('OpenCode Tab')
+      expect(tabElement.getAttribute('data-visual-state')).toBe('working')
       const icons = within(tabElement).getAllByTestId('pane-icon')
-      const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-opencode-1')
-      const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-opencode-2')
-
-      expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
-      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
+      for (const icon of icons) {
+        expect(icon.getAttribute('class')).toContain('text-zinc-600')
+        expect(icon.getAttribute('class')).not.toContain('text-blue-500')
+      }
     })
   })
 
@@ -930,10 +926,12 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const icons = screen.getAllByTestId('pane-icon')
+      // Tab icons are unconditionally dark grey — no per-status coloring.
       const runningIndicator = icons.find((c) =>
-        getClassString(c).includes('text-success')
+        getClassString(c).includes('text-zinc-600')
       )
       expect(runningIndicator).toBeDefined()
+      expect(getClassString(runningIndicator!)).not.toContain('text-success')
     })
 
     it('shows exited status indicator for exited terminal', () => {
@@ -947,10 +945,13 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const icons = screen.getAllByTestId('pane-icon')
+      // Exited tab icons keep the dimming but are dark grey, not muted-status.
       const exitedIndicator = icons.find((c) =>
-        getClassString(c).includes('text-muted-foreground/40')
+        getClassString(c).includes('opacity-40')
       )
       expect(exitedIndicator).toBeDefined()
+      expect(getClassString(exitedIndicator!)).toContain('text-zinc-600')
+      expect(getClassString(exitedIndicator!)).not.toContain('text-muted-foreground/40')
     })
 
     it('shows error status indicator for error terminal', () => {
@@ -965,9 +966,10 @@ describe('TabBar', () => {
 
       const icons = screen.getAllByTestId('pane-icon')
       const errorIndicator = icons.find((c) =>
-        getClassString(c).includes('text-destructive')
+        getClassString(c).includes('text-zinc-600')
       )
       expect(errorIndicator).toBeDefined()
+      expect(getClassString(errorIndicator!)).not.toContain('text-destructive')
     })
 
     it('shows a muted creating status indicator for a creating terminal', () => {
@@ -982,9 +984,10 @@ describe('TabBar', () => {
 
       const icons = screen.getAllByTestId('pane-icon')
       const creatingIndicator = icons.find((c) =>
-        getClassString(c).includes('text-muted-foreground')
+        getClassString(c).includes('text-zinc-600')
       )
       expect(creatingIndicator).toBeDefined()
+      expect(getClassString(creatingIndicator!)).not.toContain('text-muted-foreground')
       expect(getClassString(creatingIndicator!)).not.toContain('text-blue-500')
     })
 
@@ -1005,19 +1008,16 @@ describe('TabBar', () => {
       // We should have 3 status indicators (one per tab)
       expect(icons).toHaveLength(3)
 
-      // Check for running indicator
-      const hasRunning = icons.some((c) => getClassString(c).includes('text-success'))
-      expect(hasRunning).toBe(true)
+      // All tab icons are unconditionally dark grey — no per-status colors.
+      for (const icon of icons) {
+        expect(getClassString(icon)).toContain('text-zinc-600')
+        expect(getClassString(icon)).not.toContain('text-success')
+        expect(getClassString(icon)).not.toContain('text-destructive')
+      }
 
-      // Check for exited indicator
-      const hasExited = icons.some((c) =>
-        getClassString(c).includes('text-muted-foreground/40')
-      )
-      expect(hasExited).toBe(true)
-
-      // Check for error indicator
-      const hasError = icons.some((c) => getClassString(c).includes('text-destructive'))
-      expect(hasError).toBe(true)
+      // Exited dimming is the only per-status icon treatment that remains.
+      const dimmed = icons.filter((c) => getClassString(c).includes('opacity-40'))
+      expect(dimmed).toHaveLength(1)
     })
   })
 

@@ -8,8 +8,8 @@ async function getActiveLeaf(harness: any) {
   return { tabId: tabId!, paneId: layout.id as string }
 }
 
-function activeTabIcon(page: any, tabId: string) {
-  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).locator('svg').first()
+function activeTab(page: any, tabId: string) {
+  return page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
 }
 
 function activePaneIcon(page: any) {
@@ -17,15 +17,18 @@ function activePaneIcon(page: any) {
 }
 
 async function expectChromeBlue(page: any, tabId: string, expected: boolean) {
-  const tabIcon = activeTabIcon(page, tabId)
+  // Tab icons are unconditionally dark grey now — the tab-side busy signal is
+  // the structural data-visual-state marker on the tab container. Pane headers
+  // keep their blue busy coloring.
+  const tab = activeTab(page, tabId)
   const paneIcon = activePaneIcon(page)
   if (expected) {
-    await expect(tabIcon).toHaveClass(/text-blue-500/)
+    await expect(tab).toHaveAttribute('data-visual-state', 'working')
     await expect(paneIcon).toHaveClass(/text-blue-500/)
     return
   }
 
-  await expect(tabIcon).not.toHaveClass(/text-blue-500/)
+  await expect(tab).not.toHaveAttribute('data-visual-state', 'working')
   await expect(paneIcon).not.toHaveClass(/text-blue-500/)
 }
 

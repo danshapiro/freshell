@@ -157,7 +157,7 @@ describe('codex activity indicator flow (e2e)', () => {
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
     const tabButton = getVisibleSinglePaneTab()
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(tabButton.getAttribute('data-visual-state')).toBe('working')
   })
 
   it('shows no activity when pane has no terminalId even during single-pane rehydrate gaps', () => {
@@ -177,7 +177,7 @@ describe('codex activity indicator flow (e2e)', () => {
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     const tabButton = getVisibleSinglePaneTab()
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(tabButton.getAttribute('data-visual-state')).not.toBe('working')
   })
 
   it('never shows blue from resumeSessionId, sessionRef, cwd, or provider-only terminal meta fallbacks', () => {
@@ -221,6 +221,6 @@ describe('codex activity indicator flow (e2e)', () => {
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     const tabButton = getVisibleSinglePaneTab()
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(tabButton.getAttribute('data-visual-state')).not.toBe('working')
   })
 })

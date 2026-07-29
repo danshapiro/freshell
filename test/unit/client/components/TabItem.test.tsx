@@ -109,22 +109,101 @@ describe('TabItem', () => {
     const el = getTabElement()
     expect(el?.className).toContain('bg-foreground/15')
     expect(el?.className).not.toContain('bg-emerald-100')
+    expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
   })
 
   it('applies no attention styles when style is none', () => {
+    // Under the new scheme `none` keeps the GREEN base and only suppresses
+    // the unacked emphasis (bar/pulse/darken).
     render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="none" />)
     const el = getTabElement()
-    expect(el?.className).not.toContain('bg-emerald-100')
+    expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+    expect(el?.className).not.toContain('animate-pulse')
     expect(el?.className).not.toContain('bg-foreground/15')
-    expect(el?.className).toContain('bg-muted')
+    expect(el?.className).toContain('bg-emerald-100')
   })
 
-  it('shows a blue single dot when a pane is busy even if the aggregate tab.status is not running', () => {
+  describe('canonical visual states', () => {
+    it('working: busy inactive tab renders GREY (not blue, not emerald)', () => {
+      render(<TabItem {...defaultProps} busy={true} />)
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-zinc-300')
+      expect(el?.className).not.toContain('bg-emerald-100')
+      expect(el?.className).not.toContain('blue-500')
+      // Structural busy marker — the out-of-task suites in Step 4b re-target
+      // their busy/idle assertions and Playwright locators to this attribute.
+      expect(el?.getAttribute('data-visual-state')).toBe('working')
+    })
+
+    it('ready: isReady inactive tab renders GREEN without the bar', () => {
+      render(<TabItem {...defaultProps} isReady={true} />)
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-emerald-100')
+      expect(el?.getAttribute('data-visual-state')).toBe('ready')
+      expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+    })
+
+    it('idle: a plain inactive tab exposes the neutral structural state', () => {
+      render(<TabItem {...defaultProps} />)
+      expect(getTabElement()?.getAttribute('data-visual-state')).toBe('neutral')
+    })
+
+    it('ready-unacked: attention on an inactive tab renders GREEN with the GREEN BAR', () => {
+      render(<TabItem {...defaultProps} needsAttention={true} />)
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-emerald-100')
+      const bar = screen.getByTestId('tab-attention-bar')
+      expect(bar.className).toContain('bg-emerald-500')
+    })
+
+    it('the ACTIVE tab never shows the bar even with attention', () => {
+      render(<TabItem {...defaultProps} isActive={true} needsAttention={true} />)
+      expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+      const el = getTabElement()
+      expect(el?.className).toContain('border-t-success')
+    })
+
+    it('working takes precedence over ready/attention', () => {
+      render(<TabItem {...defaultProps} busy={true} isReady={true} needsAttention={true} />)
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-zinc-300')
+      expect(el?.className).not.toContain('bg-emerald-100')
+      expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+    })
+
+    it('a tab whose panes all exited is neutral even when flagged ready', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          tab={createTab({ status: 'exited' })}
+          isReady={true}
+        />
+      )
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-muted')
+      expect(el?.className).not.toContain('bg-emerald-100')
+    })
+
+    it('tabAttentionStyle none suppresses the bar but keeps the green base', () => {
+      render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="none" />)
+      expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+      expect(getTabElement()?.className).toContain('bg-emerald-100')
+    })
+
+    it('tabAttentionStyle pulse animates the unacked tab', () => {
+      render(<TabItem {...defaultProps} needsAttention={true} tabAttentionStyle="pulse" />)
+      expect(getTabElement()?.className).toContain('animate-pulse')
+      expect(screen.getByTestId('tab-attention-bar')).toBeTruthy()
+    })
+  })
+
+  it('shows a grey single dot when a pane is busy even if the aggregate tab.status is not running', () => {
     // Multi-pane tab where last-writer-wins tab.status is 'exited' but a pane is
-    // still busy. The single dot must reflect busy (blue), not the clobbered status.
+    // still busy. The single dot must reflect busy (grey), not the clobbered status.
     render(<TabItem {...defaultProps} tab={createTab({ status: 'exited' })} paneEntries={[]} iconsOnTabs={false} busy={true} />)
     const dot = screen.getByTestId('circle-icon')
-    expect(dot.getAttribute('class')).toContain('fill-blue-500')
+    expect(dot.getAttribute('class')).toContain('fill-zinc-500')
+    expect(dot.getAttribute('class')).not.toContain('fill-blue-500')
   })
 
   it('uses a muted status dot for creating tabs when pane icons are unavailable', () => {
@@ -143,26 +222,31 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-success/15')
   })
 
-  it('applies attention classes on active tab with darken', () => {
+  it('renders plain green on active tab with darken (no darken emphasis on the active tab)', () => {
+    // RECORDED DECISION: 'ready-unacked' is unreachable on the ACTIVE tab, so
+    // darken emphasis never applies there — the base green state is unconditional.
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="darken" />)
     const el = getTabElement()
     expect(el?.className).toContain('border-t-[3px]')
-    expect(el?.className).toContain('border-t-muted-foreground')
-    expect(el?.className).toContain('bg-foreground/[0.08]')
+    expect(el?.className).toContain('border-t-success')
+    expect(el?.className).toContain('bg-success/15')
+    expect(el?.className).not.toContain('bg-foreground/[0.08]')
   })
 
-  it('does not apply attention classes on active tab with none', () => {
+  it('keeps the green base on active tab with none (base states are unconditional)', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="none" />)
     const el = getTabElement()
-    expect(el?.className).not.toContain('border-t-[3px]')
-    expect(el?.className).not.toContain('border-t-success')
-    expect(el?.className).not.toContain('border-t-muted-foreground')
+    expect(el?.className).toContain('border-t-[3px]')
+    expect(el?.className).toContain('border-t-success')
+    expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
   })
 
-  it('applies animate-pulse on active tab with pulse style and attention', () => {
+  it('does not animate the active tab with pulse style and attention', () => {
+    // Pulse emphasis is unacked-only; the active tab is never 'ready-unacked'.
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="pulse" />)
     const el = getTabElement()
-    expect(el?.className).toContain('animate-pulse')
+    expect(el?.className).not.toContain('animate-pulse')
+    expect(el?.className).toContain('border-t-success')
   })
 
   it('shows input when isRenaming is true', () => {
@@ -176,7 +260,7 @@ describe('TabItem', () => {
     expect(screen.getByDisplayValue('Editing')).toBeInTheDocument()
   })
 
-  it('shows blue icon only for the exact busy terminal in split tabs', () => {
+  it('renders all pane icons in dark grey regardless of busy state', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -206,14 +290,14 @@ describe('TabItem', () => {
     )
 
     const icons = screen.getAllByTestId('pane-icon')
-    const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
-    const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
-
-    expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
-    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
+    for (const icon of icons) {
+      expect(icon.getAttribute('class')).toContain('text-zinc-600')
+      expect(icon.getAttribute('class')).not.toContain('text-blue-500')
+      expect(icon.getAttribute('class')).not.toContain('text-success')
+    }
   })
 
-  it('shows blue icon for a single unnamed terminal during the exact tab-terminal fallback', () => {
+  it('shows grey icon for a single unnamed terminal during the exact tab-terminal fallback', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -234,10 +318,12 @@ describe('TabItem', () => {
       />
     )
 
-    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    const icon = screen.getByTestId('pane-icon')
+    expect(icon.getAttribute('class')).toContain('text-zinc-600')
+    expect(icon.getAttribute('class')).not.toContain('text-blue-500')
   })
 
-  it('shows blue overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
+  it('shows grey emphasized overflow indicator when the busy terminal is hidden beyond the icon cap', () => {
     const paneContents: PaneContent[] = Array.from({ length: 7 }, (_, index) => ({
       kind: 'terminal',
       mode: 'shell',
@@ -256,7 +342,8 @@ describe('TabItem', () => {
       />
     )
 
-    expect(screen.getByText('+4').getAttribute('class')).toContain('text-blue-500')
+    expect(screen.getByText('+4').getAttribute('class')).toContain('text-zinc-600')
+    expect(screen.getByText('+4').getAttribute('class')).not.toContain('text-blue-500')
   })
 
   it('caps pane icons at 3 and shows a muted +N badge for the rest', () => {

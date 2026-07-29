@@ -1,7 +1,8 @@
 import { X, Circle } from 'lucide-react'
 import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
-import { getTerminalStatusDotClassName, getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
+import { getTerminalStatusDotClassName } from '@/lib/terminal-status-indicator'
+import { resolveTabVisualState, tabHasLivePane } from '@/lib/tab-visual-state'
 import PaneIcon from '@/components/icons/PaneIcon'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -20,8 +21,17 @@ type TabPaneEntry = {
 function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean }) {
   // `busy` is already the authoritative per-pane busy aggregate (busyPaneIds);
   // do NOT AND it with the last-writer-wins tab.status, which a sibling pane's
-  // 'exited' can clobber and wrongly suppress blue.
-  return <Circle className={cn('h-2 w-2', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
+  // 'exited' can clobber and wrongly suppress the working indicator.
+  return (
+    <Circle
+      className={cn(
+        'h-2 w-2',
+        busy
+          ? 'fill-zinc-500 text-zinc-500 dark:fill-zinc-400 dark:text-zinc-400'
+          : getTerminalStatusDotClassName(status),
+      )}
+    />
+  )
 }
 
 /** Max pane-type icons shown per tab; panes beyond this fold into the '+N' badge. */
@@ -40,6 +50,8 @@ export interface TabItemProps {
   needsAttention: boolean
   busy?: boolean
   busyPaneIds?: string[]
+  /** Tab has turned ready at least once (turnCompletion.readyByTab). */
+  isReady?: boolean
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -62,6 +74,7 @@ export default function TabItem({
   needsAttention,
   busy,
   busyPaneIds = [],
+  isReady = false,
   isDragging,
   isRenaming,
   renameValue,
@@ -84,6 +97,20 @@ export default function TabItem({
       inputRef.current.focus()
     }
   }, [isRenaming])
+
+  const visualState = resolveTabVisualState({
+    isBusy: !!busy,
+    hasAttention: needsAttention,
+    isReady,
+    isActive,
+    hasLivePane: tabHasLivePane(tab, paneEntries),
+  })
+  const isGreen = visualState === 'ready' || visualState === 'ready-unacked'
+  // tabAttentionStyle governs only the UNACKED emphasis:
+  //   highlight (default) -> green bar; pulse -> bar + pulse;
+  //   darken -> darken treatment instead of the bar; none -> plain green.
+  const attentionEmphasis = visualState === 'ready-unacked' && tabAttentionStyle !== 'none'
+  const showAttentionBar = attentionEmphasis && tabAttentionStyle !== 'darken'
 
   const renderIcons = () => {
     if (!iconsOnTabs || !paneEntries || paneEntries.length === 0) {
@@ -134,14 +161,15 @@ export default function TabItem({
             )}
             {group.entries.map(({ paneId, content }) => {
               const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
-              const isBusy = busyPaneIds.includes(paneId)
               return (
                 <PaneIcon
                   key={paneId}
                   content={content}
                   className={cn(
-                    'h-3 w-3 shrink-0',
-                    isBusy ? 'text-blue-500' : getTerminalStatusIconClassName(status),
+                    // Tabs render provider logos in dark grey ONLY (no status
+                    // coloring) — the tab container now carries the state color.
+                    'h-3 w-3 shrink-0 text-zinc-600 dark:text-zinc-400',
+                    status === 'exited' && 'opacity-40',
                   )}
                 />
               )
@@ -149,7 +177,7 @@ export default function TabItem({
           </span>
         ))}
         {overflow > 0 && (
-          <span className={cn('text-[10px] leading-none', hiddenBusyPane ? 'text-blue-500' : 'text-muted-foreground')}>+{overflow}</span>
+          <span className={cn('text-[10px] leading-none', hiddenBusyPane ? 'text-zinc-600 dark:text-zinc-400 font-semibold' : 'text-muted-foreground')}>+{overflow}</span>
         )}
       </span>
     )
@@ -162,23 +190,30 @@ export default function TabItem({
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
-              needsAttention && tabAttentionStyle !== 'none' && (
-                tabAttentionStyle === 'darken'
-                  ? 'border-t-[3px] border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]'
-                  : 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
-              ),
-              needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
+              visualState === 'working'
+                && 'border-t-[3px] border-t-zinc-500 dark:border-t-zinc-400',
+              isGreen
+                && 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
+              // NOTE (deliberate behavior change, decided during load-bearing
+              // validation): `ready-unacked` is unreachable on the ACTIVE tab
+              // (Task 2 mapping), so no darken/pulse emphasis ever applies here.
+              // With tabAttentionStyle='darken', an active tab with attention now
+              // renders plain GREEN (previously it was darkened). Base states are
+              // unconditional; the style setting governs only unacked emphasis.
             )
           : cn(
               'shadow-[inset_0_-1px_0_hsl(var(--muted-foreground)/0.45)]',
-              needsAttention && tabAttentionStyle !== 'none'
-                ? tabAttentionStyle === 'darken'
+              visualState === 'neutral'
+                && 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90',
+              visualState === 'working'
+                && 'bg-zinc-300 text-zinc-800 hover:bg-zinc-300/80 dark:bg-zinc-600/70 dark:text-zinc-100 dark:hover:bg-zinc-600/60',
+              // Mutually exclusive: darken REPLACES the emerald fill (plain-join
+              // cn cannot safely stack conflicting bg-*/text-* utilities).
+              isGreen
+                && (attentionEmphasis && tabAttentionStyle === 'darken'
                   ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
-                  : cn(
-                      'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
-                      tabAttentionStyle === 'pulse' && 'animate-pulse'
-                    )
-                : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90'
+                  : 'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'),
+              attentionEmphasis && tabAttentionStyle === 'pulse' && 'animate-pulse'
             ),
         isDragging && 'opacity-50'
       )}
@@ -187,6 +222,7 @@ export default function TabItem({
       aria-label={tab.title}
       data-context={ContextIds.Tab}
       data-tab-id={tab.id}
+      data-visual-state={visualState}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
       onKeyDown={(e) => {
@@ -229,6 +265,14 @@ export default function TabItem({
       >
         <X className="h-3 w-3" />
       </button>
+
+      {showAttentionBar && (
+        <span
+          data-testid="tab-attention-bar"
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-1.5 bottom-[3px] h-[3px] rounded-full bg-emerald-500"
+        />
+      )}
     </div>
   )
 
