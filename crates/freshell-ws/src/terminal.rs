@@ -2152,8 +2152,11 @@ pub(crate) async fn handle_create(
         // observe "no dir yet" and race the mkdir — the LOSER here can hold
         // `created == true` while the WINNER's live terminal is already
         // using the dir; GC'ing it here would delete the winner's session
-        // out from under it.
+        // out from under it. The MCP-config cleanup below the return is
+        // per-terminal (this loser's id, never the winner's), so it is safe
+        // — and required, mirroring the REST twin — on this path too.
         if err.kind() == std::io::ErrorKind::AlreadyExists {
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
             return send_create_error(
                 out,
                 ErrorCode::PtySpawnFailed,
