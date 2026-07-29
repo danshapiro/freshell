@@ -80,8 +80,8 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
 }
 
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
-/// reused by `crate::amplifier_association` for the locator's `now_ms`
-/// clock -- one wall-clock source for the whole crate.
+/// reused by the locator association seams and the identity invariant
+/// sweep -- one wall-clock source for the whole crate.
 pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -90,8 +90,11 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 /// The modes that get a spawn-time pending marker: EXACTLY the modes with a
-/// registered post-spawn identity resolver (codex candidate adoption,
-/// opencode/amplifier locator sweeps). NOT "any non-shell mode" (V7.md):
+/// registered post-spawn identity resolver (codex candidate adoption, the
+/// opencode locator sweep; amplifier's post-spawn locator was deleted —
+/// kata qmpk — but fresh amplifier creates carry a launcher-minted resume
+/// id, so the marker branch only fires for the accepted legacy
+/// identity-less restore case). NOT "any non-shell mode" (V7.md):
 /// claude has create-time identity (pre-allocation) and NO resolver — its
 /// degenerate no-identity payloads (mismatched-provider sessionRef,
 /// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
@@ -633,17 +636,8 @@ async fn handle_client_text(
             state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
-            // Restore-across-restart fix: an armed amplifier terminal's first
-            // Enter/submit opens the locator's Enter↔session-dir correlation
-            // window. No-ops for every other terminal/mode (never armed) and
-            // for non-submit-shaped input.
-            crate::amplifier_association::note_possible_submit(
-                state,
-                &input.terminal_id,
-                &input.data,
-            );
-            // Restore-across-restart fix (opencode): sibling seam for an
-            // armed opencode terminal's first Enter/submit. No-ops for every
+            // Restore-across-restart fix (opencode): seam for an armed
+            // opencode terminal's first Enter/submit. No-ops for every
             // other terminal/mode and for non-submit-shaped input.
             crate::opencode_association::note_possible_submit(
                 state,
@@ -1227,13 +1221,7 @@ pub(crate) struct ExitHookDeps {
     pub identity: crate::identity::TerminalIdentityRegistry,
     /// P1.8 exit hygiene: the pending-marker delete rides the same hook.
     pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
-    /// Restore-across-restart fix: disarm the amplifier locator too, so an
-    /// exited (never-submitted, or already-associated) terminal's armed
-    /// entry is never left dangling (mirrors `handleExit`,
-    /// `amplifier-session-locator.ts:220-223`).
-    pub amplifier_locator:
-        Option<std::sync::Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
-    /// Restore-across-restart fix (opencode): sibling disarm, so an exited
+    /// Restore-across-restart fix (opencode): disarm the locator, so an exited
     /// (never-submitted, or already-associated) opencode terminal's armed
     /// entry is never left dangling.
     pub opencode_locator:
@@ -1286,9 +1274,6 @@ pub(crate) fn build_pty_exit_hook(
         // the one truly-synchronous ledger call site (V1.md).
         if let Err(err) = deps.pane_ledger.delete_pending(&terminal_id) {
             tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_marker_delete_failed_on_exit");
-        }
-        if let Some(locator) = &deps.amplifier_locator {
-            locator.disarm(&terminal_id);
         }
         if let Some(locator) = &deps.opencode_locator {
             locator.disarm(&terminal_id);
@@ -2090,7 +2075,6 @@ pub(crate) async fn handle_create(
             registry: state.registry.clone(),
             identity: state.identity.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
-            amplifier_locator: state.amplifier_locator.clone(),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
@@ -2250,16 +2234,6 @@ pub(crate) async fn handle_create(
         None,
         Some(mode.clone()),
         resume_session_id.clone(),
-    );
-
-    // Restore-across-restart fix: arm the amplifier locator for a FRESH
-    // (non-resuming) amplifier pane. No-ops for every other mode/resume case.
-    crate::amplifier_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
     );
 
     // Restore-across-restart fix (opencode): arm the opencode locator for a
@@ -2725,7 +2699,6 @@ pub async fn respawn_agent_terminal(
             registry: state.registry.clone(),
             identity: state.identity.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
-            amplifier_locator: state.amplifier_locator.clone(),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
@@ -2836,15 +2809,8 @@ pub async fn respawn_agent_terminal(
     );
 
     // Arm the provider locators the way `handle_create` does for this mode
-    // (all three gate on a FRESH — non-resuming — pane, so they no-op for a
+    // (both gate on a FRESH — non-resuming — pane, so they no-op for a
     // respawn's always-`Some` resume id; kept for step-for-step fidelity).
-    crate::amplifier_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
-    );
     crate::opencode_association::maybe_arm(
         state,
         &terminal_id,
@@ -4554,7 +4520,6 @@ mod terminals_changed_tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             activity: None,
@@ -4767,7 +4732,6 @@ mod terminal_meta_created_tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             activity: None,

@@ -91,7 +91,6 @@ async fn spawn_server(hello_timeout_ms: u64) -> String {
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,

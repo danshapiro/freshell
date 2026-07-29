@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 /// amplifier's own dir diverge), which is why the exact-match contract test
 /// (`amplifier-stub-adoption-contract.test.ts`) and the boot canary exist.
 pub fn cwd_slug(resolved_cwd: &str) -> String {
+    // Deliberately three consecutive replaces: a 1:1 visual mirror of the
+    // Python contract line above, so a byte-match audit against
+    // `project_utils.py` is a straight read (clippy would collapse the
+    // first two into `replace(['/', '\\'], "-")`).
+    #[allow(clippy::collapsible_str_replace)]
     let slug = resolved_cwd
         .replace('/', "-")
         .replace('\\', "-")
@@ -159,7 +164,10 @@ pub fn ensure_session(
         }
     }
 
-    let dir = projects.join(expected_slug).join("sessions").join(session_id);
+    let dir = projects
+        .join(expected_slug)
+        .join("sessions")
+        .join(session_id);
     std::fs::create_dir_all(&dir)?;
     let metadata = serde_json::json!({
         "session_id": session_id,
@@ -337,10 +345,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "amp-stub-{label}-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("amp-stub-{label}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -457,8 +463,18 @@ mod tests {
         assert!(meta.get("turn_count").is_none());
         // Empty transcript + empty events (events.jsonl is load-bearing for
         // the create-time activity events-lane attach).
-        assert_eq!(std::fs::metadata(expected_dir.join("transcript.jsonl")).unwrap().len(), 0);
-        assert_eq!(std::fs::metadata(expected_dir.join("events.jsonl")).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::metadata(expected_dir.join("transcript.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(expected_dir.join("events.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
 
         // Ensure-exists: a second call FINDS the dir, does not recreate.
         let again = ensure_session(
@@ -495,17 +511,15 @@ mod tests {
 
         let cwd_dir = home.join("elsewhere");
         std::fs::create_dir_all(&cwd_dir).unwrap();
-        let ensured =
-            ensure_session(&home, "sess-1", cwd_dir.to_str().unwrap(), "term-9").unwrap();
+        let ensured = ensure_session(&home, "sess-1", cwd_dir.to_str().unwrap(), "term-9").unwrap();
         assert!(!ensured.created);
         assert!(ensured.found_under_divergent_slug);
         assert_eq!(ensured.working_dir_of_existing.as_deref(), Some("/x"));
         assert_eq!(ensured.session_dir, existing);
         // Untouched: turn_count kept, no freshell_terminal_id injected.
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(existing.join("metadata.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(existing.join("metadata.json")).unwrap())
+                .unwrap();
         assert_eq!(meta["turn_count"], 3);
         assert!(meta.get("freshell_terminal_id").is_none());
     }
@@ -515,8 +529,7 @@ mod tests {
         let home = unique_temp_home("pathsafety");
         let cwd = std::env::temp_dir();
         for bad in ["", ".", "..", "../../../etc/passwd", "a/b", "a\\b", "x\0y"] {
-            let err =
-                ensure_session(&home, bad, cwd.to_str().unwrap(), "t").unwrap_err();
+            let err = ensure_session(&home, bad, cwd.to_str().unwrap(), "t").unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id {bad:?}");
         }
         // Rejected BEFORE touching disk: projects/ never appears.
@@ -591,10 +604,16 @@ mod tests {
     fn gc_stub_if_unused_deletes_only_unused_dirs() {
         let home = unique_temp_home("gc-rm");
         let unused = write_gc_fixture(
-            &home, "u", r#"{"session_id":"u","working_dir":"/w"}"#, Some(""),
+            &home,
+            "u",
+            r#"{"session_id":"u","working_dir":"/w"}"#,
+            Some(""),
         );
         let used = write_gc_fixture(
-            &home, "v", r#"{"session_id":"v","working_dir":"/w","turn_count":1}"#, Some(""),
+            &home,
+            "v",
+            r#"{"session_id":"v","working_dir":"/w","turn_count":1}"#,
+            Some(""),
         );
         assert!(gc_stub_if_unused(&unused));
         assert!(!unused.exists());
@@ -618,7 +637,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             verify_amplifier_layout_contract(&home),
-            CanaryOutcome::Pass { sessions_checked: 1 }
+            CanaryOutcome::Pass {
+                sessions_checked: 1
+            }
         );
     }
 
@@ -661,7 +682,11 @@ mod tests {
         let home = unique_temp_home("canary-skips");
         // (a) session dir with no metadata.json (events.jsonl-only, 2.4% of
         // the validated corpus) — skipped, not Broken.
-        let no_meta = home.join("projects").join("-p1").join("sessions").join("s1");
+        let no_meta = home
+            .join("projects")
+            .join("-p1")
+            .join("sessions")
+            .join("s1");
         std::fs::create_dir_all(&no_meta).unwrap();
         // (b) a projects/ entry with no sessions/ subdir (a literal
         // `{project}` template dir exists in real data) — skipped.
@@ -680,7 +705,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             verify_amplifier_layout_contract(&home),
-            CanaryOutcome::Pass { sessions_checked: 1 }
+            CanaryOutcome::Pass {
+                sessions_checked: 1
+            }
         );
     }
 }

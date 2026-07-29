@@ -1,5 +1,5 @@
 //! `OpencodeLocator` — deterministic PTY↔session association for FRESH opencode
-//! terminal panes. Sibling module to [`crate::amplifier_locator`]
+//! terminal panes. Sibling module to the deleted `amplifier_locator` (kata qmpk)
 //! (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`, §8: a
 //! provider-parameterized locator was explicitly rejected — the two providers'
 //! detection substrates share zero code).
@@ -53,7 +53,7 @@
 //! [`OpencodeLocator::tick`] performs **zero** SQLite reads whenever zero
 //! terminals are armed — there is nothing a tick could resolve with no armed
 //! terminal to correlate against. Mirrors
-//! [`crate::amplifier_locator::AmplifierLocator::tick`]'s identical
+//! the deleted `AmplifierLocator::tick`'s identical
 //! short-circuit and rationale.
 //!
 //! ## Bounded reads only (never the full `session` table)
@@ -339,7 +339,7 @@ impl OpencodeLocator {
             }
             if matches.len() > 1 {
                 // Never guess: refuse and log (mirrors
-                // `amplifier_locator.rs`'s ambiguity refusal).
+                // the deleted `amplifier_locator.rs`'s ambiguity refusal).
                 tracing::warn!(
                     terminal_id = %terminal_id,
                     candidates = ?matches.iter().map(|r| r.session_id.clone()).collect::<Vec<_>>(),
@@ -363,7 +363,7 @@ impl OpencodeLocator {
     }
 }
 
-/// Lexical cwd normalization (mirrors `amplifier_locator::normalize_cwd`):
+/// Lexical cwd normalization (mirrors the deleted `amplifier_locator`'s):
 /// trailing-slash / separator only — no realpath; `std::fs::canonicalize` is
 /// used opportunistically where the path exists.
 pub(crate) fn normalize_cwd(input: &str) -> String {

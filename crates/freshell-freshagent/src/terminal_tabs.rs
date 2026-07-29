@@ -447,16 +447,17 @@ fn wrap_terminal_spawn_error(
     }
 }
 
-/// Arm the amplifier/opencode session locator for a freshly-created REST
-/// terminal, iff it's a fresh (non-resuming) pane of the matching mode with a
-/// resolved cwd -- mirrors `crates/freshell-ws/src/amplifier_association::maybe_arm`
-/// / `opencode_association::maybe_arm` EXACTLY (same shared-instance `arm()`
-/// call, same argument shape); those wrapper fns are `pub(crate)` inside
-/// `freshell-ws` and unreachable from this crate (circular-dependency
-/// boundary, see this module's top doc), so this is the thin, crate-local
-/// equivalent -- the actual mode/resume/cwd admission logic lives ONCE, inside
-/// `AmplifierLocator::arm`/`OpencodeLocator::arm` themselves (shared by both
-/// crates via `freshell-sessions`), not duplicated here.
+/// Arm the opencode session locator for a freshly-created REST terminal,
+/// iff it's a fresh (non-resuming) pane of the matching mode with a
+/// resolved cwd -- mirrors `crates/freshell-ws/src/opencode_association::maybe_arm`
+/// EXACTLY (same shared-instance `arm()` call, same argument shape); that
+/// wrapper fn is `pub(crate)` inside `freshell-ws` and unreachable from this
+/// crate (circular-dependency boundary, see this module's top doc), so this
+/// is the thin, crate-local equivalent -- the actual mode/resume/cwd
+/// admission logic lives ONCE, inside `OpencodeLocator::arm` itself (shared
+/// by both crates via `freshell-sessions`), not duplicated here. (The
+/// amplifier arm was deleted with the correlation-window locator, kata qmpk
+/// — amplifier identity is launcher-assigned at create time.)
 fn arm_locators_for_fresh_pane(
     state: &FreshAgentState,
     terminal_id: &str,
@@ -464,9 +465,6 @@ fn arm_locators_for_fresh_pane(
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
 ) {
-    if let Some(locator) = &state.amplifier_locator {
-        locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
-    }
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
@@ -1353,8 +1351,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 
     // Exit hook (`tr:1479-1510` finishTerminalPtyExit, mirrored from
     // `crates/freshell-ws/src/terminal.rs:937-972`): cleanupMcpConfig BEFORE
-    // registry bookkeeping, then disarm both locators -- so a REST-created
-    // amplifier/opencode pane's armed entry is never left dangling on exit,
+    // registry bookkeeping, then disarm the opencode locator -- so a
+    // REST-created opencode pane's armed entry is never left dangling on exit,
     // exactly like the WS path's on_exit closes this same gap (the parity
     // fix this slice's scope item 2 requires). KNOWN GAP (documented, not
     // silently dropped): unlike the WS on_exit, this hook cannot call
@@ -1370,7 +1368,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         let cleanup_mode = mode.clone();
         let cleanup_cwd = mcp_cwd.clone();
         let registry_for_exit = registry.clone();
-        let amplifier_locator = state.amplifier_locator.clone();
         let opencode_locator = state.opencode_locator.clone();
         // Launcher-assigned amplifier identity (Task 11, REST twin of the WS
         // Task 10 hook): only a stub THIS create wrote (`created == true`) is
@@ -1389,9 +1386,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
-            if let Some(locator) = &amplifier_locator {
-                locator.disarm(&tid);
-            }
             if let Some(locator) = &opencode_locator {
                 locator.disarm(&tid);
             }
@@ -1950,19 +1944,16 @@ pub(crate) fn maybe_send_keys(
         }
     }
     registry.input(&terminal_id, text.as_bytes());
-    // Feed the amplifier/opencode locator's Enter<->session correlation
+    // Feed the opencode locator's Enter<->session correlation
     // (`is_submit_input`/`note_possible_submit`,
-    // `crates/freshell-ws/src/amplifier_association.rs:29-33,66-72`): a
-    // REST-created fresh amplifier/opencode pane only associates once its
-    // FIRST submit-shaped input (a bare CR/LF run) is observed here -- a
-    // REST `send-keys` must feed the SAME shared locator the WS `terminal.input`
-    // path does, or a REST-driven Enter would silently never open the
-    // locator's correlation window. No-ops (`note_submit` itself checks
-    // "is this terminal armed?") for every non-armed/non-Enter case.
+    // `crates/freshell-ws/src/opencode_association.rs`): a REST-created
+    // fresh opencode pane only associates once its FIRST submit-shaped
+    // input (a bare CR/LF run) is observed here -- a REST `send-keys` must
+    // feed the SAME shared locator the WS `terminal.input` path does, or a
+    // REST-driven Enter would silently never open the locator's correlation
+    // window. No-ops (`note_submit` itself checks "is this terminal
+    // armed?") for every non-armed/non-Enter case.
     if is_submit_input(text) {
-        if let Some(locator) = &state.amplifier_locator {
-            locator.note_submit(&terminal_id, now_ms());
-        }
         if let Some(locator) = &state.opencode_locator {
             locator.note_submit(&terminal_id, now_ms());
         }
@@ -1971,7 +1962,7 @@ pub(crate) fn maybe_send_keys(
 }
 
 /// `isSubmitInput` (`shared/turn-complete-signal.ts:125-127`, mirrored from
-/// `crates/freshell-ws/src/amplifier_association.rs:29-33`): the input is
+/// `crates/freshell-ws/src/opencode_association.rs`'s twin): the input is
 /// ONLY a run of CR/LF bytes -- an Enter keypress, possibly repeated.
 /// Anything else (real text, control sequences, partial lines) is not a
 /// submit.
@@ -3025,12 +3016,6 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
-    fn state_with_amplifier_locator(home: std::path::PathBuf) -> FreshAgentState {
-        state_with_registry().with_amplifier_locator(Some(std::sync::Arc::new(
-            freshell_sessions::amplifier_locator::AmplifierLocator::new(home),
-        )))
-    }
-
     fn state_with_opencode_locator(home: std::path::PathBuf) -> FreshAgentState {
         state_with_registry().with_opencode_locator(Some(std::sync::Arc::new(
             freshell_sessions::opencode_locator::OpencodeLocator::new(home),
@@ -3048,8 +3033,8 @@ mod tests {
             std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root));
         let state = state_with_registry().with_codex_locator(Some(locator.clone()));
         // Some(...) matches the sibling test-helper convention: the existing
-        // locator tests pass Some(std::sync::Arc::new(...)) (terminal_tabs.rs:2327-2337)
-        // because the builders take Option (with_amplifier_locator, lib.rs:362-368).
+        // locator tests pass Some(std::sync::Arc::new(...)) because the
+        // builders take Option (with_opencode_locator / with_codex_locator).
 
         arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
 
@@ -3093,11 +3078,10 @@ mod tests {
     /// broadcast `paneContent.sessionRef` (EDEV-07).
     #[tokio::test]
     async fn create_amplifier_tab_fresh_mints_identity_prestubs_and_spawns_resume_argv() {
-        let home = unique_temp_home("amplifier-fresh");
         let argv_file = unique_argv_file("amplifier-fresh");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![amplifier_recording_cli_spec(&argv_file)]),
-        );
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            amplifier_recording_cli_spec(&argv_file),
+        ]));
         let mut rx = state.broadcast_tx.subscribe();
         let tmp = std::env::temp_dir();
         let (status, body) = post(
@@ -3158,7 +3142,6 @@ mod tests {
         );
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_file(&argv_file);
     }
 
@@ -3284,58 +3267,6 @@ mod tests {
         }
 
         registry.kill(&terminal_id);
-        let _ = std::fs::remove_file(&argv_file);
-    }
-
-    #[tokio::test]
-    async fn create_amplifier_tab_disarms_locator_on_exit() {
-        let home = unique_temp_home("amplifier-disarm");
-        let argv_file = unique_argv_file("amplifier-disarm");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
-        );
-        let tmp = std::env::temp_dir();
-        let (status, body) = post(
-            app(state.clone()),
-            "/api/tabs",
-            json!({ "mode": "amplifier", "cwd": tmp.to_string_lossy() }),
-            true,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-        // Launcher-assigned identity (Task 11): fresh amplifier creates now
-        // carry a minted resume id, so `AmplifierLocator::arm`'s own gate
-        // no-ops on create (Task 12 removes the arm call entirely). ARM the
-        // locator directly for this terminal — the contract THIS test guards
-        // is the exit hook's disarm, which must keep clearing legacy armed
-        // entries regardless of how they were armed.
-        state.amplifier_locator.as_ref().unwrap().arm(
-            &terminal_id,
-            "amplifier",
-            true,
-            None,
-            Some(&tmp.to_string_lossy()),
-            now_ms(),
-        );
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
-
-        let registry = state.terminal_registry.clone().unwrap();
-        registry.kill(&terminal_id);
-        // `kill` drives the PTY's on_exit hook synchronously-enough that a
-        // short bounded poll always observes the disarm.
-        for _ in 0..30 {
-            if state.amplifier_locator.as_ref().unwrap().armed_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(
-            state.amplifier_locator.as_ref().unwrap().armed_count(),
-            0,
-            "on_exit must disarm the locator (parity with the WS create path)"
-        );
-        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_file(&argv_file);
     }
 
@@ -4488,96 +4419,6 @@ mod tests {
         );
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_file(&argv_file);
-    }
-
-    #[tokio::test]
-    async fn send_keys_enter_feeds_amplifier_locator_and_tick_locates_session() {
-        let home = unique_temp_home("amplifier-e2e");
-        let argv_file = unique_argv_file("amplifier-e2e");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
-        );
-        let router = app(state.clone());
-        let cwd_dir = home.join("workspace-cwd");
-        std::fs::create_dir_all(&cwd_dir).unwrap();
-        let (status, body) = post(
-            router.clone(),
-            "/api/tabs",
-            json!({ "mode": "amplifier", "cwd": cwd_dir.to_string_lossy() }),
-            true,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-        // Launcher-assigned identity (Task 11): fresh amplifier creates now
-        // carry a minted resume id, so `AmplifierLocator::arm`'s own gate
-        // no-ops on create (Task 12 removes the arm call entirely). ARM the
-        // locator directly — the contract THIS test guards is the send-keys
-        // → note_submit → tick correlation pipeline, not create-time arming.
-        state.amplifier_locator.as_ref().unwrap().arm(
-            &terminal_id,
-            "amplifier",
-            true,
-            None,
-            Some(&cwd_dir.to_string_lossy()),
-            now_ms(),
-        );
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
-
-        // REST send-keys with a lone Enter must feed the SAME shared locator
-        // the WS `terminal.input` path feeds (`maybe_send_keys` ->
-        // `is_submit_input` -> `note_submit`) -- proven here by driving the
-        // locator's own `tick()` directly (the periodic sweep's core
-        // mechanism, `freshell_sessions::amplifier_locator::AmplifierLocator::tick`,
-        // is public and crate-reachable; the WS-owned broadcast fan-out
-        // `drain_and_associate` wraps is NOT reachable from this crate --
-        // see this module's doc comment -- so THAT half is covered by
-        // `crates/freshell-ws/src/amplifier_association.rs`'s own test
-        // suite, not duplicated here).
-        let (send_status, _) = post(
-            router.clone(),
-            &format!("/api/panes/{pane_id}/send-keys"),
-            json!({ "data": "\r" }),
-            true,
-        )
-        .await;
-        assert_eq!(send_status, StatusCode::OK);
-
-        let dir = home
-            .join("projects")
-            .join("proj")
-            .join("sessions")
-            .join("sess-rest-e2e");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("events.jsonl"),
-            format!(
-                "{{\"event\":\"session:start\"}}\n{{\"event\":\"session:config\",\"working_dir\":\"{}\"}}\n",
-                cwd_dir.display()
-            ),
-        )
-        .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut located_ids: Vec<String> = Vec::new();
-        for _ in 0..30 {
-            let located = state.amplifier_locator.as_ref().unwrap().tick(now_ms());
-            located_ids.extend(located.into_iter().map(|l| l.session_id));
-            if !located_ids.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(
-            located_ids.contains(&"sess-rest-e2e".to_string()),
-            "expected the REST-armed + REST-note_submit'd terminal to correlate with the new \
-             session dir via tick(); located: {located_ids:?}"
-        );
-
-        state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_file(&argv_file);
     }
 

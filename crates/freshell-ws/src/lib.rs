@@ -21,7 +21,6 @@
 //! wire bytes are contract-locked.
 
 pub mod activity;
-pub mod amplifier_association;
 pub mod auto_resume;
 pub mod backpressure;
 pub mod codex_association;
@@ -32,7 +31,7 @@ pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
 pub mod identity;
-pub(crate) mod invariants;
+pub mod invariants;
 pub mod opencode_association;
 pub mod origin;
 pub mod pane_ledger;
@@ -234,16 +233,6 @@ pub struct WsState {
     /// both the `hello` frame and every later `terminal.*` frame on this
     /// connection are bounded identically.
     pub ws_max_payload_bytes: usize,
-    /// The amplifier session locator (restore-across-restart fix,
-    /// `docs/plans/2026-07-18-amplifier-restore-spec.md`): correlates a fresh
-    /// amplifier PTY's first Enter/submit with the new
-    /// `~/.amplifier/projects/.../sessions/<id>/` dir amplifier lazily creates,
-    /// so the terminal can be bound to a session identity and `terminal.rs`'s
-    /// generic resume-id derivation can drive `amplifier resume <id>` on
-    /// restart. `None` when the provider home couldn't be resolved (mirrors
-    /// `SessionDirectoryState::session_index`'s `Option` convention) -- every
-    /// [`crate::amplifier_association`] entry point no-ops in that case.
-    pub amplifier_locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
     /// Reconciliation handshake (design §5.1): the disk-truth probe behind the
     /// `pane.reconcile.request` verdict derivation — "does `provider:sessionId`
     /// exist on disk?" with defined Present/Absent/Unknown semantics. Backed by
@@ -276,8 +265,9 @@ pub struct WsState {
     /// `terminal.rs`'s generic resume-id derivation can drive
     /// `opencode --session <id>` on restart. `None` when the data home
     /// couldn't be resolved — every [`crate::opencode_association`] entry
-    /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
-    /// provider-parameterized locator was explicitly rejected).
+    /// point no-ops in that case. Sibling to the deleted amplifier locator
+    /// (spec §8: a provider-parameterized locator was explicitly rejected;
+    /// amplifier identity is now launcher-assigned at create time, kata qmpk).
     pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
     /// The codex terminal-pane rollout locator (Lane B2): correlates a fresh
     /// codex PTY's first Enter with the new rollout JSONL codex writes under
@@ -807,7 +797,6 @@ mod tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             activity: None,

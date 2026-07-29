@@ -30,25 +30,37 @@ use freshell_terminal::registry::IdentityProbeRow;
 
 use crate::identity::TerminalIdentityRegistry;
 
-/// How long after terminal creation an unresolved identity becomes
-/// alarm-worthy. The amplifier locator's dir-appear correlation window is
-/// [`freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS`]
-/// (2s) after a submit; five windows of slack keeps the alarm quiet through
-/// any normal association latency while still firing within seconds of a
-/// genuinely-lost identity.
-///
-/// This same grace also covers the codex locator
-/// ([`freshell_sessions::codex_locator::CODEX_WINDOW_MS`] = 2s,
-/// Enter-anchored, plus
-/// [`freshell_sessions::codex_locator::PENDING_FIRST_LINE_GRACE_MS`] = 10s
-/// that applies ONLY in the anomalous empty-first-line gap): fresh codex
-/// panes are expected to resolve via `codex_association` within this grace
-/// of their first Enter. A maximally slow codex git-info gap (rollout header
-/// held back until codex finishes probing repo state) can legitimately
-/// outlast the alarm grace -- in that case the alarm is advisory, not a
-/// lost identity.
-pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 =
-    5 * freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS;
+/// How long a non-shell coding-CLI terminal may run without a resolvable
+/// session identity before the invariant alarm fires once. 10s: identity is
+/// launcher-assigned at create time for claude and amplifier; the codex and
+/// opencode locators resolve within their own ~2s correlation windows, so
+/// anything unresolved after 10s is a real defect, not a race.
+/// (Previously derived from the deleted amplifier locator's
+/// AMPLIFIER_DIR_APPEAR_WINDOW_MS; the alarm also previously rode the
+/// amplifier locator sweep's 150ms ticker and silently never ran when no
+/// provider home existed — it now owns its sweep unconditionally.)
+pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 = 10_000;
+
+/// Own sweep for the terminal_identity_unresolved alarm (re-homed off the
+/// deleted amplifier locator sweep, kata qmpk). Spawned UNCONDITIONALLY at
+/// boot — the old home only ran `if amplifier_locator.is_some()`, so a
+/// missing provider home silently disabled the alarm for every provider.
+pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Once-per-terminal bound, sweep-task-lifetime scoped.
+        let mut identity_warned = std::collections::HashSet::new();
+        loop {
+            ticker.tick().await;
+            warn_unresolved_terminal_identities(
+                &state.registry.identity_probe_rows(),
+                &state.identity,
+                &mut identity_warned,
+                crate::terminal::now_ms(),
+            );
+        }
+    });
+}
 
 /// One sweep pass: WARN (once per terminal, tracked in `warned`) for every
 /// RUNNING non-shell terminal older than [`IDENTITY_RESOLUTION_GRACE_MS`]
@@ -233,6 +245,16 @@ mod tests {
             })
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn identity_resolution_grace_is_a_standalone_constant() {
+        // Re-homed from 5 * AMPLIFIER_DIR_APPEAR_WINDOW_MS when the amplifier
+        // correlation-window locator was deleted (kata qmpk). 10s: generous
+        // for every provider's identity to land at create time (identity is
+        // launcher-assigned for claude and amplifier; codex/opencode locators
+        // resolve within their own ~2s windows).
+        assert_eq!(IDENTITY_RESOLUTION_GRACE_MS, 10_000);
     }
 
     #[test]

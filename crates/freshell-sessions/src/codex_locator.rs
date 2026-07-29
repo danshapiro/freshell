@@ -1,6 +1,6 @@
 //! Server-side codex terminal-pane session locator (Lane B2, campaign §2.3.2).
 //!
-//! Third sibling of `amplifier_locator` / `opencode_locator` (a
+//! Sibling of `opencode_locator` and the deleted `amplifier_locator` (a
 //! provider-parameterized locator was explicitly rejected — the substrates
 //! share zero code). Substrate: codex persists ONE JSONL rollout file per
 //! session under a process-global sessions root

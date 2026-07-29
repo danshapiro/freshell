@@ -189,25 +189,19 @@ pub struct FreshAgentState {
     /// route degrades honestly instead of touching data it was never given"
     /// convention.
     pub(crate) cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
-    /// The SAME amplifier session locator the WS `terminal.create` path arms
-    /// (`freshell_ws::amplifier_association::maybe_arm`), wired in from
-    /// `freshell-server`'s main.rs via [`Self::with_amplifier_locator`] so a
-    /// REST-created fresh amplifier pane arms the identical instance the
+    /// The SAME opencode session locator the WS `terminal.create` path arms
+    /// (`freshell_ws::opencode_association::maybe_arm`), wired in from
+    /// `freshell-server`'s main.rs via [`Self::with_opencode_locator`] so a
+    /// REST-created fresh opencode pane arms the identical instance the
     /// periodic sweep (spawned once, against `WsState`, at boot) already
     /// polls -- association/broadcast parity falls out of sharing the one
     /// locator rather than standing up a second sweep loop this crate would
     /// have no way to drive (the sweep's `identity.upsert` target,
     /// `freshell_ws::identity::TerminalIdentityRegistry`, is `freshell-ws`-
     /// owned and unreachable here without a circular crate dependency).
-    /// `None` when unwired (every pre-existing test) or when the provider
-    /// home can't be resolved (mirrors `main.rs`'s own `Option` convention).
-    pub(crate) amplifier_locator:
-        Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
-    /// Sibling to [`Self::amplifier_locator`] for the opencode terminal-pane
-    /// restore fix -- the SAME shared instance
-    /// `freshell_ws::opencode_association::maybe_arm` arms.
+    /// `None` when unwired (every pre-existing test).
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
-    /// Sibling to [`Self::amplifier_locator`] for the P1.14 / Incident-4
+    /// Sibling to [`Self::opencode_locator`] for the P1.14 / Incident-4
     /// codex hardening -- the SAME shared instance the WS
     /// `codex_association` entry points arm and the B2 sweep polls.
     pub(crate) codex_locator:
@@ -287,7 +281,6 @@ impl FreshAgentState {
             pane_tabs: Arc::new(Mutex::new(HashMap::new())),
             restore_keys: Arc::new(Mutex::new(HashMap::new())),
             cli_commands: Arc::new(Vec::new()),
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             identity_sink: Arc::new(std::sync::OnceLock::new()),
@@ -419,21 +412,11 @@ impl FreshAgentState {
     }
 
     /// Slice 3a (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): wire
-    /// in the SAME [`freshell_sessions::amplifier_locator::AmplifierLocator`]
-    /// the WS `terminal.create` path arms, so a REST-created fresh amplifier
+    /// in the SAME [`freshell_sessions::opencode_locator::OpencodeLocator`]
+    /// the WS `terminal.create` path arms, so a REST-created fresh opencode
     /// pane is armed in the identical instance the already-running periodic
     /// sweep polls. `freshell-server`'s `main.rs` calls this once at boot
     /// with the same `Arc` (or `None`) `WsState` holds.
-    pub fn with_amplifier_locator(
-        mut self,
-        locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
-    ) -> Self {
-        self.amplifier_locator = locator;
-        self
-    }
-
-    /// Sibling to [`Self::with_amplifier_locator`] for the opencode
-    /// terminal-pane restore fix's [`freshell_sessions::opencode_locator::OpencodeLocator`].
     pub fn with_opencode_locator(
         mut self,
         locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
@@ -442,7 +425,7 @@ impl FreshAgentState {
         self
     }
 
-    /// Sibling to [`Self::with_amplifier_locator`] for the P1.14 /
+    /// Sibling to [`Self::with_opencode_locator`] for the P1.14 /
     /// Incident-4 codex hardening's [`freshell_sessions::codex_locator::CodexLocator`].
     pub fn with_codex_locator(
         mut self,

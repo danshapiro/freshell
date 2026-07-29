@@ -1,5 +1,5 @@
 //! OpenCode terminal-pane session association (Slice B + the input-submit
-//! seam) — sibling of [`crate::amplifier_association`], bringing opencode
+//! seam) — sibling of the deleted amplifier association (kata qmpk), bringing opencode
 //! TERMINAL panes (the raw `opencode` CLI in a PTY) to durable-restore parity
 //! with codex/amplifier (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`).
 //!
@@ -15,7 +15,7 @@
 //! feed it submit-shaped input, and (once it resolves) bind + broadcast the
 //! identity exactly like every other provider's create-time path does.
 //!
-//! Mirrors `amplifier_association.rs`'s reject checks (terminal missing/not
+//! Mirrors the deleted `amplifier_association.rs`'s reject checks (terminal missing/not
 //! running, wrong mode, already bound) as defense-in-depth — the locator's
 //! own single-bind-per-terminal design already makes these redundant in
 //! practice, but a terminal could legitimately be killed between `Located`
@@ -32,7 +32,7 @@ use crate::WsState;
 /// `isSubmitInput` (`shared/turn-complete-signal.ts:125-127`): the input is
 /// ONLY a run of CR/LF bytes -- an Enter keypress, possibly repeated. Anything
 /// else (real text, control sequences, partial lines) is not a submit.
-/// Identical rule to `amplifier_association::is_submit_input` — duplicated
+/// Identical rule to the deleted `amplifier_association::is_submit_input` — duplicated
 /// rather than shared (spec §5, Slice B: "a one-liner, duplication
 /// acceptable").
 pub(crate) fn is_submit_input(data: &str) -> bool {
@@ -75,14 +75,14 @@ pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &st
 
 /// Drive one locator polling cycle and bind + broadcast every association it
 /// resolved this tick. Intended to be called periodically (the sweep-timer
-/// pattern already used by `spawn_amplifier_locator_sweep`).
+/// pattern the deleted `spawn_amplifier_locator_sweep` also used).
 ///
 /// `OpencodeLocator::tick` is a synchronous, bounded SQLite read whenever at
 /// least one terminal is armed (see its module doc for the idle
 /// short-circuit that makes it a zero-I/O no-op otherwise). Either way, this
 /// runs the tick inside `tokio::task::spawn_blocking` rather than directly on
 /// this async task's worker thread — mirroring
-/// `amplifier_association::drain_and_associate`'s identical wrapping.
+/// the deleted `amplifier_association::drain_and_associate`'s identical wrapping.
 pub(crate) async fn drain_and_associate(state: &WsState) {
     let Some(locator) = &state.opencode_locator else {
         return;
@@ -172,7 +172,7 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
 /// `reconcileTerminalSessionAssociation` persists) AND a `terminal.meta.updated`
 /// upsert (the same shape `terminal.rs`'s `broadcast_terminal_meta_created`
 /// emits at create time for every other provider) to every connection.
-/// Mirrors `amplifier_association::broadcast_terminal_session_associated`.
+/// Mirrors the deleted `amplifier_association`'s identical broadcast (kata qmpk).
 fn broadcast_terminal_session_associated(
     state: &WsState,
     terminal_id: &str,
@@ -211,7 +211,7 @@ fn broadcast_terminal_session_associated(
     }
 }
 
-/// The sweep-timer wiring (mirrors `spawn_amplifier_locator_sweep`):
+/// The sweep-timer wiring (mirrors `freshell-server`'s `spawn_sessions_sweep`):
 /// periodically drive the locator's polling cycle and process any resolved
 /// associations, off the per-connection select loops.
 pub fn spawn_opencode_locator_sweep(state: WsState, interval: std::time::Duration) {
@@ -290,7 +290,6 @@ mod tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
             codex_locator: None,
             activity: None,

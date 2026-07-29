@@ -223,10 +223,16 @@ impl ActivityHub {
         })
     }
 
-    /// Attach an amplifier events lane for a freshly-ASSOCIATED terminal
-    /// (called by [`crate::amplifier_association`] once the locator resolves).
-    /// `Start` replays the young file from byte 0 — the recorded
-    /// `prompt:submit` is what confirms the tracker's provisional busy.
+    /// Test-only model of the create-time events-lane attach: enqueues the
+    /// same `HubEvent::AmplifierAttach` (with `AttachAt::Start`) the
+    /// production `ActivityEvent::Created` resolver arm enqueues for an
+    /// amplifier terminal whose `events.jsonl` already exists. Its production
+    /// caller was the deleted post-spawn amplifier association (kata qmpk —
+    /// identity is launcher-assigned at create time now); the unit tests
+    /// below keep using it to pin real lane behavior. `Start` replays the
+    /// young file from byte 0 — the recorded `prompt:submit` is what
+    /// confirms the tracker's provisional busy.
+    #[cfg(test)]
     pub fn attach_amplifier_association(
         &self,
         terminal_id: &str,

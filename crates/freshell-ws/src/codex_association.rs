@@ -16,7 +16,7 @@ use crate::terminal::now_ms;
 use crate::WsState;
 
 /// Deliberate one-line duplicate of `opencode_association::is_submit_input`
-/// (itself a duplicate of `amplifier_association`'s — spec §5: "a one-liner,
+/// (itself a duplicate of the deleted `amplifier_association`'s — spec §5: "a one-liner,
 /// duplication acceptable"): the input is ONLY a run of CR/LF bytes — an
 /// Enter keypress, possibly repeated.
 pub(crate) fn is_submit_input(data: &str) -> bool {
@@ -224,7 +224,6 @@ mod tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: Some(StdArc::new(CodexLocator::new(data_home))),
             activity: None,
