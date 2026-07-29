@@ -225,13 +225,16 @@ snapshot fact maps to retry. That is the state-race fence.
 - `crates/freshell-ws/src/reconcile_freshagent.rs`
 - `crates/freshell-ws/src/terminal.rs`
 - `crates/freshell-ws/src/lib.rs`
+- `crates/freshell-server/src/identity_sink.rs`
 - `crates/freshell-server/src/existence.rs`
 - `crates/freshell-server/src/main.rs`
 - New: `crates/freshell-server/src/recovery_providers.rs`
 - `crates/freshell-ws/src/pane_ledger.rs`
+- `crates/freshell-ws/src/pane_ledger_scan.rs`
 - `crates/freshell-ws/src/pane_ledger_tests.rs`
 - `crates/freshell-terminal/src/registry.rs`
 - `crates/freshell-freshagent/src/lib.rs`
+- `crates/freshell-freshagent/src/identity_sink.rs`
 - `crates/freshell-freshagent/src/session_lease.rs`
 - `shared/ws-protocol.ts`
 - `crates/freshell-protocol/src/common.rs`
@@ -298,6 +301,7 @@ snapshot fact maps to retry. That is the state-race fence.
 - New: `crates/freshell-sessions/tests/opencode_exact.rs`
 - New: `crates/freshell-server/tests/opencode_database_alignment.rs`
 - `crates/freshell-protocol/tests/roundtrip.rs`
+- `crates/freshell-protocol/tests/inventory.rs`
 - `test/unit/client/lib/pane-reconcile.test.ts`
 - New: `test/unit/client/lib/pane-reconcile-controller.test.ts`
 - `test/unit/client/lib/ws-client.reconcile.test.ts`
@@ -324,14 +328,28 @@ snapshot fact maps to retry. That is the state-race fence.
 - Modify `crates/freshell-server/Cargo.toml`
 - Modify `crates/freshell-ws/src/existence.rs`
 - Modify `crates/freshell-ws/src/reconcile.rs`
+- Modify `crates/freshell-ws/src/reconcile_freshagent.rs`
+- Modify `crates/freshell-ws/src/terminal.rs`
+- Modify `crates/freshell-ws/src/lib.rs`
+- Modify `crates/freshell-ws/src/codex_association.rs`
 - Modify `crates/freshell-ws/src/pane_ledger.rs`
+- Modify `crates/freshell-ws/src/pane_ledger_scan.rs`
 - Modify `crates/freshell-ws/src/pane_ledger_tests.rs`
+- Modify `crates/freshell-ws/tests/pane_ledger_restore.rs`
+- Modify `crates/freshell-ws/tests/pane_reconcile.rs`
+- Modify `crates/freshell-ws/tests/pane_reconcile_freshagent.rs`
 - Add `crates/freshell-server/src/recovery_providers.rs`
+- Modify `crates/freshell-server/src/existence.rs`
+- Modify `crates/freshell-server/src/identity_sink.rs`
 - Modify `crates/freshell-server/src/main.rs`
+- Modify `crates/freshell-server/src/recovery_inventory.rs`
+- Modify `crates/freshell-server/src/recovery_inventory_tests.rs`
+- Modify `crates/freshell-freshagent/src/identity_sink.rs`
 - Modify `shared/ws-protocol.ts`
 - Modify `crates/freshell-protocol/src/common.rs`
 - Modify `crates/freshell-protocol/src/client_messages.rs`
 - Modify `crates/freshell-protocol/src/server_messages.rs`
+- Modify `crates/freshell-protocol/tests/inventory.rs`
 - Modify focused protocol/reconcile tests
 
 **Interfaces:**
@@ -390,16 +408,19 @@ cargo test -p freshell-ws --test pane_reconcile invalid_session_refs_do_zero_sto
 cargo test -p freshell-ws --test pane_reconcile_freshagent invalid_session_refs_do_zero_store_io -- --nocapture
 ```
 
-Expected RED: unknown providers currently become absent/fresh and validation is
-not provider-aware.
+Expected RED: the new exact validator/registry contract does not exist yet.
+Exercise it directly; the production legacy WebSocket handler intentionally
+keeps its old absent/fresh behavior until Task 5 activates the complete exact
+runtime.
 
 - [ ] **Step 2: Implement the leaf contract crate, typed registry, and validation**
 
 Put the I/O-free query/result types, coordinator interface, and ownership
 interface in `freshell-recovery`, depending only on lower-level protocol/value
-crates. Both `freshell-ws` and `freshell-freshagent` depend on this leaf; the
-leaf must not depend on either, preventing a cycle. The server composition
-root owns the concrete provider registry. Task 1 makes it
+crates plus the external UUID parser needed for canonical validation. Both
+`freshell-ws` and `freshell-freshagent` depend on this leaf; the leaf must not
+depend on either, on provider-store crates, or on the server, preventing a
+cycle. The server composition root owns the concrete provider registry. Task 1 makes it
 constructible/testable; Task 4 injects the same shared coordinator/owner into
 WebSocket, REST, auto-resume, and fresh-agent state, and Task 5 activates the
 complete runtime.
@@ -418,8 +439,11 @@ APIs are exercised directly by focused tests.
 - [ ] **Step 3: Write RED additive wire-capability tests**
 
 Pin protocol parsing/serialization for offered, acknowledged, and omitted
-`paneReconcileExactV1`. A server may echo it only when the client offered it
-and the complete `ExactRestoreRuntime` is installed; otherwise it is omitted
+`paneReconcileExactV1`. In Task 1, round-trip the wire value and prove the real
+server omits it even when offered because no complete `ExactRestoreRuntime`
+exists. Task 5 adds the first positive real-handshake test when it constructs
+that aggregate runtime. A server may echo the capability only when the client
+offered it and the complete runtime is installed; otherwise it is omitted
 while legacy `paneReconcileV1` remains unchanged. The capability is additive.
 Do not change the request/result discriminants, the 200-pane limit, or the
 frozen verdict enum. Also pin the additive cancel/ack frames; an old server
@@ -500,6 +524,7 @@ cargo fmt --check
 git diff --check
 git add Cargo.toml Cargo.lock crates/freshell-recovery crates/freshell-protocol \
   crates/freshell-ws crates/freshell-freshagent/Cargo.toml \
+  crates/freshell-freshagent/src/identity_sink.rs \
   crates/freshell-server shared/ws-protocol.ts
 git commit -m "feat(recovery): close durable provider and materialization contracts"
 ```
@@ -559,9 +584,12 @@ git commit -m "feat(recovery): close durable provider and materialization contra
 - Fall back to both `sessions/` and `archived_sessions/`.
 - A valid DB-selected owned path is canonical. Without a valid DB selection,
   one unique owned fallback wins; multiple distinct owned fallbacks conflict.
-- Stale row, missing row/file, empty/partial metadata, busy/corrupt/unknown
-  schema, or incomplete scan is retryable. Never migrate, checkpoint, or
-  read-repair.
+- A stale/missing DB row or its missing referenced file triggers the bounded
+  active/archive fallback. One unique fully owned fallback is present;
+  no unique proof is retryable (and multiple distinct owned fallbacks
+  conflict). Empty/partial metadata, SQLite busy/corrupt/unknown schema, or
+  an incomplete scan remains retryable and never authorizes a process. Never
+  migrate, checkpoint, or read-repair.
 
 - [ ] **Step 1: Pin Claude behavior with RED tests**
 
@@ -913,8 +941,10 @@ Assertions:
 - overload retry;
 - an admitted >400 ms fake returns retry by the deadline while retaining its
   permit until the fake exits;
-- a provider panic/join failure maps only its affected queries to retry,
-  releases the permit, and leaves subsequent requests healthy;
+- a provider panic caught inside the blocking job maps only that provider’s
+  affected queries to retry; an outer `spawn_blocking` `JoinError`, which
+  loses the whole job result, maps every query in that request to retry.
+  Both paths release the permit and leave subsequent requests healthy;
 - event loop remains responsive;
 - final A→B without a B fact retries;
 - live terminal appearing while the batch runs attaches;
@@ -1220,6 +1250,8 @@ present. Its constructor requires the coordinator, arbiter, launch guard,
 identity reporters, ledger, and cleanup supervisor; callers cannot set a
 free-floating readiness bool. Add a handshake/integration assertion that
 constructing server state without the aggregate keeps the capability omitted.
+With the aggregate present, an offered exact capability is echoed; an
+unoffered capability remains omitted.
 When the aggregate is present, route both exact-capability and legacy
 `paneReconcileV1` requests through the exact engine; only the capability echo
 controls whether a new client may release durable creates.
