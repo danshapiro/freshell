@@ -592,7 +592,12 @@ mod tests {
             // SAFETY: umask() only reads/writes this (now-private) thread's
             // umask and returns the prior value; no pointers involved.
             let prior = unsafe { libc::umask(0o222) };
-            let outcome = ensure_session(&home_for_thread, &session_id_owned, &cwd_str, "term-rollback");
+            let outcome = ensure_session(
+                &home_for_thread,
+                &session_id_owned,
+                &cwd_str,
+                "term-rollback",
+            );
             unsafe { libc::umask(prior) };
             outcome
         })
