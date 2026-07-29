@@ -61,6 +61,7 @@ interface SortableTabProps {
   displayTitle: string
   isActive: boolean
   needsAttention: boolean
+  isReady: boolean
   busy: boolean
   busyPaneIds: string[]
   isDragging: boolean
@@ -84,6 +85,7 @@ function SortableTab({
   displayTitle,
   isActive,
   needsAttention,
+  isReady,
   busy,
   busyPaneIds,
   isDragging,
@@ -126,6 +128,7 @@ function SortableTab({
         tab={tabWithDisplayTitle}
         isActive={isActive}
         needsAttention={needsAttention}
+        isReady={isReady}
         busy={busy}
         busyPaneIds={busyPaneIds}
         isDragging={isDragging}
@@ -151,6 +154,7 @@ function SortableTab({
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
+const EMPTY_READY: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
@@ -176,6 +180,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
+  const readyByTab = useAppSelector((s) => s.turnCompletion?.readyByTab) ?? EMPTY_READY
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
   const amplifierActivityByTerminalId = useAppSelector((s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID)
@@ -334,6 +339,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         displayTitle={getDisplayTitle(tab)}
         isActive={tab.id === activeTabId}
         needsAttention={!!attentionByTab[tab.id]}
+        isReady={!!readyByTab[tab.id]}
         busy={busyPaneIds.length > 0}
         busyPaneIds={busyPaneIds}
         isDragging={activeId === tab.id}
@@ -382,6 +388,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     activeId,
     activeTabId,
     attentionByTab,
+    readyByTab,
     attentionDismiss,
     dispatch,
     getDisplayTitle,
@@ -596,6 +603,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
                 needsAttention={!!attentionByTab[activeTab.id]}
+                isReady={!!readyByTab[activeTab.id]}
                 busy={getBusyPaneIds(activeTab).length > 0}
                 busyPaneIds={getBusyPaneIds(activeTab)}
                 isDragging={false}

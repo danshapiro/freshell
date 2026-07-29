@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, within, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
@@ -10,7 +10,7 @@ import panesReducer from '@/store/panesSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
-import turnCompletionReducer from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { markTabAttention } from '@/store/turnCompletionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -544,6 +544,40 @@ describe('TabBar', () => {
       const attentionTabElement = screen.getByText('Needs Attention').closest('div[class*="group"]')
       expect(attentionTabElement?.className).toContain('bg-emerald-100')
       expect(attentionTabElement?.className).toContain('text-emerald-900')
+    })
+  })
+
+  describe('canonical state wiring', () => {
+    it('unacked inactive tab shows the green bar; clicking it clears the bar but keeps green', async () => {
+      const tab1 = createTab({ id: 'tab-1', title: 'Tab 1' })
+      const tab2 = createTab({ id: 'tab-2', title: 'Tab 2' })
+
+      const store = createStore({
+        tabs: [tab1, tab2],
+        activeTabId: 'tab-1',
+      })
+
+      renderWithStore(<TabBar />, store)
+
+      // Mark tab-2 ready+unacked through the real reducers:
+      act(() => {
+        store.dispatch(markTabAttention({ tabId: 'tab-2' }))
+      })
+
+      // Bar visible on the inactive unacked tab.
+      expect(screen.getByTestId('tab-attention-bar')).toBeTruthy()
+
+      // Click tab-2 (attentionDismiss defaults to 'click').
+      fireEvent.click(screen.getByText('Tab 2'))
+
+      // Attention cleared -> bar gone; readyByTab persists -> still green.
+      // NOTE: after the click tab-2 is the ACTIVE tab, so "green" renders as the
+      // active-ready style (green top border), not the inactive emerald fill.
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
+      expect(store.getState().turnCompletion.readyByTab['tab-2']).toBe(true)
+      expect(screen.queryByTestId('tab-attention-bar')).toBeNull()
+      const tabEl = screen.getByText('Tab 2').closest('div[class*="group"]')
+      expect(tabEl?.className).toContain('border-t-success')
     })
   })
 
