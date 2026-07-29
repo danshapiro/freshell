@@ -827,7 +827,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByText('Pane-owned session').closest('button')
       expect(button).not.toBeNull()
       expect(button).toHaveAttribute('data-has-tab', 'true')
-      expect(button).toHaveClass('bg-muted')
+      expect(button).toHaveClass('bg-zinc-200')
     })
 
     it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
@@ -884,7 +884,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByText('Named resume session').closest('button')
       expect(button).not.toBeNull()
       expect(button).toHaveAttribute('data-has-tab', 'false')
-      expect(button).not.toHaveClass('bg-muted')
+      expect(button).not.toHaveClass('bg-zinc-200')
     })
   })
 

@@ -954,7 +954,10 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           className={cn(
             'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group',
             isActiveTab
-              ? 'bg-muted'
+              ? // Slightly darker selected highlight than bg-muted (zinc-100/zinc-800).
+                // Dark mode uses translucent zinc-800 over the bg-card surface so it is
+                // darker than the old #27272A while staying distinguishable from #18181B.
+                'bg-zinc-200 dark:bg-zinc-800/60'
               : 'hover:bg-muted/50'
           )}
           data-context={ContextIds.SidebarSession}
