@@ -58,9 +58,11 @@ zstd), React 18, Redux Toolkit, TypeScript, Vitest, Playwright.
 - 201 and 417 panes are sent as deterministic wire batches of at most 200.
   Every create remains held until that pane’s own current-generation verdict.
 - A miss, partial read, metadata error, SQLite busy/schema error, stale row,
-  ambiguous match, or provider-store race never authorizes a process.
-- A restore create whose current proof no longer establishes the same exact
-  owner between reconcile and launch does not spawn.
+  ambiguous match, or provider-store race never exposes or binds a process.
+- A restore create whose proof changes before the immediate pre-spawn fence
+  does not spawn. A change possible only after spawn keeps that resource
+  quarantined; post-ack proof failure cleans it before any created response or
+  durable binding.
 - A provider that reports a different session identity after launch is treated
   as a failed restore, not silently adopted.
 - Simultaneous terminal-versus-fresh, WS-versus-REST, and auto-resume races for
@@ -69,8 +71,9 @@ zstd), React 18, Redux Toolkit, TypeScript, Vitest, Playwright.
 - A new client trusts actionable durable reconciliation only when
   `ready.capabilities.paneReconcileExactV1` is acknowledged. Against an older
   server—whether it advertises only the legacy capability or none—it sends
-  zero durable creates and shows “Server update required to restore saved
-  sessions.” Stateless panes still start.
+  zero durable launch-capable messages (create, attach, or materializing send)
+  and shows “Server update required to restore saved sessions.” Stateless
+  panes still start and their current-generation sends remain usable.
 - This is a deliberate WebSocket protocol v8 revision. A v8 client that
   receives v7’s pre-auth `PROTOCOL_MISMATCH` reconnects once with v7, then
   applies the exact-capability fail-closed rule above. A v8 server accepts
@@ -186,12 +189,26 @@ pub struct ExactRecoveryProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExactRecoveryQuery {
+pub struct ExactRecoveryLookupKey {
     pub session_ref: SessionLocator,
     pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactRecoveryQuery {
+    pub key: ExactRecoveryLookupKey,
     pub materialization: MaterializationState,
 }
 ```
+
+`ExactRecoverySnapshot` is keyed only by `ExactRecoveryLookupKey`.
+Materialization is policy input, never part of lookup identity: the coordinator
+deduplicates on the stable key, probes artifacts, then applies the most current
+ledger materialization during final mapping. A provider-positive result may
+persist `Observed` and remain addressable under the same snapshot key. If an
+artifact-missing `AllocatedUnmaterialized` fact is followed by a final ledger
+transition away from `Allocated`, it becomes retryable; it cannot inherit the
+old allocation exception.
 
 The shared terminal/fresh mapper is exact:
 
@@ -209,9 +226,11 @@ Stable invalid issue codes include `unsupported_session_provider`,
 returns `SessionExistence::Absent`. History state and pane kind cannot alter
 this table; pane-kind support is validated before lookup.
 
-The request-local snapshot answers only the exact keys it contains. If final
-registry/ledger re-derivation selects a different reference or cwd, a missing
-snapshot fact maps to retry. That is the state-race fence.
+The request-local snapshot answers only the exact stable lookup keys it
+contains. If final registry/ledger re-derivation selects a different reference
+or cwd, a missing snapshot fact maps to retry. A materialization-only
+transition uses the same key and the stricter current policy as described
+above. That is the state-race fence.
 
 ---
 
@@ -252,6 +271,8 @@ snapshot fact maps to retry. That is the state-race fence.
 - `port/contract/ws-server-messages.schema.json`
 - `port/contract/ws-message-inventory.json`
 - `port/contract/README.md`
+- `port/contract/nondeterministic-fields.md`
+- `server/ws-handler.ts`
 
 ### Provider proofs
 
@@ -292,6 +313,7 @@ snapshot fact maps to retry. That is the state-race fence.
 - New: `src/lib/pane-reconcile-controller.ts`
 - `src/lib/pane-reconcile.ts`
 - `src/lib/ws-client.ts`
+- `src/lib/fresh-agent-ws.ts`
 - `src/App.tsx`
 - `src/components/TerminalView.tsx`
 - `src/components/fresh-agent/FreshAgentView.tsx`
@@ -317,9 +339,12 @@ snapshot fact maps to retry. That is the state-race fence.
 - `crates/freshell-protocol/tests/inventory.rs`
 - `crates/freshell-protocol/tests/version.rs`
 - `test/unit/port/ws-contract-freeze.test.ts`
+- `test/unit/port/oracle/external-handshake-t0.test.ts`
+- `test/server/ws-tabs-registry.test.ts`
 - `test/unit/client/lib/pane-reconcile.test.ts`
 - New: `test/unit/client/lib/pane-reconcile-controller.test.ts`
 - `test/unit/client/lib/ws-client.reconcile.test.ts`
+- `test/unit/client/lib/fresh-agent-ws.test.ts`
 - `test/unit/client/components/App.reconcile-adoption.test.tsx`
 - New: `test/unit/client/components/TerminalView.reconcile.test.tsx`
 - `test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx`
@@ -340,6 +365,31 @@ snapshot fact maps to retry. That is the state-race fence.
 - `test/e2e-browser/fixtures/fake-opencode.cjs`
 - `test/e2e-browser/fixtures/fake-amplifier-cli.mjs`
 - `test/e2e-browser/playwright.config.ts`
+
+---
+
+## Shared-Worktree Commit Discipline
+
+At the start of every task, record `TASK_BASE=$(git rev-parse HEAD)`. Before
+staging, inspect `git status --short` and the task diff. Stage only individual,
+reviewed files that the implementer changed for that task, using exact path
+arguments (`git add -- path/to/file ...`). Never use a directory path, glob,
+`git add -A`, or `git add .`; another agent may have changed a neighboring
+file. Generated contract artifacts are three explicit file paths, not the
+`port/contract` directory.
+
+Before each commit run:
+
+```bash
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
+```
+
+Every staged path must appear in that task’s Files list (or be a
+compile-required path added to the plan and implementer report), and every
+hunk must belong to the task. If an unexpected/shared edit appears, leave it
+unstaged and report it rather than absorbing it.
 
 ---
 
@@ -386,14 +436,19 @@ snapshot fact maps to retry. That is the state-race fence.
 - Regenerate `port/contract/ws-server-messages.schema.json`
 - Regenerate `port/contract/ws-message-inventory.json`
 - Modify `port/contract/README.md`
+- Modify `port/contract/nondeterministic-fields.md`
+- Modify `server/ws-handler.ts`
 - Modify `test/unit/port/ws-contract-freeze.test.ts`
+- Modify `test/unit/port/oracle/external-handshake-t0.test.ts`
+- Modify `test/server/ws-tabs-registry.test.ts`
 - Modify `src/lib/ws-client.ts`
 - Modify `test/unit/client/lib/ws-client.reconcile.test.ts`
 - Modify focused protocol/reconcile tests
 
 **Interfaces:**
 - `RecoveryProviderRegistry`
-- `ExactRecoveryQuery`, `ExactRecoveryState`, `ExactRecoveryIssue`
+- `ExactRecoveryLookupKey`, `ExactRecoveryQuery`, `ExactRecoveryState`,
+  `ExactRecoveryIssue`
 - `ExactRecoveryProof`
 - `RecoveryOwnerKey` with provider-defined global/project scope
 - `MaterializationState::{Allocated, Observed, Unknown}`
@@ -501,8 +556,8 @@ Treat this as protocol v8, not an incidental edit to the frozen v7 contract:
 - the server accepts 7 or 8 but exact capability negotiation is v8-only;
 - the client normally sends 8 and, only after an actual pre-auth
   `PROTOCOL_MISMATCH`, retries that connection once with 7. On v7 it withholds
-  all durable creates and shows the server-update state once Task 6 installs
-  the exact sender gate; Task 1 implements the one-shot transport fallback so
+  all durable launch traffic and shows the server-update state once Task 6
+  installs the exact sender gate; Task 1 implements the one-shot transport fallback so
   the intermediate commit preserves legacy connectivity. Preserve queued
   messages without sending them between handshakes, then use the existing
   legacy flush only after v7 `ready`; Task 6 replaces that flush for durable
@@ -528,14 +583,28 @@ cargo test -p freshell-protocol --test inventory -- --nocapture
 cargo test -p freshell-protocol --test version -- --nocapture
 cargo test -p freshell-ws capability_negotiation -- --nocapture
 npm run contract:generate
-git add port/contract
+git add -- port/contract/ws-protocol.schema.json \
+  port/contract/ws-server-messages.schema.json \
+  port/contract/ws-message-inventory.json
 npm run contract:generate
 git diff --exit-code -- port/contract
 npm run test:port
 npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/server/ws-tabs-registry.test.ts --config config/vitest/vitest.server.config.ts
 ```
 
-- [ ] **Step 4: Write RED ledger tests for allocated versus observed**
+- [ ] **Step 4: Implement and regenerate the v8 compatibility transport**
+
+Implement the Rust/TypeScript message types, optional pane cwd, dual-version
+server handshake, exact-capability omission, and one-shot client fallback
+specified above. Update every hard-coded protocol assertion: the external T0
+handshake uses current v8; the Node handshake suite accepts both v7 and v8 and
+rejects v6/v9 rather than using `WS_PROTOCOL_VERSION - 1`; contract
+nondeterminism guidance names v8 current and v7 compatibility. Regenerate and
+stage only the three named contract artifacts, regenerate a second time, then
+run every command from Step 3 to GREEN.
+
+- [ ] **Step 5: Write RED ledger tests for allocated versus observed**
 
 Pin additive JSON compatibility:
 
@@ -568,7 +637,7 @@ Run:
 cargo test -p freshell-ws pane_ledger -- --nocapture
 ```
 
-- [ ] **Step 5: Implement materialization persistence**
+- [ ] **Step 6: Implement materialization persistence**
 
 Add `materialization` and optional normalized `provider_scope` to
 `BindingWrite`/ledger rows. Key new rows and filenames by `RecoveryOwnerKey`;
@@ -596,13 +665,13 @@ Provider stores remain read-only. Add a batched ledger operation so a
 17-pane reconcile performs one serialized ledger transaction rather than 17
 independent lock acquisitions.
 
-- [ ] **Step 6: Add independent provider-root construction tests**
+- [ ] **Step 7: Add independent provider-root construction tests**
 
 With `HOME` absent, construct the registry with only one provider override at a
 time. Exact-provider registration must not depend on `SessionIndex` or
 `provider_home()`.
 
-- [ ] **Step 7: Run focused checks and commit**
+- [ ] **Step 8: Run focused checks and commit**
 
 ```bash
 cargo test -p freshell-ws pane_ledger -- --nocapture
@@ -612,15 +681,14 @@ cargo test -p freshell-protocol --test pane_reconcile -- --nocapture
 cargo test -p freshell-protocol --test inventory -- --nocapture
 cargo test -p freshell-protocol --test version -- --nocapture
 npm run test:port
+npm run test:vitest -- run test/server/ws-tabs-registry.test.ts --config config/vitest/vitest.server.config.ts
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add Cargo.toml Cargo.lock crates/freshell-recovery crates/freshell-protocol \
-  crates/freshell-ws crates/freshell-freshagent/Cargo.toml \
-  crates/freshell-freshagent/src/identity_sink.rs \
-  crates/freshell-server shared/ws-protocol.ts shared/ws-version.ts \
-  port/contract test/unit/port/ws-contract-freeze.test.ts \
-  src/lib/ws-client.ts test/unit/client/lib/ws-client.reconcile.test.ts
+# Stage each reviewed Task 1 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "feat(recovery): close durable provider and materialization contracts"
 ```
 
@@ -750,9 +818,10 @@ cargo test -p freshell-sessions codex -- --nocapture
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add Cargo.toml Cargo.lock crates/freshell-freshagent \
-  crates/freshell-platform crates/freshell-sessions \
-  crates/freshell-server/src/recovery_providers.rs
+# Stage each reviewed Task 2 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "feat(recovery): prove exact claude and codex sessions"
 ```
 
@@ -894,12 +963,10 @@ cargo test -p freshell-server recovery_providers -- --nocapture
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add Cargo.lock crates/freshell-sessions crates/freshell-platform \
-  crates/freshell-opencode crates/freshell-freshagent/src/lib.rs \
-  crates/freshell-freshagent/src/opencode_ws.rs \
-  crates/freshell-freshagent/src/terminal_tabs.rs \
-  crates/freshell-ws/src/lib.rs crates/freshell-ws/src/terminal.rs \
-  crates/freshell-ws/src/opencode_association.rs crates/freshell-server
+# Stage each reviewed Task 3 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "feat(recovery): prove opencode and amplifier recovery identities"
 ```
 
@@ -1042,6 +1109,10 @@ Assertions:
   Both paths release the permit and leave subsequent requests healthy;
 - event loop remains responsive;
 - final A→B without a B fact retries;
+- an `Allocated` query with a provider-positive artifact is persisted as
+  `Observed` yet remains actionable under its stable lookup key in that same
+  request; an artifact-missing allocation that changes to `Unknown`/`Observed`
+  before final mapping retries;
 - live terminal appearing while the batch runs attaches;
 - a same-owner artifact replacement is actionable only after the replacement
   is independently verified and produces a current proof; and
@@ -1116,8 +1187,10 @@ cargo test -p freshell-server existence -- --nocapture
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add Cargo.lock crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
-  crates/freshell-terminal crates/freshell-server
+# Stage each reviewed Task 4 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "fix(recovery): reconcile exact sessions off thread without guessing"
 ```
 
@@ -1157,6 +1230,31 @@ git commit -m "fix(recovery): reconcile exact sessions off thread without guessi
 - Regenerate `port/contract/ws-server-messages.schema.json`
 - Regenerate `port/contract/ws-message-inventory.json`
 
+**Additional launch-proof interface:**
+
+```rust
+pub trait HeldLaunchEvidence: Send + Sync {
+    fn owner_key(&self) -> &RecoveryOwnerKey;
+}
+
+pub struct LaunchProofLease {
+    // Opaque provider-owned open handles/transaction identity; non-Clone.
+    held: Box<dyn HeldLaunchEvidence>,
+    launch_materialization: MaterializationState,
+}
+
+impl RecoveryCoordinator {
+    pub async fn acquire_launch_proof(/* current query + expected owner */)
+        -> Result<LaunchProofLease, ExactRecoveryIssue>;
+    pub async fn verify_launch_proof(/* &LaunchProofLease */)
+        -> Result<ExactRecoveryProof, ExactRecoveryIssue>;
+}
+```
+
+The leaf crate defines the opaque ownership boundary; concrete provider
+adapters create/verify the handles in admitted blocking work. Async launch code
+cannot inspect, clone, or fabricate the evidence.
+
 **Launch transaction:**
 
 Every restore/resume entry point follows one order:
@@ -1170,20 +1268,46 @@ Every restore/resume entry point follows one order:
 4. claim that global cross-kind owner key;
 5. reread final authority and revalidate exact provider proof through the
    bounded coordinator while holding the claim. A changed key fails closed;
-6. perform provider setup and launch;
-7. await the first authoritative identity acknowledgement carrying this
+6. perform provider setup while keeping the resource unexposed;
+7. revalidate again immediately after setup, acquire a provider-specific
+   `LaunchProofLease`, and spawn without an intervening await or mutable
+   provider operation;
+8. await the first authoritative identity acknowledgement carrying this
    launch nonce;
-8. atomically bind the global owner and persist the observed identity; then
-9. answer the client and release the spawn permit.
+9. while the proof lease is still alive, post-ack revalidate the same owner
+   and artifact identity (or the unchanged allocated authority);
+10. atomically bind the global owner and persist the observed identity (an
+   idempotent confirmation for an artifact-positive restore; the first
+   `Observed` transition for an allocated/unmaterialized restore); then
+11. answer the client and release the spawn permit.
 
-Ownership remains held through step 8. Any preflight is advisory only; step 5
-is the authority fence. On lost/wrong ownership proof, timeout, revocation,
-identity mismatch, or launch failure, terminate and confirm the owned process
-tree before releasing the owner. OpenCode’s shared sidecar is the explicit
-exception: discard the failed logical session attempt and its routes without
-killing unrelated sessions in the shared process.
+Ownership remains held through step 10. Any earlier preflight is advisory;
+steps 5/7/9 are the authority fences. On lost/wrong ownership proof, timeout,
+revocation, identity mismatch, or launch failure, terminate and confirm the
+owned process tree before releasing the owner. OpenCode’s shared sidecar is
+the explicit exception: discard the failed logical session attempt and its
+routes without killing unrelated sessions in the shared process.
 
-“Atomically” at step 8 means externally fenced, not a fictitious cross-file
+`LaunchProofLease` is provider-specific and keeps the original verified
+resource identity alive across spawn: an open regular-file handle plus
+device/inode and effective-root fingerprint for Claude/Codex rollouts, an open
+database handle plus DB identity and exact row key for OpenCode, and an open
+project/session directory or metadata handle plus resolved scope for
+Amplifier. Content length/mtime may change normally after resume, but owner,
+root, row/path, and file identity may not. Post-ack lookup must prove the same
+owner and stable resource identity while that original handle remains open.
+For a ledger-proved allocated identity with no artifact, the lease instead
+pins the owner key, materialization generation, scope, and launch nonce; a
+Freshell-created Amplifier stub does not itself advance `Observed`.
+
+No external CLI offers a transactional “consume this exact open handle” API,
+so a hostile provider-store writer can race after `exec`. That process remains
+quarantined: no created frame, binding, or session route is exposed until the
+matching nonce acknowledgement and post-ack fence both pass. A race before
+step 7 prevents spawn; a race after step 7 forces supervised cleanup. This is
+the enforceable boundary and the tests distinguish those two cases.
+
+“Atomically” at step 10 means externally fenced, not a fictitious cross-file
 transaction: while the claim excludes contenders, persist the `Observed`
 ledger row first, recheck resource liveness, then transition the in-memory
 owner to `Bound` and emit the client response. A persistence/liveness failure
@@ -1298,14 +1422,19 @@ Create a table-driven harness for every launch door above. Mutate the final
 identity carrier while queued: structured ref, promoted mode/ref, terminal
 identity, registry identity, ledger supersession terminus, and cwd. Delete,
 replace, partially rewrite, or conflict the provider artifact after reconcile
-but before launch.
+at barriers before step 5, during setup, after setup but before the step-7
+pre-spawn fence, immediately after that fence but before `exec`, and after
+spawn before acknowledgement.
 
 Assert a newly selected invalid/unproved reference causes zero provider-store
 and setup calls; failed proof causes no restub, app-server/proxy, OpenCode
-manager/config write, PTY, or fresh runtime; retryable fresh outcomes do not
-burn the respawn cap. With duplicate Amplifier IDs in projects A/B, launch A
-uses the proof’s resolved cwd and scoped setup, the fake CLI reports A plus
-the exact ID, and B’s tree remains byte-for-byte unchanged.
+manager/config write, PTY, or fresh runtime; any change observed by the
+step-7 fence produces zero spawns. A race released only after step 7 may spawn
+one quarantined resource, but produces no created frame/binding/route and is
+confirmed cleaned after the post-ack fence fails. Retryable fresh outcomes do
+not burn the respawn cap. With duplicate Amplifier IDs in projects A/B,
+launch A uses the proof’s resolved cwd and scoped setup, the fake CLI reports
+A plus the exact ID, and B’s tree remains byte-for-byte unchanged.
 
 - [ ] **Step 2: Write RED provider acknowledgement tests**
 
@@ -1334,10 +1463,12 @@ npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --con
 - [ ] **Step 3: Write RED cleanup and long-launch ownership tests**
 
 Use controlled child processes and barriers at queue, proof, setup, spawned,
-and acknowledgement phases. Hold each phase beyond the former 20-second lease
-window and race a second claimant. Assert no auto-steal and at most one
-process/logical writer. For each failure phase, assert cleanup completes before
-another owner is admitted. Exercise process-tree cleanup in the destructive
+pre-spawn lease, acknowledgement, and post-ack-proof phases. Hold each phase
+beyond the former 20-second lease window and race a second claimant. Assert no
+auto-steal and at most one process/logical writer. Replace the path/row while
+the original proof handle remains open and prove stable identity comparison
+catches it. For each failure phase, assert cleanup completes before another
+owner is admitted. Exercise process-tree cleanup in the destructive
 sandbox; abort the request task and disconnect its socket at every phase;
 prove cancellation hands cleanup to the supervisor; and prove the OpenCode
 shared-sidecar exception removes only the failed logical route. Race
@@ -1370,8 +1501,12 @@ paths so `Unknown`/`Allocated`/`Observed` cannot drift.
 
 Register the expected identity before spawning or exposing a runtime. Remove
 the current behavior that treats a different first identity as an ordinary
-rebind. Persist `Observed` only after the matching acknowledgement and owner
-binding are committed together. Once every launch door uses this transaction,
+rebind. Artifact-positive sessions were already persisted as `Observed`
+during reconciliation before their positive verdict became actionable; after
+the matching acknowledgement, confirm that state idempotently before binding.
+For `AllocatedUnmaterialized`, persist the first `Observed` transition only
+after the matching acknowledgement and immediately before owner binding.
+Once every launch door uses this transaction,
 construct `ExactRestoreRuntime` at the server composition root and acknowledge
 `paneReconcileExactV1` only when the client offered it and that aggregate is
 present. Its constructor requires the coordinator, arbiter, launch guard,
@@ -1383,7 +1518,7 @@ unoffered capability remains omitted. A v7 connection never receives the
 exact capability even if it injects the new field.
 When the aggregate is present, route both exact-capability and legacy
 `paneReconcileV1` requests through the exact engine; only the capability echo
-controls whether a new client may release durable creates.
+controls whether a new client may release durable launch traffic.
 
 - [ ] **Step 6: Run focused checks and commit**
 
@@ -1396,7 +1531,9 @@ cargo test -p freshell-protocol --test roundtrip restore_launch -- --nocapture
 cargo test -p freshell-ws capability_negotiation -- --nocapture
 npm run test:vitest -- run test/unit/server/opencode-rebind-plugin.test.ts --config config/vitest/vitest.config.ts
 npm run contract:generate
-git add port/contract
+git add -- port/contract/ws-protocol.schema.json \
+  port/contract/ws-server-messages.schema.json \
+  port/contract/ws-message-inventory.json
 npm run contract:generate
 git diff --exit-code -- port/contract
 npm run test:port
@@ -1407,12 +1544,10 @@ scripts/sandbox-test.sh "cargo test -p freshell-ws --test cross_kind_liveness --
 cargo check --workspace
 cargo fmt --check
 git diff --check
-git add crates/freshell-recovery crates/freshell-ws crates/freshell-freshagent \
-  crates/freshell-platform crates/freshell-terminal crates/freshell-sessions \
-  crates/freshell-codex \
-  crates/freshell-server extensions/opencode \
-  crates/freshell-protocol shared/ws-protocol.ts port/contract \
-  test/unit/server/opencode-rebind-plugin.test.ts
+# Stage each reviewed Task 5 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "fix(recovery): fence restore launch identity across every surface"
 ```
 
@@ -1424,6 +1559,7 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
 - Add `src/lib/pane-reconcile-controller.ts`
 - Modify `src/lib/pane-reconcile.ts`
 - Modify `src/lib/ws-client.ts`
+- Modify `src/lib/fresh-agent-ws.ts`
 - Modify `src/App.tsx`
 - Modify `src/components/TerminalView.tsx`
 - Modify `src/components/fresh-agent/FreshAgentView.tsx`
@@ -1432,6 +1568,7 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
 - Modify `src/store/paneTypes.ts`
 - Modify `src/store/panesSlice.ts`
 - Modify `docs/index.html`
+- Modify `test/unit/client/lib/fresh-agent-ws.test.ts`
 - Add/modify focused client tests
 
 **Controller contract:**
@@ -1446,20 +1583,27 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
   after auth/network/parse errors, and never retries v8↔v7 in a loop.
 - Durable restore authority requires the server to echo
   `paneReconcileExactV1`. If it is absent—with or without legacy
-  `paneReconcileV1`—hold then discard every durable create without sending it
-  and send no legacy reconcile request for those panes; show “Server update
-  required to restore saved sessions.” Stateless panes proceed normally.
+  `paneReconcileV1`—hold then discard every durable launch-capable message
+  without sending it and send no legacy reconcile request for those panes;
+  show “Server update required to restore saved sessions.” This includes
+  terminal/fresh creates, every `freshAgent.attach`, and any
+  `freshAgent.send` whose target was not created stateless and confirmed live
+  in the current connection generation. Stateless panes proceed normally,
+  and a send to a current-generation stateless-created session remains usable.
   “Start new” remains an explicit identity-clearing escape hatch.
 - This fail-closed decision happens inside WsClient’s `ready` handling before
   it flushes the pre-ready create queue, generic pending messages, or
   reconnect replay. It cannot wait for a later React/App callback. The sender
-  identifies durable creates through one shared classifier covering terminal
-  coding-mode `restore`, any `sessionRef`, provider-mode `resumeSessionId`,
-  saved coding-mode live handle, and Codex durability candidate, plus every
-  fresh-agent resume/session carrier. Only an explicitly identity-free fresh
-  create or identity-free shell create is stateless.
-  No-capability and legacy-only servers therefore get zero durable creates
-  even during mount/reconnect races.
+  identifies durable launch traffic through one shared classifier covering
+  terminal coding-mode `restore`, any `sessionRef`, provider-mode
+  `resumeSessionId`, saved coding-mode live handle, and Codex durability
+  candidate, plus every fresh-agent resume/session carrier,
+  `freshAgent.attach`, and materializing `freshAgent.send`. Track
+  current-generation stateless-created session IDs explicitly; only a send to
+  one of those confirmed live IDs bypasses the durable gate. An explicitly
+  identity-free fresh create or identity-free shell create is stateless.
+  No-capability and legacy-only servers therefore get zero durable
+  create/attach/materializing-send traffic even during mount/reconnect races.
 - Each pane also owns an episode token within that connection generation.
   Manual Retry supersedes the prior episode immediately, so a late automatic
   or boot result from the same socket cannot fold.
@@ -1534,8 +1678,8 @@ git commit -m "fix(recovery): fence restore launch identity across every surface
   handles, and send one identity-free fresh create. No existing reducer that
   deliberately preserves the old request ID may be reused.
 - On the server-update-required state, Retry performs one reconnect/capability
-  renegotiation; it still cannot send a durable create unless the new socket
-  acknowledges exact recovery.
+  renegotiation; it still cannot send durable launch traffic unless the new
+  socket acknowledges exact recovery.
 
 - [ ] **Step 1: Write RED request batching tests**
 
@@ -1567,11 +1711,13 @@ Use fake clocks and fixed IDs. Cover:
 - App boot + manual retry + reconnect stale-result interleavings;
 - already-ready App bootstrap;
 - exact-capability absent (both no capability and legacy-only): zero durable
-  creates before and after App handles `ready`, explicit server-update UX,
-  stateless creates unaffected;
+  create/attach/materializing-send traffic before and after App handles
+  `ready`, explicit server-update UX, stateless creates and their
+  current-generation sends unaffected;
 - v8 protocol mismatch → one v7 reconnect → legacy ready: no message flush
-  between handshakes, zero durable creates/reconcile requests, one stateless
-  create, and no downgrade loop; auth/network/parse errors never downgrade;
+  between handshakes, zero durable create/attach/materializing-send/reconcile
+  traffic, one stateless create plus its current-generation send, and no
+  downgrade loop; auth/network/parse errors never downgrade;
 - boot → manual Retry → late boot result within one connection generation;
 - retry exhaustion cancels rather than flushes;
 - permanent conflict/unavailable/invalid;
@@ -1604,13 +1750,18 @@ narrow/cancel IDs, an absent controller cannot send a held restore create, and
 both pane kinds remain gated until their exact outcome. Directly invoke
 WsClient’s `ready` path with no capability and legacy-only capability, before
 mounting App, and prove its pre-ready queue, generic queue, and reconnect
-replay emit zero durable creates while a stateless create emits once. Use a
-table covering every durable carrier above so a missing `sessionRef` cannot
-smuggle a saved live handle or Codex candidate through the legacy flush.
+replay emit zero durable creates, attaches, or materializing sends while a
+stateless create emits once. After that create’s current-generation
+`freshAgent.created`, a send to its confirmed session emits; a send to a
+persisted, prior-generation, unknown, or merely client-claimed ID does not.
+Use a table covering every durable carrier above so a missing `sessionRef`
+cannot smuggle a saved live handle, attach, send, or Codex candidate through
+the legacy flush.
 
 ```bash
 npm run test:vitest -- run \
   test/unit/client/lib/ws-client.reconcile.test.ts \
+  test/unit/client/lib/fresh-agent-ws.test.ts \
   test/unit/client/components/App.reconcile-adoption.test.tsx \
   test/unit/client/components/TerminalView.reconcile.test.tsx \
   test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx \
@@ -1650,6 +1801,7 @@ npm run test:vitest -- run \
   test/unit/client/lib/pane-reconcile.test.ts \
   test/unit/client/lib/pane-reconcile-controller.test.ts \
   test/unit/client/lib/ws-client.reconcile.test.ts \
+  test/unit/client/lib/fresh-agent-ws.test.ts \
   test/unit/client/components/App.reconcile-adoption.test.tsx \
   test/unit/client/components/TerminalView.reconcile.test.tsx \
   test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx \
@@ -1658,7 +1810,10 @@ npm run test:vitest -- run \
 npm run typecheck
 npm run lint
 git diff --check
-git add src test/unit/client docs/index.html
+# Stage each reviewed Task 6 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "fix(recovery): restore panes through one automatic reconcile controller"
 ```
 
@@ -1795,9 +1950,10 @@ sources cannot leak into the base bundle. Exercise:
   successful durable restore over v8;
 - candidate client + base server: the initial v8 hello receives
   `PROTOCOL_MISMATCH`, exactly one v7 fallback connects, exact capability is
-  absent, zero durable reconcile requests/creates are sent before/between/
-  after handshakes, explicit server-update UX appears, a stateless pane still
-  starts, and even a fixture-injected unsolicited legacy
+  absent, zero durable reconcile/create/attach/materializing-send traffic is
+  sent before/between/after handshakes, explicit server-update UX appears, a
+  stateless pane still starts and can send in its current generation, and even
+  a fixture-injected unsolicited legacy
   `fresh`/`dead_session`/`respawn` frame is ignored;
 - base client + candidate server: the candidate accepts its v7 hello and
   returns legacy capability/result shape only;
@@ -1823,7 +1979,10 @@ scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-br
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts'
 scripts/sandbox-test.sh 'npm run test:e2e -- --project=rust-chromium --workers=1 --retries=0 --repeat-each=20 test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts -g "17 durable panes restore while History remains blocked"'
 git diff --check
-git add test/e2e-browser
+# Stage each reviewed Task 7 file individually per Shared-Worktree Commit Discipline.
+git diff --cached --name-status
+git diff --cached --check
+git diff --cached
 git commit -m "test(recovery): prove fast exact restore while history is blocked"
 ```
 
@@ -1864,6 +2023,7 @@ npm run test:vitest -- run \
   test/unit/client/lib/pane-reconcile.test.ts \
   test/unit/client/lib/pane-reconcile-controller.test.ts \
   test/unit/client/lib/ws-client.reconcile.test.ts \
+  test/unit/client/lib/fresh-agent-ws.test.ts \
   test/unit/client/components/App.reconcile-adoption.test.tsx \
   test/unit/client/components/TerminalView.reconcile.test.tsx \
   test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx \
