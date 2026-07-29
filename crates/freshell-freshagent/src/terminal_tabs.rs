@@ -1187,8 +1187,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         );
         child_env = freshell_terminal::build_child_env_from_process(&spec);
     } else {
-        let host_os = host_os_live();
-        let is_wsl = is_wsl_env_live();
         let shell_type = shell_str
             .as_deref()
             .and_then(ShellType::parse)
