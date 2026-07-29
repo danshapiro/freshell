@@ -13,12 +13,14 @@
 - Work only in `.worktrees/deploy-compatibility-rollback` on branch `feat/deploy-compatibility-rollback`.
 - Base all behavior on verified-green `origin/main` commit `4c04dc9c1d5bd603ac6bb00540cfbafed675a78b`; the coordinated suite passed there with 9,585 active tests and repository-documented skips.
 - Preserve deliberate independent advancement: client and server versions do not need to be equal, share a release number, or come from the same commit.
-- A client-only update proceeds only when the candidate client accepts the running server version and the running server accepts the candidate client plus every retained reconnectable client version.
-- A server-only update proceeds only when the candidate server accepts the selected client plus every retained reconnectable client version and the selected client accepts the candidate server.
-- A combined update validates the staged client and staged server reciprocally and validates the staged server against reconnectable clients before stopping the old server.
+- A client-only update proceeds only when the candidate client accepts the running server version and the running server accepts the candidate client. Already-loaded older clients remain governed by their own declarations and the reload fence below.
+- A server-only update proceeds only when the candidate server and selected client accept each other and every active/reconnecting client is either reciprocally compatible or safely reloaded onto the selected client before the old server stops.
+- A combined update validates the staged client and staged server reciprocally and applies the same active/reconnecting-client fence before stopping the old server.
+- A client declaration is immutable for a component version: the server persists the full canonical declaration and digest, and rejects a second declaration using the same version with different contents.
+- Do not keep a permanent “every version ever seen” compatibility pin. During deployment, atomically fence new application handshakes, snapshot active declarations, reload incompatible loaded tabs onto the selected compatible client, and admit a reconnect only after it presents a compatible declaration. A client that reaches an incompatible server receives only the reload-required handshake path, never ordinary application traffic.
 - Reject missing, malformed, or incompatible declarations before switching the live generation or stopping a working server.
 - Keep product/app version semantics unchanged. Deployment component versions are separate metadata and must not replace `APP_VERSION`, `/api/version`, health version, diagnostics version, or GitHub update-check version.
-- Keep WebSocket protocol version 7 and its exact mismatch behavior. Adding an optional client component version is additive and does not relax protocol validation.
+- Keep WebSocket protocol version 7 and its exact mismatch behavior. Adding an optional client declaration/digest and reload-required response is additive and does not relax protocol validation.
 - A failed server deployment must attempt to restore the exact prior immutable generation. If safe restoration is blocked by foreign port ownership, unreadable receipts, storage failure, or unproven process identity, retain the recovery receipt, signal no unproven process, and fail loudly; do not claim uninterrupted availability or impossible recovery from external destruction.
 - Do not roll back `.env`, user settings, transcripts, provider state, or logs. This change adds no persisted user-data migration.
 - Do not add an in-product updater, release downloader, UI, or claim that this caused/fixes the earlier red-pane incident.
@@ -37,11 +39,11 @@
 - Vite can emit a root manifest to an absolute private output, but Vite does not typecheck. Every client build retains `npm run typecheck:client`. Put the artifact build test in a new unmocked test because the existing Vite config test mocks `node:fs`.
 - A plain `.mjs` helper using only Node built-ins works without `tsx` or `node_modules`; statically check it with TypeScript `allowJs/checkJs` plus `node --check`.
 - The running server may be a deleted executable inode whose bytes differ from `target/release/freshell-server`; this is true in the present installation. Legacy capture and rollback must copy `/proc/<pid>/exe` after verifying boot ID/start time/inode/digest. Future servers launch from immutable generation paths.
-- The rollback closure is larger than binary plus client. It includes built-in extensions, the Claude Node sidecar, and the compiled MCP runtime. Add explicit runtime overrides and copy these repo-owned files into each generation. Node itself, `node_modules`, coding CLIs, `.env`, and user/provider data remain preflighted host prerequisites/state, not copied release artifacts.
+- The rollback closure is larger than binary plus client. It includes built-in extensions, the Claude Node sidecar, the compiled MCP runtime, and an immutable lockfile-derived production `node_modules` closure for those Node entry points. Add explicit runtime overrides and copy these files into each generation. The Node executable/version, coding CLIs, `.env`, and user/provider data remain preflighted host prerequisites/state, not copied release artifacts.
 - Rust retains an unresolved `FRESHELL_CLIENT_DIR` path and opens files per request. A stable `current/client` indirection permits a no-restart client-only switch. New client generations retain prior hashed assets so already-loaded tabs can still lazy-load old chunks.
-- A client manifest on disk does not identify already-loaded tabs. Send the client component version additively in WebSocket `hello`, track active/seen versions server-side, expose them to the authenticated deployment controller, and retain them in generation receipts. A future explicit retirement mechanism is outside this scope.
+- A client manifest on disk does not identify already-loaded tabs. Send the full canonical client declaration and digest additively in WebSocket `hello`. Persist the declaration registry, reject version/declaration conflicts, and expose an authenticated nonce-bound deployment fence that atomically snapshots active clients while preventing a new unchecked application handshake. Incompatible loaded clients are instructed to reload the selected current client and must reconnect compatibly before deployment proceeds; disconnected old pages get the same reload-only treatment when they return. This retires an old version safely instead of pinning the server to every version ever seen.
 - Current shell PID/cwd/argv checks cannot close PID reuse or signal races. The Rust controller uses kernel boot ID, `/proc` identity, pidfds, exact ready receipts, a single-user/non-hostile-same-UID threat model, and never kills by process scans or port ownership.
-- The authoritative generation store is inside the checkout, outside ordinary `dist` and `target` build outputs. It uses private staging, recursive manifests/digests, sibling copy+fsync+rename publication, a checkout/port lock, atomic pointers, and a durable intent-before-side-effect journal.
+- The authoritative generation store is inside the checkout, outside ordinary `dist` and `target` build outputs. It uses private staging, recursive manifests/digests, sibling copy+fsync+rename publication, a checkout/port lock, atomic pointers, and a durable intent-before-side-effect journal. The atomic `current` pointer switch is the commit boundary: before it, recovery restores the prior generation; after it, recovery completes activation of the target. A candidate cannot serve ordinary browser/API traffic before that boundary.
 - Existing artifacts have no declarations/receipts. The first transition must capture and scratch-validate the actual working legacy closure before any non-private build, then permit only a combined declared update. One-sided advancement fails closed until bootstrap succeeds; an emergency restart may use only the captured legacy receipt.
 - Real E2E global setup can write checkout `dist` even when launched through the Docker sandbox. Deployment tests need a dedicated no-global-setup config and container `/tmp` fixture root. Use `CARGO_BUILD_JOBS=2` and `CMAKE_BUILD_PARALLEL_LEVEL=2` to stay within the sandbox PID budget.
 
@@ -60,14 +62,14 @@
 - Modify `crates/freshell-api/src/lib.rs`, `crates/freshell-server/src/main.rs`, `crates/freshell-server/src/rate_limit.rs`
   - Authenticated operational compatibility status and nonce-bound actual-address ready receipts.
 - Modify `shared/ws-protocol.ts`, `src/lib/ws-client.ts`, `crates/freshell-ws/src/lib.rs`, and related state wiring
-  - Optional client component version in hello plus active/seen-version tracking.
+  - Optional canonical client declaration/digest in hello, durable declaration identity, active connection tracking, and reload-required handling.
 - Modify `crates/freshell-platform/src/mcp_inject.rs`
   - Explicit compiled MCP entry override.
 - Create `crates/freshell-deploy/`
   - Rust deployment controller: canonical inputs, locks, immutable store, legacy capture, staging verification, pidfds, journal, activation, rollback, recovery.
 - Refactor `scripts/launch-rust.sh`
   - Thin mode/build wrapper with `--server-only`, private builds, controller selection, and no direct process kill/artifact replacement.
-- Create focused unit/integration/sandbox tests under `test/integration/server/`, `crates/freshell-deploy/tests/`, and `config/vitest/vitest.deploy-sandbox.config.ts`.
+- Create focused unit/integration tests plus explicitly excluded Docker-only tests under `test/integration/server/`, `crates/freshell-deploy/tests/`, and `config/vitest/vitest.deploy-sandbox.config.ts`. Real signals, process stops, crashes, and rollback run only from the dedicated sandbox config.
 - Modify `AGENTS.md`
   - Exact operator commands, first-bootstrap rule, compatibility behavior, truthful rollback guarantee, and unchanged `APPROVED` rule.
 
@@ -175,19 +177,21 @@ git commit -m "feat(deploy): define reciprocal component compatibility"
 **Interfaces:**
 - Produces client artifact `deployment-compatibility.json`.
 - Produces compile-time `FRESHELL_SERVER_COMPONENT_VERSION` and bounds.
-- Produces authenticated `GET /api/deployment-compatibility` containing server declaration, `activeClientVersions`, `seenClientVersions`, generation ID, and boot ID.
+- Produces authenticated `GET /api/deployment-compatibility` containing the server declaration, canonical persisted client declarations/digests, active connection counts, deployment-fence state, generation ID, and boot ID.
+- Produces authenticated controller-only fence operations bound to a fresh nonce: begin fence and atomically snapshot active client declarations, request reload for incompatible clients, observe compatible reconnects, and release the fence.
 - Produces optional durable ready receipt selected by `FRESHELL_DEPLOY_READY_FILE` and bound to `FRESHELL_DEPLOY_NONCE`.
 
 - [ ] **Step 1: Write failing real client-artifact and Rust API tests**
 
 The unmocked client test runs `npm run typecheck:client`, builds to an absolute temp directory, asserts the exact client manifest, and asserts `dist/client` is unchanged. Rust router tests authenticate the endpoint, prove it bypasses only the rate bucket (not auth), and prove `/api/health` remains exactly seven fields.
 
-- [ ] **Step 2: Implement Vite projection and version define**
+- [ ] **Step 2: Implement Vite projection and declaration defines**
 
 Reject a non-absolute `FRESHELL_CLIENT_OUT_DIR`. Emit the projected client declaration and define:
 
 ```ts
-__FRESHELL_CLIENT_COMPONENT_VERSION__: JSON.stringify(clientDeclaration.version)
+__FRESHELL_CLIENT_DEPLOYMENT_DECLARATION__: JSON.stringify(clientDeclaration),
+__FRESHELL_CLIENT_DEPLOYMENT_DECLARATION_DIGEST__: JSON.stringify(clientDeclarationDigest)
 ```
 
 Add its type to `src/vite-env.d.ts`.
@@ -221,30 +225,41 @@ git commit -m "feat(deploy): embed client and server deployment identity"
 - Modify: `crates/freshell-server/src/extensions.rs` tests if needed
 
 **Interfaces:**
-- Consumes `__FRESHELL_CLIENT_COMPONENT_VERSION__`.
-- Produces optional `hello.clientVersion`.
-- Produces active/seen client-version registry shared with deployment status.
+- Consumes the build-emitted client declaration and digest.
+- Produces optional `hello.clientDeclaration` and `hello.clientDeclarationDigest`.
+- Produces a durable version-to-declaration registry and reference-counted active connection inventory shared with deployment status.
+- Produces a nonce-bound deployment fence and reload-required handshake path before ordinary application traffic.
 - Produces `FRESHELL_MCP_SERVER_ENTRY` override; reuses existing `FRESHELL_CLIENT_DIR`, `FRESHELL_EXTENSIONS_DIR`, and `FRESHELL_CLAUDE_SIDECAR`.
 
 - [ ] **Step 1: Write failing handshake lifecycle tests**
 
-Prove protocol 7 still validates first, a valid component version is tracked, disconnect removes it from active but not seen, multiple connections are reference-counted, malformed versions are rejected clearly, and missing legacy values map to `legacyClientVersion`.
+Prove protocol 7 still validates first; a valid canonical declaration/digest is persisted; a second declaration with the same version but different contents is rejected; multiple connections are reference-counted; disconnect removes them from the active inventory; and missing legacy values map to the single configured legacy declaration during bootstrap.
 
 - [ ] **Step 2: Implement additive client identity tracking**
 
 Send:
 
 ```ts
-{ type: 'hello', token, protocolVersion: WS_PROTOCOL_VERSION, clientVersion: __FRESHELL_CLIENT_COMPONENT_VERSION__ }
+{
+  type: 'hello',
+  token,
+  protocolVersion: WS_PROTOCOL_VERSION,
+  clientDeclaration: __FRESHELL_CLIENT_DEPLOYMENT_DECLARATION__,
+  clientDeclarationDigest: __FRESHELL_CLIENT_DEPLOYMENT_DECLARATION_DIGEST__
+}
 ```
 
-Share a concurrency-safe registry with the deployment API. Do not add client version to unrelated messages.
+Share a concurrency-safe registry with the deployment API and persist each first-seen canonical declaration atomically. Do not add deployment identity to unrelated messages.
 
-- [ ] **Step 3: Add explicit MCP runtime override**
+- [ ] **Step 3: Implement the fenced reload handshake**
+
+An authenticated controller call starts a nonce-bound fence before the final compatibility snapshot. While fenced, no unchecked WebSocket may enter ordinary application handling. Compatible declarations may reconnect and be counted; incompatible loaded clients receive `client.reloadRequired`, reload the selected client once, and reconnect. The controller waits for the pre-fence active connection set to either reconnect compatibly or close, then takes the final snapshot. Timeout aborts with the old server still running. Persist the declaration registry and fence/snapshot under the per-port deployment store so a server or controller crash cannot forget which clients were admitted. A declaration-less legacy client has no reload handler, so it must be reciprocally compatible with the candidate server or the deployment aborts before interruption.
+
+- [ ] **Step 4: Add explicit MCP runtime override**
 
 When `FRESHELL_MCP_SERVER_ENTRY` is non-empty, use that compiled JS path directly. Otherwise preserve existing production/source fallback exactly.
 
-- [ ] **Step 4: Run focused client/Rust protocol and runtime tests**
+- [ ] **Step 5: Run focused client/Rust protocol and runtime tests**
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/shared/ws-protocol.reconcile.test.ts
@@ -252,7 +267,7 @@ cargo test -p freshell-ws
 cargo test -p freshell-platform mcp
 ```
 
-- [ ] **Step 5: Refactor and commit**
+- [ ] **Step 6: Refactor and commit**
 
 ```bash
 git add shared/ws-protocol.ts src/lib/ws-client.ts crates/freshell-ws crates/freshell-platform/src/mcp_inject.rs crates/freshell-server/src/extensions.rs test
@@ -274,11 +289,12 @@ Stage only the exact focused tests changed by this task; do not sweep unrelated 
 - Store root: `<canonical-checkout>/.freshell-deploy/ports/<port>/`
 - Produces immutable generation manifest covering relative path, type, mode, symlink target, and SHA-256.
 - Produces atomic `current` pointer and `live.json` receipt.
+- Produces an atomic declaration registry keyed by component version with a canonical declaration digest; one version can never acquire new compatibility bounds.
 - Produces legacy `capture` using a verified `/proc/<pid>/exe`.
 
 - [ ] **Step 1: Write failing path/store/manifest tests**
 
-Cover invalid ports, symlinked/relative/unsafe roots, exclusive generation creation, cross-device import through sibling temp, digest/mode mismatch, concurrent locks, atomic pointer switch, and refusal to clean any unmanifested path.
+Cover invalid ports, symlinked/relative/unsafe roots, exclusive generation creation, cross-device import through sibling temp, digest/mode mismatch, concurrent locks, atomic pointer switch, declaration-version conflict, and refusal to clean any unmanifested path.
 
 - [ ] **Step 2: Implement canonical store and manifest publication**
 
@@ -286,11 +302,11 @@ Every authoritative file uses write-temp, `sync_all`, rename, and parent-directo
 
 - [ ] **Step 3: Write failing legacy capture tests**
 
-Inside a temp fixture, start an executable, replace/unlink its pathname, verify path bytes differ, capture `/proc/<pid>/exe`, and assert boot ID/start time/device/inode/digest/mode before and after the copy. Also require captured client, extensions, sidecar, MCP runtime, cwd, and non-secret launch metadata.
+Inside a temp fixture, start an executable, replace/unlink its pathname, verify path bytes differ, capture `/proc/<pid>/exe`, and assert boot ID/start time/device/inode/digest/mode before and after the copy. Also require captured client, extensions, sidecar, MCP runtime, lockfile-derived production dependencies, cwd, Node executable/version, and non-secret launch metadata.
 
 - [ ] **Step 4: Implement legacy capture and fail-closed rules**
 
-Do not treat the legacy PID file alone as ownership. Capture must keep the observed process alive, revalidate after copying, scratch-start the captured closure on port 0 with an isolated home, and mark the receipt `legacy: true` without inventing compatibility declarations.
+Do not treat the legacy PID file alone as ownership. Capture must keep the observed process alive, revalidate after copying, scratch-start the captured closure—including actual sidecar and MCP imports—on port 0 with an isolated home, and mark the receipt `legacy: true` without inventing compatibility declarations.
 
 - [ ] **Step 5: Run, refactor, and commit**
 
@@ -306,40 +322,43 @@ git commit -m "feat(deploy): capture immutable working generations"
 **Files:**
 - Add modules under `crates/freshell-deploy/src/` for probe, journal, process control, activation, rollback, and recovery.
 - Create: `crates/freshell-deploy/tests/transaction_state.rs`
-- Create: `crates/freshell-deploy/tests/process_identity.rs`
+- Create: `crates/freshell-deploy/tests/process_identity.rs` using fake process/pidfd adapters only; real signaling remains in Docker-only launcher tests.
 
 **Interfaces:**
-- Durable phases: `prepared`, `stop_old_intent`, `start_target_intent`, `target_ready`, `switch_current_intent`, `activate_intent`, `committed`, `rollback_complete`.
+- Durable phases: `prepared`, `clients_fenced`, `stop_old_intent`, `start_target_intent`, `target_ready_fenced`, `switch_current_intent`, `committed`, `activation_confirmed`, `rollback_complete`.
 - Produces pidfd-bound SIGTERM/SIGKILL only for receipt-proven transaction candidates.
-- Produces next-invocation conservative rollback for every uncommitted active transaction.
+- Treats the atomic `current` pointer switch as the durable commit/roll-forward boundary: recovery rolls back before it and completes target activation after it.
+- Keeps the target listener fenced from ordinary browser/API traffic until that commit boundary.
 
 - [ ] **Step 1: Write the state-table tests before implementation**
 
-Table-drive controller death or IO failure before/after every durable intent and side effect. Assert: no live mutation before `prepared`; any pre-commit replay restores prior; post-commit replay preserves target; a third-party pointer/port/process is never overwritten or signaled.
+Table-drive controller death or IO failure before/after every durable intent and side effect. Assert: no live mutation before `prepared`; every failure before the pointer commit restores prior; once the atomic pointer names the target, replay preserves and activates the target; no ordinary request is served by the target before commit; and a third-party pointer/port/process is never overwritten or signaled.
 
 - [ ] **Step 2: Implement probe on actual port 0**
 
-Launch with an allowlisted environment, isolated home/token, explicit staged runtime paths, nonce, generation ID, and ready-file path. Verify ready receipt, pidfd, boot ID/start time, executable inode/digest, actual listener, exact compatibility response, then terminate/reap the probe.
+Launch with an allowlisted environment, isolated home/token, explicit staged runtime paths and production dependencies, nonce, generation ID, and ready-file path. Verify ready receipt, pidfd, boot ID/start time, executable inode/digest, Node executable/version, real sidecar/MCP imports, actual listener, and exact compatibility response, then terminate/reap the probe. Immediately before stopping the old server, repeat the same restartability/closure verification for the prior generation.
 
 - [ ] **Step 3: Implement server/full activation**
 
-Durably prepare prior/target receipts, stop only the pidfd-proven old server with SIGTERM, start target from its immutable path while `current` remains prior, verify target identity/readiness, switch `current`, reverify served generation, write atomic live/PID receipts, then commit.
+Begin the nonce-bound client fence, obtain the final atomic active-client declaration snapshot, and require reciprocal compatibility after any reloads. Durably prepare prior/target receipts, stop only the pidfd-proven old server with SIGTERM, and start the target from its immutable path in a fenced mode that binds the live port but serves only nonce-authenticated controller checks. Verify target identity/readiness and prepare its live/PID receipts. Atomically switch `current`; that switch is the commit point. Then lift the target fence, verify the selected generation is serving, and durably record `activation_confirmed`. A crash after the pointer switch rolls forward by activating or restarting the exact target; it never restores old assets beneath browsers that may have observed the committed pointer.
 
 - [ ] **Step 4: Implement client-only activation**
 
-Require the running server identity before and after the switch; target generation reuses identical server/runtime digests, merges prior hashed assets into candidate client, validates reciprocal compatibility, switches `current` atomically, and never signals the server.
+Require the running server identity before and after the switch; target generation reuses identical server/runtime/dependency digests, merges prior hashed assets into the candidate client, validates reciprocal compatibility, and prepares all receipts. The atomic `current` switch is the commit point and the only user-visible mutation. A crash before it retains prior; a crash after it preserves target and finishes receipts. Never signal the server.
 
 - [ ] **Step 5: Implement rollback and replay**
 
-Rollback stops only a verified candidate. SIGKILL is permitted only through its verified pidfd after bounded SIGTERM failure. Restore prior pointer, start exact prior generation, verify identity/health, and return the original deployment failure. Foreign port theft, uncertain identity, unreadable receipts, or rollback-start failure retain prior artifacts and active recovery receipt and fail closed.
+Before the pointer commit, rollback stops only a verified candidate. SIGKILL is permitted only through its verified pidfd after bounded SIGTERM failure. Restore the prior pointer if needed, start the exact prior generation, verify identity/health/runtime imports, and return the original deployment failure. After the pointer commit, replay instead preserves the target pointer and completes target activation from its exact generation. Foreign port theft, uncertain identity, unreadable receipts, or restart failure retain both generations and the active recovery receipt and fail closed.
 
-- [ ] **Step 6: Run process tests only in Docker, refactor, and commit**
+- [ ] **Step 6: Run host-safe state/identity tests, refactor, and commit**
 
 ```bash
-scripts/sandbox-test.sh "CARGO_BUILD_JOBS=2 cargo test -p freshell-deploy transaction_state process_identity -- --test-threads=1"
+cargo test -p freshell-deploy transaction_state process_identity
 git add crates/freshell-deploy Cargo.lock
 git commit -m "feat(deploy): recover interrupted server activations"
 ```
+
+These Cargo tests exercise deterministic adapters and never signal or stop a host process. The production Linux process adapter is exercised only by the explicitly sandboxed tests in Tasks 6–7.
 
 ### Task 6: Canonical Wrapper and Independent Update Modes
 
@@ -347,18 +366,20 @@ git commit -m "feat(deploy): recover interrupted server activations"
 - Refactor: `scripts/launch-rust.sh`
 - Create: `test/integration/server/launch-rust-deployment.sandbox.test.ts`
 - Create: `config/vitest/vitest.deploy-sandbox.config.ts`
+- Modify: `config/vitest/vitest.server.config.ts`
 - Create fixture commands beneath `test/fixtures/launch-rust/`
 
 **Interfaces:**
 - `--client-only`: typecheck/build private client; controller reuses server/runtime.
 - `--server-only --restart`: typecheck/build private server JS, Rust binary, controller, extensions/sidecar; controller reuses client.
 - `--restart`: privately build both components/runtime and activate combined.
-- `--skip-build`: restart exact current generation through its stored controller; no npm/Cargo/tsx dependency.
+- `--skip-build`: preserve existing behavior: start the exact current generation only when it is not already running; never restart a running server by itself.
+- `--skip-build --restart`: restart the exact current generation through its stored controller; no npm/Cargo/tsx dependency.
 - `--stop`: stop only receipt-proven current process.
 
 - [ ] **Step 1: Write the complete failing flag/build/preflight matrix**
 
-Reject invalid/repeated/conflicting flags and malformed ports before build. Prove each mode builds only its component set, uses exclusive private staging, never writes checkout `dist`/`target`, and rejects both incompatibility directions before stop/pointer switch.
+Reject invalid/repeated/conflicting flags and malformed ports before build. Prove each mode builds only its component set, uses exclusive private staging, never writes checkout `dist`/`target`, and rejects both incompatibility directions before stop/pointer switch. Prove plain `--skip-build` is a no-op when the current generation is already running and only `--skip-build --restart` interrupts it.
 
 - [ ] **Step 2: Refactor shell to a thin wrapper**
 
@@ -366,7 +387,9 @@ The wrapper selects/builds a controller, creates private outputs, runs required 
 
 - [ ] **Step 3: Implement generation assembly by mode**
 
-Server runtime assembly includes staged compiled `dist/server`, built-in extensions, Claude sidecar, and runtime overrides. Client-only copies the selected server/runtime generation; server-only copies the selected client. Combined bootstrap captures legacy before any command allowed to write non-private outputs.
+Server runtime assembly includes staged compiled `dist/server`, built-in extensions, Claude sidecar, runtime overrides, `package.json`/lockfile, and a private `npm ci --omit=dev` production dependency closure. Client-only copies the selected server/runtime/dependency generation; server-only copies the selected client. Combined bootstrap captures legacy before any command allowed to write non-private outputs.
+
+Modify the ordinary server Vitest config to explicitly exclude `**/*.sandbox.test.ts`. The dedicated deploy-sandbox config includes only those files, has no global setup, and every sandbox test hard-fails unless `FRESHELL_DESTRUCTIVE_SANDBOX=1`. No Cargo auto-discovered test may send real signals; those boundaries are exercised through this dedicated config.
 
 - [ ] **Step 4: Run exhaustive sandbox mode/failpoint tests**
 
@@ -378,7 +401,7 @@ bash -n scripts/launch-rust.sh
 - [ ] **Step 5: Refactor and commit**
 
 ```bash
-git add scripts/launch-rust.sh config/vitest/vitest.deploy-sandbox.config.ts test/integration/server/launch-rust-deployment.sandbox.test.ts test/fixtures/launch-rust
+git add scripts/launch-rust.sh config/vitest/vitest.deploy-sandbox.config.ts config/vitest/vitest.server.config.ts test/integration/server/launch-rust-deployment.sandbox.test.ts test/fixtures/launch-rust
 git commit -m "feat(deploy): add compatibility-checked update modes"
 ```
 
@@ -392,7 +415,7 @@ git commit -m "feat(deploy): add compatibility-checked update modes"
 
 - [ ] **Step 1: Write one serial real-boundary scenario**
 
-Use container `/tmp` for the complete runtime/store. Prebuild the real server with two Cargo jobs. Assert real ELF `/proc` identity, immutable generation digests, explicit client/extensions/sidecar/MCP paths, real compatibility endpoint, exact seven-field health, and served unique client marker. Then activate a native candidate that passes shadow probe but exits on the requested live port and prove the controller restores the real prior binary/client generation with ordered events.
+Use container `/tmp` for the complete runtime/store. Prebuild the real server with two Cargo jobs. Assert real ELF `/proc` identity, immutable generation digests, explicit client/extensions/sidecar/MCP/dependency paths, successful real sidecar and MCP imports, real compatibility endpoint, exact seven-field health, and served unique client marker. Then activate a native candidate that passes shadow probe but exits before the atomic pointer commit on the requested live port and prove the controller restores the real prior binary/client generation with ordered events. Add a second failpoint immediately after pointer commit and prove recovery rolls forward to the exact target rather than serving prior assets after target visibility.
 
 - [ ] **Step 2: Run real-boundary verification**
 
@@ -405,7 +428,7 @@ Expected: PASS without changing bind-mounted checkout `dist`, source, production
 
 - [ ] **Step 3: Run the exact-pair browser compatibility smoke**
 
-Run only focused existing cases with private build outputs or a corrected harness that cannot write checkout `dist`: Rust boot/restart/reap, terminal command, lazy editor chunk load, and multi-pane server restart. Cap Cargo jobs at 2. Any pre-existing unrelated flaky case is reported, not hidden or skipped.
+Run only focused existing cases with private build outputs or a corrected harness that cannot write checkout `dist`: Rust boot/restart/reap, terminal command, lazy editor chunk load, and multi-pane server restart. Add an unequal-version case in which an older loaded client reconnects: if reciprocal bounds accept it, it resumes normally; if not, it is limited to the reload-required handshake, reloads the selected compatible client, restores its tabs, and only then receives ordinary traffic. Cap Cargo jobs at 2. Any pre-existing unrelated flaky case is reported, not hidden or skipped.
 
 - [ ] **Step 4: Update operator instructions**
 
@@ -416,9 +439,10 @@ scripts/launch-rust.sh --client-only
 scripts/launch-rust.sh --server-only --restart
 scripts/launch-rust.sh --restart
 scripts/launch-rust.sh --skip-build
+scripts/launch-rust.sh --skip-build --restart
 ```
 
-Explain in plain language: different versions are normal; both sides must accept the pairing; incompatible updates stop before replacement; server candidates are tested before interruption; failed activation restores the recorded prior generation when the machine and port permit; first adoption from legacy artifacts requires a combined approved restart; port 3002 still requires exact user approval `APPROVED`.
+Explain in plain language: different versions are normal; both sides must accept the pairing; older loaded tabs are safely reloaded when they cannot speak to the new server; incompatible updates stop before replacement; server candidates are tested before interruption; a failure before the visible switch restores the recorded prior generation, while a crash after the visible switch completes the new generation; plain `--skip-build` never restarts an already-running server; first adoption from legacy artifacts requires a combined approved restart; port 3002 still requires exact user approval `APPROVED`.
 
 - [ ] **Step 5: Run full verification**
 
@@ -443,7 +467,7 @@ git commit -m "docs: explain compatibility-checked Rust deploys"
 
 - **Spec coverage:** Tasks 1–3 implement truthful independent declarations and active client identity. Tasks 4–6 make each update mode private, coherent, preflighted, and recoverable. Task 7 proves the production boundary and documents the plain-language behavior.
 - **Production proof:** Fake fixtures cover malformed input and every fault boundary; the dedicated no-global-setup sandbox test sends a real Rust ELF through the actual controller and rollback path; focused browser tests cover the exact seeded pair and reconnect behavior.
-- **No silent deferral:** Compatible client-only/server-only/combined paths, both incompatibility directions, missing declarations, legacy bootstrap, interrupted transactions, failed live start, candidate TERM refusal, foreign port ownership, rollback-start failure, and first-install cleanup all have explicit behavior/tests.
+- **No silent deferral:** Compatible client-only/server-only/combined paths, both incompatibility directions, conflicting declarations, incompatible loaded-client reload, missing declarations, legacy bootstrap, interrupted transactions on both sides of the pointer commit, failed live start, candidate TERM refusal, foreign port ownership, rollback-start failure, and first-install cleanup all have explicit behavior/tests.
 - **Scope guard:** No UI updater, downloader, session/pane repair, product-version coupling, generic host packaging, user-data rollback, or red-pane root-cause claim is included.
 - **Type consistency:** Source and artifacts use canonical strings; bounds are always `minInclusive`/`maxExclusive`; client supports server and server supports client; receipts identify full immutable generations.
-- **Truthful user promise:** Normal compatible updates proceed independently. Incompatible updates do not replace the live generation. A failed server activation restores the exact prior recorded generation when Freshell can still safely own the port/process/storage; otherwise it preserves recovery evidence and refuses dangerous guesses.
+- **Truthful user promise:** Normal compatible updates proceed independently. Incompatible updates do not replace the live generation. A failure before the new generation becomes visible restores the exact prior recorded generation when Freshell can still safely own the port/process/storage. Once the new generation is durably selected, recovery completes that generation instead of exposing a mixed old/new state. If either recovery path is unsafe, Freshell preserves evidence and refuses dangerous guesses.
