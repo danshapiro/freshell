@@ -20,10 +20,20 @@ where
     J: TransactionJournal,
     D: ActivationDriver,
 {
-    let record = journal
+    let mut record = journal
         .load()?
         .ok_or_else(|| DeployError::Recovery("no durable transaction to recover".to_string()))?;
     record.validate()?;
+    if record.mode.changes_server()
+        && record.launch_protocol_version.is_none()
+        && record.phase >= TransactionPhase::StartTargetIntent
+        && record.phase != TransactionPhase::RollbackComplete
+    {
+        return Err(DeployError::Recovery(
+            "legacy transaction lacks durable pre-spawn launch evidence".to_string(),
+        ));
+    }
+    record = reconcile_pending_launch(journal, driver, &record)?;
     if record.mode == UpdateMode::ClientOnly {
         return recover_client(journal, driver, &record);
     }
@@ -92,86 +102,111 @@ where
                             .to_string(),
                     )
                 })?;
-                require_selected(driver, &record.target_generation_id)?;
-                driver.request_activation_cancellation(candidate, &record.controls)?;
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    let activated = driver.activation_receipt(&record)?;
+                let selected = driver.selected_generation()?;
+                if selected == record.prior_generation_id {
                     let cancelled = driver.cancellation_receipt(&record)?;
+                    let activated = driver.activation_receipt(&record)?;
                     match (activated, cancelled) {
                         (
-                            ActivationReceiptObservation::Present(receipt),
                             ActivationReceiptObservation::Absent,
+                            ActivationReceiptObservation::Present(receipt),
                         ) => {
                             require_matching_receipt(&record, candidate, &receipt)?;
-                            require_selected(driver, &record.target_generation_id)?;
-                            let state = driver.observe_port(&record)?;
-                            let process =
-                                match require_target(&state, &record, ServiceState::Ordinary) {
-                                    Ok(process) => process,
-                                    Err(_)
-                                        if matches!(
-                                            state,
-                                            PortState::Target {
-                                                service: ServiceState::Gated,
-                                                ..
-                                            }
-                                        ) && Instant::now() < deadline =>
-                                    {
-                                        std::thread::sleep(Duration::from_millis(25));
-                                        continue;
-                                    }
-                                    Err(error) => return Err(error),
-                                };
-                            driver.verify_running(process)?;
-                            driver.verify_ordinary(process)?;
-                            let activated = record.advanced(TransactionPhase::Activated)?;
-                            require_selected(driver, &record.target_generation_id)?;
-                            journal.save(&activated)?;
-                            let confirmed =
-                                activated.advanced(TransactionPhase::ActivationConfirmed)?;
-                            require_selected(driver, &record.target_generation_id)?;
-                            journal.save(&confirmed)?;
-                            roll_forward_confirmed(journal, driver, &confirmed)?;
-                            return Ok(RecoveryOutcome::Activated);
+                            driver.verify_exited(&candidate.process)?;
+                            require_selected(driver, &record.prior_generation_id)?;
                         }
                         (
                             ActivationReceiptObservation::Absent,
-                            ActivationReceiptObservation::Present(receipt),
+                            ActivationReceiptObservation::Absent,
                         ) => {
-                            require_matching_receipt(&record, candidate, &receipt)?;
-                            if driver.verify_exited(&candidate.process).is_ok() {
-                                break;
+                            driver.verify_exited(&candidate.process)?;
+                            require_selected(driver, &record.prior_generation_id)?;
+                        }
+                        _ => return Err(DeployError::Recovery(
+                            "prior pointer is accepted only for a durably cancelled, exited target"
+                                .to_string(),
+                        )),
+                    }
+                } else {
+                    require_selected(driver, &record.target_generation_id)?;
+                    driver.request_activation_cancellation(candidate, &record.controls)?;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let activated = driver.activation_receipt(&record)?;
+                        let cancelled = driver.cancellation_receipt(&record)?;
+                        match (activated, cancelled) {
+                            (
+                                ActivationReceiptObservation::Present(receipt),
+                                ActivationReceiptObservation::Absent,
+                            ) => {
+                                require_matching_receipt(&record, candidate, &receipt)?;
+                                require_selected(driver, &record.target_generation_id)?;
+                                let state = driver.observe_port(&record)?;
+                                let process =
+                                    match require_target(&state, &record, ServiceState::Ordinary) {
+                                        Ok(process) => process,
+                                        Err(_)
+                                            if matches!(
+                                                state,
+                                                PortState::Target {
+                                                    service: ServiceState::Gated,
+                                                    ..
+                                                }
+                                            ) && Instant::now() < deadline =>
+                                        {
+                                            std::thread::sleep(Duration::from_millis(25));
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                driver.verify_running(process)?;
+                                driver.verify_ordinary(process)?;
+                                let activated = record.advanced(TransactionPhase::Activated)?;
+                                require_selected(driver, &record.target_generation_id)?;
+                                journal.save(&activated)?;
+                                let confirmed =
+                                    activated.advanced(TransactionPhase::ActivationConfirmed)?;
+                                require_selected(driver, &record.target_generation_id)?;
+                                journal.save(&confirmed)?;
+                                roll_forward_confirmed(journal, driver, &confirmed)?;
+                                return Ok(RecoveryOutcome::Activated);
                             }
-                            if Instant::now() >= deadline {
-                                return Err(DeployError::Recovery(
+                            (
+                                ActivationReceiptObservation::Absent,
+                                ActivationReceiptObservation::Present(receipt),
+                            ) => {
+                                require_matching_receipt(&record, candidate, &receipt)?;
+                                if driver.verify_exited(&candidate.process).is_ok() {
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(DeployError::Recovery(
                                     "cancelled target did not exit before the recovery deadline"
                                         .to_string(),
                                 ));
+                                }
                             }
-                        }
-                        (
-                            ActivationReceiptObservation::Absent,
-                            ActivationReceiptObservation::Absent,
-                        ) => {
-                            if driver.verify_exited(&candidate.process).is_ok() {
-                                break;
-                            }
-                            if Instant::now() >= deadline {
-                                return Err(DeployError::Recovery(
+                            (
+                                ActivationReceiptObservation::Absent,
+                                ActivationReceiptObservation::Absent,
+                            ) => {
+                                if driver.verify_exited(&candidate.process).is_ok() {
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(DeployError::Recovery(
                                     "target has not durably accepted cancellation or activation"
                                         .to_string(),
                                 ));
+                                }
                             }
-                        }
-                        _ => {
-                            return Err(DeployError::Recovery(
+                            _ => return Err(DeployError::Recovery(
                                 "activation cancellation outcome is contradictory or unreadable"
                                     .to_string(),
-                            ))
+                            )),
                         }
+                        std::thread::sleep(Duration::from_millis(25));
                     }
-                    std::thread::sleep(Duration::from_millis(25));
                 }
             }
             ActivationReceiptObservation::Malformed
@@ -189,6 +224,57 @@ where
 
     rollback(journal, driver, &record)?;
     Ok(RecoveryOutcome::RolledBack)
+}
+
+fn reconcile_pending_launch<J, D>(
+    journal: &mut J,
+    driver: &mut D,
+    record: &TransactionRecord,
+) -> Result<TransactionRecord>
+where
+    J: TransactionJournal,
+    D: ActivationDriver,
+{
+    let Some(attempt) = record.pending_launch_attempt().cloned() else {
+        return Ok(record.clone());
+    };
+    match driver.observe_launch_attempt(&attempt, record)? {
+        crate::activation::LaunchAttemptObservation::Absent => Err(DeployError::Recovery(
+            "unbound launch attempt has no recoverable receipt".to_string(),
+        )),
+        crate::activation::LaunchAttemptObservation::DefinitelyNotStarted => {
+            let resolved = record.with_launch_definitely_not_started()?;
+            journal.save(&resolved)?;
+            Ok(resolved)
+        }
+        crate::activation::LaunchAttemptObservation::Gated(candidate)
+            if attempt.lane == crate::journal::LaunchLane::TargetGated =>
+        {
+            crate::journal::validate_candidate(record, &candidate)?;
+            let bound = record.with_bound_gated_candidate(candidate)?;
+            journal.save(&bound)?;
+            Ok(bound)
+        }
+        crate::activation::LaunchAttemptObservation::Ordinary(process)
+            if matches!(
+                attempt.lane,
+                crate::journal::LaunchLane::PriorRollback
+                    | crate::journal::LaunchLane::TargetRollForward
+            ) =>
+        {
+            crate::journal::validate_generation_process(
+                record,
+                &process,
+                attempt.lane == crate::journal::LaunchLane::PriorRollback,
+            )?;
+            let bound = record.with_bound_relaunch_attempt(process)?;
+            journal.save(&bound)?;
+            Ok(bound)
+        }
+        _ => Err(DeployError::Recovery(
+            "launch attempt receipt is malformed or belongs to the wrong lane".to_string(),
+        )),
+    }
 }
 
 pub(crate) fn roll_forward_confirmed<J, D>(
@@ -243,6 +329,25 @@ where
         PortState::Free => {
             verify_owned_predecessors_exited(driver, &working)?;
             require_selected(driver, &working.target_generation_id)?;
+            let created = working.pending_launch_attempt().is_none();
+            if created {
+                working = working
+                    .with_new_launch_attempt(crate::journal::LaunchLane::TargetRollForward)?;
+                journal.save(&working)?;
+            }
+            let attempt = working
+                .pending_launch_attempt()
+                .ok_or_else(|| {
+                    DeployError::Recovery(
+                        "target relaunch attempt was unexpectedly already bound".to_string(),
+                    )
+                })?
+                .clone();
+            if !created {
+                return Err(DeployError::Recovery(
+                    "unbound target relaunch attempt has no recoverable receipt".to_string(),
+                ));
+            }
             let runtime = crate::journal::live_runtime(
                 &working.target_runtime,
                 &working.target_generation_root,
@@ -252,8 +357,11 @@ where
                 &working.target_generation_id,
                 &runtime,
                 &working.target_node,
+                &attempt,
             )?;
             validate_relaunched_process(&working, &process, false)?;
+            working = working.with_bound_relaunch_attempt(process.clone())?;
+            journal.save(&working)?;
             (process, true)
         }
         PortState::Prior { .. } | PortState::Foreign => {
@@ -323,6 +431,15 @@ where
     D: ActivationDriver,
 {
     let selected = driver.selected_generation()?;
+    if matches!(
+        record.phase,
+        TransactionPhase::Activated | TransactionPhase::ActivationConfirmed
+    ) && selected != record.target_generation_id
+    {
+        return Err(DeployError::Recovery(
+            "client-only confirmed transaction requires the target pointer".to_string(),
+        ));
+    }
     if selected == record.prior_generation_id {
         let state = driver.observe_port(record)?;
         validate_port_state(record, &state)?;

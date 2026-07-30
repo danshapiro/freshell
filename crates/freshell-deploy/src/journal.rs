@@ -34,6 +34,25 @@ pub enum UpdateMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchLane {
+    TargetGated,
+    PriorRollback,
+    TargetRollForward,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchAttempt {
+    pub attempt_id: String,
+    pub ready_file: PathBuf,
+    pub lane: LaunchLane,
+    pub process_identity: Option<crate::process_identity::ProcessIdentity>,
+    #[serde(default)]
+    pub definitely_not_started: bool,
+}
+
 impl UpdateMode {
     pub fn changes_server(self) -> bool {
         !matches!(self, Self::ClientOnly)
@@ -156,9 +175,13 @@ pub struct TransactionRecord {
     pub target_node: crate::legacy::NodePrerequisite,
     pub prior_live: LiveReceipt,
     pub controls: ControlPaths,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_protocol_version: Option<String>,
     pub candidate: Option<CandidateEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relaunch_attempts: Vec<crate::process_identity::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_attempts: Vec<LaunchAttempt>,
     pub phase: TransactionPhase,
     #[serde(default)]
     pub finalized: bool,
@@ -184,8 +207,10 @@ impl TransactionRecord {
             target_node: request.target_node.clone(),
             prior_live: request.prior_live.clone(),
             controls: request.controls.clone(),
+            launch_protocol_version: Some("1".to_string()),
             candidate: None,
             relaunch_attempts: Vec::new(),
+            launch_attempts: Vec::new(),
             phase: TransactionPhase::Prepared,
             finalized: false,
         };
@@ -238,6 +263,15 @@ impl TransactionRecord {
         validate_node_prerequisite(&self.prior_node, &self.prior_runtime)?;
         validate_node_prerequisite(&self.target_node, &self.target_runtime)?;
         self.controls.validate(&self.transaction_id)?;
+        if self
+            .launch_protocol_version
+            .as_deref()
+            .is_some_and(|version| version != "1")
+        {
+            return Err(DeployError::Journal(
+                "launch protocol version is unsupported".to_string(),
+            ));
+        }
         if self.controls.directory
             != prior_port_root
                 .join("transactions")
@@ -274,6 +308,148 @@ impl TransactionRecord {
             let prior = self.phase != TransactionPhase::ActivationConfirmed;
             validate_generation_process(self, process, prior)?;
         }
+        for (index, attempt) in self.launch_attempts.iter().enumerate() {
+            let expected_id = format!("{}-{index}", attempt.lane.as_str());
+            if attempt.attempt_id != expected_id
+                || attempt.ready_file
+                    != self
+                        .controls
+                        .directory
+                        .join(format!("launch-{expected_id}.json"))
+            {
+                return Err(DeployError::Journal(
+                    "launch attempt identity or receipt path is not deterministic".to_string(),
+                ));
+            }
+            if attempt.process_identity.is_some() && attempt.definitely_not_started {
+                return Err(DeployError::Journal(
+                    "launch attempt cannot be both started and not-started".to_string(),
+                ));
+            }
+            if attempt.process_identity.is_none()
+                && !attempt.definitely_not_started
+                && !match attempt.lane {
+                    LaunchLane::TargetGated => self.phase == TransactionPhase::StartTargetIntent,
+                    LaunchLane::PriorRollback => {
+                        self.mode.changes_server()
+                            && self.phase <= TransactionPhase::ActivationAuthorized
+                    }
+                    LaunchLane::TargetRollForward => {
+                        self.mode.changes_server()
+                            && self.phase == TransactionPhase::ActivationConfirmed
+                    }
+                }
+            {
+                return Err(DeployError::Journal(
+                    "unbound launch attempt is invalid for this transaction phase".to_string(),
+                ));
+            }
+            if self.launch_protocol_version.is_some()
+                && match attempt.lane {
+                    LaunchLane::TargetGated => false,
+                    LaunchLane::PriorRollback => {
+                        self.phase > TransactionPhase::ActivationAuthorized
+                            && self.phase != TransactionPhase::RollbackComplete
+                    }
+                    LaunchLane::TargetRollForward => {
+                        self.phase != TransactionPhase::ActivationConfirmed
+                    }
+                }
+            {
+                return Err(DeployError::Journal(
+                    "launch attempt lane is invalid for the durable phase".to_string(),
+                ));
+            }
+            if let Some(process) = &attempt.process_identity {
+                validate_generation_process(
+                    self,
+                    process,
+                    attempt.lane == LaunchLane::PriorRollback,
+                )?;
+            }
+        }
+        let unresolved = self
+            .launch_attempts
+            .iter()
+            .enumerate()
+            .filter(|(_, attempt)| {
+                attempt.process_identity.is_none() && !attempt.definitely_not_started
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if unresolved.len() > 1
+            || unresolved
+                .first()
+                .is_some_and(|index| *index + 1 != self.launch_attempts.len())
+            || (self.finalized && !unresolved.is_empty())
+        {
+            return Err(DeployError::Journal(
+                "at most one final launch attempt may remain unresolved".to_string(),
+            ));
+        }
+        let ordinary_bound = self
+            .launch_attempts
+            .iter()
+            .filter(|attempt| attempt.lane != LaunchLane::TargetGated)
+            .filter_map(|attempt| attempt.process_identity.as_ref())
+            .collect::<Vec<_>>();
+        if self.launch_protocol_version.is_some()
+            && (ordinary_bound.len() != self.relaunch_attempts.len()
+                || !ordinary_bound
+                    .iter()
+                    .zip(self.relaunch_attempts.iter())
+                    .all(|(attempt, process)| *attempt == process))
+        {
+            return Err(DeployError::Journal(
+                "ordinary launch attempts are not mirrored by relaunch evidence".to_string(),
+            ));
+        }
+        let bound_gated = self
+            .launch_attempts
+            .iter()
+            .filter(|attempt| attempt.lane == LaunchLane::TargetGated)
+            .filter_map(|attempt| attempt.process_identity.as_ref())
+            .collect::<Vec<_>>();
+        if self.launch_protocol_version.is_some()
+            && match &self.candidate {
+                None => !bound_gated.is_empty(),
+                Some(candidate) => {
+                    bound_gated.len() != 1
+                        || bound_gated.first().copied() != Some(&candidate.process)
+                }
+            }
+        {
+            return Err(DeployError::Journal(
+                "bound gated launch attempt is not mirrored by candidate evidence".to_string(),
+            ));
+        }
+        if self.launch_protocol_version.is_some() {
+            let has_prior = self
+                .launch_attempts
+                .iter()
+                .any(|attempt| attempt.lane == LaunchLane::PriorRollback);
+            let has_target_roll = self
+                .launch_attempts
+                .iter()
+                .any(|attempt| attempt.lane == LaunchLane::TargetRollForward);
+            let mut ordinary_seen = false;
+            for attempt in &self.launch_attempts {
+                if attempt.lane == LaunchLane::TargetGated {
+                    if ordinary_seen {
+                        return Err(DeployError::Journal(
+                            "gated launch attempts must precede every ordinary lane".to_string(),
+                        ));
+                    }
+                } else {
+                    ordinary_seen = true;
+                }
+            }
+            if has_prior && has_target_roll {
+                return Err(DeployError::Journal(
+                    "rollback and roll-forward launch lanes are mutually exclusive".to_string(),
+                ));
+            }
+        }
         if self.phase >= TransactionPhase::TargetReadyGated
             && self.phase < TransactionPhase::RollbackComplete
             && self.mode.changes_server()
@@ -309,24 +485,6 @@ impl TransactionRecord {
         Ok(next)
     }
 
-    pub(crate) fn with_candidate(
-        &self,
-        candidate: CandidateEvidence,
-        phase: TransactionPhase,
-    ) -> Result<Self> {
-        let mut next = self.clone();
-        next.candidate = Some(candidate);
-        next.phase = phase;
-        if !valid_transition(self.mode, self.phase, phase) {
-            return Err(DeployError::Journal(format!(
-                "invalid candidate phase transition {:?} -> {:?}",
-                self.phase, phase
-            )));
-        }
-        next.validate()?;
-        Ok(next)
-    }
-
     pub(crate) fn finalized(&self) -> Result<Self> {
         let mut next = self.clone();
         next.finalized = true;
@@ -353,6 +511,90 @@ impl TransactionRecord {
         self.relaunch_attempts.last()
     }
 
+    pub(crate) fn pending_launch_attempt(&self) -> Option<&LaunchAttempt> {
+        self.launch_attempts
+            .last()
+            .filter(|attempt| attempt.process_identity.is_none() && !attempt.definitely_not_started)
+    }
+
+    pub(crate) fn with_new_launch_attempt(&self, lane: LaunchLane) -> Result<Self> {
+        if self.pending_launch_attempt().is_some() {
+            return Err(DeployError::Journal(
+                "cannot create a second unbound launch attempt".to_string(),
+            ));
+        }
+        let attempt_id = format!("{}-{}", lane.as_str(), self.launch_attempts.len());
+        let mut next = self.clone();
+        next.launch_attempts.push(LaunchAttempt {
+            ready_file: self
+                .controls
+                .directory
+                .join(format!("launch-{attempt_id}.json")),
+            attempt_id,
+            lane,
+            process_identity: None,
+            definitely_not_started: false,
+        });
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub(crate) fn with_launch_definitely_not_started(&self) -> Result<Self> {
+        let mut next = self.clone();
+        let attempt = next.launch_attempts.last_mut().ok_or_else(|| {
+            DeployError::Journal("cannot resolve a missing launch attempt".to_string())
+        })?;
+        if attempt.process_identity.is_some() {
+            return Err(DeployError::Journal(
+                "started launch attempt cannot become not-started".to_string(),
+            ));
+        }
+        attempt.definitely_not_started = true;
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub(crate) fn with_bound_gated_candidate(&self, candidate: CandidateEvidence) -> Result<Self> {
+        let mut next = self.clone();
+        let attempt = next.launch_attempts.last_mut().ok_or_else(|| {
+            DeployError::Journal("cannot bind a missing gated launch attempt".to_string())
+        })?;
+        if attempt.lane != LaunchLane::TargetGated || attempt.process_identity.is_some() {
+            return Err(DeployError::Journal(
+                "active launch attempt is not an unbound gated target".to_string(),
+            ));
+        }
+        attempt.process_identity = Some(candidate.process.clone());
+        next.candidate = Some(candidate);
+        next.phase = TransactionPhase::TargetReadyGated;
+        if !valid_transition(self.mode, self.phase, next.phase) {
+            return Err(DeployError::Journal(
+                "gated launch binding cannot advance this phase".to_string(),
+            ));
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub(crate) fn with_bound_relaunch_attempt(
+        &self,
+        process: crate::process_identity::ProcessIdentity,
+    ) -> Result<Self> {
+        let mut next = self.clone();
+        let attempt = next.launch_attempts.last_mut().ok_or_else(|| {
+            DeployError::Journal("cannot bind a missing ordinary launch attempt".to_string())
+        })?;
+        if attempt.lane == LaunchLane::TargetGated || attempt.process_identity.is_some() {
+            return Err(DeployError::Journal(
+                "active launch attempt is not an unbound ordinary relaunch".to_string(),
+            ));
+        }
+        attempt.process_identity = Some(process.clone());
+        next.relaunch_attempts.push(process);
+        next.validate()?;
+        Ok(next)
+    }
+
     pub(crate) fn expected_prior_process(&self) -> &crate::process_identity::ProcessIdentity {
         self.prior_live
             .process_identity
@@ -377,6 +619,16 @@ impl TransactionRecord {
             ));
         }
         Ok(prior)
+    }
+}
+
+impl LaunchLane {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetGated => "target-gated",
+            Self::PriorRollback => "prior-rollback",
+            Self::TargetRollForward => "target-roll-forward",
+        }
     }
 }
 
@@ -745,25 +997,40 @@ impl TransactionJournal for DurableTransactionJournal {
             && existing.prior_node == record.prior_node
             && existing.target_node == record.target_node
             && existing.prior_live == record.prior_live
-            && existing.controls == record.controls;
+            && existing.controls == record.controls
+            && existing.launch_protocol_version == record.launch_protocol_version;
         let candidate_matches = existing.candidate == record.candidate
             || (existing.candidate.is_none()
                 && record.candidate.is_some()
                 && existing.phase == TransactionPhase::StartTargetIntent
                 && record.phase == TransactionPhase::TargetReadyGated);
+        let protocol_candidate_matches = existing.launch_protocol_version.is_none()
+            || candidate_advance_matches_gated_binding(&existing, record);
         let relaunch_matches = record
             .relaunch_attempts
             .starts_with(&existing.relaunch_attempts)
             && record.relaunch_attempts.len() <= existing.relaunch_attempts.len() + 1
             && (record.relaunch_attempts.len() == existing.relaunch_attempts.len()
                 || existing.phase == record.phase);
+        let launch_matches = launch_attempts_advance_monotonically(
+            &existing.launch_attempts,
+            &record.launch_attempts,
+        ) && (existing.launch_attempts == record.launch_attempts
+            || existing.phase == record.phase
+            || (existing.phase == TransactionPhase::StartTargetIntent
+                && record.phase == TransactionPhase::TargetReadyGated));
+        let protocol_relaunch_matches = existing.launch_protocol_version.is_none()
+            || relaunch_advance_matches_launch_binding(&existing, record);
         let finalization_is_monotonic = !existing.finalized
             || (record.finalized
                 && existing.phase == record.phase
                 && existing.candidate == record.candidate);
         if !immutable_identity_matches
             || !candidate_matches
+            || !protocol_candidate_matches
             || !relaunch_matches
+            || !launch_matches
+            || !protocol_relaunch_matches
             || !finalization_is_monotonic
             || !valid_transition(record.mode, existing.phase, record.phase)
         {
@@ -774,6 +1041,90 @@ impl TransactionJournal for DurableTransactionJournal {
         }
         self.publish(record)
     }
+}
+
+fn candidate_advance_matches_gated_binding(
+    existing: &TransactionRecord,
+    next: &TransactionRecord,
+) -> bool {
+    let candidate_added = existing.candidate.is_none() && next.candidate.is_some();
+    let gated_bound = existing.launch_attempts.len() == next.launch_attempts.len()
+        && existing
+            .launch_attempts
+            .last()
+            .zip(next.launch_attempts.last())
+            .is_some_and(|(old, new)| {
+                old.attempt_id == new.attempt_id
+                    && old.lane == LaunchLane::TargetGated
+                    && old.process_identity.is_none()
+                    && !old.definitely_not_started
+                    && new.process_identity.as_ref()
+                        == next.candidate.as_ref().map(|candidate| &candidate.process)
+            });
+    candidate_added == gated_bound
+}
+
+fn relaunch_advance_matches_launch_binding(
+    existing: &TransactionRecord,
+    next: &TransactionRecord,
+) -> bool {
+    let relaunch_added = next.relaunch_attempts.len() == existing.relaunch_attempts.len() + 1;
+    let launch_bound = existing.launch_attempts.len() == next.launch_attempts.len()
+        && existing
+            .launch_attempts
+            .last()
+            .zip(next.launch_attempts.last())
+            .is_some_and(|(old, new)| {
+                old.attempt_id == new.attempt_id
+                    && old.lane == new.lane
+                    && old.lane != LaunchLane::TargetGated
+                    && old.process_identity.is_none()
+                    && !old.definitely_not_started
+                    && new.process_identity.as_ref() == next.relaunch_attempts.last()
+            });
+    relaunch_added == launch_bound
+}
+
+fn launch_attempts_advance_monotonically(
+    existing: &[LaunchAttempt],
+    next: &[LaunchAttempt],
+) -> bool {
+    if next.len() < existing.len() || next.len() > existing.len() + 1 {
+        return false;
+    }
+    let mut changed_existing = false;
+    for (index, old) in existing.iter().enumerate() {
+        let Some(new) = next.get(index) else {
+            return false;
+        };
+        if old == new {
+            continue;
+        }
+        changed_existing = true;
+        let binds_process = old.process_identity.is_none()
+            && new.process_identity.is_some()
+            && !old.definitely_not_started
+            && !new.definitely_not_started;
+        let proves_not_started = old.process_identity.is_none()
+            && new.process_identity.is_none()
+            && !old.definitely_not_started
+            && new.definitely_not_started;
+        if index + 1 != existing.len()
+            || old.attempt_id != new.attempt_id
+            || old.ready_file != new.ready_file
+            || old.lane != new.lane
+            || (!binds_process && !proves_not_started)
+        {
+            return false;
+        }
+    }
+    if next.len() > existing.len() && changed_existing {
+        return false;
+    }
+    next.len() == existing.len()
+        || next.last().is_some_and(|attempt| {
+            attempt.process_identity.is_none() && !attempt.definitely_not_started
+        })
 }
 
 fn validate_private_transaction_store(record: &TransactionRecord) -> Result<()> {

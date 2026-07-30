@@ -20,14 +20,14 @@ mod store;
 pub use activation::{
     publish_activation_authorization, publish_activation_cancellation, read_activation_receipt,
     read_cancellation_receipt, ActivationController, ActivationDriver, ActivationProgress,
-    ActivationReceiptObservation, ActivationRequest, CancellationReceiptObservation, PortState,
-    ServiceState,
+    ActivationReceiptObservation, ActivationRequest, CancellationReceiptObservation,
+    LaunchAttemptObservation, PortState, ServiceState,
 };
 pub use cli::{execute_capture, CaptureCommand};
 pub use error::{DeployError, Result};
 pub use journal::{
-    ControlPaths, DurableTransactionJournal, TransactionJournal, TransactionPhase,
-    TransactionRecord, UpdateMode,
+    ControlPaths, DurableTransactionJournal, LaunchAttempt, LaunchLane, TransactionJournal,
+    TransactionPhase, TransactionRecord, UpdateMode,
 };
 pub use legacy::{
     capture_legacy, LegacyCaptureReceipt, LegacyCaptureRequest, LegacyRuntimeSources,

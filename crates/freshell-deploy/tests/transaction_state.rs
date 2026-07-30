@@ -13,10 +13,11 @@ use freshell_deploy::{
     validate_compatibility_artifacts, ActivationController, ActivationDriver, ActivationProgress,
     ActivationReceiptObservation, ActivationRequest, CandidateEvidence, ControlPaths, DeployError,
     DeployPort, DurableTransactionJournal, EntryKind, FileIdentity, GenerationProbe,
-    GenerationProbeRequest, LegacyCaptureReceipt, LiveReceipt, ManifestEntry, NodePrerequisite,
-    NonSecretLaunchMetadata, PortState, ProbeBackend, ProbeCommand, ProbeCommandOutput,
-    ProbeLaunch, RecoveryOutcome, Result, RuntimeBindings, RuntimeProvenance, ServiceState, Store,
-    TransactionJournal, TransactionPhase, TransactionRecord, UpdateMode,
+    GenerationProbeRequest, LaunchAttempt, LaunchAttemptObservation, LaunchLane,
+    LegacyCaptureReceipt, LiveReceipt, ManifestEntry, NodePrerequisite, NonSecretLaunchMetadata,
+    PortState, ProbeBackend, ProbeCommand, ProbeCommandOutput, ProbeLaunch, RecoveryOutcome,
+    Result, RuntimeBindings, RuntimeProvenance, ServiceState, Store, TransactionJournal,
+    TransactionPhase, TransactionRecord, UpdateMode,
 };
 
 use support::{
@@ -56,9 +57,50 @@ impl TransactionJournal for FailOnceJournal {
     }
 }
 
+struct FailLaunchBindingJournal {
+    inner: MemoryJournal,
+    failed: bool,
+}
+
+impl TransactionJournal for FailLaunchBindingJournal {
+    fn load(&self) -> Result<Option<TransactionRecord>> {
+        self.inner.load()
+    }
+
+    fn begin(&mut self, record: &TransactionRecord) -> Result<()> {
+        self.inner.begin(record)
+    }
+
+    fn save(&mut self, record: &TransactionRecord) -> Result<()> {
+        let binds_pending = self
+            .inner
+            .record
+            .as_ref()
+            .and_then(|existing| existing.launch_attempts.last())
+            .is_some_and(|attempt| {
+                attempt.process_identity.is_none() && !attempt.definitely_not_started
+            })
+            && record.launch_attempts.last().is_some_and(|attempt| {
+                attempt.process_identity.is_some() || attempt.definitely_not_started
+            })
+            && record
+                .launch_attempts
+                .last()
+                .and_then(|attempt| attempt.process_identity.as_ref())
+                .is_some();
+        if !self.failed && binds_pending {
+            self.failed = true;
+            return Err(DeployError::Journal(
+                "injected launch binding failure".to_string(),
+            ));
+        }
+        self.inner.save(record)
+    }
+}
+
 impl TransactionJournal for MemoryJournal {
     fn load(&self) -> Result<Option<TransactionRecord>> {
-        Ok(self.record.clone())
+        Ok(self.record.clone().map(normalize_test_launch_history))
     }
 
     fn begin(&mut self, record: &TransactionRecord) -> Result<()> {
@@ -138,6 +180,7 @@ struct FakeDriver {
     cancellation_requested: bool,
     cancellation_leaves_process_draining: bool,
     cancellation_publishes_both: bool,
+    attempt_receipts: BTreeMap<String, LaunchAttemptObservation>,
 }
 
 impl FakeDriver {
@@ -176,6 +219,7 @@ impl FakeDriver {
             cancellation_requested: false,
             cancellation_leaves_process_draining: false,
             cancellation_publishes_both: false,
+            attempt_receipts: BTreeMap::new(),
         }
     }
 
@@ -275,6 +319,18 @@ impl ActivationDriver for FakeDriver {
         Ok(self.state.clone())
     }
 
+    fn observe_launch_attempt(
+        &mut self,
+        attempt: &LaunchAttempt,
+        _record: &TransactionRecord,
+    ) -> Result<LaunchAttemptObservation> {
+        Ok(self
+            .attempt_receipts
+            .get(&attempt.attempt_id)
+            .cloned()
+            .unwrap_or(LaunchAttemptObservation::Absent))
+    }
+
     fn stop(&mut self, process: &freshell_deploy::ProcessIdentity) -> Result<()> {
         self.maybe_fail(DriverOperation::Stop, FailureTiming::Before)?;
         let observed = match &self.state {
@@ -306,7 +362,14 @@ impl ActivationDriver for FakeDriver {
         runtime: &RuntimeProvenance,
         node: &NodePrerequisite,
         _controls: &ControlPaths,
+        attempt: &LaunchAttempt,
     ) -> Result<CandidateEvidence> {
+        if self.fail_once == Some((DriverOperation::StartGated, FailureTiming::Before)) {
+            self.attempt_receipts.insert(
+                attempt.attempt_id.clone(),
+                LaunchAttemptObservation::DefinitelyNotStarted,
+            );
+        }
         self.maybe_fail(DriverOperation::StartGated, FailureTiming::Before)?;
         assert_eq!(
             root,
@@ -322,6 +385,10 @@ impl ActivationDriver for FakeDriver {
         self.events
             .push(Event::StartGated(root.display().to_string()));
         self.target_gated();
+        self.attempt_receipts.insert(
+            attempt.attempt_id.clone(),
+            LaunchAttemptObservation::Gated(self.target.clone()),
+        );
         self.maybe_fail(DriverOperation::StartGated, FailureTiming::After)?;
         Ok(self.target.clone())
     }
@@ -332,11 +399,18 @@ impl ActivationDriver for FakeDriver {
         generation_id: &str,
         runtime: &RuntimeProvenance,
         node: &NodePrerequisite,
+        attempt: &LaunchAttempt,
     ) -> Result<freshell_deploy::ProcessIdentity> {
         if !self.off_port_processes.is_empty() {
             return Err(DeployError::Activation(
                 "cannot relaunch while an owned predecessor is draining off-port".to_string(),
             ));
+        }
+        if self.fail_once == Some((DriverOperation::StartOrdinary, FailureTiming::Before)) {
+            self.attempt_receipts.insert(
+                attempt.attempt_id.clone(),
+                LaunchAttemptObservation::DefinitelyNotStarted,
+            );
         }
         self.maybe_fail(DriverOperation::StartOrdinary, FailureTiming::Before)?;
         assert_eq!(
@@ -377,6 +451,10 @@ impl ActivationDriver for FakeDriver {
                 service: ServiceState::Ordinary,
             }
         };
+        self.attempt_receipts.insert(
+            attempt.attempt_id.clone(),
+            LaunchAttemptObservation::Ordinary(process.clone()),
+        );
         self.maybe_fail(DriverOperation::StartOrdinary, FailureTiming::After)?;
         Ok(process)
     }
@@ -607,6 +685,70 @@ fn dual_identity_request(
 
 fn prepared_record(mode: UpdateMode, port: u16) -> TransactionRecord {
     TransactionRecord::prepared(&request(mode, port)).unwrap()
+}
+
+fn seed_bound_relaunch(
+    record: &mut TransactionRecord,
+    lane: LaunchLane,
+    process: freshell_deploy::ProcessIdentity,
+) {
+    let index = record.launch_attempts.len();
+    let lane_name = match lane {
+        LaunchLane::PriorRollback => "prior-rollback",
+        LaunchLane::TargetRollForward => "target-roll-forward",
+        LaunchLane::TargetGated => panic!("relaunch helper requires an ordinary lane"),
+    };
+    let attempt_id = format!("{lane_name}-{index}");
+    record.launch_attempts.push(LaunchAttempt {
+        ready_file: record
+            .controls
+            .directory
+            .join(format!("launch-{attempt_id}.json")),
+        attempt_id,
+        lane,
+        process_identity: Some(process.clone()),
+        definitely_not_started: false,
+    });
+    record.relaunch_attempts.push(process);
+}
+
+fn normalize_test_launch_history(mut record: TransactionRecord) -> TransactionRecord {
+    if record.launch_protocol_version.is_none() || record.candidate.is_none() {
+        return record;
+    }
+    let has_bound_gated = record.launch_attempts.iter().any(|attempt| {
+        attempt.lane == LaunchLane::TargetGated && attempt.process_identity.is_some()
+    });
+    if !has_bound_gated {
+        let candidate = record.candidate.as_ref().unwrap();
+        record.launch_attempts.insert(
+            0,
+            LaunchAttempt {
+                attempt_id: String::new(),
+                ready_file: PathBuf::new(),
+                lane: LaunchLane::TargetGated,
+                process_identity: Some(candidate.process.clone()),
+                definitely_not_started: false,
+            },
+        );
+        reindex_test_attempts(&mut record);
+    }
+    record
+}
+
+fn reindex_test_attempts(record: &mut TransactionRecord) {
+    for (index, attempt) in record.launch_attempts.iter_mut().enumerate() {
+        let lane_name = match attempt.lane {
+            LaunchLane::TargetGated => "target-gated",
+            LaunchLane::PriorRollback => "prior-rollback",
+            LaunchLane::TargetRollForward => "target-roll-forward",
+        };
+        attempt.attempt_id = format!("{lane_name}-{index}");
+        attempt.ready_file = record
+            .controls
+            .directory
+            .join(format!("launch-{}.json", attempt.attempt_id));
+    }
 }
 
 fn relaunched_identity(
@@ -1336,6 +1478,7 @@ fn live_candidate_accepts_wildcard_bind_but_rejects_executable_and_runtime_drift
     let mut exact = candidate(TARGET_ID, 5102, 3532);
     exact.ready.actual_address = "0.0.0.0:3532".to_string();
     record.candidate = Some(exact.clone());
+    record = normalize_test_launch_history(record);
     record
         .validate()
         .expect("the live server may bind the normal wildcard address");
@@ -1564,6 +1707,104 @@ fn contradictory_activation_and_cancellation_receipts_fail_closed() {
 }
 
 #[test]
+fn authorized_rollback_resumes_after_the_prior_pointer_was_restored() {
+    let mut record = prepared_record(UpdateMode::Server, 3543);
+    record.phase = TransactionPhase::ActivationAuthorized;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3543));
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3543);
+    driver.selected = PRIOR_ID.to_string();
+    driver.state = PortState::Free;
+    driver.cancellation_receipt =
+        ActivationReceiptObservation::Present(driver.target.ready.clone());
+
+    assert_eq!(
+        ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .unwrap(),
+        RecoveryOutcome::RolledBack
+    );
+    assert_eq!(
+        journal.record.as_ref().unwrap().phase,
+        TransactionPhase::RollbackComplete
+    );
+    assert_eq!(driver.live.selected_generation_id, PRIOR_ID);
+}
+
+#[test]
+fn authorized_rollback_replays_a_crash_after_restoring_the_prior_pointer() {
+    let mut record = prepared_record(UpdateMode::Server, 3550);
+    record.phase = TransactionPhase::ActivationAuthorized;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3550));
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3550);
+    driver.selected = TARGET_ID.to_string();
+    driver.target_gated();
+    driver.fail_once = Some((DriverOperation::Switch, FailureTiming::After));
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert_eq!(driver.selected, PRIOR_ID);
+    assert!(matches!(driver.state, PortState::Free));
+    assert_eq!(
+        journal.record.as_ref().unwrap().phase,
+        TransactionPhase::ActivationAuthorized
+    );
+
+    assert_eq!(
+        ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .unwrap(),
+        RecoveryOutcome::RolledBack
+    );
+    assert_eq!(
+        journal.record.as_ref().unwrap().phase,
+        TransactionPhase::RollbackComplete
+    );
+}
+
+#[test]
+fn confirmed_client_pointer_drift_fails_before_live_receipt_mutation() {
+    for (phase, selected) in [
+        (TransactionPhase::Activated, PRIOR_ID),
+        (TransactionPhase::Activated, FOREIGN_ID),
+        (TransactionPhase::ActivationConfirmed, PRIOR_ID),
+        (TransactionPhase::ActivationConfirmed, FOREIGN_ID),
+    ] {
+        let mut record = prepared_record(UpdateMode::ClientOnly, 3544);
+        record.phase = phase;
+        let mut journal = MemoryJournal {
+            record: Some(record),
+            phases: Vec::new(),
+        };
+        let mut driver = FakeDriver::server(3544);
+        driver.selected = selected.to_string();
+        let original_live = driver.live.clone();
+
+        assert!(ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .is_err());
+        assert_eq!(driver.live, original_live);
+        assert!(driver.events.iter().all(|event| !matches!(
+            event,
+            Event::WriteLive(_, _)
+                | Event::Switch(_, _)
+                | Event::Stop(_)
+                | Event::StartGated(_)
+                | Event::StartOrdinary(_)
+        )));
+        assert_eq!(journal.record.as_ref().unwrap().phase, phase);
+    }
+}
+
+#[test]
 fn ordinary_activation_never_starts_beside_an_off_port_prior() {
     let mut record = prepared_record(UpdateMode::Server, 3542);
     record.phase = TransactionPhase::StartTargetIntent;
@@ -1582,6 +1823,182 @@ fn ordinary_activation_never_starts_beside_an_off_port_prior() {
         .events
         .iter()
         .any(|event| matches!(event, Event::StartGated(_))));
+}
+
+#[test]
+fn unbound_gated_attempt_is_recovered_before_off_port_rollback() {
+    let mut record = prepared_record(UpdateMode::Server, 3547);
+    record.phase = TransactionPhase::StartTargetIntent;
+    let mut journal = FailLaunchBindingJournal {
+        inner: MemoryJournal {
+            record: Some(record),
+            phases: Vec::new(),
+        },
+        failed: false,
+    };
+    let mut driver = FakeDriver::server(3547);
+    driver.state = PortState::Free;
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .step()
+        .is_err());
+    let process = driver.target.process.clone();
+    driver.state = PortState::Free;
+    driver.off_port_processes.push(process.clone());
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert_eq!(
+        journal
+            .inner
+            .record
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .process,
+        process
+    );
+    assert_eq!(
+        driver
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::StartGated(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unbound_prior_relaunch_is_recovered_before_off_port_successor() {
+    let mut record = prepared_record(UpdateMode::Server, 3548);
+    record.phase = TransactionPhase::StartTargetIntent;
+    let mut journal = FailLaunchBindingJournal {
+        inner: MemoryJournal {
+            record: Some(record),
+            phases: Vec::new(),
+        },
+        failed: false,
+    };
+    let mut driver = FakeDriver::server(3548);
+    driver.state = PortState::Free;
+    driver.relaunch_with_new_identity = true;
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    let process = match &driver.state {
+        PortState::Prior { process, .. } => process.clone(),
+        state => panic!("expected prior relaunch, got {state:?}"),
+    };
+    driver.state = PortState::Free;
+    driver.off_port_processes.push(process.clone());
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert_eq!(
+        journal
+            .inner
+            .record
+            .as_ref()
+            .unwrap()
+            .relaunch_attempts
+            .last(),
+        Some(&process)
+    );
+    assert_eq!(
+        driver
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::StartOrdinary(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unbound_target_relaunch_is_recovered_before_off_port_successor() {
+    let mut record = prepared_record(UpdateMode::Server, 3549);
+    record.phase = TransactionPhase::ActivationConfirmed;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3549));
+    let mut journal = FailLaunchBindingJournal {
+        inner: MemoryJournal {
+            record: Some(record),
+            phases: Vec::new(),
+        },
+        failed: false,
+    };
+    let mut driver = FakeDriver::server(3549);
+    driver.selected = TARGET_ID.to_string();
+    driver.state = PortState::Free;
+    driver.relaunch_with_new_identity = true;
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    let process = match &driver.state {
+        PortState::TargetRelaunch { process } => process.clone(),
+        state => panic!("expected target relaunch, got {state:?}"),
+    };
+    driver.state = PortState::Free;
+    driver.off_port_processes.push(process.clone());
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert_eq!(
+        journal
+            .inner
+            .record
+            .as_ref()
+            .unwrap()
+            .relaunch_attempts
+            .last(),
+        Some(&process)
+    );
+    assert_eq!(
+        driver
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::StartOrdinary(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn legacy_empty_launch_history_never_authorizes_start_or_signal() {
+    for gated in [false, true] {
+        let mut record = prepared_record(UpdateMode::Server, 3551);
+        record.launch_protocol_version = None;
+        record.phase = if gated {
+            record.candidate = Some(candidate(TARGET_ID, 5102, 3551));
+            TransactionPhase::TargetReadyGated
+        } else {
+            TransactionPhase::StartTargetIntent
+        };
+        let mut journal = MemoryJournal {
+            record: Some(record),
+            phases: Vec::new(),
+        };
+        let mut driver = FakeDriver::server(3551);
+        if gated {
+            driver.target_gated();
+        } else {
+            driver.state = PortState::Free;
+        }
+
+        assert!(ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .is_err());
+        assert!(driver.events.iter().all(|event| !matches!(
+            event,
+            Event::Stop(_) | Event::StartGated(_) | Event::StartOrdinary(_)
+        )));
+    }
 }
 
 #[test]
@@ -1965,7 +2382,7 @@ fn recovery_rechecks_current_after_exit_proof_before_relaunch_rebind_save() {
     record.phase = TransactionPhase::ActivationConfirmed;
     record.candidate = Some(candidate(TARGET_ID, 5102, 3555));
     let first_relaunch = relaunched_identity(process_identity(TARGET_ID, 5102, 3555), 1_000);
-    record.relaunch_attempts.push(first_relaunch);
+    seed_bound_relaunch(&mut record, LaunchLane::TargetRollForward, first_relaunch);
     let mut journal = MemoryJournal {
         record: Some(record),
         phases: Vec::new(),
@@ -1985,9 +2402,14 @@ fn recovery_rechecks_current_after_exit_proof_before_relaunch_rebind_save() {
     );
     assert_eq!(
         journal.record.as_ref().unwrap().relaunch_attempts.len(),
-        1,
-        "foreign current must not gain a newly durable process binding"
+        2,
+        "the launched process identity must remain recoverable despite pointer theft"
     );
+    assert!(!journal.record.as_ref().unwrap().finalized);
+    assert!(!driver
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::WriteLive(_, _))));
 }
 
 #[test]
@@ -2322,12 +2744,11 @@ fn replay_rebinds_new_process_identity_after_ordinary_relaunch_crashes() {
     ] {
         let mut record = prepared_record(UpdateMode::Server, 3538);
         record.phase = TransactionPhase::StartTargetIntent;
-        let mut journal = FailOnceJournal {
+        let mut journal = FailLaunchBindingJournal {
             inner: MemoryJournal {
                 record: Some(record),
                 phases: Vec::new(),
             },
-            phase: fail_phase,
             failed: false,
         };
         let mut driver = FakeDriver::server(3538);
@@ -2354,12 +2775,11 @@ fn replay_rebinds_new_process_identity_after_ordinary_relaunch_crashes() {
     let mut record = prepared_record(UpdateMode::Server, 3539);
     record.phase = TransactionPhase::ActivationConfirmed;
     record.candidate = Some(candidate(TARGET_ID, 5102, 3539));
-    let mut journal = FailOnceJournal {
+    let mut journal = FailLaunchBindingJournal {
         inner: MemoryJournal {
             record: Some(record),
             phases: Vec::new(),
         },
-        phase: TransactionPhase::ActivationConfirmed,
         failed: false,
     };
     let mut driver = FakeDriver::server(3539);
@@ -2387,10 +2807,11 @@ fn replay_rebinds_new_process_identity_after_ordinary_relaunch_crashes() {
 fn replay_appends_a_new_attempt_only_after_the_bound_relaunch_exits() {
     let mut rollback_record = prepared_record(UpdateMode::Server, 3544);
     rollback_record.phase = TransactionPhase::StartTargetIntent;
-    rollback_record.relaunch_attempts.push(relaunched_identity(
-        process_identity(PRIOR_ID, 5101, 3544),
-        1_000,
-    ));
+    seed_bound_relaunch(
+        &mut rollback_record,
+        LaunchLane::PriorRollback,
+        relaunched_identity(process_identity(PRIOR_ID, 5101, 3544), 1_000),
+    );
     let mut rollback_journal = MemoryJournal {
         record: Some(rollback_record),
         phases: Vec::new(),
@@ -2417,10 +2838,11 @@ fn replay_appends_a_new_attempt_only_after_the_bound_relaunch_exits() {
     let mut target_record = prepared_record(UpdateMode::Server, 3545);
     target_record.phase = TransactionPhase::ActivationConfirmed;
     target_record.candidate = Some(candidate(TARGET_ID, 5102, 3545));
-    target_record.relaunch_attempts.push(relaunched_identity(
-        process_identity(TARGET_ID, 5102, 3545),
-        1_000,
-    ));
+    seed_bound_relaunch(
+        &mut target_record,
+        LaunchLane::TargetRollForward,
+        relaunched_identity(process_identity(TARGET_ID, 5102, 3545), 1_000),
+    );
     let mut target_journal = MemoryJournal {
         record: Some(target_record),
         phases: Vec::new(),
@@ -2448,16 +2870,16 @@ fn replay_appends_a_new_attempt_only_after_the_bound_relaunch_exits() {
     let mut crash_record = prepared_record(UpdateMode::Server, 3546);
     crash_record.phase = TransactionPhase::ActivationConfirmed;
     crash_record.candidate = Some(candidate(TARGET_ID, 5102, 3546));
-    crash_record.relaunch_attempts.push(relaunched_identity(
-        process_identity(TARGET_ID, 5102, 3546),
-        1_000,
-    ));
-    let mut crash_journal = FailOnceJournal {
+    seed_bound_relaunch(
+        &mut crash_record,
+        LaunchLane::TargetRollForward,
+        relaunched_identity(process_identity(TARGET_ID, 5102, 3546), 1_000),
+    );
+    let mut crash_journal = FailLaunchBindingJournal {
         inner: MemoryJournal {
             record: Some(crash_record),
             phases: Vec::new(),
         },
-        phase: TransactionPhase::ActivationConfirmed,
         failed: false,
     };
     let mut crash_driver = FakeDriver::server(3546);
@@ -2964,10 +3386,25 @@ fn durable_journal_freezes_transaction_identity_and_candidate_evidence() {
     let mut start = stop.clone();
     start.phase = TransactionPhase::StartTargetIntent;
     journal.save(&start).unwrap();
+    let attempt_id = "target-gated-0".to_string();
+    start.launch_attempts.push(LaunchAttempt {
+        ready_file: start
+            .controls
+            .directory
+            .join(format!("launch-{attempt_id}.json")),
+        attempt_id,
+        lane: LaunchLane::TargetGated,
+        process_identity: None,
+        definitely_not_started: false,
+    });
+    journal.save(&start).unwrap();
     let mut gated = start.clone();
     gated.phase = TransactionPhase::TargetReadyGated;
-    gated.candidate = Some(candidate(TARGET_ID, 5102, 3531));
+    let candidate = candidate(TARGET_ID, 5102, 3531);
+    gated.candidate = Some(candidate);
     relocate_record(&mut gated, fixture.path());
+    gated.launch_attempts.last_mut().unwrap().process_identity =
+        Some(gated.candidate.as_ref().unwrap().process.clone());
     journal.save(&gated).unwrap();
 
     let mut replaced_candidate = gated.clone();
