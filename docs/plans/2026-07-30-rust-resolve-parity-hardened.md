@@ -32,17 +32,17 @@
 
 ---
 
-### Task 1: Verify post-rebase reality and adopt the spec doc
+### Task 1: Verify post-rebase reality and the committed spec doc
 
-The rebase resolved TS conflicts favoring main's hardened semantics. Before changing anything, pin down what actually compiles and passes NOW — the failures and drift found here are the worklist the later tasks close. Also commit the SYNC-06 spec doc that is sitting untracked in the worktree.
+The rebase resolved TS conflicts favoring main's hardened semantics. Before changing anything, pin down what actually compiles and passes NOW — the failures and drift found here are the worklist the later tasks close. The SYNC-06 spec doc is ALREADY COMMITTED (`docs/plans/2026-07-29-rust-resolve-parity-spec.md`, aligned to the hardened contract during plan review) — verify it, do not re-commit it.
 
 **Files:**
-- Commit (already present, untracked): `docs/plans/2026-07-29-rust-resolve-parity-spec.md`
-- No source changes in this task.
+- Read (already committed): `docs/plans/2026-07-29-rust-resolve-parity-spec.md`
+- No file changes and NO commit in this task.
 
 **Interfaces:**
 - Consumes: the rebased worktree at `feat/rust-resolve-parity` (merge-base == `f903e8a6`).
-- Produces: a verified baseline (recorded in the commit message body) that later tasks rely on: cargo workspace state, which resume suites pass, and the confirmed drift findings listed below.
+- Produces: a verified baseline (recorded in this task's completion report; later tasks' commit bodies may cite it): cargo workspace state, which resume suites pass, and the confirmed drift findings listed below.
 
 - [ ] **Step 1: Confirm worktree identity and cleanliness**
 
@@ -51,15 +51,17 @@ Run:
 cd /home/dan/code/freshell/.worktrees/rust-resolve-parity
 git branch --show-current && git merge-base HEAD f903e8a6f5e2e0e926890e38c28e775776fec7de && git status --porcelain
 ```
-Expected: branch `feat/rust-resolve-parity`; merge-base prints `f903e8a6f5e2e0e926890e38c28e775776fec7de`; the ONLY status line is `?? docs/plans/2026-07-29-rust-resolve-parity-spec.md`. If there are OTHER dirty files or lock files, STOP and surface it — the worktree is not idle.
+Expected: branch `feat/rust-resolve-parity`; merge-base prints `f903e8a6f5e2e0e926890e38c28e775776fec7de`; `git status --porcelain` prints NOTHING (clean tree — the spec doc is already committed). If there ARE dirty/untracked files or lock files, STOP and surface it — the worktree is not idle.
 
 - [ ] **Step 2: Rust baseline**
 
 Run (from the worktree root):
 ```bash
+set -o pipefail
 cargo test -p freshell-sessions -p freshell-server 2>&1 | tail -20
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -5
 ```
+(`set -o pipefail` is load-bearing on every piped cargo command in this plan: without it a failing `cargo` exits through `tail`'s success status.)
 Expected: all tests pass and fmt/clippy are clean. The Rust side compiled at the old base and the rebase touched no Rust files' dependencies, so a failure here means the rebase broke something — investigate before proceeding (do not "fix forward" blind).
 
 - [ ] **Step 3: TS baseline for the resume suites**
@@ -81,21 +83,10 @@ Verify each of these against the code; they are the delta worklist:
 4. `crates/freshell-sessions/src/parse/opencode.rs::opencode_session_directory_by_id` is the OLD #583 parent-walk; hardened Node (`opencode-by-id-query.ts`) is a direct by-id row query (archived + child sessions included, full row returned, errors PROPAGATE).
 5. `crates/freshell-server/src/resolve.rs` response is `{status, matches, hint}` only; hardened wire adds `providerErrors`, `unsearchedProviders`, `homeDir` (`server/sessions-router.ts:306-314`), plus scan-failure merge, disabled-provider reporting, and degraded fire-and-forget refresh.
 
-- [ ] **Step 5: Commit the spec doc (with the baseline recorded in the body)**
+- [ ] **Step 5: Verify the committed spec doc and record the baseline**
 
-```bash
-git add docs/plans/2026-07-29-rust-resolve-parity-spec.md
-git commit -m "docs: adopt SYNC-06 rust resolve parity spec into the worktree
-
-Post-rebase baseline (onto f903e8a6): cargo -p freshell-sessions -p
-freshell-server green, fmt+clippy clean; hardened TS resume suites green;
-confirmed delta: TS parser test no longer consumes the shared fixture,
-rust parser/resolver/by-id/wire still implement pre-#586 semantics.
-
-🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
-
-Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
-```
+Run: `git log --oneline -1 -- docs/plans/2026-07-29-rust-resolve-parity-spec.md`
+Expected: one commit line (the spec is tracked, nothing uncommitted). Open the spec and confirm its "Contract" bullet describes the HARDENED response (`ready|warming|degraded`, `providerErrors`, `unsearchedProviders`, `homeDir`) — it was aligned during plan review; if it still describes a `{status, matches, hint}`-only response, STOP and surface it. Record the Step 2–4 baseline findings (workspace state, suite results, confirmed drift list) in this task's completion report. NO commit in this task.
 
 ---
 
@@ -573,7 +564,33 @@ fn provider_identity_travels_with_the_fallback_not_its_position() {
 }
 ```
 
-Also carry over (adapted) the pre-existing tests for: warming when `sessions: None` (assert `provider_errors` empty), ready-empty for garbage input, exact-beats-prefix same token, candidate priority order, ambiguous prefix most-recent-first capped at `RESOLVE_MATCH_CAP` (build 25 sessions with a shared prefix, assert 20 back, sorted by `last_activity_at` desc), and dedupe-most-recent (two entries same `(provider, session_id)`, different `last_activity_at`).
+The COMPLETE 23-test mapping to the Node suite (every `it(...)` title in `test/unit/server/coding-cli/resolve-session.test.ts` at this worktree's HEAD, in file order — the Rust suite must cover ALL 23; legend: ✎ = verbatim body given above, ↻ = carry over/adapt the old Rust test body, ✚ = write new from the stated expectation):
+
+1. `exact match wins across all providers at once (claude UUID, no hint needed)` ✚ — index sessions for several providers, input = CLAUDE_ID → exactly 1 exact match, `hint` is `None`.
+2. `short hex prefix matches the amplifier session (spec row: 417e8345)` ✚ — index an amplifier session `417e8345aaaa`, input `417e8345` → 1 prefix match.
+3. `exact-id match is case-insensitive for UUID/hex tokens` ✎ `exact_id_match_is_case_insensitive_for_uuid_hex_tokens`
+4. `ses_ ids are case-SENSITIVE (base62): a case-variant does NOT match` ✎ `ses_ids_are_case_sensitive_a_case_variant_does_not_match`
+5. `opencode ses_ id resolves to opencode even though other providers exist` ✚ — index sessions for all four providers incl. the SES_ID opencode row, input = SES_ID → 1 exact opencode match.
+6. `exact match takes precedence over prefix matches of the same token` ↻
+7. `ambiguous prefix returns all matches most-recent first, capped` ↻ — build 25 sessions with a shared prefix, assert 20 back (`RESOLVE_MATCH_CAP`), sorted by `last_activity_at` desc.
+8. `tries candidates in priority order until one resolves` ↻
+9. `an EXACT id finds a subagent/child session (spec: scan ALL sessions)` ✎ `an_exact_id_finds_a_subagent_child_session`
+10. `prefix DISCOVERY does not surface subagent sessions` ✎ `prefix_discovery_does_not_surface_subagent_sessions`
+11. `an exact FALLBACK hit beats an indexed PREFIX match of the same token` ✎ `an_exact_fallback_hit_beats_an_indexed_prefix_match_of_the_same_token`
+12. `sessionType defaults to the provider name when the index has none` ✎ `session_type_defaults_to_the_provider_name_when_the_overlay_has_none`
+13. `index miss consults exact-id fallbacks (claude transcript locator)` ✚ — empty index, input = OTHER_UUID, claude fallback returns a hit with cwd → 1 exact `claude` match carrying the cwd.
+14. `index miss consults opencode by-id fallback` ✎ `opencode_fallback_hit_carries_title_and_floored_last_activity` (covers it with richer asserts — keep them)
+15. `zero matches when nothing resolves anywhere` ↻ — ready-empty for garbage input.
+16. `a THROWING fallback never fails the request: it degrades with a provider error summary` ✎ `a_failing_fallback_never_fails_the_resolve_it_degrades_with_a_provider_error`
+17. `provider identity in providerErrors comes from the fallback PAIR, not its position` ✎ `provider_identity_travels_with_the_fallback_not_its_position`
+18. `a typed ClaudeTranscriptLocatorError surfaces its errno code in the provider error` ✚ — claude fallback returns `Err(ProviderFailure { code: Some("EACCES"), .. })` on a uuid token → `provider_errors[0].code == Some("EACCES")` (Rust models Node's typed error as `ProviderFailure.code`).
+19. `a healthy resolve reports NO provider errors` ✎ `a_healthy_resolve_reports_no_provider_errors_and_stays_ready`
+20. `a failed exact-id fallback does NOT hide a later lower-priority match — but marks the response degraded` ✎ `a_failed_fallback_does_not_hide_a_later_lower_priority_match_but_marks_degraded`
+21. `a fallback exact hit for a HIGHER-priority token beats an indexed exact hit of a LOWER-priority token` ✎ `a_fallback_exact_hit_for_a_higher_priority_token_beats_an_indexed_exact_of_a_lower_one`
+22. `dedupes duplicate (provider, sessionId) snapshot entries, keeping the most recent` ↻
+23. `returns warming (not "not found") while the index is not ready` ↻ — `sessions: None`, assert `provider_errors` empty too.
+
+ALSO keep the Rust-only additions given verbatim above that have no Node twin (`shape_gates_wrong_shape_tokens_do_no_fallback_work`, `fallback_work_is_budgeted_to_two_calls_per_request_per_provider`, `wrong_shape_tokens_consume_no_budget`) and the old file's hint-alongside-evidence carryover — the suite therefore ends up with MORE than 23 tests; the 23 above are the mirror contract.
 
 - [ ] **Step 2: Run — expect compile FAILURE (new API does not exist yet)**
 
@@ -1113,6 +1130,17 @@ fn corrupt_db_file_is_an_error() { /* write 64 bytes of garbage to
     opencode.db → Err */ }
 
 #[test]
+fn locked_db_is_an_error_after_the_busy_timeout() { /* REAL contention proof
+    for the load-bearing 500 ms busy timeout: build a valid fixture db with
+    one row, open a SECOND rusqlite Connection to the same file and run
+    `BEGIN EXCLUSIVE` (hold the txn open, do not commit); now call
+    opencode_session_row_by_id → expect Err (SQLITE_BUSY surfaces as
+    OpencodeReadError once the 500 ms busy_timeout expires — the read-only
+    open cannot acquire the shared lock). Optionally assert the call took
+    >= ~400 ms to show the timeout (not an instant failure), then ROLLBACK/
+    drop the writer connection so the temp dir cleans up. */ }
+
+#[test]
 fn real_time_updated_is_floored_to_integer_ms() { /* insert with
     time_updated = 1234.9 (REAL) → last_activity_at Some(1234) */ }
 ```
@@ -1270,7 +1298,7 @@ Node's route merges `codingCliIndexer.getScanFailures()` into `providerErrors` a
   - `SessionSource::provider_name(&self) -> Option<&'static str>` (default `None`; `ClaudeSource` → `Some("claude")`, `CodexSource` → `Some("codex")`, `OpencodeSource` → `Some("opencode")`)
   - `SessionIndex::scan_failures(&self) -> Vec<String>` (sorted, deduped)
   - `SessionIndex::request_refresh(&self)` (non-blocking, no-op if a sweep is already running)
-  - `SettingsStore::coding_cli_enabled_providers(&self) -> Vec<String>`
+  - `SettingsStore::coding_cli_enabled_providers(&self) -> Vec<String>` — **async** (`pub async fn`): `ServerSettings` lives in a `tokio::sync::RwLock`, so the getter mirrors `get()` (`self.inner.read().await...`); a sync getter is impossible without `blocking_read`, which can panic inside the runtime. (`session_overrides()` is NOT the pattern here — it reads a separate `std::sync::Mutex`.)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1305,15 +1333,23 @@ async fn a_failing_direct_list_records_a_scan_failure_and_recovery_clears_it() {
         std::time::Duration::ZERO, // every snapshot() sweeps
         None,
     );
+    // COLD cache: the first snapshot() sweeps INLINE, so this assert is
+    // deterministic.
     let _ = index.snapshot().await;
     assert_eq!(index.scan_failures(), vec!["opencode".to_string()]);
     broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    // WARM-but-stale cache: snapshot() returns stale data immediately and
+    // refreshes DETACHED (stale-while-revalidate) — recovery must be observed
+    // by POLLING. Reuse the module's existing `wait_until` test helper.
     let _ = index.snapshot().await;
-    assert!(index.scan_failures().is_empty());
+    assert!(
+        wait_until(std::time::Duration::from_secs(2), || index.scan_failures().is_empty()).await,
+        "scan failure must clear once the source recovers"
+    );
 }
 ```
 
-And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern): load a store from a temp home with a settings file whose `codingCli.enabledProviders` is `["claude", "opencode"]`, assert `coding_cli_enabled_providers()` returns exactly that; and for a FRESH temp home (no settings file) assert the returned list equals whatever the store's default resolution yields — pin the actual observed default in the assert (run the test once to see it; the migration logic seeds from the discovered/known list — record what it returns, and note it in a comment).
+And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern; `#[tokio::test]` since the getter is async): load a store from a temp home whose `<home>/.freshell/config.json` contains the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}` (SettingsStore reads `config.json` and unwraps the top-level `settings` key — see `load_full_settings`; there is NO `settings.json`), assert `coding_cli_enabled_providers().await` returns exactly that; and for a FRESH temp home (no config file) assert the returned list equals whatever the store's default resolution yields — pin the actual observed default in the assert (run the test once to see it; the migration logic seeds from the discovered/known list — record what it returns, and note it in a comment).
 
 Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-server settings_store` — expected: compile FAILURE (methods missing).
 
@@ -1348,13 +1384,16 @@ Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-
       }
   }
   ```
-- `SettingsStore` getter — mirror the read pattern of `session_overrides()` (`settings_store.rs:673`), returning `settings.coding_cli.enabled_providers.clone()` from the same locked settings snapshot:
+- `SettingsStore` getter — ASYNC, mirroring `get()` (`ServerSettings` lives in `Arc<tokio::sync::RwLock<..>>`; `session_overrides()` is NOT the pattern — it reads a separate `std::sync::Mutex`, and `blocking_read` in an async context can panic):
   ```rust
   /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
-  /// — the resolve route's unsearched-provider computation reads this.
-  pub fn coding_cli_enabled_providers(&self) -> Vec<String> { /* same lock/read
-      body shape as session_overrides() */ }
+  /// — the resolve route's unsearched-provider computation reads this. Async
+  /// because the settings tree is behind a tokio RwLock (same as `get()`).
+  pub async fn coding_cli_enabled_providers(&self) -> Vec<String> {
+      self.inner.read().await.coding_cli.enabled_providers.clone()
+  }
   ```
+  (Adjust the field path to `ServerSettings`' actual field names for `codingCli.enabledProviders` — verify in `crates/freshell-server/src/settings.rs`.)
 
 - [ ] **Step 3: Run**
 
@@ -1383,7 +1422,7 @@ Upgrade `POST /api/sessions/resolve` to the full hardened wire shape and route s
 
 **Files:**
 - Modify: `crates/freshell-server/src/resolve.rs` (wire struct, route merge, tests)
-- Modify: `crates/freshell-server/src/main.rs` (state wiring: home_dir, enabled-gated fallbacks, failure-reporting closures)
+- Modify: `crates/freshell-server/src/main.rs` (state wiring: home_dir from the OS user home, ALWAYS-wired failure-reporting fallback closures — settings do not gate fallbacks)
 - Modify: `crates/freshell-freshagent/src/claude_snapshot.rs` + `lib.rs` (add `locate_transcript_checked`)
 
 **Interfaces:**
@@ -1472,7 +1511,7 @@ async fn disabled_providers_are_reported_unsearched_never_as_errors() {
 }
 ```
 
-For `a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal` and `disabled_providers_are_reported_unsearched_never_as_errors`, write the bodies fully in the same style as the snippets above — the `FailingDirectSource` is the Task-5 test source with a fixed `Err`, and the settings file seeding follows `settings_store.rs`'s own test fixtures (`dir/.freshell/settings.json` with `{"codingCli":{"enabledProviders":["claude"]}}` — check the exact filename/shape settings_store tests use and match it).
+For `a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal` and `disabled_providers_are_reported_unsearched_never_as_errors`, write the bodies fully in the same style as the snippets above — the `FailingDirectSource` is the Task-5 test source with a fixed `Err`, and the settings file seeding writes `dir/.freshell/config.json` containing the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude"]}}}` (`SettingsStore` reads `<home>/.freshell/config.json` and unwraps the top-level `settings` key — see `load_full_settings` in `settings_store.rs`; there is NO `settings.json` and a bare `codingCli` object would be ignored, silently reading defaults).
 
 Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state fields, wire fields missing).
 
@@ -1501,14 +1540,14 @@ Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state 
       home_dir: Option<String>,
   }
   ```
-- After the `spawn_blocking` join (keep the never-5xx panic fallback, now built as a ready-empty `ResumeResolveOutcome`), merge exactly like the Node route:
+- After the `spawn_blocking` join: a `JoinError` means the resolver PANICKED — return `500 INTERNAL_SERVER_ERROR` with a JSON error body (the router's standard error shape), NOT a fabricated ready-empty result. The hardened contract forbids presenting an unsearchable state as a healthy "not found"; masking a crashed locator/query as ready-empty is exactly the incident class this plan closes. RECORDED DEVIATION (state it in the module doc): Node has no defined behavior here — a top-level resolver throw becomes an unhandled rejection in the async Express 4 handler (no response at all), so the explicit 500 is the honest port, not a wire mismatch. Update the pre-existing panic-fallback test (it currently pins ready-empty-on-JoinError) to assert the 500. Then, on the `Ok(outcome)` path, merge exactly like the Node route:
   ```rust
   /// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
   /// (`shared/coding-cli-defaults.ts:3`).
   const KNOWN_RESUME_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
 
   let enabled: std::collections::HashSet<String> =
-      state.settings.coding_cli_enabled_providers().into_iter().collect();
+      state.settings.coding_cli_enabled_providers().await.into_iter().collect();
   let unsearched_providers: Vec<String> = KNOWN_RESUME_PROVIDERS
       .iter()
       .filter(|name| !enabled.contains(**name))
@@ -1581,15 +1620,22 @@ let entries = match std::fs::read_dir(&projects) {
 };
 ```
 
-and the same two-level scan, propagating non-NotFound errors from the inner `read_dir` the same way (mirror `find_transcript`'s body — read it and keep the traversal identical, only the error handling changes). Re-export from `lib.rs` next to `locate_transcript`. Unit test in the same file's test module: a projects dir with mode `0o000` (use `std::os::unix::fs::PermissionsExt`; restore permissions afterward so cleanup works) yields `Err` with `kind() == PermissionDenied`, and a missing projects dir yields `Ok(None)`.
+and the scan must construct the AUTHORITATIVE Node candidate layouts (`server/coding-cli/claude-transcript-locator.ts:39-48`): direct `<projects>/<project-dir>/<id>.jsonl` and subagent `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl`. CAUTION: the existing `find_transcript` probes `<project-dir>/<subdir>/<id>.jsonl` WITHOUT the `subagents` segment — that diverges from Node and misses child sessions; do NOT mirror it. The checked variant uses the Node layout (leave `find_transcript` itself untouched for its other consumers). Propagate non-NotFound errors from every `read_dir`, and probe candidate files with `std::fs::metadata` (NotFound ⇒ miss for that candidate; any OTHER error propagates) instead of the error-swallowing `Path::is_file()`.
+
+Also add `transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error>` beside `transcript_cwd` (which stays for other consumers): open error of kind NotFound ⇒ `Ok(None)` (a raced deletion keeps the hit, cwd-less — Node behaves the same); any OTHER open/read error PROPAGATES (Node wraps these in `ClaudeTranscriptLocatorError`); malformed JSON lines are still skipped. The 3b wiring below uses the checked variant — without it the "no longer swallowed" commit claim would be false, since `transcript_cwd` converts read errors to `None`.
+
+Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs` next to `locate_transcript`. Unit tests in the same file's test module: (a) a projects dir with mode `0o000` (use `std::os::unix::fs::PermissionsExt`; restore permissions afterward so cleanup works) yields `Err` with `kind() == PermissionDenied`; (b) a missing projects dir yields `Ok(None)`; (c) a transcript placed at `<projects>/<project>/<parent>/subagents/<id>.jsonl` IS found by `locate_transcript_checked` (the child-session layout).
 
 3b. `crates/freshell-server/src/main.rs` — final wiring (replaces the Task-3/4 temporaries). Above the router construction:
 
 ```rust
-// Resolve fallbacks are built from the ENABLED provider set at boot, like
-// Node's buildResolveFallbacks over the live provider set.
-let resolve_enabled: std::collections::HashSet<String> =
-    settings_store.coding_cli_enabled_providers().into_iter().collect();
+// Resolve fallbacks mirror Node's buildResolveFallbacks over the FIXED
+// provider registry (server/index.ts wires ALL FOUR codingCliProviders into
+// it unconditionally): settings do NOT gate the exact-id fallbacks — they
+// only gate INDEXING and feed unsearchedProviders. Both closures are
+// therefore ALWAYS wired; gating them on boot-time settings would produce
+// false misses after a live settings change and diverge from Node for
+// disabled-provider exact IDs.
 
 /// errno-ish code for a provider-error summary (Node's typed locator errors
 /// carry the fs errno in `.code`).
@@ -1605,8 +1651,14 @@ fn errno_code(err: &std::io::Error) -> Option<String> {
 State fields:
 
 ```rust
-home_dir: home.as_ref().map(|h| Arc::new(h.display().to_string())),
-opencode_session_by_id: resolve_enabled.contains("opencode").then(|| {
+// Node sends os.homedir() (`sessions-router.ts:306-314`) — the USER's home.
+// Do NOT reuse resolve_home(): it prefers FRESHELL_HOME, a config/storage
+// root that can differ from the real home, and the dialog would prefill a
+// cwd-less resume into the wrong directory.
+home_dir: std::env::var_os("HOME")
+    .or_else(|| std::env::var_os("USERPROFILE"))
+    .map(|h| Arc::new(h.to_string_lossy().into_owned())),
+opencode_session_by_id: Some({
     std::sync::Arc::new(|session_id: &str| {
         let data_home = freshell_sessions::parse::default_opencode_data_home();
         freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
@@ -1624,14 +1676,20 @@ opencode_session_by_id: resolve_enabled.contains("opencode").then(|| {
             })
     }) as crate::resolve::OpencodeByIdLookup
 }),
-locate_claude_transcript: resolve_enabled.contains("claude").then(|| {
+locate_claude_transcript: Some({
     std::sync::Arc::new(|session_id: &str| {
         let lowered = session_id.to_ascii_lowercase();
         match freshell_freshagent::locate_transcript_checked(&lowered) {
-            Ok(Some(path)) => Ok(Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
-                cwd: freshell_freshagent::transcript_cwd(&path),
-                session_id: lowered,
-            })),
+            Ok(Some(path)) => match freshell_freshagent::transcript_cwd_checked(&path) {
+                Ok(cwd) => Ok(Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    cwd,
+                    session_id: lowered,
+                })),
+                Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                    code: errno_code(&e),
+                    message: format!("Claude transcript read failed: {e}"),
+                }),
+            },
             Ok(None) => Ok(None),
             Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
                 code: errno_code(&e),
@@ -1642,16 +1700,20 @@ locate_claude_transcript: resolve_enabled.contains("claude").then(|| {
 }),
 ```
 
-(Adjust `home` to whatever the existing variable holding `resolve_home()`'s output is named at that point in `main.rs` — it is `home: Option<PathBuf>`, resolved near the top of `main`.)
-
 - [ ] **Step 4: Async-hygiene verification (context §5 — verify, don't assume)**
 
 Confirm and record (in the commit message body): the ENTIRE `resolve_resume_input` call — including both blocking fallback closures (rusqlite query, transcript directory walk) — runs inside `tokio::task::spawn_blocking` (`resolve.rs`, the Task-3-preserved block), so no DB/FS wait ever blocks the async runtime; per-request work is bounded by `MAX_RESUME_CANDIDATES (8) × FALLBACK_BUDGET_PER_REQUEST (2 per provider)` fallback calls + one index scan per token. Grep that no OTHER call path invokes these closures outside `spawn_blocking`: `grep -rn "opencode_session_by_id\|locate_claude_transcript" crates/freshell-server/src/ --include=*.rs`. Add one sentence to `resolve.rs`'s module doc stating this invariant so future edits keep it.
 
 - [ ] **Step 5: Run**
 
-Run: `cargo test -p freshell-server && cargo test -p freshell-freshagent && cargo test --workspace 2>&1 | tail -5 && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-Expected: ALL PASS, clean.
+Run:
+```bash
+set -o pipefail
+cargo test -p freshell-server && cargo test -p freshell-freshagent
+cargo test --workspace 2>&1 | grep -E '^test result:'
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+Expected: ALL PASS (every `test result:` line shows `0 failed`), fmt/clippy clean. (`set -o pipefail` keeps a failing `cargo test` from exiting through `grep`'s success status.)
 
 - [ ] **Step 6: Commit**
 
@@ -1676,7 +1738,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ### Task 7: Full verification, shared e2e 2× both projects, SYNC-06 checklist evidence, push
 
-The shared client dialog (hardened: degraded UI + manual retry + homeDir prefill) and the `sessionResolve` flag are proven by the SHARED e2e spec running against BOTH server kinds — that is the design's proof that the Rust server behaves identically. Then record the evidence and push.
+The `sessionResolve` flag and the shared client dialog's resume HAPPY PATH are proven by the SHARED e2e spec running against BOTH server kinds. Scope honesty: `resume-button.spec.ts` has exactly 3 tests (pinned-button visibility at scroll positions, mobile visibility, paste-then-Enter exact resume) — it does NOT exercise degraded UI, manual retry, or homeDir prefill. Those hardened behaviors are proven at the WIRE level by Task 6's endpoint tests, and the shared client's own #586 coverage (unchanged by this branch) proves the dialog's handling of that wire. Then record the evidence and push.
 
 **Files:**
 - Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` (SYNC-06 entry, line ~803)
@@ -1688,8 +1750,13 @@ The shared client dialog (hardened: degraded UI + manual retry + homeDir prefill
 
 - [ ] **Step 1: Rust full gate**
 
-Run: `cargo test --workspace 2>&1 | tail -5 && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
-Expected: 0 failed, clean. Record the total passed count for the checklist entry.
+Run:
+```bash
+set -o pipefail
+cargo test --workspace 2>&1 | grep -E '^test result:'
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+Expected: every `test result:` line shows `0 failed`; fmt/clippy clean. (`set -o pipefail` keeps a failing `cargo test` from exiting through the pipe with `grep`'s success status.) Cargo prints one `test result:` line PER TEST BINARY and no workspace aggregate — record the checklist's total passed count by SUMMING the `N passed` figures across the printed lines.
 
 - [ ] **Step 2: Coordinated TS suites**
 
@@ -1705,12 +1772,12 @@ Expected: ALL PASS (the branch did not modify Node server code; these prove no a
 
 Sanity-check first that the flag declaration still stands: `grep -n "sessionResolve" crates/freshell-server/src/main.rs` — expected: present in `build_platform_payload`.
 
-Run TWICE (the config's own server management uses ephemeral ports/HOMEs — verify no `--port 3001/3002` style overrides leak in via env before running):
+Run TWICE (the config's own server management uses ephemeral ports/HOMEs — verify no `--port 3001/3002` style overrides leak in via env before running). The explicit `--project` filters are REQUIRED: without them the default `chromium` project also matches this spec and each run would be 9 tests, not 6:
 ```bash
-npm run test:e2e -- resume-button.spec.ts
-npm run test:e2e -- resume-button.spec.ts
+npm run test:e2e -- resume-button.spec.ts --project=legacy-chromium --project=rust-chromium
+npm run test:e2e -- resume-button.spec.ts --project=legacy-chromium --project=rust-chromium
 ```
-Expected: all 3 tests × both projects (legacy-chromium AND rust-chromium) pass, both runs — 6/6 each run. This is the acceptance proof for warming preservation and the hardened dialog (degraded UI, manual retry, homeDir prefill) against the Rust server, since the spec and client are shared.
+Expected: all 3 tests × both projects (legacy-chromium AND rust-chromium) pass, both runs — 6/6 each run. This is the acceptance proof that the shared dialog's resume happy path (paste-then-Enter exact resume) and the `sessionResolve` flag work identically against the Rust server; the hardened degraded/retry/homeDir behaviors are proven at the wire level by Task 6's endpoint tests (this spec does not exercise them).
 
 - [ ] **Step 4: Update the SYNC-06 checklist entry (PARTIAL convention)**
 
@@ -1740,10 +1807,10 @@ Expected: push succeeds (the branch was local-only; this creates the remote bran
 
 ## Self-Review Record
 
-**1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING + shared dialog via shared e2e → Task 7. Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
+**1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING (core + wire tests, Tasks 3+6) + shared dialog happy-path via shared e2e → Task 7 (degraded/retry/homeDir UI proven at the wire by Task 6; the e2e spec covers visibility + exact resume only). Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
 
 **1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
 
 **2. Placeholder scan:** Task 4 Step 1 and Task 6 Step 1 contain two test bodies described by full behavioral specification + fixture pattern reference rather than verbatim code (`scan_failure` literal test, disabled-provider test, opencode row-fixture bodies); each names the exact fixture pattern file to copy, the exact inputs, and the exact expected JSON/values — the implementer writes mechanical rusqlite/axum plumbing only. Checklist `<N>` slots are run-time evidence by design. No TBD/TODO/"handle edge cases" items remain.
 
-**3. Type consistency check:** `ResumeResolveOutcome{status,matches,hint,provider_errors}` produced in Task 3 = consumed in Task 6. `OpencodeByIdHit{session_id,cwd,title,last_activity_at}` (Task 3) is built from `OpencodeByIdRow` (Task 4) in Task 6's closure — field names verified 1:1. `ProviderFailure{code,message}` used identically in Tasks 3/4/6. `scan_failures()->Vec<String>`, `request_refresh()`, `coding_cli_enabled_providers()->Vec<String>` (Task 5) match Task 6's call sites. `MAX_RESUME_CANDIDATES` (Task 2) referenced in Task 6's hygiene note. State field `opencode_session_by_id` renamed once in Task 3 and used consistently after.
+**3. Type consistency check:** `ResumeResolveOutcome{status,matches,hint,provider_errors}` produced in Task 3 = consumed in Task 6. `OpencodeByIdHit{session_id,cwd,title,last_activity_at}` (Task 3) is built from `OpencodeByIdRow` (Task 4) in Task 6's closure — field names verified 1:1. `ProviderFailure{code,message}` used identically in Tasks 3/4/6. `scan_failures()->Vec<String>`, `request_refresh()`, `async coding_cli_enabled_providers()->Vec<String>` (Task 5) match Task 6's call sites (awaited in the async route/main). `MAX_RESUME_CANDIDATES` (Task 2) referenced in Task 6's hygiene note. State field `opencode_session_by_id` renamed once in Task 3 and used consistently after.
