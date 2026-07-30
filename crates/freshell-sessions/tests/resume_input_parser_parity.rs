@@ -25,7 +25,7 @@ fn parser_matches_every_shared_fixture_case() {
     let raw = std::fs::read_to_string(&path).expect("read shared parser fixture");
     let fixture: Fixture = serde_json::from_str(&raw).expect("parse fixture json");
     assert!(
-        fixture.cases.len() >= 31,
+        fixture.cases.len() >= 32,
         "shared fixture unexpectedly small: {}",
         fixture.cases.len()
     );

@@ -1,8 +1,12 @@
-//! SYNC-06 resolve-core parity tests — a 1:1 mirror of the Node integration
-//! suite `test/integration/server/sessions-resolve-router.test.ts` (matching,
-//! ordering, cap, dedupe, warming, fallbacks) at the logic level, plus
-//! wire-shape pins the Node suite leaves implicit (camelCase field names,
-//! omitted optionals, hint null).
+//! SYNC-06 resolve-core parity tests — mirrors the MATCHING-SEMANTICS subset
+//! of the Node integration suite
+//! `test/integration/server/sessions-resolve-router.test.ts` (exact→fallback→
+//! prefix ordering, case gating, subagent exclusion, cap, dedupe, warming,
+//! fallbacks) at the logic level, plus wire-shape pins the Node suite leaves
+//! implicit (camelCase field names, omitted optionals, hint null). The Node
+//! suite's `degraded`/`providerErrors`/`unsearchedProviders`/`homeDir`
+//! coverage is NOT mirrored here — that response surface is deferred to
+//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6.
 
 use std::collections::HashMap;
 
@@ -106,9 +110,9 @@ fn match_carries_full_resume_metadata() {
     assert_eq!(m["title"], "Fix the parser");
     assert_eq!(m["firstUserMessage"], "fix the parser");
     assert_eq!(m["lastActivityAt"], 400);
-    // sessionType absent (no metadata-store overlay entry): key OMITTED,
-    // not null — the client and the Node contract treat undefined as omitted.
-    assert!(m.get("sessionType").is_none());
+    // No metadata-store overlay entry: sessionType defaults to the provider —
+    // hardened Node's `toMatch` emits `sessionType ?? provider`, never absent.
+    assert_eq!(m["sessionType"], "claude");
 }
 
 #[test]
@@ -316,10 +320,12 @@ fn claude_transcript_fallback_on_exact_id_index_miss() {
 }
 
 #[test]
-fn fallbacks_are_not_consulted_when_the_index_matches() {
-    // Node only reaches the fallback loop when EVERY candidate missed the index.
+fn fallbacks_are_not_consulted_on_an_exact_index_hit() {
+    // Hardened per-token order is exact → fallback → prefix: an EXACT index
+    // hit short-circuits before the fallbacks run (fallbacks only cover
+    // sessions the index cannot see).
     let locate = |_id: &str| -> Option<ClaudeTranscriptHit> {
-        panic!("locate_claude_transcript must not run on an index hit")
+        panic!("locate_claude_transcript must not run on an exact index hit")
     };
     let types = no_types();
     let sessions = fixture_sessions();
@@ -336,6 +342,111 @@ fn fallbacks_are_not_consulted_when_the_index_matches() {
 }
 
 #[test]
+fn exact_id_fallback_beats_a_prefix_match_on_the_same_token() {
+    // Hardened ordering: PER TOKEN, exact-id fallbacks run BEFORE prefix
+    // matching — an unindexed session whose id EQUALS the token must beat an
+    // indexed session whose id merely BEGINS with it, or the wrong session
+    // gets resumed. (The retired pre-#586 ordering ran ALL index passes —
+    // prefix included — before any fallback.)
+    let token = "aaaaaaaa-1111-4222-8333-444444444444";
+    // Indexed session whose id starts with the token but is NOT equal to it.
+    let sessions = vec![session(
+        "claude",
+        &format!("{token}-extra"),
+        "/repo/alpha",
+        400,
+    )];
+    let locate = |id: &str| {
+        Some(ClaudeTranscriptHit {
+            session_id: id.to_string(),
+            cwd: Some("/repo/gamma".to_string()),
+        })
+    };
+    let types = no_types();
+    let response = resolve_resume_input(
+        token,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: None,
+            locate_claude_transcript: Some(&locate),
+        },
+    );
+    assert_eq!(
+        as_json(&response)["matches"],
+        serde_json::json!([{
+            "provider": "claude",
+            "sessionId": token,
+            "cwd": "/repo/gamma",
+            "sessionType": "claude",
+            "matchKind": "exact"
+        }])
+    );
+}
+
+#[test]
+fn prefix_still_resolves_when_the_fallback_misses() {
+    // Fallbacks run before prefix, but a fallback MISS falls through to
+    // prefix discovery on the same token.
+    let token = "aaaaaaaa-1111-4222-8333-444444444444";
+    let indexed_id = format!("{token}-extra");
+    let sessions = vec![session("claude", &indexed_id, "/repo/alpha", 400)];
+    let locate = |_id: &str| -> Option<ClaudeTranscriptHit> { None };
+    let types = no_types();
+    let response = resolve_resume_input(
+        token,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: None,
+            locate_claude_transcript: Some(&locate),
+        },
+    );
+    let body = as_json(&response);
+    assert_eq!(body["matches"][0]["sessionId"], indexed_id.as_str());
+    assert_eq!(body["matches"][0]["matchKind"], "prefix");
+}
+
+#[test]
+fn prefix_discovery_excludes_subagent_sessions() {
+    // Hardened prefix DISCOVERY is top-level-only (`!isSubagent`): surfacing
+    // hidden subagent children for partial ids would flood disambiguation
+    // with noise.
+    let mut sessions = fixture_sessions();
+    let mut child = session(
+        "amplifier",
+        "417e8345-cccc-4ddd-8eee-000000000003",
+        "/repo/beta",
+        950,
+    );
+    child.is_subagent = true;
+    sessions.push(child);
+    let body = as_json(&resolve("417e8345", &sessions));
+    let ids: Vec<&str> = body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["sessionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![AMP_ID_NEW, AMP_ID_OLD]);
+}
+
+#[test]
+fn exact_index_match_still_reaches_subagent_sessions() {
+    // The asymmetry is the point: an exact pasted id must resolve even for
+    // hidden subagent children — only PREFIX discovery filters them.
+    let subagent_id = "417e8345-cccc-4ddd-8eee-000000000003";
+    let mut sessions = fixture_sessions();
+    let mut child = session("amplifier", subagent_id, "/repo/beta", 950);
+    child.is_subagent = true;
+    sessions.push(child);
+    let body = as_json(&resolve(subagent_id, &sessions));
+    assert_eq!(body["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(body["matches"][0]["sessionId"], subagent_id);
+    assert_eq!(body["matches"][0]["matchKind"], "exact");
+}
+
+#[test]
 fn garbage_input_is_ready_empty_with_null_hint() {
     let response = resolve("hello decade facade!!", &fixture_sessions());
     assert_eq!(
@@ -345,8 +456,25 @@ fn garbage_input_is_ready_empty_with_null_hint() {
 }
 
 #[test]
-fn matching_is_case_insensitive_but_returns_stored_ids() {
+fn uuid_matching_is_case_insensitive_but_returns_stored_ids() {
+    // uuid/hex tokens (hex digits + dashes only) match case-insensitively —
+    // Node's `isCaseInsensitiveToken`.
     let body = as_json(&resolve(&CLAUDE_ID.to_uppercase(), &fixture_sessions()));
     assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+    assert_eq!(body["matches"][0]["matchKind"], "exact");
+}
+
+#[test]
+fn ses_id_matching_is_case_sensitive() {
+    // ses_ + base62: upper/lower case are DISTINCT values, so case-folding
+    // could resolve the WRONG session. A wrong-case ses_ id must NOT match —
+    // neither exact nor prefix.
+    let wrong_case = "ses_ROOT0000000000000000000000";
+    let body = as_json(&resolve(wrong_case, &fixture_sessions()));
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["matches"], serde_json::json!([]));
+    // The correctly-cased id still resolves exactly.
+    let body = as_json(&resolve(OPENCODE_ID, &fixture_sessions()));
+    assert_eq!(body["matches"][0]["sessionId"], OPENCODE_ID);
     assert_eq!(body["matches"][0]["matchKind"], "exact");
 }

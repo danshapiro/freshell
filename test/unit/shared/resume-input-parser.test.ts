@@ -1,5 +1,8 @@
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parseResumeInput, MAX_RESUME_CANDIDATES } from '@shared/resume-input-parser'
+import type { ResumeCandidate, ResumeHint } from '@shared/resume-input-parser'
 
 const V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
 const V7 = '019fac27-69d7-78a0-b972-b339d551042e'
@@ -96,5 +99,31 @@ describe('parseResumeInput — advisory hint', () => {
 
   it('returns null hint for garbage', () => {
     expect(parseResumeInput('nothing to see').hint).toBeNull()
+  })
+})
+
+// SYNC-06 cross-language anti-drift: the SAME fixture table pins this parser
+// and the Rust port (crates/freshell-sessions/tests/resume_input_parser_parity.rs).
+// Behavior changes go through the fixture first — add cases there, never inline.
+const FIXTURE = JSON.parse(
+  readFileSync(path.join(__dirname, '../../fixtures/resume-input/parser-cases.json'), 'utf-8'),
+) as {
+  cases: Array<{
+    name: string
+    input: string
+    candidates: ResumeCandidate[]
+    hint: ResumeHint | null
+  }>
+}
+
+describe('parseResumeInput — shared cross-language fixture', () => {
+  it('has at least the pinned number of cases (anti-deletion gate, mirrors the Rust floor)', () => {
+    expect(FIXTURE.cases.length).toBeGreaterThanOrEqual(32)
+  })
+
+  it.each(FIXTURE.cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    const parsed = parseResumeInput(c.input)
+    expect(parsed.candidates).toEqual(c.candidates)
+    expect(parsed.hint ?? null).toEqual(c.hint ?? null)
   })
 })
