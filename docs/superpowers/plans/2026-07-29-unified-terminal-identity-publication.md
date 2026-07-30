@@ -22,6 +22,26 @@
 > path `docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md`
 > now holds PR #584's own historical plan document — never edit that file.
 
+> **Revision 3 (Fresh Eyes round 2):** A second independent Fresh Eyes review
+> failed revision 2 with 2 critical + 12 major + 1 minor findings — all
+> encoded below (see the "Fresh Eyes Round 2" table). The structural changes:
+> `SessionAdmission` bindings now carry a table-minted **admission epoch**
+> token required by every cleanup call (FE-R2-1, closing the codex
+> double-clear reuse race); a refused discovery collision installs a
+> **conflict hold** that keeps the key closed until the refused-but-running
+> process exits (FE-R2-2); `Held`/`BoundLive` expose the **holder kind** so
+> each door maps same-kind vs cross-kind contention to its exact error
+> (FE-R2-3); pending markers are deleted on **every** exit while `Closed`
+> retirement stays explicit-close-only (FE-R2-7); explicit-close retirement is
+> **awaitable** and awaited by `handle_kill` (FE-R2-8); the REST
+> announcement/guard ordering is an explicit **two-phase settle handoff**
+> (FE-R2-9); freshness pairing gets an atomic
+> `peek_with_freshness` in `freshell-sessions` (FE-R2-5) and a defined
+> fresh-`Unknown` disposition (FE-R2-6). The base also moved again:
+> `origin/main` is now `c5e9fdaa` (PR #585, deck visual work only —
+> `git diff 6147c700..c5e9fdaa -- crates docs/superpowers/plans` is empty, so
+> every crate-level file:line fact verified on `6147c700` remains valid).
+
 **Goal:** Give every authoritative terminal session identity—accepted resume,
 server-preallocated fresh identity, provider-discovered identity, or
 existence-validated legacy resume—one provider-aware publication pipeline that
@@ -178,19 +198,51 @@ Every architectural rule below traces to a validated finding. Summary:
 | FE10 | Two invalid REST claude shapes launch bare unresumable processes (restore:true w/o identity; cross-provider parsed ref) | REST rejection ladder: 400 `SESSION_REF_PROVIDER_MISMATCH`, 422 `CLAUDE_RESTORE_UNRESOLVED` (WS `error_claude_restore_unresolved` mirror) + route-matrix tests (Slice E2) |
 | FE11 | Same-kind `BoundLive` "adopt" is unsafe at discovery time (different owner, same provider) | `claim_discovered` distinguishes exact-same-owner (idempotent) from **any** different owner (atomic refusal, loud error, process left running — D3); Slice B0 tests |
 
+### Fresh Eyes Round 2 (GPT; verdict: failed — every finding encoded here)
+
+| # | Finding (condensed) | Resolution — encoded in |
+| --- | --- | --- |
+| FE-R2-1 (critical) | `BoundOwner` had no generation token while `clear_binding(provider, sid)` facades survived; codex clears the binding twice (watcher `codex.rs:3287/3295`, then `handle_kill` awaits the watcher and clears again at `codex.rs:1245`) — a replacement binding on the same key between the two clears is erased and admission reopens under a live writer | Table-minted `AdmissionEpoch` inside every `BoundOwner`; every cleanup call carries the token; the epochless `clear_binding` facade is deleted; call-site migration enumerated; `stale_epoch_clear_cannot_release_a_replacement_binding` + `codex_double_clear_cannot_release_a_replacement_binding` (Slice B0) |
+| FE-R2-2 (critical) | A refused discovery collision (D3: process left running) was invisible to `SessionAdmission`; when the original owner exits, the key frees while the refused process may still be writing | Refusal installs a **conflict hold** that poisons the key until the refused process exits; `refused_discovery_poisons_key_until_refused_process_exits` + poisoned-retry barrier variant (Slice B0) |
+| FE-R2-3 | `AdmissionClaim::Held` omitted the holder kind, so facades could not distinguish D2 cross-kind `RESTORE_UNAVAILABLE` from same-kind D8 `SESSION_RESERVED` | `Held`/lease records expose `HolderKind`; per-door error mapping specified; barrier tests assert the exact loser error for same-kind AND cross-kind contention (Slice B0) |
+| FE-R2-4 | Base pinned to `6147c700`; `origin/main` moved to `c5e9fdaa` | Base refs updated; drift verified crate-empty (PR #585 deck visuals only); the Preflight gate now targets "current `origin/main` at implementation start" so it cannot go stale the same way again |
+| FE-R2-5 | `SessionIndex::peek()` and `is_fresh()` are separate lock acquisitions (`directory_index.rs:751-759`; the backing `fresh_cached()`/`any_cached()` helpers each take `self.snapshot.lock()` independently, `directory_index.rs:763-777`); a refresh can interleave and pair a stale `Absent` with `index_fresh: true` → wrongful permanent rejection | New atomic `peek_with_freshness()` (one lock, snapshot + freshness + generation) in `freshell-sessions`; `IndexExistenceProbe::exists_with_freshness` uses only it; file map + Slice D inventory + test |
+| FE-R2-6 | F5 stops at the first `index_fresh: true` answer but fresh `Unknown` is possible (OpenCode by-id fallback `Unreadable → Unknown` inside the warm-snapshot arm, `server/existence.rs:268-270`) | Fresh `Unknown` never terminates the schedule: bounded requery continues, exhaustion drops with a structured warning; `fresh_unknown_answers_continue_the_bounded_requery` (Slice F5) |
+| FE-R2-7 | The plan made pending-marker deletion `ExplicitClose`-only, but natural exit must delete durable PENDING markers (current behavior; ported binder pin `retire_pane_identity_retires_row_and_clears_pending`, `pane_identity_binder.rs:267-310`) | `retire_terminal_identity` runs the epoch-guarded pending delete on **every** exit cause; only ledger `Closed` retirement stays explicit-close-only; ported test kept intact (Lifecycle Corrections; Slices D/E2) |
+| FE-R2-8 | The sink's fire-and-forget retirement job broke `handle_kill`'s awaited ledger retirement (`ws/terminal.rs:3880-3903`): a kill response + crash could leave a `Bound` row | `retire_terminal_identity` returns an awaitable `TerminalRetirementCompletion`; `handle_kill` awaits it before completing; `handle_kill_awaits_ledger_retirement_before_completing` (Slices D/F4) |
+| FE-R2-9 | Detached-settle-task guard ownership vs REST `ui.command`-first announcement was unimplementable as specified (routes build `ui.command` after the spawn helper returns; Slice H forbids lower-helper announcement) | Explicit **two-phase settle handoff**: the route hands its announcement closure into the settle task over a oneshot and awaits an enqueue ack; sender-drop (client abort) triggers the deferred-shape fallback announcement; ordering/cancellation specified with tests (Lifecycle Corrections; Slices E2/H) |
+| FE-R2-10 | `OnceLock::set(...).expect(...)` does not compile (`Err(Arc<dyn PaneIdentitySink>)` is not `Debug`) | Boot wiring specified as `assert!(cell.set(sink).is_ok(), "identity sink wired twice")` (Sink Placement and Boot Wiring) |
+| FE-R2-11 | Preflight/E1 `--exact` commands used the bare test name, matching zero tests → vacuous green | Fully qualified `cli_launch::tests::fresh_claude_preallocation_predicate_truth_table`; global convention: every focused command must show a nonzero selected-test count (never `running 0 tests`) |
+| FE-R2-12 | F5's focused command named an undeclared test; the bounded-exhaustion and fresh-Unknown tests were missing | F5 test list redeclared (five tests) and every focused command matches a declared name exactly (Slice F5) |
+| FE-R2-13 | The new Rust-only Playwright spec was not added to `test/e2e-browser/playwright.config.ts` | Spec added to BOTH the `rust-chromium` `testMatch` allowlist and `RUST_ONLY_SPECS`; config file in Slice I inventory + commit (Slice I) |
+| FE-R2-14 | The real OpenCode contract command omitted `--config config/vitest/vitest.server.config.ts` (default config excludes `test/integration/real/**`) → would not execute | Command fixed to mirror the amplifier one (Slice I) |
+| FE-R2-15 (minor) | Type-family comment labeled `ProviderUnavailable` deferrable, contradicting the correct permanent classification | Comment fixed (Slice A type family) |
+
 ## Global Constraints
 
 - Work only in
   `/home/dan/code/freshell/.worktrees/rest-codex-terminal-identity` on branch
   `fix/rest-terminal-identity-publication`, rebased onto `origin/main`
-  `6147c700` (= `537d7d09` + PR #583 + PR #584). **That rebase is already
-  done** — verify it, do not redo it.
-- **Preflight baseline (required before the first implementation slice):** no
-  recorded baseline exists for `6147c700` (the old 9,585-pass evidence was for
-  the long-stale `4c04dc9c`). Before any implementation commit, run the
-  repo-supported baseline on the current base per `AGENTS.md` (broad suites go
-  through the shared test coordinator; never kill a foreign holder), record
-  the result, and stop if the base is not green.
+  `c5e9fdaa` (= `537d7d09` + PR #583 + PR #584 = `6147c700`, + PR #585).
+  **That rebase is already done** — verify it, do not redo it (FE-R2-4).
+- **File:line fact provenance (FE-R2-4):** every crate-level file:line
+  reference in this plan was verified on `6147c700`.
+  `git diff 6147c700..c5e9fdaa -- crates docs/superpowers/plans` is empty
+  (PR #585 is deck visual work only), so every such reference remains valid
+  on `c5e9fdaa`. Where the text says a fact holds "on `6147c700`", read
+  "verified on `6147c700`, unchanged through `c5e9fdaa`".
+- **Preflight baseline (required before the first implementation slice):**
+  the gate targets **current `origin/main` at implementation start**, not
+  any SHA written here (pins in this plan go stale as main moves; `c5e9fdaa`
+  is only the value as of this revision). Before any implementation commit:
+  fetch; if `origin/main` has moved past `c5e9fdaa`, rebase, verify the new
+  drift is irrelevant to this plan's crate-level facts
+  (`git diff c5e9fdaa..origin/main -- crates` — if non-empty, re-validate
+  the affected facts before proceeding); then run the repo-supported
+  baseline on that base per `AGENTS.md` (broad suites go through the shared
+  test coordinator; never kill a foreign holder), record the result, and
+  stop if the base is not green. No recorded baseline exists for this base
+  (the old 9,585-pass evidence was for the long-stale `4c04dc9c`).
 - Use red/green/refactor TDD with **runtime reds only**: every slice lands its
   test surface together with a compiling minimal stub, so each RED is a
   genuine assertion failure, never a missing-symbol compile error. No commit
@@ -249,8 +301,14 @@ Every architectural rule below traces to a validated finding. Summary:
   on a detached Tokio task that owns the spawn permit precisely so a client
   abort drops only the HTTP handler future, never settlement — FE9). The
   guard must never be held by, returned to, or awaited from the HTTP handler
-  future. A locator result racing with exit cannot publish identity to a
-  missing or non-running terminal.
+  future. Because the route builds `ui.command` and its pane/tab bookkeeping
+  only after the spawn helper returns, the settle task holds the guard
+  through announcement via the **two-phase settle handoff** (FE-R2-9,
+  specified in Lifecycle Corrections): the route hands its announcement
+  closure into the settle task over a oneshot and awaits an enqueue ack; a
+  dropped sender (client abort) triggers the deferred-shape fallback
+  announcement. A locator result racing with exit cannot publish identity to
+  a missing or non-running terminal.
 - **Exit-cause discipline:** durable ledger rows become `Closed` only on
   explicit user kill — today that is exactly the WS `terminal.kill` door
   (`handle_kill`). **No REST route kills a PTY** (pane/tab DELETEs keep PTYs
@@ -265,7 +323,10 @@ Every architectural rule below traces to a validated finding. Summary:
 - **Epoch-conditional cleanup:** every delayed mutation (ledger retire,
   pending delete, admission binding clear) carries the owning terminal id
   (and create-request id where available) and mutates only if it still owns
-  the row/key. Never let old cleanup erase a replacement owner.
+  the row/key. Admission binding clears additionally carry the table-minted
+  `AdmissionEpoch` inside the `BoundOwner` token (FE-R2-1) — a key string
+  alone is never ownership proof, because keys are reused across
+  generations. Never let old cleanup erase a replacement owner.
 - **Transport ordering claims are enqueue claims.** The server guarantees
   frames are enqueued to the broadcast bus, in order, before the HTTP handler
   returns — and per-socket FIFO delivery for connected subscribers. It cannot
@@ -414,84 +475,180 @@ both doors with no dependency cycle: `freshell-freshagent → freshell-terminal`
 // codex thread ids).
 pub enum HolderKind { Terminal { conn: u64 }, FreshAgent }
 pub enum KillHandle { Pty { pid: u32 }, SidecarTree { pid: u32, ownership_id: String } }
-pub enum BoundOwner { Terminal { terminal_id: String }, FreshAgent { live_session_key: String } }
+
+/// Table-minted, table-global, monotonically increasing, never reused
+/// (FE-R2-1). Minted inside `complete`/`claim_discovered` under the one
+/// admission lock; the session key alone is NOT an ownership identity,
+/// because keys are reused across generations of the same session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionEpoch(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundOwnerKind {
+    Terminal { terminal_id: String },
+    FreshAgent { live_session_key: String },
+}
+
+/// The binding token. `complete`/`claim_discovered` mint and RETURN it; the
+/// caller retains it and must present it to every later cleanup call.
+/// Equality (kind AND epoch) is the only thing cleanup honors (FE-R2-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundOwner { pub kind: BoundOwnerKind, pub epoch: AdmissionEpoch }
 
 pub enum AdmissionClaim {
     Acquired,
-    Held { retry_after_ms: u64 },
+    // Holder kind exposed so each door maps same-kind vs cross-kind
+    // contention to its exact error (FE-R2-3, D2).
+    Held { holder: HolderKind, retry_after_ms: u64 },
     // Idempotent ONLY for the exact same owner; every DIFFERENT owner —
     // same kind or cross kind — refuses (FE11; see "Owner-conflict answers").
+    // `owner.kind` tells the facade which kind holds the binding.
     BoundLive { owner: BoundOwner },
     ExpiredNeedsKill { handle: KillHandle },
+    // FE-R2-2: the key is poisoned by one or more conflict holds — a
+    // refused-but-still-running writer exists. Never adoptable, never
+    // freed by the original owner's exit alone.
+    Poisoned { holds: usize },
 }
 
+/// FE-R2-2: a refused discovery collision (D3 leaves the refused process
+/// running) is a live writer the table must keep representing. Installed by
+/// the refusing `claim_discovered`; released only by the refused process's
+/// own exit path.
+struct ConflictHold { holder: BoundOwnerKind, installed_at_ms: u64 }
+
 pub struct SessionAdmission {
-    // ONE std Mutex over both maps — the same lock discipline both existing
-    // maps already use.
-    inner: Mutex<Inner>, // { leases: HashMap<Key, Lease>, bindings: HashMap<Key, BoundOwner> }
+    // ONE std Mutex over all three maps — the same lock discipline both
+    // existing maps already use.
+    inner: Mutex<Inner>,
+    // Inner: {
+    //   leases:    HashMap<Key, Lease>,          // Lease records HolderKind
+    //   bindings:  HashMap<Key, BoundOwner>,
+    //   conflicts: HashMap<Key, Vec<ConflictHold>>, // poison set (FE-R2-2)
+    //   next_epoch: u64,
+    // }
 }
 ```
 
 API: `claim(provider, sid, holder_id, kind, now_ms)`, `set_kill_handle`,
-`complete(…, BoundOwner)` (binding insert + lease removal in one lock scope,
-preserving the existing TOCTOU closures at `registry.rs:2103-2116` and
-`session_lease.rs:218-221`), `fail`,
-`clear_binding_if_owner(provider, sid, expected_owner)` (epoch-conditional),
-`release_for_conn(conn)` (Terminal holders only),
-`force_release_after_confirmed_kill`, and
-`claim_discovered(provider, sid, owner)` for identity-discovered adoption.
+`complete(…, BoundOwnerKind) -> BoundOwner` (binding insert + lease removal
+in one lock scope, preserving the existing TOCTOU closures at
+`registry.rs:2103-2116` and `session_lease.rs:218-221`; mints and returns the
+epoch token — FE-R2-1), `fail`,
+`clear_binding_if_owner(provider, sid, expected: &BoundOwner)`
+(epoch-conditional: kind AND epoch must match; a stale token is a no-op
+`NotOwned`, never a release), `release_for_conn(conn)` (Terminal holders
+only), `force_release_after_confirmed_kill`,
+`claim_discovered(provider, sid, kind) -> DiscoveredClaim` for
+identity-discovered adoption (returns the minted `BoundOwner` on success; on
+refusal installs a `ConflictHold` for the refused holder and returns the
+conflicting owner — FE-R2-2), and
+`release_conflict_hold(provider, sid, holder: &BoundOwnerKind)` (called from
+the refused process's exit path; when the last hold on a key drops and no
+binding remains, the key frees).
 
-**Replace the storage, keep the facades.**
+**Key-freeing rule (FE-R2-2):** a key admits a new claim only when it has no
+lease, no binding, **and no conflict holds**. The original owner's exit
+clears its binding but a poisoned key answers `Held`/refusal (mapped to the
+same per-door loser errors) until every refused-but-running process has
+exited and released its hold. This is what makes "leave the loser running"
+(D3) safe: the running loser stays visible to admission for its whole life.
+
+**Replace the storage, migrate the facades (FE-R2-1).**
 `TerminalRegistry::claim_session_ref` keeps its signature and its step-1a
 row-join + known-dead pruning (registry locks are taken and released before
 the admission lock — the acyclic order documented at `registry.rs:1947-1951`),
-but its lease/binding maps delegate to an injected `Arc<SessionAdmission>`.
-`FreshAgentSessionLeases` becomes a thin facade over the same `Arc` (its
-kill-tree machinery in `session_lease.rs:65-188` stays; only map storage
-moves). `main.rs` constructs **one** `SessionAdmission` and injects it into
-the registry and all fresh-agent states — the same wiring precedent as the
-shared `SpawnGate` and `FreshAgentSessionLeases` (`main.rs:236-261`). Facade
-preservation must keep the existing 900-line lease suite and the D8 registry
-tests green without semantic edits.
+but its lease/binding maps delegate to an injected `Arc<SessionAdmission>`;
+`complete_session_ref_claim` stores the minted `BoundOwner` on the terminal
+row's admission record so the exit hook and known-dead pruning clear with
+the exact token. `FreshAgentSessionLeases` becomes a thin facade over the
+same `Arc` (its kill-tree machinery in `session_lease.rs:65-188` stays; only
+map storage moves) — **but its `complete` (`session_lease.rs:330`) now
+returns the minted `BoundOwner`, and its epochless
+`clear_binding(provider, session_id)` (`session_lease.rs:363`) is DELETED in
+favor of `clear_binding_if_owner(provider, sid, &owner)`. Every caller
+stores the token in its session entry and presents it on cleanup. Complete
+production call-site migration:** codex watcher, both arms
+(`codex.rs:3287` and `codex.rs:3295` — the watcher captures the token at
+bind time), codex `handle_kill` (`codex.rs:1245` — reads the token from the
+removed session entry; after the awaited watcher already cleared, this
+second clear is an idempotent `NotOwned` no-op, and a replacement binding's
+NEW epoch can never be erased by it), claude (`claude.rs:1218`), opencode
+(`opencode_ws.rs:791`). `main.rs` constructs **one** `SessionAdmission` and
+injects it into the registry and all fresh-agent states — the same wiring
+precedent as the shared `SpawnGate` and `FreshAgentSessionLeases`
+(`main.rs:236-261`). Facade preservation must keep the existing 900-line
+lease suite and the D8 registry tests green **with only the mechanical
+token-threading edits this migration requires** (e.g.
+`clear_binding_reopens_after_the_bound_session_exits` now clears with the
+token `complete` returned); no other semantic edits.
 
-**Owner-conflict answers (D2/D3, FE11):**
+**Owner-conflict answers (D2/D3, FE11, FE-R2-3):**
 
+- The facades decide same-kind vs cross-kind from the exposed holder/owner
+  kind (`Held.holder`, `BoundLive.owner.kind` — FE-R2-3). The per-door
+  mapping is exact and barrier-test-asserted (Slice B0 Step 6):
+  - WS terminal door, **same-kind** contention (`Held{Terminal}` /
+    `BoundLive{Terminal}`) → existing D8 `SESSION_RESERVED` error frame with
+    `retry_after_ms` (`terminal.rs:1252,1551` semantics preserved);
+    **cross-kind** (`Held{FreshAgent}` / `BoundLive{FreshAgent}` /
+    `Poisoned`) → `error{RESTORE_UNAVAILABLE}` per D2.
+  - REST terminal door → 409 for every refusal (existing conservative-v1
+    envelope, `terminal_tabs.rs:1069-1085`): same-kind keeps today's 409
+    `RESTORE_UNAVAILABLE` body; cross-kind and poisoned answer the same 409
+    `RESTORE_UNAVAILABLE` (D2).
+  - Fresh-agent doors → same-kind keeps today's
+    `SESSION_RESERVED { retryable: true }`; cross-kind and poisoned also
+    answer `create.failed{SESSION_RESERVED, retryable: true}` per D2.
 - Create/attach doors, same-kind `BoundLive` → existing behavior unchanged:
   terminal doors keep their `BoundElsewhere` semantics; the fresh-agent
-  attach flow adopts only **its own** completed binding.
-- Cross-kind `BoundLive` → deterministic refusal, never adoption: terminal
-  doors answer `RESTORE_UNAVAILABLE` (409 on REST, the error frame on WS);
-  fresh-agent doors answer `SESSION_RESERVED { retryable: true }`. A new
-  `SessionRefClaim::OwnedByFreshAgent` variant carries this through the
-  registry facade. **Every exhaustive `SessionRefClaim` match gains the new
-  arm in the same slice (FE4)** — including
-  `auto_resume.rs::claim_session` (`crates/freshell-ws/src/auto_resume.rs:651-681`),
+  attach flow adopts only **its own** completed binding (exact
+  `BoundOwner` token match, kind and epoch).
+- Cross-kind `BoundLive` → deterministic refusal, never adoption, mapped per
+  the table above. A new `SessionRefClaim::OwnedByFreshAgent` variant
+  carries this through the registry facade. **Every exhaustive
+  `SessionRefClaim` match gains the new arm in the same slice (FE4)** —
+  including `auto_resume.rs::claim_session`
+  (`crates/freshell-ws/src/auto_resume.rs:651-681`),
   which answers `false` (a fresh-agent-owned session is never auto-respawned).
 - Cross-kind `ExpiredNeedsKill` → v1 answers `Held`/409; the holder's own
   kind performs its kill. No cross-kind sweeping.
-- `claim_discovered(provider, sid, owner)` — discovery-time adoption (FE11):
-  binding absent → bind atomically. Binding present with the **exact same
-  owner** (same `BoundOwner` variant and same terminal id / live-session
-  key) → idempotent success (re-publication of an established fact). Binding
-  present with **any different owner — same kind or cross kind** → refuse the
-  binding atomically, leave the process running,
+- `claim_discovered(provider, sid, kind)` — discovery-time adoption (FE11,
+  FE-R2-2): binding absent and no conflict holds → bind atomically, mint and
+  return the `BoundOwner`. Binding present with the **exact same owner**
+  (same kind and same epoch) → idempotent success (re-publication of an
+  established fact). Binding present with **any different owner — same kind
+  or cross kind** → refuse the binding atomically, **install a
+  `ConflictHold` for the refused holder in the same lock scope** (the
+  refused process keeps running per D3 and must stay visible to admission —
+  FE-R2-2), leave the process running,
   `tracing::error!(target: "invariant")`, and a user-visible client
   notification via the same loud surface as the existing D8 duplicate-session
   alarm (`alarm_if_duplicate_session_ref`). Never kill (D3). A second
   same-provider process on one session is exactly the two-writer shape this
-  plan kills; "same kind" is never a license to steal a binding.
+  plan kills; "same kind" is never a license to steal a binding. The refused
+  holder's exit path calls `release_conflict_hold`; only then (and only with
+  no binding and no other holds) does the key free.
 
 **Spawn-door inventory routed through the claim:** WS `terminal.create`
 (negotiated; legacy session-carrying creates are removed per D5), REST
 `POST /api/tabs` / split / respawn (including the legacy-raw rung, which
 today claims nothing), fresh-agent create and attach for claude/codex/
 opencode, auto-resume respawn, OpenCode signal-rebind restart, and recovery
-flows. Release paths: terminal spawn failure → existing RAII
+flows. Release paths (every cleanup call presents the minted `BoundOwner`
+token — FE-R2-1): terminal spawn failure → existing RAII
 `fail_session_ref_claim` guards → facade `fail`; PTY exit/kill →
-`clear_binding_if_owner(Terminal{terminal_id})` (known-dead pruning stays as
-backstop); conn death → `release_for_conn`; fresh-agent sidecar failure →
-`fail`; session exit watcher → owner-conditional `clear_binding_if_owner`;
-TTL tree-kill → `force_release_after_confirmed_kill`. Server restart: table
+`clear_binding_if_owner(provider, sid, &owner)` with the token stored at
+`complete_session_ref_claim` time (known-dead pruning stays as backstop and
+also clears token-conditionally); conn death → `release_for_conn`;
+fresh-agent sidecar failure → `fail`; session exit watcher →
+token-conditional `clear_binding_if_owner` (codex watcher arms
+`codex.rs:3287/3295`; the awaited-watcher-then-clear-again shape in codex
+`handle_kill` `codex.rs:1245` becomes an idempotent `NotOwned` no-op that
+can never erase a replacement's new-epoch binding); TTL tree-kill →
+`force_release_after_confirmed_kill`; **refused-discovery conflict holds
+(FE-R2-2)** → the refused process's own exit path (terminal exit hook or
+fresh-agent watcher) calls `release_conflict_hold`. Server restart: table
 is in-memory, like both current maps.
 
 ## Launch Hint vs Authoritative Identity (LB10)
@@ -592,10 +749,43 @@ fn exists_with_freshness(&self, provider: &str, session_id: &str)
 
 with a default body delegating to `exists` with `index_fresh: false`
 (conservative: an unknown-freshness `Absent` defers instead of permanently
-rejecting). `IndexExistenceProbe` implements it by capturing
-`self.index.is_fresh()` in the same call that peeks the snapshot. The
-`SharedExistenceProbe` alias in `crates/freshell-ws/src/existence.rs`
-carries the same shape. Authorization uses only `exists_with_freshness`.
+rejecting). The `SharedExistenceProbe` alias in
+`crates/freshell-ws/src/existence.rs` carries the same shape. Authorization
+uses only `exists_with_freshness`.
+
+**Atomic snapshot+freshness read (FE-R2-5):** `SessionIndex::peek()` and
+`is_fresh()` are two separate lock acquisitions
+(`crates/freshell-sessions/src/directory_index.rs:751-759` — the backing
+`any_cached()` and `fresh_cached()` helpers each take `self.snapshot.lock()`
+independently, `directory_index.rs:763-777`), so a
+refresh interleaving between them could pair a **stale** `Absent` snapshot
+with `index_fresh: true` — turning a deferrable miss into a wrongful
+permanent rejection. `IndexExistenceProbe` therefore must NOT compose
+`peek()` + `is_fresh()`. `freshell-sessions` gains one atomic API (Slice D):
+
+```rust
+pub struct PeekedSnapshot {
+    pub items: Option<Arc<Vec<IndexedSession>>>,
+    pub fresh: bool,        // fetched_at.elapsed() < ttl, same guard read
+    pub generation: u64,    // monotone publish counter, same guard read
+}
+
+/// One acquisition of `self.snapshot`'s lock; items, freshness, and
+/// generation all derive from the SAME guard read.
+pub fn peek_with_freshness(&self) -> PeekedSnapshot;
+```
+
+(`SnapshotCache` gains the `generation` counter, bumped on every publish.)
+`IndexExistenceProbe::exists_with_freshness` calls `peek_with_freshness()`
+exactly once and derives both the existence answer and `index_fresh` from
+that one `PeekedSnapshot`; the existing `exists` keeps its behavior. Test in
+`freshell-sessions`:
+`peek_with_freshness_pairs_snapshot_and_freshness_from_one_guard_read` —
+publish snapshot generation 1, expire the TTL (injected/short TTL), publish
+generation 2, hammer `peek_with_freshness` concurrently with re-publishes,
+and assert every returned `PeekedSnapshot` with `fresh: true` carries the
+generation that was fresh at its own read (never a stale generation's items
+paired with another generation's freshness).
 
 **Deferred re-authorization (Slice F5):** a launched-but-unconfirmed legacy
 candidate (`Unknown` or stale-`Absent`) is recorded as an unconfirmed
@@ -606,14 +796,22 @@ a **bounded fresh-answer requery schedule** per marker: requery
 `exists_with_freshness` with capped exponential backoff (1s, 2s, 4s, … cap
 30s, at most 8 attempts) — each `exists` call itself kicks the detached
 refresh (`existence.rs` module doc), which is what makes the schedule
-converge — and stop early on the first answer with `index_fresh: true`.
-Fresh `Present` → publish through the discovered pipeline
+converge — and stop early on the first **conclusive** fresh answer.
+Dispositions, exhaustively (FE-R2-6):
+fresh `Present` → publish through the discovered pipeline
 (`publish_running_session_identity` + sink persist/announce) with provenance
-`ExistenceValidatedLegacyResume`. Fresh `Absent` → drop the marker
-permanently with a structured warning. Attempts exhausted without a fresh
-answer → drop with a structured warning (the client's re-present loop is
-the remaining manual path). Markers are dropped on terminal exit. Fresh
-`Absent` or `ProviderUnavailable` at create time is never deferred.
+`ExistenceValidatedLegacyResume`; fresh `Absent` → drop the marker
+permanently with a structured warning; fresh **`Unknown`** → **continue the
+bounded requery** — `Unknown` is non-final regardless of freshness (it is
+reachable even from a warm, fresh index: the OpenCode by-id DB fallback
+answers `Unreadable → Unknown` inside the warm-snapshot arm,
+`crates/freshell-server/src/existence.rs:268-270`, e.g. under WAL lock
+contention); `ProviderUnavailable` → drop permanently with a structured
+warning (FE7). Attempts exhausted without a conclusive fresh answer —
+including exhaustion on repeated fresh `Unknown`s — → drop with a
+structured warning (the client's re-present loop is the remaining manual
+path). Markers are dropped on terminal exit. Fresh `Absent` or
+`ProviderUnavailable` at create time is never deferred.
 
 ## Amplifier Probe-Before-Stub (LB15)
 
@@ -694,7 +892,8 @@ adapter:
   binder pre-spawn methods behind typed trait methods (Slice D) so the
   exception stays visible and testable. All other spawn failures write
   nothing and release the admission lease via RAII.
-- **Settlement-owner-held finalization guard (LB6, FE9).**
+- **Settlement-owner-held finalization guard (LB6, FE9) with the two-phase
+  settle handoff (FE-R2-9).**
   `create_with_publication` returns a `CreateFinalizationGuard`. The wrapped
   exit hook waits on it; the **settlement owner** holds it through provider
   settlement, the awaited durable write, and the announcement enqueue, then
@@ -703,7 +902,30 @@ adapter:
   lives inside that task's scope and is never returned to the HTTP handler
   future, so a client abort (which drops only the handler future) cannot
   open the gate early or skip bookkeeping; a cancellation test proves it
-  (Slice E2). Exit cleanup can therefore never resurrect a row after
+  (Slice E2). **The announcement-ordering conflict is resolved explicitly
+  (FE-R2-9):** the route builds `ui.command` and completes its pane/tab
+  bookkeeping only after the spawn helper returns, yet the settle task must
+  hold the guard through announcement and Slice H forbids the lower helper
+  announcing before caller bookkeeping. Design — a two-phase handoff:
+  - **Phase 1 (settle):** the detached settle task runs provider
+    settlement + the awaited durable write, then awaits an
+    **announcement-handoff oneshot** from the route.
+  - **Phase 2 (announce):** the route, after its pane/tab bookkeeping and
+    `ui.command` construction, sends its announcement closure (or the
+    prebuilt frames) through the oneshot and then awaits an **enqueue-ack
+    oneshot** back from the settle task before building the HTTP response —
+    preserving the enqueue-before-return claim. The settle task runs the
+    closure, enqueues `ui.command -> terminals.changed ->
+    terminal.meta.updated` in order, sends the ack, and only then drops the
+    guard.
+  - **Cancellation:** if the HTTP handler future is dropped before the
+    handoff (client abort), the oneshot sender drops; the settle task
+    observes the closed channel **deterministically** (no timeout) and runs
+    the fallback **deferred-shape announcement**
+    (`terminals.changed -> terminal.meta.updated`, no `ui.command`), then
+    drops the guard — settlement and gate release always complete (FE9).
+    Ack-send failure after a late abort is ignored.
+  Exit cleanup can therefore never resurrect a row after
   retirement, delete a pending marker before it is written, or announce a
   retired terminal as created.
 - **Gate opens on every error path (LB4, FE1).** The guard is created
@@ -722,13 +944,26 @@ adapter:
   ```
 
   `retire_terminal_identity(terminal_id, cause)`: both causes mark the
-  in-memory identity retired (retained). Only `ExplicitClose` runs
-  `retire_closed_if_owned` on the ledger. Natural exit, successful and
-  exhausted auto-resume, and graceful shutdown leave rows `Bound`
-  (`auto_resume.rs` doc: a still-Bound row is the not-closed signal;
+  in-memory identity retired (retained) **and both causes run the
+  epoch-guarded pending-marker delete (`delete_pending_if_owned`) — pending
+  cleanup happens on every exit (FE-R2-7: the landed binder's natural-exit
+  hook already deletes pending markers, pinned by
+  `retire_pane_identity_retires_row_and_clears_pending`,
+  `pane_identity_binder.rs:267-310`; that behavior is current production
+  truth and is preserved through the migration).** Only `ExplicitClose`
+  additionally runs `retire_closed_if_owned` on the ledger. Natural exit,
+  successful and exhausted auto-resume, and graceful shutdown leave rows
+  `Bound` (`auto_resume.rs` doc: a still-Bound row is the not-closed signal;
   `retire_closed`'s single production call site today is `handle_kill`,
   `ws/terminal.rs:3880/3895` — that discipline is preserved and **stays
-  WS-only**). **FE8: there is no REST close door.** Pane/tab DELETEs keep
+  WS-only**). **Explicit-close persistence stays awaited (FE-R2-8):**
+  today's `handle_kill` awaits the `spawn_blocking` ledger retirement before
+  completing (`ws/terminal.rs:3880-3903`); the sink must not weaken that to
+  fire-and-forget, or a kill response followed by a crash could leave a
+  `Bound` row. `retire_terminal_identity` therefore returns an awaitable
+  `TerminalRetirementCompletion` (see Slice D) that resolves when the
+  ledger cleanup job settles; `handle_kill` awaits it. **FE8: there is no
+  REST close door.** Pane/tab DELETEs keep
   PTYs for reattach and `DELETE /api/terminals/:id` only hides
   (`terminals.rs:1033-1050`), so no REST code path may pass `ExplicitClose`;
   a REST kill route is explicitly out of scope. Graceful shutdown calls no
@@ -776,7 +1011,11 @@ adapter:
   each expose `identity_sink_wired()` plus an assertion accessor; boot
   asserts all five wired **and** `Arc::ptr_eq` against the one constructed
   sink. Production wiring surfaces a discarded `OnceLock::set` failure
-  loudly (`.expect("identity sink wired twice")` on the boot path); the
+  loudly — FE-R2-10: `OnceLock::set(...).expect(...)` does **not** compile
+  here (the `Err(Arc<dyn PaneIdentitySink>)` payload is not `Debug`), so the
+  boot path uses
+  `assert!(cell.set(sink).is_ok(), "identity sink wired twice")` (or the
+  setters return `bool` and boot asserts each); the
   four current setters' silent `let _ =` (`lib.rs:292-294`,
   `claude.rs:189-191`, `codex.rs:318-320`, `opencode_ws.rs:234-236`) must
   not remain the only guard. The sink owns the shared `terminals_revision`
@@ -816,11 +1055,15 @@ post-launch discovery (fresh codex/opencode; deferred legacy re-auth):
 exit:
   finalization guard wait (create settlement completes first)
   -> finish_pty_exit
-  -> retire_terminal_identity(terminal_id, cause):
+  -> retire_terminal_identity(terminal_id, cause) -> completion:
        memory identity marked retired (retained)
-       ExplicitClose only: retire_closed_if_owned + epoch-guarded pending delete
-       NaturalExit: no ledger retirement (rows stay Bound; auto-resume intact)
-  -> admission clear_binding_if_owner
+       every cause: epoch-guarded pending delete (FE-R2-7)
+       ExplicitClose only: retire_closed_if_owned
+         (handle_kill AWAITS the returned completion — FE-R2-8)
+       NaturalExit: no ledger Closed retirement (rows stay Bound;
+         auto-resume intact; completion may be dropped)
+  -> admission clear_binding_if_owner(&BoundOwner token) (FE-R2-1)
+     + release_conflict_hold if this process was a refused loser (FE-R2-2)
   -> provider-specific locator/sidecar/stub cleanup
 ```
 
@@ -852,8 +1095,10 @@ frames.
   publication, cause-aware retirement, ordered REST announcement, scoped pane
   promotion.
 - Modify `crates/freshell-freshagent/src/{claude,codex,opencode_ws}.rs`: loud
-  sink setters/getters for boot assertions; lease facade call sites
-  unchanged.
+  sink setters/getters for boot assertions (Slice D); lease cleanup call
+  sites migrate to the epoch-token `clear_binding_if_owner` form (Slice B0,
+  FE-R2-1 — `claude.rs:1218`, `codex.rs:1245/3287/3295`,
+  `opencode_ws.rs:791`).
 - Create `crates/freshell-ws/src/identity_sink.rs`: the production
   `LedgerIdentitySink` (moved per LB18; absorbs `LedgerPaneIdentityBinder`'s
   write logic and ported unit tests) with authorization ordering, exit-cause
@@ -898,6 +1143,9 @@ frames.
   impl (FE6); probe-only / legacy-adjudication variant that ignores
   zero-turn broker-shaped stubs (trait extension in
   `crates/freshell-ws/src/existence.rs`).
+- Modify `crates/freshell-sessions/src/directory_index.rs`: atomic
+  `peek_with_freshness()` (one-lock snapshot + freshness + generation,
+  FE-R2-5) that `exists_with_freshness` consumes.
 - `crates/freshell-platform/src/cli_launch.rs`: **no change** — the shared
   fresh-Claude preallocation predicate landed in #584 (Slice E1 is
   verify-only).
@@ -912,17 +1160,22 @@ frames.
   directory-row convergence regression + adverse-interleaving test.
 - Create `test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts`:
   scratch-server browser proof.
+- Modify `test/e2e-browser/playwright.config.ts`: register the new
+  Rust-only spec in **both** the `rust-chromium` `testMatch` allowlist and
+  the `RUST_ONLY_SPECS` exclusion list (FE-R2-13).
 - Modify `test/integration/real/coding-cli-session-contract.test.ts`:
   version-gated OpenCode contract.
 - Do not modify `src/store/selectors/sidebarSelectors.ts`.
 
-## Reconciliation with Merged PR #584 (base `6147c700`)
+## Reconciliation with Merged PR #584 (landed at `6147c700`; base now `c5e9fdaa`)
 
 PR #584 (`fix/rest-terminal-session-identity`, kata `hbsa`) and PR #583
 merged into `origin/main` while the previous revision was being written; the
-old "harvest the Claude-focused branch" guidance is obsolete. This section is
+old "harvest the Claude-focused branch" guidance is obsolete. PR #585 then
+moved main to `c5e9fdaa` with deck visual work only (crate-empty diff —
+FE-R2-4, see Global Constraints). This section is
 the authoritative delta. Implementers must study
-`git log --stat 537d7d09..6147c700` before starting.
+`git log --stat 537d7d09..c5e9fdaa` before starting.
 
 **Landed — verify, do not redo:**
 
@@ -1000,13 +1253,28 @@ commit contains a red test; (c) no slice leaves any Cargo target uncompilable
 at its commit boundary; (d) trait growth never breaks a downstream implementer
 across a slice boundary (defaults flipped to required within one slice);
 (e) every focused command names a real crate/target and is not blocked by an
-earlier slice.
+earlier slice; (f) **no vacuous greens (FE-R2-11):** every focused test
+command must demonstrably select at least one test — `--exact` filters use
+the **fully qualified module path** (e.g.
+`cli_launch::tests::fresh_claude_preallocation_predicate_truth_table`, never
+the bare function name), and the runner must verify the harness summary
+shows the expected nonzero count (e.g. `1 passed`) — a `running 0 tests` /
+`0 passed; 0 failed` result is a command bug, treat it as RED.
 
-- [ ] **Preflight (before Slice A):** confirm branch/base
-  (`git log --oneline -5` shows this plan's commits atop `6147c700`), confirm
-  the landed E1 predicate
-  (`cargo test -p freshell-platform fresh_claude_preallocation_predicate_truth_table -- --exact`),
-  study `git log --stat 537d7d09..6147c700` (Reconciliation section), then
+- [ ] **Preflight (before Slice A):** confirm branch/base per the Global
+  Constraints baseline gate — fetch and verify the branch sits atop
+  **current `origin/main`** (`c5e9fdaa` as of this revision; if main moved,
+  rebase and verify `git diff c5e9fdaa..origin/main -- crates` is empty or
+  re-validate affected facts first — FE-R2-4). Confirm the landed E1
+  predicate with the fully qualified name (FE-R2-11):
+
+```bash
+cargo test -p freshell-platform cli_launch::tests::fresh_claude_preallocation_predicate_truth_table -- --exact --nocapture
+```
+
+  Verify the summary reports `1 passed` (a `running 0 tests` output means
+  the filter is wrong — treat as RED). Study
+  `git log --stat 537d7d09..c5e9fdaa` (Reconciliation section), then
   run the repo-supported baseline on this base via the shared test
   coordinator per `AGENTS.md`. Record counts in the implementation report.
   Stop on a red base.
@@ -1070,9 +1338,9 @@ pub struct AuthorizedTerminalIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalIdentityRejection {
     LiveFreshAgentOwner,
-    LegacyIdentityAbsent,        // permanent (warm-index miss)
-    LegacyIdentityUnconfirmed,   // deferrable (cold index)
-    ProviderUnavailable,         // deferrable (cold index, missing root)
+    LegacyIdentityAbsent,        // permanent (fresh-index miss)
+    LegacyIdentityUnconfirmed,   // deferrable (cold/stale index)
+    ProviderUnavailable,         // permanent (missing provider root — FE7/FE-R2-15)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,6 +1477,8 @@ Session Admission" above and **D5**.
 **Files:** create `crates/freshell-terminal/src/session_admission.rs`; modify
 `crates/freshell-terminal/src/{lib,registry}.rs`,
 `crates/freshell-freshagent/src/session_lease.rs`,
+`crates/freshell-freshagent/src/{claude,codex,opencode_ws}.rs` (FE-R2-1
+epoch-token cleanup migration),
 `crates/freshell-freshagent/src/terminal_tabs.rs`,
 `crates/freshell-ws/src/terminal.rs`,
 `crates/freshell-ws/src/auto_resume.rs` (FE4 — its `claim_session` has an
@@ -1218,21 +1488,41 @@ step), `crates/freshell-server/src/main.rs`;
 create `crates/freshell-ws/tests/cross_kind_admission.rs`.
 
 - [ ] **Step 1 (B0.1 RED):** land `SessionAdmission` with `claim` stubbed to
-  always return `Acquired` and `complete`/`clear_binding_if_owner` as
-  recording no-ops, together with threadless unit pins in
+  always return `Acquired`, `complete`/`claim_discovered` returning a fixed
+  epoch-0 `BoundOwner`, and `clear_binding_if_owner`/`release_conflict_hold`
+  as recording no-ops, together with threadless unit pins in
   `session_admission::tests` (the `registry.rs:4655`-style staged-
   interleaving trick, no sleeps):
 
   - `claim_vs_claim_yields_exactly_one_acquired`
   - `claim_across_complete_answers_bound_live`
   - `cross_kind_bound_live_is_never_adoptable`
+  - `held_exposes_holder_kind` (FE-R2-3: a lease held by a Terminal holder
+    answers `Held{holder: Terminal{..}}` to a second claimant; a
+    FreshAgent-held lease answers `Held{holder: FreshAgent}` — this is the
+    field the per-door same-kind/cross-kind error mapping depends on)
+  - `complete_mints_a_unique_monotone_epoch_per_binding` (FE-R2-1: two
+    sequential bind/clear/rebind cycles on the same key yield distinct,
+    increasing epochs)
   - `claim_discovered_vs_lease_is_atomic`
-  - `claim_discovered_same_exact_owner_is_idempotent` (FE11)
+  - `claim_discovered_same_exact_owner_is_idempotent` (FE11: same kind AND
+    same epoch)
   - `claim_discovered_any_different_owner_is_refused` (FE11: a second
     same-kind terminal owner and a cross-kind owner both refuse; the
     process-left-running + loud-surface halves are asserted at the door
     level in Step 6 and Slice F)
-  - `clear_binding_requires_owner_match`
+  - `refused_discovery_installs_conflict_hold_and_poisons_key` (FE-R2-2:
+    after a refusal, a fresh claim on the key answers `Poisoned`, never
+    `Acquired`)
+  - `poisoned_key_stays_closed_after_owner_exit_until_hold_released`
+    (FE-R2-2: owner A bound; discovery for B refused → hold installed; A's
+    binding cleared with its token; a new claim is still refused while B's
+    hold lives; `release_conflict_hold(B)` → the next claim acquires)
+  - `clear_binding_requires_owner_match` (kind AND epoch — FE-R2-1)
+  - `stale_epoch_clear_cannot_release_a_replacement_binding` (FE-R2-1, the
+    table-level codex double-clear shape: bind epoch N, clear with token N,
+    rebind (epoch N+1), clear again with the stale token N → `NotOwned`,
+    replacement binding intact)
   - `release_for_conn_releases_only_terminal_holders`
   - `force_release_requires_confirmed_kill`
 
@@ -1270,8 +1560,24 @@ cargo test -p freshell-freshagent terminal_tabs::tests::rest_legacy_raw_resume_c
   Expected RED: both creates succeed today (the hole).
 
 - [ ] **Step 4 (B0.2 GREEN):** convert both lease stores to facades over one
-  injected `Arc<SessionAdmission>` (public APIs and signatures preserved);
-  add `SessionRefClaim::OwnedByFreshAgent` — **and, in this same step, every
+  injected `Arc<SessionAdmission>`. Public APIs and signatures are preserved
+  **except the FE-R2-1 token migration:** `FreshAgentSessionLeases::complete`
+  (`session_lease.rs:330`) returns the minted `BoundOwner`; the epochless
+  `clear_binding(provider, session_id)` (`session_lease.rs:363`) is deleted
+  and every production call site migrates to
+  `clear_binding_if_owner(provider, sid, &owner)` with the token stored on
+  its session entry — codex watcher both arms (`codex.rs:3287`,
+  `codex.rs:3295`), codex `handle_kill` (`codex.rs:1245`), claude
+  (`claude.rs:1218`), opencode (`opencode_ws.rs:791`); on the terminal side
+  `complete_session_ref_claim` stores the token for exit-hook/known-dead
+  clears. Add the codex double-clear regression at the facade level:
+  `codex_double_clear_cannot_release_a_replacement_binding` (in the codex
+  tests: bind S, run the watcher clear, rebind S as a replacement (new
+  epoch), then run `handle_kill`'s post-watcher clear with the old token —
+  the replacement binding must survive and a subsequent claim on S must
+  answer `BoundLive`, not `Acquired`). Update the lease suite's own pins
+  mechanically for the token (no other semantic edits).
+  Add `SessionRefClaim::OwnedByFreshAgent` — **and, in this same step, every
   exhaustive `SessionRefClaim` match gains the new arm so `cargo check`
   stays green (FE4):** the WS door (`terminal.rs:1496-1534`) and REST door
   (`terminal_tabs.rs:1061-1075`) map it to the D2 errors, and
@@ -1296,6 +1602,9 @@ cargo check -p freshell-server
 git add crates/freshell-terminal/src/session_admission.rs \
   crates/freshell-terminal/src/registry.rs \
   crates/freshell-freshagent/src/session_lease.rs \
+  crates/freshell-freshagent/src/claude.rs \
+  crates/freshell-freshagent/src/codex.rs \
+  crates/freshell-freshagent/src/opencode_ws.rs \
   crates/freshell-freshagent/src/terminal_tabs.rs \
   crates/freshell-ws/src/terminal.rs \
   crates/freshell-ws/src/auto_resume.rs \
@@ -1338,10 +1647,23 @@ git commit -m "feat(ws)!: require pane_reconcile_v1 for session-carrying termina
   `tokio::Barrier` simultaneous-send variant, and assert:
 
   1. exactly one winner (XOR of `terminal.created` / `freshAgent.created`);
-  2. the loser's exact structured error for its door (D2);
+  2. the loser's **exact** structured error for its door and contention
+     kind (D2, FE-R2-3): cross-kind terminal loser → REST 409
+     `RESTORE_UNAVAILABLE` body / WS `error{RESTORE_UNAVAILABLE}` frame;
+     fresh-agent loser → `create.failed{SESSION_RESERVED, retryable: true}`;
+     plus a same-kind control pairing per door proving WS terminal×terminal
+     still answers the existing D8 `SESSION_RESERVED` frame (assert code
+     equality, not just refusal);
   3. exactly one writer post-hoc (≤1 sidecar create for S, ≤1 Running row,
      one writer pid in the fake provider transcript);
-  4. loser-retry convergence after winner exit + binding clear.
+  4. loser-retry convergence after winner exit + binding clear;
+  5. **poisoned-key retry (FE-R2-2):**
+     `refused_discovery_keeps_key_closed_until_refused_process_exits` — a
+     fresh-agent pane owns S; a terminal's discovered identity for S is
+     refused (D3: process keeps running, conflict hold installed); the
+     fresh-agent owner exits and its binding clears; a retry create for S
+     is **still refused** while the refused terminal runs; the refused
+     terminal exits (hold released) and the retry then acquires.
 
   These are the LB14 acceptance gate. They should pass on first run if
   Steps 2–5 are correct; if any fails, that is a real admission bug — fix
@@ -1617,7 +1939,9 @@ land with default bodies, flip to required in this same slice; extended
 `crates/freshell-server/src/main.rs` (one sink, five consumers, boot
 assertions, weak probes), `crates/freshell-server/src/existence.rs` (+ trait
 touch in `crates/freshell-ws/src/existence.rs` if needed) for the
-legacy-adjudication probe variant.
+legacy-adjudication probe variant, and
+`crates/freshell-sessions/src/directory_index.rs` for the atomic
+`peek_with_freshness()` (FE-R2-5) that `exists_with_freshness` consumes.
 
 **Trait additions to `PaneIdentitySink`** (existing `record_pending`,
 `record_binding`, `load_settings`, `was_recorded` stay source-compatible):
@@ -1641,7 +1965,15 @@ fn persist_terminal_identity(
 fn persist_terminal_pending(&self, pending: TerminalPendingIdentity)
     -> TerminalDurabilityWrite;
 
-fn retire_terminal_identity(&self, terminal_id: &str, cause: TerminalExitCause);
+// Synchronous-callable from the PTY reader hook; returns an awaitable
+// completion (FE-R2-8). `handle_kill` MUST await it for ExplicitClose
+// (preserving today's awaited semantics, ws/terminal.rs:3880-3903);
+// NaturalExit callers may drop it.
+fn retire_terminal_identity(&self, terminal_id: &str, cause: TerminalExitCause)
+    -> TerminalRetirementCompletion;
+// alias next to the others:
+// pub type TerminalRetirementCompletion =
+//     Pin<Box<dyn Future<Output = TerminalIdentityDurability> + Send + 'static>>;
 
 fn defer_legacy_reauthorization(&self, candidate: TerminalIdentityCandidate);
 fn drop_legacy_reauthorization(&self, terminal_id: &str);
@@ -1708,9 +2040,18 @@ Behavior:
 - `retire_terminal_identity(terminal_id, cause)` is synchronous-callable from
   the PTY reader hook: it marks the in-memory identity retired immediately
   (retained), drops any deferred re-auth marker, then spawns one ordered
-  async cleanup job via the runtime handle; only `ExplicitClose` runs
-  `retire_closed_if_owned` + `delete_pending_if_owned` on `spawn_blocking`.
-  Test-only completion receiver for deterministic waits.
+  async cleanup job via the runtime handle. The cleanup job runs
+  `delete_pending_if_owned` for **every** cause (FE-R2-7 — natural exit
+  must keep deleting durable pending markers, current production behavior),
+  and additionally `retire_closed_if_owned` for `ExplicitClose` only; both
+  on `spawn_blocking`. The method returns a `TerminalRetirementCompletion`
+  resolving when the cleanup job settles (FE-R2-8): production
+  `handle_kill` awaits it before completing so a kill response is never
+  emitted ahead of the ledger retirement (today's awaited contract,
+  `ws/terminal.rs:3880-3903`); the natural-exit reader hook drops it
+  (fire-and-forget is safe there — nothing downstream depends on marker
+  deletion completing before the hook returns). The same completion serves
+  deterministic test waits.
 - `announce_terminal_identity` enqueues, per event:
 
 ```text
@@ -1785,14 +2126,30 @@ missed literal.
   - `prespawn_minted_claude_binding_writes_bound_row_and_delete_removes_it`
     (ported from the landed binder unit tests; PIN2 exception via the sink)
   - `natural_exit_retires_memory_but_leaves_ledger_bound` (LB7)
-  - `explicit_close_retires_ledger_via_epoch_guard` (LB7/LB8)
+  - `natural_exit_deletes_pending_marker_and_leaves_binding_bound`
+    (FE-R2-7: NaturalExit runs `delete_pending_if_owned` — the ported
+    binder pin `retire_pane_identity_retires_row_and_clears_pending`'s
+    pending-delete half stays true through the migration)
+  - `explicit_close_retires_ledger_via_epoch_guard` (LB7/LB8; the test
+    awaits the returned `TerminalRetirementCompletion` — FE-R2-8)
   - `retirement_retires_memory_then_runs_ledger_cleanup_off_reader_thread`
+  - `retirement_completion_resolves_only_after_ledger_cleanup_settles`
+    (FE-R2-8: barrier-gated ledger; the completion must not resolve before
+    the blocking job finishes)
+
+  freshell-sessions lib (`directory_index::tests`):
+  - `peek_with_freshness_pairs_snapshot_and_freshness_from_one_guard_read`
+    (FE-R2-5: items, `fresh`, and `generation` all from one lock
+    acquisition; a stale snapshot can never be paired with another
+    generation's freshness — see the probe-contract section for the full
+    fixture)
 
   freshell-server bin (`existence::tests`):
   - `exists_with_freshness_reports_stale_snapshot_absent_as_unfresh` (FE6:
     seeded index, session written after the snapshot; `exists` alone says
     `Absent`, `exists_with_freshness` says `Absent` + `index_fresh: false`;
-    companion to the existing
+    implemented over `peek_with_freshness` — never `peek()` + `is_fresh()`
+    composed (FE-R2-5); companion to the existing
     `session_written_after_cold_read_resolves_present_on_requery`)
 
   freshell-server bin (`identity_sink::tests`):
@@ -1812,10 +2169,11 @@ cargo test -p freshell-freshagent identity_sink::tests -- --nocapture
 cargo test -p freshell-ws identity_sink::tests -- --nocapture
 cargo test -p freshell-server identity_sink::tests -- --nocapture
 cargo test -p freshell-server existence::tests -- --nocapture
+cargo test -p freshell-sessions directory_index::tests::peek_with_freshness_pairs_snapshot_and_freshness_from_one_guard_read -- --exact --nocapture
 cargo test -p freshell-ws --all-targets   # FE5 gate: every WsState literal updated
 cargo check -p freshell-server
 cargo fmt --all --check
-cargo clippy -p freshell-freshagent -p freshell-ws -p freshell-server --all-targets -- -D warnings
+cargo clippy -p freshell-sessions -p freshell-freshagent -p freshell-ws -p freshell-server --all-targets -- -D warnings
 ```
 
 - [ ] **Step 3 (Commit):**
@@ -1826,6 +2184,7 @@ git add crates/freshell-freshagent/src/identity_sink.rs \
   crates/freshell-freshagent/src/claude.rs \
   crates/freshell-freshagent/src/codex.rs \
   crates/freshell-freshagent/src/opencode_ws.rs \
+  crates/freshell-sessions/src/directory_index.rs \
   crates/freshell-ws/src/identity_sink.rs \
   crates/freshell-ws/src/lib.rs \
   crates/freshell-ws/src/existence.rs \
@@ -1846,10 +2205,12 @@ test `fresh_claude_preallocation_predicate_truth_table` (`cli_launch.rs:693+`),
 already consumed by **both** doors (WS `terminal.rs` and REST
 `terminal_tabs.rs`). There is no work in this slice and no commit.
 
-- [ ] **Verify only:**
+- [ ] **Verify only** (fully qualified path — the bare name with `--exact`
+  selects zero tests and passes vacuously, FE-R2-11; require `1 passed` in
+  the summary):
 
 ```bash
-cargo test -p freshell-platform fresh_claude_preallocation_predicate_truth_table -- --exact --nocapture
+cargo test -p freshell-platform cli_launch::tests::fresh_claude_preallocation_predicate_truth_table -- --exact --nocapture
 ```
 
 ---
@@ -1934,15 +2295,21 @@ settle inputs/spawn result as needed (`GatedSettleInputs` already carries
     is deleted by the landed failure-delete twin, now via the sink; the
     admission lease is released)
   - `immediate_exit_retires_after_atomic_publication`
-  - `natural_exit_leaves_ledger_bound` (route-level LB7; `ExplicitClose` is
+  - `natural_exit_leaves_ledger_bound_and_deletes_pending_marker`
+    (route-level LB7 + FE-R2-7: the binding stays `Bound` AND the
+    epoch-keyed pending marker is deleted on natural exit — current
+    production behavior preserved; `ExplicitClose` is
     WS-only per FE8 — no REST path may pass it, asserted by the absence of
     any `ExplicitClose` call in `terminal_tabs.rs`)
-  - `client_abort_mid_create_still_completes_settlement` (FE9: start a
-    create against a barrier-gated recording CLI, drop the HTTP
-    handler/response future mid-flight, release the barrier; assert identity
-    published, durable write completed, announcement frames enqueued, and
-    the finalization guard dropped only after settlement — the detached
-    settle task owns the guard)
+  - `client_abort_mid_create_still_completes_settlement` (FE9 + FE-R2-9:
+    start a create against a barrier-gated recording CLI, drop the HTTP
+    handler/response future mid-flight **before the announcement handoff**,
+    release the barrier; assert identity published, durable write
+    completed, the **fallback deferred-shape announcement**
+    (`terminals.changed -> terminal.meta.updated`, no `ui.command`)
+    enqueued by the settle task after it observes the dropped handoff
+    sender, and the finalization guard dropped only after settlement — the
+    detached settle task owns the guard through both phases)
   - `tab_split_and_respawn_share_the_known_identity_pipeline` (the landed
     split/respawn mint pins stay green alongside)
 
@@ -1973,10 +2340,16 @@ settle inputs/spawn result as needed (`GatedSettleInputs` already carries
      Managed-Codex planner id mismatch → 500 before spawn.
   5. `create_with_publication` with the synchronous memory-publish callback
      (`debug_assert_eq!` terminal ids); the **detached settle task** holds
-     the returned `CreateFinalizationGuard` through settlement (FE9 — never
-     the HTTP handler); exit hook calls
-     `retire_terminal_identity(id, NaturalExit)` after `finish_pty_exit`.
-     No REST code path passes `ExplicitClose` (FE8).
+     the returned `CreateFinalizationGuard` through settlement AND
+     announcement via the **two-phase settle handoff** (FE9 + FE-R2-9, per
+     Lifecycle Corrections: route → settle-task announcement-closure
+     oneshot; settle task → route enqueue-ack oneshot; dropped sender →
+     deferred-shape fallback announcement; the guard drops only after
+     phase 2) — never the HTTP handler; exit hook calls
+     `retire_terminal_identity(id, NaturalExit)` after `finish_pty_exit`
+     (completion dropped — FE-R2-8's await applies to `ExplicitClose`,
+     which has no REST path). No REST code path passes `ExplicitClose`
+     (FE8).
   6. Post-spawn awaited `persist_terminal_identity(…, Postspawn)` for every
      authorized identity (single result, no settlement aggregation).
      `persist_terminal_pending` for identityless fresh Codex/OpenCode
@@ -2042,8 +2415,10 @@ pub(crate) async fn publish_retired_signal_identity(
 ) -> SessionIdentityPublishResult;
 ```
 
-Discovered algorithm: `claim_discovered` on the admission table (cross-kind
-conflict → atomic refusal + D3 loud surface, process left running) →
+Discovered algorithm: `claim_discovered` on the admission table (any
+different-owner conflict → atomic refusal + conflict hold installed
+(FE-R2-2) + D3 loud surface, process left running; the refused terminal's
+exit hook later calls `release_conflict_hold`) →
 `authorize_terminal_identity` (live-owner first) →
 `registry.publish_running_session_identity` with the expected previous id →
 synchronous `publish_terminal_identity_memory(Live)` in its callback → on
@@ -2133,15 +2508,21 @@ git commit -m "refactor(ws): signal rebinds publish through the shared retired-a
   and provider candidate policy as REST; `registry.create_with_publication`
   + held finalization guard + shared post-spawn durability + existing origin
   `terminal.created` + shared `Created` announcement; exit hook passes
-  `NaturalExit`; `handle_kill` switches to
+  `NaturalExit` (completion dropped); `handle_kill` switches to
   `retire_terminal_identity(id, ExplicitClose)` backed by
-  `retire_closed_if_owned`. Do not change request-id dedupe, attach/adopt
-  branches, or provider launch arguments. Auto-resume pins must stay green
-  (LB7 + drift constraint: no interference with `auto_resume_cancels` or
-  settle frames).
+  `retire_closed_if_owned` **and awaits the returned
+  `TerminalRetirementCompletion` before completing (FE-R2-8 — preserving
+  today's awaited `spawn_blocking` retirement, `terminal.rs:3880-3903`),**
+  with RED test `handle_kill_awaits_ledger_retirement_before_completing`
+  (barrier-gated ledger: the kill handler must not finish while the
+  retirement job is still blocked). Do not change request-id dedupe,
+  attach/adopt branches, or provider launch arguments. Auto-resume pins
+  must stay green (LB7 + drift constraint: no interference with
+  `auto_resume_cancels` or settle frames).
 
 ```bash
 cargo test -p freshell-ws ws_known_create_publishes_through_shared_sink -- --nocapture
+cargo test -p freshell-ws handle_kill_awaits_ledger_retirement_before_completing -- --nocapture
 cargo test -p freshell-ws --test session_identity_frames
 cargo test -p freshell-ws --test live_session_ref_guard
 cargo test -p freshell-ws --test pane_ledger_triggers
@@ -2150,26 +2531,43 @@ git add crates/freshell-ws/src/terminal.rs
 git commit -m "refactor(ws): share known-create terminal identity publication"
 ```
 
-- [ ] **F5 (deferred re-authorization, LB12/FE6/FE7):** RED —
-  `unknown_legacy_resume_authorizes_late_and_publishes_via_discovered_pipeline`
-  (fake existence probe answers `Unknown`, terminal launches with a deferred
-  marker, probe flips to fresh `Present`, worker publishes; assert
-  `associated -> changed -> meta` and the published
-  `ExistenceValidatedLegacyResume` identity),
-  `stale_absent_defers_then_fresh_absent_drops_permanently` (fake probe:
-  `Absent`+stale → marker retained and requeried; `Absent`+fresh → marker
-  dropped with a structured warning), and
-  `fresh_absent_and_provider_unavailable_are_never_deferred` fail against
-  the stub worker. GREEN — implement the **bounded fresh-answer requery
-  worker** in `terminal_identity_publication.rs` over the sink's deferred
-  markers, exactly per "Deferred re-authorization" (capped backoff, ≤ 8
-  attempts, stop on the first `index_fresh: true` answer, drop-with-warning
-  on exhaustion; the fake probe drives the schedule deterministically via
+- [ ] **F5 (deferred re-authorization, LB12/FE6/FE7/FE-R2-6):** RED — the
+  five declared tests (FE-R2-12: this list is exhaustive and every focused
+  command below names one of them exactly):
+
+  1. `unknown_legacy_resume_authorizes_late_and_publishes_via_discovered_pipeline`
+     (fake existence probe answers `Unknown`, terminal launches with a
+     deferred marker, probe flips to fresh `Present`, worker publishes;
+     assert `associated -> changed -> meta` and the published
+     `ExistenceValidatedLegacyResume` identity)
+  2. `stale_absent_defers_then_fresh_absent_drops_permanently` (fake probe:
+     `Absent`+stale → marker retained and requeried; `Absent`+fresh →
+     marker dropped with a structured warning)
+  3. `fresh_absent_and_provider_unavailable_are_never_deferred`
+  4. `fresh_unknown_answers_continue_the_bounded_requery` (FE-R2-6: the
+     fake probe answers `Unknown` with `index_fresh: true` — the warm-index
+     OpenCode `Unreadable → Unknown` shape — for three attempts, then fresh
+     `Present`; the worker must NOT stop on the fresh `Unknown`s and must
+     publish on the `Present`)
+  5. `requery_exhaustion_drops_marker_with_structured_warning` (the fake
+     probe never answers conclusively — stale answers and/or fresh
+     `Unknown`s through all 8 attempts; assert the marker is dropped with
+     the structured warning and nothing publishes)
+
+  All five fail against the stub worker. GREEN — implement the **bounded
+  fresh-answer requery worker** in `terminal_identity_publication.rs` over
+  the sink's deferred markers, exactly per "Deferred re-authorization"
+  (capped backoff, ≤ 8 attempts, stop on the first **conclusive** fresh
+  answer — fresh `Unknown` continues (FE-R2-6) — drop-with-warning on
+  exhaustion; the fake probe drives the schedule deterministically via
   injected clock/attempt hooks — no sleeps); markers dropped on exit.
 
 ```bash
 cargo test -p freshell-ws unknown_legacy_resume_authorizes_late_and_publishes_via_discovered_pipeline -- --nocapture
-cargo test -p freshell-ws absent_legacy_resume_is_permanently_rejected_without_requery -- --nocapture
+cargo test -p freshell-ws stale_absent_defers_then_fresh_absent_drops_permanently -- --nocapture
+cargo test -p freshell-ws fresh_absent_and_provider_unavailable_are_never_deferred -- --nocapture
+cargo test -p freshell-ws fresh_unknown_answers_continue_the_bounded_requery -- --nocapture
+cargo test -p freshell-ws requery_exhaustion_drops_marker_with_structured_warning -- --nocapture
 cargo test -p freshell-ws --all-targets
 cargo fmt --all --check
 cargo clippy -p freshell-ws -p freshell-server --all-targets -- -D warnings
@@ -2269,11 +2667,22 @@ cargo test -p freshell-freshagent terminal_tabs::tests::degraded_durability_emit
 
   (All four declared tests are run focused — no declared/run drift.)
 
-- [ ] **Step 2 (GREEN):** `create_terminal_tab` announces after durable
-  settlement via `announce_terminal_identity`, then returns; deferred
-  delivery returns the command in the body. Split/respawn callers use the
-  same settlement announcement after their UI command; never announce inside
-  the lower spawn helper before caller bookkeeping exists.
+- [ ] **Step 2 (GREEN):** implement via the **two-phase settle handoff**
+  (FE-R2-9, per Lifecycle Corrections — this is how "the settle task holds
+  the guard through announcement" coexists with "the route builds
+  `ui.command` after the spawn helper returns" and with the
+  no-lower-helper-announcement rule): after durable settlement the settle
+  task awaits the route's announcement-closure oneshot;
+  `create_terminal_tab`, after its pane/tab bookkeeping and `ui.command`
+  construction, sends the closure and awaits the enqueue ack before
+  returning (this is what makes the Step 1 enqueue-before-return
+  assertions pass); the settle task enqueues
+  `ui.command -> terminals.changed -> terminal.meta.updated` in order,
+  acks, then drops the finalization guard. Deferred delivery sends a
+  no-`ui.command` closure and returns the command in the body. A dropped
+  sender (client abort) yields the fallback deferred-shape announcement
+  (tested in Slice E2). Split/respawn callers use the same handoff after
+  their UI command; the lower spawn helper itself never announces.
 - [ ] **Step 3 (client regression):** in `App.ws-bootstrap.test.tsx`, with
   the real store/handler/thunk/reducer/selector/rendered Sidebar, seed the
   exact incident (`sessionId = '019f9cb3-…'`,
@@ -2312,7 +2721,9 @@ no red phase required.
 
 **Files:** create `crates/freshell-ws/tests/rest_terminal_identity.rs`;
 modify `test/integration/real/coding-cli-session-contract.test.ts`; create
-`test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts`.
+`test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts`; modify
+`test/e2e-browser/playwright.config.ts` (register the new Rust-only spec —
+FE-R2-13).
 
 - [ ] **Step 1:** merged-server harness reusing the
   `rest_ws_shared_gate.rs` listener/router pattern and the real-ledger state
@@ -2370,9 +2781,14 @@ cargo test -p freshell-ws --test rest_terminal_identity -- --nocapture
   as a provider contract change.
 
 ```bash
-FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/coding-cli-session-contract.test.ts
+FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/coding-cli-session-contract.test.ts --config config/vitest/vitest.server.config.ts
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/amplifier-stub-adoption-contract.test.ts --config config/vitest/vitest.server.config.ts
 ```
+
+  (Both commands need `--config config/vitest/vitest.server.config.ts` —
+  the default `config/vitest/vitest.config.ts` **excludes**
+  `test/integration/real/**`, so without it the run selects nothing and
+  passes vacuously — FE-R2-14 and the FE-R2-11 zero-selection rule.)
 
 - [ ] **Step 7 (browser E2E):** one Rust-only Playwright spec using the fake
   provider fixtures and scratch-server conventions from
@@ -2381,7 +2797,17 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integrati
   fresh Amplifier (stub before start receipt); fresh OpenCode (no
   `--session`, locator materialization, one canonical row); spec-owned
   scratch restart; restored panes resume with the durable ids. Never
-  reference port 3002.
+  reference port 3002. **Register the spec in
+  `test/e2e-browser/playwright.config.ts` in BOTH lists (FE-R2-13):** add
+  `/rest-terminal-identity-rust\.spec\.ts$/` to the `rust-chromium`
+  project's `testMatch` allowlist (the additions block after
+  `MATRIX_SPECS`, config line ~216) — without this the
+  `--project=rust-chromium` run below selects nothing and passes vacuously
+  (the FE-R2-11 rule applies: verify the Playwright summary shows the
+  spec's tests actually ran) — **and** to the `RUST_ONLY_SPECS` list
+  (config line ~81) so the default `chromium` project's `testIgnore` (and
+  every match-all project) never picks up a spec whose
+  `e2eServerKind: 'rust'` guard fails under the fixture-default `legacy`.
 
 ```bash
 npm run test:e2e -- test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts --project=rust-chromium
@@ -2394,7 +2820,8 @@ npm run test:e2e -- test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts -
 ```bash
 git add crates/freshell-ws/tests/rest_terminal_identity.rs \
   test/integration/real/coding-cli-session-contract.test.ts \
-  test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts
+  test/e2e-browser/specs/rest-terminal-identity-rust.spec.ts \
+  test/e2e-browser/playwright.config.ts
 git commit -m "test(identity): cover REST provider identity matrix"
 ```
 
@@ -2483,7 +2910,8 @@ git log --oneline --decorate origin/main..HEAD
 - [ ] **Step 7 (report + stop):** do not push unless asked; no PR, merge,
   deploy, restart, or worktree removal. Report:
 
-  - worktree, branch, base SHA (`6147c700`), head SHA, and the fresh
+  - worktree, branch, base SHA (current `origin/main` at implementation
+    start — `c5e9fdaa` as of this revision), head SHA, and the fresh
     baseline evidence from Preflight
   - focused commits per slice
   - `gf ui` green-pin evidence (Slice I) with reference to #584's landed
@@ -2499,10 +2927,19 @@ git log --oneline --decorate origin/main..HEAD
   - the FE10 rejection-ladder evidence (400 provider mismatch, 422
     unresolved claude restore, amplifier restore-bare carve-out pin)
   - cross-kind admission barrier-test evidence (exactly-one-winner for
-    claude/codex/opencode on both doors, both orders) — this replaces the
-    old "residual race" report item, which no longer exists — plus the
-    `auto_resume` `OwnedByFreshAgent` refusal test (FE4) and the
-    `claim_discovered` owner-distinction tests (FE11)
+    claude/codex/opencode on both doors, both orders, with **exact** loser
+    error codes for both cross-kind and same-kind contention — FE-R2-3) —
+    this replaces the old "residual race" report item, which no longer
+    exists — plus the `auto_resume` `OwnedByFreshAgent` refusal test (FE4),
+    the `claim_discovered` owner-distinction tests (FE11), the
+    epoch-token/double-clear regressions
+    (`stale_epoch_clear_cannot_release_a_replacement_binding`,
+    `codex_double_clear_cannot_release_a_replacement_binding` — FE-R2-1),
+    and the poisoned-key conflict-hold tests
+    (`poisoned_key_stays_closed_after_owner_exit_until_hold_released` and
+    the barrier-level
+    `refused_discovery_keeps_key_closed_until_refused_process_exits` —
+    FE-R2-2)
   - the D5 legacy-WS removal evidence (reject + plain-shell-allowed tests)
   - provider matrix outcomes; OpenCode no-preallocation evidence/version;
     pinned amplifier contract version and the key-gated skip status
@@ -2527,14 +2964,25 @@ git log --oneline --decorate origin/main..HEAD
 2. **Cross-kind admission is atomic:** one `SessionAdmission` table admits
    terminal and fresh-agent creates; barrier-synchronized tests prove
    exactly-one-winner and exactly-one-writer for claude, codex, and opencode
-   on both doors (WS and REST), in both interleaving orders, with
-   deterministic loser errors (REST 409 `RESTORE_UNAVAILABLE`, WS
-   `RESTORE_UNAVAILABLE` frame, fresh-agent `SESSION_RESERVED` retryable).
+   on both doors (WS and REST), in both interleaving orders, with **exact**
+   per-door, per-contention-kind loser errors (cross-kind: REST 409
+   `RESTORE_UNAVAILABLE`, WS `RESTORE_UNAVAILABLE` frame, fresh-agent
+   `SESSION_RESERVED` retryable; same-kind WS terminal contention keeps the
+   existing D8 `SESSION_RESERVED` frame — FE-R2-3, distinguished via the
+   exposed holder kind). Every binding carries a table-minted
+   `AdmissionEpoch` and every cleanup call presents it, so stale cleanup —
+   including the codex watcher/`handle_kill` double clear — can never
+   release a replacement owner's binding (FE-R2-1, regression-tested at
+   table and facade level).
    The previously deterministic REST-door two-writer hole has a direct
    regression test. No residual race is recorded or accepted.
-3. A retroactively discovered identity that collides cross-kind is refused
-   atomically with an invariant log and a user-visible error; the running
-   process is never auto-killed.
+3. A retroactively discovered identity that collides — same kind or cross
+   kind — is refused atomically with an invariant log and a user-visible
+   error; the running process is never auto-killed, **and the refusal
+   installs a conflict hold that keeps the session key closed until the
+   refused process exits (FE-R2-2)** — the original owner's exit alone never
+   frees a key that a refused writer is still using (poisoned-key retry
+   proven in the barrier suite).
 4. Legacy (non-negotiated) WS connections can no longer perform
    session-carrying `terminal.create` (deterministic `ProtocolMismatch`
    error instructing a refresh); plain-shell creates on legacy connections
@@ -2578,7 +3026,11 @@ git log --oneline --decorate origin/main..HEAD
     resurrect stale identity.
 12. Durable rows become `Closed` only on explicit user kill — the WS
     `terminal.kill` door exclusively (FE8; no REST close/kill door exists or
-    is added); natural exit, auto-resume settlement, and graceful shutdown
+    is added), and `handle_kill` **awaits** the retirement completion before
+    completing, preserving today's awaited ledger retirement (FE-R2-8);
+    epoch-keyed pending markers are deleted on **every** exit cause
+    (FE-R2-7 — the landed binder's natural-exit pending cleanup is
+    preserved); natural exit, auto-resume settlement, and graceful shutdown
     leave rows `Bound` (auto-resume e2e pins stay green); all delayed
     cleanup is epoch-conditional and cannot erase a replacement owner; the
     retired OpenCode missing-row rebind lane still works after explicit
@@ -2596,7 +3048,9 @@ git log --oneline --decorate origin/main..HEAD
     eventual one-key convergence; handshake-inventory resync is the
     documented recovery invariant.
 16. Focused, workspace, contract, lint, coordinated JS, and Rust-browser E2E
-    gates pass on the fresh `6147c700` baseline; the landed #584 pins
+    gates pass on the fresh baseline taken on current `origin/main` at
+    implementation start (`c5e9fdaa` as of this revision); the landed #584
+    pins
     (`rest_claude_identity.rs`, `rest_locator_identity.rs`,
     `pane_ledger_restore.rs`) stay green (with any deliberate raw-id
     rescope recorded); the `PaneIdentityBinder` module/trait/wiring are
