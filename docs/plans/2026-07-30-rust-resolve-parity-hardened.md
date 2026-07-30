@@ -1,0 +1,1749 @@
+# Rust Resolve-Session Parity with the Hardened (#586) Resume Contract — Implementation Plan
+
+> **For agentic workers:** This plan is executed task-by-task by the
+> workflow's execute stage: a fresh implementer per task, with a spec +
+> quality review after each task. Steps use checkbox (`- [ ]`) syntax
+> for tracking.
+
+**Goal:** Bring the existing, rebased 16-commit Rust resolve-parity foundation (branch `feat/rust-resolve-parity`) up to the HARDENED resume contract that landed on main in PR #586 (merge `f903e8a6`), so the Rust `POST /api/sessions/resolve` is wire- and behavior-identical to the hardened Node implementation.
+
+**Architecture:** This is an ADOPT-AND-EXTEND delta, not a rebuild. The rebase onto `f903e8a6` is already done (merge-base verified == `f903e8a6`); conflicts were resolved favoring main's hardened TS. The Node code AT THIS WORKTREE'S HEAD is therefore the authoritative truth to mirror: `shared/resume-resolve-contract.ts`, `shared/resume-input-parser.ts`, `server/coding-cli/resolve-session.ts`, `server/coding-cli/resolve-fallbacks.ts`, `server/coding-cli/providers/opencode-by-id-query.ts`, `server/sessions-router.ts` (lines 255–316). The Rust side to extend: `crates/freshell-sessions/src/{resume_input.rs,resume_resolve.rs}`, `crates/freshell-sessions/src/parse/opencode.rs`, `crates/freshell-sessions/src/directory_index.rs`, `crates/freshell-server/src/resolve.rs`, `crates/freshell-server/src/main.rs`. The cross-language fixture `test/fixtures/resume-input/parser-cases.json` is the anti-drift keystone: it gets EXTENDED to the hardened parser behavior and BOTH implementations must pass it (the rebase silently dropped the TS side's fixture consumption — Task 2 restores it).
+
+**Tech Stack:** Rust (axum, serde with `preserve_order`, rusqlite, regex, tokio), TypeScript (Node server, zod 4.3.6, vitest), Playwright e2e matrix (legacy-chromium + rust-chromium).
+
+## Global Constraints
+
+- NEVER touch ports 3001/3002 or any process you did not spawn (production server + live tabs run there). All server testing on ephemeral ports with throwaway HOMEs. Repeat this constraint to any subagent you dispatch.
+- The MAIN checkout `/home/dan/code/freshell` has ~15 dirty files + untracked files from OTHER live sessions — never stage, stash, clean, or modify them. ALL work happens in the worktree `/home/dan/code/freshell/.worktrees/rust-resolve-parity` on branch `feat/rust-resolve-parity`.
+- TS imports use NodeNext ESM: relative imports carry the `.js` extension.
+- Coordinated tests: run `npm run test:status` before any broad vitest run; use `npm run test:vitest -- --config <config> <paths> --run` for focused runs; `cargo test -p <crate>` for Rust.
+- Conventional commits, focused and atomic, each with the Amplifier footer:
+
+  ```
+  🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+  Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>
+  ```
+
+- Wire-shape parity constants (copy these EXACT values): `RESOLVE_MATCH_CAP = 20`, `MAX_RESUME_CANDIDATES = 8`, `FALLBACK_BUDGET_PER_REQUEST = 2`, opencode by-id busy timeout `500` ms, known resume providers `["claude", "codex", "opencode", "amplifier"]`, scan-failure message literal `"session scan failed"`.
+- `serde_json` has `preserve_order` enabled workspace-wide: struct field order IS wire key order. Field order in Rust wire structs must match the Node object literals.
+- README.md is the only end-user markdown doc; this plan and the SYNC-06 checklist/spec under `docs/plans/` are working/agent docs.
+- Branch may be pushed to origin at the end (Task 7). NO pull request without explicit user approval.
+
+---
+
+### Task 1: Verify post-rebase reality and adopt the spec doc
+
+The rebase resolved TS conflicts favoring main's hardened semantics. Before changing anything, pin down what actually compiles and passes NOW — the failures and drift found here are the worklist the later tasks close. Also commit the SYNC-06 spec doc that is sitting untracked in the worktree.
+
+**Files:**
+- Commit (already present, untracked): `docs/plans/2026-07-29-rust-resolve-parity-spec.md`
+- No source changes in this task.
+
+**Interfaces:**
+- Consumes: the rebased worktree at `feat/rust-resolve-parity` (merge-base == `f903e8a6`).
+- Produces: a verified baseline (recorded in the commit message body) that later tasks rely on: cargo workspace state, which resume suites pass, and the confirmed drift findings listed below.
+
+- [ ] **Step 1: Confirm worktree identity and cleanliness**
+
+Run:
+```bash
+cd /home/dan/code/freshell/.worktrees/rust-resolve-parity
+git branch --show-current && git merge-base HEAD f903e8a6f5e2e0e926890e38c28e775776fec7de && git status --porcelain
+```
+Expected: branch `feat/rust-resolve-parity`; merge-base prints `f903e8a6f5e2e0e926890e38c28e775776fec7de`; the ONLY status line is `?? docs/plans/2026-07-29-rust-resolve-parity-spec.md`. If there are OTHER dirty files or lock files, STOP and surface it — the worktree is not idle.
+
+- [ ] **Step 2: Rust baseline**
+
+Run (from the worktree root):
+```bash
+cargo test -p freshell-sessions -p freshell-server 2>&1 | tail -20
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -5
+```
+Expected: all tests pass and fmt/clippy are clean. The Rust side compiled at the old base and the rebase touched no Rust files' dependencies, so a failure here means the rebase broke something — investigate before proceeding (do not "fix forward" blind).
+
+- [ ] **Step 3: TS baseline for the resume suites**
+
+Run:
+```bash
+npm run test:status
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/resolve-session.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts test/integration/server/sessions-resolve-router.test.ts --run
+```
+Expected: ALL PASS (these are main's hardened tests, untouched by the branch).
+
+- [ ] **Step 4: Confirm the drift findings (read, don't fix — fixes are Tasks 2–6)**
+
+Verify each of these against the code; they are the delta worklist:
+1. `test/unit/shared/resume-input-parser.test.ts` does NOT read `test/fixtures/resume-input/parser-cases.json` (the rebase kept main's inline version) — the anti-drift keystone is broken on the TS side even though both suites are green.
+2. `crates/freshell-sessions/src/resume_input.rs` still has the generic `[a-z]{2,10}_[0-9A-Za-z]{8,40}` prefixed-id regex and NO candidate cap; the hardened TS parser (`shared/resume-input-parser.ts:29,37`) has the known-family regex and `MAX_RESUME_CANDIDATES = 8`.
+3. `crates/freshell-sessions/src/resume_resolve.rs` has status `Ready|Warming` only (no `Degraded`), no `providerErrors`, lowercases ALL tokens (ses_ ids must be case-SENSITIVE), does not exclude subagents from prefix discovery, runs the index pass for ALL tokens before ANY fallback (hardened order is per-token exact → fallback → prefix), has no fallback shape gates or per-request budget, and maps fallback read errors to a silent miss (the incident class).
+4. `crates/freshell-sessions/src/parse/opencode.rs::opencode_session_directory_by_id` is the OLD #583 parent-walk; hardened Node (`opencode-by-id-query.ts`) is a direct by-id row query (archived + child sessions included, full row returned, errors PROPAGATE).
+5. `crates/freshell-server/src/resolve.rs` response is `{status, matches, hint}` only; hardened wire adds `providerErrors`, `unsearchedProviders`, `homeDir` (`server/sessions-router.ts:306-314`), plus scan-failure merge, disabled-provider reporting, and degraded fire-and-forget refresh.
+
+- [ ] **Step 5: Commit the spec doc (with the baseline recorded in the body)**
+
+```bash
+git add docs/plans/2026-07-29-rust-resolve-parity-spec.md
+git commit -m "docs: adopt SYNC-06 rust resolve parity spec into the worktree
+
+Post-rebase baseline (onto f903e8a6): cargo -p freshell-sessions -p
+freshell-server green, fmt+clippy clean; hardened TS resume suites green;
+confirmed delta: TS parser test no longer consumes the shared fixture,
+rust parser/resolver/by-id/wire still implement pre-#586 semantics.
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 2: Extend the shared parser fixture to the hardened parser; both parsers pass it
+
+The fixture table is the anti-drift mechanism. Extend it to the hardened TS parser's behavior, restore fixture consumption on the TS side, and port the hardened parser rules (known-family prefix regex, candidate cap 8) to Rust. One task because the fixture change necessarily goes red on one side until both parsers agree — the task is done only when BOTH suites are green against the SAME table.
+
+**Files:**
+- Modify: `test/fixtures/resume-input/parser-cases.json`
+- Rewrite: `test/unit/shared/resume-input-parser.test.ts`
+- Modify: `crates/freshell-sessions/src/resume_input.rs`
+- Existing (unchanged): `crates/freshell-sessions/tests/resume_input_parser_parity.rs` (already fixture-driven)
+
+**Interfaces:**
+- Consumes: `parseResumeInput` / `parse_resume_input` as they exist today.
+- Produces: `pub const MAX_RESUME_CANDIDATES: usize = 8` exported from `crates/freshell-sessions/src/resume_input.rs` (Task 3's core relies on the parser capping candidates; nothing else changes in the parser's public signature). TS `MAX_RESUME_CANDIDATES` already exists.
+
+- [ ] **Step 1: Rewrite the TS test to be fixture-driven (this is the failing test)**
+
+Replace the ENTIRE contents of `test/unit/shared/resume-input-parser.test.ts` with:
+
+```ts
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { describe, expect, it } from 'vitest'
+import { parseResumeInput, MAX_RESUME_CANDIDATES } from '@shared/resume-input-parser'
+
+interface FixtureCase {
+  name: string
+  input: string
+  candidates: Array<{ token: string; kind: string }>
+  hint: { provider: string; source: string } | null
+}
+
+const fixturePath = fileURLToPath(
+  new URL('../../fixtures/resume-input/parser-cases.json', import.meta.url),
+)
+const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as { cases: FixtureCase[] }
+
+describe('parseResumeInput — shared cross-language fixture (SYNC-06 anti-drift)', () => {
+  it('fixture is non-trivial', () => {
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(31)
+  })
+
+  it.each(fixture.cases.map((c) => [c.name, c] as const))('%s', (_name, testCase) => {
+    const parsed = parseResumeInput(testCase.input)
+    expect(parsed.candidates).toEqual(testCase.candidates)
+    expect(parsed.hint).toEqual(testCase.hint)
+  })
+})
+
+describe('parseResumeInput — TS-only invariants', () => {
+  // The cap VALUE is part of the server work-budget contract; the capping
+  // BEHAVIOR is pinned by the fixture's cap case in both languages.
+  it('MAX_RESUME_CANDIDATES is 8', () => {
+    expect(MAX_RESUME_CANDIDATES).toBe(8)
+  })
+})
+```
+
+- [ ] **Step 2: Run it — expect FAIL (proves the keystone pins the TS parser again)**
+
+Run: `npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run`
+Expected: FAIL on exactly one case — `non-ses prefixed id yields no id-shape hint` (`abc_12345678`): the hardened TS parser rejects unknown `abc_` families, so it returns NO candidates while the stale fixture expects one. Every other case passes.
+
+- [ ] **Step 3: Update the fixture to the hardened parser's behavior**
+
+In `test/fixtures/resume-input/parser-cases.json`:
+
+3a. REPLACE the case named `"non-ses prefixed id yields no id-shape hint"` (the `abc_12345678` one) with:
+
+```json
+    {
+      "name": "arbitrary snake_case prefix is not a known id family",
+      "input": "abc_12345678",
+      "candidates": [],
+      "hint": null
+    },
+```
+
+3b. APPEND these cases before the closing `]` (after the `"claude -rf ..."` case, adding a comma to that case's closing brace):
+
+```json
+    {
+      "name": "arbitrary snake_case identifiers never match",
+      "input": "my_function123 snake_casedword9",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "known thread_ id family",
+      "input": "thread_abc123456",
+      "candidates": [{ "token": "thread_abc123456", "kind": "prefixed-id" }],
+      "hint": null
+    },
+    {
+      "name": "known task_ id family with a long 46-char suffix",
+      "input": "task_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3",
+      "candidates": [
+        { "token": "task_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3", "kind": "prefixed-id" }
+      ],
+      "hint": null
+    },
+    {
+      "name": "candidates are capped at 8 (server work budget)",
+      "input": "417e83450a00 417e83450a01 417e83450a02 417e83450a03 417e83450a04 417e83450a05 417e83450a06 417e83450a07 417e83450a08 417e83450a09 417e83450a10 417e83450a11",
+      "candidates": [
+        { "token": "417e83450a00", "kind": "hex-prefix" },
+        { "token": "417e83450a01", "kind": "hex-prefix" },
+        { "token": "417e83450a02", "kind": "hex-prefix" },
+        { "token": "417e83450a03", "kind": "hex-prefix" },
+        { "token": "417e83450a04", "kind": "hex-prefix" },
+        { "token": "417e83450a05", "kind": "hex-prefix" },
+        { "token": "417e83450a06", "kind": "hex-prefix" },
+        { "token": "417e83450a07", "kind": "hex-prefix" }
+      ],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    }
+```
+
+(Verification notes for the case authors above, against `shared/resume-input-parser.ts`: `thread_abc123456` has an 9-char suffix within `{8,64}` and no agent word → prefixed-id candidate, no `ses_` prefix → hint null. The 46-char `task_` suffix is within `{8,64}` and beyond the OLD Rust regex's 40 cap. The 12 hex tokens are equal-length so the stable length sort keeps text order; the cap keeps the first 8; top candidate is a hex-prefix → amplifier id-shape hint.)
+
+- [ ] **Step 4: Run the TS suite — expect PASS**
+
+Run: `npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run`
+Expected: PASS (all fixture cases + TS-only invariants).
+
+- [ ] **Step 5: Run the Rust parity suite — expect FAIL (the fixture now leads the Rust parser)**
+
+Run: `cargo test -p freshell-sessions --test resume_input_parser_parity`
+Expected: FAIL on `arbitrary snake_case prefix is not a known id family` (old generic regex still matches `abc_12345678`), `arbitrary snake_case identifiers never match`, `known task_ id family with a long 46-char suffix` (old regex caps the suffix at 40), and `candidates are capped at 8` (no cap yet).
+
+- [ ] **Step 6: Port the hardened parser rules to Rust**
+
+In `crates/freshell-sessions/src/resume_input.rs`:
+
+6a. Replace the `PREFIXED_ID_RE` definition (and its comment) with:
+
+```rust
+// Known xxx_-prefixed id families only (ses_ + 26 base62 is opencode's,
+// first-class). Arbitrary snake_case identifiers must NOT match: they would
+// rank FIRST and waste resolver passes on non-ids. Mirrors
+// `shared/resume-input-parser.ts:37`.
+static PREFIXED_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?-u:\b)(?:ses|sess|session|thread|thr|run|msg|task|amp)_[0-9A-Za-z]{8,64}(?-u:\b)")
+        .expect("static regex")
+});
+```
+
+6b. Add the cap constant right below the type definitions (near `ResumeInputParse`):
+
+```rust
+/// Work budget: candidates are capped so one pasted blob can never trigger
+/// unbounded server-side scans/DB lookups in the resolve endpoint.
+/// Mirrors `MAX_RESUME_CANDIDATES` (`shared/resume-input-parser.ts:29`).
+pub const MAX_RESUME_CANDIDATES: usize = 8;
+```
+
+6c. In `parse_resume_input`, replace the final two lines
+
+```rust
+    let hint = derive_hint(&sanitized, &candidates);
+    ResumeInputParse { candidates, hint }
+```
+
+with:
+
+```rust
+    // Cap = work budget: bounds resolver scans + exact-id fallback lookups
+    // per request. The hint derives from the CAPPED list (TS parity:
+    // `deriveHint(sanitized, capped)`).
+    candidates.truncate(MAX_RESUME_CANDIDATES);
+    let hint = derive_hint(&sanitized, &candidates);
+    ResumeInputParse { candidates, hint }
+```
+
+Also update the doc comment on the `candidates` field of `ResumeInputParse` to say "capped at `MAX_RESUME_CANDIDATES`".
+
+- [ ] **Step 7: Run both sides — expect PASS**
+
+Run:
+```bash
+cargo test -p freshell-sessions --test resume_input_parser_parity
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run
+```
+Expected: both PASS. Also run `cargo test -p freshell-sessions` and `cargo test -p freshell-server` — expect PASS (the old resolver consumes the parser output shape unchanged; if a resolver test relied on >8 candidates, fix the TEST input, not the cap).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add test/fixtures/resume-input/parser-cases.json test/unit/shared/resume-input-parser.test.ts crates/freshell-sessions/src/resume_input.rs
+git commit -m "feat(sessions): align resume-input parser to hardened #586 rules via the shared fixture
+
+Fixture extended to the hardened parser (known-family prefix regex,
+MAX_RESUME_CANDIDATES=8 cap); TS test restored to fixture-driven form
+(the rebase had kept main's inline version, silently unpinning the
+keystone); Rust parser ported to the same rules. Both suites pass the
+same table. (SYNC-06)
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 3: Hardened resolve core — ranking, case rules, subagents, sessionType default, provider-health channel, budgeted fallbacks
+
+Rewrite `crates/freshell-sessions/src/resume_resolve.rs` as a step-for-step port of the HARDENED `server/coding-cli/resolve-session.ts` + the budget/shape-gate logic of `resolve-fallbacks.ts`. This is the core of the delta.
+
+**Files:**
+- Rewrite: `crates/freshell-sessions/src/resume_resolve.rs`
+- Rewrite: `crates/freshell-sessions/tests/resume_resolve.rs` (mirror the hardened `test/unit/server/coding-cli/resolve-session.test.ts`)
+- Modify (compile only): `crates/freshell-server/src/resolve.rs` — minimal adaptation so the workspace compiles; the full wire upgrade is Task 6.
+
+**Interfaces:**
+- Consumes: `parse_resume_input` + `MAX_RESUME_CANDIDATES` (Task 2), `IndexedSession` (`directory_index.rs`, has `is_subagent: bool`, `key() -> "{provider}:{session_id}"`).
+- Produces (Tasks 4 and 6 depend on these EXACT names):
+  - `pub enum ResumeResolveStatus { Ready, Warming, Degraded }` (serde lowercase)
+  - `pub struct ResumeResolveProviderError { pub provider: String, pub code: Option<String>, pub message: Option<String> }` (camelCase wire, `code`/`message` omitted when `None`)
+  - `pub struct ProviderFailure { pub code: Option<String>, pub message: String }`
+  - `pub struct ClaudeTranscriptHit { pub session_id: String, pub cwd: Option<String> }` (unchanged)
+  - `pub struct OpencodeByIdHit { pub session_id: String, pub cwd: Option<String>, pub title: Option<String>, pub last_activity_at: Option<i64> }`
+  - `pub struct ResolveDeps<'a>` with fallback fields typed `Option<&'a (dyn Fn(&str) -> Result<Option<...Hit>, ProviderFailure> + Send + Sync)>`
+  - `pub struct ResumeResolveOutcome { pub status: ResumeResolveStatus, pub matches: Vec<ResumeResolveMatch>, pub hint: Option<ResumeHint>, pub provider_errors: Vec<ResumeResolveProviderError> }`
+  - `pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolveOutcome`
+  - `pub const RESOLVE_MATCH_CAP: usize = 20;` and `pub const FALLBACK_BUDGET_PER_REQUEST: usize = 2;`
+  - The old `ResumeResolveResponse` struct is DELETED from this module (the wire response moves to `resolve.rs` in Task 6).
+
+- [ ] **Step 1: Write the failing tests (rewrite `crates/freshell-sessions/tests/resume_resolve.rs`)**
+
+Mirror the hardened Node core suite `test/unit/server/coding-cli/resolve-session.test.ts` test-for-test (25 tests; read it side-by-side while writing). Start the file with this header and helpers:
+
+```rust
+//! SYNC-06 logic-parity mirror of the HARDENED Node core suite
+//! `test/unit/server/coding-cli/resolve-session.test.ts` (post-#586),
+//! test-for-test. The HTTP wire (auth/validation/router merge) is pinned in
+//! `crates/freshell-server/src/resolve.rs`.
+
+use std::collections::HashMap;
+
+use freshell_sessions::directory_index::IndexedSession;
+use freshell_sessions::resume_resolve::{
+    resolve_resume_input, ClaudeTranscriptHit, OpencodeByIdHit, ProviderFailure, ResolveDeps,
+    ResumeResolveOutcome, ResumeResolveStatus, RESOLVE_MATCH_CAP,
+};
+
+const CLAUDE_ID: &str = "ed2afda6-a340-443e-ba60-024a1b3554b4";
+const OTHER_UUID: &str = "aaaaaaaa-1111-4222-8333-444444444444";
+const SES_ID: &str = "ses_root0000000000000000000000";
+
+fn session(provider: &str, id: &str, last: i64) -> IndexedSession {
+    IndexedSession {
+        session_id: id.to_string(),
+        provider: provider.to_string(),
+        project_path: format!("/repo/{provider}"),
+        title: Some(format!("{provider} title")),
+        summary: None,
+        first_user_message: Some("hello".to_string()),
+        last_activity_at: last,
+        created_at: None,
+        cwd: Some(format!("/repo/{provider}")),
+        is_subagent: false,
+        is_non_interactive: false,
+        source_file: None,
+    }
+}
+
+fn resolve(
+    input: &str,
+    sessions: Option<&[IndexedSession]>,
+    claude: Option<&(dyn Fn(&str) -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> + Send + Sync)>,
+    opencode: Option<&(dyn Fn(&str) -> Result<Option<OpencodeByIdHit>, ProviderFailure> + Send + Sync)>,
+) -> ResumeResolveOutcome {
+    let session_types: HashMap<String, String> = HashMap::new();
+    resolve_resume_input(
+        input,
+        &ResolveDeps {
+            sessions,
+            session_types: &session_types,
+            locate_claude_transcript: claude,
+            opencode_session_by_id: opencode,
+        },
+    )
+}
+```
+
+Then write the tests. The COMPLETE code for the tests covering NEW hardened behavior (write these verbatim); for behaviors that already had a green mirror test in the old file (exact-wins-over-prefix, priority order of candidates, cap-20, dedupe-most-recent, warming, ready-empty, hint-alongside-evidence), carry the old test bodies over, adapting only the deps construction to the `resolve(...)` helper above and expected `session_type` values per the new default rule (index matches now ALWAYS carry `sessionType`, defaulting to the provider name):
+
+```rust
+#[test]
+fn ses_ids_are_case_sensitive_a_case_variant_does_not_match() {
+    let sessions = vec![session("opencode", SES_ID, 100)];
+    let variant = SES_ID.to_uppercase().replace("SES_", "ses_");
+    let out = resolve(&variant, Some(&sessions), None, None);
+    assert_eq!(out.status, ResumeResolveStatus::Ready);
+    // Not exact — but it IS a prefix miss too (different chars), so empty.
+    assert!(out.matches.is_empty());
+}
+
+#[test]
+fn exact_id_match_is_case_insensitive_for_uuid_hex_tokens() {
+    let sessions = vec![session("claude", CLAUDE_ID, 100)];
+    let out = resolve(&CLAUDE_ID.to_uppercase(), Some(&sessions), None, None);
+    assert_eq!(out.matches.len(), 1);
+    assert_eq!(out.matches[0].match_kind, freshell_sessions::resume_resolve::ResumeMatchKind::Exact);
+}
+
+#[test]
+fn an_exact_id_finds_a_subagent_child_session() {
+    let mut child = session("claude", CLAUDE_ID, 100);
+    child.is_subagent = true;
+    let out = resolve(CLAUDE_ID, Some(&[child]), None, None);
+    assert_eq!(out.matches.len(), 1);
+}
+
+#[test]
+fn prefix_discovery_does_not_surface_subagent_sessions() {
+    let mut child = session("claude", CLAUDE_ID, 100);
+    child.is_subagent = true;
+    let top = session("claude", "ed2afda6-a340-443e-ba60-024a1b3554b5", 90);
+    let out = resolve("ed2afda6", Some(&[child, top]), None, None);
+    assert_eq!(out.matches.len(), 1);
+    assert_eq!(out.matches[0].session_id, "ed2afda6-a340-443e-ba60-024a1b3554b5");
+}
+
+#[test]
+fn session_type_defaults_to_the_provider_name_when_the_overlay_has_none() {
+    let sessions = vec![session("claude", CLAUDE_ID, 100)];
+    let out = resolve(CLAUDE_ID, Some(&sessions), None, None);
+    assert_eq!(out.matches[0].session_type.as_deref(), Some("claude"));
+}
+
+#[test]
+fn an_exact_fallback_hit_beats_an_indexed_prefix_match_of_the_same_token() {
+    // Index holds a session whose id merely STARTS WITH the pasted full id.
+    let longer = session("claude", &format!("{CLAUDE_ID}0"), 100);
+    let hits = |id: &str| -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> {
+        Ok(Some(ClaudeTranscriptHit { session_id: id.to_ascii_lowercase(), cwd: Some("/repo/x".into()) }))
+    };
+    let out = resolve(CLAUDE_ID, Some(&[longer]), Some(&hits), None);
+    assert_eq!(out.matches.len(), 1);
+    assert_eq!(out.matches[0].session_id, CLAUDE_ID);
+    assert_eq!(out.matches[0].provider, "claude");
+}
+
+#[test]
+fn a_fallback_exact_hit_for_a_higher_priority_token_beats_an_indexed_exact_of_a_lower_one() {
+    // Candidate order: ses_ (prefixed) outranks the uuid. The ses_ id resolves
+    // only via the opencode fallback; the uuid has an indexed exact hit.
+    let indexed = vec![session("claude", CLAUDE_ID, 100)];
+    let oc = |id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        Ok(Some(OpencodeByIdHit { session_id: id.to_string(), cwd: Some("/repo/oc".into()), title: None, last_activity_at: None }))
+    };
+    let out = resolve(&format!("{SES_ID} {CLAUDE_ID}"), Some(&indexed), None, Some(&oc));
+    assert_eq!(out.matches.len(), 1);
+    assert_eq!(out.matches[0].provider, "opencode");
+    assert_eq!(out.matches[0].session_id, SES_ID);
+}
+
+#[test]
+fn a_failing_fallback_never_fails_the_resolve_it_degrades_with_a_provider_error() {
+    let broken = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        Err(ProviderFailure { code: Some("SQLITE_CANTOPEN".into()), message: "unable to open database file".into() })
+    };
+    let out = resolve(SES_ID, Some(&[]), None, Some(&broken));
+    assert_eq!(out.status, ResumeResolveStatus::Degraded);
+    assert!(out.matches.is_empty());
+    assert_eq!(out.provider_errors.len(), 1);
+    assert_eq!(out.provider_errors[0].provider, "opencode");
+    assert_eq!(out.provider_errors[0].code.as_deref(), Some("SQLITE_CANTOPEN"));
+    assert_eq!(out.provider_errors[0].message.as_deref(), Some("unable to open database file"));
+}
+
+#[test]
+fn a_failed_fallback_does_not_hide_a_later_lower_priority_match_but_marks_degraded() {
+    // ses_ token fails in the fallback; the later hex token prefix-matches the index.
+    let indexed = vec![session("amplifier", "417e8345aaaa", 50)];
+    let broken = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        Err(ProviderFailure { code: None, message: "locked".into() })
+    };
+    let out = resolve(&format!("{SES_ID} 417e8345"), Some(&indexed), None, Some(&broken));
+    assert_eq!(out.status, ResumeResolveStatus::Degraded);
+    assert_eq!(out.matches.len(), 1);
+    assert_eq!(out.matches[0].session_id, "417e8345aaaa");
+    assert_eq!(out.provider_errors[0].provider, "opencode");
+}
+
+#[test]
+fn a_healthy_resolve_reports_no_provider_errors_and_stays_ready() {
+    let sessions = vec![session("claude", CLAUDE_ID, 100)];
+    let out = resolve(CLAUDE_ID, Some(&sessions), None, None);
+    assert_eq!(out.status, ResumeResolveStatus::Ready);
+    assert!(out.provider_errors.is_empty());
+}
+
+#[test]
+fn shape_gates_wrong_shape_tokens_do_no_fallback_work() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let counting = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    };
+    // "ses_short001" matches the parser's prefixed-id family but NOT the
+    // full-id shape ^ses_[0-9a-zA-Z]{26}$ — the fallback must not run.
+    let out = resolve("ses_short001", Some(&[]), None, Some(&counting));
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(out.status, ResumeResolveStatus::Ready);
+}
+
+#[test]
+fn fallback_work_is_budgeted_to_two_calls_per_request_per_provider() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let counting = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    };
+    // Four full-shape ses_ ids in one paste: only the first TWO may do work.
+    let ids = [
+        "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ses_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "ses_cccccccccccccccccccccccccc",
+        "ses_dddddddddddddddddddddddddd",
+    ];
+    let _ = resolve(&ids.join(" "), Some(&[]), None, Some(&counting));
+    assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn wrong_shape_tokens_consume_no_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let counting = |_id: &str| -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    };
+    // Two ses_ tokens (wrong shape for claude) then a valid uuid: the uuid
+    // must still reach the claude fallback (shape gate runs BEFORE budget).
+    let input = format!("ses_aaaaaaaaaaaaaaaaaaaaaaaaaa ses_bbbbbbbbbbbbbbbbbbbbbbbbbb {OTHER_UUID}");
+    let _ = resolve(&input, Some(&[]), Some(&counting), None);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn opencode_fallback_hit_carries_title_and_floored_last_activity() {
+    let oc = |id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
+        Ok(Some(OpencodeByIdHit {
+            session_id: id.to_string(),
+            cwd: Some("/repo/beta".into()),
+            title: Some("beta work".into()),
+            last_activity_at: Some(1234),
+        }))
+    };
+    let out = resolve(SES_ID, Some(&[]), None, Some(&oc));
+    let m = &out.matches[0];
+    assert_eq!(m.provider, "opencode");
+    assert_eq!(m.title.as_deref(), Some("beta work"));
+    assert_eq!(m.last_activity_at, Some(1234));
+    assert_eq!(m.session_type.as_deref(), Some("opencode"));
+}
+
+#[test]
+fn provider_identity_travels_with_the_fallback_not_its_position() {
+    // BOTH fallbacks present; only claude's fails on a uuid token.
+    let broken_claude = |_id: &str| -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> {
+        Err(ProviderFailure { code: Some("EACCES".into()), message: "denied".into() })
+    };
+    let quiet_oc = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> { Ok(None) };
+    let out = resolve(OTHER_UUID, Some(&[]), Some(&broken_claude), Some(&quiet_oc));
+    assert_eq!(out.provider_errors.len(), 1);
+    assert_eq!(out.provider_errors[0].provider, "claude");
+    assert_eq!(out.provider_errors[0].code.as_deref(), Some("EACCES"));
+}
+```
+
+Also carry over (adapted) the pre-existing tests for: warming when `sessions: None` (assert `provider_errors` empty), ready-empty for garbage input, exact-beats-prefix same token, candidate priority order, ambiguous prefix most-recent-first capped at `RESOLVE_MATCH_CAP` (build 25 sessions with a shared prefix, assert 20 back, sorted by `last_activity_at` desc), and dedupe-most-recent (two entries same `(provider, session_id)`, different `last_activity_at`).
+
+- [ ] **Step 2: Run — expect compile FAILURE (new API does not exist yet)**
+
+Run: `cargo test -p freshell-sessions --test resume_resolve`
+Expected: compile errors (`OpencodeByIdHit`, `ProviderFailure`, `ResumeResolveOutcome`, `Degraded` unknown).
+
+- [ ] **Step 3: Rewrite `crates/freshell-sessions/src/resume_resolve.rs`**
+
+Replace the whole file with (keep the existing module doc, updating its second paragraph to note the hardened contract):
+
+```rust
+//! Rust port of the HARDENED (#586) `server/coding-cli/resolve-session.ts` +
+//! the shape-gate/budget logic of `resolve-fallbacks.ts` — the resume-by-id
+//! resolve core. Pure and synchronous: the HTTP layer
+//! (`crates/freshell-server/src/resolve.rs`) supplies the index snapshot, the
+//! sessionType overlay map, and the two exact-id fallback closures, then
+//! merges router-level fields (scan failures, unsearchedProviders, homeDir)
+//! and serializes.
+//!
+//! Wire parity notes:
+//! - Field ORDER in `ResumeResolveMatch` matches the Node object literals —
+//!   `serde_json` `preserve_order` + struct field order drive output order.
+//! - Optional match fields are OMITTED when `None` (Node drops `undefined`);
+//!   `hint` is `null` when absent (zod `.nullable()`), so NOT skip-serialized.
+//! - Per-token resolution order (resolve-session.ts:56-70): exact index hits
+//!   (ALL sessions, subagents included) → exact-id fallbacks → prefix
+//!   discovery (top-level only). A prefix match must NEVER outrank any exact
+//!   resolution of the same or a higher-priority token.
+//! - UUID/hex-family tokens (hex digits + dashes only) match
+//!   case-INSENSITIVELY; everything else — notably ses_ base62 ids — matches
+//!   case-SENSITIVELY (base62 case-folding could resolve the WRONG session).
+//! - Provider failure ≠ not found: a failing fallback records a per-provider
+//!   error and the result becomes `degraded` — never a silent empty miss.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::directory_index::IndexedSession;
+use crate::resume_input::{parse_resume_input, ResumeHint};
+
+/// `RESOLVE_MATCH_CAP` (`resolve-session.ts:12`).
+pub const RESOLVE_MATCH_CAP: usize = 20;
+
+/// `FALLBACK_BUDGET_PER_REQUEST` (`resolve-fallbacks.ts:34`): each fallback
+/// may do REAL work at most this many times per request; beyond that it
+/// reports a miss without doing work. Shape gates run FIRST and consume no
+/// budget (`resolve-fallbacks.ts:46-48` — order is load-bearing).
+pub const FALLBACK_BUDGET_PER_REQUEST: usize = 2;
+
+/// `FALLBACK_ID_SHAPES` (`resolve-fallbacks.ts:22-25`): FULL-id gates.
+static CLAUDE_FALLBACK_ID_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        .expect("static regex")
+});
+static OPENCODE_FALLBACK_ID_SHAPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^ses_[0-9a-zA-Z]{26}$").expect("static regex"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeResolveStatus {
+    Ready,
+    Warming,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeMatchKind {
+    Exact,
+    Prefix,
+}
+
+/// One resolve match (`ResumeResolveMatchSchema`). Field order = Node's
+/// `toMatch` / fallback literals.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeResolveMatch {
+    pub provider: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_user_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<i64>,
+    pub match_kind: ResumeMatchKind,
+}
+
+/// `ResumeResolveProviderErrorSchema`: a provider that could not be searched
+/// is 'degraded' — NEVER "not found". Node builds `{provider, ...code, message}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeResolveProviderError {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A fallback failure as reported by the closure (the Rust analog of a Node
+/// fallback rejection; typed locator errors carry an errno-ish `code`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderFailure {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// The claude transcript fallback's answer. `session_id` is the LOWERCASED
+/// id (the locator lowercases before scanning, Node parity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeTranscriptHit {
+    pub session_id: String,
+    pub cwd: Option<String>,
+}
+
+/// The opencode by-id fallback's answer (hardened Node: the full sqlite row
+/// from `opencode-by-id-query.ts`, archived + child sessions included).
+/// `last_activity_at` is already floored to integer ms by the producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeByIdHit {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub last_activity_at: Option<i64>,
+}
+
+/// Dependencies for one resolve call (`ResolveResumeDeps`). Fallbacks return
+/// `Err(ProviderFailure)` when the provider store could not be searched —
+/// the core records it and continues (provider unavailable ≠ not found).
+pub struct ResolveDeps<'a> {
+    /// Deleted-filtered index snapshot; `None` = never published ⇒ warming.
+    pub sessions: Option<&'a [IndexedSession]>,
+    /// sessionType overlay keyed `"{provider}:{session_id}"`.
+    pub session_types: &'a HashMap<String, String>,
+    /// claude transcript exact-id fallback (`locateClaudeTranscript`).
+    #[allow(clippy::type_complexity)]
+    pub locate_claude_transcript: Option<
+        &'a (dyn Fn(&str) -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> + Send + Sync),
+    >,
+    /// opencode `ses_*` exact-id fallback (hardened by-id row query).
+    #[allow(clippy::type_complexity)]
+    pub opencode_session_by_id: Option<
+        &'a (dyn Fn(&str) -> Result<Option<OpencodeByIdHit>, ProviderFailure> + Send + Sync),
+    >,
+}
+
+/// Core result (`ResolveResumeResult` in `resolve-session.ts:31-36`).
+/// `provider_errors` carries FALLBACK failures only; the HTTP layer merges in
+/// index scan failures and adds `unsearchedProviders`/`homeDir`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeResolveOutcome {
+    pub status: ResumeResolveStatus,
+    pub matches: Vec<ResumeResolveMatch>,
+    pub hint: Option<ResumeHint>,
+    pub provider_errors: Vec<ResumeResolveProviderError>,
+}
+
+/// `isCaseInsensitiveToken` (`resolve-session.ts:51-53`).
+fn is_case_insensitive_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// `resolveResumeInput` (`resolve-session.ts:72-170`), step for step.
+pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolveOutcome {
+    // Parse BEFORE the warming gate: the warming response still carries the hint.
+    let parsed = parse_resume_input(input);
+    let hint = parsed.hint;
+
+    let Some(sessions) = deps.sessions else {
+        return ResumeResolveOutcome {
+            status: ResumeResolveStatus::Warming,
+            matches: Vec::new(),
+            hint,
+            provider_errors: Vec::new(),
+        };
+    };
+    if parsed.candidates.is_empty() {
+        return ResumeResolveOutcome {
+            status: ResumeResolveStatus::Ready,
+            matches: Vec::new(),
+            hint,
+            provider_errors: Vec::new(),
+        };
+    }
+
+    // First-error-per-provider, insertion order (Node's Map semantics).
+    let mut errors: Vec<ResumeResolveProviderError> = Vec::new();
+    // Per-REQUEST budgets (`withRequestBudget` wraps once, before the loop).
+    let mut claude_used = 0usize;
+    let mut opencode_used = 0usize;
+
+    for candidate in &parsed.candidates {
+        let ci = is_case_insensitive_token(&candidate.token);
+        let norm = |value: &str| {
+            if ci {
+                value.to_ascii_lowercase()
+            } else {
+                value.to_string()
+            }
+        };
+        let target = norm(&candidate.token);
+
+        // 1. Exact index hits — scan ALL sessions, subagent children included.
+        let exact: Vec<ResumeResolveMatch> = sessions
+            .iter()
+            .filter(|session| norm(&session.session_id) == target)
+            .map(|session| to_match(session, ResumeMatchKind::Exact, deps.session_types))
+            .collect();
+        if !exact.is_empty() {
+            return finish(exact, hint, errors);
+        }
+
+        // 2. Exact-id fallbacks BEFORE prefix matching. Shape FIRST, budget
+        // SECOND (wrong-shape tokens are free no-ops); iterated claude-then-
+        // opencode so a failure is attributed to the RIGHT provider.
+        let mut hits: Vec<ResumeResolveMatch> = Vec::new();
+        if let Some(locate) = deps.locate_claude_transcript {
+            if CLAUDE_FALLBACK_ID_SHAPE.is_match(&candidate.token)
+                && claude_used < FALLBACK_BUDGET_PER_REQUEST
+            {
+                claude_used += 1;
+                match locate(&candidate.token) {
+                    Ok(Some(hit)) => hits.push(ResumeResolveMatch {
+                        provider: "claude".to_string(),
+                        session_id: hit.session_id.clone(),
+                        // cwd may legitimately be missing — the CLIENT then
+                        // asks for a working directory instead of auto-opening.
+                        cwd: hit.cwd,
+                        session_type: Some(overlay_or(
+                            deps.session_types,
+                            "claude",
+                            &hit.session_id,
+                        )),
+                        title: None,
+                        first_user_message: None,
+                        last_activity_at: None,
+                        match_kind: ResumeMatchKind::Exact,
+                    }),
+                    Ok(None) => {}
+                    Err(failure) => record_error("claude", failure, &mut errors),
+                }
+            }
+        }
+        if let Some(lookup) = deps.opencode_session_by_id {
+            if OPENCODE_FALLBACK_ID_SHAPE.is_match(&candidate.token)
+                && opencode_used < FALLBACK_BUDGET_PER_REQUEST
+            {
+                opencode_used += 1;
+                match lookup(&candidate.token) {
+                    Ok(Some(hit)) => hits.push(ResumeResolveMatch {
+                        provider: "opencode".to_string(),
+                        session_id: hit.session_id.clone(),
+                        // opencode resumes in the SPAWN cwd (the row's own
+                        // `directory`); empty ⇒ omitted (Node `row.cwd || undefined`).
+                        cwd: hit.cwd.filter(|c| !c.is_empty()),
+                        session_type: Some(overlay_or(
+                            deps.session_types,
+                            "opencode",
+                            &hit.session_id,
+                        )),
+                        title: hit.title.filter(|t| !t.is_empty()),
+                        first_user_message: None,
+                        last_activity_at: hit.last_activity_at,
+                        match_kind: ResumeMatchKind::Exact,
+                    }),
+                    Ok(None) => {}
+                    Err(failure) => record_error("opencode", failure, &mut errors),
+                }
+            }
+        }
+        if !hits.is_empty() {
+            return finish(hits, hint, errors);
+        }
+
+        // 3. Prefix DISCOVERY — top-level sessions only; exact ids above
+        // still reach subagent children.
+        let prefix: Vec<ResumeResolveMatch> = sessions
+            .iter()
+            .filter(|session| {
+                !session.is_subagent && norm(&session.session_id).starts_with(&target)
+            })
+            .map(|session| to_match(session, ResumeMatchKind::Prefix, deps.session_types))
+            .collect();
+        if !prefix.is_empty() {
+            return finish(prefix, hint, errors);
+        }
+    }
+
+    finish(Vec::new(), hint, errors)
+}
+
+/// Node's `finish` closure (`resolve-session.ts:100-109`): sort most-recent
+/// first (stable, like JS), dedupe keeping the survivor with the most recent
+/// activity, cap, and derive degraded-ness from recorded errors.
+fn finish(
+    mut matches: Vec<ResumeResolveMatch>,
+    hint: Option<ResumeHint>,
+    errors: Vec<ResumeResolveProviderError>,
+) -> ResumeResolveOutcome {
+    matches.sort_by(|a, b| {
+        b.last_activity_at
+            .unwrap_or(0)
+            .cmp(&a.last_activity_at.unwrap_or(0))
+    });
+    let matches: Vec<ResumeResolveMatch> =
+        dedupe(matches).into_iter().take(RESOLVE_MATCH_CAP).collect();
+    ResumeResolveOutcome {
+        status: if errors.is_empty() {
+            ResumeResolveStatus::Ready
+        } else {
+            // Even with matches: a failed HIGHER-priority exact search may
+            // have hidden the right session — the client must not auto-resume.
+            ResumeResolveStatus::Degraded
+        },
+        matches,
+        hint,
+        provider_errors: errors,
+    }
+}
+
+/// First error per provider wins (Node: `if (!errorsByProvider.has(provider))`).
+fn record_error(
+    provider: &str,
+    failure: ProviderFailure,
+    errors: &mut Vec<ResumeResolveProviderError>,
+) {
+    if errors.iter().any(|e| e.provider == provider) {
+        return;
+    }
+    errors.push(ResumeResolveProviderError {
+        provider: provider.to_string(),
+        code: failure.code,
+        message: Some(failure.message),
+    });
+}
+
+/// sessionType resolution shared by index and fallback matches: overlay map
+/// (keyed `"{provider}:{id}"`) → provider-name default
+/// (`toMatch`'s `session.sessionType ?? session.provider` and
+/// `resolve-fallbacks.ts`'s `sessionTypeFor`).
+fn overlay_or(session_types: &HashMap<String, String>, provider: &str, id: &str) -> String {
+    session_types
+        .get(&format!("{provider}:{id}"))
+        .cloned()
+        .unwrap_or_else(|| provider.to_string())
+}
+
+/// `toMatch` (`resolve-session.ts:172-183`).
+fn to_match(
+    session: &IndexedSession,
+    match_kind: ResumeMatchKind,
+    session_types: &HashMap<String, String>,
+) -> ResumeResolveMatch {
+    ResumeResolveMatch {
+        provider: session.provider.clone(),
+        session_id: session.session_id.clone(),
+        cwd: Some(
+            session
+                .cwd
+                .clone()
+                .unwrap_or_else(|| session.project_path.clone()),
+        ),
+        session_type: Some(overlay_or(
+            session_types,
+            &session.provider,
+            &session.session_id,
+        )),
+        title: session.title.clone(),
+        first_user_message: session.first_user_message.clone(),
+        last_activity_at: Some(session.last_activity_at),
+        match_kind,
+    }
+}
+
+/// `dedupe` (`resolve-session.ts:189-197`): first `provider:sessionId` wins —
+/// which, post-sort, is the most recent entry.
+fn dedupe(matches: Vec<ResumeResolveMatch>) -> Vec<ResumeResolveMatch> {
+    let mut seen: HashSet<String> = HashSet::new();
+    matches
+        .into_iter()
+        .filter(|m| seen.insert(format!("{}:{}", m.provider, m.session_id)))
+        .collect()
+}
+```
+
+Note the key `overlay_or` uses `IndexedSession.key()`'s format; if `key()` exists use `session.key()` for the index path (it does — `directory_index.rs:86`) — either spelling is fine as long as the format is `"{provider}:{session_id}"`.
+
+- [ ] **Step 4: Minimal compile adaptation of the HTTP layer (behavior parity deferred to Task 6)**
+
+`crates/freshell-server/src/resolve.rs` no longer compiles (old `ResumeResolveResponse`, `OpencodeDirLookup` closure types). Make the smallest change that keeps current wire behavior while compiling against the new core, so this task stays reviewable on its own:
+
+- Change the two lookup type aliases to the new fallible forms:
+  ```rust
+  pub type OpencodeByIdLookup =
+      Arc<dyn Fn(&str) -> Result<Option<OpencodeByIdHit>, ProviderFailure> + Send + Sync>;
+  pub type ClaudeLocator =
+      Arc<dyn Fn(&str) -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> + Send + Sync>;
+  ```
+  and rename the state field `opencode_dir_by_id` → `opencode_session_by_id` (imports: `OpencodeByIdHit`, `ProviderFailure`, `ResumeResolveOutcome` from `freshell_sessions::resume_resolve`; drop the now-unused `OpencodeSessionDirectory` import).
+- In the handler, build `ResolveDeps` with the renamed fields and serialize a TEMPORARY wire struct locally so today's `{status, matches, hint}` shape is preserved until Task 6:
+  ```rust
+  #[derive(serde::Serialize)]
+  struct LegacyWire {
+      status: freshell_sessions::resume_resolve::ResumeResolveStatus,
+      matches: Vec<freshell_sessions::resume_resolve::ResumeResolveMatch>,
+      hint: Option<freshell_sessions::resume_input::ResumeHint>,
+  }
+  ```
+  mapping the outcome's fields into it (drop `provider_errors` for now) — and mark it `// TASK-6: replaced by the full hardened wire response`.
+- In `crates/freshell-server/src/main.rs`, update the two closures to the new signatures MINIMALLY (same silent-miss behavior for now, full health channel in Task 6):
+  ```rust
+  opencode_session_by_id: Some(std::sync::Arc::new(|session_id: &str| {
+      let data_home = freshell_sessions::parse::default_opencode_data_home();
+      Ok(freshell_sessions::parse::opencode_session_directory_by_id(&data_home, session_id)
+          .ok()
+          .flatten()
+          .map(|hit| freshell_sessions::resume_resolve::OpencodeByIdHit {
+              session_id: session_id.to_string(),
+              cwd: hit.directory,
+              title: None,
+              last_activity_at: None,
+          }))
+  })),
+  locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
+      let lowered = session_id.to_ascii_lowercase();
+      Ok(freshell_freshagent::locate_transcript(&lowered).map(|path| {
+          freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+              session_id: lowered.clone(),
+              cwd: freshell_freshagent::transcript_cwd(&path),
+          }
+      }))
+  })),
+  ```
+- Update `resolve.rs`'s in-module tests only as far as compilation requires (closure signatures gain `Ok(...)`; the exact-match test's expected JSON gains `"sessionType": "claude"` — the new provider-name default is intentionally visible on the wire NOW, it matches hardened Node).
+
+- [ ] **Step 5: Run the suites**
+
+Run: `cargo test -p freshell-sessions --test resume_resolve && cargo test -p freshell-server && cargo test -p freshell-sessions`
+Expected: ALL PASS. Then `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/freshell-sessions/src/resume_resolve.rs crates/freshell-sessions/tests/resume_resolve.rs crates/freshell-server/src/resolve.rs crates/freshell-server/src/main.rs
+git commit -m "feat(sessions): hardened #586 resolve core — per-token ranking, case rules, provider-health channel, budgeted fallbacks
+
+Per-token exact→fallback→prefix order (a prefix match never outranks an
+exact resolution); ses_ ids case-SENSITIVE, uuid/hex case-folded;
+subagents excluded from prefix discovery; sessionType defaults to the
+provider name; fallbacks are shape-gated + budgeted (2/request/provider)
+and their failures surface as degraded + providerErrors — never a silent
+empty not-found. Mirrors test/unit/server/coding-cli/resolve-session.test.ts.
+(SYNC-06)
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 4: Hardened opencode exact-id lookup — direct by-id row query replacing the parent walk
+
+Hardened Node replaced the #583 `resolveOpencodeSessionRoots` parent-walk with a direct by-id sqlite row query (`server/coding-cli/providers/opencode-by-id-query.ts`): archived and CHILD sessions included, full row returned (title/timestamps), errors PROPAGATE (provider unavailable ≠ not found). Port it.
+
+**Files:**
+- Modify: `crates/freshell-sessions/src/parse/opencode.rs` (add `OpencodeByIdRow` + `opencode_session_row_by_id`; DELETE `opencode_session_directory_by_id`, its `SessionRow`/`fetch_session_row` helpers, and the `OpencodeSessionDirectory` struct once nothing references them — grep first: `grep -rn "OpencodeSessionDirectory\|opencode_session_directory_by_id" crates/ --include=*.rs`)
+- Rewrite: `crates/freshell-sessions/tests/opencode_directory_by_id.rs` → delete and create `crates/freshell-sessions/tests/opencode_row_by_id.rs`
+- Modify: `crates/freshell-sessions/src/parse/mod.rs` (export the new names, drop the old)
+
+**Interfaces:**
+- Consumes: rusqlite (already a dependency), the existing `OpencodeReadError` and `to_opt_string`/`to_opt_i64` helpers in the same file.
+- Produces (Task 6 wires this): `pub fn opencode_session_row_by_id(data_home: &Path, session_id: &str) -> Result<Option<OpencodeByIdRow>, OpencodeReadError>` and `pub struct OpencodeByIdRow { pub session_id: String, pub cwd: Option<String>, pub title: Option<String>, pub created_at: Option<i64>, pub last_activity_at: Option<i64>, pub project_path: Option<String> }`.
+
+- [ ] **Step 1: Write the failing tests (`crates/freshell-sessions/tests/opencode_row_by_id.rs`)**
+
+Reuse the DB-fixture helpers from the old `opencode_directory_by_id.rs` (it builds real sqlite files in temp dirs — copy its `temp dir` + schema-setup helpers verbatim, adjusting the schema to include `time_created`, `time_updated`, `time_archived`, `title` columns and a `project` table). Test set (complete expectations; adapt helper names to what you copied):
+
+```rust
+//! Hardened (#586) opencode exact-id lookup parity: mirrors
+//! `server/coding-cli/providers/opencode-by-id-query.ts` — a DIRECT by-id
+//! row query. Unlike the #583 parent-walk it includes ARCHIVED and CHILD
+//! sessions, returns the full row (title/timestamps), and PROPAGATES read
+//! errors (provider unavailable ≠ not found).
+
+use freshell_sessions::parse::{opencode_session_row_by_id, OpencodeByIdRow};
+
+// helpers: create_db(dir) -> PathBuf building
+//   CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+//     title TEXT, project_id TEXT, time_created INTEGER, time_updated INTEGER,
+//     time_archived INTEGER);
+//   CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+// plus insert_session(...) / insert_project(...) row insert helpers.
+
+#[test]
+fn resolves_a_root_row_with_full_metadata() { /* insert root row with title
+    "beta", directory "/repo/beta", time_updated 1234, project worktree
+    "/repo"; expect Ok(Some(row)) with session_id, cwd Some("/repo/beta"),
+    title Some("beta"), last_activity_at Some(1234), project_path Some("/repo") */ }
+
+#[test]
+fn resolves_a_child_row_the_listing_hides() { /* insert parent + child with
+    parent_id set; query the CHILD id; expect Ok(Some(..)) — NO parent walk */ }
+
+#[test]
+fn resolves_an_archived_row() { /* time_archived NOT NULL still resolves */ }
+
+#[test]
+fn missing_row_is_ok_none() { /* valid db, unknown id → Ok(None) */ }
+
+#[test]
+fn db_without_a_session_table_is_ok_none() { /* db with only an unrelated
+    table → Ok(None) (Node: `if (!tableNames.has('session')) return null`) */ }
+
+#[test]
+fn db_without_a_project_table_still_resolves_with_null_project_path() { /* session
+    table only; expect Ok(Some(row)) with project_path None */ }
+
+#[test]
+fn missing_db_file_is_an_error_not_a_silent_miss() { /* empty temp dir →
+    Err(OpencodeReadError) (Node: DatabaseSync open throws SQLITE_CANTOPEN;
+    the provider is present-but-unreadable, and silence here is the incident
+    class) */ }
+
+#[test]
+fn corrupt_db_file_is_an_error() { /* write 64 bytes of garbage to
+    opencode.db → Err */ }
+
+#[test]
+fn real_time_updated_is_floored_to_integer_ms() { /* insert with
+    time_updated = 1234.9 (REAL) → last_activity_at Some(1234) */ }
+```
+
+Write each body out fully using the copied helpers (they are short rusqlite calls; the old test file shows the pattern). Run: `cargo test -p freshell-sessions --test opencode_row_by_id` — expected: compile FAILURE (function does not exist).
+
+- [ ] **Step 2: Implement `opencode_session_row_by_id`**
+
+In `crates/freshell-sessions/src/parse/opencode.rs`, add:
+
+```rust
+/// SHORT busy timeout (`opencode-by-id-query.ts:12`): a locked DB must fail
+/// FAST — the failure surfaces as provider-unavailable, never "not found".
+const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
+
+/// The hardened exact-id row (`OpencodeSessionRow` subset the by-id query
+/// selects). `last_activity_at` floored to integer ms (REAL columns possible).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpencodeByIdRow {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub created_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
+    pub project_path: Option<String>,
+}
+
+/// Hardened (#586) exact-id lookup — 1:1 port of
+/// `runOpencodeSessionByIdQuery` (`opencode-by-id-query.ts`). Deliberately
+/// includes ARCHIVED and CHILD sessions: an exact id pasted by the user must
+/// resolve even when the listing hides it. Errors PROPAGATE (a missing or
+/// unreadable DB file is `Err`, matching Node's throwing `DatabaseSync`
+/// open — provider unavailable ≠ not found).
+pub fn opencode_session_row_by_id(
+    data_home: &Path,
+    session_id: &str,
+) -> Result<Option<OpencodeByIdRow>, OpencodeReadError> {
+    let db_path = data_home.join("opencode.db");
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        OPENCODE_BYID_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+
+    let table_names: std::collections::HashSet<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r.map_err(|e| OpencodeReadError(e.to_string()))?);
+        }
+        set
+    };
+    if !table_names.contains("session") {
+        return Ok(None);
+    }
+    let has_project = table_names.contains("project");
+    let project_select = if has_project { "p.worktree" } else { "NULL" };
+    let project_join = if has_project {
+        "LEFT JOIN project p ON p.id = s.project_id"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT s.id, s.directory, s.title, s.time_created, s.time_updated, \
+         {project_select} FROM session s {project_join} WHERE s.id = ?1 LIMIT 1"
+    );
+    match conn.query_row(&sql, rusqlite::params![session_id], |row| {
+        Ok(OpencodeByIdRow {
+            session_id: match row.get::<_, SqlValue>(0)? {
+                SqlValue::Text(s) => s,
+                other => to_opt_string(&other).unwrap_or_default(),
+            },
+            cwd: to_opt_string(&row.get::<_, SqlValue>(1)?),
+            title: to_opt_string(&row.get::<_, SqlValue>(2)?),
+            created_at: to_opt_i64(&row.get::<_, SqlValue>(3)?),
+            last_activity_at: to_opt_i64(&row.get::<_, SqlValue>(4)?),
+            project_path: to_opt_string(&row.get::<_, SqlValue>(5)?),
+        })
+    }) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(OpencodeReadError(e.to_string())),
+    }
+}
+```
+
+(`to_opt_i64` already truncates REAL toward zero via `as i64`; epoch-ms values are positive so truncation == `Math.floor` — same note the listing query carries.)
+
+- [ ] **Step 3: Delete the old walk**
+
+Grep consumers: `grep -rn "OpencodeSessionDirectory\|opencode_session_directory_by_id" crates/ --include=*.rs`. Expected remaining consumers after Task 3: only `parse/mod.rs` exports and possibly a leftover import in `resolve.rs`'s doc comments/tests. Delete `opencode_session_directory_by_id`, `fetch_session_row`, the `SessionRow` alias, and `OpencodeSessionDirectory`; delete `crates/freshell-sessions/tests/opencode_directory_by_id.rs`; update `parse/mod.rs` exports (`opencode_session_row_by_id`, `OpencodeByIdRow` in; old names out). Update the Task-3 temporary closure in `main.rs` to the new query:
+
+```rust
+opencode_session_by_id: Some(std::sync::Arc::new(|session_id: &str| {
+    let data_home = freshell_sessions::parse::default_opencode_data_home();
+    match freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id) {
+        Ok(row) => Ok(row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
+            session_id: r.session_id,
+            cwd: r.cwd,
+            title: r.title,
+            last_activity_at: r.last_activity_at,
+        })),
+        // TASK-6 upgrades this to Err(ProviderFailure{..}) once the wire
+        // carries providerErrors; until then a read failure stays a miss.
+        Err(_) => Ok(None),
+    }
+})),
+```
+
+Also update `resolve.rs`'s in-module opencode fallback test to return an `OpencodeByIdHit` (the old `OpencodeSessionDirectory` literal no longer exists) and extend its expected match JSON with the row-borne fields it now passes (`title`, `lastActivityAt`) if the test supplies them.
+
+- [ ] **Step 4: Run**
+
+Run: `cargo test -p freshell-sessions && cargo test -p freshell-server && cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: ALL PASS, clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/freshell-sessions/src/parse/ crates/freshell-sessions/tests/ crates/freshell-server/src/ 
+git commit -m "feat(sessions): hardened opencode exact-id lookup — direct by-id row query (archived+child included, errors propagate)
+
+Ports opencode-by-id-query.ts, replacing the #583 parent-walk. Full row
+(title/timestamps) feeds the resolve match; a missing/locked/corrupt DB
+is Err — provider unavailable ≠ not found. (SYNC-06)
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 5: SessionIndex scan-failure channel + fire-and-forget refresh + settings enabled-providers getter
+
+Node's route merges `codingCliIndexer.getScanFailures()` into `providerErrors` and fire-and-forgets `requestRefresh()` on degraded (`sessions-router.ts:293-305`). Give the Rust `SessionIndex` the same two capabilities, and `SettingsStore` an enabled-providers reader.
+
+**Files:**
+- Modify: `crates/freshell-sessions/src/directory_index.rs`
+- Modify: `crates/freshell-server/src/settings_store.rs`
+- Test: unit tests inside `directory_index.rs`'s existing `#[cfg(test)]` module (follow its current test patterns) and `settings_store.rs`'s.
+
+**Interfaces:**
+- Consumes: existing `SessionSource` trait, `refresh_snapshot` free function, `spawn_background_refresh`.
+- Produces (Task 6 depends on these EXACT names):
+  - `SessionSource::provider_name(&self) -> Option<&'static str>` (default `None`; `ClaudeSource` → `Some("claude")`, `CodexSource` → `Some("codex")`, `OpencodeSource` → `Some("opencode")`)
+  - `SessionIndex::scan_failures(&self) -> Vec<String>` (sorted, deduped)
+  - `SessionIndex::request_refresh(&self)` (non-blocking, no-op if a sweep is already running)
+  - `SettingsStore::coding_cli_enabled_providers(&self) -> Vec<String>`
+
+- [ ] **Step 1: Write the failing tests**
+
+In `directory_index.rs`'s test module (reuse its existing fixture-source pattern — the file has test sources; model on them):
+
+```rust
+#[tokio::test]
+async fn a_failing_direct_list_records_a_scan_failure_and_recovery_clears_it() {
+    // A direct-listed source whose direct_list() can be toggled to Err.
+    struct FlakySource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl SessionSource for FlakySource {
+        fn discover(&self) -> Vec<FileStat> { Vec::new() }
+        fn parse(&self, _p: &Path) -> Option<IndexedSession> { None }
+        fn provider_name(&self) -> Option<&'static str> { Some("opencode") }
+        // A CHANGING token each call, so every sweep re-queries.
+        fn direct_change_token(&self) -> Option<i64> {
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static N: AtomicI64 = AtomicI64::new(0);
+            Some(N.fetch_add(1, Ordering::SeqCst))
+        }
+        fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("unable to open database file".to_string())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+    let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let index = SessionIndex::with_ttl_and_cache_path(
+        vec![std::sync::Arc::new(FlakySource(std::sync::Arc::clone(&broken))) as _],
+        std::time::Duration::ZERO, // every snapshot() sweeps
+        None,
+    );
+    let _ = index.snapshot().await;
+    assert_eq!(index.scan_failures(), vec!["opencode".to_string()]);
+    broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = index.snapshot().await;
+    assert!(index.scan_failures().is_empty());
+}
+```
+
+And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern): load a store from a temp home with a settings file whose `codingCli.enabledProviders` is `["claude", "opencode"]`, assert `coding_cli_enabled_providers()` returns exactly that; and for a FRESH temp home (no settings file) assert the returned list equals whatever the store's default resolution yields — pin the actual observed default in the assert (run the test once to see it; the migration logic seeds from the discovered/known list — record what it returns, and note it in a comment).
+
+Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-server settings_store` — expected: compile FAILURE (methods missing).
+
+- [ ] **Step 2: Implement**
+
+- `SessionSource` trait: add
+  ```rust
+  /// Provider identity for scan-failure reporting (`getScanFailures` parity).
+  /// `None` (default) = this source does not participate in failure tracking.
+  fn provider_name(&self) -> Option<&'static str> {
+      None
+  }
+  ```
+  Implement `Some("claude")`/`Some("codex")`/`Some("opencode")` on the three real sources.
+- `SessionIndex`: add field `scan_failures: Arc<StdMutex<HashSet<String>>>` (init empty in `with_ttl_and_cache_path`); pass `Arc::clone` of it into both `refresh_snapshot` call sites (inline + background — extend the free function's parameter list). Inside `refresh_snapshot`'s direct-listed branch: on `Ok`, `set.remove(name)`; on `Err`, `set.insert(name.to_string())` — only when `source.provider_name()` is `Some(name)`. RECORDED DEVIATION (document in a comment on `scan_failures()`): Rust file-based sources (claude/codex) are corruption-tolerant by design and never fail a listing wholesale, so only direct-listed sources (opencode — the incident-class store) can appear here; Node's file providers can also report listing failures. The wire contract is unchanged — the field is additive either way.
+- Public accessors on `SessionIndex`:
+  ```rust
+  /// Providers whose MOST RECENT listing attempt failed (unsearchable, not
+  /// empty) — `codingCliIndexer.getScanFailures()` parity.
+  pub fn scan_failures(&self) -> Vec<String> {
+      let mut names: Vec<String> = self.scan_failures.lock().unwrap().iter().cloned().collect();
+      names.sort();
+      names
+  }
+
+  /// Fire-and-forget refresh (`requestRefresh` parity): gives a degraded
+  /// response's Retry a chance to converge once a failed provider recovers.
+  /// No-op if a sweep is already running.
+  pub fn request_refresh(&self) {
+      if let Ok(guard) = Arc::clone(&self.refresh_lock).try_lock_owned() {
+          self.spawn_background_refresh(guard);
+      }
+  }
+  ```
+- `SettingsStore` getter — mirror the read pattern of `session_overrides()` (`settings_store.rs:673`), returning `settings.coding_cli.enabled_providers.clone()` from the same locked settings snapshot:
+  ```rust
+  /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
+  /// — the resolve route's unsearched-provider computation reads this.
+  pub fn coding_cli_enabled_providers(&self) -> Vec<String> { /* same lock/read
+      body shape as session_overrides() */ }
+  ```
+
+- [ ] **Step 3: Run**
+
+Run: `cargo test -p freshell-sessions && cargo test -p freshell-server && cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: ALL PASS, clean. (Every test `SessionSource` impl in the workspace compiles unchanged thanks to the defaulted trait method.)
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/freshell-sessions/src/directory_index.rs crates/freshell-server/src/settings_store.rs
+git commit -m "feat(sessions): scan-failure tracking + fire-and-forget refresh on SessionIndex; enabled-providers reader on SettingsStore
+
+getScanFailures()/requestRefresh() parity plumbing for the hardened
+resolve route (SYNC-06). Only direct-listed sources participate in
+failure tracking (recorded deviation: rust file sources are
+corruption-tolerant and cannot fail a listing wholesale).
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---### Task 6: Hardened wire response + route merge + production fallback wiring (degraded-path proof)
+
+Upgrade `POST /api/sessions/resolve` to the full hardened wire shape and route semantics (`sessions-router.ts:255-316`), wire the production fallbacks to REPORT failures instead of swallowing them, and prove the degraded path on the wire. Includes the async-hygiene verification (context §5).
+
+**Files:**
+- Modify: `crates/freshell-server/src/resolve.rs` (wire struct, route merge, tests)
+- Modify: `crates/freshell-server/src/main.rs` (state wiring: home_dir, enabled-gated fallbacks, failure-reporting closures)
+- Modify: `crates/freshell-freshagent/src/claude_snapshot.rs` + `lib.rs` (add `locate_transcript_checked`)
+
+**Interfaces:**
+- Consumes: Task 3's `ResumeResolveOutcome`/`ProviderFailure`, Task 4's `opencode_session_row_by_id`, Task 5's `scan_failures()`/`request_refresh()`/`coding_cli_enabled_providers()`.
+- Produces: the final wire response `{status, matches, hint, providerErrors, unsearchedProviders, homeDir}`; `freshell_freshagent::locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, std::io::Error>`.
+
+- [ ] **Step 1: Write the failing endpoint tests (in `resolve.rs`'s `#[cfg(test)]`)**
+
+Add these; also UPDATE the existing full-body asserts (`warming_with_hint_when_index_never_published`, `exact_match_returns_full_metadata_via_the_index`, fallback tests) to the new shape — every 200 body now carries `providerErrors` (array, default empty), `unsearchedProviders` (array), and `homeDir` (present when the state carries one). To keep expectations deterministic, extend the test `state()` helper: construct `SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into(), "opencode".into(), "amplifier".into()])` and set `home_dir: Some(Arc::new("/home/tester".to_string()))`, then run the settings-default probe once — if the fresh-store default enables all four discovered providers, baseline `unsearchedProviders` is `[]`; pin whatever the store actually returns (assert it explicitly in the first new test so a wrong guess fails loudly, then align the other expectations).
+
+```rust
+#[tokio::test]
+async fn wire_shape_carries_the_hardened_provider_health_fields() {
+    let dir = temp_dir("wire");
+    let index = fixture_index(vec![claude_fixture()]).await;
+    let (status, body) = post(state(&dir, Some(index)), serde_json::json!({ "input": CLAUDE_ID }), true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["providerErrors"], serde_json::json!([]));
+    assert!(body["unsearchedProviders"].is_array());
+    assert_eq!(body["homeDir"], "/home/tester");
+}
+
+#[tokio::test]
+async fn broken_opencode_store_degrades_with_a_provider_error_never_silent_not_found() {
+    // THE acceptance test (context §4): an unreadable provider store yields
+    // degraded + providerErrors on the wire — matches stay empty, status is
+    // NOT "ready".
+    let dir = temp_dir("degraded");
+    let index = fixture_index(vec![claude_fixture()]).await;
+    let mut st = state(&dir, Some(index));
+    st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+        Err(freshell_sessions::resume_resolve::ProviderFailure {
+            code: Some("SQLITE_CANTOPEN".into()),
+            message: "unable to open database file".into(),
+        })
+    }));
+    let (status, body) = post(st, serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" }), true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["matches"], serde_json::json!([]));
+    assert_eq!(
+        body["providerErrors"],
+        serde_json::json!([{ "provider": "opencode", "code": "SQLITE_CANTOPEN", "message": "unable to open database file" }])
+    );
+}
+
+#[tokio::test]
+async fn degraded_even_with_matches_when_a_higher_priority_fallback_failed() {
+    // ses_ fallback fails; the later hex token still prefix-matches the index
+    // — the response carries the match AND stays degraded (no auto-resume).
+    let dir = temp_dir("degmatch");
+    let mut amp = claude_fixture();
+    amp.provider = "amplifier".to_string();
+    amp.session_id = "417e8345aaaa".to_string();
+    let index = fixture_index(vec![amp]).await;
+    let mut st = state(&dir, Some(index));
+    st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+        Err(freshell_sessions::resume_resolve::ProviderFailure { code: None, message: "locked".into() })
+    }));
+    let (_, body) = post(st, serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa 417e8345" }), true).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["matches"][0]["sessionId"], "417e8345aaaa");
+}
+
+#[tokio::test]
+async fn a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal() {
+    // Index whose direct-listed source errs → scan_failures ["opencode"] →
+    // degraded + {provider:"opencode", message:"session scan failed"} even
+    // though no fallback ran. Build the index from a FailingDirectSource
+    // (provider_name Some("opencode"), direct_list Err) alongside the claude
+    // fixture source, warm it, then post a claude-uuid input.
+    /* ... assert status "degraded", providerErrors == 
+       [{"provider":"opencode","message":"session scan failed"}] ... */
+}
+
+#[tokio::test]
+async fn disabled_providers_are_reported_unsearched_never_as_errors() {
+    // Settings with enabledProviders ["claude"]: unsearchedProviders lists
+    // the other three; a scan failure for DISABLED opencode is excluded from
+    // providerErrors and the response stays "ready".
+    /* build the settings file under dir/.freshell/ the way settings_store
+       tests do, with codingCli.enabledProviders = ["claude"]; reuse the
+       FailingDirectSource index; assert status "ready", providerErrors [],
+       unsearchedProviders containing "codex","opencode","amplifier" */
+}
+```
+
+For `a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal` and `disabled_providers_are_reported_unsearched_never_as_errors`, write the bodies fully in the same style as the snippets above — the `FailingDirectSource` is the Task-5 test source with a fixed `Err`, and the settings file seeding follows `settings_store.rs`'s own test fixtures (`dir/.freshell/settings.json` with `{"codingCli":{"enabledProviders":["claude"]}}` — check the exact filename/shape settings_store tests use and match it).
+
+Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state fields, wire fields missing).
+
+- [ ] **Step 2: Implement the wire + route merge in `resolve.rs`**
+
+- Extend `ResolveState`:
+  ```rust
+  pub home_dir: Option<Arc<String>>,
+  ```
+- Replace the Task-3 `LegacyWire` with the final wire struct (field order = the Node route's object literal, `sessions-router.ts:306-314`):
+  ```rust
+  /// Wire response (`ResumeResolveResponseSchema`): the core outcome plus the
+  /// router-level provider-health fields. `providerErrors`/`unsearchedProviders`
+  /// are always present (zod defaults exist for legacy tolerance, but Node
+  /// always sends them); `homeDir` is omitted only when the server has no
+  /// resolvable home.
+  #[derive(serde::Serialize)]
+  #[serde(rename_all = "camelCase")]
+  struct ResolveWireResponse {
+      status: ResumeResolveStatus,
+      matches: Vec<ResumeResolveMatch>,
+      hint: Option<ResumeHint>,
+      provider_errors: Vec<ResumeResolveProviderError>,
+      unsearched_providers: Vec<String>,
+      #[serde(skip_serializing_if = "Option::is_none")]
+      home_dir: Option<String>,
+  }
+  ```
+- After the `spawn_blocking` join (keep the never-5xx panic fallback, now built as a ready-empty `ResumeResolveOutcome`), merge exactly like the Node route:
+  ```rust
+  /// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
+  /// (`shared/coding-cli-defaults.ts:3`).
+  const KNOWN_RESUME_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+
+  let enabled: std::collections::HashSet<String> =
+      state.settings.coding_cli_enabled_providers().into_iter().collect();
+  let unsearched_providers: Vec<String> = KNOWN_RESUME_PROVIDERS
+      .iter()
+      .filter(|name| !enabled.contains(**name))
+      .map(|name| (*name).to_string())
+      .collect();
+  // Scan failures: enabled-only, fallback errors win the dedupe (more
+  // specific code/message). Disabled+failed must NOT stick degraded forever.
+  let mut provider_errors = outcome.provider_errors;
+  if let Some(index) = state.session_index.as_ref() {
+      for name in index.scan_failures() {
+          if !enabled.contains(&name) || provider_errors.iter().any(|e| e.provider == name) {
+              continue;
+          }
+          provider_errors.push(ResumeResolveProviderError {
+              provider: name,
+              code: None,
+              message: Some("session scan failed".to_string()),
+          });
+      }
+  }
+  let status = match outcome.status {
+      ResumeResolveStatus::Warming => ResumeResolveStatus::Warming,
+      _ if !provider_errors.is_empty() => ResumeResolveStatus::Degraded,
+      _ => ResumeResolveStatus::Ready,
+  };
+  if status == ResumeResolveStatus::Degraded {
+      if let Some(index) = state.session_index.as_ref() {
+          index.request_refresh();
+      }
+  }
+  Json(ResolveWireResponse {
+      status,
+      matches: outcome.matches,
+      hint: outcome.hint,
+      provider_errors,
+      unsearched_providers,
+      home_dir: state.home_dir.as_ref().map(|h| h.as_str().to_string()),
+  })
+  .into_response()
+  ```
+- Update the module doc's behavior-contract bullet list with the new fields and the degraded semantics (one bullet each).
+
+- [ ] **Step 3: Failure-reporting production closures + checked claude locator**
+
+3a. `crates/freshell-freshagent/src/claude_snapshot.rs` — add alongside `locate_transcript` (which stays, other consumers depend on it):
+
+```rust
+/// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
+/// provider-health channel (#586 parity): an unreadable claude store must
+/// surface as a provider error, never a silent miss. A missing projects dir
+/// (`NotFound`) is a genuine miss for that root; any OTHER io error
+/// propagates.
+pub fn locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, std::io::Error> {
+    for root in claude_home_candidates() {
+        if let Some(path) = find_transcript_checked(&root, session_id)? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+```
+
+and a `find_transcript_checked` that is `find_transcript` with error propagation: same id-shape guard (returns `Ok(None)`), then
+
+```rust
+let entries = match std::fs::read_dir(&projects) {
+    Ok(entries) => entries,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => return Err(e),
+};
+```
+
+and the same two-level scan, propagating non-NotFound errors from the inner `read_dir` the same way (mirror `find_transcript`'s body — read it and keep the traversal identical, only the error handling changes). Re-export from `lib.rs` next to `locate_transcript`. Unit test in the same file's test module: a projects dir with mode `0o000` (use `std::os::unix::fs::PermissionsExt`; restore permissions afterward so cleanup works) yields `Err` with `kind() == PermissionDenied`, and a missing projects dir yields `Ok(None)`.
+
+3b. `crates/freshell-server/src/main.rs` — final wiring (replaces the Task-3/4 temporaries). Above the router construction:
+
+```rust
+// Resolve fallbacks are built from the ENABLED provider set at boot, like
+// Node's buildResolveFallbacks over the live provider set.
+let resolve_enabled: std::collections::HashSet<String> =
+    settings_store.coding_cli_enabled_providers().into_iter().collect();
+
+/// errno-ish code for a provider-error summary (Node's typed locator errors
+/// carry the fs errno in `.code`).
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => Some("EACCES".to_string()),
+        std::io::ErrorKind::NotFound => Some("ENOENT".to_string()),
+        _ => None,
+    }
+}
+```
+
+State fields:
+
+```rust
+home_dir: home.as_ref().map(|h| Arc::new(h.display().to_string())),
+opencode_session_by_id: resolve_enabled.contains("opencode").then(|| {
+    std::sync::Arc::new(|session_id: &str| {
+        let data_home = freshell_sessions::parse::default_opencode_data_home();
+        freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
+            .map(|row| {
+                row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
+                    session_id: r.session_id,
+                    cwd: r.cwd,
+                    title: r.title,
+                    last_activity_at: r.last_activity_at,
+                })
+            })
+            .map_err(|e| freshell_sessions::resume_resolve::ProviderFailure {
+                code: None,
+                message: e.to_string(),
+            })
+    }) as crate::resolve::OpencodeByIdLookup
+}),
+locate_claude_transcript: resolve_enabled.contains("claude").then(|| {
+    std::sync::Arc::new(|session_id: &str| {
+        let lowered = session_id.to_ascii_lowercase();
+        match freshell_freshagent::locate_transcript_checked(&lowered) {
+            Ok(Some(path)) => Ok(Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                cwd: freshell_freshagent::transcript_cwd(&path),
+                session_id: lowered,
+            })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                code: errno_code(&e),
+                message: format!("Claude transcript scan failed: {e}"),
+            }),
+        }
+    }) as crate::resolve::ClaudeLocator
+}),
+```
+
+(Adjust `home` to whatever the existing variable holding `resolve_home()`'s output is named at that point in `main.rs` — it is `home: Option<PathBuf>`, resolved near the top of `main`.)
+
+- [ ] **Step 4: Async-hygiene verification (context §5 — verify, don't assume)**
+
+Confirm and record (in the commit message body): the ENTIRE `resolve_resume_input` call — including both blocking fallback closures (rusqlite query, transcript directory walk) — runs inside `tokio::task::spawn_blocking` (`resolve.rs`, the Task-3-preserved block), so no DB/FS wait ever blocks the async runtime; per-request work is bounded by `MAX_RESUME_CANDIDATES (8) × FALLBACK_BUDGET_PER_REQUEST (2 per provider)` fallback calls + one index scan per token. Grep that no OTHER call path invokes these closures outside `spawn_blocking`: `grep -rn "opencode_session_by_id\|locate_claude_transcript" crates/freshell-server/src/ --include=*.rs`. Add one sentence to `resolve.rs`'s module doc stating this invariant so future edits keep it.
+
+- [ ] **Step 5: Run**
+
+Run: `cargo test -p freshell-server && cargo test -p freshell-freshagent && cargo test --workspace 2>&1 | tail -5 && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: ALL PASS, clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/freshell-server/src/resolve.rs crates/freshell-server/src/main.rs crates/freshell-freshagent/src/
+git commit -m "feat(server): hardened resolve wire — providerErrors/unsearchedProviders/homeDir, scan-failure merge, degraded fire-and-forget refresh
+
+POST /api/sessions/resolve now emits the full #586 contract; production
+fallbacks report failures (checked claude locator, propagating opencode
+by-id) instead of swallowing them; degraded-path proven on the wire
+(broken store -> degraded + providerErrors, never silent not-found).
+Async hygiene verified: all blocking fallback IO runs inside the
+endpoint's spawn_blocking; work bounded by cap-8 candidates x budget-2
+fallbacks. (SYNC-06)
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 7: Full verification, shared e2e 2× both projects, SYNC-06 checklist evidence, push
+
+The shared client dialog (hardened: degraded UI + manual retry + homeDir prefill) and the `sessionResolve` flag are proven by the SHARED e2e spec running against BOTH server kinds — that is the design's proof that the Rust server behaves identically. Then record the evidence and push.
+
+**Files:**
+- Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` (SYNC-06 entry, line ~803)
+- No source changes expected; any failure discovered here is fixed by amending the responsible earlier area with its own test-first micro-cycle.
+
+**Interfaces:**
+- Consumes: all previous tasks' work, committed.
+- Produces: green full-matrix evidence + updated checklist + pushed branch.
+
+- [ ] **Step 1: Rust full gate**
+
+Run: `cargo test --workspace 2>&1 | tail -5 && cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+Expected: 0 failed, clean. Record the total passed count for the checklist entry.
+
+- [ ] **Step 2: Coordinated TS suites**
+
+Run:
+```bash
+npm run test:status
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/resolve-session.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts test/integration/server/sessions-resolve-router.test.ts --run
+```
+Expected: ALL PASS (the branch did not modify Node server code; these prove no accidental TS regressions). If `test:status` reports another session's run in progress, WAIT — never kill processes you did not spawn.
+
+- [ ] **Step 3: Shared e2e, both projects, twice**
+
+Sanity-check first that the flag declaration still stands: `grep -n "sessionResolve" crates/freshell-server/src/main.rs` — expected: present in `build_platform_payload`.
+
+Run TWICE (the config's own server management uses ephemeral ports/HOMEs — verify no `--port 3001/3002` style overrides leak in via env before running):
+```bash
+npm run test:e2e -- resume-button.spec.ts
+npm run test:e2e -- resume-button.spec.ts
+```
+Expected: all 3 tests × both projects (legacy-chromium AND rust-chromium) pass, both runs — 6/6 each run. This is the acceptance proof for warming preservation and the hardened dialog (degraded UI, manual retry, homeDir prefill) against the Rust server, since the spec and client are shared.
+
+- [ ] **Step 4: Update the SYNC-06 checklist entry (PARTIAL convention)**
+
+In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, append a NEW `PARTIAL` bullet under the SYNC-06 item, directly after the existing `PARTIAL (2026-07-30, commit c38422a0)` bullet, following that bullet's exact style:
+
+```markdown
+  - PARTIAL (2026-07-30, hardened-contract follow-up, commit `<HEAD short sha>`): rebased onto `f903e8a6` (#586) and closed the hardening delta. Contract: `status` gains `degraded`; `providerErrors`/`unsearchedProviders`/`homeDir` on the wire (`crates/freshell-server/src/resolve.rs`). Ranking: per-token exact→fallback→prefix, ses_ case-SENSITIVE, subagents excluded from prefix discovery, sessionType provider-default. Parser: known-family prefix regex + MAX_RESUME_CANDIDATES=8, pinned by the EXTENDED shared fixture `test/fixtures/resume-input/parser-cases.json` (<N> cases; TS test restored to fixture-driven form) green on BOTH parsers. Provider health: broken opencode store → degraded + providerErrors on the wire (never silent not-found), scan-failure channel + disabled→unsearched, degraded fire-and-forget refresh; hardened by-id row query (archived+child, errors propagate). Async hygiene: all fallback IO inside spawn_blocking, work bounded by cap-8×budget-2. `cargo test --workspace`: <N> passed, 0 failed; fmt+clippy clean. E2E: `resume-button.spec.ts` green on BOTH projects, 2 runs each (<N>/<N> per run). MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half remains out of scope, per the SYNC-05/SAFE-11 PARTIAL convention.
+```
+
+Replace every `<N>`/`<HEAD short sha>` with the REAL numbers/sha from Steps 1–3 (they are evidence, not boilerplate — copy them from the actual command output).
+
+- [ ] **Step 5: Commit and push (NO PR)**
+
+```bash
+git add docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
+git commit -m "docs: record SYNC-06 hardened-contract parity evidence in completion checklist
+
+🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+git push -u origin feat/rust-resolve-parity
+```
+
+Expected: push succeeds (the branch was local-only; this creates the remote branch). Do NOT open a pull request — that requires explicit user approval.
+
+---
+
+## Self-Review Record
+
+**1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING + shared dialog via shared e2e → Task 7. Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
+
+**1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
+
+**2. Placeholder scan:** Task 4 Step 1 and Task 6 Step 1 contain two test bodies described by full behavioral specification + fixture pattern reference rather than verbatim code (`scan_failure` literal test, disabled-provider test, opencode row-fixture bodies); each names the exact fixture pattern file to copy, the exact inputs, and the exact expected JSON/values — the implementer writes mechanical rusqlite/axum plumbing only. Checklist `<N>` slots are run-time evidence by design. No TBD/TODO/"handle edge cases" items remain.
+
+**3. Type consistency check:** `ResumeResolveOutcome{status,matches,hint,provider_errors}` produced in Task 3 = consumed in Task 6. `OpencodeByIdHit{session_id,cwd,title,last_activity_at}` (Task 3) is built from `OpencodeByIdRow` (Task 4) in Task 6's closure — field names verified 1:1. `ProviderFailure{code,message}` used identically in Tasks 3/4/6. `scan_failures()->Vec<String>`, `request_refresh()`, `coding_cli_enabled_providers()->Vec<String>` (Task 5) match Task 6's call sites. `MAX_RESUME_CANDIDATES` (Task 2) referenced in Task 6's hygiene note. State field `opencode_session_by_id` renamed once in Task 3 and used consistently after.
