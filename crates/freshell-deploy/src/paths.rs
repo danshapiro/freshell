@@ -64,9 +64,11 @@ pub struct StorePaths {
     store_root: PathBuf,
     port_root: PathBuf,
     generations: PathBuf,
+    transactions: PathBuf,
     current: PathBuf,
     live: PathBuf,
     legacy: PathBuf,
+    transaction: PathBuf,
     lock: PathBuf,
 }
 
@@ -105,9 +107,11 @@ impl StorePaths {
             checkout: canonical,
             port,
             generations: port_root.join("generations"),
+            transactions: port_root.join("transactions"),
             current: port_root.join("current"),
             live: port_root.join("live.json"),
             legacy: port_root.join("legacy.json"),
+            transaction: port_root.join("transaction.json"),
             lock: port_root.join("deploy.lock"),
             store_root,
             port_root,
@@ -119,6 +123,7 @@ impl StorePaths {
         ensure_private_directory(&self.store_root.join("ports"))?;
         ensure_private_directory(&self.port_root)?;
         ensure_private_directory(&self.generations)?;
+        ensure_private_directory(&self.transactions)?;
         Ok(())
     }
 
@@ -142,6 +147,10 @@ impl StorePaths {
         &self.generations
     }
 
+    pub fn transactions_dir(&self) -> &Path {
+        &self.transactions
+    }
+
     pub fn current_pointer(&self) -> &Path {
         &self.current
     }
@@ -154,12 +163,16 @@ impl StorePaths {
         &self.legacy
     }
 
+    pub fn transaction_journal(&self) -> &Path {
+        &self.transaction
+    }
+
     pub fn lock_file(&self) -> &Path {
         &self.lock
     }
 }
 
-fn ensure_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let current_uid = unsafe { libc::geteuid() };

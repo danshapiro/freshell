@@ -10,6 +10,7 @@ use crate::durable::{
     atomic_symlink, atomic_write, atomic_write_new, rename_noreplace, sync_directory,
 };
 use crate::error::{DeployError, Result};
+use crate::journal::{DurableTransactionJournal, TransactionJournal, TransactionPhase};
 use crate::legacy::LegacyCaptureReceipt;
 use crate::locks::DeploymentLock;
 use crate::manifest::{copy_open_file, copy_regular_file, GenerationManifest, MANIFEST_FILE_NAME};
@@ -211,6 +212,17 @@ impl Store {
 
     fn remove_generation_locked(&self, id: &str) -> Result<()> {
         let generation = self.verify_generation(id)?;
+        if let Some(transaction) =
+            DurableTransactionJournal::new(self.paths.transaction_journal())?.load()?
+        {
+            let unfinished =
+                !transaction.finalized && transaction.phase != TransactionPhase::RollbackComplete;
+            if unfinished
+                && (transaction.prior_generation_id == id || transaction.target_generation_id == id)
+            {
+                return Err(DeployError::TransactionGeneration(id.to_string()));
+            }
+        }
         let selected = self.selected_generation_id()?;
         if selected.as_deref() == Some(id) {
             return Err(DeployError::SelectedGeneration(id.to_string()));
@@ -313,41 +325,27 @@ impl Store {
                 "running process cwd is not the claimed generation root".to_string(),
             ));
         }
-        for (label, actual, relative) in [
-            ("client", &process.runtime.client_dir, "client"),
-            ("extensions", &process.runtime.extensions_dir, "extensions"),
-            (
-                "compiled server",
-                &process.runtime.dist_server_dir,
-                "dist/server",
-            ),
-            (
-                "MCP entry",
-                &process.runtime.mcp_entry,
-                "dist/server/mcp/server.js",
-            ),
-            (
-                "Claude sidecar",
-                &process.runtime.claude_sidecar_entry,
-                "claude-sidecar/index.mjs",
-            ),
-            (
-                "package.json",
-                &process.runtime.package_json,
-                "package.json",
-            ),
-            (
-                "package-lock.json",
-                &process.runtime.package_lock,
-                "package-lock.json",
-            ),
+        let client = Path::new(&process.runtime.client_dir);
+        let selected_client = self.paths.current_pointer().join("client");
+        if client != selected_client {
+            return Err(DeployError::InvalidReceipt(
+                "running managed process client provenance is not the stable current/client indirection"
+                    .to_string(),
+            ));
+        }
+        for (label, actual) in [
+            ("extensions", &process.runtime.extensions_dir),
+            ("compiled server", &process.runtime.dist_server_dir),
+            ("MCP entry", &process.runtime.mcp_entry),
+            ("Claude sidecar", &process.runtime.claude_sidecar_entry),
+            ("package.json", &process.runtime.package_json),
+            ("package-lock.json", &process.runtime.package_lock),
             (
                 "production dependencies",
                 &process.runtime.production_node_modules,
-                "node_modules",
             ),
         ] {
-            if Path::new(actual) != generation.path.join(relative) {
+            if !is_strict_generation_path(Path::new(actual), &generation.path) {
                 return Err(DeployError::InvalidReceipt(format!(
                     "running process {label} provenance is outside the claimed generation"
                 )));
@@ -355,6 +353,18 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn is_strict_generation_path(path: &Path, root: &Path) -> bool {
+    path.is_absolute()
+        && path != root
+        && path.starts_with(root)
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 fn read_private_receipt(path: &Path) -> Result<Option<Vec<u8>>> {

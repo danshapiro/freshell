@@ -44,6 +44,8 @@ pub enum DeployError {
     RunningGeneration(String),
     #[error("cannot remove the legacy recovery generation: {0}")]
     LegacyGeneration(String),
+    #[error("cannot remove a generation retained by an unfinished transaction: {0}")]
+    TransactionGeneration(String),
     #[error("storage state is ambiguous after {operation} at {path}: {cause}")]
     StorageAmbiguous {
         operation: &'static str,
@@ -52,6 +54,16 @@ pub enum DeployError {
     },
     #[error("process identity could not be proven: {0}")]
     ProcessIdentity(String),
+    #[error("pidfd process control failed closed: {0}")]
+    ProcessControl(String),
+    #[error("deployment probe failed: {0}")]
+    Probe(String),
+    #[error("deployment transaction journal is invalid: {0}")]
+    Journal(String),
+    #[error("deployment activation failed closed: {0}")]
+    Activation(String),
+    #[error("deployment recovery failed closed: {0}")]
+    Recovery(String),
     #[error("legacy capture failed: {0}")]
     LegacyCapture(String),
     #[error("{0}")]

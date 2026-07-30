@@ -336,6 +336,31 @@ impl LinuxProcfs {
         Ok(owners)
     }
 
+    pub(crate) fn listener_is_loopback(
+        &self,
+        port: DeployPort,
+        socket_inode: &str,
+    ) -> Result<bool> {
+        let mut matches = Vec::new();
+        for table in ["tcp", "tcp6"] {
+            let path = self.root.join("net").join(table);
+            let raw = fs::read_to_string(&path).map_err(|error| {
+                DeployError::ProcessIdentity(format!(
+                    "cannot read listener table {}: {error}",
+                    path.display()
+                ))
+            })?;
+            parse_listener_addresses(&raw, table, port, socket_inode, &mut matches)?;
+        }
+        if matches.len() != 1 {
+            return Err(DeployError::ProcessIdentity(format!(
+                "listener inode {socket_inode} has {} matching address rows",
+                matches.len()
+            )));
+        }
+        Ok(matches[0])
+    }
+
     fn pid_path(&self, pid: u32, suffix: &str) -> PathBuf {
         self.root.join(pid.to_string()).join(suffix)
     }
@@ -344,6 +369,12 @@ impl LinuxProcfs {
 pub struct LinuxPidFd {
     pid: u32,
     descriptor: OwnedFd,
+}
+
+impl LinuxPidFd {
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.descriptor.as_raw_fd()
+    }
 }
 
 impl ProcessInspector for LinuxProcfs {
@@ -565,7 +596,7 @@ impl LinuxProcfs {
             node_path
         };
         Ok(RuntimeProvenance {
-            client_dir: canonical_runtime_path(cwd, &client_path, "FRESHELL_CLIENT_DIR")?,
+            client_dir: client_runtime_path(cwd, &client_path)?,
             extensions_dir: effective("FRESHELL_EXTENSIONS_DIR", cwd.join("extensions"))?,
             dist_server_dir: canonical_runtime_path(
                 cwd,
@@ -595,6 +626,77 @@ impl LinuxProcfs {
             )?,
         })
     }
+}
+
+fn client_runtime_path(cwd: &Path, path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    if !looks_like_managed_current_client(&absolute) {
+        return canonical_runtime_path(cwd, path, "FRESHELL_CLIENT_DIR");
+    }
+    if absolute.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(DeployError::ProcessIdentity(
+            "managed current/client path is not lexically normalized".to_string(),
+        ));
+    }
+    let current = absolute
+        .parent()
+        .expect("stable current/client has a parent");
+    let metadata = fs::symlink_metadata(current)?;
+    let target = fs::read_link(current)?;
+    let mut target_parts = target.components();
+    let target_is_generation = !target.is_absolute()
+        && target_parts
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            == Some("generations")
+        && target_parts
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .is_some_and(|id| crate::receipts::validate_generation_id(id).is_ok())
+        && target_parts.next().is_none();
+    if !metadata.file_type().is_symlink()
+        || !target_is_generation
+        || !fs::canonicalize(&absolute)?.is_dir()
+    {
+        return Err(DeployError::ProcessIdentity(
+            "managed current/client path is not backed by the atomic current symlink".to_string(),
+        ));
+    }
+    absolute.to_str().map(str::to_string).ok_or_else(|| {
+        DeployError::ProcessIdentity("managed current/client path is not UTF-8".to_string())
+    })
+}
+
+fn looks_like_managed_current_client(path: &Path) -> bool {
+    let Some(current) = path.parent() else {
+        return false;
+    };
+    let Some(port_root) = current.parent() else {
+        return false;
+    };
+    let Some(ports) = port_root.parent() else {
+        return false;
+    };
+    let Some(deploy_root) = ports.parent() else {
+        return false;
+    };
+    path.file_name() == Some(std::ffi::OsStr::new("client"))
+        && current.file_name() == Some(std::ffi::OsStr::new("current"))
+        && port_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|port| DeployPort::parse(port).is_ok())
+        && ports.file_name() == Some(std::ffi::OsStr::new("ports"))
+        && deploy_root.file_name() == Some(std::ffi::OsStr::new(".freshell-deploy"))
 }
 
 fn infer_compiled_workspace_root(executable: &[u8]) -> Result<PathBuf> {
@@ -771,6 +873,70 @@ fn parse_listener_table(raw: &str, port: DeployPort, output: &mut BTreeSet<Strin
     Ok(())
 }
 
+fn parse_listener_addresses(
+    raw: &str,
+    table: &str,
+    port: DeployPort,
+    socket_inode: &str,
+    output: &mut Vec<bool>,
+) -> Result<()> {
+    for line in raw.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            return Err(DeployError::ProcessIdentity(
+                "malformed /proc TCP listener row".to_string(),
+            ));
+        }
+        if fields[3] != "0A" || fields[9] != socket_inode {
+            continue;
+        }
+        let (address_hex, port_hex) = fields[1].rsplit_once(':').ok_or_else(|| {
+            DeployError::ProcessIdentity("malformed listener address".to_string())
+        })?;
+        let parsed_port = u16::from_str_radix(port_hex, 16)
+            .map_err(|_| DeployError::ProcessIdentity("malformed listener port".to_string()))?;
+        if parsed_port != port.get() {
+            continue;
+        }
+        let loopback = match table {
+            "tcp" => {
+                let encoded = u32::from_str_radix(address_hex, 16).map_err(|_| {
+                    DeployError::ProcessIdentity("malformed IPv4 listener address".to_string())
+                })?;
+                std::net::Ipv4Addr::from(encoded.to_le_bytes()).is_loopback()
+            }
+            "tcp6" => {
+                if address_hex.len() != 32 {
+                    return Err(DeployError::ProcessIdentity(
+                        "malformed IPv6 listener address".to_string(),
+                    ));
+                }
+                let mut octets = [0_u8; 16];
+                for (index, chunk) in address_hex.as_bytes().chunks_exact(8).enumerate() {
+                    let chunk = std::str::from_utf8(chunk).map_err(|_| {
+                        DeployError::ProcessIdentity("malformed IPv6 listener address".to_string())
+                    })?;
+                    let word = u32::from_str_radix(chunk, 16).map_err(|_| {
+                        DeployError::ProcessIdentity("malformed IPv6 listener address".to_string())
+                    })?;
+                    octets[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+                std::net::Ipv6Addr::from(octets).is_loopback()
+            }
+            _ => {
+                return Err(DeployError::ProcessIdentity(
+                    "unknown /proc listener table".to_string(),
+                ))
+            }
+        };
+        output.push(loopback);
+    }
+    Ok(())
+}
+
 fn parse_start_time(stat: &str) -> Result<u64> {
     let close = stat
         .rfind(')')
@@ -906,6 +1072,39 @@ mod tests {
     }
 
     #[test]
+    fn proc_listener_address_parser_distinguishes_loopback_from_wildcard() {
+        let header =
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let loopback =
+            "   0: 0100007F:B415 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345\n";
+        let wildcard =
+            "   0: 00000000:B415 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345\n";
+        let port = DeployPort::new(46_101).unwrap();
+
+        let mut addresses = Vec::new();
+        parse_listener_addresses(
+            &format!("{header}{loopback}"),
+            "tcp",
+            port,
+            "12345",
+            &mut addresses,
+        )
+        .unwrap();
+        assert_eq!(addresses, [true]);
+
+        addresses.clear();
+        parse_listener_addresses(
+            &format!("{header}{wildcard}"),
+            "tcp",
+            port,
+            "12345",
+            &mut addresses,
+        )
+        .unwrap();
+        assert_eq!(addresses, [false]);
+    }
+
+    #[test]
     fn absent_overrides_use_the_binary_compile_root_not_launch_cwd() {
         let fixture = tempfile::tempdir().unwrap();
         let compiled = runtime_tree(fixture.path(), "compiled");
@@ -1002,6 +1201,79 @@ mod tests {
         assert_eq!(
             Path::new(&provenance.claude_sidecar_entry),
             fs::canonicalize(sidecar).unwrap()
+        );
+    }
+
+    #[test]
+    fn managed_current_client_override_preserves_the_stable_lexical_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let port_root = fixture.path().join(".freshell-deploy/ports/3410");
+        let generation = runtime_tree(
+            &port_root.join("generations"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        fs::create_dir(generation.join("client")).unwrap();
+        fs::write(generation.join("client/index.html"), "managed client").unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("generations")
+                .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            port_root.join("current"),
+        )
+        .unwrap();
+        let stable_client = port_root.join("current/client");
+        let node = generation.join("node");
+        let sidecar = generation.join("crates/freshell-claude-sidecar/index.mjs");
+        let proc = proc_fixture(
+            &fixture,
+            &[],
+            &[
+                ("FRESHELL_CLAUDE_NODE", node.as_path()),
+                ("FRESHELL_CLIENT_DIR", stable_client.as_path()),
+                ("FRESHELL_CLAUDE_SIDECAR", sidecar.as_path()),
+            ],
+        );
+
+        let provenance = proc
+            .runtime_provenance(FIXTURE_PID, &generation)
+            .expect("managed stable client provenance");
+
+        assert_eq!(Path::new(&provenance.client_dir), stable_client);
+        assert_ne!(
+            Path::new(&provenance.client_dir),
+            fs::canonicalize(&stable_client).unwrap(),
+            "current/client must not be frozen to the selected generation"
+        );
+    }
+
+    #[test]
+    fn unrelated_current_client_symlink_is_not_treated_as_managed_indirection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let generation = runtime_tree(fixture.path(), "ordinary-generation");
+        fs::create_dir(generation.join("client")).unwrap();
+        fs::write(generation.join("client/index.html"), "ordinary client").unwrap();
+        let unrelated = fixture.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        std::os::unix::fs::symlink(&generation, unrelated.join("current")).unwrap();
+        let client = unrelated.join("current/client");
+        let node = generation.join("node");
+        let sidecar = generation.join("crates/freshell-claude-sidecar/index.mjs");
+        let proc = proc_fixture(
+            &fixture,
+            &[],
+            &[
+                ("FRESHELL_CLAUDE_NODE", node.as_path()),
+                ("FRESHELL_CLIENT_DIR", client.as_path()),
+                ("FRESHELL_CLAUDE_SIDECAR", sidecar.as_path()),
+            ],
+        );
+
+        let provenance = proc
+            .runtime_provenance(FIXTURE_PID, &generation)
+            .expect("ordinary symlink provenance");
+
+        assert_eq!(
+            Path::new(&provenance.client_dir),
+            fs::canonicalize(client).unwrap()
         );
     }
 

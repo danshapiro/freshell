@@ -72,7 +72,14 @@ fn running_identity(generation: &Generation, port: u16) -> ProcessIdentity {
         argument_count: 1,
         effective_uid: unsafe { libc::geteuid() },
         runtime: RuntimeProvenance {
-            client_dir: path("client"),
+            client_dir: generation
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .join("current/client")
+                .display()
+                .to_string(),
             extensions_dir: path("extensions"),
             dist_server_dir: path("dist/server"),
             mcp_entry: path("dist/server/mcp/server.js"),

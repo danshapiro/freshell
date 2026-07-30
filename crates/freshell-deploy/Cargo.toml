@@ -7,9 +7,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+freshell-deployment = { path = "../freshell-deployment" }
 libc = "0.2"
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
