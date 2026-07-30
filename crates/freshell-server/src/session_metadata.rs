@@ -19,7 +19,7 @@
 //! { "version": 1, "sessions": { "<provider>": { "<sessionId>": { "sessionType": "...", "sessionTypeSource": "explicit" } } } }
 //! ```
 //!
-//! `get_all()`/`get()` are provided for future read-surfaces (test-only until the session-indexer read path is ported) (the sidebar directory listing
+//! `get_all()` is a production read (resolve endpoint's sessionType overlay, SYNC-06); `get()` remains test-gated until a production caller lands (the sidebar directory listing
 //! embeds `sessionType` inline via `codingCliIndexer` server-side in the reference; this
 //! port's `crates/freshell-sessions` directory index is a SEPARATE crate this module does
 //! not reach into — wiring metadata into the directory listing is out of THIS module's
