@@ -1,81 +1,32 @@
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { parseResumeInput } from '@shared/resume-input-parser'
 
-const V4 = 'ed2afda6-a340-443e-ba60-024a1b3554b4'
-const V7 = '019fac27-69d7-78a0-b972-b339d551042e'
-const SES = 'ses_root0000000000000000000000'
+// SYNC-06 anti-drift mechanism: the SAME fixture table is consumed by
+// crates/freshell-sessions/tests/resume_input_parser_parity.rs. Every case
+// asserts BOTH candidates and hint. Add cases to the fixture, never inline.
+interface FixtureCase {
+  name: string
+  input: string
+  candidates: Array<{ token: string; kind: string }>
+  hint: { provider: string; source: string } | null
+}
 
-describe('parseResumeInput — candidate extraction', () => {
-  it.each([
-    ['bare short hex', '417e8345', [{ token: '417e8345', kind: 'hex-prefix' }]],
-    ['bare v4 uuid', V4, [{ token: V4, kind: 'uuid' }]],
-    ['bare opencode id', SES, [{ token: SES, kind: 'prefixed-id' }]],
-    ['codex resume command', `codex resume ${V7}`, [{ token: V7, kind: 'uuid' }]],
-    ['claude --resume command', `claude --resume ${V4}`, [{ token: V4, kind: 'uuid' }]],
-    ['claude -r command', `$ claude -r ${V4}`, [{ token: V4, kind: 'uuid' }]],
-    ['opencode --session command', `opencode --session ${SES}`, [{ token: SES, kind: 'prefixed-id' }]],
-    ['amplifier --resume short id', 'amplifier --resume 417e8345', [{ token: '417e8345', kind: 'hex-prefix' }]],
-    ['quoted + padded', `  "claude --resume ${V4}"  `, [{ token: V4, kind: 'uuid' }]],
-    ['backticks', '`417e8345`', [{ token: '417e8345', kind: 'hex-prefix' }]],
-    ['id embedded in a path', `/home/x/.claude/projects/foo/${V4}.jsonl`, [{ token: V4, kind: 'uuid' }]],
-    ['trailing punctuation', 'session 417e8345.', [{ token: '417e8345', kind: 'hex-prefix' }]],
-    ['ansi codes', `\u001b[32m417e8345\u001b[0m`, [{ token: '417e8345', kind: 'hex-prefix' }]],
-    [
-      'multi-line noise',
-      `To continue:\n$ codex resume ${V7}\nor open the app`,
-      [{ token: V7, kind: 'uuid' }],
-    ],
-  ] as const)('%s', (_label, input, expected) => {
-    expect(parseResumeInput(input).candidates).toEqual(expected)
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const { cases } = JSON.parse(
+  readFileSync(path.join(__dirname, '../../fixtures/resume-input/parser-cases.json'), 'utf8'),
+) as { cases: FixtureCase[] }
+
+describe('parseResumeInput — shared fixture parity', () => {
+  it('fixture is non-trivial', () => {
+    expect(cases.length).toBeGreaterThanOrEqual(31)
   })
 
-  it.each([
-    ['english hex-looking word', 'decade'],
-    ['facade sentence', 'I spent a decade behind a facade'],
-    ['hex without digits', 'deadbeef'],
-    ['garbage', 'hello world!! no ids here'],
-    ['empty', ''],
-  ] as const)('extracts nothing from %s', (_label, input) => {
-    expect(parseResumeInput(input).candidates).toEqual([])
-  })
-
-  it('orders prefixed ids, then uuids, then hex prefixes longest-first', () => {
-    const { candidates } = parseResumeInput(`417e8345 ${V4} ${SES} 417e8345abcd`)
-    expect(candidates.map((c) => c.token)).toEqual([SES, V4, '417e8345abcd', '417e8345'])
-  })
-
-  it('dedupes repeated tokens case-insensitively', () => {
-    const { candidates } = parseResumeInput(`${V4} ${V4.toUpperCase()}`)
-    expect(candidates).toHaveLength(1)
-  })
-
-  it('does not extract hex segments out of a uuid', () => {
-    const { candidates } = parseResumeInput(V4)
-    expect(candidates).toEqual([{ token: V4, kind: 'uuid' }])
-  })
-
-  it('caps hex tokens at 32 chars (git shas do not match)', () => {
-    expect(parseResumeInput('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2').candidates).toEqual([])
-  })
-})
-
-describe('parseResumeInput — advisory hint', () => {
-  it.each([
-    ['codex command', `codex resume ${V7}`, { provider: 'codex', source: 'command' }],
-    ['claude --resume', `claude --resume ${V4}`, { provider: 'claude', source: 'command' }],
-    ['claude -r', `claude -r ${V4}`, { provider: 'claude', source: 'command' }],
-    ['opencode --session', `opencode --session ${SES}`, { provider: 'opencode', source: 'command' }],
-    ['amplifier --resume', 'amplifier --resume 417e8345', { provider: 'amplifier', source: 'command' }],
-    ['agent word only', `the claude session ${V4}`, { provider: 'claude', source: 'word' }],
-    ['ses_ id shape', SES, { provider: 'opencode', source: 'id-shape' }],
-    ['uuid v7 shape', V7, { provider: 'codex', source: 'id-shape' }],
-    ['uuid v4 shape', V4, { provider: 'claude', source: 'id-shape' }],
-    ['short hex shape', '417e8345', { provider: 'amplifier', source: 'id-shape' }],
-  ] as const)('%s', (_label, input, expected) => {
-    expect(parseResumeInput(input).hint).toEqual(expected)
-  })
-
-  it('returns null hint for garbage', () => {
-    expect(parseResumeInput('nothing to see').hint).toBeNull()
+  it.each(cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
+    const parsed = parseResumeInput(c.input)
+    expect(parsed.candidates).toEqual(c.candidates)
+    expect(parsed.hint).toEqual(c.hint)
   })
 })
