@@ -305,92 +305,233 @@ async fn enforce_activation_gate(
     response
 }
 
-/// Atomically replace `path` with compact JSON and fsync both the file and its
-/// containing directory. The caller owns directory creation; a missing or
-/// unwritable parent is a startup/activation failure, never a silent fallback.
-fn publish_durable_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    use std::io::Write;
+trait DurablePublishOps {
+    fn write_and_sync_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn sync_parent(&self, parent: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
 
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "deployment receipt path has no parent",
-        )
-    })?;
+struct RealDurablePublishOps;
+
+impl DurablePublishOps for RealDurablePublishOps {
+    fn write_and_sync_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn sync_parent(&self, parent: &Path) -> std::io::Result<()> {
+        std::fs::File::open(parent)?.sync_all()
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Result of a failed durable publication.
+///
+/// `RolledBack` means no authoritative target remains and that absence was
+/// durably synced when publication had already reached the rename boundary.
+/// `Ambiguous` means cleanup or its sync could not be proven. For activation,
+/// the server stays gated and exits with this distinct classification.
+///
+/// Recovery contract: `activated.json` alone is never sufficient commit
+/// authority. Task 5's controller must also have its own durable
+/// `activation_confirmed` journal phase. Without that phase, any uncertain
+/// receipt is fail-closed even if valid JSON is visible after a storage error.
+#[derive(Debug)]
+enum DurablePublishError {
+    RolledBack {
+        phase: &'static str,
+        cause: String,
+    },
+    Ambiguous {
+        phase: &'static str,
+        publish_cause: String,
+        cleanup_cause: String,
+    },
+}
+
+impl std::fmt::Display for DurablePublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RolledBack { phase, cause } => {
+                write!(
+                    formatter,
+                    "durable publication rolled_back during {phase}: {cause}"
+                )
+            }
+            Self::Ambiguous {
+                phase,
+                publish_cause,
+                cleanup_cause,
+            } => write!(
+                formatter,
+                "durable publication storage_ambiguous after {phase}: \
+                 publication failed: {publish_cause}; cleanup proof failed: {cleanup_cause}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurablePublishError {}
+
+/// Atomically replace `path` with compact JSON and fsync both the file and its
+/// containing directory. A post-rename sync failure triggers removal plus a
+/// second parent-directory sync. If either cleanup step is uncertain, the
+/// result is explicitly [`DurablePublishError::Ambiguous`], never success.
+fn publish_durable_json<T: Serialize>(path: &Path, value: &T) -> Result<(), DurablePublishError> {
+    publish_durable_json_with_ops(path, value, &RealDurablePublishOps)
+}
+
+fn publish_durable_json_with_ops<T: Serialize>(
+    path: &Path,
+    value: &T,
+    ops: &dyn DurablePublishOps,
+) -> Result<(), DurablePublishError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DurablePublishError::RolledBack {
+            phase: "validate_path",
+            cause: "deployment receipt path has no parent".to_string(),
+        })?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "deployment receipt path has no UTF-8 filename",
-            )
+        .ok_or_else(|| DurablePublishError::RolledBack {
+            phase: "validate_path",
+            cause: "deployment receipt path has no UTF-8 filename".to_string(),
         })?;
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut bytes = serde_json::to_vec(value).map_err(|error| DurablePublishError::RolledBack {
+        phase: "serialize",
+        cause: error.to_string(),
+    })?;
+    bytes.push(b'\n');
     let temporary = parent.join(format!(
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
         Uuid::new_v4()
     ));
 
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        std::fs::File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    if let Err(error) = ops.write_and_sync_new(&temporary, &bytes) {
+        let _ = ops.remove_file(&temporary);
+        return Err(DurablePublishError::RolledBack {
+            phase: "file_sync",
+            cause: error.to_string(),
+        });
     }
-    result
+    if let Err(error) = ops.rename(&temporary, path) {
+        let _ = ops.remove_file(&temporary);
+        return Err(DurablePublishError::RolledBack {
+            phase: "rename",
+            cause: error.to_string(),
+        });
+    }
+    let publish_error = match ops.sync_parent(parent) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match ops.remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => {
+            return Err(DurablePublishError::Ambiguous {
+                phase: "parent_sync",
+                publish_cause: publish_error.to_string(),
+                cleanup_cause: format!("remove final receipt: {cleanup_error}"),
+            });
+        }
+    }
+    match ops.sync_parent(parent) {
+        Ok(()) => Err(DurablePublishError::RolledBack {
+            phase: "parent_sync",
+            cause: publish_error.to_string(),
+        }),
+        Err(cleanup_error) => Err(DurablePublishError::Ambiguous {
+            phase: "parent_sync",
+            publish_cause: publish_error.to_string(),
+            cleanup_cause: format!("sync receipt removal: {cleanup_error}"),
+        }),
+    }
 }
+
+#[derive(Debug)]
+enum ActivationError {
+    Authorization(String),
+    Publication(DurablePublishError),
+}
+
+impl std::fmt::Display for ActivationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authorization(message) => write!(formatter, "{message}"),
+            Self::Publication(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ActivationError {}
 
 fn try_activate(
     activation: &ActivationFiles,
     receipt: &DeploymentReceipt,
     gate: &ActivationGate,
-) -> Result<ActivationPoll, String> {
+) -> Result<ActivationPoll, ActivationError> {
+    try_activate_with_ops(activation, receipt, gate, &RealDurablePublishOps)
+}
+
+fn try_activate_with_ops(
+    activation: &ActivationFiles,
+    receipt: &DeploymentReceipt,
+    gate: &ActivationGate,
+    ops: &dyn DurablePublishOps,
+) -> Result<ActivationPoll, ActivationError> {
     let bytes = match std::fs::read(&activation.authorization_file) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ActivationPoll::Waiting);
         }
         Err(error) => {
-            return Err(format!(
+            return Err(ActivationError::Authorization(format!(
                 "read activation authorization {}: {error}",
                 activation.authorization_file.display()
-            ));
+            )));
         }
     };
     let authorization: ActivationAuthorization =
         serde_json::from_slice(&bytes).map_err(|error| {
-            format!(
+            ActivationError::Authorization(format!(
                 "parse activation authorization {}: {error}",
                 activation.authorization_file.display()
-            )
+            ))
         })?;
     if authorization.schema_version != "1"
         || authorization.nonce != receipt.nonce
         || authorization.server_process_generation_id != receipt.server_process_generation_id
     {
-        return Err("activation authorization does not match nonce and generation".to_string());
+        return Err(ActivationError::Authorization(
+            "activation authorization does not match nonce and generation".to_string(),
+        ));
     }
 
-    // All fallible work ends here. Once this durable target-owned receipt
-    // exists, recovery rolls forward; the following gate flip is infallible.
-    publish_durable_json(&activation.activated_file, receipt).map_err(|error| {
-        format!(
-            "publish activated receipt {}: {error}",
-            activation.activated_file.display()
-        )
-    })?;
+    // All server-side fallible work ends here. A successful durable receipt
+    // permits this process's infallible gate flip. Controller recovery still
+    // requires its separate durable `activation_confirmed` journal phase; the
+    // receipt alone is deliberately not global commit authority.
+    publish_durable_json_with_ops(&activation.activated_file, receipt, ops)
+        .map_err(ActivationError::Publication)?;
     gate.activate();
     Ok(ActivationPoll::Activated)
 }
@@ -399,7 +540,7 @@ async fn wait_for_activation(
     activation: &ActivationFiles,
     receipt: &DeploymentReceipt,
     gate: &ActivationGate,
-) -> Result<(), String> {
+) -> Result<(), ActivationError> {
     loop {
         match try_activate(activation, receipt, gate)? {
             ActivationPoll::Waiting => {
@@ -2684,6 +2825,210 @@ mod tests {
         let path = temp.path().join("missing-parent").join("ready.json");
         assert!(publish_durable_json(&path, &deployment_receipt()).is_err());
         assert!(!path.exists());
+    }
+
+    #[derive(Default)]
+    struct FaultInjectingPublishOps {
+        fail_file_sync: bool,
+        fail_rename: bool,
+        fail_parent_sync_call: Option<usize>,
+        fail_remove: bool,
+        parent_sync_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DurablePublishOps for FaultInjectingPublishOps {
+        fn write_and_sync_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)?;
+            file.write_all(bytes)?;
+            if self.fail_file_sync {
+                return Err(std::io::Error::other("injected file sync failure"));
+            }
+            file.sync_all()
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_rename {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            std::fs::rename(from, to)
+        }
+
+        fn sync_parent(&self, parent: &Path) -> std::io::Result<()> {
+            let call = self
+                .parent_sync_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.fail_parent_sync_call == Some(call) {
+                return Err(std::io::Error::other(format!(
+                    "injected parent sync failure on call {call}"
+                )));
+            }
+            std::fs::File::open(parent)?.sync_all()
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            if self.fail_remove {
+                return Err(std::io::Error::other("injected cleanup failure"));
+            }
+            std::fs::remove_file(path)
+        }
+    }
+
+    fn activation_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (ActivationFiles, DeploymentReceipt, ActivationGate) {
+        let activation = ActivationFiles {
+            authorization_file: temp.path().join("authorize.json"),
+            activated_file: temp.path().join("activated.json"),
+        };
+        publish_durable_json(
+            &activation.authorization_file,
+            &ActivationAuthorization {
+                schema_version: "1".to_string(),
+                nonce: "nonce-123".to_string(),
+                server_process_generation_id: "generation-123".to_string(),
+            },
+        )
+        .unwrap();
+        (activation, deployment_receipt(), ActivationGate::gated())
+    }
+
+    #[test]
+    fn activation_file_sync_failure_rolls_back_without_opening_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        let ops = FaultInjectingPublishOps {
+            fail_file_sync: true,
+            ..Default::default()
+        };
+
+        let error = try_activate_with_ops(&activation, &receipt, &gate, &ops).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationError::Publication(DurablePublishError::RolledBack { .. })
+        ));
+        assert!(!activation.activated_file.exists());
+        assert!(gate.is_gated(), "ordinary traffic must remain closed");
+    }
+
+    #[test]
+    fn activation_rename_failure_rolls_back_without_opening_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        let ops = FaultInjectingPublishOps {
+            fail_rename: true,
+            ..Default::default()
+        };
+
+        let error = try_activate_with_ops(&activation, &receipt, &gate, &ops).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationError::Publication(DurablePublishError::RolledBack { .. })
+        ));
+        assert!(!activation.activated_file.exists());
+        assert!(gate.is_gated(), "ordinary traffic must remain closed");
+    }
+
+    #[test]
+    fn activation_parent_sync_failure_removes_receipt_and_durably_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        let ops = FaultInjectingPublishOps {
+            fail_parent_sync_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = try_activate_with_ops(&activation, &receipt, &gate, &ops).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationError::Publication(DurablePublishError::RolledBack { .. })
+        ));
+        assert_eq!(
+            ops.parent_sync_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the cleanup removal must be followed by its own parent-directory sync"
+        );
+        assert!(!activation.activated_file.exists());
+        assert!(gate.is_gated(), "ordinary traffic must remain closed");
+    }
+
+    #[test]
+    fn activation_cleanup_failure_is_storage_ambiguous_and_receipt_alone_is_not_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        let ops = FaultInjectingPublishOps {
+            fail_parent_sync_call: Some(1),
+            fail_remove: true,
+            ..Default::default()
+        };
+
+        let error = try_activate_with_ops(&activation, &receipt, &gate, &ops).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationError::Publication(DurablePublishError::Ambiguous { .. })
+        ));
+        assert!(
+            activation.activated_file.exists(),
+            "fault models a valid receipt left visible after rename"
+        );
+        assert!(
+            gate.is_gated(),
+            "a visible uncertain receipt must never open ordinary traffic"
+        );
+        assert!(
+            error.to_string().contains("storage_ambiguous"),
+            "the server/controller boundary must report the distinct fail-closed classification"
+        );
+    }
+
+    #[test]
+    fn activation_cleanup_parent_sync_failure_is_storage_ambiguous_and_stays_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        let ops = FaultInjectingPublishOps {
+            fail_parent_sync_call: Some(2),
+            ..Default::default()
+        };
+
+        // The first call is the post-rename sync, so force it to fail too by
+        // wrapping an implementation whose first and second calls both fail.
+        struct BothParentSyncsFail(FaultInjectingPublishOps);
+        impl DurablePublishOps for BothParentSyncsFail {
+            fn write_and_sync_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+                self.0.write_and_sync_new(path, bytes)
+            }
+            fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+                self.0.rename(from, to)
+            }
+            fn sync_parent(&self, _parent: &Path) -> std::io::Result<()> {
+                let call = self
+                    .0
+                    .parent_sync_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                Err(std::io::Error::other(format!(
+                    "injected parent sync failure on call {call}"
+                )))
+            }
+            fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+                self.0.remove_file(path)
+            }
+        }
+        let ops = BothParentSyncsFail(ops);
+
+        let error = try_activate_with_ops(&activation, &receipt, &gate, &ops).unwrap_err();
+        assert!(matches!(
+            error,
+            ActivationError::Publication(DurablePublishError::Ambiguous { .. })
+        ));
+        assert!(!activation.activated_file.exists());
+        assert!(gate.is_gated(), "ordinary traffic must remain closed");
     }
 
     #[tokio::test]
