@@ -1,6 +1,6 @@
 use crate::activation::{
-    require_matching_receipt, require_prior_ordinary, require_target, validate_port_state,
-    ActivationDriver, ActivationReceiptObservation, PortState, ServiceState,
+    require_matching_receipt, require_prior_ordinary, validate_port_state, ActivationDriver,
+    ActivationReceiptObservation, PortState, ServiceState,
 };
 use crate::error::{DeployError, Result};
 use crate::journal::{TransactionJournal, TransactionPhase, TransactionRecord, UpdateMode};
@@ -74,25 +74,12 @@ where
     if record.phase >= TransactionPhase::ActivationAuthorized {
         match receipt {
             ActivationReceiptObservation::Present(receipt) => {
-                require_selected(driver, &record.target_generation_id)?;
                 let candidate = record.candidate.as_ref().ok_or_else(|| {
                     DeployError::Recovery(
                         "activation receipt exists without durable candidate evidence".to_string(),
                     )
                 })?;
-                require_matching_receipt(&record, candidate, &receipt)?;
-                let state = driver.observe_port(&record)?;
-                validate_port_state(&record, &state)?;
-                let process = require_target(&state, &record, ServiceState::Ordinary)?;
-                driver.verify_running(process)?;
-                driver.verify_ordinary(process)?;
-                let activated = record.advanced(TransactionPhase::Activated)?;
-                require_selected(driver, &record.target_generation_id)?;
-                journal.save(&activated)?;
-                let confirmed = activated.advanced(TransactionPhase::ActivationConfirmed)?;
-                require_selected(driver, &record.target_generation_id)?;
-                journal.save(&confirmed)?;
-                roll_forward_confirmed(journal, driver, &confirmed)?;
+                confirm_durable_activation(journal, driver, &record, candidate, &receipt)?;
                 return Ok(RecoveryOutcome::Activated);
             }
             ActivationReceiptObservation::Absent => {
@@ -139,36 +126,9 @@ where
                                 ActivationReceiptObservation::Present(receipt),
                                 ActivationReceiptObservation::Absent,
                             ) => {
-                                require_matching_receipt(&record, candidate, &receipt)?;
-                                require_selected(driver, &record.target_generation_id)?;
-                                let state = driver.observe_port(&record)?;
-                                let process =
-                                    match require_target(&state, &record, ServiceState::Ordinary) {
-                                        Ok(process) => process,
-                                        Err(_)
-                                            if matches!(
-                                                state,
-                                                PortState::Target {
-                                                    service: ServiceState::Gated,
-                                                    ..
-                                                }
-                                            ) && Instant::now() < deadline =>
-                                        {
-                                            std::thread::sleep(Duration::from_millis(25));
-                                            continue;
-                                        }
-                                        Err(error) => return Err(error),
-                                    };
-                                driver.verify_running(process)?;
-                                driver.verify_ordinary(process)?;
-                                let activated = record.advanced(TransactionPhase::Activated)?;
-                                require_selected(driver, &record.target_generation_id)?;
-                                journal.save(&activated)?;
-                                let confirmed =
-                                    activated.advanced(TransactionPhase::ActivationConfirmed)?;
-                                require_selected(driver, &record.target_generation_id)?;
-                                journal.save(&confirmed)?;
-                                roll_forward_confirmed(journal, driver, &confirmed)?;
+                                confirm_durable_activation(
+                                    journal, driver, &record, candidate, &receipt,
+                                )?;
                                 return Ok(RecoveryOutcome::Activated);
                             }
                             (
@@ -224,6 +184,27 @@ where
 
     rollback(journal, driver, &record)?;
     Ok(RecoveryOutcome::RolledBack)
+}
+
+fn confirm_durable_activation<J, D>(
+    journal: &mut J,
+    driver: &mut D,
+    record: &TransactionRecord,
+    candidate: &crate::probe::CandidateEvidence,
+    receipt: &crate::probe::DeploymentReadyReceipt,
+) -> Result<()>
+where
+    J: TransactionJournal,
+    D: ActivationDriver,
+{
+    require_matching_receipt(record, candidate, receipt)?;
+    require_selected(driver, &record.target_generation_id)?;
+    let activated = record.advanced(TransactionPhase::Activated)?;
+    journal.save(&activated)?;
+    require_selected(driver, &record.target_generation_id)?;
+    let confirmed = activated.advanced(TransactionPhase::ActivationConfirmed)?;
+    journal.save(&confirmed)?;
+    roll_forward_confirmed(journal, driver, &confirmed)
 }
 
 pub(crate) fn reconcile_pending_launch<J, D>(

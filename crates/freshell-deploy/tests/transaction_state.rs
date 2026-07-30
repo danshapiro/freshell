@@ -1481,7 +1481,7 @@ fn precommit_recovery_covers_each_stop_start_and_pointer_crash_window() {
 }
 
 #[test]
-fn an_unconfirmed_visible_receipt_is_never_commit_authority_by_itself() {
+fn exact_durable_activation_receipt_commits_even_after_candidate_exit() {
     let mut record = prepared_record(UpdateMode::Server, 3514);
     record.phase = TransactionPhase::ActivationAuthorized;
     record.candidate = Some(candidate(TARGET_ID, 5102, 3514));
@@ -1496,18 +1496,24 @@ fn an_unconfirmed_visible_receipt_is_never_commit_authority_by_itself() {
 
     let result = ActivationController::new(&mut journal, &mut driver).recover();
 
-    assert!(result.is_err());
+    assert_eq!(result.unwrap(), RecoveryOutcome::Activated);
     assert_eq!(
         journal.record.as_ref().unwrap().phase,
-        TransactionPhase::ActivationAuthorized
+        TransactionPhase::ActivationConfirmed
     );
+    assert!(journal.record.as_ref().unwrap().finalized);
     assert_eq!(driver.selected, TARGET_ID);
     assert!(
-        !driver
+        driver
             .events
             .iter()
-            .any(|event| matches!(event, Event::Stop(_) | Event::Switch(_, _))),
-        "ambiguous receipt state must neither signal nor rewrite current"
+            .any(|event| matches!(event, Event::StartOrdinary(_))),
+        "a committed target whose original process exited must relaunch the exact target generation"
+    );
+    assert_eq!(driver.live.selected_generation_id, TARGET_ID);
+    assert_eq!(
+        driver.live.running_server_generation_id.as_deref(),
+        Some(TARGET_ID)
     );
 }
 

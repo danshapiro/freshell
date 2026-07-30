@@ -267,6 +267,29 @@ function isRecordedProcessRunning(identity: RecordedProcessIdentity) {
   }
 }
 
+async function stopRecordedProcess(
+  identity: RecordedProcessIdentity,
+  label: string,
+  timeout = 20_000,
+) {
+  if (!isRecordedProcessRunning(identity)) return
+  process.kill(identity.pid, 'SIGTERM')
+  const gracefulDeadline = Date.now() + timeout / 2
+  while (Date.now() < gracefulDeadline && isRecordedProcessRunning(identity)) {
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  }
+  if (isRecordedProcessRunning(identity)) {
+    process.kill(identity.pid, 'SIGKILL')
+  }
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline && isRecordedProcessRunning(identity)) {
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  }
+  if (isRecordedProcessRunning(identity)) {
+    throw new Error(`${label} did not exit: ${processIdentityKey(identity)}`)
+  }
+}
+
 async function waitForPortFree(port: number, timeout = 20_000) {
   const deadline = Date.now() + timeout
   while (Date.now() < deadline) {
@@ -1308,6 +1331,8 @@ describe('real deployment controller boundary', () => {
           activated: false,
           live: false,
           finalized: false,
+          interruptPriorRelaunch: true,
+          stopCandidateAfterReceipt: false,
         },
         {
           name: 'pointer-switch',
@@ -1316,6 +1341,8 @@ describe('real deployment controller boundary', () => {
           activated: false,
           live: false,
           finalized: false,
+          interruptPriorRelaunch: false,
+          stopCandidateAfterReceipt: false,
         },
         {
           name: 'target-owned-receipt',
@@ -1324,6 +1351,8 @@ describe('real deployment controller boundary', () => {
           activated: true,
           live: false,
           finalized: false,
+          interruptPriorRelaunch: false,
+          stopCandidateAfterReceipt: true,
         },
         {
           name: 'live-receipt',
@@ -1332,6 +1361,8 @@ describe('real deployment controller boundary', () => {
           activated: true,
           live: true,
           finalized: false,
+          interruptPriorRelaunch: false,
+          stopCandidateAfterReceipt: false,
         },
         {
           name: 'finalization',
@@ -1340,6 +1371,8 @@ describe('real deployment controller boundary', () => {
           activated: true,
           live: true,
           finalized: true,
+          interruptPriorRelaunch: false,
+          stopCandidateAfterReceipt: false,
         },
       ] as const
       for (const boundary of boundaries) {
@@ -1390,6 +1423,19 @@ describe('real deployment controller boundary', () => {
           boundary.name,
         ).toBe(boundary.live)
 
+        if (boundary.stopCandidateAfterReceipt) {
+          await stopRecordedProcess(
+            interrupted.candidate.process,
+            'receipt-publishing target candidate',
+          )
+          await waitForHttp(port, 'down')
+          await waitForPortFree(port)
+          expect(
+            readFileSync(interrupted.controls.activatedFile, 'utf8'),
+            boundary.name,
+          ).toBe(activationReceiptBytes)
+        }
+
         if (boundary.name === 'pre-commit') {
           writeFileSync(
             path.join(realCheckout, '.env'),
@@ -1409,6 +1455,35 @@ describe('real deployment controller boundary', () => {
           )
         }
 
+        if (boundary.interruptPriorRelaunch) {
+          await expect(
+            checkedAsync(controller, ['bootstrap-status', ...common], {
+              cwd: realCheckout,
+              env: {
+                ...realEnvironment,
+                FRESHELL_DESTRUCTIVE_SANDBOX: '1',
+                FRESHELL_DEPLOY_TEST_INTERRUPT_AFTER: 'prior-relaunch-binding',
+              },
+              timeout: 300_000,
+            }),
+          ).rejects.toThrow()
+          const rebound = JSON.parse(
+            readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+          )
+          const priorAttempt = rebound.launchAttempts.at(-1)
+          expect(priorAttempt.lane, boundary.name).toBe('prior_rollback')
+          expect(priorAttempt.state.status, boundary.name).toBe('started')
+          rememberProcess(knownProcesses, priorAttempt.state.processIdentity)
+          expect(
+            isRecordedProcessRunning(priorAttempt.state.processIdentity),
+            boundary.name,
+          ).toBe(true)
+          expect(
+            path.basename(readlinkSync(path.join(portRoot, 'current'))),
+            boundary.name,
+          ).toBe(rebound.priorGenerationId)
+        }
+
         expect(
           (await checkedAsync(controller, ['bootstrap-status', ...common], {
             cwd: realCheckout,
@@ -1425,10 +1500,25 @@ describe('real deployment controller boundary', () => {
         rememberProcess(knownProcesses, recoveredLive.processIdentity)
 
         if (boundary.activated) {
-          expect(recoveredLive.processIdentity, boundary.name)
-            .toEqual(interrupted.candidate.process)
-          expect(recovered.launchAttempts, boundary.name)
-            .toEqual(interrupted.launchAttempts)
+          if (boundary.stopCandidateAfterReceipt) {
+            expect(recoveredLive.processIdentity, boundary.name)
+              .not.toEqual(interrupted.candidate.process)
+            expect(isRecordedProcessRunning(interrupted.candidate.process), boundary.name)
+              .toBe(false)
+            expect(
+              recovered.launchAttempts.map((attempt: any) => attempt.lane),
+              boundary.name,
+            ).toEqual(['target_gated', 'target_roll_forward'])
+            expect(
+              recovered.launchAttempts.at(-1).state.processIdentity,
+              boundary.name,
+            ).toEqual(recoveredLive.processIdentity)
+          } else {
+            expect(recoveredLive.processIdentity, boundary.name)
+              .toEqual(interrupted.candidate.process)
+            expect(recovered.launchAttempts, boundary.name)
+              .toEqual(interrupted.launchAttempts)
+          }
           expect(readFileSync(interrupted.controls.activatedFile, 'utf8'), boundary.name)
             .toBe(activationReceiptBytes)
           expect(
@@ -1439,8 +1529,10 @@ describe('real deployment controller boundary', () => {
             recovered.launchAttempts.map((attempt: any) => attempt.lane),
             boundary.name,
           ).not.toContain('prior_rollback')
-          expect(isRecordedProcessRunning(interrupted.candidate.process), boundary.name)
-            .toBe(true)
+          expect(
+            isRecordedProcessRunning(recoveredLive.processIdentity),
+            boundary.name,
+          ).toBe(true)
         } else {
           expect(recovered.phase, boundary.name).toBe('rollback_complete')
           expect(recoveredLive.selectedGenerationId, boundary.name)

@@ -85,6 +85,7 @@ where
                     )
                 })?;
                 validate_relaunched_process(&working, &process, true)?;
+                crate::sandbox_interrupt::interrupt_after("prior-relaunch-binding", &working);
                 (process, true)
             }
             PortState::Prior {

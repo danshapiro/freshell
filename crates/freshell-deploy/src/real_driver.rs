@@ -47,6 +47,18 @@ enum ExpectedProcessObservation {
     Foreign,
 }
 
+fn distinct_expected_processes<'a>(
+    processes: impl IntoIterator<Item = &'a ProcessIdentity>,
+) -> Vec<&'a ProcessIdentity> {
+    let mut distinct = Vec::new();
+    for process in processes {
+        if !distinct.contains(&process) {
+            distinct.push(process);
+        }
+    }
+    distinct
+}
+
 pub struct RealActivationDriver<'store, 'lock> {
     store: &'store Store,
     locked: &'lock LockedStore<'store>,
@@ -420,25 +432,18 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
     }
 
     fn observe_port(&mut self, record: &TransactionRecord) -> Result<PortState> {
-        let mut expected_processes = Vec::new();
-        for process in [
-            Some(record.expected_prior_process()),
-            record
-                .candidate
-                .as_ref()
-                .map(|candidate| &candidate.process),
-            record.active_relaunch_process(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !expected_processes
-                .iter()
-                .any(|expected: &&ProcessIdentity| expected.pid == process.pid)
-            {
-                expected_processes.push(process);
-            }
-        }
+        let expected_processes = distinct_expected_processes(
+            [
+                Some(record.expected_prior_process()),
+                record
+                    .candidate
+                    .as_ref()
+                    .map(|candidate| &candidate.process),
+                record.active_relaunch_process(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
 
         let mut observed_occupied = false;
         for expected in expected_processes {
@@ -467,7 +472,16 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
                 }
             }
             if record.active_relaunch_process() == Some(&*process) {
-                return Ok(PortState::TargetRelaunch { process: *process });
+                return match record.active_relaunch_lane() {
+                    Some(LaunchLane::PriorRollback) => Ok(PortState::Prior {
+                        process: *process,
+                        service: ServiceState::Ordinary,
+                    }),
+                    Some(LaunchLane::TargetRollForward) => {
+                        Ok(PortState::TargetRelaunch { process: *process })
+                    }
+                    Some(LaunchLane::TargetGated) | None => Ok(PortState::Foreign),
+                };
             }
             return Ok(PortState::Foreign);
         }
@@ -870,5 +884,64 @@ pub(crate) fn runtime_from_bindings(
             .join(&bindings.production_node_modules)
             .display()
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::distinct_expected_processes;
+    use crate::paths::DeployPort;
+    use crate::process_identity::{
+        FileIdentity, ListenerIdentity, ProcessIdentity, RuntimeProvenance,
+    };
+
+    fn identity(
+        pid: u32,
+        birth: &str,
+        executable_inode: &str,
+        socket_inode: &str,
+    ) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            kernel_boot_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            start_time_ticks: birth.to_string(),
+            executable: FileIdentity {
+                device: "2049".to_string(),
+                inode: executable_inode.to_string(),
+                sha256: "a".repeat(64),
+                mode: 0o555,
+            },
+            listener: ListenerIdentity {
+                port: DeployPort::new(43_127).unwrap(),
+                socket_inode: socket_inode.to_string(),
+                owner_pid: pid,
+                network_namespace: "net:[4026533111]".to_string(),
+            },
+            cwd: "/tmp/generation".to_string(),
+            argv0: "freshell-server".to_string(),
+            argument_count: 1,
+            effective_uid: unsafe { libc::geteuid() },
+            runtime: RuntimeProvenance {
+                client_dir: "/tmp/current/client".to_string(),
+                extensions_dir: "/tmp/generation/extensions".to_string(),
+                dist_server_dir: "/tmp/generation/dist/server".to_string(),
+                mcp_entry: "/tmp/generation/dist/server/mcp/server.js".to_string(),
+                claude_sidecar_entry: "/tmp/generation/sidecar/index.mjs".to_string(),
+                node_executable: "/usr/bin/node".to_string(),
+                package_json: "/tmp/generation/package.json".to_string(),
+                package_lock: "/tmp/generation/package-lock.json".to_string(),
+                production_node_modules: "/tmp/generation/node_modules".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn expected_processes_keep_same_pid_with_distinct_birth_and_listener_identity() {
+        let stale = identity(41_337, "100", "200", "300");
+        let reused = identity(41_337, "101", "201", "301");
+
+        let distinct = distinct_expected_processes([&stale, &reused, &reused]);
+
+        assert_eq!(distinct, vec![&stale, &reused]);
     }
 }

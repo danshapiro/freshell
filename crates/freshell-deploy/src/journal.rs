@@ -687,6 +687,15 @@ impl TransactionRecord {
         self.relaunch_attempts.last()
     }
 
+    pub(crate) fn active_relaunch_lane(&self) -> Option<LaunchLane> {
+        let active = self.active_relaunch_process()?;
+        self.launch_attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.process_identity() == Some(active))
+            .map(|attempt| attempt.lane)
+    }
+
     pub(crate) fn pending_launch_attempt(&self) -> Option<&LaunchAttempt> {
         self.launch_attempts
             .last()

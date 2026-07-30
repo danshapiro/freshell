@@ -585,10 +585,10 @@ fn try_activate_with_ops(
         std::process::exit(86);
     }
 
-    // All server-side fallible work ends here. A successful durable receipt
-    // permits this process's infallible gate flip. Controller recovery still
-    // requires its separate durable `activation_confirmed` journal phase; the
-    // receipt alone is deliberately not global commit authority.
+    // All server-side fallible work ends here. This exact durable target-owned
+    // receipt is the deployment commit boundary: controller recovery may
+    // confirm it and relaunch this generation even if this process exits after
+    // publication. The gate flip itself remains infallible.
     publish_durable_json_with_ops(&activation.activated_file, receipt, ops)
         .map_err(ActivationError::Publication)?;
     gate.activate();
