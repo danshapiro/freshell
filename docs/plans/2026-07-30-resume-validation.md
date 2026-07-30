@@ -48,9 +48,10 @@ Ground truth gathered by three independent investigations of the worktree and
 main. An implementer should trust-but-spot-check line numbers (they drift);
 the structural facts are load-bearing.
 
-**The branch** (18 commits `0d877c1f2..948e52b5f`, forked from `ca1a60d3`,
-+5648/−83 across 26 code files; the tip `948e52b5f` is the docs-only commit
-adding this plan):
+**The branch** (19 commits `0d877c1f2..0e077fd4b`, forked from `ca1a60d3`,
++5648/−83 across 26 code files; the top two commits are docs-only —
+`948e52b5f` adds this plan, and the tip `0e077fd4b` hardens it with the
+validation-pass findings):
 
 - Door 1 (WS `terminal.create` restore): `crates/freshell-ws/src/terminal.rs:1799–1885` inside `handle_create` (@1412), keyed on `resume_id_from_wire`; must sit AFTER the D7 liveness guard and BEFORE the amplifier `ensure_session` re-stub. Emits `notice:` on the `TerminalCreated` frame (~:2704).
 - Door 2 (auto-resume respawn): `terminal.rs:2810–2884` inside `respawn_agent_terminal` (@2779); replaces the locals so post-spawn bookkeeping records the fresh id; rekeys `ensure_session` from `req.session_id` to the gate-validated local (:3005–3024). No `notice` — broadcasts `terminal.status{Recovering, reason}`.
@@ -133,10 +134,10 @@ git status --short            # MUST be empty; halt if not
 git fetch origin
 git rev-parse origin/main     # MUST print 39010cb57... ; halt if not
 git branch backup/resume-validation-pre-rebase-2026-07-30
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 18 (17 feature commits + the docs-only plan commit 948e52b5f at the tip)
+git log --oneline ca1a60d3..HEAD | wc -l   # expect 19 (17 feature commits + 2 docs-only plan commits: 948e52b5f adds this plan, 0e077fd4b hardens it)
 ```
 
-Expected: clean tree, `39010cb57…`, `18`. If `origin/main` moved past
+Expected: clean tree, `39010cb57…`, `19`. If `origin/main` moved past
 `39010cb57`, STOP and surface it — the spec pins this exact target.
 
 - [ ] **Step 2: Confirm the fmt-sweep commit is adjacent to its parent**
@@ -160,7 +161,7 @@ fixup discards only the `style:` message; its content survives inside #14.
 
 ```bash
 GIT_SEQUENCE_EDITOR='sed -i "s/^pick 2b5f46c6e/fixup 2b5f46c6e/"' git rebase -i ca1a60d3
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 17
+git log --oneline ca1a60d3..HEAD | wc -l   # expect 18
 ```
 
 Expected: rebase completes with no conflicts (pure history rewrite of adjacent
@@ -352,7 +353,8 @@ fixed in this task before committing.
 
 - [ ] **Step 9: Commit the reconciliation residue**
 
-The replayed 16 commits are already committed by the rebase. Commit the Step 7
+The 18 replayed commits (17 post-fold feature/docs commits, or 19 if Step 3's
+fold was skipped per its fallback) are already committed by the rebase. Commit the Step 7
 initializer fixes + Step 8 fmt as one focused commit:
 
 ```bash
@@ -368,7 +370,7 @@ harnesses and literals after replaying onto origin/main."
 If Step 7 required zero changes, skip this commit (the rebase alone is the
 deliverable; `git log` shows the replayed commits atop `39010cb57`).
 
-Final check: `git log --oneline origin/main..HEAD | wc -l` prints 17 or 18,
+Final check: `git log --oneline origin/main..HEAD | wc -l` prints 18 or 19,
 and `git merge-base origin/main HEAD` prints `39010cb57…`.
 
 ---
@@ -1073,7 +1075,7 @@ fix, commit, re-run Step 4. Rust-side baselines were verified green on main
 
 ```bash
 git status --short                          # empty
-git log --oneline origin/main..HEAD         # 17–23 commits, all *(resume-validation)* scoped
+git log --oneline origin/main..HEAD         # 18–24 commits, all *(resume-validation)* scoped
 git merge-base origin/main HEAD             # 39010cb57...
 git log -1 --format='%an <%ae>'             # Dan Shapiro <3732858+danshapiro@users.noreply.github.com>
 ```
@@ -1108,7 +1110,9 @@ left local and verified — that is the stop condition.
 The plan's load-bearing assumptions were validated (ledger:
 `.worktrees/.the-usual-logs/resume-validation/load-bearing-ledger.md`):
 9 verified, 2 falsified and fixed in this revision (branch commit counts —
-now 18/17/"17 or 18" including the docs plan commit; Task 2's observation
+now 19/18/"18 or 19" including the two docs plan commits (`948e52b5f` adds
+this plan, `0e077fd4b` hardens it — the fresh-eyes pass caught that the
+hardening commit itself was omitted from the counts); Task 2's observation
 mechanism — rewritten to main's `RecordingBinder` seam since PIN 2 is
 binder-gated and unobservable via any ledger query), 1 accepted residual
 (no npm-side baseline record on this host — mitigated by Task 7's
