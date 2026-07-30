@@ -17,6 +17,14 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+DEFINITION_SHA256="$(
+  sha256sum \
+    "${REPO_ROOT}/docker/sandbox/Dockerfile" \
+    "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
+  | awk '{print $1}' \
+  | sha256sum \
+  | awk '{print $1}'
+)"
 
 MOUNT_CORPUS=0
 if [ "${1:-}" = "--corpus" ]; then
@@ -30,8 +38,14 @@ if [ "$#" -lt 1 ]; then
 fi
 CMD="$1"
 
-if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
-  echo "[sandbox] image ${IMAGE_TAG} not found, building it first..." >&2
+IMAGE_DEFINITION_SHA256="$(
+  docker image inspect \
+    --format '{{ index .Config.Labels "com.freshell.sandbox-definition-sha256" }}' \
+    "${IMAGE_TAG}" 2>/dev/null \
+  || true
+)"
+if [ "${IMAGE_DEFINITION_SHA256}" != "${DEFINITION_SHA256}" ]; then
+  echo "[sandbox] image ${IMAGE_TAG} is missing or stale; rebuilding for definition ${DEFINITION_SHA256}..." >&2
   "${REPO_ROOT}/scripts/sandbox-build.sh"
 fi
 

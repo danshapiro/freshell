@@ -77,6 +77,9 @@ COPY --chmod=755 entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 
 WORKDIR /workspace
 
+ARG FRESHELL_SANDBOX_DEFINITION_SHA256
+LABEL com.freshell.sandbox-definition-sha256="${FRESHELL_SANDBOX_DEFINITION_SHA256}"
+
 # The container starts as root (not USER sandbox): named volumes Docker
 # creates fresh at runtime (cargo registry/git, the sandbox-owned
 # node_modules/target under the bind-mounted /workspace) are root-owned by

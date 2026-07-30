@@ -36,10 +36,18 @@ for dir in "${VOLUME_DIRS[@]}"; do
   fi
 done
 
-if [ -f package-lock.json ] && [ ! -f node_modules/.sandbox-npm-ci-done ]; then
-  echo "[sandbox] populating sandbox-owned node_modules via npm ci (first use of this volume)..." >&2
-  gosu sandbox npm ci --no-audit --no-fund
-  gosu sandbox touch node_modules/.sandbox-npm-ci-done
+if [ -f package-lock.json ]; then
+  LOCK_SHA256="$(sha256sum package-lock.json | awk '{print $1}')"
+  INSTALLED_LOCK_SHA256="$(
+    cat node_modules/.sandbox-package-lock-sha256 2>/dev/null \
+    || true
+  )"
+  if [ "${INSTALLED_LOCK_SHA256}" != "${LOCK_SHA256}" ]; then
+    echo "[sandbox] refreshing sandbox-owned node_modules for package-lock ${LOCK_SHA256}..." >&2
+    gosu sandbox npm ci --no-audit --no-fund
+    printf '%s\n' "${LOCK_SHA256}" \
+      | gosu sandbox tee node_modules/.sandbox-package-lock-sha256 >/dev/null
+  fi
 fi
 
 exec gosu sandbox "$@"
