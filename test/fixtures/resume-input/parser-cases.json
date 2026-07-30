@@ -1,0 +1,199 @@
+{
+  "$comment": "SYNC-06 shared parser fixture. Consumed by test/unit/shared/resume-input-parser.test.ts AND crates/freshell-sessions/tests/resume_input_parser_parity.rs. Both implementations of the resume-input parser must pass every case. Add cases here, never inline, so the TS and Rust parsers cannot drift.",
+  "cases": [
+    {
+      "name": "bare short hex",
+      "input": "417e8345",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    },
+    {
+      "name": "bare v4 uuid",
+      "input": "ed2afda6-a340-443e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "id-shape" }
+    },
+    {
+      "name": "bare v7 uuid",
+      "input": "019fac27-69d7-78a0-b972-b339d551042e",
+      "candidates": [{ "token": "019fac27-69d7-78a0-b972-b339d551042e", "kind": "uuid" }],
+      "hint": { "provider": "codex", "source": "id-shape" }
+    },
+    {
+      "name": "bare opencode id",
+      "input": "ses_root0000000000000000000000",
+      "candidates": [{ "token": "ses_root0000000000000000000000", "kind": "prefixed-id" }],
+      "hint": { "provider": "opencode", "source": "id-shape" }
+    },
+    {
+      "name": "codex resume command",
+      "input": "codex resume 019fac27-69d7-78a0-b972-b339d551042e",
+      "candidates": [{ "token": "019fac27-69d7-78a0-b972-b339d551042e", "kind": "uuid" }],
+      "hint": { "provider": "codex", "source": "command" }
+    },
+    {
+      "name": "claude --resume command",
+      "input": "claude --resume ed2afda6-a340-443e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "command" }
+    },
+    {
+      "name": "claude -r command with prompt",
+      "input": "$ claude -r ed2afda6-a340-443e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "command" }
+    },
+    {
+      "name": "opencode --session command",
+      "input": "opencode --session ses_root0000000000000000000000",
+      "candidates": [{ "token": "ses_root0000000000000000000000", "kind": "prefixed-id" }],
+      "hint": { "provider": "opencode", "source": "command" }
+    },
+    {
+      "name": "amplifier --resume short id",
+      "input": "amplifier --resume 417e8345",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "command" }
+    },
+    {
+      "name": "quoted and padded",
+      "input": "  \"claude --resume ed2afda6-a340-443e-ba60-024a1b3554b4\"  ",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "command" }
+    },
+    {
+      "name": "backticks",
+      "input": "`417e8345`",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    },
+    {
+      "name": "id embedded in a path",
+      "input": "/home/x/.claude/projects/foo/ed2afda6-a340-443e-ba60-024a1b3554b4.jsonl",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "word" }
+    },
+    {
+      "name": "trailing punctuation",
+      "input": "session 417e8345.",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    },
+    {
+      "name": "ansi codes",
+      "input": "\u001b[32m417e8345\u001b[0m",
+      "candidates": [{ "token": "417e8345", "kind": "hex-prefix" }],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    },
+    {
+      "name": "multi-line noise",
+      "input": "To continue:\n$ codex resume 019fac27-69d7-78a0-b972-b339d551042e\nor open the app",
+      "candidates": [{ "token": "019fac27-69d7-78a0-b972-b339d551042e", "kind": "uuid" }],
+      "hint": { "provider": "codex", "source": "command" }
+    },
+    {
+      "name": "english hex-looking word",
+      "input": "decade",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "facade sentence",
+      "input": "I spent a decade behind a facade",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "hex without digits",
+      "input": "deadbeef",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "garbage",
+      "input": "hello world!! no ids here",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "orders prefixed ids, then uuids, then hex prefixes longest-first",
+      "input": "417e8345 ed2afda6-a340-443e-ba60-024a1b3554b4 ses_root0000000000000000000000 417e8345abcd",
+      "candidates": [
+        { "token": "ses_root0000000000000000000000", "kind": "prefixed-id" },
+        { "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" },
+        { "token": "417e8345abcd", "kind": "hex-prefix" },
+        { "token": "417e8345", "kind": "hex-prefix" }
+      ],
+      "hint": { "provider": "opencode", "source": "id-shape" }
+    },
+    {
+      "name": "dedupes repeated tokens case-insensitively keeping the first casing",
+      "input": "ed2afda6-a340-443e-ba60-024a1b3554b4 ED2AFDA6-A340-443E-BA60-024A1B3554B4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "id-shape" }
+    },
+    {
+      "name": "caps hex tokens at 32 chars so git shas do not match",
+      "input": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "agent word only",
+      "input": "the claude session ed2afda6-a340-443e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "word" }
+    },
+    {
+      "name": "returns null hint for prose without ids or agent words",
+      "input": "nothing to see",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "equal-length hex tokens keep text order (stable sort)",
+      "input": "417e8345 88997766",
+      "candidates": [
+        { "token": "417e8345", "kind": "hex-prefix" },
+        { "token": "88997766", "kind": "hex-prefix" }
+      ],
+      "hint": { "provider": "amplifier", "source": "id-shape" }
+    },
+    {
+      "name": "non-ses prefixed id yields no id-shape hint",
+      "input": "abc_12345678",
+      "candidates": [{ "token": "abc_12345678", "kind": "prefixed-id" }],
+      "hint": null
+    },
+    {
+      "name": "uuid version other than 4 or 7 yields no id-shape hint",
+      "input": "ed2afda6-a340-143e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-143e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": null
+    },
+    {
+      "name": "uppercase uuid token is preserved as written",
+      "input": "ED2AFDA6-A340-443E-BA60-024A1B3554B4",
+      "candidates": [{ "token": "ED2AFDA6-A340-443E-BA60-024A1B3554B4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "id-shape" }
+    },
+    {
+      "name": "seven hex chars are not a candidate",
+      "input": "417e834",
+      "candidates": [],
+      "hint": null
+    },
+    {
+      "name": "claude -rf does not match the -r command shape but the word still hints",
+      "input": "claude -rf ed2afda6-a340-443e-ba60-024a1b3554b4",
+      "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
+      "hint": { "provider": "claude", "source": "word" }
+    }
+  ]
+}
