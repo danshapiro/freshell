@@ -22,12 +22,29 @@ import { createHash } from 'node:crypto'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 
+function isStrictlyBeneath(root: string, candidate: string) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate))
+  return (
+    relative !== ''
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative)
+  )
+}
+
+function isAtOrBeneath(root: string, candidate: string) {
+  return (
+    path.resolve(root) === path.resolve(candidate)
+    || isStrictlyBeneath(root, candidate)
+  )
+}
+
 if (process.env.FRESHELL_DESTRUCTIVE_SANDBOX !== '1') {
   throw new Error(
     'launch-rust deployment tests are destructive and require FRESHELL_DESTRUCTIVE_SANDBOX=1',
   )
 }
-if (!path.resolve(os.tmpdir()).startsWith('/tmp')) {
+if (!isAtOrBeneath('/tmp', os.tmpdir())) {
   throw new Error(`sandbox test outputs must be rooted beneath container /tmp, got ${os.tmpdir()}`)
 }
 
@@ -46,6 +63,40 @@ type FixtureState = {
 let fixtureRoot = ''
 let checkout = ''
 let environment: NodeJS.ProcessEnv
+
+type RecordedProcessIdentity = {
+  pid: number
+  kernelBootId: string
+  startTimeTicks: string
+}
+
+function processIdentityKey(identity: RecordedProcessIdentity) {
+  return `${identity.pid}:${identity.kernelBootId}:${identity.startTimeTicks}`
+}
+
+function rememberProcess(
+  processes: Map<string, RecordedProcessIdentity>,
+  identity: RecordedProcessIdentity,
+) {
+  processes.set(processIdentityKey(identity), {
+    pid: identity.pid,
+    kernelBootId: identity.kernelBootId,
+    startTimeTicks: identity.startTimeTicks,
+  })
+}
+
+function readProcessIdentity(pid: number): RecordedProcessIdentity {
+  const kernelBootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+  const commandEnd = stat.lastIndexOf(')')
+  if (commandEnd < 0) throw new Error(`could not parse /proc/${pid}/stat`)
+  const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
+  return {
+    pid,
+    kernelBootId,
+    startTimeTicks: fieldsAfterCommand[19],
+  }
+}
 
 function run(args: string[], extraEnvironment: NodeJS.ProcessEnv = {}) {
   return spawnSync(path.join(checkout, 'scripts/launch-rust.sh'), args, {
@@ -199,16 +250,50 @@ function sha256(file: string) {
   return createHash('sha256').update(readFileSync(file)).digest('hex')
 }
 
-function isProcessAlive(pid: number) {
+function isRecordedProcessRunning(identity: RecordedProcessIdentity) {
   try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+    const actual = readProcessIdentity(identity.pid)
+    const stat = readFileSync(`/proc/${identity.pid}/stat`, 'utf8')
+    const commandEnd = stat.lastIndexOf(')')
+    const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
+    return (
+      actual.kernelBootId === identity.kernelBootId
+      && actual.startTimeTicks === identity.startTimeTicks
+      && fieldsAfterCommand[0] !== 'Z'
+    )
+  } catch {
+    return false
   }
 }
 
-function assertExactManagedGeneration(portRoot: string, live: any, port: number) {
+async function waitForPortFree(port: number, timeout = 20_000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const probe = net.createServer()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        probe.once('error', reject)
+        probe.listen(port, '127.0.0.1', resolve)
+      })
+      await new Promise<void>((resolve, reject) => {
+        probe.close((error) => error ? reject(error) : resolve())
+      })
+      return
+    } catch {
+      probe.close()
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  }
+  throw new Error(`port ${port} did not become free`)
+}
+
+function assertExactManagedGeneration(
+  portRoot: string,
+  live: any,
+  port: number,
+  expectedNode: string,
+  expectController = true,
+) {
   const generationRoot = path.join(portRoot, 'generations', live.selectedGenerationId)
   const manifest = JSON.parse(readFileSync(path.join(generationRoot, 'manifest.json'), 'utf8'))
   const fileEntries = manifest.entries.filter((entry: any) => entry.type === 'file')
@@ -217,16 +302,17 @@ function assertExactManagedGeneration(portRoot: string, live: any, port: number)
   for (const entry of fileEntries) {
     expect(sha256(path.join(generationRoot, entry.path)), entry.path).toBe(entry.sha256)
   }
-  for (const required of [
+  const requiredFiles = [
     'client/index.html',
     'server/freshell-server',
-    'controller/freshell-deploy',
     'dist/server/mcp/server.js',
     'claude-sidecar/index.mjs',
     'package.json',
     'package-lock.json',
     'node_modules/.package-lock.json',
-  ]) {
+  ]
+  if (expectController) requiredFiles.push('controller/freshell-deploy')
+  for (const required of requiredFiles) {
     expect(fileEntries.some((entry: any) => entry.path === required), required).toBe(true)
   }
   expect(fileEntries.some((entry: any) => entry.path.startsWith('extensions/'))).toBe(true)
@@ -267,6 +353,7 @@ function assertExactManagedGeneration(portRoot: string, live: any, port: number)
     packageJson: path.join(generationRoot, 'package.json'),
     packageLock: path.join(generationRoot, 'package-lock.json'),
     productionNodeModules: path.join(generationRoot, 'node_modules'),
+    nodeExecutable: expectedNode,
   }
   expect(identity.runtime).toMatchObject(expectedRuntime)
   const processEnvironment = Object.fromEntries(
@@ -283,9 +370,59 @@ function assertExactManagedGeneration(portRoot: string, live: any, port: number)
     FRESHELL_CLIENT_DIR: expectedRuntime.clientDir,
     FRESHELL_EXTENSIONS_DIR: expectedRuntime.extensionsDir,
     FRESHELL_CLAUDE_SIDECAR: expectedRuntime.claudeSidecarEntry,
+    FRESHELL_CLAUDE_NODE: expectedRuntime.nodeExecutable,
     FRESHELL_MCP_SERVER_ENTRY: expectedRuntime.mcpEntry,
     FRESHELL_DEPLOY_GENERATION_ID: live.runningServerGenerationId,
   })
+}
+
+function assertExactPrecommitRollback(
+  transaction: any,
+  priorLive: any,
+  restoredLive: any,
+) {
+  expect(transaction.phase).toBe('rollback_complete')
+  expect(transaction.finalized).toBe(true)
+  expect(transaction.launchAttempts.map((attempt: any) => attempt.lane))
+    .toEqual(['target_gated', 'prior_rollback'])
+  expect(transaction.launchAttempts.map((attempt: any) => attempt.state.status))
+    .toEqual(['started', 'started'])
+  expect(transaction.launchAttempts[0].state.processIdentity)
+    .toEqual(transaction.candidate.process)
+  expect(transaction.launchAttempts[1].state.processIdentity)
+    .toEqual(restoredLive.processIdentity)
+
+  const targetAttempt = transaction.launchAttempts[0]
+  const targetReadyFile = path.join(
+    path.dirname(targetAttempt.readyFile),
+    `${targetAttempt.attemptId}.server-ready.json`,
+  )
+  const ready = JSON.parse(readFileSync(targetReadyFile, 'utf8'))
+  const authorization = JSON.parse(
+    readFileSync(transaction.controls.authorizationFile, 'utf8'),
+  )
+  expect(ready).toEqual(transaction.candidate.ready)
+  expect(authorization).toEqual({
+    schemaVersion: '1',
+    nonce: transaction.nonce,
+    serverProcessGenerationId: transaction.targetGenerationId,
+  })
+  expect(existsSync(transaction.controls.activatedFile)).toBe(false)
+  expect(transaction.candidate.ready).toMatchObject({
+    schemaVersion: '1',
+    nonce: transaction.nonce,
+    pid: transaction.candidate.process.pid,
+    serverProcessGenerationId: transaction.targetGenerationId,
+  })
+  expect(transaction.candidate.process.listener.ownerPid)
+    .toBe(transaction.candidate.process.pid)
+  expect(isRecordedProcessRunning(priorLive.processIdentity)).toBe(false)
+  expect(isRecordedProcessRunning(transaction.candidate.process)).toBe(false)
+  expect(isRecordedProcessRunning(restoredLive.processIdentity)).toBe(true)
+  expect(restoredLive.selectedGenerationId).toBe(priorLive.selectedGenerationId)
+  expect(restoredLive.runningServerGenerationId).toBe(
+    priorLive.runningServerGenerationId,
+  )
 }
 
 function initialize(label = 'prior', options: string[] = []) {
@@ -399,8 +536,12 @@ describe('canonical launch-rust deployment wrapper', () => {
         ['run', 'typecheck:client'],
         ['run', 'build:client'],
       ])
-    expect(recorded.find((event) => event.command === 'npm' && event.args[1] === 'build:client')?.clientOut)
-      .toMatch(/^\/tmp\//)
+    expect(isStrictlyBeneath(
+      '/tmp',
+      recorded.find(
+        (event) => event.command === 'npm' && event.args[1] === 'build:client',
+      )?.clientOut ?? '',
+    )).toBe(true)
     expect(recorded.find((event) => event.command === 'controller')?.args).toContain('client-only')
     expect(existsSync(path.join(checkout, 'dist'))).toBe(false)
     expect(existsSync(path.join(checkout, 'target'))).toBe(false)
@@ -413,9 +554,12 @@ describe('canonical launch-rust deployment wrapper', () => {
       { FRESHELL_DEPLOY_BUILD_PARENT: undefined },
     )
     expect(defaultResult.status, defaultResult.stderr).toBe(0)
-    expect(
-      events().find((event) => event.command === 'npm' && event.args[1] === 'build:client')?.clientOut,
-    ).toMatch(/^\/tmp\//)
+    expect(isStrictlyBeneath(
+      '/tmp',
+      events().find(
+        (event) => event.command === 'npm' && event.args[1] === 'build:client',
+      )?.clientOut ?? '',
+    )).toBe(true)
     expect(existsSync(path.join(checkout, '.freshell-deploy', 'builds'))).toBe(false)
 
     writeFileSync(environment.FRESHELL_FIXTURE_LOG!, '')
@@ -467,7 +611,7 @@ describe('canonical launch-rust deployment wrapper', () => {
       ])
     const cargo = recorded.find((event) => event.command === 'cargo')
     expect(cargo?.args).toEqual(expect.arrayContaining(['freshell-server', 'freshell-deploy']))
-    expect(cargo?.target).toMatch(/^\/tmp\//)
+    expect(isStrictlyBeneath('/tmp', cargo?.target ?? '')).toBe(true)
     expect(recorded.find((event) => event.command === 'controller')?.args).toContain('server')
     expect(existsSync(path.join(checkout, 'dist'))).toBe(false)
     expect(existsSync(path.join(checkout, 'target'))).toBe(false)
@@ -649,15 +793,24 @@ describe('real deployment controller boundary', () => {
     const node = realpathSync(process.execPath)
     let port = await unusedPort()
     while (port === 3002) port = await unusedPort()
-    const knownPids = new Set<number>()
+    const knownProcesses = new Map<string, RecordedProcessIdentity>()
     const unrelatedSentinel = spawn(
       node,
       ['--eval', 'setInterval(() => {}, 1000)'],
       { stdio: 'ignore' },
     )
     if (!unrelatedSentinel.pid) throw new Error('unrelated sentinel did not start')
+    const unrelatedSentinelIdentity = readProcessIdentity(unrelatedSentinel.pid)
+    rememberProcess(knownProcesses, unrelatedSentinelIdentity)
+    const realEnvironment = {
+      ...process.env,
+      AUTH_TOKEN: token,
+      FRESHELL_HOME: home,
+      HOME: home,
+    }
 
-    mkdirSync(realCheckout, { recursive: true })
+    try {
+      mkdirSync(realCheckout, { recursive: true })
     mkdirSync(home)
     mkdirSync(path.join(distServer, 'mcp'), { recursive: true })
     mkdirSync(sidecar)
@@ -709,14 +862,6 @@ describe('real deployment controller boundary', () => {
         "})\n",
     )
 
-    const realEnvironment = {
-      ...process.env,
-      AUTH_TOKEN: token,
-      FRESHELL_HOME: home,
-      HOME: home,
-    }
-
-    try {
       await checkedAsync('cargo', ['build', '--quiet', '-p', 'freshell-server'], {
         env: { ...realEnvironment, CARGO_TARGET_DIR: cargoTarget },
         timeout: 240_000,
@@ -778,7 +923,8 @@ describe('real deployment controller boundary', () => {
       })
       const legacyPid = Number(readFileSync(pidFile, 'utf8').trim())
       expect(Number.isSafeInteger(legacyPid)).toBe(true)
-      knownPids.add(legacyPid)
+      const legacyProcessIdentity = readProcessIdentity(legacyPid)
+      rememberProcess(knownProcesses, legacyProcessIdentity)
       await waitForHttp(port, 'up')
 
       const common = ['--checkout', realCheckout, '--port', String(port)]
@@ -824,6 +970,36 @@ describe('real deployment controller boundary', () => {
       const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
       const liveFile = path.join(portRoot, 'live.json')
       const capturedLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
+      const legacyReceiptFile = path.join(portRoot, 'legacy.json')
+      const legacyReceiptBytes = readFileSync(legacyReceiptFile, 'utf8')
+      const legacyReceipt = JSON.parse(legacyReceiptBytes)
+      expect(legacyReceipt).toMatchObject({
+        schemaVersion: '1',
+        generationId: capturedLegacy.selectedGenerationId,
+        legacy: true,
+        process: capturedLegacy.processIdentity,
+        node: {
+          executable: node,
+          version: process.version,
+        },
+        runtime: {
+          serverExecutable: 'server/freshell-server',
+          clientDir: 'client',
+          extensionsDir: 'extensions',
+          distServerDir: 'dist/server',
+          mcpEntry: 'dist/server/mcp/server.js',
+          claudeSidecarEntry: 'claude-sidecar/index.mjs',
+          packageJson: 'package.json',
+          packageLock: 'package-lock.json',
+          productionNodeModules: 'node_modules',
+        },
+      })
+      expect(legacyReceipt.process).toEqual(capturedLegacy.processIdentity)
+      expect(legacyReceipt.launch).toEqual({
+        cwd: capturedLegacy.processIdentity.cwd,
+        argv0: capturedLegacy.processIdentity.argv0,
+        argumentCount: capturedLegacy.processIdentity.argumentCount,
+      })
       const capturedLegacyExecutableDigest = capturedLegacy.processIdentity.executable.sha256
       const failedLegacyClient = path.join(root, 'failed-legacy-client')
       cpSync(candidateClient, failedLegacyClient, { recursive: true })
@@ -855,15 +1031,24 @@ describe('real deployment controller boundary', () => {
         readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
       )
       const restoredLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
-      knownPids.add(restoredLegacy.processIdentity.pid)
+      rememberProcess(knownProcesses, restoredLegacy.processIdentity)
       if (failedLegacyTransaction.candidate?.process?.pid) {
-        knownPids.add(failedLegacyTransaction.candidate.process.pid)
+        rememberProcess(knownProcesses, failedLegacyTransaction.candidate.process)
       }
-      expect(failedLegacyTransaction.phase).toBe('rollback_complete')
-      expect(failedLegacyTransaction.finalized).toBe(true)
-      expect(failedLegacyTransaction.launchAttempts.map((attempt: any) => attempt.lane))
-        .toEqual(['target_gated', 'prior_rollback'])
-      expect(existsSync(failedLegacyTransaction.controls.activatedFile)).toBe(false)
+      assertExactPrecommitRollback(
+        failedLegacyTransaction,
+        capturedLegacy,
+        restoredLegacy,
+      )
+      expect(readFileSync(legacyReceiptFile, 'utf8')).toBe(legacyReceiptBytes)
+      expect(failedLegacyTransaction.priorNode).toEqual(legacyReceipt.node)
+      expect(failedLegacyTransaction.priorRuntime).toEqual({
+        ...restoredLegacy.processIdentity.runtime,
+        clientDir: path.join(
+          failedLegacyTransaction.priorGenerationRoot,
+          'client',
+        ),
+      })
       expect(restoredLegacy).toMatchObject({
         selectedGenerationId: capturedLegacy.selectedGenerationId,
         runningServerGenerationId: capturedLegacy.runningServerGenerationId,
@@ -891,7 +1076,8 @@ describe('real deployment controller boundary', () => {
         ),
       ).toBe(true)
       expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toContain(clientMarker)
-      expect(isProcessAlive(unrelatedSentinel.pid!)).toBe(true)
+      assertExactManagedGeneration(portRoot, restoredLegacy, port, node, false)
+      expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
 
       await checkedAsync(
         controller,
@@ -904,7 +1090,7 @@ describe('real deployment controller boundary', () => {
       expect(transaction.finalized).toBe(true)
       expect(existsSync(transaction.controls.activatedFile)).toBe(true)
       const fullLive = JSON.parse(readFileSync(liveFile, 'utf8'))
-      knownPids.add(fullLive.processIdentity.pid)
+      rememberProcess(knownProcesses, fullLive.processIdentity)
       expect(fullLive.legacy).toBe(false)
       expect(fullLive.runningServerGenerationId).toBe(fullLive.selectedGenerationId)
       expect(port).not.toBe(3002)
@@ -918,9 +1104,12 @@ describe('real deployment controller boundary', () => {
         portRoot,
         fullLive.processIdentity.cwd,
       ]) {
-        expect(realpathSync(disposablePath), disposablePath).toMatch(/^\/tmp\//)
+        expect(
+          isStrictlyBeneath('/tmp', realpathSync(disposablePath)),
+          disposablePath,
+        ).toBe(true)
       }
-      assertExactManagedGeneration(portRoot, fullLive, port)
+      assertExactManagedGeneration(portRoot, fullLive, port, node)
 
       const healthResponse = await fetch(`http://127.0.0.1:${port}/api/health`)
       const health = await healthResponse.json()
@@ -1055,18 +1244,15 @@ describe('real deployment controller boundary', () => {
         readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
       )
       if (failedTransaction.candidate?.process?.pid) {
-        knownPids.add(failedTransaction.candidate.process.pid)
+        rememberProcess(knownProcesses, failedTransaction.candidate.process)
       }
       const restoredAfterFailure = JSON.parse(readFileSync(liveFile, 'utf8'))
-      knownPids.add(restoredAfterFailure.processIdentity.pid)
-      expect(failedTransaction.phase).toBe('rollback_complete')
-      expect(failedTransaction.finalized).toBe(true)
-      expect(failedTransaction.launchAttempts.map((attempt: any) => attempt.lane))
-        .toEqual(['target_gated', 'prior_rollback'])
-      expect(failedTransaction.launchAttempts.map((attempt: any) => attempt.state.status))
-        .toEqual(['started', 'started'])
-      expect(existsSync(failedTransaction.controls.authorizationFile)).toBe(true)
-      expect(existsSync(failedTransaction.controls.activatedFile)).toBe(false)
+      rememberProcess(knownProcesses, restoredAfterFailure.processIdentity)
+      assertExactPrecommitRollback(
+        failedTransaction,
+        beforeFailedActivation,
+        restoredAfterFailure,
+      )
       expect(restoredAfterFailure.selectedGenerationId).toBe(
         beforeFailedActivation.selectedGenerationId,
       )
@@ -1092,10 +1278,10 @@ describe('real deployment controller boundary', () => {
           ),
         ),
       ).toBe(true)
-      assertExactManagedGeneration(portRoot, restoredAfterFailure, port)
+      assertExactManagedGeneration(portRoot, restoredAfterFailure, port, node)
       expect(await (await fetch(`http://127.0.0.1:${port}/`)).text())
         .toContain(clientMarker)
-      expect(isProcessAlive(unrelatedSentinel.pid!)).toBe(true)
+      expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
 
       const boundaries = [
         {
@@ -1141,7 +1327,7 @@ describe('real deployment controller boundary', () => {
       ] as const
       for (const boundary of boundaries) {
         const priorLive = JSON.parse(readFileSync(liveFile, 'utf8'))
-        knownPids.add(priorLive.processIdentity.pid)
+        rememberProcess(knownProcesses, priorLive.processIdentity)
         const interruptedClient = path.join(root, `interrupt-${boundary.name}`)
         cpSync(candidateClient, interruptedClient, { recursive: true })
         writeFileSync(
@@ -1165,8 +1351,11 @@ describe('real deployment controller boundary', () => {
           readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
         )
         if (interrupted.candidate?.process?.pid) {
-          knownPids.add(interrupted.candidate.process.pid)
+          rememberProcess(knownProcesses, interrupted.candidate.process)
         }
+        const activationReceiptBytes = boundary.activated
+          ? readFileSync(interrupted.controls.activatedFile, 'utf8')
+          : null
         const selected = path.basename(readlinkSync(path.join(portRoot, 'current')))
         expect(interrupted.phase, boundary.name).toBe(boundary.phase)
         expect(interrupted.finalized, boundary.name).toBe(boundary.finalized)
@@ -1211,17 +1400,49 @@ describe('real deployment controller boundary', () => {
           })).stdout.trim(),
           boundary.name,
         ).toBe('managed')
-        await checkedAsync(controller, fullDeployArgs(interruptedClient), {
-          cwd: realCheckout,
-          env: realEnvironment,
-          timeout: 300_000,
-        })
         await waitForHttp(port, 'up')
-        const recovered = JSON.parse(
+        let recovered = JSON.parse(
           readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
         )
-        const recoveredLive = JSON.parse(readFileSync(liveFile, 'utf8'))
-        knownPids.add(recoveredLive.processIdentity.pid)
+        let recoveredLive = JSON.parse(readFileSync(liveFile, 'utf8'))
+        rememberProcess(knownProcesses, recoveredLive.processIdentity)
+
+        if (boundary.activated) {
+          expect(recoveredLive.processIdentity, boundary.name)
+            .toEqual(interrupted.candidate.process)
+          expect(recovered.launchAttempts, boundary.name)
+            .toEqual(interrupted.launchAttempts)
+          expect(readFileSync(interrupted.controls.activatedFile, 'utf8'), boundary.name)
+            .toBe(activationReceiptBytes)
+          expect(
+            JSON.parse(readFileSync(interrupted.controls.activatedFile, 'utf8')),
+            boundary.name,
+          ).toEqual(interrupted.candidate.ready)
+          expect(
+            recovered.launchAttempts.map((attempt: any) => attempt.lane),
+            boundary.name,
+          ).not.toContain('prior_rollback')
+          expect(isRecordedProcessRunning(interrupted.candidate.process), boundary.name)
+            .toBe(true)
+        } else {
+          expect(recovered.phase, boundary.name).toBe('rollback_complete')
+          expect(recoveredLive.selectedGenerationId, boundary.name)
+            .toBe(interrupted.priorGenerationId)
+          expect(recoveredLive.runningServerGenerationId, boundary.name)
+            .toBe(interrupted.priorGenerationId)
+          await checkedAsync(controller, fullDeployArgs(interruptedClient), {
+            cwd: realCheckout,
+            env: realEnvironment,
+            timeout: 300_000,
+          })
+          await waitForHttp(port, 'up')
+          recovered = JSON.parse(
+            readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+          )
+          recoveredLive = JSON.parse(readFileSync(liveFile, 'utf8'))
+          rememberProcess(knownProcesses, recoveredLive.processIdentity)
+        }
+
         expect(recovered.finalized, boundary.name).toBe(true)
         expect(recoveredLive.selectedGenerationId, boundary.name).toBe(
           path.basename(readlinkSync(path.join(portRoot, 'current'))),
@@ -1240,10 +1461,7 @@ describe('real deployment controller boundary', () => {
           ).text(),
           boundary.name,
         ).toContain(boundary.name)
-        if (boundary.name === 'target-owned-receipt') {
-          expect(
-            recovered.launchAttempts.map((attempt: any) => attempt.lane),
-          ).not.toContain('prior_rollback')
+        if (boundary.activated) {
           expect(existsSync(recovered.controls.activatedFile)).toBe(true)
           expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
             recovered.targetGenerationId,
@@ -1302,7 +1520,7 @@ describe('real deployment controller boundary', () => {
       })
       await waitForHttp(port, 'up')
       const started = JSON.parse(readFileSync(liveFile, 'utf8'))
-      knownPids.add(started.processIdentity.pid)
+      rememberProcess(knownProcesses, started.processIdentity)
       expect(started.runningServerGenerationId).toBe(started.selectedGenerationId)
 
       await checkedAsync(storedController, ['restart-current', ...common], {
@@ -1311,7 +1529,7 @@ describe('real deployment controller boundary', () => {
       })
       await waitForHttp(port, 'up')
       const restarted = JSON.parse(readFileSync(liveFile, 'utf8'))
-      knownPids.add(restarted.processIdentity.pid)
+      rememberProcess(knownProcesses, restarted.processIdentity)
       expect(restarted.processIdentity.pid).not.toBe(started.processIdentity.pid)
       expect(restarted.runningServerGenerationId).toBe(restarted.selectedGenerationId)
 
@@ -1321,26 +1539,86 @@ describe('real deployment controller boundary', () => {
       })
       await waitForHttp(port, 'down')
     } finally {
+      const cleanupErrors: string[] = []
       const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
       const liveFile = path.join(portRoot, 'live.json')
       if (existsSync(liveFile)) {
         try {
           const live = JSON.parse(readFileSync(liveFile, 'utf8'))
-          if (live.processIdentity?.pid) knownPids.add(live.processIdentity.pid)
-        } catch {
-          // Exact PIDs already observed remain available for sandbox cleanup.
+          if (live.processIdentity?.pid) {
+            rememberProcess(knownProcesses, live.processIdentity)
+          }
+          const storedController = path.join(
+            portRoot,
+            'current/controller/freshell-deploy',
+          )
+          if (existsSync(storedController)) {
+            try {
+              await checkedAsync(
+                storedController,
+                [
+                  'stop-current',
+                  '--checkout',
+                  realCheckout,
+                  '--port',
+                  String(port),
+                ],
+                { cwd: realCheckout, env: realEnvironment, timeout: 60_000 },
+              )
+            } catch (error) {
+              cleanupErrors.push(`controller stop failed: ${String(error)}`)
+            }
+          }
+        } catch (error) {
+          cleanupErrors.push(`could not inspect live receipt: ${String(error)}`)
         }
       }
-      for (const pid of knownPids) {
+      if (existsSync(pidFile)) {
         try {
-          process.kill(pid, 'SIGTERM')
+          rememberProcess(
+            knownProcesses,
+            readProcessIdentity(Number(readFileSync(pidFile, 'utf8').trim())),
+          )
         } catch {
-          // Already stopped by the controller.
+          // The exact captured birth is already gone.
         }
       }
-      unrelatedSentinel.kill('SIGTERM')
-      spawnSync('chmod', ['-R', 'u+w', root], { encoding: 'utf8' })
+
+      for (const identity of knownProcesses.values()) {
+        if (!isRecordedProcessRunning(identity)) continue
+        try {
+          process.kill(identity.pid, 'SIGTERM')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+            cleanupErrors.push(
+              `could not stop ${processIdentityKey(identity)}: ${String(error)}`,
+            )
+          }
+        }
+      }
+      const processDeadline = Date.now() + 20_000
+      while (
+        Date.now() < processDeadline
+        && [...knownProcesses.values()].some(isRecordedProcessRunning)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40))
+      }
+      for (const identity of knownProcesses.values()) {
+        if (isRecordedProcessRunning(identity)) {
+          cleanupErrors.push(`recorded process remained alive: ${processIdentityKey(identity)}`)
+        }
+      }
+      try {
+        await waitForHttp(port, 'down')
+        await waitForPortFree(port)
+      } catch (error) {
+        cleanupErrors.push(`port ${port} was not proved free: ${String(error)}`)
+      }
+      spawnSync('chmod', ['-R', 'u+rwX', root], { encoding: 'utf8' })
       rmSync(root, { recursive: true, force: true })
+      if (cleanupErrors.length > 0) {
+        throw new Error(`real deployment cleanup was incomplete:\n${cleanupErrors.join('\n')}`)
+      }
     }
   }, 900_000)
 })

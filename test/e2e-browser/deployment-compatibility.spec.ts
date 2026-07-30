@@ -51,15 +51,54 @@ type Rig = {
   token: string
   baseUrl: string
   portRoot: string
+  pidFile: string
+  codexArgvLog: string
   environment: NodeJS.ProcessEnv
-  knownPids: Set<number>
+  knownProcesses: Map<string, RecordedProcessIdentity>
   sentinel: ChildProcess
+  sentinelIdentity: RecordedProcessIdentity
 }
 
 type CommandResult = {
   code: number
   stdout: string
   stderr: string
+}
+
+type RecordedProcessIdentity = {
+  pid: number
+  kernelBootId: string
+  startTimeTicks: string
+}
+
+type FakeCodexInvocation = RecordedProcessIdentity & {
+  t: number
+  argv: string[]
+}
+
+function processIdentityKey(identity: RecordedProcessIdentity) {
+  return `${identity.pid}:${identity.kernelBootId}:${identity.startTimeTicks}`
+}
+
+function readProcessIdentity(pid: number): RecordedProcessIdentity {
+  const kernelBootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+  const commandEnd = stat.lastIndexOf(')')
+  if (commandEnd < 0) throw new Error(`could not parse /proc/${pid}/stat`)
+  const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
+  return {
+    pid,
+    kernelBootId,
+    startTimeTicks: fieldsAfterCommand[19],
+  }
+}
+
+function rememberProcess(rig: Rig, identity: RecordedProcessIdentity) {
+  rig.knownProcesses.set(processIdentityKey(identity), {
+    pid: identity.pid,
+    kernelBootId: identity.kernelBootId,
+    startTimeTicks: identity.startTimeTicks,
+  })
 }
 
 async function unusedPort() {
@@ -145,15 +184,6 @@ async function waitForHttp(port: number, expected: 'up' | 'down', timeout = 60_0
   }).toPass({ timeout, intervals: [50, 100, 250, 500] })
 }
 
-function isProcessAlive(pid: number) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
-  }
-}
-
 function isRecordedProcessRunning(identity: {
   pid: number
   kernelBootId: string
@@ -175,6 +205,42 @@ function isRecordedProcessRunning(identity: {
   } catch {
     return false
   }
+}
+
+async function waitForPortFree(port: number, timeout = 20_000) {
+  await expect(async () => {
+    const probe = net.createServer()
+    await new Promise<void>((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(port, '127.0.0.1', resolve)
+    })
+    await new Promise<void>((resolve, reject) => {
+      probe.close((error) => error ? reject(error) : resolve())
+    })
+  }).toPass({ timeout, intervals: [50, 100, 250, 500] })
+}
+
+function fakeCodexInvocations(rig: Rig): FakeCodexInvocation[] {
+  if (!existsSync(rig.codexArgvLog)) return []
+  const invocations = readFileSync(rig.codexArgvLog, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  for (const invocation of invocations) rememberProcess(rig, invocation)
+  return invocations
+}
+
+async function expectFakeCodexInvocationCount(rig: Rig, expected: number) {
+  await expect(() => {
+    const invocations = fakeCodexInvocations(rig)
+    expect(invocations).toHaveLength(expected)
+    expect(new Set(invocations.map(processIdentityKey)).size).toBe(expected)
+  }).toPass({ timeout: 30_000, intervals: [50, 100, 250, 500] })
+  await new Promise((resolve) => setTimeout(resolve, 750))
+  const stable = fakeCodexInvocations(rig)
+  expect(stable).toHaveLength(expected)
+  expect(new Set(stable.map(processIdentityKey)).size).toBe(expected)
 }
 
 function copyCheckout(source: string, destination: string) {
@@ -209,12 +275,50 @@ async function setupRig(): Promise<Rig> {
   const bin = path.join(root, 'bin')
   const pidFile = path.join(root, 'legacy.pid')
   const logFile = path.join(root, 'legacy.log')
+  const codexArgvLog = path.join(root, 'fake-codex-invocations.jsonl')
   const token = `task7-browser-${Date.now()}-token`
   const clientMarker = `task7-browser-client-${Date.now()}`
   let port = await unusedPort()
   while (port === 3002) port = await unusedPort()
+  const portRoot = path.join(checkout, '.freshell-deploy/ports', String(port))
+  const node = realpathSync(process.execPath)
+  const environment = {
+    ...process.env,
+    AUTH_TOKEN: token,
+    FRESHELL_HOME: home,
+    HOME: home,
+    FRESHELL_CODEX_MANAGED_LAUNCH: '0',
+    FAKE_CODEX_ARGV_LOG: codexArgvLog,
+    CARGO_BUILD_JOBS: '2',
+    CMAKE_BUILD_PARALLEL_LEVEL: '2',
+    FRESHELL_DEPLOY_BUILD_PARENT: path.join(root, 'builds'),
+  }
+  const sentinel = spawn(
+    node,
+    ['--eval', 'setInterval(() => {}, 1000)'],
+    { stdio: 'ignore' },
+  )
+  if (!sentinel.pid) throw new Error('unrelated sentinel did not start')
+  const rig: Rig = {
+    root,
+    checkout,
+    home,
+    bootstrapTarget,
+    port,
+    token,
+    baseUrl: `http://127.0.0.1:${port}`,
+    portRoot,
+    pidFile,
+    codexArgvLog,
+    environment,
+    knownProcesses: new Map(),
+    sentinel,
+    sentinelIdentity: readProcessIdentity(sentinel.pid),
+  }
+  rememberProcess(rig, rig.sentinelIdentity)
 
-  copyCheckout(repository, checkout)
+  try {
+    copyCheckout(repository, checkout)
   mkdirSync(home)
   mkdirSync(bin)
   mkdirSync(path.join(distServer, 'mcp'), { recursive: true })
@@ -312,18 +416,11 @@ async function setupRig(): Promise<Rig> {
 
   writeFileSync(
     path.join(checkout, '.env'),
-    `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\nCODEX_CMD=${path.join(bin, 'codex')}\n`,
+    `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\nCODEX_CMD=${path.join(bin, 'codex')}\n` +
+      'FRESHELL_CODEX_MANAGED_LAUNCH=0\n' +
+      `FAKE_CODEX_ARGV_LOG=${codexArgvLog}\n`,
     { mode: 0o600 },
   )
-  const environment = {
-    ...process.env,
-    AUTH_TOKEN: token,
-    FRESHELL_HOME: home,
-    HOME: home,
-    CARGO_BUILD_JOBS: '2',
-    CMAKE_BUILD_PARALLEL_LEVEL: '2',
-    FRESHELL_DEPLOY_BUILD_PARENT: path.join(root, 'builds'),
-  }
 
   await checked('cargo', ['build', '--quiet', '--release', '-p', 'freshell-server', '-p', 'freshell-deploy'], {
     cwd: checkout,
@@ -356,7 +453,6 @@ async function setupRig(): Promise<Rig> {
   symlinkSync(nodeModules, path.join(checkout, 'node_modules'))
   writeFileSync(path.join(checkout, 'package.json'), packageManifest)
   writeFileSync(path.join(checkout, 'package-lock.json'), packageLock)
-  const node = realpathSync(process.execPath)
   const server = path.join(bootstrapTarget, 'release/freshell-server')
   const controller = path.join(bootstrapTarget, 'release/freshell-deploy')
   await checked(captureFixture, [], {
@@ -390,7 +486,8 @@ async function setupRig(): Promise<Rig> {
   })
   console.log('task7 deploy sandbox: captured real legacy listener')
 
-  const knownPids = new Set<number>([Number(readFileSync(pidFile, 'utf8').trim())])
+  const capturedLive = JSON.parse(readFileSync(path.join(portRoot, 'live.json'), 'utf8'))
+  rememberProcess(rig, capturedLive.processIdentity)
   await checked(controller, [
     'deploy',
     '--checkout',
@@ -432,63 +529,96 @@ async function setupRig(): Promise<Rig> {
   writeFileSync(path.join(checkout, 'package.json'), checkoutPackage)
   writeFileSync(path.join(checkout, 'package-lock.json'), checkoutPackageLock)
   await waitForHttp(port, 'up')
-  const portRoot = path.join(checkout, '.freshell-deploy/ports', String(port))
   const live = JSON.parse(readFileSync(path.join(portRoot, 'live.json'), 'utf8'))
-  knownPids.add(live.processIdentity.pid)
+  rememberProcess(rig, live.processIdentity)
 
-  const sentinel = spawn(
-    node,
-    ['--eval', 'setInterval(() => {}, 1000)'],
-    { stdio: 'ignore' },
-  )
-  if (!sentinel.pid) throw new Error('unrelated sentinel did not start')
-
-  return {
-    root,
-    checkout,
-    home,
-    bootstrapTarget,
-    port,
-    token,
-    baseUrl: `http://127.0.0.1:${port}`,
-    portRoot,
-    environment,
-    knownPids,
-    sentinel,
+    return rig
+  } catch (error) {
+    if (existsSync(pidFile)) {
+      try {
+        rememberProcess(rig, readProcessIdentity(Number(readFileSync(pidFile, 'utf8').trim())))
+      } catch {
+        // The exact legacy birth is already gone or was never fully published.
+      }
+    }
+    try {
+      await cleanupRig(rig)
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Task 7 rig setup and cleanup both failed')
+    }
+    throw error
   }
 }
 
 async function cleanupRig(rig: Rig) {
+  const cleanupErrors: string[] = []
   const liveFile = path.join(rig.portRoot, 'live.json')
   if (existsSync(liveFile)) {
     try {
       const live = JSON.parse(readFileSync(liveFile, 'utf8'))
-      if (live.processIdentity?.pid) rig.knownPids.add(live.processIdentity.pid)
+      if (live.processIdentity?.pid) rememberProcess(rig, live.processIdentity)
       const controller = path.join(rig.portRoot, 'current/controller/freshell-deploy')
       if (existsSync(controller)) {
-        await result(controller, [
+        const stopped = await result(controller, [
           'stop-current',
           '--checkout',
           rig.checkout,
           '--port',
           String(rig.port),
         ], { cwd: rig.checkout, env: rig.environment, timeout: 60_000 })
+        if (stopped.code !== 0) {
+          cleanupErrors.push(`controller stop failed: ${stopped.stdout}\n${stopped.stderr}`)
+        }
       }
-    } catch {
-      // Exact PIDs already observed remain available for sandbox cleanup.
+    } catch (error) {
+      cleanupErrors.push(`could not inspect/stop live receipt: ${String(error)}`)
     }
   }
-  for (const pid of rig.knownPids) {
+
+  if (existsSync(rig.pidFile)) {
     try {
-      process.kill(pid, 'SIGTERM')
+      rememberProcess(
+        rig,
+        readProcessIdentity(Number(readFileSync(rig.pidFile, 'utf8').trim())),
+      )
     } catch {
-      // Already stopped by the controller.
+      // The captured process is already gone; never signal an unverified PID.
     }
   }
-  rig.sentinel.kill('SIGTERM')
-  await waitForHttp(rig.port, 'down', 20_000).catch(() => {})
+
+  for (const identity of rig.knownProcesses.values()) {
+    if (!isRecordedProcessRunning(identity)) continue
+    try {
+      process.kill(identity.pid, 'SIGTERM')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+        cleanupErrors.push(
+          `could not stop recorded process ${processIdentityKey(identity)}: ${String(error)}`,
+        )
+      }
+    }
+  }
+
+  try {
+    await expect(() => {
+      for (const identity of rig.knownProcesses.values()) {
+        expect(isRecordedProcessRunning(identity), processIdentityKey(identity)).toBe(false)
+      }
+    }).toPass({ timeout: 20_000, intervals: [50, 100, 250, 500] })
+  } catch (error) {
+    cleanupErrors.push(`recorded process did not exit: ${String(error)}`)
+  }
+  try {
+    await waitForHttp(rig.port, 'down', 20_000)
+    await waitForPortFree(rig.port, 20_000)
+  } catch (error) {
+    cleanupErrors.push(`port ${rig.port} was not proved free: ${String(error)}`)
+  }
   await result('chmod', ['-R', 'u+rwX', rig.root], { timeout: 60_000 })
   rmSync(rig.root, { recursive: true, force: true })
+  if (cleanupErrors.length > 0) {
+    throw new Error(`Task 7 rig cleanup was incomplete:\n${cleanupErrors.join('\n')}`)
+  }
 }
 
 async function connect(page: Page, rig: Rig) {
@@ -570,7 +700,7 @@ async function browserIdentity(harness: TestHarness) {
 async function deploymentIdentity(rig: Rig) {
   const liveBytes = readFileSync(path.join(rig.portRoot, 'live.json'), 'utf8')
   const live = JSON.parse(liveBytes)
-  rig.knownPids.add(live.processIdentity.pid)
+  rememberProcess(rig, live.processIdentity)
   const health = await (await fetch(`${rig.baseUrl}/api/health`)).json()
   const compatibility = await (
     await fetch(`${rig.baseUrl}/api/deployment-compatibility`, {
@@ -584,6 +714,10 @@ async function deploymentIdentity(rig: Rig) {
     compatibility,
     current: readlinkSync(path.join(rig.portRoot, 'current')),
     transaction: readFileSync(path.join(rig.portRoot, 'transaction.json'), 'utf8'),
+    clientDeclaration: readFileSync(
+      path.join(rig.portRoot, 'current/client/deployment-compatibility.json'),
+      'utf8',
+    ),
   }
 }
 
@@ -632,31 +766,50 @@ async function assertTerminalMarker(
   await terminal.waitForOutput(marker, { terminalId, timeout: 30_000 })
 }
 
-async function assertLazyEditorChunk(page: Page) {
+async function assertLazyEditorChunk(page: Page, selectedClientRoot: string) {
   const loaded = new Set(
     await page.evaluate(() => performance.getEntriesByType('resource')
       .map((entry) => entry.name)
       .filter((name) => /\.js(?:\?|$)/.test(name))),
   )
-  const newScripts: string[] = []
-  const listener = (request: any) => {
+  const selectedRoot = realpathSync(selectedClientRoot)
+  const selectedChunks: string[] = []
+  const listener = async (response: any) => {
+    const request = response.request()
+    const url = new URL(response.url())
     if (
-      (request.resourceType() === 'script' || /\.js(?:\?|$)/.test(request.url()))
+      response.ok()
+      && (request.resourceType() === 'script' || /\.js(?:\?|$)/.test(request.url()))
       && !loaded.has(request.url())
+      && /^\/assets\/[^/?]+-[A-Za-z0-9_-]{8,}\.js$/.test(url.pathname)
     ) {
-      newScripts.push(request.url())
+      const relative = decodeURIComponent(url.pathname).replace(/^\/+/, '')
+      const candidate = path.resolve(selectedRoot, relative)
+      const contained = path.relative(selectedRoot, candidate)
+      if (
+        contained !== ''
+        && contained !== '..'
+        && !contained.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(contained)
+        && existsSync(candidate)
+      ) {
+        selectedChunks.push(candidate)
+      }
     }
   }
-  page.on('request', listener)
+  page.on('response', listener)
   try {
     await page.locator('.xterm').first().click({ button: 'right' })
     await page.getByRole('menuitem', { name: /split horizontally/i }).click()
     await page.getByRole('button', { name: /^Editor$/i }).click()
     await expect(page.locator('[data-testid="editor-pane"]')).toBeVisible()
     await expect(page.locator('[data-testid="editor-pane-loading"]')).toBeHidden()
-    expect(newScripts.length).toBeGreaterThan(0)
+    await expect(() => expect(selectedChunks.length).toBeGreaterThan(0)).toPass()
+    for (const chunk of selectedChunks) {
+      expect(realpathSync(chunk)).toBe(chunk)
+    }
   } finally {
-    page.off('request', listener)
+    page.off('response', listener)
   }
 }
 
@@ -678,16 +831,28 @@ test('compatibility-checked deployment preserves one connected browser and rejec
       'generations',
       initial.live.selectedGenerationId,
     )
-    const clientDeclaration = JSON.parse(
-      readFileSync(
-        path.join(selectedRoot, 'client/deployment-compatibility.json'),
-        'utf8',
-      ),
-    ).declaration
+    const selectedClientDeclarationBytes = readFileSync(
+      path.join(selectedRoot, 'client/deployment-compatibility.json'),
+      'utf8',
+    )
+    const selectedClientArtifact = JSON.parse(selectedClientDeclarationBytes)
+    const clientDeclaration = selectedClientArtifact.declaration
     expect(clientDeclaration.version).toBe('0.7.5')
     expect(clientDeclaration.supports.server).toEqual({
       minInclusive: '0.7.0',
       maxExclusive: '0.7.1',
+    })
+    expect(selectedClientArtifact.declarationSha256).toBe(declarationDigest(clientDeclaration))
+    expect(initial.clientDeclaration).toBe(selectedClientDeclarationBytes)
+    expect(initial.compatibility.serverDeclarationSha256)
+      .toBe(declarationDigest(initial.compatibility.serverDeclaration))
+    const browserClientDeclaration = await page.evaluate(async () => {
+      const response = await fetch('/deployment-compatibility.json')
+      return { ok: response.ok, bytes: await response.text() }
+    })
+    expect(browserClientDeclaration).toEqual({
+      ok: true,
+      bytes: selectedClientDeclarationBytes,
     })
     expect(initial.compatibility.serverProcessGenerationId)
       .toBe(initial.live.runningServerGenerationId)
@@ -703,6 +868,7 @@ test('compatibility-checked deployment preserves one connected browser and rejec
     })
     expect(shell.terminalId).toBeTruthy()
     expect(codex.terminalId).toBeTruthy()
+    await expectFakeCodexInvocationCount(rig, 1)
     await waitForPersistedCoverage(rig, 2)
     const capture = await tabDiff(rig, [
       'capture',
@@ -747,6 +913,20 @@ test('compatibility-checked deployment preserves one connected browser and rejec
     console.log('task7 deploy sandbox: canonical server-only restart completed')
     await harness.waitForConnection(60_000)
     const after = await deploymentIdentity(rig)
+    const acceptedTransaction = JSON.parse(after.transaction)
+    expect(acceptedTransaction).toMatchObject({
+      mode: 'server',
+      priorGenerationId: initial.live.selectedGenerationId,
+      targetGenerationId: after.live.selectedGenerationId,
+      phase: 'activation_confirmed',
+      finalized: true,
+    })
+    expect(after.clientDeclaration).toBe(initial.clientDeclaration)
+    expect(after.compatibility.serverDeclarationSha256)
+      .toBe(declarationDigest(after.compatibility.serverDeclaration))
+    const afterClientArtifact = JSON.parse(after.clientDeclaration)
+    expect(afterClientArtifact.declarationSha256)
+      .toBe(declarationDigest(afterClientArtifact.declaration))
     expect(after.live.processIdentity.pid).not.toBe(initial.live.processIdentity.pid)
     expect(after.health.instanceId).toBe(initial.health.instanceId)
     expect(after.compatibility.bootId).not.toBe(initial.compatibility.bootId)
@@ -757,7 +937,7 @@ test('compatibility-checked deployment preserves one connected browser and rejec
     await expect(() => {
       expect(isRecordedProcessRunning(initial.live.processIdentity)).toBe(false)
     }).toPass({ timeout: 10_000, intervals: [50, 100, 250, 500] })
-    expect(isProcessAlive(rig.sentinel.pid!)).toBe(true)
+    expect(isRecordedProcessRunning(rig.sentinelIdentity)).toBe(true)
 
     await expect(async () => {
       const afterBrowser = await browserIdentity(harness)
@@ -786,6 +966,7 @@ test('compatibility-checked deployment preserves one connected browser and rejec
       shellAfter.terminalId,
       'task7-after-restart',
     )
+    await expectFakeCodexInvocationCount(rig, 2)
     await waitForSnapshotAfter(rig, capturedAt)
     const verify = await tabDiff(rig, [
       'verify',
@@ -799,9 +980,17 @@ test('compatibility-checked deployment preserves one connected browser and rejec
     expect(verify.code, `${verify.stdout}\n${verify.stderr}`).toBe(0)
     expect(verify.stdout).toContain('OK: every previously-live pane came back')
     await expect(page.getByRole('alert')).toHaveCount(0)
-    await expect(page.getByText(/auto-resuming/i)).toHaveCount(0)
+    await expect(page.getByText(/auto-resum/i)).toHaveCount(0)
     await expect(page.locator('[data-testid="crash-trace"]')).toHaveCount(0)
-    await assertLazyEditorChunk(page)
+    await assertLazyEditorChunk(
+      page,
+      path.join(
+        rig.portRoot,
+        'generations',
+        after.live.selectedGenerationId,
+        'client',
+      ),
+    )
 
     const assertRejectedWithoutMutation = async (
       attempt: () => Promise<CommandResult>,
@@ -814,11 +1003,15 @@ test('compatibility-checked deployment preserves one connected browser and rejec
       const afterDeploy = await deploymentIdentity(rig)
       expect(afterDeploy.liveBytes).toBe(beforeDeploy.liveBytes)
       expect(afterDeploy.current).toBe(beforeDeploy.current)
+      expect(afterDeploy.transaction).toBe(beforeDeploy.transaction)
+      expect(afterDeploy.clientDeclaration).toBe(beforeDeploy.clientDeclaration)
+      expect(afterDeploy.compatibility).toEqual(beforeDeploy.compatibility)
       expect(afterDeploy.live.processIdentity.pid).toBe(beforeDeploy.live.processIdentity.pid)
       expect(afterDeploy.health.instanceId).toBe(beforeDeploy.health.instanceId)
       expect(await browserIdentity(harness)).toEqual(beforeUi)
       expect(isRecordedProcessRunning(beforeDeploy.live.processIdentity)).toBe(true)
-      expect(isProcessAlive(rig.sentinel.pid!)).toBe(true)
+      expect(isRecordedProcessRunning(rig.sentinelIdentity)).toBe(true)
+      await expectFakeCodexInvocationCount(rig, 2)
       await assertTerminalMarker(
         page,
         harness,
@@ -930,6 +1123,7 @@ test('compatibility-checked deployment preserves one connected browser and rejec
     expect(`${serverRejected.stdout}\n${serverRejected.stderr}`).toMatch(
       /server.*client|compatib/i,
     )
+    await expectFakeCodexInvocationCount(rig, 2)
     console.log('task7 deploy sandbox: candidate-server rejection proved')
   } finally {
     await cleanupRig(rig)

@@ -26,8 +26,18 @@ const argv = process.argv.slice(2)
 function appendArgvLog() {
   const logPath = process.env.FAKE_CODEX_ARGV_LOG
   if (!logPath) return
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8')
+  const commandEnd = stat.lastIndexOf(')')
+  if (commandEnd < 0) throw new Error(`could not parse /proc/${process.pid}/stat`)
+  const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
   fs.mkdirSync(path.dirname(logPath), { recursive: true })
-  fs.appendFileSync(logPath, `${JSON.stringify({ pid: process.pid, t: Date.now(), argv })}\n`)
+  fs.appendFileSync(logPath, `${JSON.stringify({
+    pid: process.pid,
+    kernelBootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
+    startTimeTicks: fieldsAfterCommand[19],
+    t: Date.now(),
+    argv,
+  })}\n`)
 }
 appendArgvLog()
 

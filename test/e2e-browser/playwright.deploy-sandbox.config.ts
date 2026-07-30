@@ -7,7 +7,12 @@ if (process.env.FRESHELL_DESTRUCTIVE_SANDBOX !== '1') {
     'deployment compatibility browser proof requires FRESHELL_DESTRUCTIVE_SANDBOX=1',
   )
 }
-if (!path.resolve(os.tmpdir()).startsWith('/tmp')) {
+const tmpRelative = path.relative('/tmp', path.resolve(os.tmpdir()))
+if (
+  tmpRelative === '..'
+  || tmpRelative.startsWith(`..${path.sep}`)
+  || path.isAbsolute(tmpRelative)
+) {
   throw new Error(`Playwright deployment sandbox must use container /tmp, got ${os.tmpdir()}`)
 }
 
