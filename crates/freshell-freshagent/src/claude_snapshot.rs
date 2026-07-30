@@ -87,6 +87,53 @@ pub fn transcript_cwd(path: &Path) -> Option<String> {
     None
 }
 
+/// Node's `CWD_SCAN_BYTES` (`claude-transcript-locator.ts:31`): the resolve
+/// endpoint's cwd read never scans past the first 64 KiB of a transcript.
+const CWD_SCAN_BYTES: u64 = 64 * 1024;
+
+/// Bounded variant of [`transcript_cwd`] for the resume-resolve claude
+/// exact-id fallback (`crates/freshell-server/src/main.rs`). Node parity
+/// (`claude-transcript-locator.ts:121-152` `readCwdFromTranscript`): read AT
+/// MOST the first [`CWD_SCAN_BYTES`] of the file, split that prefix on
+/// `\n`, and attempt to parse EVERY segment INCLUDING the final one —
+/// Node's `head.split('\n')` loop has no discard-the-truncated-tail rule (a
+/// fragment cut at the 64 KiB boundary simply fails `JSON.parse` and is
+/// skipped, while a COMPLETE final line with no trailing newline still
+/// parses). First non-empty string `cwd` wins. One resolve request against
+/// a multi-GB transcript (or a single enormous line) must not allocate or
+/// scan past the 64 KiB prefix — do NOT swap this for [`transcript_cwd`]'s
+/// unbounded `BufRead::lines()` loop.
+///
+/// Errors are swallowed to `None` like [`transcript_cwd`]; the
+/// error-PROPAGATING `transcript_cwd_checked` (provider-error channel) is
+/// the deferred Task-3 work in
+/// `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`.
+pub fn transcript_cwd_bounded(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(CWD_SCAN_BYTES).read_to_end(&mut head).ok()?;
+    // Node's Buffer.toString('utf8') is lossy at the truncation boundary;
+    // from_utf8_lossy matches (replacement chars only ever land in the
+    // final fragment, which then fails to parse — same as Node).
+    let head = String::from_utf8_lossy(&head);
+    for segment in head.split('\n') {
+        let trimmed = segment.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Locate `<claude_home>/projects/*/<session_id>.jsonl` (or one subdir deeper, e.g.
 /// `<project>/<session-id-dir>/...` layouts). Filename scan, NEVER slug re-derivation:
 /// the cwd->slug encoding is lossy (`docs/port-plan.md:45`). Sorted dirs for
@@ -467,6 +514,55 @@ mod tests {
         let empty = home.path().join("e.jsonl");
         std::fs::write(&empty, "").unwrap();
         assert_eq!(transcript_cwd(&empty), None);
+    }
+
+    #[test]
+    fn transcript_cwd_bounded_never_scans_past_the_64kib_prefix() {
+        // Node parity (`CWD_SCAN_BYTES`, `claude-transcript-locator.ts`): a
+        // cwd line that begins beyond the first 64 KiB is invisible to the
+        // resolve fallback's bounded reader — while the unbounded
+        // `transcript_cwd` (other consumers) still finds it. Also covers the
+        // boundary-straddling case: the line cut at the 64 KiB edge is a
+        // truncated fragment that fails to parse and is skipped, like Node's
+        // JSON.parse catch.
+        let home = temp_home();
+        let file = home.path().join("big.jsonl");
+        let filler_line = "{\"type\":\"noise\"}\n";
+        let mut content = String::new();
+        while content.len() <= 64 * 1024 {
+            content.push_str(filler_line);
+        }
+        content.push_str("{\"type\":\"user\",\"cwd\":\"/beyond/prefix\"}\n");
+        std::fs::write(&file, &content).unwrap();
+        assert_eq!(transcript_cwd_bounded(&file), None);
+        assert_eq!(transcript_cwd(&file), Some("/beyond/prefix".to_string()));
+    }
+
+    #[test]
+    fn transcript_cwd_bounded_parses_a_complete_unterminated_final_line() {
+        // Node's `head.split('\n')` loop has no discard-the-tail rule: a
+        // COMPLETE final line with no trailing newline (small transcript)
+        // still parses. Do not drop the final segment.
+        let home = temp_home();
+        let file = home.path().join("small.jsonl");
+        std::fs::write(
+            &file,
+            "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"/home/user/proj\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_cwd_bounded(&file),
+            Some("/home/user/proj".to_string())
+        );
+        // First non-empty string cwd wins; empty-string cwd is skipped.
+        let skip = home.path().join("skip.jsonl");
+        std::fs::write(&skip, "{\"cwd\":\"\"}\n{\"cwd\":42}\n{\"cwd\":\"/real\"}\n").unwrap();
+        assert_eq!(transcript_cwd_bounded(&skip), Some("/real".to_string()));
+        // Missing file: swallowed to None (checked variant is deferred).
+        assert_eq!(
+            transcript_cwd_bounded(&home.path().join("absent.jsonl")),
+            None
+        );
     }
 
     const SAMPLE_TRANSCRIPT: &str = include_str!(concat!(
