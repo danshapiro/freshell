@@ -1,5 +1,15 @@
 # REST Terminal Session Identity Publication — Takeover Handoff
 
+> **SUPERSEDED (2026-07-30).** This handoff is a historical record of the state
+> at 2026-07-29. All five validation groups have since completed, PR #584
+> merged the Claude-focused branch into `main`, and the unified plan was
+> rewritten, renamed, and restructured. The current plan is
+> `docs/superpowers/plans/2026-07-29-unified-terminal-identity-publication.md`
+> on this branch; the plan path referenced throughout this document
+> (`docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md`) now
+> holds PR #584's own historical plan on `main` and is NOT the unified plan.
+> Follow the current plan, not the sequencing instructions below.
+
 **Status:** Paused at the user's request after evidence preservation, root-cause
 investigation, unified planning, load-bearing assumption discovery, validation
 strategy, and the first of five planned validation groups.
