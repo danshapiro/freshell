@@ -1,13 +1,39 @@
 import { defineConfig, loadEnv } from 'vite'
 import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
+import { readFileSync } from 'node:fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { getNetworkHost } from '../../server/get-network-host.js'
+import {
+  declarationDigest,
+  parseContract,
+  projectDeclaration,
+} from '../../scripts/deployment-compatibility.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
+const compatibilityContractPath = path.join(projectRoot, 'config/deployment-compatibility.json')
+
+function resolveClientOutDir(): string {
+  const requested = process.env.FRESHELL_CLIENT_OUT_DIR
+  if (requested === undefined) return path.join(projectRoot, 'dist/client')
+  if (!path.isAbsolute(requested)) {
+    throw new Error('FRESHELL_CLIENT_OUT_DIR must be an absolute path')
+  }
+  return requested
+}
+
+function deploymentCompatibilityArtifact() {
+  const contract = parseContract(readFileSync(compatibilityContractPath, 'utf8'))
+  const declaration = projectDeclaration(contract, 'client')
+  return {
+    schemaVersion: '1',
+    declaration,
+    declarationSha256: declarationDigest(declaration),
+  }
+}
 
 /**
  * Transport-level proxy failures that mean "the backend is down or restarting":
@@ -54,7 +80,20 @@ export default defineConfig(({ mode }) => {
 
   return {
     root: projectRoot,
-    plugins: [react()],
+    plugins: [
+      react(),
+      {
+        name: 'freshell-deployment-compatibility',
+        apply: 'build',
+        generateBundle() {
+          this.emitFile({
+            type: 'asset',
+            fileName: 'deployment-compatibility.json',
+            source: `${JSON.stringify(deploymentCompatibilityArtifact(), null, 2)}\n`,
+          })
+        },
+      },
+    ],
     define: {
       __PERF_LOGGING__: JSON.stringify(env.PERF_LOGGING || ''),
     },
@@ -66,7 +105,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      outDir: 'dist/client',
+      outDir: resolveClientOutDir(),
       sourcemap: mode === 'development',
       chunkSizeWarningLimit: 1400,
     },

@@ -25,7 +25,12 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    Json, Router,
+};
 use serde_json::{json, Value};
 
 /// Shared, cheaply-cloneable REST state.
@@ -51,12 +56,26 @@ pub struct ApiState {
     /// health `startedAt` (mirrors `server/health-router.ts`
     /// `startedAt: startedAt.toISOString()`).
     pub started_at: Arc<String>,
+    /// Compile-time server component compatibility declaration. This is
+    /// separate from the established product `version`.
+    pub server_declaration: Value,
+    /// Lowercase SHA-256 of the canonical server declaration bytes.
+    pub server_declaration_sha256: Arc<String>,
+    /// Controller-selected immutable generation for this process, or `None`
+    /// for an ordinary unmanaged start.
+    pub server_process_generation_id: Option<Arc<String>>,
+    /// Per-process boot identity shared with the existing server state.
+    pub boot_id: Arc<String>,
 }
 
 /// The REST sub-router, pre-bound to its state (mergeable into the server app).
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route(
+            "/api/deployment-compatibility",
+            get(deployment_compatibility),
+        )
         .with_state(state)
 }
 
@@ -83,6 +102,43 @@ fn health_body(state: &ApiState) -> Value {
         "instanceId": &*state.instance_id,
         "startedAt": &*state.started_at,
     })
+}
+
+/// Authenticated operational identity for deployment preflight and recovery.
+///
+/// The global rate limiter exempts this controller check so rollback cannot be
+/// blocked by an exhausted browser bucket. Authentication is still mandatory.
+async fn deployment_compatibility(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    deployment_compatibility_body(&state, &headers)
+}
+
+fn deployment_compatibility_body(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    let provided = headers
+        .get("x-auth-token")
+        .and_then(|value| value.to_str().ok());
+    if !check_auth(provided, state.auth_token.as_str()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthorized" })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "schemaVersion": "1",
+            "serverDeclaration": &state.server_declaration,
+            "serverDeclarationSha256": &*state.server_declaration_sha256,
+            "serverProcessGenerationId": state.server_process_generation_id.as_deref(),
+            "bootId": &*state.boot_id,
+        })),
+    )
 }
 
 /// Constant-time byte-slice equality for the auth-token gate. Mirrors
@@ -128,6 +184,22 @@ mod tests {
             version: Arc::new("0.7.0".to_string()),
             instance_id: Arc::new("srv-11112222-3333-4444-5555-666677778888".to_string()),
             started_at: Arc::new("2024-01-15T12:34:56.789Z".to_string()),
+            server_declaration: json!({
+                "schemaVersion": "1",
+                "component": "server",
+                "version": "0.7.0",
+                "supports": {
+                    "client": {
+                        "minInclusive": "0.7.5",
+                        "maxExclusive": "0.7.6"
+                    }
+                }
+            }),
+            server_declaration_sha256: Arc::new(
+                "cb2a8fa7d33c53b91a19f2dccfe4ab4c7796e222f3d1107424079f38d33a1955".to_string(),
+            ),
+            server_process_generation_id: Some(Arc::new("generation-42".to_string())),
+            boot_id: Arc::new("boot-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
         }
     }
 
@@ -182,5 +254,59 @@ mod tests {
         // `ready` is independent of the predicate — a not-yet-ready server is still
         // a valid, discoverable freshell candidate.
         assert_eq!(body["ready"], json!(false));
+    }
+
+    #[test]
+    fn deployment_compatibility_requires_auth_and_returns_exact_status_shape() {
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+
+        let state = sample_state(true);
+        let unauthorized = deployment_compatibility_body(&state, &HeaderMap::new());
+        assert_eq!(unauthorized.0, StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-auth-token",
+            HeaderValue::from_static("s3cr3t-token-abcdef"),
+        );
+        let response = deployment_compatibility_body(&state, &headers);
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(
+            response.1 .0,
+            json!({
+                "schemaVersion": "1",
+                "serverDeclaration": {
+                    "schemaVersion": "1",
+                    "component": "server",
+                    "version": "0.7.0",
+                    "supports": {
+                        "client": {
+                            "minInclusive": "0.7.5",
+                            "maxExclusive": "0.7.6"
+                        }
+                    }
+                },
+                "serverDeclarationSha256":
+                    "cb2a8fa7d33c53b91a19f2dccfe4ab4c7796e222f3d1107424079f38d33a1955",
+                "serverProcessGenerationId": "generation-42",
+                "bootId": "boot-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            })
+        );
+    }
+
+    #[test]
+    fn deployment_compatibility_reports_null_for_an_unmanaged_process_generation() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let mut state = sample_state(true);
+        state.server_process_generation_id = None;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-auth-token",
+            HeaderValue::from_static("s3cr3t-token-abcdef"),
+        );
+
+        let response = deployment_compatibility_body(&state, &headers);
+        assert_eq!(response.1 .0["serverProcessGenerationId"], Value::Null);
     }
 }

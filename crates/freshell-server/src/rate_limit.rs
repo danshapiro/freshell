@@ -20,12 +20,14 @@
 //!   reproduces the same steady-state ceiling while refilling continuously
 //!   instead of resetting on a hard window boundary (strictly more generous
 //!   than legacy's reset-to-zero-then-refill-to-300 cliff).
-//! * **Exempt path**: `/api/health` is handled by its own router mounted
+//! * **Exempt paths**: `/api/health` is handled by its own router mounted
 //!   BEFORE the limiter (`server/index.ts:149` vs `:161`), so a health probe
 //!   never reaches it -- a structural exemption via Express dispatch order,
 //!   not an explicit skip list. `is_limited_path` below reproduces the same
-//!   effect with an explicit check, since this port's `axum::middleware::from_fn`
-//!   layer wraps every merged route uniformly regardless of mount order.
+//!   effect with an explicit check. The authenticated
+//!   `/api/deployment-compatibility` controller check is also exempt so an
+//!   exhausted browser bucket cannot prevent deploy recovery; its own auth
+//!   handler remains mandatory.
 //! * **Response body**: legacy sends `express-rate-limit`'s default plain-text
 //!   message, no JSON envelope. This port instead uses the `{ ok, error,
 //!   message }` shape already established across the rest of this crate's
@@ -254,13 +256,11 @@ impl RateLimiter {
     }
 }
 
-/// Whether `path` is subject to the limiter: `/api/*` EXCLUDING
-/// `/api/health`. Everything else (the `/ws` upgrade, the retained SPA's
-/// static assets and any other non-`/api` path) never matches this prefix
-/// and is therefore always exempt -- see the module doc comment for why
-/// this reproduces legacy's structural health exemption explicitly.
+/// Whether `path` is subject to the limiter: `/api/*` excluding health and
+/// the authenticated deployment-controller status. Everything outside
+/// `/api` (including `/ws` and static assets) is also exempt.
 fn is_limited_path(path: &str) -> bool {
-    path.starts_with("/api/") && path != "/api/health"
+    path.starts_with("/api/") && path != "/api/health" && path != "/api/deployment-compatibility"
 }
 
 /// The `axum::middleware::from_fn` body. Callers wire this via a capturing
@@ -476,6 +476,61 @@ mod tests {
         let app = probe_app(limiter).await;
         let resp = app.oneshot(get_req("/ws")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn deployment_controller_status_bypasses_rate_bucket_but_not_auth() {
+        let (limiter, _clock) = limiter_with(RateLimitConfig {
+            capacity: 0.0,
+            refill_per_sec: 0.0,
+        });
+        let app = freshell_api::router(freshell_api::ApiState {
+            auth_token: Arc::new("s3cr3t-token-abcdef".to_string()),
+            ready: true,
+            version: Arc::new("0.7.0".to_string()),
+            instance_id: Arc::new("srv-test".to_string()),
+            started_at: Arc::new("2026-07-29T00:00:00.000Z".to_string()),
+            server_declaration: serde_json::json!({
+                "schemaVersion": "1",
+                "component": "server",
+                "version": "0.7.0",
+                "supports": {
+                    "client": {
+                        "minInclusive": "0.7.5",
+                        "maxExclusive": "0.7.6"
+                    }
+                }
+            }),
+            server_declaration_sha256: Arc::new(
+                "cb2a8fa7d33c53b91a19f2dccfe4ab4c7796e222f3d1107424079f38d33a1955".to_string(),
+            ),
+            server_process_generation_id: Some(Arc::new("generation-42".to_string())),
+            boot_id: Arc::new("boot-test".to_string()),
+        })
+        .layer(axum::middleware::from_fn(move |req, next| {
+            let limiter = Arc::clone(&limiter);
+            async move { enforce(limiter, req, next).await }
+        }));
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(get_req("/api/deployment-compatibility"))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/api/deployment-compatibility")
+                    .header("x-auth-token", "s3cr3t-token-abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
     }
 
     #[tokio::test]

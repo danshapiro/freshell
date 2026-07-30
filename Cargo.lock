@@ -1361,6 +1361,7 @@ dependencies = [
  "dotenvy",
  "freshell-api",
  "freshell-codex",
+ "freshell-deployment",
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",

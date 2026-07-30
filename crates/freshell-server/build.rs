@@ -40,6 +40,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    embed_deployment_compatibility();
+
     let commit = git_head_commit().unwrap_or_else(|| "unknown".to_string());
     let dirty = git_tree_dirty();
 
@@ -49,6 +51,48 @@ fn main() {
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+/// Load and validate the canonical cross-language contract at build time,
+/// then project only the server component fields into compile-time constants.
+/// Product `APP_VERSION` is intentionally not derived from this declaration.
+fn embed_deployment_compatibility() {
+    use freshell_deployment::{
+        declaration_digest, parse_contract, project_declaration, Component, Supports,
+    };
+
+    let manifest_dir =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let contract_path = manifest_dir
+        .join("../../config/deployment-compatibility.json")
+        .canonicalize()
+        .expect("canonical deployment compatibility contract path");
+    println!("cargo:rerun-if-changed={}", contract_path.display());
+
+    let raw =
+        std::fs::read_to_string(&contract_path).expect("read config/deployment-compatibility.json");
+    let contract = parse_contract(&raw).expect("valid deployment compatibility contract");
+    let declaration = project_declaration(&contract, Component::Server);
+    let Supports::Client(bounds) = &declaration.supports else {
+        unreachable!("server declaration always supports client");
+    };
+
+    println!(
+        "cargo:rustc-env=FRESHELL_SERVER_COMPONENT_VERSION={}",
+        declaration.version
+    );
+    println!(
+        "cargo:rustc-env=FRESHELL_SERVER_SUPPORTS_CLIENT_MIN_INCLUSIVE={}",
+        bounds.min_inclusive
+    );
+    println!(
+        "cargo:rustc-env=FRESHELL_SERVER_SUPPORTS_CLIENT_MAX_EXCLUSIVE={}",
+        bounds.max_exclusive
+    );
+    println!(
+        "cargo:rustc-env=FRESHELL_SERVER_DECLARATION_SHA256={}",
+        declaration_digest(&declaration)
+    );
 }
 
 /// `git rev-parse HEAD`, trimmed. `None` on any failure (git not on `PATH`,

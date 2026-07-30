@@ -45,10 +45,14 @@ mod tabs_snapshots;
 mod terminals;
 mod updater;
 
+use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use freshell_api::ApiState;
 use freshell_freshagent::FreshAgentState;
@@ -56,6 +60,7 @@ use freshell_platform::detect::{
     detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version,
 };
 use freshell_ws::WsState;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::boot::BootState;
@@ -63,6 +68,347 @@ use crate::boot::BootState;
 /// App version reported by `GET /api/version` (mirrors `package.json` `version`).
 /// Overridable via `FRESHELL_APP_VERSION` for parity when a run needs it.
 const APP_VERSION: &str = "0.7.0";
+
+const SERVER_COMPONENT_VERSION: &str = env!("FRESHELL_SERVER_COMPONENT_VERSION");
+const SERVER_SUPPORTS_CLIENT_MIN_INCLUSIVE: &str =
+    env!("FRESHELL_SERVER_SUPPORTS_CLIENT_MIN_INCLUSIVE");
+const SERVER_SUPPORTS_CLIENT_MAX_EXCLUSIVE: &str =
+    env!("FRESHELL_SERVER_SUPPORTS_CLIENT_MAX_EXCLUSIVE");
+const SERVER_DECLARATION_SHA256: &str = env!("FRESHELL_SERVER_DECLARATION_SHA256");
+
+fn server_declaration() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "1",
+        "component": "server",
+        "version": SERVER_COMPONENT_VERSION,
+        "supports": {
+            "client": {
+                "minInclusive": SERVER_SUPPORTS_CLIENT_MIN_INCLUSIVE,
+                "maxExclusive": SERVER_SUPPORTS_CLIENT_MAX_EXCLUSIVE,
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeploymentReceipt {
+    schema_version: String,
+    nonce: String,
+    actual_address: String,
+    pid: u32,
+    boot_id: String,
+    instance_id: String,
+    server_process_generation_id: String,
+    server_component_version: String,
+    build_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActivationAuthorization {
+    schema_version: String,
+    nonce: String,
+    server_process_generation_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActivationFiles {
+    authorization_file: PathBuf,
+    activated_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DeploymentControl {
+    ready_file: Option<PathBuf>,
+    nonce: Option<String>,
+    generation_id: Option<String>,
+    activation: Option<ActivationFiles>,
+}
+
+impl DeploymentControl {
+    fn from_environment() -> Result<Self, String> {
+        Self::from_values(
+            deployment_path_env("FRESHELL_DEPLOY_READY_FILE")?,
+            deployment_string_env("FRESHELL_DEPLOY_NONCE")?,
+            deployment_string_env("FRESHELL_DEPLOY_GENERATION_ID")?,
+            deployment_path_env("FRESHELL_DEPLOY_ACTIVATION_FILE")?,
+            deployment_path_env("FRESHELL_DEPLOY_ACTIVATED_FILE")?,
+        )
+    }
+
+    fn from_values(
+        ready_file: Option<PathBuf>,
+        nonce: Option<String>,
+        generation_id: Option<String>,
+        authorization_file: Option<PathBuf>,
+        activated_file: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        for path in [
+            ready_file.as_ref(),
+            authorization_file.as_ref(),
+            activated_file.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "deployment control path must be absolute: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        let activation = match (authorization_file, activated_file) {
+            (Some(authorization_file), Some(activated_file)) => Some(ActivationFiles {
+                authorization_file,
+                activated_file,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "FRESHELL_DEPLOY_ACTIVATION_FILE and FRESHELL_DEPLOY_ACTIVATED_FILE must be set together"
+                        .to_string(),
+                );
+            }
+        };
+
+        if ready_file.is_some() || activation.is_some() {
+            if nonce.as_deref().is_none_or(str::is_empty) {
+                return Err(
+                    "FRESHELL_DEPLOY_NONCE is required when deployment receipt files are requested"
+                        .to_string(),
+                );
+            }
+            if generation_id.as_deref().is_none_or(str::is_empty) {
+                return Err(
+                    "FRESHELL_DEPLOY_GENERATION_ID is required when deployment receipt files are requested"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(Self {
+            ready_file,
+            nonce,
+            generation_id,
+            activation,
+        })
+    }
+
+    fn is_gated(&self) -> bool {
+        self.activation.is_some()
+    }
+
+    fn receipt(
+        &self,
+        actual_address: SocketAddr,
+        boot_id: &str,
+        instance_id: &str,
+    ) -> Option<DeploymentReceipt> {
+        let requested = self.ready_file.is_some() || self.activation.is_some();
+        requested.then(|| DeploymentReceipt {
+            schema_version: "1".to_string(),
+            nonce: self.nonce.clone().expect("validated deployment nonce"),
+            actual_address: actual_address.to_string(),
+            pid: std::process::id(),
+            boot_id: boot_id.to_string(),
+            instance_id: instance_id.to_string(),
+            server_process_generation_id: self
+                .generation_id
+                .clone()
+                .expect("validated deployment generation"),
+            server_component_version: SERVER_COMPONENT_VERSION.to_string(),
+            build_commit: diag::build_commit().to_string(),
+        })
+    }
+}
+
+fn deployment_string_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => Err(format!("{name} must not be empty")),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be UTF-8")),
+    }
+}
+
+fn deployment_path_env(name: &str) -> Result<Option<PathBuf>, String> {
+    deployment_string_env(name).map(|value| value.map(PathBuf::from))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationPoll {
+    Waiting,
+    Activated,
+}
+
+#[derive(Clone)]
+struct ActivationGate {
+    gated: Arc<AtomicBool>,
+}
+
+impl ActivationGate {
+    fn open() -> Self {
+        Self {
+            gated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn gated() -> Self {
+        Self {
+            gated: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn is_gated(&self) -> bool {
+        self.gated.load(Ordering::Acquire)
+    }
+
+    /// The only operation after durable activation publication. Atomic store
+    /// cannot fail, so the receipt is always the recovery boundary immediately
+    /// before ordinary routing becomes available.
+    fn activate(&self) {
+        self.gated.store(false, Ordering::Release);
+    }
+}
+
+fn is_deployment_controller_path(path: &str) -> bool {
+    matches!(path, "/api/health" | "/api/deployment-compatibility")
+}
+
+async fn enforce_activation_gate(
+    gate: ActivationGate,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if !gate.is_gated() || is_deployment_controller_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let mut response = (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "ok": false,
+            "error": "deployment_activation_pending",
+            "message": "Server activation is pending.",
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+}
+
+/// Atomically replace `path` with compact JSON and fsync both the file and its
+/// containing directory. The caller owns directory creation; a missing or
+/// unwritable parent is a startup/activation failure, never a silent fallback.
+fn publish_durable_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "deployment receipt path has no parent",
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "deployment receipt path has no UTF-8 filename",
+            )
+        })?;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn try_activate(
+    activation: &ActivationFiles,
+    receipt: &DeploymentReceipt,
+    gate: &ActivationGate,
+) -> Result<ActivationPoll, String> {
+    let bytes = match std::fs::read(&activation.authorization_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ActivationPoll::Waiting);
+        }
+        Err(error) => {
+            return Err(format!(
+                "read activation authorization {}: {error}",
+                activation.authorization_file.display()
+            ));
+        }
+    };
+    let authorization: ActivationAuthorization =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "parse activation authorization {}: {error}",
+                activation.authorization_file.display()
+            )
+        })?;
+    if authorization.schema_version != "1"
+        || authorization.nonce != receipt.nonce
+        || authorization.server_process_generation_id != receipt.server_process_generation_id
+    {
+        return Err("activation authorization does not match nonce and generation".to_string());
+    }
+
+    // All fallible work ends here. Once this durable target-owned receipt
+    // exists, recovery rolls forward; the following gate flip is infallible.
+    publish_durable_json(&activation.activated_file, receipt).map_err(|error| {
+        format!(
+            "publish activated receipt {}: {error}",
+            activation.activated_file.display()
+        )
+    })?;
+    gate.activate();
+    Ok(ActivationPoll::Activated)
+}
+
+async fn wait_for_activation(
+    activation: &ActivationFiles,
+    receipt: &DeploymentReceipt,
+    gate: &ActivationGate,
+) -> Result<(), String> {
+    loop {
+        match try_activate(activation, receipt, gate)? {
+            ActivationPoll::Waiting => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            ActivationPoll::Activated => return Ok(()),
+        }
+    }
+}
 
 /// Load `.env` from `dir` into the process environment — legacy parity for the
 /// original's `import 'dotenv/config'` (`server/index.ts:2-3`), which resolves
@@ -99,6 +445,19 @@ async fn main() -> ExitCode {
             eprintln!("AUTH_TOKEN is required. Refusing to start without authentication.");
             return ExitCode::FAILURE;
         }
+    };
+
+    let deployment_control = match DeploymentControl::from_environment() {
+        Ok(control) => control,
+        Err(error) => {
+            eprintln!("freshell-server: invalid deployment control configuration: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let activation_gate = if deployment_control.is_gated() {
+        ActivationGate::gated()
+    } else {
+        ActivationGate::open()
     };
 
     let port = resolve_port();
@@ -744,7 +1103,7 @@ async fn main() -> ExitCode {
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
-        boot_id,
+        boot_id: Arc::clone(&boot_id),
         settings: Arc::clone(&settings),
         config_fallback: config_fallback.clone(),
         broadcast_tx: Arc::clone(&broadcast_tx),
@@ -867,6 +1226,13 @@ async fn main() -> ExitCode {
         version: Arc::clone(&app_version),
         instance_id: Arc::clone(&server_instance_id),
         started_at: Arc::clone(&started_at),
+        server_declaration: server_declaration(),
+        server_declaration_sha256: Arc::new(SERVER_DECLARATION_SHA256.to_string()),
+        server_process_generation_id: deployment_control
+            .generation_id
+            .as_ref()
+            .map(|value| Arc::new(value.clone())),
+        boot_id: Arc::clone(&boot_id),
     };
     // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
     // claude/codex/opencode agents, was `{}`) and serialize the client registry for
@@ -1235,13 +1601,23 @@ async fn main() -> ExitCode {
         // `ensure_json_charset` -- a rejection here short-circuits before that
         // inner layer runs, so `rate_limit::rate_limited_response` sets its own
         // `application/json; charset=utf-8` content-type directly rather than
-        // depending on it. `rate_limit::enforce` itself exempts `/api/health`
-        // and everything outside the `/api` prefix (the `/ws` upgrade, the
-        // retained SPA's static assets) -- see that module's doc comment for
-        // the full legacy-parity derivation (`server/index.ts:161-170`).
+        // depending on it. `rate_limit::enforce` itself exempts `/api/health`,
+        // the authenticated deployment-controller status check, and everything
+        // outside the `/api` prefix (`/ws`, retained SPA assets).
         .layer(axum::middleware::from_fn(move |req, next| {
             let rate_limiter = Arc::clone(&rate_limiter);
             async move { rate_limit::enforce(rate_limiter, req, next).await }
+        }))
+        // A live-port deployment candidate binds and exposes only its two
+        // controller checks until it has durably published its target-owned
+        // activation receipt. This layer sits outside every ordinary route,
+        // including `/ws` and static/fallback serving.
+        .layer(axum::middleware::from_fn({
+            let activation_gate = activation_gate.clone();
+            move |request, next| {
+                let activation_gate = activation_gate.clone();
+                async move { enforce_activation_gate(activation_gate, request, next).await }
+            }
         }))
         // DIAG-01: the outermost layer, so it wraps every route INCLUDING the
         // fallback (unmatched-path 404/401, the retained SPA, and the `/ws`
@@ -1263,24 +1639,69 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let actual_addr = match listener.local_addr() {
+        Ok(actual_addr) => actual_addr,
+        Err(error) => {
+            eprintln!("freshell-server: failed to resolve bound listener address: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let deployment_receipt =
+        deployment_control.receipt(actual_addr, boot_id.as_str(), server_instance_id.as_str());
+    if let (Some(path), Some(receipt)) = (
+        deployment_control.ready_file.as_deref(),
+        deployment_receipt.as_ref(),
+    ) {
+        if let Err(error) = publish_durable_json(path, receipt) {
+            eprintln!(
+                "freshell-server: failed to publish deployment ready receipt {}: {error}",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     // Single startup line (stderr, so it never pollutes any stdout protocol).
     // Provenance-hardening lane: the commit suffix (same `commit` value
     // `GET /api/server-info` reports, `diag.rs::build_commit()`) means an
     // operator tailing boot logs can identify exactly which source commit
     // is running without a separate authenticated request.
     eprintln!(
-        "freshell-server listening on http://{addr} (ws://{addr}/ws) [commit {}]",
+        "freshell-server listening on http://{actual_addr} (ws://{actual_addr}/ws) [commit {}]",
         diag::build_commit()
     );
 
     // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
     // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
-    let serve_result = axum::serve(listener, app)
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(
             Arc::clone(&shutdown_notify),
             std::sync::Arc::clone(&shutdown_started),
         ))
-        .await;
+        .into_future();
+    tokio::pin!(server);
+    let mut activation_failure = None;
+    let serve_result = if let (Some(activation), Some(receipt)) = (
+        deployment_control.activation.as_ref(),
+        deployment_receipt.as_ref(),
+    ) {
+        tokio::select! {
+            result = &mut server => result,
+            result = wait_for_activation(activation, receipt, &activation_gate) => {
+                match result {
+                    Ok(()) => server.await,
+                    Err(error) => {
+                        // Dropping the pinned server future closes the gated
+                        // listener. Cleanup below still reaps every owned child
+                        // before startup returns failure to the controller.
+                        activation_failure = Some(error);
+                        Ok(())
+                    }
+                }
+            }
+        }
+    } else {
+        server.await
+    };
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
     // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
@@ -1329,6 +1750,10 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    if let Some(error) = activation_failure {
+        eprintln!("freshell-server: deployment activation failed: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Err(err) = serve_result {
         eprintln!("freshell-server: serve error: {err}");
         return ExitCode::FAILURE;
@@ -2188,6 +2613,279 @@ mod sessions_sweep_tests {
 mod tests {
     use super::*;
     use freshell_platform::MapEnv;
+
+    #[test]
+    fn deployment_identity_is_compile_time_metadata_not_product_version() {
+        assert_eq!(APP_VERSION, "0.7.0");
+        assert_eq!(SERVER_COMPONENT_VERSION, "0.7.0");
+        assert_eq!(SERVER_SUPPORTS_CLIENT_MIN_INCLUSIVE, "0.7.5");
+        assert_eq!(SERVER_SUPPORTS_CLIENT_MAX_EXCLUSIVE, "0.7.6");
+        assert_eq!(
+            SERVER_DECLARATION_SHA256,
+            "cb2a8fa7d33c53b91a19f2dccfe4ab4c7796e222f3d1107424079f38d33a1955"
+        );
+        assert_eq!(
+            server_declaration(),
+            serde_json::json!({
+                "schemaVersion": "1",
+                "component": "server",
+                "version": "0.7.0",
+                "supports": {
+                    "client": {
+                        "minInclusive": "0.7.5",
+                        "maxExclusive": "0.7.6"
+                    }
+                }
+            })
+        );
+    }
+
+    fn deployment_receipt() -> DeploymentReceipt {
+        DeploymentReceipt {
+            schema_version: "1".to_string(),
+            nonce: "nonce-123".to_string(),
+            actual_address: "127.0.0.1:45678".to_string(),
+            pid: 4242,
+            boot_id: "boot-123".to_string(),
+            instance_id: "srv-123".to_string(),
+            server_process_generation_id: "generation-123".to_string(),
+            server_component_version: "0.7.0".to_string(),
+            build_commit: "abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn durable_ready_receipt_has_exact_nonce_bound_actual_listener_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ready.json");
+        publish_durable_json(&path, &deployment_receipt()).unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "schemaVersion": "1",
+                "nonce": "nonce-123",
+                "actualAddress": "127.0.0.1:45678",
+                "pid": 4242,
+                "bootId": "boot-123",
+                "instanceId": "srv-123",
+                "serverProcessGenerationId": "generation-123",
+                "serverComponentVersion": "0.7.0",
+                "buildCommit": "abc123"
+            })
+        );
+    }
+
+    #[test]
+    fn requested_receipt_fails_when_it_cannot_be_durably_published() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing-parent").join("ready.json");
+        assert!(publish_durable_json(&path, &deployment_receipt()).is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn gated_router_admits_only_controller_checks_until_matching_activation() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let authorization_file = temp.path().join("authorize.json");
+        let activated_file = temp.path().join("activated.json");
+        let activation = ActivationFiles {
+            authorization_file,
+            activated_file: activated_file.clone(),
+        };
+        let gate = ActivationGate::gated();
+        let receipt = deployment_receipt();
+        let api_state = ApiState {
+            auth_token: Arc::new("s3cr3t-token-abcdef".to_string()),
+            ready: true,
+            version: Arc::new(APP_VERSION.to_string()),
+            instance_id: Arc::new("srv-123".to_string()),
+            started_at: Arc::new("2026-07-29T00:00:00.000Z".to_string()),
+            server_declaration: server_declaration(),
+            server_declaration_sha256: Arc::new(SERVER_DECLARATION_SHA256.to_string()),
+            server_process_generation_id: Some(Arc::new("generation-123".to_string())),
+            boot_id: Arc::new("boot-123".to_string()),
+        };
+        let app = freshell_api::router(api_state)
+            .route("/api/ordinary", get(|| async { "ordinary" }))
+            .route("/ws", get(|| async { "websocket" }))
+            .layer(axum::middleware::from_fn({
+                let gate = gate.clone();
+                move |request, next| {
+                    let gate = gate.clone();
+                    async move { enforce_activation_gate(gate, request, next).await }
+                }
+            }));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let health_body = axum::body::to_bytes(health.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health_body: serde_json::Value = serde_json::from_slice(&health_body).unwrap();
+        assert_eq!(health_body.as_object().unwrap().len(), 7);
+
+        let status_without_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deployment-compatibility")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_without_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let status_with_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deployment-compatibility")
+                    .header("x-auth-token", "s3cr3t-token-abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_with_auth.status(), StatusCode::OK);
+
+        for uri in ["/api/ordinary", "/ws", "/index.html"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "deployment_activation_pending");
+        }
+
+        publish_durable_json(
+            &activation.authorization_file,
+            &ActivationAuthorization {
+                schema_version: "1".to_string(),
+                nonce: "wrong-nonce".to_string(),
+                server_process_generation_id: "generation-123".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(try_activate(&activation, &receipt, &gate).is_err());
+        assert!(gate.is_gated());
+        assert!(!activated_file.exists());
+
+        publish_durable_json(
+            &activation.authorization_file,
+            &ActivationAuthorization {
+                schema_version: "1".to_string(),
+                nonce: "nonce-123".to_string(),
+                server_process_generation_id: "generation-123".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            try_activate(&activation, &receipt, &gate).unwrap(),
+            ActivationPoll::Activated
+        );
+        assert!(!gate.is_gated());
+        let activated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(activated_file).unwrap()).unwrap();
+        assert_eq!(
+            activated,
+            serde_json::to_value(&receipt).unwrap(),
+            "the durable target-owned activation receipt binds the exact ready identity"
+        );
+
+        let ordinary = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ordinary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn activation_authorization_rejects_unknown_keys_and_remains_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let activation = ActivationFiles {
+            authorization_file: temp.path().join("authorize.json"),
+            activated_file: temp.path().join("activated.json"),
+        };
+        std::fs::write(
+            &activation.authorization_file,
+            r#"{"schemaVersion":"1","nonce":"nonce-123","serverProcessGenerationId":"generation-123","token":"must-not-be-here"}"#,
+        )
+        .unwrap();
+        let gate = ActivationGate::gated();
+        assert!(try_activate(&activation, &deployment_receipt(), &gate).is_err());
+        assert!(gate.is_gated());
+        assert!(!activation.activated_file.exists());
+    }
+
+    #[test]
+    fn deployment_control_requires_absolute_complete_nonce_bound_file_configuration() {
+        let absolute = std::env::temp_dir().join("freshell-deploy-control-test");
+        assert!(DeploymentControl::from_values(
+            Some(PathBuf::from("relative-ready.json")),
+            Some("nonce".to_string()),
+            Some("generation".to_string()),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(DeploymentControl::from_values(
+            Some(absolute.join("ready.json")),
+            None,
+            Some("generation".to_string()),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(DeploymentControl::from_values(
+            None,
+            Some("nonce".to_string()),
+            Some("generation".to_string()),
+            Some(absolute.join("authorize.json")),
+            None,
+        )
+        .is_err());
+
+        let control = DeploymentControl::from_values(
+            Some(absolute.join("ready.json")),
+            Some("nonce".to_string()),
+            Some("generation".to_string()),
+            Some(absolute.join("authorize.json")),
+            Some(absolute.join("activated.json")),
+        )
+        .unwrap();
+        assert!(control.ready_file.is_some());
+        assert!(control.activation.is_some());
+        assert_eq!(control.nonce.as_deref(), Some("nonce"));
+        assert_eq!(control.generation_id.as_deref(), Some("generation"));
+    }
 
     // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
     // (V10.md). Deletion is the destructive branch, so every uncertain path
