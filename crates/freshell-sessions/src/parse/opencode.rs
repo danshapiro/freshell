@@ -461,8 +461,13 @@ fn fetch_session_row(
 
 /// Resume-resolve by-id lookup — a bug-for-bug port of Node's
 /// `OpencodeProvider.resolveOpencodeSessionRoots`
-/// (`server/coding-cli/providers/opencode.ts:239-323`, consumed by
-/// `resolve-session.ts:59-85`). This is deliberately NOT the attach-arm
+/// (`server/coding-cli/providers/opencode.ts:239-323`). NOTE the Node
+/// consumer has since moved on: the RETIRED pre-#586 resolve consumed this
+/// walk directly; hardened Node resolves opencode ids via
+/// `resolve-session.ts` → `resolve-fallbacks.ts` → the by-id worker
+/// (`providers/opencode-by-id-query.ts`, a DIRECT row query). This walk
+/// remains the Rust resolve fallback's interim lookup — a recorded
+/// divergence, see `resume_resolve.rs`. This is deliberately NOT the attach-arm
 /// existence probe: Node walks the `parent_id` chain, and every quirk of
 /// that walk is wire-observable, so all are replicated:
 ///
