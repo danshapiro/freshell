@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Map, Number, Value};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,131 +104,157 @@ pub struct Declaration {
     pub supports: Supports,
 }
 
-#[derive(Debug)]
-enum CheckedValue {
-    Null,
-    Bool(bool),
-    Number(Number),
-    String(String),
-    Array(Vec<CheckedValue>),
-    Object(Vec<(String, CheckedValue)>),
+struct DuplicateKeyScanner<'a> {
+    raw: &'a str,
+    bytes: &'a [u8],
+    offset: usize,
 }
 
-impl CheckedValue {
-    fn into_value(self) -> Value {
-        match self {
-            Self::Null => Value::Null,
-            Self::Bool(value) => Value::Bool(value),
-            Self::Number(value) => Value::Number(value),
-            Self::String(value) => Value::String(value),
-            Self::Array(values) => {
-                Value::Array(values.into_iter().map(CheckedValue::into_value).collect())
+impl<'a> DuplicateKeyScanner<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            bytes: raw.as_bytes(),
+            offset: 0,
+        }
+    }
+
+    fn scan(mut self) -> Result<(), CompatibilityError> {
+        self.value()?;
+        self.whitespace();
+        if self.offset != self.bytes.len() {
+            return Err(invalid_json("unexpected content after JSON value"));
+        }
+        Ok(())
+    }
+
+    fn whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            self.offset += 1;
+        }
+    }
+
+    fn value(&mut self) -> Result<(), CompatibilityError> {
+        self.whitespace();
+        match self.bytes.get(self.offset) {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => {
+                self.string_token()?;
+                Ok(())
             }
-            Self::Object(values) => Value::Object(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, value.into_value()))
-                    .collect(),
-            ),
+            Some(_) => self.primitive(),
+            None => Err(invalid_json("expected JSON value")),
         }
     }
-}
 
-impl<'de> Deserialize<'de> for CheckedValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(CheckedValueVisitor)
-    }
-}
-
-struct CheckedValueVisitor;
-
-impl<'de> Visitor<'de> for CheckedValueVisitor {
-    type Value = CheckedValue;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(CheckedValue::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(CheckedValue::Number(Number::from(value)))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(CheckedValue::Number(Number::from(value)))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Number::from_f64(value)
-            .map(CheckedValue::Number)
-            .ok_or_else(|| E::custom("non-finite JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(CheckedValue::String(value.to_owned()))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(CheckedValue::String(value))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(CheckedValue::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(CheckedValue::Null)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element()? {
-            values.push(value);
+    fn string_token(&mut self) -> Result<String, CompatibilityError> {
+        let start = self.offset;
+        self.offset += 1;
+        while let Some(byte) = self.bytes.get(self.offset) {
+            match byte {
+                b'\\' => {
+                    self.offset += 2;
+                }
+                b'"' => {
+                    self.offset += 1;
+                    return serde_json::from_str(&self.raw[start..self.offset])
+                        .map_err(|_| invalid_json("invalid JSON string"));
+                }
+                _ => self.offset += 1,
+            }
         }
-        Ok(CheckedValue::Array(values))
+        Err(invalid_json("unterminated JSON string"))
     }
 
-    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
+    fn primitive(&mut self) -> Result<(), CompatibilityError> {
+        let start = self.offset;
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}'))
+        {
+            self.offset += 1;
+        }
+        if self.offset == start {
+            return Err(invalid_json("expected JSON value"));
+        }
+        serde_json::from_str::<Value>(&self.raw[start..self.offset])
+            .map(|_| ())
+            .map_err(|_| invalid_json("invalid JSON primitive"))
+    }
+
+    fn object(&mut self) -> Result<(), CompatibilityError> {
+        self.offset += 1;
+        self.whitespace();
         let mut keys = HashSet::new();
-        let mut values = Vec::new();
-        while let Some(key) = object.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
-                return Err(de::Error::custom(format!("DUPLICATE_KEY:{key}")));
-            }
-            values.push((key, object.next_value()?));
+        if self.bytes.get(self.offset) == Some(&b'}') {
+            self.offset += 1;
+            return Ok(());
         }
-        Ok(CheckedValue::Object(values))
+        loop {
+            self.whitespace();
+            if self.bytes.get(self.offset) != Some(&b'"') {
+                return Err(invalid_json("expected JSON object key"));
+            }
+            let key = self.string_token()?;
+            if !keys.insert(key) {
+                return Err(CompatibilityError::new(
+                    "DUPLICATE_KEY",
+                    "duplicate JSON object key",
+                ));
+            }
+            self.whitespace();
+            if self.bytes.get(self.offset) != Some(&b':') {
+                return Err(invalid_json("expected colon after JSON object key"));
+            }
+            self.offset += 1;
+            self.value()?;
+            self.whitespace();
+            match self.bytes.get(self.offset) {
+                Some(b'}') => {
+                    self.offset += 1;
+                    return Ok(());
+                }
+                Some(b',') => self.offset += 1,
+                _ => return Err(invalid_json("expected comma in JSON object")),
+            }
+        }
     }
+
+    fn array(&mut self) -> Result<(), CompatibilityError> {
+        self.offset += 1;
+        self.whitespace();
+        if self.bytes.get(self.offset) == Some(&b']') {
+            self.offset += 1;
+            return Ok(());
+        }
+        loop {
+            self.value()?;
+            self.whitespace();
+            match self.bytes.get(self.offset) {
+                Some(b']') => {
+                    self.offset += 1;
+                    return Ok(());
+                }
+                Some(b',') => self.offset += 1,
+                _ => return Err(invalid_json("expected comma in JSON array")),
+            }
+        }
+    }
+}
+
+fn invalid_json(message: &'static str) -> CompatibilityError {
+    CompatibilityError::new("INVALID_JSON", message)
 }
 
 fn parse_json(raw: &str) -> Result<Value, CompatibilityError> {
-    serde_json::from_str::<CheckedValue>(raw)
-        .map(CheckedValue::into_value)
-        .map_err(|error| {
-            if error.to_string().contains("DUPLICATE_KEY:") {
-                CompatibilityError::new("DUPLICATE_KEY", "duplicate JSON object key")
-            } else {
-                CompatibilityError::new("INVALID_JSON", "invalid JSON")
-            }
-        })
+    DuplicateKeyScanner::new(raw).scan()?;
+    serde_json::from_str(raw).map_err(|_| invalid_json("invalid JSON"))
 }
 
 fn exact_object<'a>(

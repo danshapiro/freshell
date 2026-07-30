@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const VERSION_PATTERN = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+const JSON_NUMBER_PATTERN = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/
 const MAX_COMPONENT = 4294967295n
 const COMPONENTS = new Set(['client', 'server'])
 const textEncoder = new TextEncoder()
@@ -23,8 +24,17 @@ function fail(code, message) {
 function rejectDuplicateKeys(raw) {
   let offset = 0
 
+  function isWhitespace(character) {
+    return (
+      character === ' ' ||
+      character === '\t' ||
+      character === '\r' ||
+      character === '\n'
+    )
+  }
+
   function whitespace() {
-    while (offset < raw.length && /\s/.test(raw[offset])) offset += 1
+    while (offset < raw.length && isWhitespace(raw[offset])) offset += 1
   }
 
   function stringToken() {
@@ -58,8 +68,18 @@ function rejectDuplicateKeys(raw) {
       return
     }
     const start = offset
-    while (offset < raw.length && !/[\s,\]}]/.test(raw[offset])) offset += 1
+    while (
+      offset < raw.length &&
+      !isWhitespace(raw[offset]) &&
+      ![',', ']', '}'].includes(raw[offset])
+    ) {
+      offset += 1
+    }
     if (offset === start) fail('INVALID_JSON', 'expected JSON value')
+    const token = raw.slice(start, offset)
+    if (!['null', 'true', 'false'].includes(token) && !JSON_NUMBER_PATTERN.test(token)) {
+      fail('INVALID_JSON', 'invalid JSON primitive')
+    }
   }
 
   function object() {
