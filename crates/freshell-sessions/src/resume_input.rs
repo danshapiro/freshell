@@ -70,10 +70,16 @@ pub struct ResumeHint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeInputParse {
-    /// Candidate tokens in resolution-priority order.
+    /// Candidate tokens in resolution-priority order, capped at
+    /// [`MAX_RESUME_CANDIDATES`].
     pub candidates: Vec<ResumeCandidate>,
     pub hint: Option<ResumeHint>,
 }
+
+/// Work budget: candidates are capped so one pasted blob can never trigger
+/// unbounded server-side scans/DB lookups in the resolve endpoint.
+/// (`MAX_RESUME_CANDIDATES`, `shared/resume-input-parser.ts`.)
+pub const MAX_RESUME_CANDIDATES: usize = 8;
 
 static ANSI_ESCAPE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[0-9A-Za-z]").expect("static regex"));
@@ -81,10 +87,14 @@ static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
         .expect("static regex")
 });
-// ses_ + 26 base62 is the first-class shape; the generic form also accepts
-// other known xxx_-prefixed id families.
+// Known xxx_-prefixed id families only (ses_ + 26 base62 is opencode's,
+// first-class). Arbitrary snake_case identifiers must NOT match: they would
+// rank FIRST and waste resolver passes on non-ids.
 static PREFIXED_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?-u:\b)[a-z]{2,10}_[0-9A-Za-z]{8,40}(?-u:\b)").expect("static regex")
+    Regex::new(
+        r"(?-u:\b)(?:ses|sess|session|thread|thr|run|msg|task|amp)_[0-9A-Za-z]{8,64}(?-u:\b)",
+    )
+    .expect("static regex")
 });
 // >=8 hex chars, <=32; must contain a digit (filters decade/facade/deadbeef).
 static HEX_PREFIX_RE: LazyLock<Regex> =
@@ -276,6 +286,9 @@ pub fn parse_resume_input(text: &str) -> ResumeInputParse {
         );
     }
 
+    // Cap = work budget: bounds resolver scans + exact-id fallback lookups per
+    // request. The hint reads the CAPPED list (mirrors the TS call shape).
+    candidates.truncate(MAX_RESUME_CANDIDATES);
     let hint = derive_hint(&sanitized, &candidates);
     ResumeInputParse { candidates, hint }
 }

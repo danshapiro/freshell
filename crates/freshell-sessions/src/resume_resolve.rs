@@ -1,8 +1,17 @@
-//! Rust port of `server/coding-cli/resolve-session.ts` — the resume-by-id
-//! resolve core. Pure and synchronous: the HTTP layer
-//! (`crates/freshell-server/src/resolve.rs`) supplies the index snapshot, the
-//! sessionType overlay map, and the two exact-id fallback closures, then
-//! serializes the returned response verbatim.
+//! Rust port of the resume-by-id resolve core. Ports the HARDENED matching
+//! semantics of `server/coding-cli/resolve-session.ts`: per-token
+//! exact→fallback→prefix ordering, case-sensitivity gating (uuid/hex tokens
+//! case-insensitive, `ses_` base62 case-SENSITIVE), subagent exclusion from
+//! prefix discovery, and the parser-side candidate work budget. Pure and
+//! synchronous: the HTTP layer (`crates/freshell-server/src/resolve.rs`)
+//! supplies the index snapshot, the sessionType overlay map, and the two
+//! exact-id fallback closures, then serializes the returned response verbatim.
+//!
+//! NOT YET PORTED (known divergence from the hardened Node response surface):
+//! `degraded` status, `providerErrors`, `unsearchedProviders`, `homeDir`, and
+//! the warming/ready readiness merge — tracked in
+//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6. The
+//! `sessionResolve` capability flag is held `false` until that lands.
 //!
 //! Wire parity notes:
 //! - Field ORDER in `ResumeResolveMatch` matches the Node object literals
@@ -18,7 +27,7 @@ use crate::directory_index::IndexedSession;
 use crate::parse::OpencodeSessionDirectory;
 use crate::resume_input::{parse_resume_input, ResumeCandidateKind, ResumeHint};
 
-/// `RESOLVE_MATCH_CAP` (`resolve-session.ts:9`).
+/// Node's `RESOLVE_MATCH_CAP` (`resolve-session.ts`).
 pub const RESOLVE_MATCH_CAP: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -103,7 +112,32 @@ pub struct ResolveDeps<'a> {
         Option<&'a (dyn Fn(&str) -> Option<ClaudeTranscriptHit> + Send + Sync)>,
 }
 
-/// `resolveResumeInput` (`resolve-session.ts:24-107`), step for step.
+/// Node's `isCaseInsensitiveToken`: UUID/hex-family tokens (hex digits +
+/// dashes only) match case-insensitively. Everything else — notably `ses_` +
+/// base62 ids — matches case-SENSITIVELY: base62 upper/lower case are
+/// distinct values, so case-folding could resolve the WRONG session.
+fn is_case_insensitive_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// Port of the hardened `resolveResumeInput` matching semantics. Candidate
+/// tokens are tried in priority order; PER TOKEN the resolution order is:
+///
+///   1. exact index hits (ALL sessions, including subagent children — an
+///      exact pasted id must resolve even for hidden child sessions),
+///   2. exact-id fallbacks for sessions the index cannot see (opencode child
+///      sessions; cwd-less claude transcripts skipped on cold start),
+///   3. and only then prefix matches (top-level sessions only — surfacing
+///      hidden subagent children for partial ids would flood disambiguation
+///      with noise).
+///
+/// A prefix match must NEVER outrank any exact resolution of the same or a
+/// higher-priority token: an unindexed session whose id EQUALS the token
+/// beats any indexed session whose id merely begins with it, or the wrong
+/// session gets resumed.
+///
+/// The per-provider error channel (`providerErrors` / `degraded`) is NOT yet
+/// ported — see the module doc.
 pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolveResponse {
     // Parse BEFORE the warming gate: the warming response still carries the hint.
     let parsed = parse_resume_input(input);
@@ -125,61 +159,59 @@ pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolv
     }
 
     // Evidence pass: one scan answers all providers at once. Candidates are
-    // tried in priority order until one resolves. The hint NEVER filters.
+    // tried in priority order until one resolves; PER TOKEN the order is
+    // exact → exact-id fallbacks → prefix (see the fn doc). The hint NEVER
+    // filters.
     for candidate in &parsed.candidates {
-        let needle = candidate.token.to_ascii_lowercase();
-        let mut exact: Vec<ResumeResolveMatch> = Vec::new();
-        let mut prefix: Vec<ResumeResolveMatch> = Vec::new();
-        for session in sessions {
-            let id = session.session_id.to_ascii_lowercase();
-            if id == needle {
-                exact.push(to_match(
-                    session,
-                    ResumeMatchKind::Exact,
-                    deps.session_types,
-                ));
-            } else if id.starts_with(&needle) {
-                prefix.push(to_match(
-                    session,
-                    ResumeMatchKind::Prefix,
-                    deps.session_types,
-                ));
+        let ci = is_case_insensitive_token(&candidate.token);
+        let norm = |value: &str| {
+            if ci {
+                value.to_ascii_lowercase()
+            } else {
+                value.to_string()
+            }
+        };
+        let target = norm(&candidate.token);
+
+        // 1. Exact index hits — scan ALL sessions, subagent children included.
+        let exact: Vec<ResumeResolveMatch> = sessions
+            .iter()
+            .filter(|session| norm(&session.session_id) == target)
+            .map(|session| to_match(session, ResumeMatchKind::Exact, deps.session_types))
+            .collect();
+        if !exact.is_empty() {
+            return finish(exact, hint.clone());
+        }
+
+        // 2. Exact-id fallbacks run BEFORE prefix matching (an unindexed
+        // session whose id EQUALS the token must beat any indexed session
+        // whose id merely begins with it). The full-id shape gates make
+        // wrong-shape tokens free no-ops, matching Node's budgeted fallbacks.
+        if candidate.kind == ResumeCandidateKind::Uuid {
+            if let Some(locate) = deps.locate_claude_transcript {
+                if let Some(hit) = locate(&candidate.token) {
+                    return finish(
+                        vec![ResumeResolveMatch {
+                            provider: "claude".to_string(),
+                            session_id: hit.session_id,
+                            cwd: hit.cwd,
+                            session_type: Some("claude".to_string()),
+                            title: None,
+                            first_user_message: None,
+                            last_activity_at: None,
+                            match_kind: ResumeMatchKind::Exact,
+                        }],
+                        hint.clone(),
+                    );
+                }
             }
         }
-        // Exact wins wholesale — exact and prefix are never mixed.
-        let mut matches = if !exact.is_empty() { exact } else { prefix };
-        if !matches.is_empty() {
-            // Sort BEFORE dedupe (stable), so the dedupe survivor is the
-            // most-recent entry. Missing lastActivityAt sorts as 0 in Node;
-            // the Rust index always has a value.
-            matches.sort_by(|a, b| {
-                b.last_activity_at
-                    .unwrap_or(0)
-                    .cmp(&a.last_activity_at.unwrap_or(0))
-            });
-            let matches: Vec<ResumeResolveMatch> = dedupe(matches)
-                .into_iter()
-                .take(RESOLVE_MATCH_CAP)
-                .collect();
-            return ResumeResolveResponse {
-                status: ResumeResolveStatus::Ready,
-                matches,
-                hint,
-            };
-        }
-    }
-
-    // Exact-id fallbacks for sessions the index cannot see (opencode child
-    // sessions; cwd-less claude transcripts skipped by the R10b cwd gate) —
-    // only reached when EVERY candidate missed the index.
-    for candidate in &parsed.candidates {
         if candidate.kind == ResumeCandidateKind::PrefixedId && candidate.token.starts_with("ses_")
         {
             if let Some(lookup) = deps.opencode_dir_by_id {
                 if let Some(hit) = lookup(&candidate.token) {
-                    return ResumeResolveResponse {
-                        status: ResumeResolveStatus::Ready,
-                        matches: vec![ResumeResolveMatch {
+                    return finish(
+                        vec![ResumeResolveMatch {
                             provider: "opencode".to_string(),
                             session_id: candidate.token.clone(),
                             // opencode resumes in the SPAWN cwd (the sqlite
@@ -195,30 +227,23 @@ pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolv
                             last_activity_at: None,
                             match_kind: ResumeMatchKind::Exact,
                         }],
-                        hint,
-                    };
+                        hint.clone(),
+                    );
                 }
             }
         }
-        if candidate.kind == ResumeCandidateKind::Uuid {
-            if let Some(locate) = deps.locate_claude_transcript {
-                if let Some(hit) = locate(&candidate.token) {
-                    return ResumeResolveResponse {
-                        status: ResumeResolveStatus::Ready,
-                        matches: vec![ResumeResolveMatch {
-                            provider: "claude".to_string(),
-                            session_id: hit.session_id,
-                            cwd: hit.cwd,
-                            session_type: Some("claude".to_string()),
-                            title: None,
-                            first_user_message: None,
-                            last_activity_at: None,
-                            match_kind: ResumeMatchKind::Exact,
-                        }],
-                        hint,
-                    };
-                }
-            }
+
+        // 3. Prefix DISCOVERY — top-level sessions only (`!is_subagent`);
+        // exact ids above still reach subagent children.
+        let prefix: Vec<ResumeResolveMatch> = sessions
+            .iter()
+            .filter(|session| {
+                !session.is_subagent && norm(&session.session_id).starts_with(&target)
+            })
+            .map(|session| to_match(session, ResumeMatchKind::Prefix, deps.session_types))
+            .collect();
+        if !prefix.is_empty() {
+            return finish(prefix, hint.clone());
         }
     }
 
@@ -229,8 +254,29 @@ pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolv
     }
 }
 
-/// `toMatch` (`resolve-session.ts:109-119`): `cwd: session.cwd ?? projectPath`;
-/// `sessionType` overlays from the metadata map (usually absent).
+/// Node's `finish` (minus the provider-error channel — see the module doc):
+/// sort most-recent-first BEFORE dedupe (stable, so the dedupe survivor is
+/// the most-recent entry; missing lastActivityAt sorts as 0), then cap.
+fn finish(mut matches: Vec<ResumeResolveMatch>, hint: Option<ResumeHint>) -> ResumeResolveResponse {
+    matches.sort_by(|a, b| {
+        b.last_activity_at
+            .unwrap_or(0)
+            .cmp(&a.last_activity_at.unwrap_or(0))
+    });
+    let matches: Vec<ResumeResolveMatch> = dedupe(matches)
+        .into_iter()
+        .take(RESOLVE_MATCH_CAP)
+        .collect();
+    ResumeResolveResponse {
+        status: ResumeResolveStatus::Ready,
+        matches,
+        hint,
+    }
+}
+
+/// Node's `toMatch`: `cwd: session.cwd ?? projectPath`; `sessionType` is the
+/// metadata-map overlay when present, defaulting to the provider — the
+/// hardened Node `toMatch` emits `sessionType ?? provider`, never absent.
 fn to_match(
     session: &IndexedSession,
     match_kind: ResumeMatchKind,
@@ -245,7 +291,12 @@ fn to_match(
                 .clone()
                 .unwrap_or_else(|| session.project_path.clone()),
         ),
-        session_type: session_types.get(&session.key()).cloned(),
+        session_type: Some(
+            session_types
+                .get(&session.key())
+                .cloned()
+                .unwrap_or_else(|| session.provider.clone()),
+        ),
         title: session.title.clone(),
         first_user_message: session.first_user_message.clone(),
         last_activity_at: Some(session.last_activity_at),
@@ -253,8 +304,8 @@ fn to_match(
     }
 }
 
-/// `dedupe` (`resolve-session.ts:121-133`): first `provider:sessionId` wins —
-/// which, post-sort, is the most recent entry.
+/// Node's `dedupe`: first `provider:sessionId` wins — which, post-sort, is
+/// the most recent entry.
 fn dedupe(matches: Vec<ResumeResolveMatch>) -> Vec<ResumeResolveMatch> {
     let mut seen: HashSet<String> = HashSet::new();
     matches

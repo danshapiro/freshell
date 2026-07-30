@@ -166,10 +166,25 @@
       "hint": { "provider": "amplifier", "source": "id-shape" }
     },
     {
-      "name": "non-ses prefixed id yields no id-shape hint",
+      "name": "unknown xxx_ prefix family is not a candidate",
       "input": "abc_12345678",
-      "candidates": [{ "token": "abc_12345678", "kind": "prefixed-id" }],
+      "candidates": [],
       "hint": null
+    },
+    {
+      "name": "caps candidates at the work budget of 8, keeping the first eight in priority order",
+      "input": "00000000-1111-4222-8333-444444444440 00000001-1111-4222-8333-444444444441 00000002-1111-4222-8333-444444444442 00000003-1111-4222-8333-444444444443 00000004-1111-4222-8333-444444444444 00000005-1111-4222-8333-444444444445 00000006-1111-4222-8333-444444444446 00000007-1111-4222-8333-444444444447 00000008-1111-4222-8333-444444444448 00000009-1111-4222-8333-444444444449",
+      "candidates": [
+        { "token": "00000000-1111-4222-8333-444444444440", "kind": "uuid" },
+        { "token": "00000001-1111-4222-8333-444444444441", "kind": "uuid" },
+        { "token": "00000002-1111-4222-8333-444444444442", "kind": "uuid" },
+        { "token": "00000003-1111-4222-8333-444444444443", "kind": "uuid" },
+        { "token": "00000004-1111-4222-8333-444444444444", "kind": "uuid" },
+        { "token": "00000005-1111-4222-8333-444444444445", "kind": "uuid" },
+        { "token": "00000006-1111-4222-8333-444444444446", "kind": "uuid" },
+        { "token": "00000007-1111-4222-8333-444444444447", "kind": "uuid" }
+      ],
+      "hint": { "provider": "claude", "source": "id-shape" }
     },
     {
       "name": "uuid version other than 4 or 7 yields no id-shape hint",

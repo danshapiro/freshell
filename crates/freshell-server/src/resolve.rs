@@ -1,7 +1,16 @@
-//! `POST /api/sessions/resolve` — SYNC-06 parity port of
-//! `server/sessions-router.ts:243-257` + `server/coding-cli/resolve-session.ts`.
+//! `POST /api/sessions/resolve` — SYNC-06 port of the resolve route
+//! (`server/sessions-router.ts`) + the hardened matching semantics of
+//! `server/coding-cli/resolve-session.ts` (exact→fallback→prefix ordering,
+//! case-sensitivity gating, subagent exclusion, candidate work budget).
 //!
-//! Behavior contract (mirrors Node exactly):
+//! KNOWN DIVERGENCE — hardened response surface NOT yet ported: no
+//! `degraded` status, `providerErrors`, `unsearchedProviders`, or `homeDir`,
+//! and no scan-failure/warming-default merge. Tracked in
+//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6;
+//! the `sessionResolve` capability flag is held `false` (`main.rs`) until
+//! that lands.
+//!
+//! Behavior contract:
 //! - auth: same `x-auth-token` / `freshell-auth` cookie check as every other
 //!   `/api` route (`boot::is_authed`), 401 `{"error":"Unauthorized"}`.
 //! - validation: strict body `{ input: string 1..=20000 }` (UTF-16 code
@@ -19,7 +28,7 @@
 //!   post-filter project groups (`session-indexer.ts:209,1155-1156`) and the
 //!   Rust sidebar applies the same overlay (`session_directory.rs`
 //!   `apply_session_overrides`). The exact-id fallbacks BYPASS the filter,
-//!   as Node's do (`resolve-session.ts:59-103`).
+//!   as Node's do (they read sqlite/the filesystem directly).
 //! - success is ALWAYS 200 — "not found" is `{status:"ready",matches:[]}`,
 //!   cold index is `{status:"warming",matches:[],hint}` (never 404/5xx).
 //!
@@ -241,7 +250,7 @@ async fn resolve_session(
     // divergence (the Rust sidebar does not consult them either). The
     // exact-id FALLBACKS below intentionally BYPASS this filter — Node's
     // fallbacks read sqlite/the filesystem directly and never consult
-    // overrides (`resolve-session.ts:59-103`) — bug-for-bug.
+    // overrides — bug-for-bug.
     let snapshot: Option<Vec<IndexedSession>> = snapshot.map(|sessions| {
         let overrides = state.settings.session_overrides();
         sessions
@@ -611,6 +620,8 @@ mod tests {
                 "provider": "claude",
                 "sessionId": CLAUDE_ID,
                 "cwd": "/repo/alpha",
+                // Hardened Node emits `sessionType ?? provider` — never absent.
+                "sessionType": "claude",
                 "title": "Fix the parser",
                 "firstUserMessage": "fix the parser",
                 "lastActivityAt": 400,
