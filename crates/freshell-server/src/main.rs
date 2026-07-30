@@ -596,15 +596,43 @@ fn try_activate_with_ops(
 }
 
 fn sandbox_exit_after_deploy_authorization(activation: &ActivationFiles) -> bool {
-    std::env::var("FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION").as_deref() == Ok("1")
-        && std::env::var("FRESHELL_DESTRUCTIVE_SANDBOX").as_deref() == Ok("1")
-        && std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .is_some_and(|port| port != 3002)
-        && std::env::current_dir()
-            .ok()
-            .is_some_and(|cwd| cwd.starts_with("/tmp/"))
+    let hard_exit = std::env::var("FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION").ok();
+    let sandbox = std::env::var("FRESHELL_DESTRUCTIVE_SANDBOX").ok();
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok());
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    sandbox_exit_after_deploy_authorization_for(
+        activation,
+        hard_exit.as_deref(),
+        sandbox.as_deref(),
+        port,
+        &cwd,
+    )
+}
+
+fn sandbox_exit_after_deploy_authorization_for(
+    activation: &ActivationFiles,
+    hard_exit: Option<&str>,
+    sandbox: Option<&str>,
+    port: Option<u16>,
+    cwd: &Path,
+) -> bool {
+    fn is_strictly_beneath_tmp(path: &Path) -> bool {
+        path.strip_prefix("/tmp").is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+    }
+
+    hard_exit == Some("1")
+        && sandbox == Some("1")
+        && port.is_some_and(|port| port != 3002)
+        && is_strictly_beneath_tmp(cwd)
         && [
             &activation.authorization_file,
             &activation.activated_file,
@@ -612,7 +640,7 @@ fn sandbox_exit_after_deploy_authorization(activation: &ActivationFiles) -> bool
             &activation.cancelled_file,
         ]
         .into_iter()
-        .all(|path| path.starts_with("/tmp/"))
+        .all(|path| is_strictly_beneath_tmp(path))
 }
 
 async fn wait_for_activation(
@@ -3345,6 +3373,113 @@ mod tests {
         assert!(control.activation.is_some());
         assert_eq!(control.nonce.as_deref(), Some("nonce"));
         assert_eq!(control.generation_id.as_deref(), Some("generation"));
+    }
+
+    fn sandbox_activation_files(root: &Path) -> ActivationFiles {
+        ActivationFiles {
+            authorization_file: root.join("authorize.json"),
+            activated_file: root.join("activated.json"),
+            cancellation_file: root.join("cancel.json"),
+            cancelled_file: root.join("cancelled.json"),
+        }
+    }
+
+    #[test]
+    fn deployment_authorization_hard_exit_requires_every_sandbox_guard() {
+        let safe = sandbox_activation_files(Path::new("/tmp/freshell-hard-exit/controls"));
+        assert!(sandbox_exit_after_deploy_authorization_for(
+            &safe,
+            Some("1"),
+            Some("1"),
+            Some(3499),
+            Path::new("/tmp/freshell-hard-exit/checkout"),
+        ));
+
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                None,
+                Some("1"),
+                Some(3499),
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "the explicit hard-exit request is mandatory"
+        );
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                Some("1"),
+                None,
+                Some(3499),
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "the destructive-sandbox sentinel is mandatory"
+        );
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                Some("1"),
+                Some("1"),
+                Some(3002),
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "the live self-hosted port must never honor the hard-exit seam"
+        );
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                Some("1"),
+                Some("1"),
+                None,
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "a missing or malformed port must fail closed"
+        );
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                Some("1"),
+                Some("1"),
+                Some(3499),
+                Path::new("/workspace/freshell"),
+            ),
+            "the server cwd must be beneath /tmp"
+        );
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &safe,
+                Some("1"),
+                Some("1"),
+                Some(3499),
+                Path::new("/tmp-uncontained/freshell"),
+            ),
+            "a textual /tmp prefix is not containment"
+        );
+
+        let unsafe_controls =
+            sandbox_activation_files(Path::new("/workspace/freshell-hard-exit/controls"));
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &unsafe_controls,
+                Some("1"),
+                Some("1"),
+                Some(3499),
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "every activation control path must be beneath /tmp"
+        );
+        let prefix_only_controls =
+            sandbox_activation_files(Path::new("/tmp-uncontained/freshell-hard-exit/controls"));
+        assert!(
+            !sandbox_exit_after_deploy_authorization_for(
+                &prefix_only_controls,
+                Some("1"),
+                Some("1"),
+                Some(3499),
+                Path::new("/tmp/freshell-hard-exit/checkout"),
+            ),
+            "control paths with only a textual /tmp prefix must fail closed"
+        );
     }
 
     // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
