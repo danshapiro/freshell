@@ -48,10 +48,13 @@ Ground truth gathered by three independent investigations of the worktree and
 main. An implementer should trust-but-spot-check line numbers (they drift);
 the structural facts are load-bearing.
 
-**The branch** (19 commits `0d877c1f2..0e077fd4b`, forked from `ca1a60d3`,
-+5648/−83 across 26 code files; the top two commits are docs-only —
-`948e52b5f` adds this plan, and the tip `0e077fd4b` hardens it with the
-validation-pass findings):
+**The branch** (forked from `ca1a60d3`; 17 feature/style commits
+`0d877c1f2..f9b8aa33f`, +5648/−83 across 26 code files, topped by a run of
+docs-only plan commits — `948e52b5f` adds this plan and every later
+`docs(plans):`/`docs:` commit revises it. The docs run GROWS each time this
+plan is amended, so no step below hard-codes the total commit count: Task 1
+Step 1 measures it as `N` and every later count gate is expressed relative
+to `N`):
 
 - Door 1 (WS `terminal.create` restore): `crates/freshell-ws/src/terminal.rs:1799–1885` inside `handle_create` (@1412), keyed on `resume_id_from_wire`; must sit AFTER the D7 liveness guard and BEFORE the amplifier `ensure_session` re-stub. Emits `notice:` on the `TerminalCreated` frame (~:2704).
 - Door 2 (auto-resume respawn): `terminal.rs:2810–2884` inside `respawn_agent_terminal` (@2779); replaces the locals so post-spawn bookkeeping records the fresh id; rekeys `ensure_session` from `req.session_id` to the gate-validated local (:3005–3024). No `notice` — broadcasts `terminal.status{Recovering, reason}`.
@@ -134,10 +137,17 @@ git status --short            # MUST be empty; halt if not
 git fetch origin
 git rev-parse origin/main     # MUST print 39010cb57... ; halt if not
 git branch backup/resume-validation-pre-rebase-2026-07-30
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 19 (17 feature commits + 2 docs-only plan commits: 948e52b5f adds this plan, 0e077fd4b hardens it)
+N=$(git log --oneline ca1a60d3..HEAD | wc -l); echo "N=$N"   # record N = 17 feature/style commits + the docs-only plan commits on top (20 at the time of this revision; +1 for every later plan amendment)
+git log --format='%h %s' ca1a60d3..HEAD | head -n "$((N - 17))"   # MUST all be docs-only plan commits (docs:/docs(plans): …, touching only docs/plans/**)
+git log --format='%h %s' ca1a60d3..HEAD | sed -n "$((N - 16))p"   # MUST be f9b8aa33f fix(resume-validation): confine the ~1s codex rollout walk to gate callers via exists_for_gate
 ```
 
-Expected: clean tree, `39010cb57…`, `19`. If `origin/main` moved past
+Expected: clean tree, `39010cb57…`, and the structural check holds: exactly
+`N − 17` docs-only plan commits sit above the feature tip `f9b8aa33f`. HALT
+if any of those top lines is not a docs-only plan commit, or if the
+`N − 16`th line is not `f9b8aa33f` — the 17-feature-commit floor is
+load-bearing for every count gate below. Record `N`; Steps 3/9 and Task 7
+Step 5 are expressed relative to it. If `origin/main` moved past
 `39010cb57`, STOP and surface it — the spec pins this exact target.
 
 - [ ] **Step 2: Confirm the fmt-sweep commit is adjacent to its parent**
@@ -161,7 +171,7 @@ fixup discards only the `style:` message; its content survives inside #14.
 
 ```bash
 GIT_SEQUENCE_EDITOR='sed -i "s/^pick 2b5f46c6e/fixup 2b5f46c6e/"' git rebase -i ca1a60d3
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 18
+git log --oneline ca1a60d3..HEAD | wc -l   # expect N − 1 (the fold removed exactly one commit; N from Step 1)
 ```
 
 Expected: rebase completes with no conflicts (pure history rewrite of adjacent
@@ -353,8 +363,8 @@ fixed in this task before committing.
 
 - [ ] **Step 9: Commit the reconciliation residue**
 
-The 18 replayed commits (17 post-fold feature/docs commits, or 19 if Step 3's
-fold was skipped per its fallback) are already committed by the rebase. Commit the Step 7
+The replayed commits (`N − 1` post-fold, or `N` if Step 3's fold was skipped
+per its fallback; N from Step 1) are already committed by the rebase. Commit the Step 7
 initializer fixes + Step 8 fmt as one focused commit:
 
 ```bash
@@ -370,8 +380,10 @@ harnesses and literals after replaying onto origin/main."
 If Step 7 required zero changes, skip this commit (the rebase alone is the
 deliverable; `git log` shows the replayed commits atop `39010cb57`).
 
-Final check: `git log --oneline origin/main..HEAD | wc -l` prints 18 or 19,
-and `git merge-base origin/main HEAD` prints `39010cb57…`.
+Final check: `git log --oneline origin/main..HEAD | wc -l` prints `N − 1`
+(fold done, no residue commit) or `N` (fold done + residue commit, or fold
+skipped without residue) — `N + 1` only in the fold-skipped-AND-residue
+case — and `git merge-base origin/main HEAD` prints `39010cb57…`.
 
 ---
 
@@ -1075,7 +1087,7 @@ fix, commit, re-run Step 4. Rust-side baselines were verified green on main
 
 ```bash
 git status --short                          # empty
-git log --oneline origin/main..HEAD         # 18–24 commits, all *(resume-validation)* scoped
+git log --oneline origin/main..HEAD         # between N − 1 and N + 6 commits (N from Task 1 Step 1: replayed commits + optional residue + up to 5 task commits + fix slack), all resume-validation work
 git merge-base origin/main HEAD             # 39010cb57...
 git log -1 --format='%an <%ae>'             # Dan Shapiro <3732858+danshapiro@users.noreply.github.com>
 ```
@@ -1110,9 +1122,11 @@ left local and verified — that is the stop condition.
 The plan's load-bearing assumptions were validated (ledger:
 `.worktrees/.the-usual-logs/resume-validation/load-bearing-ledger.md`):
 9 verified, 2 falsified and fixed in this revision (branch commit counts —
-now 19/18/"18 or 19" including the two docs plan commits (`948e52b5f` adds
-this plan, `0e077fd4b` hardens it — the fresh-eyes pass caught that the
-hardening commit itself was omitted from the counts); Task 2's observation
+two successive fresh-eyes passes each caught a hard-coded total going stale
+the moment the plan-fix commit itself landed, so all count gates are now
+expressed relative to `N` measured in Task 1 Step 1 (17 feature commits +
+however many docs-only plan commits sit on top), structurally immune to
+further plan amendments; Task 2's observation
 mechanism — rewritten to main's `RecordingBinder` seam since PIN 2 is
 binder-gated and unobservable via any ledger query), 1 accepted residual
 (no npm-side baseline record on this host — mitigated by Task 7's
