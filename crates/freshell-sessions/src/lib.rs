@@ -22,6 +22,7 @@ pub mod indexer;
 pub mod meta;
 pub mod opencode_locator;
 pub mod parse;
+pub mod resume_input;
 pub mod search;
 pub mod text;
 pub mod time;
