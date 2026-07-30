@@ -1351,9 +1351,10 @@ RED: create `crates/freshell-ws/tests/resume_validation_gate.rs`. Reuse the harn
 2. `restore_true_amplifier_present_resumes_unchanged`: probe answers `Present`; assert `terminal.created` has NO `notice` and the ledger row stays `Bound`.
 3. `restore_true_unknown_fails_open`: probe answers `Unknown`; assert no `notice`, row stays `Bound` (today's behavior preserved).
 4. `restore_true_live_absent_sessionref_hits_d7_not_the_gate`: registry/identity hold a RUNNING owner for `("amplifier", "stale-amp")` (set up the liveness state the way D7's own sibling tests do), probe answers `Absent`, ledger holds a `Bound` row. Send the same restore create as case 1. Assert: (a) the response is D7's `RestoreUnavailable` error frame ("still running"), NOT a `terminal.created` fresh spawn; (b) the `Bound` ledger row of the running session SURVIVES (`load_binding` still `Bound` — the gate never saw the create). This pins the after-D7 ordering (V8 §A11).
-5. `restore_true_live_absent_legacy_resume_id_fails_open`: same live state, but the create carries the id ONLY in legacy `resumeSessionId` (no `session_ref`) — this carrier bypasses D7 in every ordering. Assert: no `notice`, the row stays `Bound`, and the resume proceeds unchanged. This pins the in-gate liveness precondition.
+5. `restore_true_live_absent_legacy_resume_id_fails_open`: same live state, but the create carries the id ONLY in legacy `resumeSessionId` (no `session_ref`) — this carrier bypasses D7 in every ordering. Assert: no `notice`, the row stays `Bound`, and the resume proceeds unchanged. This pins the REGISTRY arm of the in-gate liveness precondition (case 6 pins the sidecar arm).
+6. `restore_true_sidecar_live_absent_legacy_resume_id_fails_open`: liveness held ONLY by the fresh-agent sidecar — registry/identity hold NO running owner for the ref, but the state's fresh-agent sidecar (`state.fresh_codex` for a `("codex", "stale-cx")` ref — set up the fake sidecar the way D7's own sidecar-liveness sibling tests do) answers `has_live_session("stale-cx") == true`; probe answers `Absent`; ledger holds a `Bound` row; the create carries the id only in legacy `resumeSessionId`. Assert: no `notice`, the row stays `Bound`, and the resume proceeds unchanged. This pins the ASYNC sidecar arm of the in-gate liveness join — the arm protecting live zero-turn sessions that have no rollout on disk yet (`crates/freshell-server/src/existence.rs:224-227`) — so it cannot be silently dropped while cases 4–5 still pass.
 
-Run: `cargo test -p freshell-ws --test resume_validation_gate` — tests fail (no gate wired; notice absent, row stays bound in case 1; cases 4/5 fail once the gate exists if ordering/liveness are wrong — write them RED now so the GREEN wiring must satisfy them).
+Run: `cargo test -p freshell-ws --test resume_validation_gate` — tests fail (no gate wired; notice absent, row stays bound in case 1; cases 4–6 fail once the gate exists if ordering/liveness are wrong — write them RED now so the GREEN wiring must satisfy them).
 
 GREEN — wire `handle_create` (`terminal.rs`): a tracker in the resume-id derivation region (a), the gate itself in the `:1787→:1789` slot (b), then the stamping guard (c) and notice emission (d):
 
@@ -1377,11 +1378,26 @@ b. Insert the gate in the `:1787→:1789` slot — AFTER the D7 cross-mode liven
         // In-gate liveness precondition: legacy resumeSessionId-only
         // carriers bypass D7 in every ordering — a LIVE session must never
         // gate. Same join D7 uses: registry.live_session_owner + the
-        // fresh-agent sidecar liveness consult (:1747-1758).
-        let candidate_is_live = resume_session_id.as_deref().is_some_and(|sid| {
-            /* registry.live_session_owner(Some(&state.identity), &mode, sid)
-               || <fresh-agent sidecar liveness>, copied from D7's join */
-        });
+        // fresh-agent sidecar liveness consult (:1747-1758). SHAPE NOTE
+        // (load-bearing): D7's join is partly ASYNC — the sidecar arm is
+        // `state.fresh_claude/fresh_codex/fresh_opencode
+        //  .has_live_session(sid).await` — so it CANNOT live inside a sync
+        // `is_some_and` closure. Compute it as a plain `let` with `.await`
+        // in scope, exactly the shape D7 itself uses. BOTH arms are
+        // load-bearing: dropping the async sidecar arm silently un-protects
+        // live zero-turn sessions that have no rollout on disk yet
+        // (integration case 6 pins that arm).
+        let candidate_is_live = match resume_session_id.as_deref() {
+            None => false,
+            Some(sid) => {
+                /* D7's exact two-arm join, copied from :1747-1758:
+                   registry.live_session_owner(Some(&state.identity), &mode, sid)
+                       || <fresh-agent sidecar has_live_session(sid).await
+                          consults for the matching mode(s)>
+                   — copy it, do not reimplement it, and do not reduce it
+                   to the sync registry arm alone. */
+            }
+        };
         if !candidate_is_live {
             // The probe's by-id locators do real filesystem walks (~1 s for
             // codex on a real store) — never inline on the async runtime
@@ -1718,12 +1734,29 @@ Implement `validate_rest_resume` (same body shape as `validate_wire_resume`, usi
 
 Wire it in the create pipeline — numbered, all steps MANDATORY:
 
-1. **Gate call** (inside `spawn_blocking` — A13): immediately after the resume id is derived (`derive_resume_identity`, before the amplifier ensure at `:895` and the `CliLaunchInputs` construction feeding `:1355`):
+1. **Gate call** (inside `spawn_blocking` — A13): immediately after the resume id is derived (`derive_resume_identity`, before the amplifier ensure at `:895` and the `CliLaunchInputs` construction feeding `:1355`), and guarded by a MANDATORY in-gate liveness precondition. Ordering note (load-bearing — the A11 door-1 hazard with the constraint INVERTED): in THIS pipeline the amplifier ensure (`:895`) comes BEFORE the REST D7 live-session guard (`:968-988`) and the D8 session-ref lease (`:990-1040`), so door 3 cannot get liveness protection by after-D7 placement the way door 1 did — the gate must sit before `:895` (or the `ensure_session` re-stub resurrects the stale dir), yet placed there a gate fire would clear `accepted_session_ref` / replace `resume_session_id` and FALSIFY the D7-REST applicability filter (`:968-971`): its loud `RESTORE_UNAVAILABLE`/CONFLICT reject and the D8 lease would be silently bypassed, and `on_stale_resume` → `retire_missing` would destroy the Bound ledger row of a RUNNING session. This is reachable — a live zero-turn codex session genuinely has no rollout on disk (`crates/freshell-server/src/existence.rs:224-227`). Therefore: when the candidate session is LIVE, skip the gate entirely (byte-for-byte today's behavior), letting the unchanged create flow into the D7-REST guard, which issues its loud reject exactly as today. Reuse the SAME liveness consult the REST D7 guard at `:968-988` performs for this `(mode, resume id)` — hoist it into a shared helper or call it ahead of the gate; do NOT reimplement it, and keep any async consults `.await`ed in the pipeline body (never inside the `spawn_blocking` closure or a sync closure):
 
 ```rust
+    // In-gate liveness precondition (MANDATORY — see ordering note above):
+    // a LIVE session must never be gated; the downstream REST D7 guard
+    // (:968-988) owns the loud reject for live sessions.
+    let candidate_is_live = match resume_session_id.as_deref() {
+        None => false,
+        Some(sid) => {
+            /* the SAME (mode, sid) liveness consult the REST D7 guard at
+               :968-988 performs — hoisted into a shared helper or called
+               here ahead of the gate; not reimplemented; async consults
+               `.await`ed here in the pipeline body */
+        }
+    };
     // Probe does real filesystem walks — never inline on the async runtime
-    // (A13); run the sync helper in spawn_blocking.
-    let rest_outcome = {
+    // (A13); run the sync helper in spawn_blocking. A LIVE candidate skips
+    // the gate entirely (passthrough — same shape validate_rest_resume
+    // returns for Proceed), so the unchanged create flows into the D7-REST
+    // guard and D8 lease exactly as today.
+    let rest_outcome = if candidate_is_live {
+        passthrough(resume_session_id.take(), launch_intent)
+    } else {
         let probe = state.resume_probe.clone();
         let mode_for_gate = mode.clone();
         let rid = resume_session_id.take();
@@ -1752,13 +1785,13 @@ Wire it in the create pipeline — numbered, all steps MANDATORY:
     }
 ```
 
-(Adapt local variable names/mutability to the surrounding pipeline code; the amplifier ensure at `:895` then keys off the fresh id, mirroring door 1.)
+(Adapt local variable names/mutability to the surrounding pipeline code — in particular the `resume_session_id`/`launch_intent` rebinding must flow out of the `if candidate_is_live { .. } else { .. }` expression, not shadow inside a block; the amplifier ensure at `:895` then keys off the fresh id, mirroring door 1. `passthrough(..)` is the same Proceed-shape constructor `validate_rest_resume` itself uses — expose/reuse it rather than hand-building the outcome.)
 
 2. **Thread the intent**: the pipeline today HARDCODES `launch_intent: LaunchIntent::Resume` in the `CliLaunchInputs` construction (`~:1335`) — Task 8 must thread `rest_outcome.launch_intent` into the inputs explicitly so the claude fallback's `Start` reaches the resolver. Verified safe (V9): the REST pipeline consumes the SAME Arc'd `cli_commands` the WS door uses (`main.rs:363/:409/:632`), the claude spec has `createSessionArgs` (`extensions/claude-code/freshell.json:11`), so `Start` + minted id resolves — no `StartIntentUnsupported`.
 
 3. **Notice injection**: where the handler builds the response `pane_content` (the `reconcileNotice` injection precedent at `:1657`), when `rest_outcome.notice` is `Some`, insert it as `"reconcileNotice"` in the `pane_content` JSON so the existing client chip/xterm rendering shows it. (Caveat, accepted: a hidden/background tab defers the render until a later visible attach pass — the notice is preserved in pane content, never dropped.)
 
-4. **Tests for 1+3**: add/extend unit tests in the same module asserting that when the gate fires, the built `pane_content` (a) carries the notice, and (b) carries the HEALED ref — `pane_content.sessionRef.sessionId` equals the minted fresh id, NOT the stale wire ref (pin the fall-through to the `:1686-1692` minted-ref branch). Clone the existing `:1657`-area test if one exists, otherwise assert on the handler's pane-content builder function directly.
+4. **Tests for 1+3**: add/extend unit tests in the same module asserting that when the gate fires, the built `pane_content` (a) carries the notice, and (b) carries the HEALED ref — `pane_content.sessionRef.sessionId` equals the minted fresh id, NOT the stale wire ref (pin the fall-through to the `:1686-1692` minted-ref branch). Clone the existing `:1657`-area test if one exists, otherwise assert on the handler's pane-content builder function directly. ADDITIONALLY (pins the MANDATORY liveness precondition of step 1): a live-session case — clone the setup of the existing tests that pin the REST D7 guard's `RESTORE_UNAVAILABLE`/CONFLICT reject at `:968-988` (same fake liveness state), inject a probe answering `Absent` for that same live ref, and drive the create pipeline. Assert: (a) the response is the D7-REST loud reject, NOT a gate-fired fresh spawn; (b) `state.on_stale_resume` was NEVER invoked (install a counting fake — the Bound ledger row of the running session must survive); (c) no notice was injected. This test fails RED if the gate runs before the liveness check or the precondition is dropped.
 
 Add the `FreshAgentState` fields + builders in `lib.rs` (copy the `with_opencode_locator` builder shape exactly).
 
@@ -1856,12 +1889,13 @@ restore with no explanation.
 
 **Pinning tests:** `freshell-platform` `resume_gate` unit tests;
 `freshell-ws/tests/resume_validation_gate.rs` (incl. the live-session/D7
-ordering and legacy-carrier liveness cases);
+ordering and legacy-carrier liveness cases — registry AND sidecar arms);
 `freshell-ws/tests/auto_resume_respawn.rs`
 (`respawn_with_absent_session_spawns_fresh_and_retires_binding`, incl. the
 fresh-id bookkeeping assertions);
 `freshell-freshagent` `rest_resume_*` unit tests (incl. minted-v4
-plausibility and healed pane_content stamping);
+plausibility, healed pane_content stamping, and the live-session
+precondition/D7-REST-reject preservation case);
 `freshell-server` `existence.rs` amplifier/codex by-id fallback,
 cold-index, and sub-root permission tests;
 `freshell-protocol/tests/roundtrip.rs` `notice` wire test.
@@ -1905,7 +1939,7 @@ git commit -m "docs(resume-validation): deviation ledger entry for spawn-door re
 - "If validation fails: don't pass the resume flag; spawn fresh in same cwd/mode" → fallback shapes in `validate_wire_resume`/`validate_rest_resume` mirror each mode's genuine fresh-pane spawn; cwd/mode inputs are untouched; door 3 threads the claude `Start` intent explicitly past the `~:1335` hardcode (Task 8 step 2, V9-verified). ✅
 - "Operator-visible notice naming the stale id" → Task 5 (`notice` on `terminal.created` + xterm rendering, door 1), Task 8 (`reconcileNotice` in `pane_content`, door 3); door 2 broadcasts `terminal.status{Recovering, reason}` + warn-log — documented as the best available channel on a headless path (deliberate, stated in Design Notes). AD-3 residual (missing notice on the rare stale-ref-adopts-fresh-terminal path) is recorded in Task 7. ✅
 - "Clear/mark the stale cached id so it isn't retried forever" → four cooperating mechanisms, all required with tests: Task 4 `retire_missing` (all doors) + `terminal.created.sessionRef` overwrite (claude/amplifier, existing client fold, V5-verified) + Task 5 notice-triggered clear of persisted `sessionRef`/`resumeSessionId` (codex/opencode) + Task 8's mandatory `accepted_session_ref` guard (door 3). ✅
-- "Fail open on Unknown/unreadable" — invariant now STRONGER than the original plan: gate policy (Task 1) + errors-seen accumulator locator contracts (Tasks 2–3: ANY per-entry error with no hit ⇒ `Unreadable` ⇒ `Unknown` ⇒ Proceed; never `.is_dir()`/`fs::metadata(root)` adjudication) + AD-1 root semantics (NotFound-with-readable-parent ⇒ Absent, root ERROR ⇒ Unreadable) + in-gate liveness precondition and after-D7 ordering at door 1 (a LIVE session can never be gated or have its Bound row retired) + explicit fail-open tests at every layer incl. sub-root permission fixtures (euid-guarded). ✅
+- "Fail open on Unknown/unreadable" — invariant now STRONGER than the original plan: gate policy (Task 1) + errors-seen accumulator locator contracts (Tasks 2–3: ANY per-entry error with no hit ⇒ `Unreadable` ⇒ `Unknown` ⇒ Proceed; never `.is_dir()`/`fs::metadata(root)` adjudication) + AD-1 root semantics (NotFound-with-readable-parent ⇒ Absent, root ERROR ⇒ Unreadable) + in-gate liveness precondition and after-D7 ordering at door 1, and the MANDATORY in-gate liveness precondition at door 3 (whose pipeline puts the amplifier ensure `:895` BEFORE the REST D7 guard `:968-988`, so ordering alone cannot protect it — Task 8 step 1 ordering note) — a LIVE session can never be gated or have its Bound row retired at any door + explicit fail-open tests at every layer incl. sub-root permission fixtures (euid-guarded). ✅
 - "Amplifier MUST be covered; store = ~/.amplifier/projects/<slug>/sessions/<id>/; search all projects (documented)" → Tasks 2–3 + Global Constraints; covered even before index warm-up (cold-coverage matrix in Design Notes). ✅
 - "Cover providers freshell already reads; fail open for others" → claude (same-boot deletions only — AD-2, honestly scoped in Design Notes + DEVIATIONS)/codex/opencode/amplifier validated; codex/opencode additionally fail open in the first seconds after boot (AD-4, accepted residual); gemini/kimi/third-party never blocked (tested). ✅
 - "Rust server REQUIRED; Node only if cheap — if skipped, say so" → Node explicitly skipped with reasons (Global Constraints); Task 5's mirror provably touches zero `server/` files (precedent commits `5c591843`/`a18dd4c6`). ✅
@@ -1913,8 +1947,8 @@ git commit -m "docs(resume-validation): deviation ledger entry for spawn-door re
 - "TDD, unit + e2e, coordinated test commands, worktree, no PR/deploy, known flaky test" → per-task RGR steps + Task 9 sweep + Global Constraints. ✅
 - Runtime discipline: no door blocks the async runtime — all probe/locator IO runs in `tokio::task::spawn_blocking` (one consistent shape: sync helpers, doors wrap; Tasks 6/7/8), and the expensive codex walk is confined to warm-Absent adjudication (A13/AD-4). ✅
 
-**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Behaviors the validation pass surfaced are now REQUIRED with pinning tests, not deferred: the codex/opencode notice-triggered client clear (Task 5 test), the door-3 `accepted_session_ref` guard + healed-ref stamping (Task 8 step 4 tests), the door-2 fresh-id bookkeeping (Task 7 assertion 5), the after-D7 ordering + in-gate liveness (Task 6 cases 4–5), and the minted-v4 plausibility pin (Task 8). The only accepted residuals are recorded decisions with rationale (AD-1…AD-4), not silent gaps. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose by-id fallback, cold-index, and error-contract behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. NO UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Behaviors the validation pass surfaced are now REQUIRED with pinning tests, not deferred: the codex/opencode notice-triggered client clear (Task 5 test), the door-3 `accepted_session_ref` guard + healed-ref stamping (Task 8 step 4 tests), the door-2 fresh-id bookkeeping (Task 7 assertion 5), the after-D7 ordering + in-gate liveness incl. its async sidecar arm (Task 6 cases 4–6), the door-3 liveness precondition + D7-REST-reject preservation (Task 8 step 4 live-session test), and the minted-v4 plausibility pin (Task 8). The only accepted residuals are recorded decisions with rationale (AD-1…AD-4), not silent gaps. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose by-id fallback, cold-index, and error-contract behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. NO UNRESOLVED COVERAGE GAPS.
 
-**2. Placeholder scan:** Steps that intentionally clone an existing harness (Task 3 fallback/cold/permission tests, Task 6/7 integration tests, Task 5 client tests, Task 4 ledger tests) each name the exact sibling file/test whose scaffolding to copy and spell out the complete required assertions — the behavior contract is fully specified; only mechanical harness reuse is deferred to the named files. The Task 3 `codex_rollout_on_disk` snippet leaves ONE named private helper to mechanical implementation (the tri-state first-line ownership read) with its full contract spelled inline (valid-read-mismatch ⇒ non-owner; open/read/decode failure incl. `.jsonl.zst` ⇒ error). Task 6's liveness precondition explicitly copies D7's existing join (`:1747-1758`) rather than leaving it open. No TBD/TODO/"handle edge cases" remain.
+**2. Placeholder scan:** Steps that intentionally clone an existing harness (Task 3 fallback/cold/permission tests, Task 6/7 integration tests, Task 5 client tests, Task 4 ledger tests) each name the exact sibling file/test whose scaffolding to copy and spell out the complete required assertions — the behavior contract is fully specified; only mechanical harness reuse is deferred to the named files. The Task 3 `codex_rollout_on_disk` snippet leaves ONE named private helper to mechanical implementation (the tri-state first-line ownership read) with its full contract spelled inline (valid-read-mismatch ⇒ non-owner; open/read/decode failure incl. `.jsonl.zst` ⇒ error). Task 6's liveness precondition explicitly copies D7's existing join (`:1747-1758`) — in an async-capable `let` shape, both arms — rather than leaving it open; Task 8's liveness precondition likewise reuses the REST D7 guard's own consult (`:968-988`) rather than leaving it open. No TBD/TODO/"handle edge cases" remain.
 
 **3. Type consistency check:** `ResumeExistence{Present,Absent,Unknown}` and `ResumeGateDecision{Proceed,SpawnFresh}` (Task 1) used identically in Tasks 6–8 — mapping unchanged by the validation edits; `ResumeProbeAnswer{existence, ever_observed_on_disk}`/`ResumeProbeFn` (Task 1) match Task 8's fake and main.rs closure; `AmplifierSessionAnswer{Present,Absent,Unreadable}` (Task 2, errors-seen accumulator) matches Task 3's `amplifier_dir_locator` mapping AND the cold-branch consult; `ByIdAnswer{Present,Absent,Unreadable}` (Task 3) is the single answer contract for both locators, with identical Unreadable⇒Unknown mapping at the warm-Absent adjudication and the cold branch; `retire_missing(&self, provider: &str, session_id: &str) -> bool` (Task 4) matches every call site in Tasks 6–8; `validate_wire_resume(mode, Option<String>, LaunchIntent, &dyn SessionExistenceProbe) -> ResumeValidationOutcome` stays SYNC and matches Task 7's call — both doors wrap it in `spawn_blocking` with an `Arc<dyn SessionExistenceProbe>` clone, and Task 8's sync `validate_rest_resume` is wrapped identically at its wiring site (one consistent async shape across all three doors; unit tests for all helpers stay synchronous); `notice: Option<String>` field name consistent across Tasks 5 and 6, and Task 5's client clear keys on the same field. ✅
