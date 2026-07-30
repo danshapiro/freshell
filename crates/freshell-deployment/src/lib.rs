@@ -104,6 +104,49 @@ pub struct Declaration {
     pub supports: Supports,
 }
 
+const MAX_JSON_NESTING_DEPTH: usize = 64;
+
+#[derive(Clone, Copy)]
+enum ObjectState {
+    KeyOrEnd,
+    Key,
+    Colon,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Clone, Copy)]
+enum ArrayState {
+    ValueOrEnd,
+    Value,
+    CommaOrEnd,
+}
+
+enum ContainerFrame {
+    Object {
+        keys: HashSet<String>,
+        state: ObjectState,
+    },
+    Array {
+        state: ArrayState,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum FrameState {
+    Object(ObjectState),
+    Array(ArrayState),
+}
+
+impl ContainerFrame {
+    fn state(&self) -> FrameState {
+        match self {
+            Self::Object { state, .. } => FrameState::Object(*state),
+            Self::Array { state } => FrameState::Array(*state),
+        }
+    }
+}
+
 struct DuplicateKeyScanner<'a> {
     raw: &'a str,
     bytes: &'a [u8],
@@ -120,12 +163,90 @@ impl<'a> DuplicateKeyScanner<'a> {
     }
 
     fn scan(mut self) -> Result<(), CompatibilityError> {
-        self.value()?;
-        self.whitespace();
-        if self.offset != self.bytes.len() {
-            return Err(invalid_json("unexpected content after JSON value"));
+        let mut frames = Vec::new();
+        let mut root_complete = false;
+
+        loop {
+            self.whitespace();
+            let Some(state) = frames.last().map(ContainerFrame::state) else {
+                if root_complete {
+                    if self.offset != self.bytes.len() {
+                        return Err(invalid_json("unexpected content after JSON value"));
+                    }
+                    return Ok(());
+                }
+                self.begin_value(&mut frames, &mut root_complete)?;
+                continue;
+            };
+
+            match state {
+                FrameState::Object(ObjectState::KeyOrEnd) => {
+                    if self.bytes.get(self.offset) == Some(&b'}') {
+                        self.offset += 1;
+                        frames.pop();
+                        Self::finish_value(&mut frames, &mut root_complete)?;
+                    } else {
+                        self.object_key(&mut frames)?;
+                    }
+                }
+                FrameState::Object(ObjectState::Key) => self.object_key(&mut frames)?,
+                FrameState::Object(ObjectState::Colon) => {
+                    if self.bytes.get(self.offset) != Some(&b':') {
+                        return Err(invalid_json("expected colon after JSON object key"));
+                    }
+                    self.offset += 1;
+                    let Some(ContainerFrame::Object { state, .. }) = frames.last_mut() else {
+                        unreachable!("current frame is an object");
+                    };
+                    *state = ObjectState::Value;
+                }
+                FrameState::Object(ObjectState::Value) => {
+                    self.begin_value(&mut frames, &mut root_complete)?;
+                }
+                FrameState::Object(ObjectState::CommaOrEnd) => match self.bytes.get(self.offset) {
+                    Some(b'}') => {
+                        self.offset += 1;
+                        frames.pop();
+                        Self::finish_value(&mut frames, &mut root_complete)?;
+                    }
+                    Some(b',') => {
+                        self.offset += 1;
+                        let Some(ContainerFrame::Object { state, .. }) = frames.last_mut() else {
+                            unreachable!("current frame is an object");
+                        };
+                        *state = ObjectState::Key;
+                    }
+                    _ => return Err(invalid_json("expected comma in JSON object")),
+                },
+                FrameState::Array(ArrayState::ValueOrEnd) => {
+                    if self.bytes.get(self.offset) == Some(&b']') {
+                        self.offset += 1;
+                        frames.pop();
+                        Self::finish_value(&mut frames, &mut root_complete)?;
+                    } else {
+                        self.begin_value(&mut frames, &mut root_complete)?;
+                    }
+                }
+                FrameState::Array(ArrayState::Value) => {
+                    self.begin_value(&mut frames, &mut root_complete)?;
+                }
+                FrameState::Array(ArrayState::CommaOrEnd) => match self.bytes.get(self.offset) {
+                    Some(b']') => {
+                        self.offset += 1;
+                        frames.pop();
+                        Self::finish_value(&mut frames, &mut root_complete)?;
+                    }
+                    Some(b',') => {
+                        self.offset += 1;
+                        let Some(ContainerFrame::Array { state }) = frames.last_mut() else {
+                            unreachable!("current frame is an array");
+                        };
+                        *state = ArrayState::Value;
+                    }
+                    _ => return Err(invalid_json("expected comma in JSON array")),
+                },
+            }
         }
-        Ok(())
     }
 
     fn whitespace(&mut self) {
@@ -138,18 +259,87 @@ impl<'a> DuplicateKeyScanner<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<(), CompatibilityError> {
+    fn begin_value(
+        &mut self,
+        frames: &mut Vec<ContainerFrame>,
+        root_complete: &mut bool,
+    ) -> Result<(), CompatibilityError> {
         self.whitespace();
         match self.bytes.get(self.offset) {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => {
-                self.string_token()?;
+            Some(b'{') => {
+                self.check_depth(frames.len())?;
+                self.offset += 1;
+                frames.push(ContainerFrame::Object {
+                    keys: HashSet::new(),
+                    state: ObjectState::KeyOrEnd,
+                });
                 Ok(())
             }
-            Some(_) => self.primitive(),
+            Some(b'[') => {
+                self.check_depth(frames.len())?;
+                self.offset += 1;
+                frames.push(ContainerFrame::Array {
+                    state: ArrayState::ValueOrEnd,
+                });
+                Ok(())
+            }
+            Some(b'"') => {
+                self.string_token()?;
+                Self::finish_value(frames, root_complete)
+            }
+            Some(_) => {
+                self.primitive()?;
+                Self::finish_value(frames, root_complete)
+            }
             None => Err(invalid_json("expected JSON value")),
         }
+    }
+
+    fn check_depth(&self, current_depth: usize) -> Result<(), CompatibilityError> {
+        if current_depth >= MAX_JSON_NESTING_DEPTH {
+            return Err(CompatibilityError::new(
+                "JSON_NESTING_TOO_DEEP",
+                format!("JSON nesting exceeds {MAX_JSON_NESTING_DEPTH}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_value(
+        frames: &mut [ContainerFrame],
+        root_complete: &mut bool,
+    ) -> Result<(), CompatibilityError> {
+        match frames.last_mut() {
+            Some(ContainerFrame::Object { state, .. }) if matches!(state, ObjectState::Value) => {
+                *state = ObjectState::CommaOrEnd;
+            }
+            Some(ContainerFrame::Array { state })
+                if matches!(state, ArrayState::ValueOrEnd | ArrayState::Value) =>
+            {
+                *state = ArrayState::CommaOrEnd;
+            }
+            Some(_) => return Err(invalid_json("unexpected JSON value")),
+            None => *root_complete = true,
+        }
+        Ok(())
+    }
+
+    fn object_key(&mut self, frames: &mut [ContainerFrame]) -> Result<(), CompatibilityError> {
+        if self.bytes.get(self.offset) != Some(&b'"') {
+            return Err(invalid_json("expected JSON object key"));
+        }
+        let key = self.string_token()?;
+        let Some(ContainerFrame::Object { keys, state }) = frames.last_mut() else {
+            unreachable!("current frame is an object");
+        };
+        if !keys.insert(key) {
+            return Err(CompatibilityError::new(
+                "DUPLICATE_KEY",
+                "duplicate JSON object key",
+            ));
+        }
+        *state = ObjectState::Colon;
+        Ok(())
     }
 
     fn string_token(&mut self) -> Result<String, CompatibilityError> {
@@ -186,65 +376,6 @@ impl<'a> DuplicateKeyScanner<'a> {
         serde_json::from_str::<Value>(&self.raw[start..self.offset])
             .map(|_| ())
             .map_err(|_| invalid_json("invalid JSON primitive"))
-    }
-
-    fn object(&mut self) -> Result<(), CompatibilityError> {
-        self.offset += 1;
-        self.whitespace();
-        let mut keys = HashSet::new();
-        if self.bytes.get(self.offset) == Some(&b'}') {
-            self.offset += 1;
-            return Ok(());
-        }
-        loop {
-            self.whitespace();
-            if self.bytes.get(self.offset) != Some(&b'"') {
-                return Err(invalid_json("expected JSON object key"));
-            }
-            let key = self.string_token()?;
-            if !keys.insert(key) {
-                return Err(CompatibilityError::new(
-                    "DUPLICATE_KEY",
-                    "duplicate JSON object key",
-                ));
-            }
-            self.whitespace();
-            if self.bytes.get(self.offset) != Some(&b':') {
-                return Err(invalid_json("expected colon after JSON object key"));
-            }
-            self.offset += 1;
-            self.value()?;
-            self.whitespace();
-            match self.bytes.get(self.offset) {
-                Some(b'}') => {
-                    self.offset += 1;
-                    return Ok(());
-                }
-                Some(b',') => self.offset += 1,
-                _ => return Err(invalid_json("expected comma in JSON object")),
-            }
-        }
-    }
-
-    fn array(&mut self) -> Result<(), CompatibilityError> {
-        self.offset += 1;
-        self.whitespace();
-        if self.bytes.get(self.offset) == Some(&b']') {
-            self.offset += 1;
-            return Ok(());
-        }
-        loop {
-            self.value()?;
-            self.whitespace();
-            match self.bytes.get(self.offset) {
-                Some(b']') => {
-                    self.offset += 1;
-                    return Ok(());
-                }
-                Some(b',') => self.offset += 1,
-                _ => return Err(invalid_json("expected comma in JSON array")),
-            }
-        }
     }
 }
 
@@ -626,6 +757,15 @@ mod tests {
         assert_eq!(
             serialize_event(&event),
             "{\"phase\":\"prepared\",\"generationId\":\"abc\"}\n"
+        );
+    }
+
+    #[test]
+    fn rejects_very_deep_json_without_overflowing_the_call_stack() {
+        let raw = format!("{}null{}", "[".repeat(20_000), "]".repeat(20_000));
+        assert_eq!(
+            parse_declaration(&raw, None).unwrap_err().code(),
+            "JSON_NESTING_TOO_DEEP"
         );
     }
 }

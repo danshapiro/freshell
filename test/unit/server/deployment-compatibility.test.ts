@@ -131,6 +131,11 @@ describe('deployment compatibility source contract', () => {
     )
     expect(codeOf(() => serializeEvent({ phase: undefined }))).toBe('INVALID_EVENT')
   })
+
+  it('rejects very deep JSON without overflowing the call stack', () => {
+    const raw = `${'['.repeat(20_000)}null${']'.repeat(20_000)}`
+    expect(codeOf(() => parseDeclaration(raw))).toBe('JSON_NESTING_TOO_DEEP')
+  })
 })
 
 describe('deployment compatibility CLI', () => {

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 const VERSION_PATTERN = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const JSON_NUMBER_PATTERN = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/
 const MAX_COMPONENT = 4294967295n
+const MAX_JSON_NESTING_DEPTH = 64
 const COMPONENTS = new Set(['client', 'server'])
 const textEncoder = new TextEncoder()
 
@@ -53,14 +54,20 @@ function rejectDuplicateKeys(raw) {
     fail('INVALID_JSON', 'unterminated JSON string')
   }
 
-  function value() {
+  function value(depth = 0) {
     whitespace()
     if (raw[offset] === '{') {
-      object()
+      if (depth >= MAX_JSON_NESTING_DEPTH) {
+        fail('JSON_NESTING_TOO_DEEP', `JSON nesting exceeds ${MAX_JSON_NESTING_DEPTH}`)
+      }
+      object(depth + 1)
       return
     }
     if (raw[offset] === '[') {
-      array()
+      if (depth >= MAX_JSON_NESTING_DEPTH) {
+        fail('JSON_NESTING_TOO_DEEP', `JSON nesting exceeds ${MAX_JSON_NESTING_DEPTH}`)
+      }
+      array(depth + 1)
       return
     }
     if (raw[offset] === '"') {
@@ -82,7 +89,7 @@ function rejectDuplicateKeys(raw) {
     }
   }
 
-  function object() {
+  function object(depth) {
     offset += 1
     whitespace()
     const keys = new Set()
@@ -99,7 +106,7 @@ function rejectDuplicateKeys(raw) {
       whitespace()
       if (raw[offset] !== ':') fail('INVALID_JSON', 'expected colon after JSON object key')
       offset += 1
-      value()
+      value(depth)
       whitespace()
       if (raw[offset] === '}') {
         offset += 1
@@ -111,7 +118,7 @@ function rejectDuplicateKeys(raw) {
     fail('INVALID_JSON', 'unterminated JSON object')
   }
 
-  function array() {
+  function array(depth) {
     offset += 1
     whitespace()
     if (raw[offset] === ']') {
@@ -119,7 +126,7 @@ function rejectDuplicateKeys(raw) {
       return
     }
     while (offset < raw.length) {
-      value()
+      value(depth)
       whitespace()
       if (raw[offset] === ']') {
         offset += 1
