@@ -1,14 +1,31 @@
 //! `POST /api/sessions/resolve` — SYNC-06 port of the resolve route
 //! (`server/sessions-router.ts`) + the hardened matching semantics of
-//! `server/coding-cli/resolve-session.ts` (exact→fallback→prefix ordering,
-//! case-sensitivity gating, subagent exclusion, candidate work budget).
+//! `server/coding-cli/resolve-session.ts` and `resolve-fallbacks.ts`
+//! (exact→fallback→prefix ordering, case-sensitivity gating, subagent
+//! exclusion, candidate work budget, full-id shape gates + per-request
+//! fallback budget).
 //!
-//! KNOWN DIVERGENCE — hardened response surface NOT yet ported: no
-//! `degraded` status, `providerErrors`, `unsearchedProviders`, or `homeDir`,
-//! and no scan-failure/warming-default merge. Tracked in
-//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6;
-//! the `sessionResolve` capability flag is held `false` (`main.rs`) until
-//! that lands.
+//! KNOWN DIVERGENCES — NOT yet ported (full detail in the core's module doc,
+//! `freshell-sessions/src/resume_resolve.rs`; tracked in
+//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
+//! `sessionResolve` capability flag is held `false` (`main.rs`) until this
+//! list is empty:
+//! - response surface (plan Tasks 3, 5, 6): no `degraded` status,
+//!   `providerErrors`, `unsearchedProviders`, or `homeDir`, and no
+//!   scan-failure/warming-default merge — the fallbacks wired in `main.rs`
+//!   map read errors to a MISS, never a provider error.
+//! - opencode by-id fallback runs the RETIRED parent-walk
+//!   (`resolveOpencodeSessionRoots` port), not Node's hardened direct row
+//!   query (`providers/opencode-by-id-query.ts`): orphaned/cyclic child
+//!   rows miss where Node hits, a legacy-schema DB universally hits any
+//!   full-shape `ses_*` id where Node hits only real rows, and hits omit
+//!   Node's `title`/`lastActivityAt`.
+//! - fallback hits hardcode `sessionType` (`"claude"`/`"opencode"`) instead
+//!   of consulting the session-metadata overlay (Node's `sessionTypeFor`).
+//! - the claude fallback's `locate_transcript` never probes Node's
+//!   `<project>/<parent>/subagents/<id>.jsonl` layout (subagent child
+//!   transcripts miss); its cwd read IS bounded to Node's 64 KiB
+//!   (`transcript_cwd_bounded`).
 //!
 //! Behavior contract:
 //! - auth: same `x-auth-token` / `freshell-auth` cookie check as every other

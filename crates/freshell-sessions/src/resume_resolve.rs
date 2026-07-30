@@ -10,11 +10,38 @@
 //! the sessionType overlay map, and the two exact-id fallback closures, then
 //! serializes the returned response verbatim.
 //!
-//! NOT YET PORTED (known divergence from the hardened Node response surface):
-//! `degraded` status, `providerErrors`, `unsearchedProviders`, `homeDir`, and
-//! the warming/ready readiness merge — tracked in
-//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6. The
-//! `sessionResolve` capability flag is held `false` until that lands.
+//! KNOWN DIVERGENCES / NOT YET PORTED — this list is the in-code record a
+//! follow-up implementer relies on (also tracked in
+//! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
+//! `sessionResolve` capability flag is held `false` until it is empty.
+//!
+//! Response surface (plan Tasks 3, 5, 6): no `degraded` status,
+//! `providerErrors`, `unsearchedProviders`, or `homeDir`, and no
+//! scan-failure/warming readiness merge — fallback closures answer
+//! `Option`, so a provider FAILURE is indistinguishable from a miss here.
+//!
+//! Matching semantics still diverging from hardened Node:
+//! - opencode by-id fallback: the wired lookup
+//!   (`parse::opencode::opencode_session_directory_by_id`) ports the
+//!   RETIRED parent-walk (`OpencodeProvider.resolveOpencodeSessionRoots`),
+//!   not the hardened direct row query Node's fallback now uses
+//!   (`server/coding-cli/providers/opencode-by-id-query.ts`). Consequences:
+//!   orphaned/cyclic child rows are a Rust MISS where Node HITs; a
+//!   legacy-schema DB (no `parent_id` column) is a Rust universal HIT for
+//!   any full-shape `ses_*` id where Node hits only REAL rows; and Rust
+//!   fallback hits omit the `title`/`lastActivityAt` Node's row query emits.
+//! - fallback hits hardcode `sessionType` `"claude"`/`"opencode"` instead of
+//!   consulting the session-metadata overlay (Node's `sessionTypeFor`,
+//!   `resolve-fallbacks.ts`): a freshclaude/freshopencode session resolved
+//!   via fallback would resume under the wrong runtime.
+//! - claude fallback locator: the wired `locate_transcript`
+//!   (`freshell-freshagent`) probes `<projects>/<project>/<subdir>/<id>.jsonl`
+//!   and never Node's `<projects>/<project>/<parent>/subagents/<id>.jsonl`
+//!   layout (`claude-transcript-locator.ts`), so subagent child transcripts
+//!   are a Rust MISS; it also swallows read errors as misses (no
+//!   provider-error channel — see above). The cwd read itself IS bounded to
+//!   Node's 64 KiB (`transcript_cwd_bounded`). The checked locator with the
+//!   subagent layout + error propagation is the plan's Task 3.
 //!
 //! Wire parity notes:
 //! - Field ORDER in `ResumeResolveMatch` matches the Node object literals
@@ -133,8 +160,9 @@ pub struct ResolveDeps<'a> {
     /// sessionType overlay keyed `"{provider}:{session_id}"` (Node:
     /// `session-indexer.ts:1159-1161` overlays the SessionMetadataStore).
     pub session_types: &'a HashMap<String, String>,
-    /// opencode `ses_*` exact-id fallback (`resolveOpencodeSessionIds` →
-    /// Node's by-id parent-walk): `Some(hit)` = the walk resolved the id —
+    /// opencode `ses_*` exact-id fallback (the `resolveOpencodeSessionRoots`
+    /// parent-walk port — a KNOWN divergence from Node's hardened direct row
+    /// query, see the module doc): `Some(hit)` = the walk resolved the id —
     /// `hit.directory` is the row's own TRUTHY `directory` (spawn cwd), and
     /// is `None` for empty/NULL directories and ALL legacy-schema hits (the
     /// wire match then omits `cwd`). `None` = miss (no row, orphaned chain,
