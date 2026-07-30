@@ -128,12 +128,14 @@ fn first_line_owns_tri(path: &Path, session_id: &str) -> Result<bool, ()> {
     let mut first = String::new();
     reader.read_line(&mut first).map_err(|_| ())?;
     let value = serde_json::from_str::<serde_json::Value>(first.trim()).map_err(|_| ())?;
-    Ok(value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
-        && value
-            .get("payload")
-            .and_then(|p| p.get("id"))
-            .and_then(|i| i.as_str())
-            == Some(session_id))
+    Ok(
+        value.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+            && value
+                .get("payload")
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_str())
+                == Some(session_id),
+    )
 }
 
 /// Production codex locator: wraps [`codex_rollout_on_disk`] over the same

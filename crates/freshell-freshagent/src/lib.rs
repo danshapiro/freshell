@@ -68,6 +68,28 @@ pub use spawn_gate::{SpawnGate, SpawnGateError};
 /// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
 pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// Door 3 (resume-validation): the gate-fired callback shape --
+/// `(provider, stale_session_id)`. In production, `freshell-server`'s main.rs
+/// implements it as pane-ledger `retire_missing` + `tracing::warn!`.
+pub type OnStaleResume = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Door 3 (resume-validation): the injected ASYNC sidecar-liveness probe --
+/// `(mode, session_id) -> is that session live inside a fresh-agent sidecar`.
+/// The REST create gate's registry consult is `TerminalRegistry`/PTY-scoped
+/// and structurally BLIND to sessions live inside the fresh-agent sidecars
+/// (sidecars never get PTY rows), so the in-gate liveness precondition needs
+/// this second arm. Precedent: [`TerminalLivenessProbe`] solves the SAME
+/// cross-crate liveness problem in the opposite direction -- same shape, made
+/// async. Constructed by `freshell-server`'s `main.rs` over the SAME sidecar
+/// instances the WS door's D7 join consults, so this crate never imports
+/// `freshell-ws`. `None` (not wired, e.g. bare unit-test states) => the arm
+/// contributes false.
+pub type SidecarLivenessProbe = std::sync::Arc<
+    dyn Fn(&str, &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Handle pairing the shared gate with the permit-wait timeout
 /// (`CreateProtectConfig.spawn_timeout_ms`, resolved once in main.rs so both
 /// doors share one env snapshot).
@@ -224,6 +246,20 @@ pub struct FreshAgentState {
     /// `identity_sink`). `None` = ungated (unwired unit tests keep legacy
     /// behavior; production always wires it).
     spawn_gate: Arc<std::sync::OnceLock<RestSpawnGate>>,
+    /// Door 3 (resume-validation): the disk-existence probe consulted before
+    /// a REST create turns a cached resume id into resume argv. Injected as
+    /// [`freshell_platform::resume_gate::ResumeProbeFn`] because this crate
+    /// must NOT depend on `freshell-ws` (whose probe trait would be circular
+    /// -- see this Cargo.toml's freshell-sessions comment). `None` = feature
+    /// off = today's behavior (every pre-existing test).
+    pub(crate) resume_probe: Option<freshell_platform::resume_gate::ResumeProbeFn>,
+    /// Door 3: called with `(provider, stale_session_id)` when the gate
+    /// fires. `freshell-server`'s main.rs implements it as pane-ledger
+    /// `retire_missing` + `tracing::warn!`. `None` = no-op.
+    pub(crate) on_stale_resume: Option<OnStaleResume>,
+    /// Door 3: arm 2 of the in-gate liveness precondition (see
+    /// [`SidecarLivenessProbe`]). `None` = arm contributes false.
+    pub(crate) sidecar_liveness: Option<SidecarLivenessProbe>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -292,6 +328,9 @@ impl FreshAgentState {
             codex_locator: None,
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             spawn_gate: Arc::new(std::sync::OnceLock::new()),
+            resume_probe: None,
+            on_stale_resume: None,
+            sidecar_liveness: None,
         }
     }
 
@@ -477,6 +516,37 @@ impl FreshAgentState {
         binder: Arc<dyn freshell_terminal::registry::PaneIdentityBinder>,
     ) -> Self {
         self.pane_identity = Some(binder);
+        self
+    }
+
+    /// Door 3 (resume-validation): wire the disk-existence probe the REST
+    /// create pipeline consults before turning a cached resume id into
+    /// resume argv. `freshell-server`'s main.rs builds it over the SAME
+    /// `SessionExistenceProbe` the WS doors use. Unwired = feature off =
+    /// today's behavior.
+    pub fn with_resume_probe(
+        mut self,
+        probe: freshell_platform::resume_gate::ResumeProbeFn,
+    ) -> Self {
+        self.resume_probe = Some(probe);
+        self
+    }
+
+    /// Door 3: wire the gate-fired callback (`(provider, stale_session_id)`),
+    /// implemented by `freshell-server`'s main.rs as pane-ledger
+    /// `retire_missing` + `tracing::warn!`.
+    pub fn with_on_stale_resume(mut self, cb: OnStaleResume) -> Self {
+        self.on_stale_resume = Some(cb);
+        self
+    }
+
+    /// Door 3: wire arm 2 of the in-gate liveness precondition (see
+    /// [`SidecarLivenessProbe`]). MUST stay a consuming `with_*` builder like
+    /// its siblings, NOT a `set_*`/`OnceLock` late-bind: `FreshOpencodeState`
+    /// holds a `FreshAgentState` clone by value, so a late-bound handle back
+    /// to the sidecars would create a real Arc cycle.
+    pub fn with_sidecar_liveness(mut self, probe: SidecarLivenessProbe) -> Self {
+        self.sidecar_liveness = Some(probe);
         self
     }
 

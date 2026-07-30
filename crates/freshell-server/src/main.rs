@@ -520,9 +520,13 @@ async fn main() -> ExitCode {
     // /api/panes/{id}/respawn). A single concurrency budget, never two
     // parallel budgets; pinned by
     // crates/freshell-ws/tests/rest_ws_shared_gate.rs. Post-construction
-    // setter (ledger precedent): create_protect resolves here, after the
-    // last fresh_agent_state builder rebinding. SpawnGate::new passes the
-    // (already env-sanitized) values straight through.
+    // setter (ledger precedent). NOTE: the LAST fresh_agent_state builder
+    // rebinding is no longer here — it is the door-3 resume-validation
+    // wiring below (just above the WsState literal), which needs pane_ledger
+    // and the hoisted session_existence probe; this set_spawn_gate is an
+    // Arc<OnceLock> shared by every clone, so the later consuming rebinding
+    // does not affect it. SpawnGate::new passes the (already env-sanitized)
+    // values straight through.
     let spawn_gate = std::sync::Arc::new(freshell_freshagent::spawn_gate::SpawnGate::new(
         create_protect.spawn_concurrency,
         create_protect.spawn_queue_cap,
@@ -571,6 +575,158 @@ async fn main() -> ExitCode {
     // after `ws_state` is assembled (the hub needs the full state).
     let (auto_resume_tx, auto_resume_rx) =
         tokio::sync::mpsc::unbounded_channel::<freshell_ws::auto_resume::CrashEvent>();
+    // Reconciliation handshake disk-truth probe (design §5.1): backed by
+    // the SAME shared session index the History surfaces read; the
+    // no-index fallback (honest `Unknown` on known providers) when no
+    // provider home resolves — mirrors `session_index`'s own `Option`
+    // convention.
+    let session_existence: freshell_ws::existence::SharedExistenceProbe = match &session_index {
+        Some(index) => {
+            let probe = existence::IndexExistenceProbe::new(
+                std::sync::Arc::clone(index),
+                // P1.8 read 2: the durable ledger backs `ever_observed`, so a
+                // transcript deleted while the server was DOWN still derives
+                // loud dead_session (per-boot observed set is empty then).
+                Some(std::sync::Arc::clone(&pane_ledger)),
+                // Provider session roots resolved with the SAME helpers the
+                // `session_index` sources above use — a known provider whose
+                // root does not exist on this machine derives an immediate
+                // `error{provider_unavailable}`, never `index_warming`.
+                session_directory::provider_home()
+                    .map(|h| {
+                        std::collections::HashMap::from([
+                            ("claude".to_string(), session_directory::claude_home(&h)),
+                            ("codex".to_string(), session_directory::codex_home(&h)),
+                            (
+                                "opencode".to_string(),
+                                freshell_sessions::parse::default_opencode_data_home(),
+                            ),
+                            (
+                                "amplifier".to_string(),
+                                freshell_sessions::amplifier::amplifier_home(&h),
+                            ),
+                        ])
+                    })
+                    .unwrap_or_default(),
+            )
+            // Kata 09v1 zero-turn claude fallback: the SAME raw-file check
+            // the attach arm trusts (claude_snapshot ordered candidate
+            // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), so
+            // reconcile and attach can never disagree about whether a
+            // claude transcript exists. Degenerate no-roots case (HOME
+            // unset etc.): locate_transcript answers None and the probe
+            // keeps the pure index answer — identical to pre-fix behavior.
+            .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
+                freshell_freshagent::locate_transcript(session_id)
+            }))
+            // Opencode rebind fix: the SAME by-id DB truth the attach arm
+            // trusts (`opencode --session <id>` resolves children and
+            // directory-less roots the root-filtered listing hides), so
+            // reconcile and attach can never disagree about whether an
+            // opencode session exists. Points at the SAME data home the
+            // OpencodeSource above uses. Unreadable DB => Unknown
+            // (bounded deferral), never a false dead_session.
+            .with_opencode_session_locator(existence::opencode_db_locator(
+                freshell_sessions::parse::default_opencode_data_home(),
+            ));
+            // Amplifier by-id fallback (resume-validation): the SAME
+            // all-slugs disk scan the stub writer/attach arm trusts
+            // (amplifier_stub::session_on_disk), over the SAME home the
+            // stub writer resolves. Covers both a stale warm snapshot
+            // AND the cold index at boot (restore-time creates race the
+            // detached sweep). No resolvable home => probe behaves as
+            // today for amplifier.
+            let probe = match freshell_sessions::amplifier_stub::resolve_amplifier_home() {
+                Some(amplifier_home) => probe.with_amplifier_session_locator(
+                    existence::amplifier_dir_locator(amplifier_home),
+                ),
+                None => probe,
+            };
+            // Codex by-id fallback (resume-validation): the gate-safe
+            // tri-state rollout walk over the SAME sessions root the
+            // ActivityHub's resume-time locator (above) walks —
+            // warm-Absent adjudication only (AD-4: ~1s on a real
+            // store, never on the cold path). No resolvable root =>
+            // probe behaves as today for codex.
+            let probe = match freshell_ws::codex_sessions_root() {
+                Some(codex_sessions_root) => probe.with_codex_rollout_locator(
+                    existence::codex_rollout_existence_locator(codex_sessions_root),
+                ),
+                None => probe,
+            };
+            std::sync::Arc::new(probe)
+        }
+        None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    };
+    // Resume-validation wiring (door 3). Deliberately the LAST fresh_agent_state
+    // rebinding: it needs pane_ledger and the hoisted session_existence probe
+    // (both constructed just above), which do not exist at the earlier builder
+    // chains. Sound because every door-3 consumer clones fresh_agent_state
+    // AFTER this point (the freshagent REST router merge and
+    // SnapshotState::new, below); the one EARLIER capture --
+    // FreshOpencodeState::new(fresh_agent_state.clone()) near the top, held
+    // by value -- already predates every door-3-relevant builder
+    // (with_cli_commands included) by existing design and never runs the REST
+    // create pipeline. The set_spawn_gate/set_identity_sink calls above are
+    // unaffected: Arc<OnceLock> cells initialized in new(), shared by every
+    // clone including this rebound value.
+    let fresh_agent_state = fresh_agent_state
+        .with_resume_probe({
+            let probe = session_existence.clone(); // the hoisted Arc'd probe
+            std::sync::Arc::new(move |provider: &str, session_id: &str| {
+                use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
+                use freshell_ws::existence::SessionExistence;
+                let existence = match probe.exists(provider, session_id) {
+                    SessionExistence::Present => ResumeExistence::Present,
+                    SessionExistence::Absent => ResumeExistence::Absent,
+                    SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
+                        ResumeExistence::Unknown
+                    }
+                };
+                ResumeProbeAnswer {
+                    existence,
+                    ever_observed_on_disk: probe.ever_observed_on_disk(provider, session_id),
+                }
+            })
+        })
+        .with_on_stale_resume({
+            let ledger = pane_ledger.clone(); // the Arc<PaneLedger> built above
+            std::sync::Arc::new(move |provider: &str, stale_id: &str| {
+                tracing::warn!(
+                    provider = %provider,
+                    stale_session_id = %stale_id,
+                    "resume validation (REST): cached session missing on disk; spawning fresh"
+                );
+                let _ = ledger.retire_missing(provider, stale_id);
+            })
+        })
+        .with_sidecar_liveness({
+            // MANDATORY (arm 2 of the door-3 liveness precondition): the SAME
+            // sidecar instances the WS door's D7 join consults -- built and
+            // frozen near the top of main, shared with WsState below. Same
+            // mode -> sidecar mapping as the WS door's sidecar arm
+            // (crates/freshell-ws/src/terminal.rs, Task 13b cross-kind
+            // live-guard); unknown modes contribute false.
+            let claude = fresh_claude_state.clone();
+            let codex = fresh_codex_state.clone();
+            let opencode = fresh_opencode_state.clone();
+            std::sync::Arc::new(move |mode: &str, session_id: &str| {
+                let claude = claude.clone();
+                let codex = codex.clone();
+                let opencode = opencode.clone();
+                let mode = mode.to_string();
+                let sid = session_id.to_string();
+                Box::pin(async move {
+                    match mode.as_str() {
+                        "claude" => claude.has_live_session(&sid).await,
+                        "codex" => codex.has_live_session(&sid).await,
+                        "opencode" => opencode.has_live_session(&sid).await,
+                        _ => false,
+                    }
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            })
+        });
     let ws_state = WsState {
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -578,89 +734,7 @@ async fn main() -> ExitCode {
         identity: terminal_identity.clone(),
         opencode_locator: opencode_locator.clone(),
         codex_locator: codex_locator.clone(),
-        // Reconciliation handshake disk-truth probe (design §5.1): backed by
-        // the SAME shared session index the History surfaces read; the
-        // no-index fallback (honest `Unknown` on known providers) when no
-        // provider home resolves — mirrors `session_index`'s own `Option`
-        // convention.
-        session_existence: match &session_index {
-            Some(index) => {
-                let probe = existence::IndexExistenceProbe::new(
-                    std::sync::Arc::clone(index),
-                    // P1.8 read 2: the durable ledger backs `ever_observed`, so a
-                    // transcript deleted while the server was DOWN still derives
-                    // loud dead_session (per-boot observed set is empty then).
-                    Some(std::sync::Arc::clone(&pane_ledger)),
-                    // Provider session roots resolved with the SAME helpers the
-                    // `session_index` sources above use — a known provider whose
-                    // root does not exist on this machine derives an immediate
-                    // `error{provider_unavailable}`, never `index_warming`.
-                    session_directory::provider_home()
-                        .map(|h| {
-                            std::collections::HashMap::from([
-                                ("claude".to_string(), session_directory::claude_home(&h)),
-                                ("codex".to_string(), session_directory::codex_home(&h)),
-                                (
-                                    "opencode".to_string(),
-                                    freshell_sessions::parse::default_opencode_data_home(),
-                                ),
-                                (
-                                    "amplifier".to_string(),
-                                    freshell_sessions::amplifier::amplifier_home(&h),
-                                ),
-                            ])
-                        })
-                        .unwrap_or_default(),
-                )
-                // Kata 09v1 zero-turn claude fallback: the SAME raw-file check
-                // the attach arm trusts (claude_snapshot ordered candidate
-                // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), so
-                // reconcile and attach can never disagree about whether a
-                // claude transcript exists. Degenerate no-roots case (HOME
-                // unset etc.): locate_transcript answers None and the probe
-                // keeps the pure index answer — identical to pre-fix behavior.
-                .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
-                    freshell_freshagent::locate_transcript(session_id)
-                }))
-                // Opencode rebind fix: the SAME by-id DB truth the attach arm
-                // trusts (`opencode --session <id>` resolves children and
-                // directory-less roots the root-filtered listing hides), so
-                // reconcile and attach can never disagree about whether an
-                // opencode session exists. Points at the SAME data home the
-                // OpencodeSource above uses. Unreadable DB => Unknown
-                // (bounded deferral), never a false dead_session.
-                .with_opencode_session_locator(existence::opencode_db_locator(
-                    freshell_sessions::parse::default_opencode_data_home(),
-                ));
-                // Amplifier by-id fallback (resume-validation): the SAME
-                // all-slugs disk scan the stub writer/attach arm trusts
-                // (amplifier_stub::session_on_disk), over the SAME home the
-                // stub writer resolves. Covers both a stale warm snapshot
-                // AND the cold index at boot (restore-time creates race the
-                // detached sweep). No resolvable home => probe behaves as
-                // today for amplifier.
-                let probe = match freshell_sessions::amplifier_stub::resolve_amplifier_home() {
-                    Some(amplifier_home) => probe.with_amplifier_session_locator(
-                        existence::amplifier_dir_locator(amplifier_home),
-                    ),
-                    None => probe,
-                };
-                // Codex by-id fallback (resume-validation): the gate-safe
-                // tri-state rollout walk over the SAME sessions root the
-                // ActivityHub's resume-time locator (above) walks —
-                // warm-Absent adjudication only (AD-4: ~1s on a real
-                // store, never on the cold path). No resolvable root =>
-                // probe behaves as today for codex.
-                let probe = match freshell_ws::codex_sessions_root() {
-                    Some(codex_sessions_root) => probe.with_codex_rollout_locator(
-                        existence::codex_rollout_existence_locator(codex_sessions_root),
-                    ),
-                    None => probe,
-                };
-                std::sync::Arc::new(probe)
-            }
-            None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
-        },
+        session_existence: session_existence.clone(),
         // §5.3 row 5: the ONE bounded index-warming deferral's budget
         // (council-pinned single deferral, default 2000ms).
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
