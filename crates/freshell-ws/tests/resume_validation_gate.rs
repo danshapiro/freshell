@@ -183,6 +183,173 @@ async fn spawn_server_with_probe(
     (format!("ws://{addr}/ws"), registry, pane_ledger, state)
 }
 
+// ── seam 5a pieces (DEV-0006 S5) — copied from codex_managed_launch_e2e.rs ──
+
+const RECV_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Real codex CliCommandSpec (env_var seam) — copied from
+/// codex_managed_launch_e2e.rs so the resolver takes the REAL codex branch
+/// and managed-launch planning engages.
+fn codex_cli_spec() -> freshell_platform::CliCommandSpec {
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+    freshell_platform::CliCommandSpec {
+        name: "codex".into(),
+        label: "Codex CLI".into(),
+        env_var: Some("CODEX_CMD".into()),
+        default_cmd: "codex".into(),
+        resume_args: Some(s(&["resume", "{{sessionId}}"])),
+        model_args: Some(s(&["--model", "{{model}}"])),
+        sandbox_args: Some(s(&["--sandbox", "{{sandbox}}"])),
+        ..Default::default()
+    }
+}
+
+/// Node dispatcher playing both codex roles — verbatim from
+/// codex_managed_launch_e2e.rs (app-server argv -> run the committed
+/// fake-app-server.mjs fixture; else dump argv JSON to
+/// $CODEX_ARGV_CAPTURE_PATH and stay alive).
+fn write_codex_dispatcher() -> std::path::PathBuf {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+        .canonicalize()
+        .expect("fake-app-server fixture exists");
+    let dispatcher = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-dispatcher-{}.mjs",
+        std::process::id()
+    ));
+    let script = format!(
+        "#!/usr/bin/env node\n\
+         import fs from 'node:fs'\n\
+         const args = process.argv.slice(2)\n\
+         if (args.includes('app-server')) {{\n\
+           await import('file://{fixture}')\n\
+         }} else {{\n\
+           fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify(args))\n\
+           setInterval(() => undefined, 1000)\n\
+         }}\n",
+        fixture = fixture.display()
+    );
+    std::fs::write(&dispatcher, script).expect("write dispatcher");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dispatcher, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dispatcher");
+    }
+    dispatcher
+}
+
+/// Poll the capture file the dispatcher writes until it appears, then parse
+/// the argv — verbatim from codex_managed_launch_e2e.rs (a SYNC helper).
+fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
+    let deadline = std::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if !raw.is_empty() {
+                return serde_json::from_str(&raw).expect("captured argv is a JSON array");
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned codex child never wrote its argv capture at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Managed-codex harness: modeled line-for-line on `spawn_server_with_probe`
+/// with exactly one difference — the CLI specs are the REAL codex spec only
+/// (no sleeper specs), so the resolver takes the env_var codex branch and
+/// managed-launch planning engages.
+async fn spawn_managed_codex_server_with_probe(
+    probe: Arc<dyn SessionExistenceProbe>,
+    fresh_agent_enabled: bool,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<PaneLedger>,
+    WsState,
+) {
+    // F7/V9 choke point: amplifier creates write stub dirs — never the real home.
+    let _ = common::isolate_amplifier_home();
+    let ledger_dir = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-ledger-{}-{}",
+        std::process::id(),
+        uuid_like_suffix()
+    ));
+    std::fs::create_dir_all(&ledger_dir).expect("create ledger temp dir");
+    let pane_ledger = Arc::new(PaneLedger::new(Some(ledger_dir)));
+
+    let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let mut settings_value = common::test_settings_value();
+    settings_value["freshAgent"]["enabled"] = json!(fresh_agent_enabled);
+    let settings =
+        Arc::new(serde_json::from_value(settings_value).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+
+    let state = WsState {
+        pane_ledger: Arc::clone(&pane_ledger),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": fresh_agent_enabled } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(vec![codex_cli_spec()]),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: probe,
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    let router = freshell_ws::router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws"), registry, pane_ledger, state)
+}
+
 fn uuid_like_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -572,4 +739,88 @@ async fn restore_true_sidecar_live_absent_legacy_resume_id_fails_open() {
     registry.kill_all();
     std::env::remove_var("CODEX_CMD");
     std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+}
+
+/// Case 7 — gate-before-plan ordering pin (managed-launch default ON): a
+/// definitively-absent codex resume id at the WS door is gated (fresh spawn
+/// + notice) BEFORE managed-launch planning — the stale id never reaches the
+/// plan, so it can never burn a sidecar planning slot. The fresh spawn still
+/// goes managed (`--remote` argv) with NO resume tokens.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
+async fn managed_default_stale_codex_id_is_gated_before_planning() {
+    // Managed leg: the flag stays UNSET (default ON). remove_var, not "1",
+    // mirroring codex_managed_launch_e2e.rs's managed phases.
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+
+    let stale_id = "0b5aa1d2-9d5c-4f6e-8f2a-1c3d5e7f9a0b"; // definitively absent
+    let capture_path = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-managed-argv-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture_path);
+    let dispatcher = write_codex_dispatcher();
+    std::env::set_var("CODEX_CMD", &dispatcher);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture_path);
+
+    // Probe: codex stale_id is POSITIVELY absent (store readable). The codex
+    // arm gates on positive Absent alone — no on-disk-history flag needed.
+    let probe = StubProbe::answering("codex", stale_id, SessionExistence::Absent);
+    // Hygiene: point CODEX_HOME at a temp dir so no codex-side path can ever
+    // touch the real ~/.codex (the fake app-server writes ~/.codex/sessions
+    // on turn/start when CODEX_HOME is unset; this test never sends
+    // turn/start, but pin it anyway):
+    let codex_home = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-codex-home-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::env::set_var("CODEX_HOME", &codex_home);
+    let (url, registry, _ledger, _state) = spawn_managed_codex_server_with_probe(probe, true).await;
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    // terminal.create with restore:true carrying the stale codex resume id —
+    // the legacy resume-id carrier shape (case 6), minus its live-sidecar
+    // arrangement: here NOTHING is live, so the gate must fire.
+    send_json(
+        &mut ws,
+        &restore_create_with_legacy_resume_id("req-gate-7", "codex", stale_id),
+    )
+    .await;
+
+    // 1. Gate fired: terminal.created carries the operator notice naming the stale id.
+    let created = next_created_or_error(&mut ws, "req-gate-7").await;
+    assert_eq!(
+        created["type"], "terminal.created",
+        "the gate-fired create must SUCCEED as a fresh spawn, got {created}"
+    );
+    let notice = notice_of(&created).expect("gate must set the stale-resume notice");
+    assert!(
+        notice.contains(stale_id),
+        "notice names the stale id: {notice}"
+    );
+
+    // 2. The FRESH spawn still went managed (default ON): the captured TUI
+    //    argv is the --remote form...
+    let argv = wait_for_captured_argv(&capture_path);
+    assert_eq!(
+        argv[0], "--remote",
+        "fresh spawn must still plan managed launch"
+    );
+
+    // 3. ...and the stale resume NEVER reached managed planning: on a managed
+    //    RESUME the `resume <id>` pair rides last in argv (e2e Phase 3 pins
+    //    that). Absence of both tokens proves the plan was Start-intent for a
+    //    fresh session — the stale id never consumed a sidecar planning slot.
+    assert!(
+        !argv.iter().any(|a| a == "resume") && !argv.iter().any(|a| a.contains(stale_id)),
+        "stale id must not appear in managed argv: {argv:?}"
+    );
+
+    // Cleanup (mirror e2e): kill the terminal via the harness, then env.
+    registry.kill_all();
+    std::env::remove_var("CODEX_CMD");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+    std::env::remove_var("CODEX_HOME");
+    let _ = std::fs::remove_file(&capture_path);
 }
