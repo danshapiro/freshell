@@ -129,6 +129,7 @@ async fn spawn_server_with_probe(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),

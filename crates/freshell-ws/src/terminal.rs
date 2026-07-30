@@ -2885,6 +2885,7 @@ pub async fn respawn_agent_terminal(
                 max_attempts: None,
                 exit_code: None,
                 reason: outcome.notice.clone(),
+                resume_cycles: None,
             });
         if let Ok(json) = serde_json::to_string(&msg) {
             let _ = state.broadcast_tx.send(json);
