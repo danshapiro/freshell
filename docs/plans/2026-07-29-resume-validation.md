@@ -17,7 +17,7 @@
 - Do NOT open a PR, do NOT merge, do NOT restart or deploy any server. The live Rust server on port 3002 must not be touched.
 - Red-Green-Refactor TDD for every task (root `AGENTS.md`): write the failing test first, watch it fail, make it pass, refactor. Never skip the refactor.
 - Structural limits (`port/AGENTS.md`): ≤1K lines per file. New logic goes in new focused files, not appended to already-huge ones.
-- Fail-open invariant (the spec's rule 3): validation must NEVER turn a working resume into a non-resume. Only a POSITIVE "store is readable and the session is definitively absent" may block a resume. `Unknown` and `ProviderUnavailable` always proceed unchanged.
+- Fail-open invariant (the spec's rule 3): validation must NEVER turn a working resume into a non-resume. Only a POSITIVE "store is readable and the session is definitively absent" may block a resume. `Unknown` and `ProviderUnavailable` always proceed unchanged. ONE decided exception, recorded as AD-5 (Design Notes): an amplifier never-used-stub resume — where "working" means `ensure_session` would fabricate an equivalent EMPTY session under the same id — is deliberately gated, because on disk it is indistinguishable from the incident.
 - Providers validated: `claude`, `codex`, `opencode`, `amplifier` (the four the existence probe knows). `gemini`, `kimi`, and any unknown provider are never blocked (they are outside the probe's `KNOWN_PROVIDERS`, whose contract maps unknown providers to `Absent` — the gate must therefore check its own provider list BEFORE consulting the probe).
 - Node server (`server/`) is deliberately NOT changed: root `AGENTS.md` states the live production server is the Rust server on port 3002 and the Node server is legacy; the validation substrate (the tri-state `IndexExistenceProbe`, opencode by-id sqlite check, claude `CLAUDE_CONFIG_DIR`-aware locator) exists only in Rust, so the port is not cheap or parallel. This is an explicit scope decision, not an oversight.
 - Rust tests: plain `cargo test -p <crate>` (no coordinator gate for Rust). Client tests: `npm run test:unit` (coordinator-gated; wait for the gate, never kill a foreign holder). Raw `npx vitest` is not a coordinated workflow.
@@ -51,7 +51,7 @@
 
 **Notice visibility per door:**
 - Door 1 (WS create): new optional `notice` field on the `terminal.created` success frame; small client change renders it into the pane's xterm exactly like the reconcile notice AND clears the pane's persisted `sessionRef`/`resumeSessionId` (required for codex/opencode, whose gate-fired spawns carry no `sessionRef` — see the "not retried forever" story below).
-- Door 2 (headless respawn): no `out` sink exists; broadcast the existing `terminal.status{Recovering, reason}` frame (precedent `auto_resume.rs:604-628`) + `tracing::warn!`. Reason prose is not client-rendered today; this is the best available channel on a headless crash-recovery path where `Absent` is near-impossible (the session was alive moments ago). Documented, deliberate.
+- Door 2 (headless respawn): no `out` sink exists; broadcast the existing `terminal.status{Recovering, reason}` frame (precedent `auto_resume.rs:604-628`) + `tracing::warn!`. Reason prose is not client-rendered today; this is the best available channel on a headless crash-recovery path where `Absent` is near-impossible for claude/codex/opencode (the session was alive moments ago). EXCEPTION, deliberate (AD-5): for amplifier, the exit-hook never-used-stub GC (`terminal.rs:1381` → `gc_stub_if_unused`) deletes a never-typed terminal's stub at the very exit that triggers the respawn, so `Absent` is the EXPECTED respawn state for that class — the gate fires and the respawn proceeds under a minted id, an equivalent empty session. Documented, deliberate.
 - Door 3 (REST create): inject `reconcileNotice` into the returned `pane_content` (existing field, existing client rendering — no client change needed).
 
 **Validation findings incorporated (2026-07-29)** (9 evidence-gathering validators ran against this plan; ledger + reports in `.worktrees/.the-usual-logs/resume-validation/`):
@@ -70,9 +70,10 @@
 - **Locator error contract (A3 falsified — six empirical false-Absent reproductions):** errors-seen accumulator. `Present` short-circuits; a scan that completes with ANY per-entry error (unreadable subdir, EACCES file, `read_dir` failure below root, first-line open/read failure) and no hit answers `Unreadable` → `Unknown` → fail open. Never adjudicate via `.is_dir()` (returns `false` on EACCES) or `fs::metadata(root)` (tests existence, not readability).
 - **Missing store root (AD-1):** store-root NotFound with a readable parent ⇒ `Absent` (positive absence — matches today's warm-path steady state and prevents the incident on fresh installs/secondary devices); any read/permission ERROR at the root ⇒ `Unreadable` (fail open).
 - **Claude scope (AD-2):** claude validation covers same-boot deletions only (per-boot in-memory `ever_observed_on_disk`; see the carve-out bullet above).
-- **Door 1 ordering (A11 falsified):** the gate runs AFTER the D7 cross-mode liveness guard and BEFORE the amplifier pre-create re-stub, with an in-gate liveness precondition for legacy carriers (Task 6).
+- **Door 1 ordering (A11 falsified):** the gate runs AFTER the D7 cross-mode liveness guard and BEFORE the amplifier pre-create re-stub, with an in-gate liveness precondition for legacy carriers (Task 6). (Consequence for amplifier's designed stub GC: AD-5 below.)
 - **"Not retried forever" (A5 falsified-split):** four cooperating mechanisms — ledger `retire_missing` (server, all doors) + `terminal.created.sessionRef` overwrite (claude/amplifier, existing client fold) + notice-triggered clear of the pane's persisted `sessionRef`/`resumeSessionId` (codex/opencode, Task 5) + the mandatory `accepted_session_ref` guard at door 3 (Task 8).
 - **AD-3 (accepted):** after a gate-fired headless respawn, the auto-resume hub's `complete_claim` keeps the STALE locator's lease bound to the fresh terminal (`auto_resume.rs:529-547`) — convergent, documented with a code comment (Task 7).
+- **AD-5 (accepted, decided — the amplifier never-used-stub GC collision; fresheyes round 3):** freshell's DESIGNED amplifier lifecycle GCs a never-typed pane's session stub at terminal exit (`terminal.rs:1381` → `amplifier_stub.rs` `gc_stub_if_unused`; a stub is "unused" when metadata has no `turn_count`, the transcript is empty, and no `prompt:submit` event exists), and both spawn doors compensate by running `amplifier_stub::ensure_session` (ensure-after-GC) before spawning, re-stubbing the SAME id (`reconcile.rs:337-347`; door-1 pre-create comment `terminal.rs:1798-1815`). The gate deliberately sits BEFORE that re-stub (A11 — otherwise `ensure_session` resurrects the dir and the probe answers Present, hiding the incident forever), so after a restart EVERY never-typed open amplifier pane probes `Absent` and the gate fires: minted id + operator notice + `SessionMissing` retirement, where today the restore silently re-stubs the same id. DECIDED: ACCEPTED, for three reasons. (a) On disk a GC'd never-used stub is INDISTINGUISHABLE from the incident's stale id — both are "no session dir anywhere under any project slug", and `ever_observed_on_disk` is per-boot in-memory so post-restart both answer `false` — any carve-out that lets the stub through (e.g. mirroring claude's zero-turn carve-out for amplifier) would let the INCIDENT through too, and the incident is this feature's reason to exist ("amplifier MUST be covered"). (b) The user-visible outcome for a never-typed pane is an equivalent EMPTY amplifier session either way — same cwd, same mode, zero history to lose; the only costs are the notice line and an id change, and the minted id is healed into client persistence by the existing `terminal.created.sessionRef` overwrite fold. (c) This does NOT conflict with reconcile's amplifier Absent carve-out (`reconcile.rs:330-352`, pinned by `reconcile.rs:703-720` — both untouched): reconcile decides whether a pane gets PARKED in the dead-sessions dialog (destructive — the pane is lost), while the gate merely swaps WHICH id an already-restoring pane spawns with (the pane survives in place). Consequences recorded: Task 1's `amplifier_absent_spawns_fresh` test and Task 6's integration case 1 deliberately enshrine this exact shape, the door-2 "Absent is near-impossible" framing is scoped to non-amplifier modes (see the Door 2 bullet above), and the Task 9 DEVIATIONS entry names this consequence explicitly.
 
 ## File Structure
 
@@ -180,6 +181,11 @@ pub fn evaluate_resume_gate(
             // conversed has no transcript on disk yet (mirrors
             // freshell-ws/reconcile.rs claude carve-out, deliberately more
             // fail-open: no ledger-bound requirement).
+            //
+            // Amplifier deliberately gets NO such carve-out (plan AD-5): a
+            // never-used stub GC'd at terminal exit is indistinguishable on
+            // disk from the incident's stale id, and the gate-fired fresh
+            // spawn is an equivalent empty session for a never-typed pane.
             if provider == "claude" && !ever_observed_on_disk {
                 ResumeGateDecision::Proceed
             } else {
@@ -215,6 +221,8 @@ mod tests {
     #[test]
     fn amplifier_absent_spawns_fresh() {
         // THE incident case: stale amplifier id with no session dir anywhere.
+        // Deliberately ALSO covers the never-used-stub-GC'd-at-exit shape —
+        // indistinguishable on disk from the incident (plan AD-5).
         assert_eq!(evaluate_resume_gate("amplifier", Absent, false), SpawnFresh);
         assert_eq!(evaluate_resume_gate("amplifier", Absent, true), SpawnFresh);
     }
@@ -1347,7 +1355,7 @@ Run: `cargo test -p freshell-ws resume_validation` — PASS.
 
 RED: create `crates/freshell-ws/tests/resume_validation_gate.rs`. Reuse the harness of `crates/freshell-ws/tests/restore_spawn_gate.rs` verbatim (same `common::*` helpers, same way it builds `WsState`, injects a probe/temp stores, sends a `terminal.create` and reads response frames). Cases to cover (each is one `#[tokio::test]`):
 
-1. `restore_true_amplifier_absent_spawns_fresh_with_notice`: state whose existence probe answers `Absent` for `("amplifier", "stale-amp")` (inject a fake `SharedExistenceProbe` — the harness sets `state.session_existence`; use a fake, not a real index) + a pane ledger containing a `Bound` row for that ref. Send `terminal.create { mode: "amplifier", restore: true, session_ref: {provider:"amplifier", sessionId:"stale-amp"}, cwd: <tempdir> }` (plus `FRESHELL_AMPLIFIER_HOME` pointed at an empty temp home so `ensure_session` runs against the temp store). Assert: the create SUCCEEDS (a `terminal.created` frame arrives, not an `error`); the `terminal.created` frame's `notice` contains `"stale-amp"`; the spawned resume id is NOT `stale-amp` (assert via the ledger: `load_binding("amplifier", "stale-amp")` is `Retired` with reason `SessionMissing`, and no amplifier session dir named `stale-amp` was created under the temp amplifier home — the fresh UUID dir exists instead).
+1. `restore_true_amplifier_absent_spawns_fresh_with_notice`: state whose existence probe answers `Absent` for `("amplifier", "stale-amp")` (inject a fake `SharedExistenceProbe` — the harness sets `state.session_existence`; use a fake, not a real index) + a pane ledger containing a `Bound` row for that ref. Send `terminal.create { mode: "amplifier", restore: true, session_ref: {provider:"amplifier", sessionId:"stale-amp"}, cwd: <tempdir> }` (plus `FRESHELL_AMPLIFIER_HOME` pointed at an empty temp home so `ensure_session` runs against the temp store). Assert: the create SUCCEEDS (a `terminal.created` frame arrives, not an `error`); the `terminal.created` frame's `notice` contains `"stale-amp"`; the spawned resume id is NOT `stale-amp` (assert via the ledger: `load_binding("amplifier", "stale-amp")` is `Retired` with reason `SessionMissing`, and no amplifier session dir named `stale-amp` was created under the temp amplifier home — the fresh UUID dir exists instead). NOTE (AD-5): this empty-home + stale-id shape is byte-identical on disk to a never-used stub GC'd at terminal exit — gating it is the DECIDED behavior, not an accident (see Design Notes AD-5).
 2. `restore_true_amplifier_present_resumes_unchanged`: probe answers `Present`; assert `terminal.created` has NO `notice` and the ledger row stays `Bound`.
 3. `restore_true_unknown_fails_open`: probe answers `Unknown`; assert no `notice`, row stays `Bound` (today's behavior preserved).
 4. `restore_true_live_absent_sessionref_hits_d7_not_the_gate`: registry/identity hold a RUNNING owner for `("amplifier", "stale-amp")` (set up the liveness state the way D7's own sibling tests do), probe answers `Absent`, ledger holds a `Bound` row. Send the same restore create as case 1. Assert: (a) the response is D7's `RestoreUnavailable` error frame ("still running"), NOT a `terminal.created` fresh spawn; (b) the `Bound` ledger row of the running session SURVIVES (`load_binding` still `Bound` — the gate never saw the create). This pins the after-D7 ordering (V8 §A11).
@@ -1814,11 +1822,28 @@ Wire it in the create pipeline — numbered, all steps MANDATORY:
 
 Add the `FreshAgentState` fields + builders in `lib.rs` — `resume_probe`, `on_stale_resume`, AND `sidecar_liveness` (type + Arc-cycle warning per Interfaces above; copy the `with_opencode_locator` builder shape exactly).
 
-In `crates/freshell-server/src/main.rs`, where `FreshAgentState` is built, chain:
+In `crates/freshell-server/src/main.rs`, the probe and the ledger do NOT exist where `FreshAgentState` is first built — the last builder chain today ends at `:408-411`, but `pane_ledger` is only constructed at `:527`, and the existence probe is built INLINE and UNNAMED inside the `WsState` struct literal's `session_existence:` field initializer (`:559-610`, a `match &session_index` with an `IndexExistenceProbe` arm and a no-index fallback arm). So the wiring takes two mechanical moves plus ONE new (final) builder rebinding at a later site:
+
+1. **Hoist the probe into a named binding (pure hoist, both arms byte-identical).** Cut the entire `match &session_index { ... }` initializer out of the `WsState` literal's `session_existence:` field and bind it immediately ABOVE the literal as `let session_existence: <the exact declared type of the WsState.session_existence field> = match &session_index { ... };`, then put `session_existence.clone()` back in the struct literal field.
+
+2. **Add one more consuming rebinding** between `pane_ledger`'s construction (`:527`) / the hoisted `session_existence` binding and the `WsState` literal that consumes them — this becomes the LAST `with_*` rebinding, so update the "last builder" comment at `:486-489` to point here:
 
 ```rust
+    // Resume-validation wiring. Deliberately the LAST rebinding: it needs
+    // pane_ledger (:527) and the hoisted session_existence probe, which do
+    // not exist at the earlier builder chains. Sound because every door-3
+    // consumer clones fresh_agent_state AFTER this point (the freshagent
+    // REST router at :1017, SnapshotState::new at :956); the one EARLIER
+    // capture — FreshOpencodeState::new(fresh_agent_state.clone()) at :260,
+    // held by value (opencode_ws.rs:94) — already predates every
+    // door-3-relevant builder (with_cli_commands lands at :408-411) by
+    // existing design and never runs the REST create pipeline. The
+    // set_spawn_gate/set_identity_sink calls at :494/:542 are unaffected:
+    // Arc<OnceLock> cells initialized in new(), shared by every clone
+    // including this rebound value.
+    let fresh_agent_state = fresh_agent_state
         .with_resume_probe({
-            let probe = existence_probe.clone(); // the Arc<IndexExistenceProbe> built earlier
+            let probe = session_existence.clone(); // the hoisted Arc'd probe from step 1
             std::sync::Arc::new(move |provider: &str, session_id: &str| {
                 use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
                 use freshell_ws::existence::{SessionExistence, SessionExistenceProbe};
@@ -1850,8 +1875,8 @@ In `crates/freshell-server/src/main.rs`, where `FreshAgentState` is built, chain
             // MANDATORY (arm 2 of the door-3 liveness precondition): the
             // SAME sidecar instances the WS door's D7 join consults — built
             // at :221/:231/:259, frozen at :333-335, shared with WsState at
-            // :624-626. This builder chain (:408-411) runs after all three
-            // bindings exist, so clones are in scope here.
+            // :624-626. All three bindings long predate this late wiring
+            // site, so clones are in scope here.
             let claude = fresh_claude_state.clone();
             let codex = fresh_codex_state.clone();
             let opencode = fresh_opencode_state.clone();
@@ -1871,10 +1896,10 @@ In `crates/freshell-server/src/main.rs`, where `FreshAgentState` is built, chain
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
             })
-        })
+        });
 ```
 
-(Adapt the variable names to what `main.rs` actually calls the probe, ledger, and sidecar-state Arcs at that point, and adapt the mode→sidecar mapping to mirror the WS door's D7 sidecar arm (`crates/freshell-ws/src/terminal.rs:1748-1752`) — the same modes must consult the same sidecars, unknown modes contribute false.)
+(All `main.rs` line anchors above are PRE-CHANGE positions — re-locate them in the file as found (the hoist in step 1 shifts everything below it). Adapt the sidecar-state binding names to what `main.rs` actually calls the three Arcs, and adapt the mode→sidecar mapping to mirror the WS door's D7 sidecar arm (`crates/freshell-ws/src/terminal.rs:1748-1752`) — the same modes must consult the same sidecars, unknown modes contribute false.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1923,8 +1948,16 @@ Absent + never-observed-on-disk resuming, and the disk-observation signal
 is a per-boot in-memory set, so a transcript deleted while the server was
 DOWN is indistinguishable from never-conversed and fails OPEN post-restart;
 deliberate, fail-open) — codex, opencode, amplifier. gemini/kimi/third-party
-are never blocked. Additive protocol field: optional `notice` on
-`terminal.created`.
+are never blocked. Known accepted consequence for amplifier (AD-5 in the
+plan): freshell's designed never-used-stub GC deletes a never-typed pane's
+session stub at terminal exit and the spawn doors re-stub the SAME id via
+`ensure_session` on the next resume — after a restart such a pane now spawns
+fresh under a minted id WITH a notice instead of silently re-stubbing the
+same id. Decided and accepted: on disk the GC'd stub is indistinguishable
+from the incident's stale id, and for a never-typed pane the outcome is an
+equivalent empty session either way (reconcile's amplifier Absent carve-out,
+which prevents PARKING such panes in the dead-sessions dialog, is untouched).
+Additive protocol field: optional `notice` on `terminal.created`.
 
 **Why:** Production incident 2026-07-29 — after a server restart, freshell
 resumed stored amplifier session id 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 which
@@ -1987,13 +2020,13 @@ git commit -m "docs(resume-validation): deviation ledger entry for spawn-door re
 - "Clear/mark the stale cached id so it isn't retried forever" → four cooperating mechanisms, all required with tests: Task 4 `retire_missing` (all doors) + `terminal.created.sessionRef` overwrite (claude/amplifier, existing client fold, V5-verified) + Task 5 notice-triggered clear of persisted `sessionRef`/`resumeSessionId` (codex/opencode) + Task 8's mandatory `accepted_session_ref` guard (door 3). ✅
 - "Fail open on Unknown/unreadable" — invariant now STRONGER than the original plan: gate policy (Task 1) + errors-seen accumulator locator contracts (Tasks 2–3: ANY per-entry error with no hit ⇒ `Unreadable` ⇒ `Unknown` ⇒ Proceed; never `.is_dir()`/`fs::metadata(root)` adjudication) + AD-1 root semantics (NotFound-with-readable-parent ⇒ Absent, root ERROR ⇒ Unreadable) + in-gate liveness precondition and after-D7 ordering at door 1, and the MANDATORY two-arm in-gate liveness precondition at door 3 (whose pipeline puts the amplifier ensure `:895` BEFORE the REST D7 guard `:968-988`, so ordering alone cannot protect it — Task 8 step 1 ordering note; and whose registry consult is PTY-scoped, so a NEW injected `sidecar_liveness` probe covers sidecar-live sessions the REST D7 guard is blind to) — a LIVE session (registry- OR sidecar-live) can never be gated or have its Bound row retired at any door + explicit fail-open tests at every layer incl. sub-root permission fixtures (euid-guarded). ✅
 - "Amplifier MUST be covered; store = ~/.amplifier/projects/<slug>/sessions/<id>/; search all projects (documented)" → Tasks 2–3 + Global Constraints; covered even before index warm-up (cold-coverage matrix in Design Notes). ✅
-- "Cover providers freshell already reads; fail open for others" → claude (same-boot deletions only — AD-2, honestly scoped in Design Notes + DEVIATIONS)/codex/opencode/amplifier validated; codex/opencode additionally fail open in the first seconds after boot (AD-4, accepted residual); gemini/kimi/third-party never blocked (tested). ✅
+- "Cover providers freshell already reads; fail open for others" → claude (same-boot deletions only — AD-2, honestly scoped in Design Notes + DEVIATIONS)/codex/opencode/amplifier validated; codex/opencode additionally fail open in the first seconds after boot (AD-4, accepted residual); amplifier's never-used-stub GC collision is DECIDED and documented, not defaulted into (AD-5 — gate deliberately fires on the GC'd-stub shape; pinned by Task 1's amplifier test + Task 6 case 1; DEVIATIONS names the consequence); gemini/kimi/third-party never blocked (tested). ✅
 - "Rust server REQUIRED; Node only if cheap — if skipped, say so" → Node explicitly skipped with reasons (Global Constraints); Task 5's mirror provably touches zero `server/` files (precedent commits `5c591843`/`a18dd4c6`). ✅
 - "Non-goals respected" → no amplifier-CLI changes; no indexing subsystem changes beyond the by-id fallbacks + the cold-branch consult the validation needs; protocol change limited to one additive optional field, mirrored via `shared/ws-protocol.ts` + regenerated contract schema (never hand-edited). ✅
 - "TDD, unit + e2e, coordinated test commands, worktree, no PR/deploy, known flaky test" → per-task RGR steps + Task 9 sweep + Global Constraints. ✅
 - Runtime discipline: no door blocks the async runtime — all probe/locator IO runs in `tokio::task::spawn_blocking` (one consistent shape: sync helpers, doors wrap; Tasks 6/7/8), and the expensive codex walk is confined to warm-Absent adjudication (A13/AD-4). ✅
 
-**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Behaviors the validation pass surfaced are now REQUIRED with pinning tests, not deferred: the codex/opencode notice-triggered client clear (Task 5 test), the door-3 `accepted_session_ref` guard + healed-ref stamping (Task 8 step 4 tests), the door-2 fresh-id bookkeeping (Task 7 assertion 5), the after-D7 ordering + in-gate liveness incl. its async sidecar arm (Task 6 cases 4–6), the door-3 two-arm liveness precondition — registry arm with D7-REST-reject preservation AND the sidecar arm via the injected `sidecar_liveness` probe (Task 8 step 4 live-session tests) — and the minted-v4 plausibility pin (Task 8). The only accepted residuals are recorded decisions with rationale (AD-1…AD-4), not silent gaps. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose by-id fallback, cold-index, and error-contract behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. NO UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Behaviors the validation pass surfaced are now REQUIRED with pinning tests, not deferred: the codex/opencode notice-triggered client clear (Task 5 test), the door-3 `accepted_session_ref` guard + healed-ref stamping (Task 8 step 4 tests), the door-2 fresh-id bookkeeping (Task 7 assertion 5), the after-D7 ordering + in-gate liveness incl. its async sidecar arm (Task 6 cases 4–6), the door-3 two-arm liveness precondition — registry arm with D7-REST-reject preservation AND the sidecar arm via the injected `sidecar_liveness` probe (Task 8 step 4 live-session tests) — and the minted-v4 plausibility pin (Task 8). The only accepted residuals are recorded decisions with rationale (AD-1…AD-5), not silent gaps. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose by-id fallback, cold-index, and error-contract behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. NO UNRESOLVED COVERAGE GAPS.
 
 **2. Placeholder scan:** Steps that intentionally clone an existing harness (Task 3 fallback/cold/permission tests, Task 6/7 integration tests, Task 5 client tests, Task 4 ledger tests) each name the exact sibling file/test whose scaffolding to copy and spell out the complete required assertions — the behavior contract is fully specified; only mechanical harness reuse is deferred to the named files. The Task 3 `codex_rollout_on_disk` snippet leaves ONE named private helper to mechanical implementation (the tri-state first-line ownership read) with its full contract spelled inline (valid-read-mismatch ⇒ non-owner; open/read/decode failure incl. `.jsonl.zst` ⇒ error). Task 6's liveness precondition explicitly copies D7's existing join (`:1747-1758`) — in an async-capable `let` shape, both arms — rather than leaving it open; Task 8's liveness precondition likewise spells out both arms rather than leaving either open — the registry arm reuses the REST D7 guard's own consult (`:968-988`, shared/hoisted, not reimplemented), and the sidecar arm is a fully-typed injected probe (`SidecarLivenessProbe` + `with_sidecar_liveness`, with its `main.rs` closure spelled inline) because the REST guard's consult is PTY-scoped and blind to sidecar-live sessions. No TBD/TODO/"handle edge cases" remain.
 
