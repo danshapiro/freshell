@@ -578,6 +578,13 @@ fn try_activate_with_ops(
         ));
     }
 
+    if sandbox_exit_after_deploy_authorization(activation) {
+        eprintln!(
+            "freshell-server: sandbox fixture exiting after deployment authorization and before activation receipt"
+        );
+        std::process::exit(86);
+    }
+
     // All server-side fallible work ends here. A successful durable receipt
     // permits this process's infallible gate flip. Controller recovery still
     // requires its separate durable `activation_confirmed` journal phase; the
@@ -586,6 +593,26 @@ fn try_activate_with_ops(
         .map_err(ActivationError::Publication)?;
     gate.activate();
     Ok(ActivationPoll::Activated)
+}
+
+fn sandbox_exit_after_deploy_authorization(activation: &ActivationFiles) -> bool {
+    std::env::var("FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION").as_deref() == Ok("1")
+        && std::env::var("FRESHELL_DESTRUCTIVE_SANDBOX").as_deref() == Ok("1")
+        && std::env::var("PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|port| port != 3002)
+        && std::env::current_dir()
+            .ok()
+            .is_some_and(|cwd| cwd.starts_with("/tmp/"))
+        && [
+            &activation.authorization_file,
+            &activation.activated_file,
+            &activation.cancellation_file,
+            &activation.cancelled_file,
+        ]
+        .into_iter()
+        .all(|path| path.starts_with("/tmp/"))
 }
 
 async fn wait_for_activation(

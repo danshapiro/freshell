@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -17,6 +18,7 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 
@@ -191,6 +193,99 @@ async function waitForHttp(port: number, expected: 'up' | 'down', timeout = 20_0
     await new Promise((resolve) => setTimeout(resolve, 40))
   }
   throw new Error(`port ${port} did not become ${expected}`)
+}
+
+function sha256(file: string) {
+  return createHash('sha256').update(readFileSync(file)).digest('hex')
+}
+
+function isProcessAlive(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+function assertExactManagedGeneration(portRoot: string, live: any, port: number) {
+  const generationRoot = path.join(portRoot, 'generations', live.selectedGenerationId)
+  const manifest = JSON.parse(readFileSync(path.join(generationRoot, 'manifest.json'), 'utf8'))
+  const fileEntries = manifest.entries.filter((entry: any) => entry.type === 'file')
+  expect(manifest.generationId).toBe(live.selectedGenerationId)
+  expect(fileEntries.length).toBeGreaterThan(10)
+  for (const entry of fileEntries) {
+    expect(sha256(path.join(generationRoot, entry.path)), entry.path).toBe(entry.sha256)
+  }
+  for (const required of [
+    'client/index.html',
+    'server/freshell-server',
+    'controller/freshell-deploy',
+    'dist/server/mcp/server.js',
+    'claude-sidecar/index.mjs',
+    'package.json',
+    'package-lock.json',
+    'node_modules/.package-lock.json',
+  ]) {
+    expect(fileEntries.some((entry: any) => entry.path === required), required).toBe(true)
+  }
+  expect(fileEntries.some((entry: any) => entry.path.startsWith('extensions/'))).toBe(true)
+
+  const identity = live.processIdentity
+  const executable = path.join(generationRoot, 'server/freshell-server')
+  const executableStat = statSync(executable)
+  expect(realpathSync(`/proc/${identity.pid}/exe`)).toBe(realpathSync(executable))
+  expect(identity.executable).toMatchObject({
+    device: String(executableStat.dev),
+    inode: String(executableStat.ino),
+    sha256: sha256(executable),
+  })
+  expect(identity.listener).toMatchObject({
+    port,
+    ownerPid: identity.pid,
+    networkNamespace: readlinkSync(`/proc/${identity.pid}/ns/net`),
+  })
+  expect(
+    readdirSync(`/proc/${identity.pid}/fd`).some((fd) => {
+      try {
+        return readlinkSync(`/proc/${identity.pid}/fd/${fd}`)
+          === `socket:[${identity.listener.socketInode}]`
+      } catch {
+        return false
+      }
+    }),
+  ).toBe(true)
+
+  const expectedRuntime = {
+    // The browser artifact follows the atomic current pointer so client-only
+    // deployments take effect without replacing this exact server process.
+    clientDir: path.join(portRoot, 'current/client'),
+    extensionsDir: path.join(generationRoot, 'extensions'),
+    distServerDir: path.join(generationRoot, 'dist/server'),
+    mcpEntry: path.join(generationRoot, 'dist/server/mcp/server.js'),
+    claudeSidecarEntry: path.join(generationRoot, 'claude-sidecar/index.mjs'),
+    packageJson: path.join(generationRoot, 'package.json'),
+    packageLock: path.join(generationRoot, 'package-lock.json'),
+    productionNodeModules: path.join(generationRoot, 'node_modules'),
+  }
+  expect(identity.runtime).toMatchObject(expectedRuntime)
+  const processEnvironment = Object.fromEntries(
+    readFileSync(`/proc/${identity.pid}/environ`)
+      .toString('utf8')
+      .split('\0')
+      .filter(Boolean)
+      .map((entry) => {
+        const equals = entry.indexOf('=')
+        return [entry.slice(0, equals), entry.slice(equals + 1)]
+      }),
+  )
+  expect(processEnvironment).toMatchObject({
+    FRESHELL_CLIENT_DIR: expectedRuntime.clientDir,
+    FRESHELL_EXTENSIONS_DIR: expectedRuntime.extensionsDir,
+    FRESHELL_CLAUDE_SIDECAR: expectedRuntime.claudeSidecarEntry,
+    FRESHELL_MCP_SERVER_ENTRY: expectedRuntime.mcpEntry,
+    FRESHELL_DEPLOY_GENERATION_ID: live.runningServerGenerationId,
+  })
 }
 
 function initialize(label = 'prior', options: string[] = []) {
@@ -543,16 +638,24 @@ describe('real deployment controller boundary', () => {
     const runtime = path.join(root, 'runtime')
     const candidateClient = path.join(root, 'candidate-client')
     const nextClient = path.join(root, 'next-client')
+    const cargoTarget = path.join(root, 'cargo-target')
     const distServer = path.join(runtime, 'dist-server')
     const sidecar = path.join(runtime, 'sidecar')
     const nodeModules = path.join(runtime, 'node_modules')
     const pidFile = path.join(root, 'legacy.pid')
     const logFile = path.join(root, 'legacy.log')
     const token = `task6-real-sandbox-${Date.now()}-token`
+    const clientMarker = `task7-real-client-${Date.now()}`
     const node = realpathSync(process.execPath)
     let port = await unusedPort()
     while (port === 3002) port = await unusedPort()
     const knownPids = new Set<number>()
+    const unrelatedSentinel = spawn(
+      node,
+      ['--eval', 'setInterval(() => {}, 1000)'],
+      { stdio: 'ignore' },
+    )
+    if (!unrelatedSentinel.pid) throw new Error('unrelated sentinel did not start')
 
     mkdirSync(realCheckout, { recursive: true })
     mkdirSync(home)
@@ -615,24 +718,32 @@ describe('real deployment controller boundary', () => {
 
     try {
       await checkedAsync('cargo', ['build', '--quiet', '-p', 'freshell-server'], {
-        env: realEnvironment,
+        env: { ...realEnvironment, CARGO_TARGET_DIR: cargoTarget },
         timeout: 240_000,
       })
       await checkedAsync('cargo', ['build', '--quiet', '--release', '-p', 'freshell-deploy'], {
-        env: realEnvironment,
+        env: { ...realEnvironment, CARGO_TARGET_DIR: cargoTarget },
         timeout: 600_000,
       })
       await checkedAsync('npm', ['run', 'build:client'], {
         env: { ...realEnvironment, FRESHELL_CLIENT_OUT_DIR: candidateClient },
       })
+      const clientIndex = path.join(candidateClient, 'index.html')
+      writeFileSync(
+        clientIndex,
+        readFileSync(clientIndex, 'utf8').replace(
+          '</head>',
+          `<meta name="task7-real-client" content="${clientMarker}"></head>`,
+        ),
+      )
       mkdirSync(path.join(realCheckout, 'dist'), { recursive: true })
       cpSync(distServer, path.join(realCheckout, 'dist/server'), {
         recursive: true,
       })
       symlinkSync(nodeModules, path.join(realCheckout, 'node_modules'))
 
-      const server = path.join(repository, 'target/debug/freshell-server')
-      const controller = path.join(repository, 'target/release/freshell-deploy')
+      const server = path.join(cargoTarget, 'debug/freshell-server')
+      const controller = path.join(cargoTarget, 'release/freshell-deploy')
       const extensions = realpathSync(path.join(repository, 'extensions'))
       const captureFixture = path.join(fixtures, 'real-capture-parent.sh')
       await checkedAsync(captureFixture, [], {
@@ -710,6 +821,78 @@ describe('real deployment controller boundary', () => {
         })).stdout.trim(),
       ).toBe('captured-legacy')
 
+      const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
+      const liveFile = path.join(portRoot, 'live.json')
+      const capturedLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
+      const capturedLegacyExecutableDigest = capturedLegacy.processIdentity.executable.sha256
+      const failedLegacyClient = path.join(root, 'failed-legacy-client')
+      cpSync(candidateClient, failedLegacyClient, { recursive: true })
+      writeFileSync(
+        path.join(failedLegacyClient, 'task7-failed-legacy-target.txt'),
+        'retained failure evidence\n',
+      )
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n` +
+          'FRESHELL_DESTRUCTIVE_SANDBOX=1\n' +
+          'FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION=1\n',
+        { mode: 0o600 },
+      )
+      await expect(
+        checkedAsync(controller, fullDeployArgs(failedLegacyClient), {
+          cwd: realCheckout,
+          env: realEnvironment,
+          timeout: 300_000,
+        }),
+      ).rejects.toThrow()
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n`,
+        { mode: 0o600 },
+      )
+      await waitForHttp(port, 'up')
+      const failedLegacyTransaction = JSON.parse(
+        readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+      )
+      const restoredLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
+      knownPids.add(restoredLegacy.processIdentity.pid)
+      if (failedLegacyTransaction.candidate?.process?.pid) {
+        knownPids.add(failedLegacyTransaction.candidate.process.pid)
+      }
+      expect(failedLegacyTransaction.phase).toBe('rollback_complete')
+      expect(failedLegacyTransaction.finalized).toBe(true)
+      expect(failedLegacyTransaction.launchAttempts.map((attempt: any) => attempt.lane))
+        .toEqual(['target_gated', 'prior_rollback'])
+      expect(existsSync(failedLegacyTransaction.controls.activatedFile)).toBe(false)
+      expect(restoredLegacy).toMatchObject({
+        selectedGenerationId: capturedLegacy.selectedGenerationId,
+        runningServerGenerationId: capturedLegacy.runningServerGenerationId,
+        // The exact captured generation is restored, but the controller now
+        // owns its relaunched process and records managed provenance.
+        legacy: false,
+      })
+      expect(restoredLegacy.processIdentity.pid).not.toBe(
+        capturedLegacy.processIdentity.pid,
+      )
+      expect(restoredLegacy.processIdentity.executable.sha256).toBe(
+        capturedLegacyExecutableDigest,
+      )
+      expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
+        capturedLegacy.selectedGenerationId,
+      )
+      expect(
+        existsSync(
+          path.join(
+            portRoot,
+            'generations',
+            failedLegacyTransaction.targetGenerationId,
+            'client/task7-failed-legacy-target.txt',
+          ),
+        ),
+      ).toBe(true)
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toContain(clientMarker)
+      expect(isProcessAlive(unrelatedSentinel.pid!)).toBe(true)
+
       await checkedAsync(
         controller,
         fullDeployArgs(candidateClient),
@@ -717,8 +900,6 @@ describe('real deployment controller boundary', () => {
       )
       await waitForHttp(port, 'up')
 
-      const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
-      const liveFile = path.join(portRoot, 'live.json')
       const transaction = JSON.parse(readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'))
       expect(transaction.finalized).toBe(true)
       expect(existsSync(transaction.controls.activatedFile)).toBe(true)
@@ -726,6 +907,195 @@ describe('real deployment controller boundary', () => {
       knownPids.add(fullLive.processIdentity.pid)
       expect(fullLive.legacy).toBe(false)
       expect(fullLive.runningServerGenerationId).toBe(fullLive.selectedGenerationId)
+      expect(port).not.toBe(3002)
+      for (const disposablePath of [
+        root,
+        realCheckout,
+        home,
+        runtime,
+        candidateClient,
+        cargoTarget,
+        portRoot,
+        fullLive.processIdentity.cwd,
+      ]) {
+        expect(realpathSync(disposablePath), disposablePath).toMatch(/^\/tmp\//)
+      }
+      assertExactManagedGeneration(portRoot, fullLive, port)
+
+      const healthResponse = await fetch(`http://127.0.0.1:${port}/api/health`)
+      const health = await healthResponse.json()
+      expect(Object.keys(health)).toEqual([
+        'app',
+        'ok',
+        'requiresAuth',
+        'version',
+        'ready',
+        'instanceId',
+        'startedAt',
+      ])
+      expect(health).toMatchObject({
+        app: 'freshell',
+        ok: true,
+        requiresAuth: true,
+        ready: true,
+      })
+      const compatibilityResponse = await fetch(
+        `http://127.0.0.1:${port}/api/deployment-compatibility`,
+        { headers: { 'x-auth-token': token } },
+      )
+      const compatibility = await compatibilityResponse.json()
+      expect(Object.keys(compatibility)).toEqual([
+        'schemaVersion',
+        'serverDeclaration',
+        'serverDeclarationSha256',
+        'serverProcessGenerationId',
+        'bootId',
+      ])
+      expect(compatibility.serverDeclaration).toMatchObject({
+        component: 'server',
+        version: '0.7.0',
+        supports: {
+          client: {
+            minInclusive: '0.7.5',
+            maxExclusive: '0.7.6',
+          },
+        },
+      })
+      expect(compatibility.serverDeclarationSha256).toBe(
+        createHash('sha256')
+          .update(JSON.stringify(compatibility.serverDeclaration))
+          .digest('hex'),
+      )
+      expect(compatibility.serverProcessGenerationId).toBe(fullLive.selectedGenerationId)
+      const selectedRoot = path.join(
+        portRoot,
+        'generations',
+        fullLive.selectedGenerationId,
+      )
+      const clientCompatibility = JSON.parse(
+        readFileSync(
+          path.join(selectedRoot, 'client/deployment-compatibility.json'),
+          'utf8',
+        ),
+      )
+      expect(clientCompatibility.declaration).toMatchObject({
+        component: 'client',
+        version: '0.7.5',
+        supports: {
+          server: {
+            minInclusive: '0.7.0',
+            maxExclusive: '0.7.1',
+          },
+        },
+      })
+      expect(clientCompatibility.declarationSha256).toBe(
+        createHash('sha256')
+          .update(JSON.stringify(clientCompatibility.declaration))
+          .digest('hex'),
+      )
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text())
+        .toContain(clientMarker)
+
+      const sidecarImport = spawnSync(
+        node,
+        [path.join(selectedRoot, 'claude-sidecar/index.mjs')],
+        {
+          cwd: selectedRoot,
+          input: '{"type":"shutdown"}\n',
+          encoding: 'utf8',
+          env: { HOME: home },
+        },
+      )
+      expect(sidecarImport.status, sidecarImport.stderr).toBe(0)
+      const mcpImport = spawnSync(
+        node,
+        [
+          '--input-type=module',
+          '--eval',
+          "const {pathToFileURL}=await import('node:url');await import(pathToFileURL(process.argv[1]).href)",
+          path.join(selectedRoot, 'dist/server/mcp/server.js'),
+        ],
+        {
+          cwd: selectedRoot,
+          encoding: 'utf8',
+          env: { HOME: home },
+        },
+      )
+      expect(mcpImport.status, mcpImport.stderr).toBe(0)
+
+      const failedClient = path.join(root, 'pre-commit-failure-client')
+      cpSync(candidateClient, failedClient, { recursive: true })
+      writeFileSync(
+        path.join(failedClient, 'task7-pre-commit-failure-marker.txt'),
+        'must-remain-retained-but-unselected\n',
+      )
+      const beforeFailedActivation = JSON.parse(readFileSync(liveFile, 'utf8'))
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n` +
+          'FRESHELL_DESTRUCTIVE_SANDBOX=1\n' +
+          'FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION=1\n',
+        { mode: 0o600 },
+      )
+      await expect(
+        checkedAsync(controller, fullDeployArgs(failedClient), {
+          cwd: realCheckout,
+          env: realEnvironment,
+          timeout: 300_000,
+        }),
+      ).rejects.toThrow()
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n`,
+        { mode: 0o600 },
+      )
+      await waitForHttp(port, 'up')
+
+      const failedTransaction = JSON.parse(
+        readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+      )
+      if (failedTransaction.candidate?.process?.pid) {
+        knownPids.add(failedTransaction.candidate.process.pid)
+      }
+      const restoredAfterFailure = JSON.parse(readFileSync(liveFile, 'utf8'))
+      knownPids.add(restoredAfterFailure.processIdentity.pid)
+      expect(failedTransaction.phase).toBe('rollback_complete')
+      expect(failedTransaction.finalized).toBe(true)
+      expect(failedTransaction.launchAttempts.map((attempt: any) => attempt.lane))
+        .toEqual(['target_gated', 'prior_rollback'])
+      expect(failedTransaction.launchAttempts.map((attempt: any) => attempt.state.status))
+        .toEqual(['started', 'started'])
+      expect(existsSync(failedTransaction.controls.authorizationFile)).toBe(true)
+      expect(existsSync(failedTransaction.controls.activatedFile)).toBe(false)
+      expect(restoredAfterFailure.selectedGenerationId).toBe(
+        beforeFailedActivation.selectedGenerationId,
+      )
+      expect(restoredAfterFailure.runningServerGenerationId).toBe(
+        beforeFailedActivation.runningServerGenerationId,
+      )
+      expect(restoredAfterFailure.processIdentity.pid).not.toBe(
+        beforeFailedActivation.processIdentity.pid,
+      )
+      expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
+        beforeFailedActivation.selectedGenerationId,
+      )
+      expect(failedTransaction.targetGenerationId).not.toBe(
+        beforeFailedActivation.selectedGenerationId,
+      )
+      expect(
+        existsSync(
+          path.join(
+            portRoot,
+            'generations',
+            failedTransaction.targetGenerationId,
+            'client/task7-pre-commit-failure-marker.txt',
+          ),
+        ),
+      ).toBe(true)
+      assertExactManagedGeneration(portRoot, restoredAfterFailure, port)
+      expect(await (await fetch(`http://127.0.0.1:${port}/`)).text())
+        .toContain(clientMarker)
+      expect(isProcessAlive(unrelatedSentinel.pid!)).toBe(true)
 
       const boundaries = [
         {
@@ -859,6 +1229,26 @@ describe('real deployment controller boundary', () => {
         expect(recoveredLive.runningServerGenerationId, boundary.name).toBe(
           recoveredLive.selectedGenerationId,
         )
+        expect(recoveredLive.selectedGenerationId, boundary.name).toBe(
+          recovered.targetGenerationId,
+        )
+        expect(
+          await (
+            await fetch(
+              `http://127.0.0.1:${port}/task6-interruption-marker.txt`,
+            )
+          ).text(),
+          boundary.name,
+        ).toContain(boundary.name)
+        if (boundary.name === 'target-owned-receipt') {
+          expect(
+            recovered.launchAttempts.map((attempt: any) => attempt.lane),
+          ).not.toContain('prior_rollback')
+          expect(existsSync(recovered.controls.activatedFile)).toBe(true)
+          expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
+            recovered.targetGenerationId,
+          )
+        }
       }
 
       cpSync(candidateClient, nextClient, { recursive: true })
@@ -948,6 +1338,7 @@ describe('real deployment controller boundary', () => {
           // Already stopped by the controller.
         }
       }
+      unrelatedSentinel.kill('SIGTERM')
       spawnSync('chmod', ['-R', 'u+w', root], { encoding: 'utf8' })
       rmSync(root, { recursive: true, force: true })
     }

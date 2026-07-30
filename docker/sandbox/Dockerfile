@@ -19,7 +19,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Build tooling for the Rust workspace (cmake/clang/perl cover aws-lc-sys and
 # similar TLS crates that need to compile native code + generate bindings)
-# plus git/curl for rustup and cargo's own network operations. gosu drops
+# plus git/curl for rustup and cargo's own network operations. jq is required
+# by the deployment tab-identity capture/verify gate exercised in this
+# destructive sandbox. gosu drops
 # root privileges cleanly (true exec, unlike su) once the entrypoint has
 # fixed up ownership of freshly-created named volumes (see entrypoint.sh).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -32,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       perl \
       git \
       curl \
+      jq \
       ca-certificates \
       gosu \
     && rm -rf /var/lib/apt/lists/*
