@@ -7,7 +7,7 @@
 
 **Goal:** Implement `POST /api/sessions/resolve` in the Rust server (`crates/freshell-server`) with full behavior parity to the Node implementation, declare the `sessionResolve` feature flag from the Rust server so the shared client shows the pinned sidebar Resume button on Rust builds, and prove it with cross-language parser fixtures plus the `resume-button` e2e spec green on BOTH Playwright projects.
 
-**Architecture:** A pure Rust port of `shared/resume-input-parser.ts` and the resolve matching core live in `crates/freshell-sessions` (`resume_input.rs`, `resume_resolve.rs`), pinned to the TS implementation by a shared JSON fixture table both test suites consume. A new focused axum module `crates/freshell-server/src/resolve.rs` owns the HTTP route (auth → zod-shaped validation → resolve core), reading the existing `SessionIndex` for evidence, the `SessionMetadataStore` for the `sessionType` overlay, and two exact-id fallbacks that already exist in Rust (claude transcript locator, opencode by-id sqlite — each extended minimally to also return cwd).
+**Architecture:** A pure Rust port of `shared/resume-input-parser.ts` and the resolve matching core live in `crates/freshell-sessions` (`resume_input.rs`, `resume_resolve.rs`), pinned to the TS implementation by a shared JSON fixture table both test suites consume. A new focused axum module `crates/freshell-server/src/resolve.rs` owns the HTTP route (auth → zod-shaped validation → resolve core), reading the existing `SessionIndex` for evidence (filtered through the settings store's `deleted` session overrides, exactly like the Rust sidebar), the `SessionMetadataStore` for the `sessionType` overlay, and two exact-id fallbacks built on existing Rust machinery (the claude transcript locator paired with its exported cwd reader; a bug-for-bug port of Node's opencode by-id sqlite parent-chain walk).
 
 **Tech Stack:** Rust (axum 0.8, tokio, serde/serde_json with `preserve_order`, `regex`, rusqlite), TypeScript (vitest, zod), Playwright.
 
@@ -18,6 +18,7 @@
 - Do NOT modify `shared/resume-resolve-contract.ts`, `shared/resume-input-parser.ts` behavior, or any Node server behavior. Allowed exceptions: refactoring `test/unit/shared/resume-input-parser.test.ts` to consume the shared fixture (behavior-identical), and a comment-only update in `server/platform-router.ts`.
 - Wire parity is byte-shape parity: response JSON field ORDER matches the Node object literals (`serde_json` `preserve_order` is on workspace-wide; struct field order controls serde output order), optional match fields are OMITTED when absent (`skip_serializing_if`), and `hint` is `null` (never omitted) when absent.
 - Constants copied from Node: result cap `RESOLVE_MATCH_CAP = 20`; request `input` length `1..=20000` counted in UTF-16 code units (zod `.min(1).max(20000)` semantics); validation failure is `400 { "error": "Invalid resolve request", "details": [...] }`; "not found" is NEVER 404 — it is `200 { "status": "ready", "matches": [] }`.
+- 400 `details` parity: the issue literals (field set, key ORDER, message wording) must match the ACTUAL zod 4.3.6 wire output as probed against the real `ResumeResolveRequestSchema` — e.g. `"Invalid input: expected string, received undefined"`, double-quoted `"Unrecognized keys: \"a\", \"b\""` (singular `"Unrecognized key: \"a\""`), `origin`/`inclusive` fields on `too_small`/`too_big`, and `expected`/`origin` emitted BEFORE `code` (the workspace-wide `preserve_order` feature + `json!` insertion order provide this). Recorded facts: (a) NO consumer reads `details` — the client resume dialog treats any non-2xx as request-failed without inspecting the body, and the Node integration test asserts only status + `error` — so this is test-pinned parity, not consumer-load-bearing; (b) the literals are pinned to zod 4.3.6 and are VERSION-FRAGILE: any future zod bump requires re-probing the real wire output and updating both the Rust literals and Task 6's tests. Accepted deviations (status parity only): payloads Express's strict body parser rejects with an HTML 400 BEFORE zod runs — malformed JSON and JSON scalar bodies (string/number/bool/null) — get the zod-shaped JSON 400 from Rust instead; axum's default 2 MB body limit vs Express `json({ limit: '1mb' })`; and `PATCH`/`GET /api/sessions/resolve` answer 405 on the merged Rust router where Express would dispatch `:sessionId="resolve"` (unreachable by any known client).
 - Vitest: NEVER run raw `npx vitest`. Use `npm run test:vitest -- --config <config> <file> --run`. Before any broad run, check `npm run test:status`; set `FRESHELL_TEST_SUMMARY="SYNC-06 rust resolve parity"` on broad runs.
 - Rust gates (CI-enforced): `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo test --workspace` requires `node_modules` present (`test -d node_modules || npm ci --no-audit --no-fund`).
 - Process safety: never use broad kill patterns (`pkill -f node`, `pkill -f vite`, …). The live self-hosted Rust server on port 3002 must NEVER be restarted (building is fine). The Playwright harness manages its own server PIDs — let it.
@@ -38,7 +39,7 @@
 | `crates/freshell-sessions/src/lib.rs` | Modify | Register `resume_input` + `resume_resolve` modules |
 | `crates/freshell-sessions/src/resume_input.rs` | Create | Rust port of `shared/resume-input-parser.ts` (pure, no IO) |
 | `crates/freshell-sessions/tests/resume_input_parser_parity.rs` | Create | Fixture-driven parser parity test |
-| `crates/freshell-sessions/src/parse/opencode.rs` | Modify | Add `opencode_session_directory_by_id` (by-id cwd lookup) |
+| `crates/freshell-sessions/src/parse/opencode.rs` | Modify | Add `opencode_session_directory_by_id` (bug-for-bug port of Node's by-id parent-walk, incl. legacy-schema early hit + truthy-directory filter) |
 | `crates/freshell-sessions/src/parse/mod.rs` | Modify | Re-export the new helper + type |
 | `crates/freshell-sessions/tests/opencode_directory_by_id.rs` | Create | Sqlite fixture test for the new helper |
 | `crates/freshell-freshagent/src/claude_snapshot.rs` | Modify | Promote `transcript_cwd` to `pub` |
@@ -48,7 +49,7 @@
 | `crates/freshell-sessions/tests/resume_resolve.rs` | Create | Logic tests mirroring `test/integration/server/sessions-resolve-router.test.ts` |
 | `crates/freshell-server/src/session_metadata.rs` | Modify | Un-gate the `get`/`get_all` read API (`#[cfg(test)]` → production) |
 | `crates/freshell-server/src/resolve.rs` | Create | HTTP endpoint: `ResolveState`, router, auth, validation, handler + in-file oneshot tests |
-| `crates/freshell-server/src/main.rs` | Modify | `mod resolve;` + wiring (index clone, metadata clone, fallback closures) + `sessionResolve` feature flag + flag test updates |
+| `crates/freshell-server/src/main.rs` | Modify | `mod resolve;` + wiring (index clone, metadata clone, settings-store clone for the deleted-override filter, fallback closures) + `sessionResolve` feature flag + flag test updates |
 | `server/platform-router.ts` | Modify | Comment-only: the "Rust omits this key" note is now stale |
 | `test/e2e-browser/specs/resume-button.spec.ts` | Modify | Delete the `RUST_SKIP` guard (3 call sites + const) |
 | `test/e2e-browser/playwright.config.ts` | Modify | Add `resume-button.spec.ts` to `MATRIX_SPECS` |
@@ -59,9 +60,16 @@ Reference sources (read-only, do not modify): `shared/resume-resolve-contract.ts
 ## Parity reference — Node behavior being ported (read once, keep handy)
 
 - Handler (`server/sessions-router.ts:243-257`): zod `ResumeResolveRequestSchema.safeParse(req.body ?? {})`; failure → `400 { error: 'Invalid resolve request', details: issues }`; success → `res.json(await resolveResumeInput(input, deps))` (always 200).
-- Core (`server/coding-cli/resolve-session.ts`): parse input → if index not ready return `{status:'warming', matches:[], hint}` → if no candidates return `{status:'ready', matches:[], hint}` → per candidate (priority order): case-insensitive exact-else-prefix bucket over ALL sessions (all four providers, one flat list; the hint never filters); exact wins wholesale; first candidate with any match short-circuits; sort `lastActivityAt` DESC (missing=0, stable), dedupe by `provider:sessionId` (first survivor = most recent), cap 20. Only if EVERY candidate missed: fallback loop per candidate — (a) `prefixed-id` starting `ses_` → opencode by-id DB lookup, hit yields exactly ONE match `{provider:'opencode', sessionId:<token as typed>, cwd:<sqlite directory column>, sessionType:'opencode', matchKind:'exact'}`; (b) `uuid` → claude transcript locator, hit yields exactly ONE match `{provider:'claude', sessionId:<lowercased id>, cwd:<first cwd line>, sessionType:'claude', matchKind:'exact'}`. Nothing found → `{status:'ready', matches:[], hint}`.
+- Core (`server/coding-cli/resolve-session.ts`): parse input → if index not ready return `{status:'warming', matches:[], hint}` → if no candidates return `{status:'ready', matches:[], hint}` → per candidate (priority order): case-insensitive exact-else-prefix bucket over ALL sessions (all four providers, one flat list from `getProjects().flatMap(g => g.sessions)` — which is Node's POST-deleted-override-filter project groups, `session-indexer.ts:209,1155-1156`; the hint never filters); exact wins wholesale; first candidate with any match short-circuits; sort `lastActivityAt` DESC (missing=0, stable), dedupe by `provider:sessionId` (first survivor = most recent), cap 20. Only if EVERY candidate missed: fallback loop per candidate (BOTH fallbacks bypass the index and its overrides) — (a) `prefixed-id` starting `ses_` → opencode by-id parent-chain WALK (`providers/opencode.ts:239-323`), NOT a bare row read: legacy schema without `parent_id` → EVERY requested id hits with cwd omitted (early return, no row query, no existence check, `opencode.ts:246-250`); modern schema → fetch the row (missing row = miss), keep its `directory` only if TRUTHY (empty string ⇒ cwd omitted, `opencode.ts:265-267,281`), walk `parent_id` with a seen-set — missing parent or cycle ⇒ MISS even though the row exists (`opencode.ts:283-303`, `resolve-session.ts:66`); a hit yields exactly ONE match `{provider:'opencode', sessionId:<token as typed>, cwd?:<the row's OWN directory>, sessionType:'opencode', matchKind:'exact'}` (`cwd` omitted when none collected); (b) `uuid` → claude transcript locator, hit yields exactly ONE match `{provider:'claude', sessionId:<lowercased id>, cwd:<first cwd line>, sessionType:'claude', matchKind:'exact'}`. Nothing found → `{status:'ready', matches:[], hint}`.
 - Index-match metadata (`toMatch`): `{provider, sessionId, cwd: session.cwd ?? session.projectPath, sessionType: session.sessionType, title, firstUserMessage, lastActivityAt, matchKind}` — in Node, `sessionType` comes from a SessionMetadataStore overlay (`session-indexer.ts:1159-1161`) and is usually `undefined`; the client falls back to `sessionType ?? provider`.
 - Flag (`server/platform-router.ts`): `detectFeatureFlags()` returns unconditional `sessionResolve: true`; the client gate is strict `featureFlags?.sessionResolve === true`.
+- Recorded deviations (accepted — none observable under the e2e harness or default config; each line states the direction):
+  - enabledProviders config gate: Node skips providers disabled in `settings.codingCli.enabledProviders` (`session-indexer.ts:1140`); the Rust snapshot has no provider filter — Rust returns a disabled provider's sessions where Node wouldn't.
+  - 256 KiB cwd snippet window: Node's full parse reads a head+tail snippet (`session-indexer.ts:20,228-270`) and permanently excludes a >256 KiB transcript whose only `cwd` line sits mid-file; Rust reads whole files — Rust returns such sessions where Node wouldn't.
+  - Cold-start transient window: right after boot Node's lightweight scan (4 KiB head, top-150 enrichment) can miss sessions until its next full rescan; Rust's `warm()` fully parses before publishing — Rust returns sessions transiently where Node wouldn't.
+  - Tie-order / recency-fallback deltas: among equal `lastActivityAt` the match order and dedupe survivor can differ (Node group-sorted flatMap order vs Rust `lastActivityAt DESC, key() DESC` pre-sort); Node falls back to `createdAt`/mtime for a missing recency value, Rust sorts it as 0 — different ORDER (not membership) on ties.
+  - Claude-locator deltas (Task 4's reuse, per the A6 validation): multi-root scan incl. `CLAUDE_CONFIG_DIR` and one-subdir-deeper layouts — Rust hits (exact match) where Node misses, bug-fix-flavored since the real claude CLI honors `CLAUDE_CONFIG_DIR`; cwd found past Node's 64 KiB read cap — Rust supplies `cwd` where Node omits it; invalid-UTF-8 line before the first cwd line — Node supplies `cwd` where Rust omits it.
+  - Transport: malformed-JSON and JSON-scalar bodies get a zod-shaped JSON 400 from Rust where Express emits an HTML 400 (status parity only); axum's default 2 MB body cap vs Express 1 MB; `PATCH`/`GET /api/sessions/resolve` → 405 on Rust where Express dispatches `:sessionId="resolve"`.
 
 ---
 
@@ -730,7 +738,12 @@ git commit -m "feat(sessions): port resume-input parser to Rust, pinned by share
 
 ### Task 3: Opencode by-id directory lookup
 
-The existing `session_exists_by_id` selects only `1`. The resolve fallback needs the row's `directory` column (the spawn cwd Node returns as `cwd`). Add a sibling helper with identical open/filter semantics.
+The existing `session_exists_by_id` selects only `1` and never walks parents. Node's resolve fallback (`deps.resolveOpencodeSessionIds` → `OpencodeProvider.resolveOpencodeSessionRoots`, `server/coding-cli/providers/opencode.ts:239-323`) is NOT a bare row read — it is a parent-chain WALK with legacy-schema and truthy-directory quirks, all of them wire-observable, so the port replicates them bug for bug:
+
+- LEGACY schema (`session` lacks `parent_id`, detected the same way the listing code detects it): Node returns EARLY (`opencode.ts:246-250`) — every requested id "resolves" as its own root with NO row query at all, so even a NONEXISTENT id is a HIT, and an existing row's `directory` is never read (`cwd` omitted on the wire).
+- MODERN schema: the requested row is fetched (missing row = miss); its own `directory` is kept only if TRUTHY (`opencode.ts:265-267, 281` — empty string ⇒ no cwd); then the `parent_id` chain is walked with a `seen` set (`opencode.ts:283-303`): a missing parent row or a cycle marks the requested id UNRESOLVED (`resolve-session.ts:66` ⇒ MISS) even though the row itself exists and its directory was already collected.
+
+Add a sibling helper with `session_exists_by_id`'s open/error conventions that implements exactly that walk.
 
 **Files:**
 - Modify: `crates/freshell-sessions/src/parse/opencode.rs`
@@ -738,21 +751,26 @@ The existing `session_exists_by_id` selects only `1`. The resolve fallback needs
 - Test: `crates/freshell-sessions/tests/opencode_directory_by_id.rs`
 
 **Interfaces:**
-- Consumes: existing `OpencodeReadError`, `Connection::open_with_flags(READ_ONLY|URI)`, `EXISTENCE_BY_ID_BUSY_TIMEOUT_MS` (all already in `opencode.rs`).
+- Consumes: existing `OpencodeReadError`, `Connection::open_with_flags(READ_ONLY|URI)`, `EXISTENCE_BY_ID_BUSY_TIMEOUT_MS`, and the listing code's `PRAGMA table_info(session)` parent-id detection pattern (all already in `opencode.rs`).
 - Produces (used by Tasks 5–6):
   - `freshell_sessions::parse::opencode_session_directory_by_id(data_home: &Path, session_id: &str) -> Result<Option<OpencodeSessionDirectory>, OpencodeReadError>`
-  - `pub struct OpencodeSessionDirectory { pub directory: Option<String> }` — `Ok(None)` = no row / no DB file; `Ok(Some(..))` = row exists (directory may be NULL for directory-less roots); `Err` = unreadable (callers treat as a resolve miss, never 5xx).
+  - `pub struct OpencodeSessionDirectory { pub directory: Option<String> }` — `Ok(Some(hit))` = Node's walk would resolve the id; `hit.directory` is the requested row's own truthy `directory` (spawn cwd), `None` when it is empty/NULL or on ANY legacy-schema hit. `Ok(None)` = miss (no DB file, no row, orphaned parent chain, or parent cycle). `Err` = unreadable (callers treat as a resolve miss, never 5xx).
 
 - [ ] **Step 1: Write the failing test**
 
 Create `crates/freshell-sessions/tests/opencode_directory_by_id.rs`:
 
 ```rust
-//! SYNC-06 resolve fallback: by-id `directory` (spawn cwd) lookup, mirroring
-//! `server/coding-cli/resolve-session.ts:71-92` (Node reads the sqlite row's
-//! `directory` column — NOT the project root — because opencode resumes in
-//! the SPAWN cwd). Same attach-arm filters as `session_exists_by_id`:
-//! children, directory-less roots, and archived rows all resolve.
+//! SYNC-06 resolve fallback: by-id `directory` (spawn cwd) lookup — a
+//! bug-for-bug port of Node's `resolveOpencodeSessionRoots` walk
+//! (`server/coding-cli/providers/opencode.ts:246-250, 265-267, 281,
+//! 283-303`, consumed by `resolve-session.ts:59-85`):
+//! - LEGACY schema (no `parent_id` column): EVERY requested id HITS with
+//!   `directory: None` — Node's early return does no row query, so even a
+//!   nonexistent id resolves and an existing row's directory is never read;
+//! - MODERN schema: the requested row's OWN `directory` is kept only if
+//!   truthy (empty string ⇒ `None`), then the parent chain is walked — a
+//!   missing parent row or a cycle is a MISS despite the row existing.
 
 use freshell_sessions::parse::{opencode_session_directory_by_id, OpencodeSessionDirectory};
 
@@ -784,37 +802,66 @@ fn seed_schema(data_home: &std::path::Path) -> rusqlite::Connection {
     conn
 }
 
-#[test]
-fn returns_directory_for_child_session_row() {
-    let home = temp_data_home("child");
-    let conn = seed_schema(&home);
+fn seed_legacy_schema(data_home: &std::path::Path) -> rusqlite::Connection {
+    // The pre-`parent_id` opencode schema (identical minus that column).
+    let conn =
+        rusqlite::Connection::open(data_home.join("opencode.db")).expect("open fixture db");
+    conn.execute_batch(
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+            project_id TEXT
+         );",
+    )
+    .expect("create legacy schema");
+    conn
+}
+
+fn insert(conn: &rusqlite::Connection, id: &str, directory: Option<&str>, parent: Option<&str>) {
     conn.execute(
         "INSERT INTO session (id, directory, parent_id) VALUES (?1, ?2, ?3)",
-        rusqlite::params!["ses_child000000000000000000000", "/repo/beta", "ses_root0000000000000000000000"],
+        rusqlite::params![id, directory, parent],
     )
     .expect("insert row");
+}
+
+#[test]
+fn child_hit_returns_the_childs_own_directory() {
+    let home = temp_data_home("child");
+    let conn = seed_schema(&home);
+    insert(&conn, "ses_root0000000000000000000000", Some("/repo/root"), None);
+    insert(
+        &conn,
+        "ses_child000000000000000000000",
+        Some("/repo/child"),
+        Some("ses_root0000000000000000000000"),
+    );
+    // Node collects the REQUESTED row's directory (`opencode.ts:265-267`),
+    // NOT the root's, then walks the chain to prove a root is reachable.
     let hit = opencode_session_directory_by_id(&home, "ses_child000000000000000000000")
         .expect("query ok");
     assert_eq!(
         hit,
         Some(OpencodeSessionDirectory {
-            directory: Some("/repo/beta".to_string())
+            directory: Some("/repo/child".to_string())
         })
     );
 }
 
 #[test]
-fn directory_less_row_still_resolves_with_none_directory() {
-    let home = temp_data_home("dirless");
+fn root_row_hits_with_its_directory() {
+    let home = temp_data_home("root");
     let conn = seed_schema(&home);
-    conn.execute(
-        "INSERT INTO session (id, directory) VALUES (?1, NULL)",
-        rusqlite::params!["ses_dirless0000000000000000000"],
-    )
-    .expect("insert row");
-    let hit = opencode_session_directory_by_id(&home, "ses_dirless0000000000000000000")
+    insert(&conn, "ses_plain000000000000000000000", Some("/repo/plain"), None);
+    let hit = opencode_session_directory_by_id(&home, "ses_plain000000000000000000000")
         .expect("query ok");
-    assert_eq!(hit, Some(OpencodeSessionDirectory { directory: None }));
+    assert_eq!(
+        hit,
+        Some(OpencodeSessionDirectory {
+            directory: Some("/repo/plain".to_string())
+        })
+    );
 }
 
 #[test]
@@ -837,12 +884,99 @@ fn archived_row_still_resolves() {
 }
 
 #[test]
-fn missing_row_is_ok_none() {
+fn missing_row_is_a_miss() {
     let home = temp_data_home("missing");
     let _conn = seed_schema(&home);
     let hit = opencode_session_directory_by_id(&home, "ses_missing0000000000000000000")
         .expect("query ok");
     assert_eq!(hit, None);
+}
+
+#[test]
+fn orphaned_parent_chain_is_a_miss_despite_the_row_existing() {
+    let home = temp_data_home("orphan");
+    let conn = seed_schema(&home);
+    insert(
+        &conn,
+        "ses_orphan00000000000000000000",
+        Some("/repo/orphan"),
+        Some("ses_gone00000000000000000000000"),
+    );
+    // Node's missing-parent guard (`opencode.ts:292-295`) marks the REQUESTED
+    // id unresolved -> `resolve-session.ts:66` -> miss.
+    let hit = opencode_session_directory_by_id(&home, "ses_orphan00000000000000000000")
+        .expect("query ok");
+    assert_eq!(hit, None);
+}
+
+#[test]
+fn parent_cycle_is_a_miss() {
+    let home = temp_data_home("cycle");
+    let conn = seed_schema(&home);
+    insert(
+        &conn,
+        "ses_cyca000000000000000000000a",
+        Some("/repo/cyca"),
+        Some("ses_cycb000000000000000000000b"),
+    );
+    insert(
+        &conn,
+        "ses_cycb000000000000000000000b",
+        Some("/repo/cycb"),
+        Some("ses_cyca000000000000000000000a"),
+    );
+    // Node's seen-set cycle guard (`opencode.ts:287-290`) -> miss.
+    let hit = opencode_session_directory_by_id(&home, "ses_cyca000000000000000000000a")
+        .expect("query ok");
+    assert_eq!(hit, None);
+}
+
+#[test]
+fn empty_string_directory_hits_with_directory_none() {
+    let home = temp_data_home("emptydir");
+    let conn = seed_schema(&home);
+    insert(&conn, "ses_empty000000000000000000000", Some(""), None);
+    // Truthy filter (`opencode.ts:265`): '' is dropped -> Node omits `cwd`.
+    let hit = opencode_session_directory_by_id(&home, "ses_empty000000000000000000000")
+        .expect("query ok");
+    assert_eq!(hit, Some(OpencodeSessionDirectory { directory: None }));
+}
+
+#[test]
+fn null_directory_hits_with_directory_none() {
+    let home = temp_data_home("nulldir");
+    let conn = seed_schema(&home);
+    insert(&conn, "ses_dirless0000000000000000000", None, None);
+    let hit = opencode_session_directory_by_id(&home, "ses_dirless0000000000000000000")
+        .expect("query ok");
+    assert_eq!(hit, Some(OpencodeSessionDirectory { directory: None }));
+}
+
+#[test]
+fn legacy_schema_existing_id_hits_with_directory_none() {
+    let home = temp_data_home("legacy");
+    let conn = seed_legacy_schema(&home);
+    conn.execute(
+        "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+        rusqlite::params!["ses_legacy00000000000000000000", "/repo/legacy"],
+    )
+    .expect("insert row");
+    // Node's early return (`opencode.ts:246-250`) never reads the row: the
+    // directory exists in sqlite but `cwd` is still omitted on the wire.
+    let hit = opencode_session_directory_by_id(&home, "ses_legacy00000000000000000000")
+        .expect("query ok");
+    assert_eq!(hit, Some(OpencodeSessionDirectory { directory: None }));
+}
+
+#[test]
+fn legacy_schema_nonexistent_id_still_hits() {
+    let home = temp_data_home("legacyghost");
+    let _conn = seed_legacy_schema(&home);
+    // Bug-for-bug: Node fabricates a hit with ZERO existence check on the
+    // legacy schema (`opencode.ts:247-250` resolves every requested id).
+    let hit = opencode_session_directory_by_id(&home, "ses_ghostleg000000000000000000")
+        .expect("query ok");
+    assert_eq!(hit, Some(OpencodeSessionDirectory { directory: None }));
 }
 
 #[test]
@@ -867,28 +1001,62 @@ Expected: COMPILE ERROR — `opencode_session_directory_by_id` / `OpencodeSessio
 In `crates/freshell-sessions/src/parse/opencode.rs`, directly AFTER the existing `session_exists_by_id` function, add:
 
 ```rust
-/// A `session` row hit for the resume-resolve by-id fallback.
+/// A resume-resolve by-id fallback HIT: Node's `resolveOpencodeSessionRoots`
+/// walk resolved the requested id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeSessionDirectory {
-    /// The row's `directory` column — the SPAWN cwd opencode resumes in
-    /// (`resolve-session.ts:80-84`: NOT the project root). `None` for a
-    /// directory-less root (real, attachable rows the listing drops).
+    /// The requested row's OWN `directory` column — the SPAWN cwd opencode
+    /// resumes in (`resolve-session.ts:77-84`: NOT the project root) — kept
+    /// only when TRUTHY (`opencode.ts:265-267, 281`). `None` for an empty or
+    /// NULL `directory` and for EVERY legacy-schema hit (Node's early return
+    /// never reads the row). `None` ⇒ the wire match OMITS `cwd`.
     pub directory: Option<String>,
 }
 
-/// Resume-resolve by-id lookup (`server/coding-cli/resolve-session.ts:71-92`
-/// parity): does `<data_home>/opencode.db` hold a `session` row with this id,
-/// and what is its `directory` (spawn cwd)?
+/// One row of the walk: `(directory, parent_id)` for an id, `None` = no row.
+fn fetch_session_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(Option<String>, Option<String>)>, OpencodeReadError> {
+    match conn.query_row(
+        "SELECT directory, parent_id FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    ) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(OpencodeReadError(e.to_string())),
+    }
+}
+
+/// Resume-resolve by-id lookup — a bug-for-bug port of Node's
+/// `OpencodeProvider.resolveOpencodeSessionRoots`
+/// (`server/coding-cli/providers/opencode.ts:239-323`, consumed by
+/// `resolve-session.ts:59-85`). This is deliberately NOT the attach-arm
+/// existence probe: Node walks the `parent_id` chain, and every quirk of
+/// that walk is wire-observable, so all are replicated:
 ///
-/// Mirrors [`session_exists_by_id`]'s attach-arm filters exactly: NO
-/// `parent_id` filter (children resolve), NO `directory` filter, NO
-/// `time_archived` filter (archived rows attach fine). Same read-only open,
-/// same short busy timeout.
+/// - LEGACY schema (`session` lacks `parent_id`, detected with the same
+///   `PRAGMA table_info(session)` probe the listing uses): return a HIT with
+///   `directory: None` for ANY requested id — Node returns early
+///   (`opencode.ts:246-250`) with NO row query and NO existence check, so
+///   even nonexistent ids hit and existing directories are never read.
+/// - MODERN schema: fetch the requested row (missing row ⇒ `Ok(None)`);
+///   keep its OWN `directory` only if non-empty (truthy filter,
+///   `opencode.ts:265-267, 281`); then walk `parent_id` with a `seen` set —
+///   a missing parent row (`opencode.ts:292-295`) or a cycle
+///   (`opencode.ts:287-290`) marks the requested id unresolved ⇒ `Ok(None)`
+///   even though the row exists; reaching a root (`parent_id` NULL) ⇒ HIT.
 ///
-/// - `Ok(None)` for a missing DB file or no matching row;
-/// - `Ok(Some(hit))` when the row exists (`directory` may be `None`);
-/// - `Err` for ANY read failure — the resolve endpoint treats `Err` as a
-///   miss (empty matches), never a 5xx.
+/// Same read-only open and short busy timeout as [`session_exists_by_id`].
+/// `Err` for ANY read failure — the resolve endpoint treats `Err` as a miss
+/// (empty matches), never a 5xx (Node likewise degrades: 3 retries then all
+/// ids unresolved, `opencode.ts:239-322`).
 pub fn opencode_session_directory_by_id(
     data_home: &Path,
     session_id: &str,
@@ -906,15 +1074,53 @@ pub fn opencode_session_directory_by_id(
         EXISTENCE_BY_ID_BUSY_TIMEOUT_MS,
     ))
     .map_err(|e| OpencodeReadError(e.to_string()))?;
-    match conn.query_row(
-        "SELECT directory FROM session WHERE id = ?1",
-        rusqlite::params![session_id],
-        |row| row.get::<_, Option<String>>(0),
-    ) {
-        Ok(directory) => Ok(Some(OpencodeSessionDirectory { directory })),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(OpencodeReadError(e.to_string())),
+
+    // PRAGMA table_info(session) -> hasParentId (same detection as the
+    // listing's `run_opencode_query_inner`).
+    let has_parent_id = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(session)")
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let mut found = false;
+        for name in names {
+            if name.map_err(|e| OpencodeReadError(e.to_string()))? == "parent_id" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_parent_id {
+        // Node's legacy early return (`opencode.ts:246-250`): every requested
+        // id resolves as its own root — no row query, no existence check, no
+        // directory read. Bug-for-bug: nonexistent ids HIT, `cwd` omitted.
+        return Ok(Some(OpencodeSessionDirectory { directory: None }));
     }
+
+    let Some((directory, first_parent)) = fetch_session_row(&conn, session_id)? else {
+        return Ok(None);
+    };
+    // Truthy filter (`opencode.ts:265-267, 281`): empty string ⇒ no cwd.
+    let directory = directory.filter(|d| !d.is_empty());
+
+    // Parent walk (`opencode.ts:283-303`): a missing parent or a cycle marks
+    // the REQUESTED id unresolved (`resolve-session.ts:66`) ⇒ miss, even
+    // though its own row exists and its directory was already collected.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(session_id.to_string());
+    let mut parent = first_parent;
+    while let Some(current) = parent {
+        if !seen.insert(current.clone()) {
+            return Ok(None); // cycle guard (`opencode.ts:287-290`)
+        }
+        match fetch_session_row(&conn, &current)? {
+            None => return Ok(None), // missing parent (`opencode.ts:292-295`)
+            Some((_, next_parent)) => parent = next_parent,
+        }
+    }
+    Ok(Some(OpencodeSessionDirectory { directory }))
 }
 ```
 
@@ -936,7 +1142,7 @@ cargo test -p freshell-sessions --test opencode_directory_by_id
 cargo test -p freshell-sessions --test opencode_exists_by_id
 ```
 
-Expected: 5 passed in the new test; the existing exists-by-id suite still fully green.
+Expected: 11 passed in the new test; the existing exists-by-id suite still fully green.
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -1052,6 +1258,13 @@ to:
 // Keep the rest of claude_snapshot crate-private.
 pub use claude_snapshot::{locate_transcript, transcript_cwd};
 ```
+
+**Recorded deviations (accepted).** Reusing the attach-arm locator (`locate_transcript` + `transcript_cwd`) instead of porting Node's `claude-transcript-locator.ts` carries these deltas (A6 validation). All are production-only — the e2e harness sets `HOME`/`CLAUDE_HOME` and DELETES `CLAUDE_CONFIG_DIR`, collapsing the Rust root list to the single `<home>/.claude` root Node scans — so no in-plan test can trip them, and NO code change is made for them:
+
+- Multi-root scan: Rust honors `CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` > `$HOME/.claude`; Node scans only `(CLAUDE_HOME || ~/.claude)/projects`. Rust returns the exact match where Node returns `matches: []` — bug-fix-flavored, since the real claude CLI honors `CLAUDE_CONFIG_DIR`.
+- One-subdir-deeper layouts (`<project>/<subdir>/<id>.jsonl`): Rust hits, Node misses. (Claude SUBAGENT transcripts live TWO levels down — `<project>/<session-dir>/subagents/` — and are missed by BOTH locators.)
+- cwd window: Node reads only the first 64 KiB (a cwd past the cap, or a first cwd-bearing line straddling the boundary, is dropped); Rust reads the whole file and supplies `cwd` where Node omits it (Rust richer).
+- Invalid-UTF-8 line before the first cwd line: Rust's `BufRead::lines()` stops scanning and yields no cwd; Node's lossy decode keeps scanning and can still find one (Node richer).
 
 - [ ] **Step 4: Run tests — must pass**
 
@@ -1340,6 +1553,39 @@ fn opencode_by_id_fallback_uses_row_directory_as_cwd() {
 }
 
 #[test]
+fn opencode_fallback_hit_without_directory_omits_cwd() {
+    // Legacy-schema and empty-string-directory walk hits carry
+    // `directory: None` (Task 3): the wire match must OMIT `cwd` entirely —
+    // matching Node, where `cwd: undefined` is dropped by `res.json` — not
+    // emit `"cwd": null` or `"cwd": ""`.
+    let unknown = "ses_legacy00000000000000000000";
+    let lookup = |id: &str| {
+        assert_eq!(id, unknown);
+        Some(OpencodeSessionDirectory { directory: None })
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    let response = resolve_resume_input(
+        unknown,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: Some(&lookup),
+            locate_claude_transcript: None,
+        },
+    );
+    assert_eq!(
+        as_json(&response)["matches"],
+        serde_json::json!([{
+            "provider": "opencode",
+            "sessionId": unknown,
+            "sessionType": "opencode",
+            "matchKind": "exact"
+        }])
+    );
+}
+
+#[test]
 fn claude_transcript_fallback_on_exact_id_index_miss() {
     let unknown = "aaaaaaaa-1111-4222-8333-444444444444";
     let locate = |id: &str| {
@@ -1505,16 +1751,24 @@ pub struct ClaudeTranscriptHit {
 /// Dependencies for one resolve call (`ResolveResumeDeps` in
 /// `resolve-session.ts`).
 pub struct ResolveDeps<'a> {
-    /// The flattened session list (Node: `getProjects().flatMap(g => g.sessions)`).
+    /// The flattened session list (Node: `getProjects().flatMap(g => g.sessions)`,
+    /// which is the POST-deleted-override-filter project groups,
+    /// `session-indexer.ts:209,1155-1156`). The slice the Rust server passes is
+    /// likewise the DELETED-FILTERED snapshot (the HTTP layer drops sessions
+    /// whose `"{provider}:{session_id}"` override says `deleted: true` before
+    /// calling in — see `resolve.rs`); this core stays filter-free on purpose.
     /// `None` = the index has never published a snapshot ⇒ `status: "warming"`
     /// (Node's `isIndexReady() === false`).
     pub sessions: Option<&'a [IndexedSession]>,
     /// sessionType overlay keyed `"{provider}:{session_id}"` (Node:
     /// `session-indexer.ts:1159-1161` overlays the SessionMetadataStore).
     pub session_types: &'a HashMap<String, String>,
-    /// opencode `ses_*` exact-id fallback (`resolveOpencodeSessionIds`):
-    /// `Some(hit)` = row exists (its `directory` is the spawn cwd), `None` =
-    /// miss. Read errors are mapped to `None` by the caller — never a 5xx.
+    /// opencode `ses_*` exact-id fallback (`resolveOpencodeSessionIds` →
+    /// Node's by-id parent-walk): `Some(hit)` = the walk resolved the id —
+    /// `hit.directory` is the row's own TRUTHY `directory` (spawn cwd), and
+    /// is `None` for empty/NULL directories and ALL legacy-schema hits (the
+    /// wire match then omits `cwd`). `None` = miss (no row, orphaned chain,
+    /// cycle). Read errors are mapped to `None` by the caller — never a 5xx.
     pub opencode_dir_by_id:
         Option<&'a (dyn Fn(&str) -> Option<OpencodeSessionDirectory> + Send + Sync)>,
     /// claude transcript exact-id fallback (`locateClaudeTranscript`).
@@ -1593,7 +1847,11 @@ pub fn resolve_resume_input(input: &str, deps: &ResolveDeps<'_>) -> ResumeResolv
                             provider: "opencode".to_string(),
                             session_id: candidate.token.clone(),
                             // opencode resumes in the SPAWN cwd (the sqlite
-                            // row's `directory` column), not the project root.
+                            // row's own `directory` column), not the project
+                            // root. `None` (empty-string directory, or any
+                            // legacy-schema hit) serializes with `cwd`
+                            // OMITTED — matching Node, whose `cwd: undefined`
+                            // is dropped by `res.json`.
                             cwd: hit.directory,
                             session_type: Some("opencode".to_string()),
                             title: None,
@@ -1677,7 +1935,7 @@ cargo test -p freshell-sessions --test resume_resolve
 cargo test -p freshell-sessions
 ```
 
-Expected: 14 passed in the new suite; the whole `freshell-sessions` crate green.
+Expected: 15 passed in the new suite; the whole `freshell-sessions` crate green.
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -1700,9 +1958,9 @@ The axum route: auth → zod-shaped validation → readiness gate → resolve co
 - Modify: `crates/freshell-server/src/main.rs` (module registration + wiring)
 
 **Interfaces:**
-- Consumes: `resolve_resume_input`, `ResolveDeps`, `ClaudeTranscriptHit` (Task 5); `OpencodeSessionDirectory` + `opencode_session_directory_by_id` (Task 3); `freshell_freshagent::{locate_transcript, transcript_cwd}` (Task 4); `SessionIndex::{peek, snapshot}`, `crate::boot::{is_authed, unauthorized}`, `SessionMetadataStore::{new, get_all}`.
+- Consumes: `resolve_resume_input`, `ResolveDeps`, `ClaudeTranscriptHit` (Task 5); `OpencodeSessionDirectory` + `opencode_session_directory_by_id` (Task 3); `freshell_freshagent::{locate_transcript, transcript_cwd}` (Task 4); `SessionIndex::{peek, snapshot}` + `IndexedSession::key`, `crate::boot::{is_authed, unauthorized}`, `SessionMetadataStore::{new, get_all}`, `crate::settings_store::SettingsStore` (the SYNC `session_overrides()` read, `settings_store.rs:673-679` — the same overlay source the sidebar's `apply_session_overrides` uses).
 - Produces: `POST /api/sessions/resolve` and:
-  - `pub struct ResolveState { pub auth_token: Arc<String>, pub session_index: Option<Arc<SessionIndex>>, pub session_metadata: SessionMetadataStore, pub opencode_dir_by_id: Option<OpencodeDirLookup>, pub locate_claude_transcript: Option<ClaudeLocator> }`
+  - `pub struct ResolveState { pub auth_token: Arc<String>, pub settings: SettingsStore, pub session_index: Option<Arc<SessionIndex>>, pub session_metadata: SessionMetadataStore, pub opencode_dir_by_id: Option<OpencodeDirLookup>, pub locate_claude_transcript: Option<ClaudeLocator> }`
   - `pub type OpencodeDirLookup = Arc<dyn Fn(&str) -> Option<OpencodeSessionDirectory> + Send + Sync>;`
   - `pub type ClaudeLocator = Arc<dyn Fn(&str) -> Option<ClaudeTranscriptHit> + Send + Sync>;`
   - `pub fn router(state: ResolveState) -> Router`
@@ -1733,10 +1991,31 @@ Create `crates/freshell-server/src/resolve.rs`. Write the WHOLE file in this ste
 //! - auth: same `x-auth-token` / `freshell-auth` cookie check as every other
 //!   `/api` route (`boot::is_authed`), 401 `{"error":"Unauthorized"}`.
 //! - validation: strict body `{ input: string 1..=20000 }` (UTF-16 code
-//!   units, zod semantics); any failure → 400
-//!   `{"error":"Invalid resolve request","details":[zod-shaped issues]}`.
+//!   units); any failure → 400
+//!   `{"error":"Invalid resolve request","details":[issues]}` where the
+//!   issue literals replicate the ACTUAL zod 4.3.6 wire output — field set,
+//!   key ORDER (`expected`/`origin` before `code`; `preserve_order` + `json!`
+//!   insertion order provide it), and message wording, probed against the
+//!   real `ResumeResolveRequestSchema`. NOTHING reads `details` (the client
+//!   dialog treats any non-2xx as request-failed without inspecting the
+//!   body), so this is test-pinned parity; the literals are pinned to zod
+//!   4.3.6 and MUST be re-probed on any zod bump.
+//! - membership: the index snapshot is filtered through `deleted: true`
+//!   session overrides before matching — Node's resolve reads the
+//!   post-filter project groups (`session-indexer.ts:209,1155-1156`) and the
+//!   Rust sidebar applies the same overlay (`session_directory.rs`
+//!   `apply_session_overrides`). The exact-id fallbacks BYPASS the filter,
+//!   as Node's do (`resolve-session.ts:59-103`).
 //! - success is ALWAYS 200 — "not found" is `{status:"ready",matches:[]}`,
 //!   cold index is `{status:"warming",matches:[],hint}` (never 404/5xx).
+//!
+//! Accepted deviations (status parity only, recorded): payloads Express's
+//! strict body parser rejects with an HTML 400 before zod runs (malformed
+//! JSON; JSON scalars string/number/bool/null) get the zod-shaped JSON 400
+//! here; axum's default 2 MB body limit vs express `json({limit:'1mb'})`;
+//! `PATCH`/`GET /api/sessions/resolve` answer 405 on the merged Rust router
+//! where Express would dispatch `:sessionId="resolve"` (unreachable by any
+//! known client).
 //!
 //! Readiness: `SessionIndex::peek()` `None` = never-published = Node's
 //! `isIndexReady() === false`. A machine with no resolvable provider home
@@ -1752,9 +2031,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
-use freshell_sessions::directory_index::SessionIndex;
+use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
 use freshell_sessions::parse::OpencodeSessionDirectory;
 use freshell_sessions::resume_resolve::{
     resolve_resume_input, ClaudeTranscriptHit, ResolveDeps, ResumeResolveResponse,
@@ -1763,13 +2042,16 @@ use freshell_sessions::resume_resolve::{
 
 use crate::boot::{is_authed, unauthorized};
 use crate::session_metadata::SessionMetadataStore;
+use crate::settings_store::SettingsStore;
 
 /// zod `.max(20000)` on `input` (`shared/resume-resolve-contract.ts`).
 const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 
-/// opencode `ses_*` by-id fallback: `Some(hit)` = session row exists (its
-/// `directory` is the spawn cwd), `None` = miss OR unreadable DB (read
-/// errors are a miss here — the endpoint never 5xxes).
+/// opencode `ses_*` by-id fallback: `Some(hit)` = Node's by-id parent-walk
+/// resolved the id (`hit.directory` is the row's own truthy `directory` —
+/// the spawn cwd — and `None` for empty/NULL directories and legacy-schema
+/// hits), `None` = walk miss (no row, orphaned chain, cycle) OR unreadable
+/// DB (read errors are a miss here — the endpoint never 5xxes).
 pub type OpencodeDirLookup = Arc<dyn Fn(&str) -> Option<OpencodeSessionDirectory> + Send + Sync>;
 
 /// claude transcript exact-id fallback: lowercased id + original cwd.
@@ -1779,6 +2061,10 @@ pub type ClaudeLocator = Arc<dyn Fn(&str) -> Option<ClaudeTranscriptHit> + Send 
 #[derive(Clone)]
 pub struct ResolveState {
     pub auth_token: Arc<String>,
+    /// `config.sessionOverrides` reader (`settings_store.rs`): the resolve
+    /// read model drops `deleted: true` sessions exactly like the sidebar's
+    /// `apply_session_overrides` and Node's post-filter `getProjects()`.
+    pub settings: SettingsStore,
     pub session_index: Option<Arc<SessionIndex>>,
     pub session_metadata: SessionMetadataStore,
     pub opencode_dir_by_id: Option<OpencodeDirLookup>,
@@ -1791,65 +2077,94 @@ pub fn router(state: ResolveState) -> Router {
         .with_state(state)
 }
 
+/// zod v4's received-type word for a JSON value.
+fn received_type(value: &Value) -> &'static str {
+    match value {
+        Value::Array(_) => "array",
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Null => "null",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Validate the request body against `ResumeResolveRequestSchema` semantics:
 /// strict object, `input: string`, 1..=20000 UTF-16 code units. Returns the
-/// input on success, or the zod-shaped `details` issue array on failure.
+/// input on success, or the `details` issue array on failure — every literal
+/// (field set, key ORDER, message wording) is the ACTUAL zod 4.3.6 wire
+/// output, probed against the real schema; see the module doc for the
+/// version-fragility and no-consumer notes. `json!` insertion order IS the
+/// serialized key order (workspace-wide `preserve_order`).
 fn validate_resolve_body(body: &Value) -> Result<String, Value> {
     let Value::Object(map) = body else {
+        // zod 4.3.6: `expected` precedes `code`; message carries the
+        // received type: `[1,2]` -> "...received array", `"x"` ->
+        // "...received string", etc.
         return Err(json!([{
-            "code": "invalid_type",
             "expected": "object",
+            "code": "invalid_type",
             "path": [],
-            "message": "Invalid input: expected object"
+            "message": format!("Invalid input: expected object, received {}", received_type(body))
         }]));
     };
     let mut issues: Vec<Value> = Vec::new();
+    // zod emits the shape (`input`) issue BEFORE `unrecognized_keys`
+    // (probed: `{foo:1}` -> [invalid_type(input), unrecognized_keys]).
+    match map.get("input") {
+        Some(Value::String(s)) => {
+            let len = s.encode_utf16().count();
+            if len < 1 {
+                issues.push(json!({
+                    "origin": "string",
+                    "code": "too_small",
+                    "minimum": 1,
+                    "inclusive": true,
+                    "path": ["input"],
+                    "message": "Too small: expected string to have >=1 characters"
+                }));
+            } else if len > RESOLVE_INPUT_MAX_UTF16 {
+                issues.push(json!({
+                    "origin": "string",
+                    "code": "too_big",
+                    "maximum": RESOLVE_INPUT_MAX_UTF16,
+                    "inclusive": true,
+                    "path": ["input"],
+                    "message": "Too big: expected string to have <=20000 characters"
+                }));
+            }
+        }
+        other => {
+            // Missing (`received undefined`) and non-string values both
+            // surface zod's invalid_type, with the actual received type.
+            let received = other.map_or("undefined", received_type);
+            issues.push(json!({
+                "expected": "string",
+                "code": "invalid_type",
+                "path": ["input"],
+                "message": format!("Invalid input: expected string, received {received}")
+            }));
+        }
+    }
     let unknown: Vec<&str> = map
         .keys()
         .map(String::as_str)
         .filter(|k| *k != "input")
         .collect();
     if !unknown.is_empty() {
+        // zod 4.3.6: double-quoted names, singular/plural noun.
         let listed = unknown
             .iter()
-            .map(|k| format!("'{k}'"))
+            .map(|k| format!("\"{k}\""))
             .collect::<Vec<_>>()
             .join(", ");
+        let noun = if unknown.len() == 1 { "key" } else { "keys" };
         issues.push(json!({
             "code": "unrecognized_keys",
             "keys": unknown,
             "path": [],
-            "message": format!("Unrecognized key(s) in object: {listed}")
+            "message": format!("Unrecognized {noun}: {listed}")
         }));
-    }
-    match map.get("input") {
-        Some(Value::String(s)) => {
-            let len = s.encode_utf16().count();
-            if len < 1 {
-                issues.push(json!({
-                    "code": "too_small",
-                    "minimum": 1,
-                    "path": ["input"],
-                    "message": "String must contain at least 1 character(s)"
-                }));
-            } else if len > RESOLVE_INPUT_MAX_UTF16 {
-                issues.push(json!({
-                    "code": "too_big",
-                    "maximum": RESOLVE_INPUT_MAX_UTF16,
-                    "path": ["input"],
-                    "message": "String must contain at most 20000 character(s)"
-                }));
-            }
-        }
-        _ => {
-            // Missing and non-string both surface zod's invalid_type.
-            issues.push(json!({
-                "code": "invalid_type",
-                "expected": "string",
-                "path": ["input"],
-                "message": "Invalid input: expected string"
-            }));
-        }
     }
     if issues.is_empty() {
         Ok(map
@@ -1862,9 +2177,15 @@ fn validate_resolve_body(body: &Value) -> Result<String, Value> {
     }
 }
 
-/// `POST /api/sessions/resolve`. Body taken as raw bytes so a malformed or
-/// absent JSON body degrades to the same 400 path Express's
-/// `req.body ?? {}` + zod produces (never an axum-flavored rejection).
+/// `POST /api/sessions/resolve`. Body taken as raw bytes (never an
+/// axum-flavored rejection): an ABSENT or UNPARSEABLE body becomes `{}` —
+/// the same value Express's `req.body ?? {}` hands zod for an absent body —
+/// so it 400s with the missing-`input` issue. Parsed non-object values
+/// (array/string/number/bool/null) flow to the invalid_type-object branch.
+/// Recorded deviation (module doc): Express's strict body parser answers
+/// malformed JSON and JSON scalars with an HTML 400 before zod ever runs;
+/// this port answers those with the zod-shaped JSON 400 (status parity only
+/// — no consumer reads 400 bodies). Arrays reach zod on both sides.
 async fn resolve_session(
     State(state): State<ResolveState>,
     headers: HeaderMap,
@@ -1873,7 +2194,8 @@ async fn resolve_session(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let parsed: Value =
+        serde_json::from_slice(&body).unwrap_or_else(|_| Value::Object(Map::new()));
     let input = match validate_resolve_body(&parsed) {
         Ok(input) => input,
         Err(details) => {
@@ -1896,6 +2218,32 @@ async fn resolve_session(
         },
         None => None,
     };
+
+    // Deleted-override filter: Node's resolve reads the POST-filter project
+    // groups (`session-indexer.ts:209,1155-1156`) and the Rust sidebar
+    // applies the same overlay (`session_directory.rs`
+    // `apply_session_overrides`) — the resolve read model must agree with
+    // both. Composite key `"{provider}:{session_id}"` ONLY: Node's extra
+    // bare-id/legacy-claude override keys are a pre-existing accepted
+    // divergence (the Rust sidebar does not consult them either). The
+    // exact-id FALLBACKS below intentionally BYPASS this filter — Node's
+    // fallbacks read sqlite/the filesystem directly and never consult
+    // overrides (`resolve-session.ts:59-103`) — bug-for-bug.
+    let snapshot: Option<Vec<IndexedSession>> = snapshot.map(|sessions| {
+        let overrides = state.settings.session_overrides();
+        sessions
+            .iter()
+            .filter(|session| {
+                overrides
+                    .get(&session.key())
+                    .and_then(Value::as_object)
+                    .is_none_or(|ov| {
+                        !ov.get("deleted").and_then(Value::as_bool).unwrap_or(false)
+                    })
+            })
+            .cloned()
+            .collect()
+    });
 
     // sessionType overlay (Node: `session-indexer.ts:1159-1161`), keyed
     // `"{provider}:{session_id}"`. Only needed when we can match at all.
@@ -2019,6 +2367,13 @@ mod tests {
     ) -> super::ResolveState {
         super::ResolveState {
             auth_token: Arc::new("tok".into()),
+            // Isolated home: overrides read/write under `<dir>/.freshell/`,
+            // never the developer's real config (same pattern as the
+            // session_directory router tests).
+            settings: crate::settings_store::SettingsStore::load(
+                Some(dir),
+                vec!["claude".into()],
+            ),
             session_index: index,
             session_metadata: crate::session_metadata::SessionMetadataStore::new(dir),
             opencode_dir_by_id: None,
@@ -2063,27 +2418,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_keys_with_400() {
+    async fn rejects_unknown_keys_with_the_zod_4_3_6_literal() {
+        // `input` valid, two unknown keys: exactly ONE issue, plural noun,
+        // double-quoted names, key order code/keys/path/message.
         let dir = temp_dir("strict");
-        let (status, body) = post(state(&dir, None), serde_json::json!({ "nope": true }), true).await;
+        let (status, body) = post(
+            state(&dir, None),
+            serde_json::json!({ "input": "x", "foo": 1, "bar": 2 }),
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "Invalid resolve request");
-        assert!(body["details"].is_array());
+        assert_eq!(
+            body["details"],
+            serde_json::json!([{
+                "code": "unrecognized_keys",
+                "keys": ["foo", "bar"],
+                "path": [],
+                "message": "Unrecognized keys: \"foo\", \"bar\""
+            }])
+        );
     }
 
     #[tokio::test]
-    async fn rejects_empty_and_missing_and_oversized_input_with_400() {
+    async fn multi_issue_order_is_input_issue_then_unrecognized_keys() {
+        // Probed zod 4.3.6 behavior for `{foo:1}`: the `input` invalid_type
+        // issue comes FIRST, `unrecognized_keys` (singular form) SECOND.
+        let dir = temp_dir("multi");
+        let (status, body) =
+            post(state(&dir, None), serde_json::json!({ "foo": 1 }), true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["details"],
+            serde_json::json!([
+                {
+                    "expected": "string",
+                    "code": "invalid_type",
+                    "path": ["input"],
+                    "message": "Invalid input: expected string, received undefined"
+                },
+                {
+                    "code": "unrecognized_keys",
+                    "keys": ["foo"],
+                    "path": [],
+                    "message": "Unrecognized key: \"foo\""
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn zod_details_literals_match_zod_4_3_6_wire_output() {
+        // One case per failure class; expectations are the EXACT zod 4.3.6
+        // `parsed.error.issues` output probed against the real schema. The
+        // scalar bodies (`null` here) are the recorded deviation: Express's
+        // strict body parser HTML-400s them before zod, Rust answers the
+        // zod-shaped issue for the parsed value instead.
         let dir = temp_dir("bounds");
-        for body in [
-            serde_json::json!({ "input": "" }),
-            serde_json::json!({}),
-            serde_json::json!({ "input": 123 }),
-            serde_json::json!({ "input": "x".repeat(20001) }),
-        ] {
-            let (status, response) = post(state(&dir, None), body, true).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(response["error"], "Invalid resolve request");
+        let cases: Vec<(serde_json::Value, serde_json::Value)> = vec![
+            (
+                serde_json::json!({ "input": "" }),
+                serde_json::json!([{
+                    "origin": "string",
+                    "code": "too_small",
+                    "minimum": 1,
+                    "inclusive": true,
+                    "path": ["input"],
+                    "message": "Too small: expected string to have >=1 characters"
+                }]),
+            ),
+            (
+                serde_json::json!({}),
+                serde_json::json!([{
+                    "expected": "string",
+                    "code": "invalid_type",
+                    "path": ["input"],
+                    "message": "Invalid input: expected string, received undefined"
+                }]),
+            ),
+            (
+                serde_json::json!({ "input": 123 }),
+                serde_json::json!([{
+                    "expected": "string",
+                    "code": "invalid_type",
+                    "path": ["input"],
+                    "message": "Invalid input: expected string, received number"
+                }]),
+            ),
+            (
+                serde_json::json!({ "input": "x".repeat(20001) }),
+                serde_json::json!([{
+                    "origin": "string",
+                    "code": "too_big",
+                    "maximum": 20000,
+                    "inclusive": true,
+                    "path": ["input"],
+                    "message": "Too big: expected string to have <=20000 characters"
+                }]),
+            ),
+            (
+                serde_json::json!([1, 2]),
+                serde_json::json!([{
+                    "expected": "object",
+                    "code": "invalid_type",
+                    "path": [],
+                    "message": "Invalid input: expected object, received array"
+                }]),
+            ),
+            (
+                serde_json::json!(null),
+                serde_json::json!([{
+                    "expected": "object",
+                    "code": "invalid_type",
+                    "path": [],
+                    "message": "Invalid input: expected object, received null"
+                }]),
+            ),
+        ];
+        for (body, details) in cases {
+            let (status, response) = post(state(&dir, None), body.clone(), true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+            assert_eq!(response["error"], "Invalid resolve request", "body {body}");
+            assert_eq!(response["details"], details, "body {body}");
         }
+        // Key ORDER is part of the wire shape (zod v4 emits `expected` /
+        // `origin` BEFORE `code`). `Value` equality is order-insensitive, so
+        // pin one case as a serialized string — `preserve_order` makes the
+        // parsed order round-trip the wire order.
+        let (_, response) =
+            post(state(&dir, None), serde_json::json!({ "input": 123 }), true).await;
+        assert_eq!(
+            serde_json::to_string(&response["details"]).unwrap(),
+            r#"[{"expected":"string","code":"invalid_type","path":["input"],"message":"Invalid input: expected string, received number"}]"#
+        );
     }
 
     #[tokio::test]
@@ -2234,7 +2702,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_json_body_is_a_400_not_a_panic() {
+    async fn deleted_override_hides_the_session_from_resolve() {
+        // Node's resolve reads the post-deleted-filter project groups
+        // (`session-indexer.ts:209,1155-1156`) and the Rust sidebar filters
+        // the same way (`session_directory.rs::apply_session_overrides`) —
+        // the resolve read model must agree with both. Written through the
+        // REAL override write path (`patch_session_override`, the same call
+        // `PATCH /api/sessions/{id}` lands on).
+        let dir = temp_dir("deleted");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{CLAUDE_ID}"),
+                &[("deleted", Some(serde_json::json!(true)))],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_body_degrades_to_the_missing_input_400() {
+        // Express's strict body parser answers malformed JSON with an HTML
+        // 400 before zod runs; this port treats an unparseable body as `{}`
+        // (Node's absent-body `req.body ?? {}`) and answers the zod-shaped
+        // missing-`input` 400 — status parity only, a recorded deviation.
         let dir = temp_dir("badjson");
         let app = super::router(state(&dir, None));
         let request = Request::builder()
@@ -2246,6 +2741,20 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "Invalid resolve request");
+        assert_eq!(
+            body["details"],
+            serde_json::json!([{
+                "expected": "string",
+                "code": "invalid_type",
+                "path": ["input"],
+                "message": "Invalid input: expected string, received undefined"
+            }])
+        );
     }
 }
 ```
@@ -2277,6 +2786,11 @@ Expected on first run: everything compiles and the tests PASS if Step 2 was tran
 ```rust
         .merge(resolve::router(resolve::ResolveState {
             auth_token: Arc::clone(&auth_token),
+            // SYNC-06 deleted-override filter: the SAME settings store the
+            // sidebar overlay (`SessionDirectoryState.settings`) and
+            // `PATCH /api/sessions/{id}` write path use (constructed once
+            // at ~line 196; Clone shares the Arc-backed innards).
+            settings: settings_store.clone(),
             session_index: resolve_session_index,
             // SYNC-06 sessionType overlay: the SAME store `POST
             // /api/session-metadata` writes (Node overlays it in
@@ -2453,6 +2967,15 @@ The checklist's PW-RUST validation. Two coupled edits — doing only one produce
 - Consumes: the Rust endpoint + flag (Tasks 6–7). The spec's `bootResumeScenario(e2eServerKind)` already parameterizes server kind, seeds an isolated HOME with 45 codex `~/.codex/sessions/*.jsonl` fixtures (first line `{type:'session_meta', payload:{id, cwd}}` — indexable by Rust's `CodexSource`, which honors the harness's `CODEX_HOME`), and boots via `createE2eServerHandle`.
 - Produces: 3 tests × 2 projects green — the GATE-01 "no Rust-only skips for a user-visible feature" evidence.
 
+- [ ] **Step 0: Install node deps in the worktree (Playwright precondition)**
+
+The worktree starts with NO `node_modules` and no `dist/client`. Playwright's `globalSetup` builds the client but does NOT install dependencies, and the legacy leg's `fake-app-server.mjs` imports `ws` — so ANY Playwright invocation below (even `--list`) needs deps installed first:
+
+```bash
+cd /home/dan/code/freshell/.worktrees/rust-resolve-parity
+test -d node_modules || npm ci --no-audit --no-fund
+```
+
 - [ ] **Step 1: Delete the skip guard**
 
 In `test/e2e-browser/specs/resume-button.spec.ts`:
@@ -2554,12 +3077,16 @@ Expected: typecheck clean; 31 passed; 14 passed.
 
 - [ ] **Step 3: Checklist evidence entry**
 
-In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, flip SYNC-06 (~line 803) from `- [ ]` to `- [x]` and append the evidence bullets, following the file's `file :: test title — assertion — projects/runs` convention. Substitute the real date, commit sha, and pass counts observed in Steps 1–2 and Task 8:
+Follow the checklist's OWN convention for items with outstanding platform legs: the checkbox stays UNCHECKED (`- [ ]`) and the evidence lands as a `PARTIAL` bullet that names what is green and what is `MISSING`. That is the SYNC-05/SAFE-11 precedent — the file's existing entry (~line 276) reads, verbatim:
+
+> - PARTIAL (2026-07-18): `crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs` (commits edf1e93d, a8d43d9d) boots the real binary, […] proven RED before the fix, green after (including sandboxed runs). MISSING: this is a Rust integration test, not a `PW-RUST`/stress-project Playwright spec — it does not cover […] (that slice is `SYNC-05`, itself only partial).
+
+In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, KEEP the SYNC-06 checkbox (~line 803) as `- [ ]` — the linux Playwright legs are green but the `PW-TAURI-WIN` half of its named validation is outstanding — and rewrite the entry as below, following the `file :: test title — assertion — projects/runs` convention. Substitute the real date, commit sha, and pass counts observed in Steps 1–2 and Task 8:
 
 ```markdown
-- [x] **SYNC-06 — Session resume-by-id parity: `POST /api/sessions/resolve` + `sessionResolve` feature flag.** The Node server (`server/sessions-router.ts`) resolves pasted session ids/resume commands across claude/codex/opencode/amplifier and gates the sidebar Resume button via the `sessionResolve` flag in `detectFeatureFlags()`; the Rust server intentionally omits the flag (button stays hidden) until it implements the endpoint. See `docs/plans/2026-07-29-resume-session-button.md`.
+- [ ] **SYNC-06 — Session resume-by-id parity: `POST /api/sessions/resolve` + `sessionResolve` feature flag.** The Node server (`server/sessions-router.ts`) resolves pasted session ids/resume commands across claude/codex/opencode/amplifier and gates the sidebar Resume button via the `sessionResolve` flag in `detectFeatureFlags()`. See `docs/plans/2026-07-29-resume-session-button.md`.
   - **Playwright validation (`PW-RUST`, `PW-TAURI-WIN`):** With the flag declared, the sidebar shows the pinned Resume button; pasting a known session id resumes it in a tab (mirror `test/e2e-browser/specs/resume-button.spec.ts`).
-  - EVIDENCE (<date>, commit `<sha>`): Rust endpoint `crates/freshell-server/src/resolve.rs` (`POST /api/sessions/resolve`: auth/400-validation/warming/exact/prefix/cap-20/dedupe/opencode+claude exact-id fallbacks) + `crates/freshell-sessions/{resume_input.rs,resume_resolve.rs}`; flag declared in `build_platform_payload` (`main.rs`). Cross-language anti-drift: `test/fixtures/resume-input/parser-cases.json` (30 cases) consumed by BOTH `test/unit/shared/resume-input-parser.test.ts` (31 passed) and `crates/freshell-sessions/tests/resume_input_parser_parity.rs` (green). Logic parity: `crates/freshell-sessions/tests/resume_resolve.rs` mirrors `test/integration/server/sessions-resolve-router.test.ts` (14 passed, unchanged). `cargo test --workspace`: <counts> passed, 0 failed; `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean. E2E: `test/e2e-browser/specs/resume-button.spec.ts` moved into `MATRIX_SPECS` with the legacy-only skip guard DELETED — all 3 tests (pinned visibility at scroll, fullWidth mobile visibility, paste-then-Enter real resume with argv proof) green on BOTH projects (legacy-chromium and rust-chromium), 2 runs each. MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half of the validation remains explicitly out of scope, as prior entries do (SYNC-05 precedent) — left to dependent tickets.
+  - PARTIAL (<date>, commit `<sha>`): Rust endpoint `crates/freshell-server/src/resolve.rs` (`POST /api/sessions/resolve`: auth/400-validation pinned to zod 4.3.6 wire literals/warming/exact/prefix/cap-20/dedupe/deleted-override filter/opencode-walk+claude exact-id fallbacks) + `crates/freshell-sessions/{resume_input.rs,resume_resolve.rs}`; flag declared in `build_platform_payload` (`main.rs`). Cross-language anti-drift: `test/fixtures/resume-input/parser-cases.json` (30 cases) consumed by BOTH `test/unit/shared/resume-input-parser.test.ts` (31 passed) and `crates/freshell-sessions/tests/resume_input_parser_parity.rs` (green). Logic parity: `crates/freshell-sessions/tests/resume_resolve.rs` mirrors `test/integration/server/sessions-resolve-router.test.ts` (14 passed, unchanged). `cargo test --workspace`: <counts> passed, 0 failed; `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean. E2E (`PW-RUST` half): `test/e2e-browser/specs/resume-button.spec.ts` moved into `MATRIX_SPECS` with the legacy-only skip guard DELETED — all 3 tests (pinned visibility at scroll, fullWidth mobile visibility, paste-then-Enter real resume with argv proof) green on BOTH projects (legacy-chromium and rust-chromium), 2 runs each. MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half of the named validation — left to dependent tickets, per the SYNC-05/SAFE-11 PARTIAL convention.
 ```
 
 - [ ] **Step 4: Final commit**
@@ -2576,10 +3103,12 @@ Expected: the branch carries one focused commit per task (≈10). Do NOT push/PR
 
 ## Self-Review Record
 
-**1. Spec coverage.** R1 endpoint parity → Task 6 (same path, same auth helper as all Rust API routes, zod-shaped strict validation with the exact 400 body, always-200 semantics). R2 parser parity + shared fixtures → Tasks 1–2 (one committed JSON table, both suites consume it). R3 matching parity (four providers, exact+prefix, most-recent-first, cap 20, matchKind) → Task 5 (+ HTTP-level pins in Task 6). R4 fallback parity → Tasks 3–4 reuse/extend the existing Rust machinery (opencode by-id sqlite gains a directory-returning sibling; the existing claude `locate_transcript` gains its already-written cwd companion via export) — nothing was found impractical, so no recorded deviation is needed. R5 metadata parity → Task 5 `to_match` + the sessionType overlay from the metadata store (Task 6 Step 1 un-gates the read; Node's overlay source is the same store, and absence is the normal case on both servers — the client falls back to `sessionType ?? provider`). R6 warming parity → Task 5/6 (peek-gated; hint still populated; `session_index: None` also warms, documented). R7 feature flag, ungated → Task 7. R8 checklist update with PW-TAURI-WIN out-of-scope note → Task 9. Verification section: Rust tests mirroring the Node suite (Task 5 + Task 6 tests), clippy/fmt (Tasks 2–9), cross-language fixtures (Tasks 1–2), e2e on both projects with guard removal + MATRIX_SPECS registration (Task 8), client suite untouched (comment-only TS changes; typecheck + the two vitest files re-run in Task 9).
+**1. Spec coverage.** R1 endpoint parity → Task 6 (same path, same auth helper as all Rust API routes, zod-shaped strict validation with the exact 400 body, always-200 semantics). R2 parser parity + shared fixtures → Tasks 1–2 (one committed JSON table, both suites consume it). R3 matching parity (four providers, exact+prefix, most-recent-first, cap 20, matchKind) → Task 5 (+ HTTP-level pins in Task 6). R4 fallback parity → Task 3 ports Node's opencode by-id parent-walk bug for bug (legacy early hit, truthy-directory filter, orphan/cycle miss); Task 4 reuses the existing claude `locate_transcript` + its already-written cwd companion via export, with the locator's known deltas RECORDED as accepted deviations (Task 4 note + Parity Reference list) rather than claimed as parity. R5 metadata parity → Task 5 `to_match` + the sessionType overlay from the metadata store (Task 6 Step 1 un-gates the read; Node's overlay source is the same store, and absence is the normal case on both servers — the client falls back to `sessionType ?? provider`). R6 warming parity → Task 5/6 (peek-gated; hint still populated; `session_index: None` also warms, documented). R7 feature flag, ungated → Task 7. R8 checklist update with PW-TAURI-WIN out-of-scope note → Task 9. Verification section: Rust tests mirroring the Node suite (Task 5 + Task 6 tests), clippy/fmt (Tasks 2–9), cross-language fixtures (Tasks 1–2), e2e on both projects with guard removal + MATRIX_SPECS registration (Task 8), client suite untouched (comment-only TS changes; typecheck + the two vitest files re-run in Task 9).
 
 **1b. No silent deferrals.** Every requirement lands as production behavior proven by an observable outcome: the e2e paste-then-Enter test spawns a REAL CLI with `resume <id>` argv against the REAL Rust server binary (no stub); fallback closures in production wiring call the real sqlite/filesystem code (test doubles appear only inside unit tests, with the production path covered by Task 3/4's direct tests + Task 8's e2e). The single intentional error-path divergence (Rust answers ready-empty where Express would 500 on a thrown dependency) is recorded in code comments (Task 5/6) and follows the Rust port's existing never-5xx convention; it is unobservable by the client's happy path and untested on the Node side.
 
 **2. Placeholder scan.** No TBDs; every code step carries complete code; commands carry expected outputs. Two deliberate "verbatim-context" dependencies remain (main.rs line numbers drift; the implementer anchors on the quoted surrounding code, which is provided), and Task 9's evidence entry contains `<date>/<sha>/<counts>` placeholders that are explicitly instructed to be substituted with observed values — they cannot be known at plan time.
 
 **3. Type consistency.** `ResumeCandidateKind/{PrefixedId,Uuid,HexPrefix}`, `ResumeHint{provider,source}` (Task 2) are consumed with those exact names in Tasks 5–6. `OpencodeSessionDirectory{directory}` (Task 3) is the closure payload in Tasks 5–6. `ClaudeTranscriptHit{session_id,cwd}` (Task 5) is constructed in Task 6's wiring and tests. `ResolveDeps` field names/borrow shapes match between definition (Task 5) and use (Task 6: `as_deref()` against `Arc<dyn Fn ... + Send + Sync>` matches the `&(dyn Fn ... + Send + Sync)` field type). `RESOLVE_MATCH_CAP` is defined once (Task 5) and asserted in tests. `SessionMetadataStore::new(dir)` appends `session-metadata.json` — Task 6's overlay test writes that exact filename into the dir it passes.
+
+**4. Load-bearing-assumption revision (2026-07-29).** A validation pass falsified four assumptions; this plan was revised accordingly and the self-review items above were re-applied to every edited task. A2 (V2-zod-truth): Task 6's 400 `details` literals were zod v3 wording — rewritten to the probed zod 4.3.6 wire output (received-type message suffixes via a `received_type` helper, `origin`/`inclusive` fields, double-quoted singular/plural `Unrecognized key(s)` form, `expected`/`origin`-before-`code` key order pinned by a serialized-string test, input-issue-before-`unrecognized_keys` array order pinned by a new multi-issue test), the body parse-failure path now degrades to `{}` (Node's absent-body `req.body ?? {}`) instead of `Null`, and the Global Constraints/module doc now record that NO consumer reads `details`, that the literals are zod-4.3.6-version-fragile (re-probe on bumps), and the accepted Express-HTML-400 / body-limit / 405-method deviations. A3 (V3-opencode-sqlite): Task 3's bare `SELECT directory` diverged from Node on 4 of 9 executed variants (D1-D4) — replaced with a bug-for-bug port of `resolveOpencodeSessionRoots` (legacy-schema early HIT with no existence check, truthy-directory filter, orphan/cycle ⇒ miss via a seen-set parent walk) plus an 11-case fixture suite covering every probed variant; Task 5's fallback docs and a new omitted-`cwd` test cover the `directory: None` hit. A4 + A14 (V4-semantics-diff, V7-deleted-overrides): the raw-snapshot membership claim was falsified — the Task 6 handler now drops `deleted`-overridden sessions via the SYNC `SettingsStore::session_overrides()` read (composite-key-only, matching Node's post-filter `getProjects()` AND the Rust sidebar's own `apply_session_overrides`; the exact-id fallbacks bypass the filter as Node's do, per comment), with `ResolveState.settings` wired from the same `settings_store.clone()` pattern as `SessionDirectoryState` and pinned by a new handler test; the remaining membership/ordering/locator deltas (enabledProviders gate, 256 KiB snippet window, cold-start window, tie-order/recency, A6 claude-locator deltas) are recorded as accepted deviations in the Parity Reference and Task 4 rather than silently claimed as parity. Also folded in: V1's 405-method note, V1's warmed-empty-index note (already honored — warming tests keep `session_index: None`), and Task 8's `npm ci` precondition (the worktree ships without `node_modules`; Playwright's globalSetup builds but does not install).
