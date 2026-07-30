@@ -70,21 +70,37 @@ The production self-hosted Freshell is the Rust server (`target/release/freshell
 **Canonical launcher: `scripts/launch-rust.sh`** — use this instead of hand-rolled build/launch commands:
 
 ```bash
-scripts/launch-rust.sh                 # build client + Rust server, start on port 3002
-scripts/launch-rust.sh --port 3499     # any other port (e.g. testing from a worktree)
-scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart needed)
-scripts/launch-rust.sh --skip-build    # start without rebuilding
-scripts/launch-rust.sh --restart       # stop the pid-file-verified instance, then start
-scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
+scripts/launch-rust.sh --client-only             # select a compatible client; do not restart
+scripts/launch-rust.sh --server-only --restart   # replace only the server
+scripts/launch-rust.sh --restart                 # replace client and server together
+scripts/launch-rust.sh --skip-build              # start the selected generation only if stopped
+scripts/launch-rust.sh --skip-build --restart    # restart the exact selected generation
+scripts/launch-rust.sh --stop                    # stop the receipt-verified current process
+# Add --port 3499 (or another non-production port) for worktree testing.
 ```
 
 Key facts:
 
-- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart** (and therefore without needing "APPROVED"). Server-side (Rust) changes DO require a restart.
-- **Restarting the live 3002 server still requires the user's explicit "APPROVED"** — `--restart`/`--stop` exist for approved deploys and for scratch instances on other ports, not as a license to bounce production.
-- The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
+- Client and server component versions are independent. Different versions are normal, but the selected client's declared server range and the server's declared client range must both accept the pair.
+- `--client-only` builds and selects a compatible immutable client generation without restarting the server. Hard-refresh the browser to load it.
+- `--server-only --restart` retains the selected client and replaces only the server closure. `--restart` builds and replaces both components.
+- Server candidates are shadow-tested before the running process is interrupted. An incompatible update stops before replacement or selection changes.
+- If a candidate fails before durable activation, the controller restores the exact recorded prior generation. If recovery begins after the target durably activated, it completes that exact target instead of rolling back.
+- Plain `--skip-build` never restarts an already-running server. `--skip-build --restart` restarts the exact selected immutable generation without rebuilding it.
+- The first adoption of a listener that predates the deployment store requires one combined approved `--restart`; one-sided updates are unavailable until that bootstrap succeeds.
+- **Any restart or stop of live port 3002 still requires the user's exact approval word `APPROVED`.** The compatibility checks do not replace that approval.
+- Before an approved live server-only or combined restart, capture browser continuity and require exit 0:
+
+  ```bash
+  scripts/deploy-tab-diff.sh capture --url <url> --token <token> --out /tmp/freshell-tabs-before.json
+  scripts/launch-rust.sh --server-only --restart   # or --restart
+  scripts/deploy-tab-diff.sh verify --url <url> --token <token> --before /tmp/freshell-tabs-before.json
+  ```
+
+  Capture exit 4 means a running terminal is absent from every persisted open-tab snapshot. Repair that coverage or explicitly decide how to handle the loss; do not bypass the gate during the normal deploy ritual.
+- The Rust controller owns immutable generations, exact process/socket identity checks, durable transaction evidence, rollback, and recovery. It refuses foreign port ownership rather than guessing which process to signal.
 - The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
-- The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
+- The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use the selected generation's server log to check what is running.
 - Health check: `curl http://127.0.0.1:<port>/api/health` (unauthenticated, rate-limit exempt).
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
