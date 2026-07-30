@@ -1022,3 +1022,82 @@ fn rebind_to_the_same_identity_is_not_a_supersession() {
     assert_eq!(row.retired_reason, None);
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn retire_missing_marks_bound_row_session_missing() {
+    // Setup: a ledger with a Bound binding for ("amplifier", "stale-sid")
+    let root = temp_root("retire-missing");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("amplifier", "stale-sid", "t1", 1_000))
+        .unwrap();
+
+    // Act: retire the binding as missing
+    let retired = ledger.retire_missing("amplifier", "stale-sid");
+
+    // Assert: retirement succeeded
+    assert!(retired);
+    let row = ledger.load_binding("amplifier", "stale-sid").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::SessionMissing));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn retire_missing_is_noop_without_binding() {
+    // Fresh ledger, no rows.
+    let root = temp_root("retire-missing-noop");
+    let ledger = PaneLedger::new(Some(root.clone()));
+
+    // Act: try to retire a non-existent binding
+    let retired = ledger.retire_missing("amplifier", "never-seen");
+
+    // Assert: no-op returns false
+    assert!(!retired);
+    // Verify no row was created
+    assert_eq!(ledger.load_binding("amplifier", "never-seen"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn retire_missing_does_not_reretire() {
+    // Bound row retired once => true; second call => false; reason stays
+    // SessionMissing; updated_at from the first retire is not clobbered
+    // by the failed second call.
+    let root = temp_root("retire-missing-reretire");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("amplifier", "sid", "t1", 1_000))
+        .unwrap();
+
+    // First retire should succeed
+    let first = ledger.retire_missing("amplifier", "sid");
+    assert!(first);
+    let row_after_first = ledger.load_binding("amplifier", "sid").unwrap();
+    let first_updated_at = row_after_first.updated_at;
+    assert_eq!(row_after_first.state, RowState::Retired);
+    assert_eq!(row_after_first.retired_reason, Some(RetiredReason::SessionMissing));
+
+    // Second retire should fail (already retired)
+    let second = ledger.retire_missing("amplifier", "sid");
+    assert!(!second);
+    let row_after_second = ledger.load_binding("amplifier", "sid").unwrap();
+    assert_eq!(row_after_second.state, RowState::Retired);
+    assert_eq!(row_after_second.retired_reason, Some(RetiredReason::SessionMissing));
+    // Verify updated_at was not clobbered
+    assert_eq!(row_after_second.updated_at, first_updated_at);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn session_missing_serde_round_trips() {
+    // Test serialization
+    let reason = RetiredReason::SessionMissing;
+    let json = serde_json::to_string(&reason).expect("serialize");
+    assert_eq!(json, r#""session_missing""#);
+
+    // Test deserialization
+    let deserialized: RetiredReason =
+        serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(deserialized, RetiredReason::SessionMissing);
+}

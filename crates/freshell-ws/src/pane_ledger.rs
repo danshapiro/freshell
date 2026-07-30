@@ -85,6 +85,7 @@ pub enum RetiredReason {
     Superseded,
     Closed,
     GcExpired,
+    SessionMissing,
 }
 
 /// A durable identity fact — see the module doc for the schema contract.
@@ -584,6 +585,31 @@ impl PaneLedger {
         row.retired_reason = Some(RetiredReason::Closed);
         row.updated_at = now_ms;
         self.write_binding(root, &mut index, &row)
+    }
+
+    /// Retire a Bound row as SessionMissing (session file not found on disk).
+    /// Returns true iff a Bound row was successfully retired; false if the row
+    /// does not exist or is already retired (idempotent).
+    pub fn retire_missing(&self, provider: &str, session_id: &str) -> bool {
+        let Some(root) = &self.root else {
+            return false;
+        };
+        let now_ms = crate::terminal::now_ms();
+        let mut index = self.guard();
+        let Some(mut row) = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
+        else {
+            return false;
+        };
+        if row.state != RowState::Bound {
+            return false;
+        }
+        row.state = RowState::Retired;
+        row.retired_reason = Some(RetiredReason::SessionMissing);
+        row.updated_at = now_ms;
+        self.write_binding(root, &mut index, &row).is_ok()
     }
 
     /// Hard-delete one binding row (file first, then index — the mirror of
