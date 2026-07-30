@@ -1455,6 +1455,7 @@ pub(crate) async fn handle_create(
                     terminal_id: existing.clone(),
                     clear_codex_durability: None,
                     cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
+                    notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
                 });
@@ -1519,6 +1520,7 @@ pub(crate) async fn handle_create(
                             terminal_id: terminal_id.clone(),
                             clear_codex_durability: None,
                             cwd: state.registry.probe(&terminal_id).and_then(|row| row.cwd),
+                            notice: None,
                             restore_error: None,
                             session_ref: state
                                 .identity
@@ -2610,6 +2612,7 @@ pub(crate) async fn handle_create(
         clear_codex_durability: None,
         // Echo the resolved cwd (`record.cwd`) when the shell spec carries one.
         cwd: spec.cwd.clone(),
+        notice: None,
         restore_error: None,
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).

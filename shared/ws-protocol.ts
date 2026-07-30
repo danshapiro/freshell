@@ -738,6 +738,8 @@ export type TerminalCreatedMessage = {
   sessionRef?: SessionLocator
   clearCodexDurability?: boolean
   restoreError?: RestoreError
+  /** Resume-validation: operator-visible notice set when the server dropped a stale resume id and spawned fresh. The client writes it into the pane's xterm. Additive; Node never sets it. */
+  notice?: string
 }
 
 export type TerminalAttachReadyMessage = {

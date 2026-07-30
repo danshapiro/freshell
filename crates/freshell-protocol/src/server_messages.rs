@@ -967,6 +967,11 @@ pub struct TerminalCreated {
     pub clear_codex_durability: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Resume-validation feature: operator-visible notice set when the server
+    /// dropped a stale resume id and spawned fresh. The client writes it into
+    /// the pane's xterm. Optional/additive — Node never sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]

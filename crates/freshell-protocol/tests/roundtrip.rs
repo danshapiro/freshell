@@ -522,3 +522,56 @@ fn terminal_auto_resume_cancel_roundtrips() {
     }
     assert_eq!(serde_json::to_value(&msg).unwrap(), json);
 }
+
+#[test]
+fn terminal_created_notice_is_optional_and_additive() {
+    // Absent => key omitted (wire-compatible with the frozen client).
+    let created = TerminalCreated {
+        created_at: 1_700_000_000_000,
+        request_id: "req-1".into(),
+        terminal_id: "t1".into(),
+        clear_codex_durability: None,
+        cwd: None,
+        restore_error: None,
+        session_ref: None,
+        notice: None,
+    };
+    let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
+    assert!(json.get("notice").is_none());
+
+    // Present => serialized verbatim.
+    let mut with_notice = created;
+    with_notice.notice = Some(
+        "Saved amplifier session X could not be found on disk — started a fresh session instead."
+            .to_string(),
+    );
+    let json = serde_json::to_value(ServerMessage::TerminalCreated(with_notice)).unwrap();
+    assert_eq!(
+        json["notice"],
+        "Saved amplifier session X could not be found on disk — started a fresh session instead."
+    );
+}
+
+#[test]
+fn terminal_created_roundtrips_with_and_without_notice() {
+    // Base shape: notice omitted — byte-identical to today's frame on the wire.
+    let base = r#"{"type":"terminal.created","createdAt":1700000000000,"requestId":"req-1","terminalId":"t1"}"#;
+    match server_roundtrip(base, "terminal.created") {
+        ServerMessage::TerminalCreated(created) => {
+            assert_eq!(created.notice, None);
+        }
+        other => panic!("expected TerminalCreated, got {other:?}"),
+    }
+    // Resume-validation shape: the fresh-spawn notice must conform to the
+    // frozen contract too.
+    let with_notice = r#"{"type":"terminal.created","createdAt":1700000000000,"requestId":"req-1","terminalId":"t1","notice":"Saved amplifier session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 could not be found on disk — started a fresh session instead."}"#;
+    match server_roundtrip(with_notice, "terminal.created") {
+        ServerMessage::TerminalCreated(created) => {
+            assert_eq!(
+                created.notice.as_deref(),
+                Some("Saved amplifier session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 could not be found on disk — started a fresh session instead.")
+            );
+        }
+        other => panic!("expected TerminalCreated, got {other:?}"),
+    }
+}

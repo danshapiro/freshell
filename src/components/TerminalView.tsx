@@ -4260,6 +4260,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const createdSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
           const createdCwd = typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined
           const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
+          // Resume-validation: a notice means the server dropped a stale
+          // resume id and spawned fresh (never built on terminal.status.reason).
+          const createdNotice = typeof msg.notice === 'string' && msg.notice ? msg.notice : undefined
           terminalIdRef.current = newId
           // Ledger A2: remember the acquired tid so the terminal.input.blocked
           // backstop still matches after a recovery path clears terminalIdRef.
@@ -4270,6 +4273,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             streamId: undefined,
             status: 'running',
             ...(createdCwd && !contentRef.current?.initialCwd ? { initialCwd: createdCwd } : {}),
+            // Resume-validation: the notice names a stale resume id the server
+            // dropped — clear the persisted refs so codex/opencode gate-fired
+            // spawns (whose created frame carries NO sessionRef) don't re-fire
+            // the gate on every restart. When the frame also carries a
+            // sessionRef, the association fold below wins.
+            ...(createdNotice ? { sessionRef: undefined, resumeSessionId: undefined } : {}),
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
@@ -4329,6 +4338,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             registerForBackgroundHydration({ queueIfStarted: true })
           } else {
             attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
+          }
+          // Resume-validation notice: the server dropped a stale resume id and
+          // spawned fresh — surface it in the pane, same write mechanism as
+          // the reconcile notice below.
+          if (createdNotice) {
+            writeLocalXtermNotice(term, `\r\n${createdNotice}\r\n`)
           }
           // One-shot reconcile notice (respawn/fresh verdicts): render it now
           // that the pane anchored, then clear it from the store.
