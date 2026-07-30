@@ -48,8 +48,9 @@ Ground truth gathered by three independent investigations of the worktree and
 main. An implementer should trust-but-spot-check line numbers (they drift);
 the structural facts are load-bearing.
 
-**The branch** (17 commits `0d877c1f2..f9b8aa33f`, forked from `ca1a60d3`,
-+5648/−83 across 26 files):
+**The branch** (18 commits `0d877c1f2..948e52b5f`, forked from `ca1a60d3`,
++5648/−83 across 26 code files; the tip `948e52b5f` is the docs-only commit
+adding this plan):
 
 - Door 1 (WS `terminal.create` restore): `crates/freshell-ws/src/terminal.rs:1799–1885` inside `handle_create` (@1412), keyed on `resume_id_from_wire`; must sit AFTER the D7 liveness guard and BEFORE the amplifier `ensure_session` re-stub. Emits `notice:` on the `TerminalCreated` frame (~:2704).
 - Door 2 (auto-resume respawn): `terminal.rs:2810–2884` inside `respawn_agent_terminal` (@2779); replaces the locals so post-spawn bookkeeping records the fresh id; rekeys `ensure_session` from `req.session_id` to the gate-validated local (:3005–3024). No `notice` — broadcasts `terminal.status{Recovering, reason}`.
@@ -72,7 +73,9 @@ the structural facts are load-bearing.
 - `resolve_coding_cli_command` remains the SOLE resume-argv constructor, called only behind the three doors — the branch's door model still holds.
 
 **Conflict surface** (from a real `rebase --onto` trial in a throwaway clone —
-13/17 commits replay clean):
+13/17 commits replay clean — re-validated 2026-07-30 by a second full rebase
+executed per THIS plan's rules: post-fold 15/17 replayed clean, stops only at
+the two predicted commits, and main.rs auto-merged at stop 2):
 
 | Replay commit | Conflicts in | Character |
 |---|---|---|
@@ -130,10 +133,10 @@ git status --short            # MUST be empty; halt if not
 git fetch origin
 git rev-parse origin/main     # MUST print 39010cb57... ; halt if not
 git branch backup/resume-validation-pre-rebase-2026-07-30
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 17
+git log --oneline ca1a60d3..HEAD | wc -l   # expect 18 (17 feature commits + the docs-only plan commit 948e52b5f at the tip)
 ```
 
-Expected: clean tree, `39010cb57…`, `17`. If `origin/main` moved past
+Expected: clean tree, `39010cb57…`, `18`. If `origin/main` moved past
 `39010cb57`, STOP and surface it — the spec pins this exact target.
 
 - [ ] **Step 2: Confirm the fmt-sweep commit is adjacent to its parent**
@@ -157,7 +160,7 @@ fixup discards only the `style:` message; its content survives inside #14.
 
 ```bash
 GIT_SEQUENCE_EDITOR='sed -i "s/^pick 2b5f46c6e/fixup 2b5f46c6e/"' git rebase -i ca1a60d3
-git log --oneline ca1a60d3..HEAD | wc -l   # expect 16
+git log --oneline ca1a60d3..HEAD | wc -l   # expect 17
 ```
 
 Expected: rebase completes with no conflicts (pure history rewrite of adjacent
@@ -168,12 +171,17 @@ Step 4 without folding, resolving #15's fmt conflicts during replay by running
 - [ ] **Step 4: Start the rebase onto main**
 
 ```bash
-git rebase origin/main
+GIT_EDITOR=true git rebase origin/main
 ```
 
+(`GIT_EDITOR=true` keeps every `git rebase --continue` non-interactive — use
+it on the continues too.)
+
 Expected: replays commits until the first stop. Two stops are expected:
-`65c938aad` (roundtrip.rs) and `777eb7542` (lib.rs + terminal_tabs.rs +
-main.rs). If any OTHER commit stops, resolve by the same precedence rule
+`65c938aad` (roundtrip.rs) and `777eb7542` (lib.rs + terminal_tabs.rs, and
+POSSIBLY main.rs — in the 2026-07-30 validation rebase main.rs auto-merged
+correctly, so stop 2 may show 2 or 3 conflicted files; either way verify
+main.rs content per Step 6(b)). If any OTHER commit stops, resolve by the same precedence rule
 (main's S5/#582/#584 semantics + branch's gate semantics, both preserved) and
 record what happened for the commit message in Step 9.
 
@@ -193,7 +201,7 @@ examples are at `roundtrip.rs:494–501`). Then:
 ```bash
 cargo test -p freshell-protocol --test roundtrip
 git add crates/freshell-protocol/tests/roundtrip.rs
-git rebase --continue
+GIT_EDITOR=true git rebase --continue
 ```
 
 Expected: all roundtrip tests pass before continuing.
@@ -206,7 +214,10 @@ main's `with_pane_identity_binder` AND the branch's `with_resume_probe`,
 `with_session_identity`. The struct fields and `Default` impl auto-merged with
 all four present — verify they did.
 
-**(b) `crates/freshell-server/src/main.rs`** — take the branch's hoist of the
+**(b) `crates/freshell-server/src/main.rs`** — NOTE: in the 2026-07-30
+validation rebase this file AUTO-MERGED correctly; if it did not conflict,
+still open it and verify the merged result matches this rule before
+continuing. Take the branch's hoist of the
 probe construction (`session_existence` built in a `let` BEFORE the `WsState`
 literal) and re-insert main's field into the literal:
 
@@ -230,7 +241,10 @@ uses — read main's version of the region first with
 `git show 39010cb57:crates/freshell-freshagent/src/terminal_tabs.rs | sed -n '850,1000p'`):
 
 ```rust
-// 1. MAIN's identity derivation, verbatim (3-tuple + locator flag):
+// 1. MAIN's identity derivation, verbatim (3-tuple + locator flag).
+//    KEEP `mut` on accepted_session_ref — the branch's gate block clears it
+//    on SpawnFresh (the 2026-07-30 validation rebase confirmed the merged
+//    binding needs `mut accepted_session_ref` to compile):
 let (mut resume_session_id, mut accepted_session_ref, session_ref_locator_present) =
     derive_resume_identity(/* main's args, verbatim */);
 
@@ -272,13 +286,19 @@ this task; just make both sides' code coexist and compile.)
 Then:
 
 ```bash
-cargo check -p freshell-freshagent -p freshell-server
+cargo check -p freshell-freshagent
 git add crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/terminal_tabs.rs crates/freshell-server/src/main.rs
-git rebase --continue
+GIT_EDITOR=true git rebase --continue
 ```
 
-Expected: rebase runs to completion (remaining commits replay clean; the trial
-showed 15/16/17 clean after this resolution).
+(Do NOT gate this stop on `cargo check -p freshell-server`: mid-rebase it
+fails with one KNOWN E0063 — freshell-ws's `TerminalStatus` literal at
+`terminal.rs:~2881` lacks `resume_cycles` until Step 7's sweep. That error is
+expected here; only `freshell-freshagent` must check clean before continuing.)
+
+Expected: rebase runs to completion (remaining commits replay clean — the
+2026-07-30 validation rebase replayed every remaining commit, including
+`f9b8aa33f` and the docs tip `948e52b5f`, clean after this resolution).
 
 - [ ] **Step 7: Post-rebase initializer sweep (main's `ef3014bab` pattern)**
 
@@ -287,6 +307,12 @@ cargo check --workspace --all-targets 2>&1 | head -50
 ```
 
 Expected: either clean, or `missing field` errors in branch-added literals.
+The 2026-07-30 validation rebase produced exactly THREE such errors, all
+in-pattern: `TerminalStatus` missing `resume_cycles` at
+`crates/freshell-ws/src/terminal.rs:~2881`, and `WsState` missing
+`auto_resume_cancels` in the two branch test harnesses
+(`resume_validation_gate.rs` ~:123, `auto_resume_respawn.rs` ~:369). Anything
+OUTSIDE the pattern below is unexpected — investigate before hacking at it.
 Fix every one mechanically:
 
 - `WsState { .. }` literals (branch harnesses `resume_validation_gate.rs`
@@ -342,7 +368,7 @@ harnesses and literals after replaying onto origin/main."
 If Step 7 required zero changes, skip this commit (the rebase alone is the
 deliverable; `git log` shows the replayed commits atop `39010cb57`).
 
-Final check: `git log --oneline origin/main..HEAD | wc -l` prints 16 or 17,
+Final check: `git log --oneline origin/main..HEAD | wc -l` prints 17 or 18,
 and `git merge-base origin/main HEAD` prints `39010cb57…`.
 
 ---
@@ -367,8 +393,15 @@ gets — a silent #584 regression.
 Add to `mod tests` in `crates/freshell-freshagent/src/terminal_tabs.rs`,
 directly after `rest_gate_fire_heals_pane_content_ref_and_injects_notice`
 (~:4200 pre-rebase; find it by name). Model the harness on that neighbor test
-verbatim (same server/ledger/probe setup — it already exercises a claude REST
-create whose gate fires); the NEW assertions are the last block:
+verbatim (same server/probe setup — it already exercises a claude REST create
+whose gate fires) — BUT note the neighbor cannot observe PIN 2 by itself: the
+PIN 2 write is `if let Some(binder)`-gated on the optional `pane_identity`
+seam (main terminal_tabs.rs:1560–1572; `None` = legacy no-write, :1150–1155),
+and the neighbor wires no binder. There is NO `bindings_for_session` API.
+Observe the write the way main's own #584 tests do: wire a `RecordingBinder`
+(defined in this module on main, ~:3912) via
+`state.with_pane_identity_binder(binder.clone())` (main's wiring at
+~:3967–3969) and assert on `binder.events()`:
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
@@ -378,28 +411,33 @@ async fn rest_gate_fired_claude_fallback_preallocates_fresh_identity() {
     // Absent + ever_observed_on_disk=true, gate fires and mints a fresh id.
     // (Copy that test's setup verbatim, through the create call.)
 
-    // NEW: the gate-minted fresh claude pane must get the same PIN 2
-    // pre-spawn ledger treatment as a natural fresh claude create.
-    // 1. The outcome-minted id (readable from the created pane's content /
-    //    notice, as the neighbor test already extracts it) has a ledger
-    //    binding row written for it — query the same PaneLedger handle the
-    //    harness constructed, the same way pane_ledger assertions are done
-    //    in this module (mirror the neighbor test's ledger access pattern).
-    // 2. The STALE id's binding is retired with RetiredReason::SessionMissing
-    //    (the neighbor test may already assert this half — keep it).
+    // NEW vs the neighbor: wire the #584 identity seam so the PIN 2 write is
+    // observable (the write is skipped entirely when no binder is wired):
+    //   let binder = RecordingBinder::default();           // main's test double, ~:3912
+    //   ... state = state.with_pane_identity_binder(binder.clone());  // main's wiring, ~:3967-3969
+    // Then, after the create completes and the gate has fired:
+    // 1. Extract the minted id from the healed pane content / notice, as the
+    //    neighbor test already does.
+    // 2. The gate-minted fresh claude pane must get the same PIN 2 pre-spawn
+    //    treatment as a natural fresh claude create — assert on the binder's
+    //    recorded events exactly like main's #584 tests (~:3964-4010):
     let minted = /* extracted minted id, as neighbor test does */;
-    let rows = ledger.bindings_for_session(&minted); // use the module's actual query API
+    let events = binder.events();
     assert!(
-        !rows.is_empty(),
-        "gate-minted fresh claude id must receive the PIN 2 pre-spawn ledger binding"
+        events.iter().any(|e| e == &format!("prespawn:{tid}:{minted}")),
+        "gate-minted fresh claude id must receive the PIN 2 pre-spawn identity binding: {events:?}"
     );
+    // Mirror main's ordering/negative assertions too: the prespawn event
+    // precedes the register event for the same terminal, and no `delete:`
+    // event fired (the spawn succeeded).
 }
 ```
 
-The exact ledger-query call must mirror whatever the surrounding tests use
-(the module already asserts ledger rows in the `rest_gate_*` family and in
-main's #584 tests `create_codex_tab_accepts_session_ref_and_derives_resume_args`
-area) — copy that access pattern; do not invent a new API.
+Copy the `RecordingBinder` usage and event-string shapes from main's own #584
+tests in this module (main @ 39010cb57 `terminal_tabs.rs` ~:3912 for the
+double, ~:3967–3969 for wiring, ~:3964–4010 for the assertion patterns) — do
+not invent a new API. There is no ledger-query path for this: PIN 2 is only
+observable through the binder seam.
 
 - [ ] **Step 2: Run it — verify it fails for the right reason**
 
@@ -407,7 +445,8 @@ area) — copy that access pattern; do not invent a new API.
 cargo test -p freshell-freshagent --lib rest_gate_fired_claude_fallback_preallocates_fresh_identity
 ```
 
-Expected: FAIL on the `!rows.is_empty()` assertion (no PIN 2 write happened),
+Expected: FAIL on the `prespawn:` assertion (no PIN 2 write happened — the
+prealloc predicate sees the gate-minted `Some(id)` and returns false),
 NOT a compile error or harness panic. If it PASSES, main's prealloc logic
 already covers the gate path — investigate (read the prealloc condition); if
 genuinely covered, delete the redundant plumbing plan for Steps 3–4, keep the
@@ -438,7 +477,16 @@ let claude_fresh_prealloc =
 
 so PIN 2 and Hunk B's `launch_intent` override both see it. Mirror the WS
 door's existing `if outcome.claude_fresh_prealloc { … }` handling — same
-field name, same semantics.
+field name, same semantics (the branch's WS door already does this exact
+OR-fold at branch `terminal.rs:1857–1858` — that is the reference).
+
+CRITICAL placement rule (verified 2026-07-30): the folded flag must NOT
+re-key main's MINT decision (`should_preallocate_fresh_claude` feeding the
+mint at main `terminal_tabs.rs:~810–811`) — a gate-fired create already
+carries the gate-minted id, and re-minting would overwrite it with a second
+UUID. Keep the mint on main's raw predicate; use the FOLDED flag only for
+the PIN 2 pre-spawn write (~:1560), the failure-path delete (~:1628), and
+the `launch_intent` override (~:1360).
 
 - [ ] **Step 4: Run the test — verify it passes, plus neighbors**
 
@@ -656,8 +704,17 @@ async fn managed_default_stale_codex_id_is_gated_before_planning() {
 
     // Probe: codex stale_id is POSITIVELY absent (store readable).
     // Construct the StubProbe exactly as restore_true_amplifier_absent_spawns_fresh_with_notice
-    // does, but keyed for provider "codex" answering Absent + ever_observed_on_disk=true.
+    // does, keyed for provider "codex" answering Absent. (Do NOT try to make
+    // it return ever_observed_on_disk=true — StubProbe can't and codex
+    // doesn't need it; the codex arm gates on positive Absent alone.)
     let probe = /* StubProbe answering Absent for (codex, stale_id) */;
+    // Hygiene: point CODEX_HOME at a temp dir so no codex-side path can ever
+    // touch the real ~/.codex (the fake app-server writes ~/.codex/sessions
+    // on turn/start when CODEX_HOME is unset; this test never sends
+    // turn/start, but pin it anyway):
+    let codex_home = std::env::temp_dir().join(format!("freshell-resume-gate-codex-home-{}", std::process::id()));
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::env::set_var("CODEX_HOME", &codex_home);
     let harness = spawn_managed_codex_server_with_probe(probe).await;
 
     // terminal.create with restore:true carrying the stale codex resume id —
@@ -673,7 +730,7 @@ async fn managed_default_stale_codex_id_is_gated_before_planning() {
 
     // 2. The FRESH spawn still went managed (default ON): the captured TUI
     //    argv is the --remote form...
-    let argv = wait_for_captured_argv(&capture_path).await; // copy helper from e2e :288-305
+    let argv = wait_for_captured_argv(&capture_path); // SYNC helper — no .await; copy from e2e ~:287-305
     assert_eq!(argv[0], "--remote", "fresh spawn must still plan managed launch");
 
     // 3. ...and the stale resume NEVER reached managed planning: on a managed
@@ -704,12 +761,15 @@ cargo test -p freshell-ws --test resume_validation_gate managed_default_stale_co
 ```
 
 Expected: PASS — the trial merge showed door-1 gate (~:1810) precedes the plan
-(~:2112). If it FAILS with `resume`/stale-id tokens in argv or a missing
-notice: the rebase broke gate-before-plan ordering in
-`crates/freshell-ws/src/terminal.rs`. Fix by moving the branch's gate block to
-run before the managed-launch plan extraction in `handle_create` (preserving
-its documented AFTER-D7 / BEFORE-`ensure_session` constraints), then re-run to
-green. Do not weaken the assertions.
+(~:2112), and the 2026-07-30 oracle validation confirmed no plausible
+non-ordering red cause (codex positive-Absent takes the notice arm
+unconditionally; `--remote` argv is guaranteed for a managed START; timing/
+plan-budget can't bite a single-test run). If it FAILS with `resume`/stale-id
+tokens in argv or a missing notice: the rebase broke gate-before-plan ordering
+in `crates/freshell-ws/src/terminal.rs`. Fix by moving the branch's gate block
+to run before the managed-launch plan extraction in `handle_create`
+(preserving its documented AFTER-D7 / BEFORE-`ensure_session` constraints),
+then re-run to green. Do not weaken the assertions.
 
 - [ ] **Step 4: Confirm the non-ignored suite still passes and fmt is clean**
 
@@ -792,12 +852,20 @@ the test already does for its `terminal.status{Recovering}` assertion:
 ```
 
 Fill the frame-matching holes with the SAME matching code the test already
-uses for its existing status-frame assertion (it already parses broadcast
-frames); for (c), inspect how `auto_resume_cancels` is declared on `WsState`
-(`Default::default()` — a lockable map/set) and read it the way
-`crates/freshell-ws/src/auto_resume.rs` tests do. If the harness does not
-currently collect all frames, extend it the way the existing assertion's
-collection works — do not build a new collection mechanism.
+uses for its existing status-frame assertion (verified 2026-07-30: the test
+subscribes BEFORE the respawn at ~:443 and drains ALL broadcast frames via
+`drain_broadcast_frames` ~:419 — settle frames ride the same bus, so no new
+collection mechanism is needed). For (c), `auto_resume_cancels` is a `pub`
+field on `WsState` (`crates/freshell-ws/src/lib.rs:~133`); read it with
+main's own idiom (main `terminal.rs:~4962–4968`):
+
+```rust
+state
+    .auto_resume_cancels
+    .lock()
+    .expect("auto_resume_cancels lock")
+    .is_empty()
+```
 
 - [ ] **Step 3: Run to green**
 
@@ -939,8 +1007,11 @@ cargo test --workspace
 ```
 
 Expected: all three exit 0. `fmt --check` is CI-enforced (a fmt violation
-just broke a main PR — zero tolerance). Fix any failure, commit as
-`fix(resume-validation): <what>`, re-run from the top of this step.
+just broke a main PR — zero tolerance). The 2026-07-30 validation rebase
+showed exactly one clippy lint on the merged tree (a mechanical
+`type_complexity` — fix with a type alias, it is not structural), and main
+itself passes `fmt --check` on this host (verified). Fix any failure, commit
+as `fix(resume-validation): <what>`, re-run from the top of this step.
 
 - [ ] **Step 2: Host-gated managed-path e2e (mutates process env — run alone)**
 
@@ -971,21 +1042,38 @@ if it doesn't, the regeneration output IS the fix — commit it as
 npm run typecheck
 npm run lint
 npm run test:status    # inspect for a foreign holder; if one is running, WAIT — never kill it
+FRESHELL_TEST_COORDINATOR_MAX_WAIT_MS=7200000 \
 FRESHELL_TEST_SUMMARY="resume-validation rebase onto 39010cb57 — full client verification" npm run check
 ```
+
+(Coordinator facts, verified 2026-07-30: the gate is a live unix socket keyed
+on the git common dir; crashed holders self-heal automatically — only a live
+process can hold the gate, so waiting is always safe. The wait is bounded:
+the 2h `MAX_WAIT_MS` above turns a wedged queue into a loud exit 124 instead
+of a silent day-long stall — if that fires, surface it, don't kill anything.)
 
 Expected: typecheck + lint clean; `npm run check` green through the
 coordinator gate, with ONE allowed exception:
 `test/e2e/terminal-font-settings.test.tsx` — if it fails, confirm it also
 fails on main (`git -C /home/dan/code/freshell stash list >/dev/null; cd /home/dan/code/freshell && FRESHELL_TEST_SUMMARY="baseline check terminal-font-settings" npm run test:vitest -- test/e2e/terminal-font-settings.test.tsx; cd /home/dan/code/freshell/.worktrees/resume-validation`)
 and note it in the final summary — do NOT chase it, do NOT mark it skipped.
-Any OTHER client failure is ours: fix, commit, re-run Step 4.
+
+Baseline-attribution rule (added 2026-07-30; generalizes the
+terminal-font-settings note): main's npm-side gates have NO recorded
+baseline-green on this host. For any OTHER client failure that is not
+plainly caused by branch changes (i.e. the failing file/area is one the
+branch never touched), first run the SAME targeted file on the main checkout
+(`cd /home/dan/code/freshell && npm run test:unit -- <file>` — targeted runs
+are delegated, no gate) before treating it as ours. Upstream-red: note it
+like terminal-font-settings and move on. Ours (red here, green on main):
+fix, commit, re-run Step 4. Rust-side baselines were verified green on main
+2026-07-30 (`cargo fmt --all --check`; `codex_managed_launch_e2e --ignored`).
 
 - [ ] **Step 5: Final state audit**
 
 ```bash
 git status --short                          # empty
-git log --oneline origin/main..HEAD         # 16–22 commits, all *(resume-validation)* scoped
+git log --oneline origin/main..HEAD         # 17–23 commits, all *(resume-validation)* scoped
 git merge-base origin/main HEAD             # 39010cb57...
 git log -1 --format='%an <%ae>'             # Dan Shapiro <3732858+danshapiro@users.noreply.github.com>
 ```
@@ -1005,12 +1093,28 @@ left local and verified — that is the stop condition.
 - §4 (gate × breaker) → Task 5.
 - §5 (docs: comments, DEV-0010, TerminalView double-message check) → Task 6. Note: investigation showed the 'DEV-0006 S4 default OFF' comments were main's pre-fork text, not branch-authored, and terminal.rs merges clean, so main's updated text wins automatically — Task 6 Step 1 still sweeps and fixes any branch-authored stragglers, satisfying the spec's intent.
 - §6 (full verification incl. fmt, clippy, workspace tests, coordinated client runs, FRESHELL_TEST_SUMMARY, known-failure note) → Task 7.
-- Rebase mechanics (clean history preference) → Task 1 preserves per-commit replay (13/17 clean; 2 resolved stops; fmt sweep folded) with one residue commit — cleaner than the single-squash fallback the spec permits.
+- Rebase mechanics (clean history preference) → Task 1 preserves per-commit replay (16/18 clean in the 2026-07-30 validation rebase; 2 resolved stops; fmt sweep folded) with one residue commit — cleaner than the single-squash fallback the spec permits.
 - Discovered-during-investigation gap (PIN 2 / `claude_fresh_prealloc` — a semantic conflict neither side wrote) → Task 2. This is in-scope: the spec's "preserve main's semantics for everything #584 added" requires it.
 - No UNRESOLVED COVERAGE GAPS.
 
 **1b. No silent deferrals:** Every requirement lands as production behavior verified by real tests: the gate test (Task 4) uses main's own fake-binary seam — the same seam main's S5 e2e uses as its production proof; no new stubs stand in for required behavior. The one allowed known-failure note (terminal-font-settings) is spec-mandated ("note it if seen, do not chase it") with a baseline cross-check, not a deferral of this branch's scope. DEV-0010 stays `proposed` deliberately: adjudication is a merge-time gate and the spec forbids merging.
 
-**2. Placeholder scan:** Task 2 Step 1, Task 4 Step 2, and Task 5 Step 2 contain deliberate copy-from-named-sibling holes (`/* ... */`) — each names the exact sibling test/helper and file to copy from, which is the honest maximum for a reconciliation plan written against a tree that Task 1 will reshape; they are instructions with concrete sources, not "TBD". No "handle edge cases", no "similar to Task N" without the source named, no undefined types (every referenced symbol exists on main or the branch per the background-facts section).
+**2. Placeholder scan:** Task 2 Step 1, Task 4 Step 2, and Task 5 Step 2 contain deliberate copy-from-named-sibling holes (`/* ... */`) — each names the exact sibling test/helper and file to copy from (Task 2 now cites main's `RecordingBinder` double, wiring, and assertion patterns at concrete main-side lines; Task 5's `auto_resume_cancels` hole is filled with main's exact read idiom), which is the honest maximum for a reconciliation plan written against a tree that Task 1 will reshape; they are instructions with concrete sources, not "TBD". No "handle edge cases", no "similar to Task N" without the source named, no undefined types (every referenced symbol exists on main or the branch per the background-facts section).
 
-**3. Type consistency:** `claude_fresh_prealloc` (Tasks 2, 6) matches the WS door's existing field name. `RestResumeOutcome`, `validate_rest_resume`, `derive_resume_identity` (3-tuple), `settle_gated_create`, `acquire_uncancellable`, `auto_resume_cancels: Default::default()`, `resume_cycles: None`, `RetiredReason::SessionMissing`, `stale_resume_notice`, `ResumeExistence::Absent` — all verified against the investigation reports and used consistently across tasks.
+**3. Type consistency:** `claude_fresh_prealloc` (Tasks 2, 6) matches the WS door's existing field name. `RestResumeOutcome`, `validate_rest_resume`, `derive_resume_identity` (3-tuple), `settle_gated_create`, `acquire_uncancellable`, `auto_resume_cancels: Default::default()`, `resume_cycles: None`, `RetiredReason::SessionMissing`, `stale_resume_notice`, `ResumeExistence::Absent`, `RecordingBinder` + `with_pane_identity_binder` + `binder.events()` (`prespawn:`/`register:`/`delete:` event strings, Task 2) — all verified against the investigation reports and used consistently across tasks.
+
+## Validation pass (2026-07-30, load-bearing assumption check)
+
+The plan's load-bearing assumptions were validated (ledger:
+`.worktrees/.the-usual-logs/resume-validation/load-bearing-ledger.md`):
+9 verified, 2 falsified and fixed in this revision (branch commit counts —
+now 18/17/"17 or 18" including the docs plan commit; Task 2's observation
+mechanism — rewritten to main's `RecordingBinder` seam since PIN 2 is
+binder-gated and unobservable via any ledger query), 1 accepted residual
+(no npm-side baseline record on this host — mitigated by Task 7's
+baseline-attribution rule; Rust-side baselines verified green on main).
+A full trial rebase per this plan's rules ran green end-to-end
+(fold conflict-free; stops only at 65c938aad and 777eb7542 with main.rs
+auto-merging; 3 in-pattern initializer errors; one mechanical clippy lint;
+contract regen convergent; merged client typechecks and its targeted tests
+pass 142/142 + 8/8).
