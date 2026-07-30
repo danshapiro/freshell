@@ -14,10 +14,13 @@ Rust endpoint's JSON must be wire-compatible with what the client already consum
 
 ## Source of truth (parity references — read these first)
 
-- Contract: `shared/resume-resolve-contract.ts` (request `{ input: string, 1..20000, strict }`;
-  response `{ status: 'ready'|'warming', matches: ResumeResolveMatch[], hint: {provider, source: 'command'|'word'|'id-shape'}|null }`;
+- Contract: `shared/resume-resolve-contract.ts` AT THIS WORKTREE'S HEAD — the HARDENED
+  (#586) shape (request `{ input: string, 1..20000, strict }`;
+  response `{ status: 'ready'|'warming'|'degraded', matches: ResumeResolveMatch[], hint: {provider, source: 'command'|'word'|'id-shape'}|null, providerErrors: {provider, code?, message?}[], unsearchedProviders: string[], homeDir?: string }`;
   match fields `provider, sessionId, cwd?, sessionType?, title?, firstUserMessage?, lastActivityAt?, matchKind: 'exact'|'prefix'`).
-  Rust serde must emit the exact same field names (camelCase) and types.
+  A failing provider surfaces as `status: 'degraded'` + a `providerErrors` entry — never a
+  silent empty "not found". Rust serde must emit the exact same field names (camelCase)
+  and types.
 - Node behavior: `server/sessions-router.ts` (routing, validation, error shapes/status
   codes, auth) and `server/coding-cli/resolve-session.ts` (matching semantics, ordering,
   result cap, fallbacks).
