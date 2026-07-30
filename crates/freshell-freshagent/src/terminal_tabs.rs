@@ -5210,6 +5210,9 @@ mod tests {
     /// `on_stale_resume` never invoked, no notice injected.
     #[tokio::test]
     async fn rest_gate_skips_sidecar_live_candidate_create_proceeds_unchanged() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         const SIDECAR_LIVE: &str = "stale-cx";
         let argv_file = unique_argv_file("door3-sidecar-skip");
         let (stale_count, on_stale) = counting_on_stale_resume();

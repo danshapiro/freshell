@@ -499,6 +499,9 @@ async fn restore_true_live_absent_legacy_resume_id_fails_open() {
 /// dropped while cases 4–5 still pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_true_sidecar_live_absent_legacy_resume_id_fails_open() {
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     // The codex fake app-server fixture (the codex.rs crash-recovery tests'
     // scripted peer), pinned to mint the exact thread id this test keys on.
     // Env mutation is process-global; this is the ONLY test in this binary
