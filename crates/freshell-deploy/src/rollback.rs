@@ -4,6 +4,7 @@ use crate::journal::{
     validate_generation_process, TransactionJournal, TransactionPhase, TransactionRecord,
 };
 use crate::receipts::LiveReceipt;
+use crate::recovery::verify_owned_predecessors_exited;
 
 pub(crate) fn rollback<J, D>(
     journal: &mut J,
@@ -69,9 +70,7 @@ where
         let after_stop = driver.observe_port(&working)?;
         match after_stop {
             PortState::Free => {
-                if let Some(previous) = working.active_relaunch_process() {
-                    driver.verify_exited(previous)?;
-                }
+                verify_owned_predecessors_exited(driver, &working)?;
                 let runtime = crate::journal::live_runtime(
                     &working.prior_runtime,
                     &working.prior_generation_root,

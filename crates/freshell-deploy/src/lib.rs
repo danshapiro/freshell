@@ -18,9 +18,10 @@ mod rollback;
 mod store;
 
 pub use activation::{
-    publish_activation_authorization, read_activation_receipt, ActivationController,
-    ActivationDriver, ActivationProgress, ActivationReceiptObservation, ActivationRequest,
-    PortState, ServiceState,
+    publish_activation_authorization, publish_activation_cancellation, read_activation_receipt,
+    read_cancellation_receipt, ActivationController, ActivationDriver, ActivationProgress,
+    ActivationReceiptObservation, ActivationRequest, CancellationReceiptObservation, PortState,
+    ServiceState,
 };
 pub use cli::{execute_capture, CaptureCommand};
 pub use error::{DeployError, Result};

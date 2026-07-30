@@ -47,6 +47,8 @@ pub struct ControlPaths {
     pub ready_file: PathBuf,
     pub authorization_file: PathBuf,
     pub activated_file: PathBuf,
+    pub cancellation_file: PathBuf,
+    pub cancelled_file: PathBuf,
 }
 
 impl ControlPaths {
@@ -56,6 +58,8 @@ impl ControlPaths {
             ready_file: directory.join("ready.json"),
             authorization_file: directory.join("authorize.json"),
             activated_file: directory.join("activated.json"),
+            cancellation_file: directory.join("cancel.json"),
+            cancelled_file: directory.join("cancelled.json"),
             directory,
         }
     }
@@ -94,6 +98,8 @@ impl ControlPaths {
             || self.ready_file != self.directory.join("ready.json")
             || self.authorization_file != self.directory.join("authorize.json")
             || self.activated_file != self.directory.join("activated.json")
+            || self.cancellation_file != self.directory.join("cancel.json")
+            || self.cancelled_file != self.directory.join("cancelled.json")
         {
             return Err(DeployError::Journal(
                 "transaction control paths are not exact absolute siblings".to_string(),
@@ -107,6 +113,8 @@ impl ControlPaths {
             ("ready receipt", &self.ready_file),
             ("authorization", &self.authorization_file),
             ("activated receipt", &self.activated_file),
+            ("cancellation", &self.cancellation_file),
+            ("cancelled receipt", &self.cancelled_file),
         ] {
             match fs::symlink_metadata(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -689,7 +697,7 @@ impl DurableTransactionJournal {
 
 impl TransactionJournal for DurableTransactionJournal {
     fn load(&self) -> Result<Option<TransactionRecord>> {
-        let Some(bytes) = read_private_file(&self.path)? else {
+        let Some(bytes) = read_durable_private_file(&self.path)? else {
             return Ok(None);
         };
         let record: TransactionRecord = serde_json::from_slice(&bytes)
@@ -826,4 +834,126 @@ fn read_private_file(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
+}
+
+fn read_durable_private_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    read_durable_private_file_with_sync(path, sync_directory)
+}
+
+fn read_durable_private_file_with_sync(
+    path: &Path,
+    sync_parent: impl Fn(&Path) -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| DeployError::UnsafeStorePath(path.to_path_buf()))?;
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    // Acquiring authority from visible journal bytes also reconciles a prior
+    // publisher that crashed after rename but before its parent-directory
+    // fsync. No terminal phase is trusted until that ambiguity is resolved.
+    if let Some(opened) = file.as_ref() {
+        opened
+            .sync_all()
+            .map_err(|error| DeployError::StorageAmbiguous {
+                operation: "journal authority file sync",
+                path: path.to_path_buf(),
+                cause: error.to_string(),
+            })?;
+    }
+    sync_parent(parent).map_err(|error| DeployError::StorageAmbiguous {
+        operation: "journal authority parent sync",
+        path: path.to_path_buf(),
+        cause: error.to_string(),
+    })?;
+
+    if file.is_none() {
+        // Re-open after the parent sync so an entry published concurrently
+        // with the first lookup cannot be reported as durably absent.
+        file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let opened = file.as_ref().expect("successful reopen returned a file");
+        opened
+            .sync_all()
+            .map_err(|error| DeployError::StorageAmbiguous {
+                operation: "journal authority file sync",
+                path: path.to_path_buf(),
+                cause: error.to_string(),
+            })?;
+        sync_parent(parent).map_err(|error| DeployError::StorageAmbiguous {
+            operation: "journal authority parent resync",
+            path: path.to_path_buf(),
+            cause: error.to_string(),
+        })?;
+    }
+
+    let mut file = file.expect("missing file returned above");
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.uid() != unsafe { libc::geteuid() }
+        || opened_metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(DeployError::Journal(format!(
+            "journal is not a private owned regular file: {}",
+            path.display()
+        )));
+    }
+    let visible_metadata = fs::symlink_metadata(path)?;
+    if visible_metadata.file_type().is_symlink()
+        || visible_metadata.dev() != opened_metadata.dev()
+        || visible_metadata.ino() != opened_metadata.ino()
+    {
+        return Err(DeployError::StorageAmbiguous {
+            operation: "journal authority pathname revalidation",
+            path: path.to_path_buf(),
+            cause: "journal pathname changed while acquiring authority".to_string(),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn durable_load_refuses_visible_bytes_when_parent_sync_is_ambiguous() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transaction.json");
+        fs::write(&path, b"{\"phase\":\"rollback_complete\"}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = read_durable_private_file_with_sync(&path, |_| {
+            Err(DeployError::Io(std::io::Error::other(
+                "injected parent sync failure",
+            )))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeployError::StorageAmbiguous {
+                operation: "journal authority parent sync",
+                ..
+            }
+        ));
+    }
 }

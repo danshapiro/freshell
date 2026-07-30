@@ -68,6 +68,8 @@ pub enum ActivationReceiptObservation {
     StorageAmbiguous,
 }
 
+pub type CancellationReceiptObservation = ActivationReceiptObservation;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ActivationAuthorization {
@@ -98,13 +100,34 @@ pub fn publish_activation_authorization(
     atomic_write(&controls.authorization_file, &bytes, 0o600)
 }
 
+pub fn publish_activation_cancellation(
+    controls: &ControlPaths,
+    candidate: &DeploymentReadyReceipt,
+) -> Result<()> {
+    candidate.validate()?;
+    let mut bytes = serde_json::to_vec(candidate)
+        .map_err(|error| DeployError::Activation(error.to_string()))?;
+    bytes.push(b'\n');
+    atomic_write(&controls.cancellation_file, &bytes, 0o600)
+}
+
 pub fn read_activation_receipt(controls: &ControlPaths) -> Result<ActivationReceiptObservation> {
+    read_deployment_receipt(&controls.activated_file)
+}
+
+pub fn read_cancellation_receipt(
+    controls: &ControlPaths,
+) -> Result<CancellationReceiptObservation> {
+    read_deployment_receipt(&controls.cancelled_file)
+}
+
+fn read_deployment_receipt(path: &Path) -> Result<ActivationReceiptObservation> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let mut file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&controls.activated_file)
+        .open(path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -167,6 +190,15 @@ pub trait ActivationDriver {
         &mut self,
         record: &TransactionRecord,
     ) -> Result<ActivationReceiptObservation>;
+    fn request_activation_cancellation(
+        &mut self,
+        candidate: &CandidateEvidence,
+        controls: &ControlPaths,
+    ) -> Result<()>;
+    fn cancellation_receipt(
+        &mut self,
+        record: &TransactionRecord,
+    ) -> Result<CancellationReceiptObservation>;
     fn verify_ordinary(&mut self, process: &ProcessIdentity) -> Result<()>;
     fn write_live(&mut self, receipt: &LiveReceipt) -> Result<()>;
 }
@@ -288,6 +320,7 @@ where
                         self.driver.stop(&process)?;
                     }
                     PortState::Free => {
+                        self.driver.verify_exited(record.expected_prior_process())?;
                         self.require_selected_generation(&record.prior_generation_id)?;
                     }
                     _ => {
@@ -301,6 +334,7 @@ where
             TransactionPhase::StartTargetIntent => {
                 let candidate = match self.checked_port(&record)? {
                     PortState::Free => {
+                        self.driver.verify_exited(record.expected_prior_process())?;
                         self.require_selected_generation(&record.prior_generation_id)?;
                         self.driver.start_gated(
                             &record.target_generation_root,

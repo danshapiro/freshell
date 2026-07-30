@@ -321,25 +321,23 @@ fn identity_drift_after_term_timeout_prevents_kill() {
 }
 
 #[test]
-fn listener_drift_after_term_timeout_prevents_kill() {
+fn listener_disappearance_after_term_timeout_still_kills_retained_process() {
     let expected = process_identity(PRIOR_ID, 4110, 3420);
     let backend = FakePidfdBackend::exact(expected.clone());
-    let mut drifted = expected.listener.clone();
-    drifted.owner_pid = 9999;
-    drifted.socket_inode = "888888".to_string();
-    backend.listener_observations.borrow_mut().extend([
-        expected.listener.clone(),
-        expected.listener.clone(),
-        expected.listener.clone(),
-        drifted,
-    ]);
-    backend.waits.borrow_mut().push_back(false);
+    backend
+        .listener_failures
+        .borrow_mut()
+        .extend([false, false, false, true]);
+    backend.waits.borrow_mut().extend([false, true]);
     let verified = VerifiedProcess::bind(&backend, &expected).unwrap();
 
-    let result = verified.terminate(StopPolicy::default());
+    verified.terminate(StopPolicy::default()).unwrap();
 
-    assert!(result.is_err());
-    assert_only_retained_pidfd(&backend, expected.pid, &[(7, Signal::Term)]);
+    assert_only_retained_pidfd(
+        &backend,
+        expected.pid,
+        &[(7, Signal::Term), (7, Signal::Kill)],
+    );
 }
 
 #[test]

@@ -116,6 +116,8 @@ struct ActivationAuthorization {
 struct ActivationFiles {
     authorization_file: PathBuf,
     activated_file: PathBuf,
+    cancellation_file: PathBuf,
+    cancelled_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +136,8 @@ impl DeploymentControl {
             deployment_string_env("FRESHELL_DEPLOY_GENERATION_ID")?,
             deployment_path_env("FRESHELL_DEPLOY_ACTIVATION_FILE")?,
             deployment_path_env("FRESHELL_DEPLOY_ACTIVATED_FILE")?,
+            deployment_path_env("FRESHELL_DEPLOY_CANCELLATION_FILE")?,
+            deployment_path_env("FRESHELL_DEPLOY_CANCELLED_FILE")?,
         )
     }
 
@@ -143,11 +147,15 @@ impl DeploymentControl {
         generation_id: Option<String>,
         authorization_file: Option<PathBuf>,
         activated_file: Option<PathBuf>,
+        cancellation_file: Option<PathBuf>,
+        cancelled_file: Option<PathBuf>,
     ) -> Result<Self, String> {
         for path in [
             ready_file.as_ref(),
             authorization_file.as_ref(),
             activated_file.as_ref(),
+            cancellation_file.as_ref(),
+            cancelled_file.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -160,15 +168,27 @@ impl DeploymentControl {
             }
         }
 
-        let activation = match (authorization_file, activated_file) {
-            (Some(authorization_file), Some(activated_file)) => Some(ActivationFiles {
+        let activation = match (
+            authorization_file,
+            activated_file,
+            cancellation_file,
+            cancelled_file,
+        ) {
+            (
+                Some(authorization_file),
+                Some(activated_file),
+                Some(cancellation_file),
+                Some(cancelled_file),
+            ) => Some(ActivationFiles {
                 authorization_file,
                 activated_file,
+                cancellation_file,
+                cancelled_file,
             }),
-            (None, None) => None,
+            (None, None, None, None) => None,
             _ => {
                 return Err(
-                    "FRESHELL_DEPLOY_ACTIVATION_FILE and FRESHELL_DEPLOY_ACTIVATED_FILE must be set together"
+                    "all activation authorization, receipt, cancellation, and cancellation-receipt paths must be set together"
                         .to_string(),
                 );
             }
@@ -242,6 +262,7 @@ fn deployment_path_env(name: &str) -> Result<Option<PathBuf>, String> {
 enum ActivationPoll {
     Waiting,
     Activated,
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -498,6 +519,37 @@ fn try_activate_with_ops(
     gate: &ActivationGate,
     ops: &dyn DurablePublishOps,
 ) -> Result<ActivationPoll, ActivationError> {
+    let cancellation = match std::fs::read(&activation.cancellation_file) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ActivationError::Authorization(format!(
+                "read activation cancellation {}: {error}",
+                activation.cancellation_file.display()
+            )))
+        }
+    };
+    if let Some(bytes) = cancellation {
+        let requested: DeploymentReceipt = serde_json::from_slice(&bytes).map_err(|error| {
+            ActivationError::Authorization(format!(
+                "parse activation cancellation {}: {error}",
+                activation.cancellation_file.display()
+            ))
+        })?;
+        if requested.nonce != receipt.nonce
+            || requested.server_process_generation_id != receipt.server_process_generation_id
+            || requested.instance_id != receipt.instance_id
+            || requested.pid != receipt.pid
+            || requested.boot_id != receipt.boot_id
+        {
+            return Err(ActivationError::Authorization(
+                "activation cancellation does not match this process".to_string(),
+            ));
+        }
+        publish_durable_json_with_ops(&activation.cancelled_file, receipt, ops)
+            .map_err(ActivationError::Publication)?;
+        return Ok(ActivationPoll::Cancelled);
+    }
     let bytes = match std::fs::read(&activation.authorization_file) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -547,6 +599,11 @@ async fn wait_for_activation(
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             ActivationPoll::Activated => return Ok(()),
+            ActivationPoll::Cancelled => {
+                return Err(ActivationError::Authorization(
+                    "activation was durably cancelled".to_string(),
+                ))
+            }
         }
     }
 }
@@ -2885,6 +2942,8 @@ mod tests {
         let activation = ActivationFiles {
             authorization_file: temp.path().join("authorize.json"),
             activated_file: temp.path().join("activated.json"),
+            cancellation_file: temp.path().join("cancel.json"),
+            cancelled_file: temp.path().join("cancelled.json"),
         };
         publish_durable_json(
             &activation.authorization_file,
@@ -3044,6 +3103,8 @@ mod tests {
         let activation = ActivationFiles {
             authorization_file,
             activated_file: activated_file.clone(),
+            cancellation_file: temp.path().join("cancel.json"),
+            cancelled_file: temp.path().join("cancelled.json"),
         };
         let gate = ActivationGate::gated();
         let receipt = deployment_receipt();
@@ -3178,6 +3239,8 @@ mod tests {
         let activation = ActivationFiles {
             authorization_file: temp.path().join("authorize.json"),
             activated_file: temp.path().join("activated.json"),
+            cancellation_file: temp.path().join("cancel.json"),
+            cancelled_file: temp.path().join("cancelled.json"),
         };
         std::fs::write(
             &activation.authorization_file,
@@ -3191,12 +3254,31 @@ mod tests {
     }
 
     #[test]
+    fn durable_cancellation_wins_over_a_simultaneous_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let (activation, receipt, gate) = activation_fixture(&temp);
+        publish_durable_json(&activation.cancellation_file, &receipt).unwrap();
+
+        assert!(matches!(
+            try_activate(&activation, &receipt, &gate).unwrap(),
+            ActivationPoll::Cancelled
+        ));
+        assert!(gate.is_gated());
+        assert!(!activation.activated_file.exists());
+        let acknowledgement: DeploymentReceipt =
+            serde_json::from_slice(&std::fs::read(&activation.cancelled_file).unwrap()).unwrap();
+        assert_eq!(acknowledgement.instance_id, receipt.instance_id);
+    }
+
+    #[test]
     fn deployment_control_requires_absolute_complete_nonce_bound_file_configuration() {
         let absolute = std::env::temp_dir().join("freshell-deploy-control-test");
         assert!(DeploymentControl::from_values(
             Some(PathBuf::from("relative-ready.json")),
             Some("nonce".to_string()),
             Some("generation".to_string()),
+            None,
+            None,
             None,
             None,
         )
@@ -3207,6 +3289,8 @@ mod tests {
             Some("generation".to_string()),
             None,
             None,
+            None,
+            None,
         )
         .is_err());
         assert!(DeploymentControl::from_values(
@@ -3214,6 +3298,8 @@ mod tests {
             Some("nonce".to_string()),
             Some("generation".to_string()),
             Some(absolute.join("authorize.json")),
+            None,
+            None,
             None,
         )
         .is_err());
@@ -3224,6 +3310,8 @@ mod tests {
             Some("generation".to_string()),
             Some(absolute.join("authorize.json")),
             Some(absolute.join("activated.json")),
+            Some(absolute.join("cancel.json")),
+            Some(absolute.join("cancelled.json")),
         )
         .unwrap();
         assert!(control.ready_file.is_some());

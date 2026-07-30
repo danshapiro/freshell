@@ -90,18 +90,23 @@ impl<'a, Backend: PidfdBackend> VerifiedProcess<'a, Backend> {
     }
 
     pub fn revalidate(&self) -> Result<()> {
+        self.revalidate_process()?;
+        let listener = self.backend.resolve_listener(self.expected.listener.port)?;
+        if listener != self.expected.listener {
+            return Err(DeployError::ProcessControl(
+                "listener ownership changed after pidfd pinning".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn revalidate_process(&self) -> Result<()> {
         let current = self
             .backend
             .snapshot(&self.pidfd, &self.expected.listener)?;
         if current != self.expected {
             return Err(DeployError::ProcessControl(
                 "boot/process/executable/socket/runtime identity changed".to_string(),
-            ));
-        }
-        let listener = self.backend.resolve_listener(self.expected.listener.port)?;
-        if listener != self.expected.listener {
-            return Err(DeployError::ProcessControl(
-                "listener ownership changed after pidfd pinning".to_string(),
             ));
         }
         Ok(())
@@ -114,9 +119,11 @@ impl<'a, Backend: PidfdBackend> VerifiedProcess<'a, Backend> {
             return Ok(());
         }
 
-        // A timeout does not grant permission to address the numeric PID.
-        // Re-prove the exact process and listener, then use the retained pidfd.
-        self.revalidate()?;
+        // Once TERM has been sent, closing the listener is expected. Re-prove
+        // the process identity through the retained pidfd without requiring
+        // the drained listener to remain present, then escalate through that
+        // same kernel-pinned handle.
+        self.revalidate_process()?;
         self.backend.signal_pidfd(&self.pidfd, Signal::Kill)?;
         if self.backend.wait_exited(&self.pidfd, policy.kill_timeout)? {
             Ok(())

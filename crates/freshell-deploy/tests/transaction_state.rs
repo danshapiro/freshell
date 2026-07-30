@@ -120,9 +120,11 @@ struct FakeDriver {
     selected: String,
     state: PortState,
     receipt: ActivationReceiptObservation,
+    cancellation_receipt: ActivationReceiptObservation,
     live: LiveReceipt,
     events: Vec<Event>,
     authorize_activates: bool,
+    authorization_completes_during_cancellation: bool,
     relaunch_with_new_identity: bool,
     relaunch_sequence: u32,
     selected_reads: usize,
@@ -130,6 +132,12 @@ struct FakeDriver {
     steal_pointer_after_switch: bool,
     steal_pointer_after_write_live: bool,
     fail_once: Option<(DriverOperation, FailureTiming)>,
+    off_port_processes: Vec<freshell_deploy::ProcessIdentity>,
+    stop_leaves_process_draining: bool,
+    cancellation_delay_polls: usize,
+    cancellation_requested: bool,
+    cancellation_leaves_process_draining: bool,
+    cancellation_publishes_both: bool,
 }
 
 impl FakeDriver {
@@ -145,6 +153,7 @@ impl FakeDriver {
                 service: ServiceState::Ordinary,
             },
             receipt: ActivationReceiptObservation::Absent,
+            cancellation_receipt: ActivationReceiptObservation::Absent,
             live: LiveReceipt::new(
                 PRIOR_ID.to_string(),
                 Some(PRIOR_ID.to_string()),
@@ -153,6 +162,7 @@ impl FakeDriver {
             ),
             events: Vec::new(),
             authorize_activates: true,
+            authorization_completes_during_cancellation: false,
             relaunch_with_new_identity: false,
             relaunch_sequence: 0,
             selected_reads: 0,
@@ -160,6 +170,12 @@ impl FakeDriver {
             steal_pointer_after_switch: false,
             steal_pointer_after_write_live: false,
             fail_once: None,
+            off_port_processes: Vec::new(),
+            stop_leaves_process_draining: false,
+            cancellation_delay_polls: 0,
+            cancellation_requested: false,
+            cancellation_leaves_process_draining: false,
+            cancellation_publishes_both: false,
         }
     }
 
@@ -241,7 +257,10 @@ impl ActivationDriver for FakeDriver {
                 candidate: observed,
                 ..
             } => &observed.process == process,
-            PortState::Free | PortState::Foreign => false,
+            PortState::Free | PortState::Foreign => self
+                .off_port_processes
+                .iter()
+                .any(|observed| observed == process),
         };
         if still_running {
             return Err(DeployError::Activation(
@@ -273,6 +292,9 @@ impl ActivationDriver for FakeDriver {
             ));
         }
         self.events.push(Event::Stop(process.pid));
+        if self.stop_leaves_process_draining {
+            self.off_port_processes.push(process.clone());
+        }
         self.state = PortState::Free;
         self.maybe_fail(DriverOperation::Stop, FailureTiming::After)
     }
@@ -311,6 +333,11 @@ impl ActivationDriver for FakeDriver {
         runtime: &RuntimeProvenance,
         node: &NodePrerequisite,
     ) -> Result<freshell_deploy::ProcessIdentity> {
+        if !self.off_port_processes.is_empty() {
+            return Err(DeployError::Activation(
+                "cannot relaunch while an owned predecessor is draining off-port".to_string(),
+            ));
+        }
         self.maybe_fail(DriverOperation::StartOrdinary, FailureTiming::Before)?;
         assert_eq!(
             generation_root,
@@ -397,6 +424,43 @@ impl ActivationDriver for FakeDriver {
         _record: &TransactionRecord,
     ) -> Result<ActivationReceiptObservation> {
         Ok(self.receipt.clone())
+    }
+
+    fn request_activation_cancellation(
+        &mut self,
+        _candidate: &CandidateEvidence,
+        _controls: &ControlPaths,
+    ) -> Result<()> {
+        self.cancellation_requested = true;
+        if self.authorization_completes_during_cancellation {
+            self.target_ordinary_with_receipt();
+        } else if self.cancellation_delay_polls == 0 {
+            self.cancellation_receipt =
+                ActivationReceiptObservation::Present(self.target.ready.clone());
+            if self.cancellation_publishes_both {
+                self.receipt = ActivationReceiptObservation::Present(self.target.ready.clone());
+            }
+            if self.cancellation_leaves_process_draining {
+                self.off_port_processes.push(self.target.process.clone());
+            }
+            self.state = PortState::Free;
+        }
+        Ok(())
+    }
+
+    fn cancellation_receipt(
+        &mut self,
+        _record: &TransactionRecord,
+    ) -> Result<ActivationReceiptObservation> {
+        if self.cancellation_requested && self.cancellation_delay_polls > 0 {
+            self.cancellation_delay_polls -= 1;
+            if self.cancellation_delay_polls == 0 {
+                self.cancellation_receipt =
+                    ActivationReceiptObservation::Present(self.target.ready.clone());
+                self.state = PortState::Free;
+            }
+        }
+        Ok(self.cancellation_receipt.clone())
     }
 
     fn verify_ordinary(&mut self, process: &freshell_deploy::ProcessIdentity) -> Result<()> {
@@ -732,7 +796,6 @@ fn io_errors_before_and_after_each_live_side_effect_reconcile_by_durable_authori
         StartGated,
         SwitchCurrent,
         Authorize,
-        ConfirmedStop,
         ConfirmedStart,
         CommittedWrite,
     }
@@ -742,7 +805,6 @@ fn io_errors_before_and_after_each_live_side_effect_reconcile_by_durable_authori
         Case::StartGated,
         Case::SwitchCurrent,
         Case::Authorize,
-        Case::ConfirmedStop,
         Case::ConfirmedStart,
         Case::CommittedWrite,
     ] {
@@ -771,11 +833,6 @@ fn io_errors_before_and_after_each_live_side_effect_reconcile_by_durable_authori
                     driver.selected = TARGET_ID.to_string();
                     driver.target_gated();
                     (DriverOperation::Authorize, timing == FailureTiming::After)
-                }
-                Case::ConfirmedStop => {
-                    record.phase = TransactionPhase::ActivationConfirmed;
-                    record.candidate = Some(candidate(TARGET_ID, 5102, 3559));
-                    (DriverOperation::Stop, true)
                 }
                 Case::ConfirmedStart => {
                     record.phase = TransactionPhase::ActivationConfirmed;
@@ -1178,7 +1235,8 @@ fn an_unconfirmed_visible_receipt_is_never_commit_authority_by_itself() {
 }
 
 #[test]
-fn activated_without_exact_receipt_and_live_ordinary_target_fails_closed() {
+fn durable_activated_authority_ignores_receipt_loss_but_rejects_gated_drift() {
+    #[derive(Clone, Copy)]
     enum BrokenEvidence {
         Absent,
         Malformed,
@@ -1228,17 +1286,21 @@ fn activated_without_exact_receipt_and_live_ordinary_target_fails_closed() {
             }
         }
 
-        assert!(ActivationController::new(&mut journal, &mut driver)
-            .recover()
-            .is_err());
-        assert_eq!(
-            journal.record.as_ref().unwrap().phase,
-            TransactionPhase::Activated
-        );
-        assert!(driver.events.iter().all(|event| !matches!(
-            event,
-            Event::Stop(_) | Event::Switch(_, _) | Event::StartOrdinary(_) | Event::WriteLive(_, _)
-        )));
+        let result = ActivationController::new(&mut journal, &mut driver).recover();
+        if matches!(broken, BrokenEvidence::Gated) {
+            assert!(result.is_err());
+            assert_eq!(
+                journal.record.as_ref().unwrap().phase,
+                TransactionPhase::Activated
+            );
+        } else {
+            assert_eq!(result.unwrap(), RecoveryOutcome::Activated);
+            assert_eq!(
+                journal.record.as_ref().unwrap().phase,
+                TransactionPhase::ActivationConfirmed
+            );
+            assert!(journal.record.as_ref().unwrap().finalized);
+        }
     }
 }
 
@@ -1349,7 +1411,7 @@ fn confirmed_recovery_rolls_forward_and_relaunches_from_the_target_root() {
 }
 
 #[test]
-fn confirmed_recovery_orders_pointer_and_process_changes_without_mixed_ordinary_service() {
+fn confirmed_recovery_rejects_prior_pointer_without_any_mutation() {
     for prior_running in [false, true] {
         let mut record = prepared_record(UpdateMode::Full, 3534);
         record.phase = TransactionPhase::ActivationConfirmed;
@@ -1363,35 +1425,13 @@ fn confirmed_recovery_orders_pointer_and_process_changes_without_mixed_ordinary_
             driver.state = PortState::Free;
         }
 
-        ActivationController::new(&mut journal, &mut driver)
+        assert!(ActivationController::new(&mut journal, &mut driver)
             .recover()
-            .unwrap();
-
-        let switch = driver
-            .events
-            .iter()
-            .position(|event| matches!(event, Event::Switch(_, _)))
-            .unwrap();
-        let start = driver
-            .events
-            .iter()
-            .position(|event| matches!(event, Event::StartOrdinary(_)))
-            .unwrap();
-        assert!(
-            switch < start,
-            "target current/client must be selected before an ordinary target starts"
-        );
-        if prior_running {
-            let stop = driver
-                .events
-                .iter()
-                .position(|event| matches!(event, Event::Stop(5101)))
-                .unwrap();
-            assert!(
-                stop < switch,
-                "the old ordinary server must stop before current/client switches"
-            );
-        }
+            .is_err());
+        assert!(driver.events.iter().all(|event| !matches!(
+            event,
+            Event::Stop(_) | Event::Switch(_, _) | Event::StartOrdinary(_) | Event::WriteLive(_, _)
+        )));
     }
 }
 
@@ -1447,6 +1487,125 @@ fn bounded_run_rolls_back_a_stuck_gate_and_reports_reconciled_commit_as_success(
         journal.inner.record.as_ref().unwrap().finalized,
         "recovery completes the durable committed transaction"
     );
+}
+
+#[test]
+fn delayed_authorization_completion_wins_the_cancellation_race() {
+    let mut record = prepared_record(UpdateMode::Server, 3536);
+    record.phase = TransactionPhase::ActivationAuthorized;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3536));
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3536);
+    driver.selected = TARGET_ID.to_string();
+    driver.target_gated();
+    driver.receipt = ActivationReceiptObservation::Absent;
+    driver.authorization_completes_during_cancellation = true;
+
+    assert_eq!(
+        ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .unwrap(),
+        RecoveryOutcome::Activated
+    );
+    assert_eq!(driver.selected, TARGET_ID);
+    assert!(driver
+        .events
+        .iter()
+        .all(|event| !matches!(event, Event::Stop(_) | Event::Switch(_, _))));
+}
+
+#[test]
+fn cancellation_recovery_waits_for_the_server_poll_to_acknowledge() {
+    let mut record = prepared_record(UpdateMode::Server, 3538);
+    record.phase = TransactionPhase::ActivationAuthorized;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3538));
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3538);
+    driver.selected = TARGET_ID.to_string();
+    driver.target_gated();
+    driver.cancellation_delay_polls = 2;
+
+    assert_eq!(
+        ActivationController::new(&mut journal, &mut driver)
+            .recover()
+            .unwrap(),
+        RecoveryOutcome::RolledBack
+    );
+}
+
+#[test]
+fn contradictory_activation_and_cancellation_receipts_fail_closed() {
+    let mut record = prepared_record(UpdateMode::Server, 3539);
+    record.phase = TransactionPhase::ActivationAuthorized;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3539));
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3539);
+    driver.selected = TARGET_ID.to_string();
+    driver.target_gated();
+    driver.cancellation_publishes_both = true;
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert_eq!(driver.selected, TARGET_ID);
+    assert!(driver
+        .events
+        .iter()
+        .all(|event| !matches!(event, Event::Stop(_) | Event::Switch(_, _))));
+}
+
+#[test]
+fn ordinary_activation_never_starts_beside_an_off_port_prior() {
+    let mut record = prepared_record(UpdateMode::Server, 3542);
+    record.phase = TransactionPhase::StartTargetIntent;
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3542);
+    driver.state = PortState::Free;
+    driver.off_port_processes.push(driver.prior.clone());
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .step()
+        .is_err());
+    assert!(!driver
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::StartGated(_))));
+}
+
+#[test]
+fn a_free_port_does_not_authorize_relaunch_while_the_candidate_is_draining() {
+    let mut record = prepared_record(UpdateMode::Server, 3537);
+    record.phase = TransactionPhase::ActivationConfirmed;
+    record.candidate = Some(candidate(TARGET_ID, 5102, 3537));
+    let candidate_process = record.candidate.as_ref().unwrap().process.clone();
+    let mut journal = MemoryJournal {
+        record: Some(record),
+        phases: Vec::new(),
+    };
+    let mut driver = FakeDriver::server(3537);
+    driver.selected = TARGET_ID.to_string();
+    driver.state = PortState::Free;
+    driver.off_port_processes.push(candidate_process);
+
+    assert!(ActivationController::new(&mut journal, &mut driver)
+        .recover()
+        .is_err());
+    assert!(!driver
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::StartOrdinary(_) | Event::WriteLive(_, _))));
 }
 
 #[test]
