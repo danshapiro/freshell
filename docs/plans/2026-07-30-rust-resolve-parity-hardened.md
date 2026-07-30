@@ -327,7 +327,7 @@ Rewrite `crates/freshell-sessions/src/resume_resolve.rs` as a step-for-step port
 
 - [ ] **Step 1: Write the failing tests (rewrite `crates/freshell-sessions/tests/resume_resolve.rs`)**
 
-Mirror the hardened Node core suite `test/unit/server/coding-cli/resolve-session.test.ts` test-for-test (25 tests; read it side-by-side while writing). Start the file with this header and helpers:
+Mirror the hardened Node core suite `test/unit/server/coding-cli/resolve-session.test.ts` test-for-test (23 `it(...)` tests, no `it.each` — count verified at this worktree's HEAD; read it side-by-side while writing). Start the file with this header and helpers:
 
 ```rust
 //! SYNC-06 logic-parity mirror of the HARDENED Node core suite
