@@ -56,6 +56,7 @@ pub mod detect;
 pub mod mcp_inject;
 pub mod opencode_plugin;
 pub mod path;
+pub mod resume_gate;
 pub mod spawn;
 
 // ---- Live-process modules (Phase 3, step 14) — builders + injected CommandRunner ----
