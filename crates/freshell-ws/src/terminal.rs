@@ -1627,6 +1627,10 @@ pub(crate) async fn handle_create(
     // failure — a resume-create's row belongs to the prior epoch and must
     // stay recoverable.
     let mut claude_fresh_prealloc = false;
+    // Resume-validation tracker (door 1): true only when the resume id below
+    // was derived from the WIRE (sessionRef / legacy resumeSessionId / the
+    // claude restore ladder) — server-minted prealloc ids are never gated.
+    let mut resume_id_from_wire = false;
     if mode != "shell" {
         let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
         let should_preallocate_fresh_claude = mode == "claude"
@@ -1678,6 +1682,10 @@ pub(crate) async fn handle_create(
                 .map(|r| r.session_id.clone())
                 .or_else(|| create.resume_session_id.clone())
                 .filter(|s| !s.is_empty());
+            // Everything this arm can produce came from the wire (or the
+            // ladder below, which resolves persisted client state) — eligible
+            // for resume validation.
+            resume_id_from_wire = true;
             // P0.4 (campaign plan §2.2): a restore:true claude create with no
             // client-supplied id must NEVER silently launch a bare `claude`
             // (neither --resume nor --session-id => permanently un-resumable).
@@ -1785,6 +1793,94 @@ pub(crate) async fn handle_create(
                 &create.request_id,
             )
             .await;
+        }
+    }
+
+    // Resume validation (docs/plans/2026-07-29-resume-validation.md): never
+    // hand the CLI a resume id that is definitively absent from the
+    // provider's on-disk store. Fail open on Unknown/ProviderUnavailable.
+    // Placed AFTER the D7 liveness guard (a gate fire would falsify D7's
+    // applicability filter and retire a running session's Bound row) and
+    // BEFORE the amplifier ensure_session re-stub (which would resurrect
+    // the stale dir).
+    let mut resume_fallback_notice: Option<String> = None;
+    if resume_id_from_wire {
+        // In-gate liveness precondition: legacy resumeSessionId-only
+        // carriers bypass D7 in every ordering — a LIVE session must never
+        // gate. Same join D7 uses: registry.live_session_owner + the
+        // fresh-agent sidecar liveness consult above. SHAPE NOTE
+        // (load-bearing): the sidecar arm is ASYNC
+        // (`has_live_session(sid).await`), so the join is computed as a
+        // plain `let` with `.await` in scope — exactly the shape D7 itself
+        // uses. BOTH arms are load-bearing: dropping the async sidecar arm
+        // silently un-protects live zero-turn sessions that have no rollout
+        // on disk yet.
+        let candidate_is_live = match resume_session_id.as_deref() {
+            None => false,
+            Some(sid) => {
+                let registry_row_live = state
+                    .registry
+                    .live_session_owner(Some(&state.identity), &mode, sid)
+                    .is_some();
+                let fresh_agent_live = !registry_row_live
+                    && match mode.as_str() {
+                        "claude" => state.fresh_claude.has_live_session(sid).await,
+                        "codex" => state.fresh_codex.has_live_session(sid).await,
+                        "opencode" => state.fresh_opencode.has_live_session(sid).await,
+                        _ => false,
+                    };
+                registry_row_live || fresh_agent_live
+            }
+        };
+        if !candidate_is_live {
+            // The probe's by-id locators do real filesystem walks (~1 s for
+            // codex on a real store) — never inline on the async runtime
+            // (A13). Run the sync helper in spawn_blocking.
+            let outcome = {
+                let probe = state.session_existence.clone();
+                let mode_for_gate = mode.clone();
+                let rid = resume_session_id.take();
+                let intent = launch_intent;
+                tokio::task::spawn_blocking(move || {
+                    crate::resume_validation::validate_wire_resume(
+                        &mode_for_gate,
+                        rid,
+                        intent,
+                        probe.as_ref(),
+                    )
+                })
+                .await
+                .expect("resume validation task panicked")
+            };
+            resume_session_id = outcome.resume_session_id;
+            launch_intent = outcome.launch_intent;
+            if outcome.claude_fresh_prealloc {
+                claude_fresh_prealloc = true;
+            }
+            if let Some(stale) = outcome.stale_session_id.as_deref() {
+                tracing::warn!(
+                    mode = %mode,
+                    stale_session_id = %stale,
+                    "resume validation: cached session missing on disk; spawning fresh"
+                );
+                // Stale-ref stamping guard: this create no longer creates the
+                // wire sessionRef's session, so a D8 lease claimed for the
+                // STALE ref must be RELEASED, never completed (completing it
+                // would bind stale-ref→terminal in the registry binding map).
+                // Dropping the armed guard runs fail_session_ref_claim.
+                session_ref_lease = None;
+                // Don't retry the stale id forever. Same blocking-pool
+                // discipline as every other pane-ledger write in this file
+                // (~15ms p50 fsyncs — past the async-worker budget).
+                let ledger = std::sync::Arc::clone(&state.pane_ledger);
+                let retire_mode = mode.clone();
+                let stale_id = stale.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    ledger.retire_missing(&retire_mode, &stale_id)
+                })
+                .await;
+                resume_fallback_notice = outcome.notice;
+            }
         }
     }
 
@@ -2603,7 +2699,9 @@ pub(crate) async fn handle_create(
         clear_codex_durability: None,
         // Echo the resolved cwd (`record.cwd`) when the shell spec carries one.
         cwd: spec.cwd.clone(),
-        notice: None,
+        // Resume-validation door 1: the operator-visible stale-resume notice
+        // (Some only when the gate fired above).
+        notice: resume_fallback_notice,
         restore_error: None,
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
