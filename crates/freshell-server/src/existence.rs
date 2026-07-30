@@ -73,6 +73,14 @@ pub enum OpencodeDbAnswer {
 /// `claude_transcript_locator` above.
 pub type OpencodeSessionLocator = Arc<dyn Fn(&str) -> OpencodeDbAnswer + Send + Sync>;
 
+// Resume-validation (plan Task 3): the amplifier/codex by-id locators live in
+// a focused sibling module; re-exported so the probe's whole locator surface
+// stays addressable as `existence::*` (main.rs wiring, tests).
+pub use crate::existence_by_id::{
+    amplifier_dir_locator, codex_rollout_existence_locator, AmplifierSessionLocator, ByIdAnswer,
+    CodexRolloutExistenceLocator,
+};
+
 pub struct IndexExistenceProbe {
     index: Arc<SessionIndex>,
     /// `provider:sessionId` keys ever seen in ANY snapshot this boot.
@@ -107,6 +115,19 @@ pub struct IndexExistenceProbe {
     /// finalized. `None` (tests, callers that never set it) keeps the pure
     /// index answer.
     opencode_session_locator: Option<OpencodeSessionLocator>,
+    /// Amplifier by-id fallback (resume-validation): the warm snapshot can be
+    /// STALE — a session created moments before a restart may be missing —
+    /// and it is `None` every boot while restore-time creates race the
+    /// detached sweep. When set, a warm-index Absent for provider
+    /// "amplifier" is re-checked by id on disk, and the COLD-index answer
+    /// runs the same cheap check (the incident scenario). `None` keeps the
+    /// pure index answer.
+    amplifier_session_locator: Option<AmplifierSessionLocator>,
+    /// Codex by-id fallback (resume-validation): warm-Absent adjudication
+    /// ONLY — the rollout walk is ~1s on a real store, so the cold path
+    /// never consults it (AD-4: cold codex stays `Unknown`). `None` keeps
+    /// the pure index answer.
+    codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
 }
 
 impl IndexExistenceProbe {
@@ -122,6 +143,8 @@ impl IndexExistenceProbe {
             provider_roots,
             claude_transcript_locator: None,
             opencode_session_locator: None,
+            amplifier_session_locator: None,
+            codex_rollout_locator: None,
         }
     }
 
@@ -137,6 +160,22 @@ impl IndexExistenceProbe {
     /// in main.rs.
     pub fn with_opencode_session_locator(mut self, locator: OpencodeSessionLocator) -> Self {
         self.opencode_session_locator = Some(locator);
+        self
+    }
+
+    /// Builder-style: install the by-id disk fallback for amplifier (see the
+    /// field doc). Chained at the single production construction site in
+    /// main.rs.
+    pub fn with_amplifier_session_locator(mut self, locator: AmplifierSessionLocator) -> Self {
+        self.amplifier_session_locator = Some(locator);
+        self
+    }
+
+    /// Builder-style: install the by-id rollout fallback for codex (see the
+    /// field doc). Chained at the single production construction site in
+    /// main.rs.
+    pub fn with_codex_rollout_locator(mut self, locator: CodexRolloutExistenceLocator) -> Self {
+        self.codex_rollout_locator = Some(locator);
         self
     }
 
@@ -199,6 +238,47 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                     .is_some_and(|root| !root.exists())
                 {
                     return SessionExistence::ProviderUnavailable;
+                }
+                // Cold-index coverage (resume-validation, A1): the snapshot
+                // is None every boot and the warm sweep is a detached spawn —
+                // restore-time creates race it. amplifier + claude have CHEAP
+                // direct by-id locators; run them so the gate still fires in
+                // the incident scenario. codex/opencode stay Unknown when
+                // cold (AD-4: the codex walk is ~1 s on a real store —
+                // warm-Absent adjudication only).
+                if provider == "amplifier" {
+                    if let Some(locator) = &self.amplifier_session_locator {
+                        return match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                // On-disk observation — feed the monotone
+                                // observed-set (module-doc invariant).
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                SessionExistence::Present
+                            }
+                            ByIdAnswer::Absent => SessionExistence::Absent,
+                            ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                        };
+                    }
+                }
+                if provider == "claude" {
+                    // Reuse the EXISTING claude transcript locator (raw-file
+                    // check — cheap), same mapping as the warm fallback
+                    // below: hit => Present, clean miss => Absent (the
+                    // Option shape has no error channel).
+                    if let Some(locator) = &self.claude_transcript_locator {
+                        return if locator(session_id).is_some() {
+                            self.observed
+                                .lock()
+                                .expect("observed set lock")
+                                .insert(format!("{provider}:{session_id}"));
+                            SessionExistence::Present
+                        } else {
+                            SessionExistence::Absent
+                        };
+                    }
                 }
                 SessionExistence::Unknown
             }
@@ -271,6 +351,47 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         }
                     }
                 }
+                // Amplifier/codex by-id fallbacks (resume-validation): a
+                // STALE warm snapshot must never adjudicate a real session
+                // absent — a session created moments before a restart may be
+                // missing from the snapshot, and `peek()` serves snapshots
+                // regardless of TTL. Same adjudication point as the claude/
+                // opencode fallbacks above: only reached when the snapshot
+                // would otherwise answer Absent. After these arms, `Absent`
+                // for all four validated providers is POSITIVE absence.
+                if provider == "amplifier" {
+                    if let Some(locator) = &self.amplifier_session_locator {
+                        match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                // A fallback hit is an on-disk observation:
+                                // feed the monotone observed-set (module-doc
+                                // invariant), same as the arms above.
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            ByIdAnswer::Absent => {}
+                        }
+                    }
+                }
+                if provider == "codex" {
+                    if let Some(locator) = &self.codex_rollout_locator {
+                        match locator(session_id) {
+                            ByIdAnswer::Present => {
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
+                            ByIdAnswer::Absent => {}
+                        }
+                    }
+                }
                 SessionExistence::Absent
             }
         }
@@ -304,7 +425,7 @@ mod tests {
     use freshell_sessions::directory_index::{ClaudeSource, OpencodeSource, SessionSource};
     use std::time::Duration;
 
-    fn temp_claude_home(tag: &str) -> std::path::PathBuf {
+    pub(super) fn temp_claude_home(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "freshell-existence-{tag}-{}-{}",
             std::process::id(),
@@ -317,7 +438,7 @@ mod tests {
         dir
     }
 
-    fn write_session(claude_home: &std::path::Path, session_id: &str) {
+    pub(super) fn write_session(claude_home: &std::path::Path, session_id: &str) {
         // Minimal claude transcript that passes the R10b cwd gate: one line
         // carrying `cwd` + timestamps; the file stem is the session id.
         let line = serde_json::json!({
@@ -336,7 +457,7 @@ mod tests {
         .expect("write session fixture");
     }
 
-    fn probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
+    pub(super) fn probe_over(home: &std::path::Path) -> (IndexExistenceProbe, Arc<SessionIndex>) {
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
             vec![Arc::new(ClaudeSource::new(home.to_path_buf())) as Arc<dyn SessionSource>],
             Duration::from_millis(50),
@@ -388,7 +509,7 @@ mod tests {
     /// Test locator with the SAME contract as claude_snapshot::locate_transcript
     /// (Some(path) iff the transcript file exists), scoped to the temp home so
     /// tests never touch process-global CLAUDE_* env vars.
-    fn direct_locator_over(home: &std::path::Path) -> ClaudeTranscriptLocator {
+    pub(super) fn direct_locator_over(home: &std::path::Path) -> ClaudeTranscriptLocator {
         let projects = home.join("projects/proj");
         Arc::new(move |session_id: &str| {
             let p = projects.join(format!("{session_id}.jsonl"));
@@ -1291,3 +1412,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+// Resume-validation (plan Task 3) tests live in a sibling file — this module
+// is already large; same include pattern as
+// freshell-sessions/src/amplifier_stub.rs's `scan_tests`. It reuses the
+// `pub(super)` scaffolding helpers from `tests` above.
+#[cfg(test)]
+#[path = "existence_resume_validation_tests.rs"]
+mod resume_validation_tests;
