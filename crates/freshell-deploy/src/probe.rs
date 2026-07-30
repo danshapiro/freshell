@@ -897,7 +897,9 @@ impl ProbeBackend for RealProbeBackend {
         child: &Self::Child,
         port: DeployPort,
     ) -> Result<ProcessIdentity> {
-        let listener = self.procfs.resolve_listener(port)?;
+        let listener = self
+            .procfs
+            .resolve_listener_for_pid(port, child.child.id())?;
         if listener.owner_pid != child.child.id() {
             return Err(DeployError::Probe(
                 "probe listener is not owned by the retained child pidfd".to_string(),
@@ -909,7 +911,9 @@ impl ProbeBackend for RealProbeBackend {
                 "retained probe pidfd snapshot does not own the listener".to_string(),
             ));
         }
-        let revalidated_listener = self.procfs.resolve_listener(port)?;
+        let revalidated_listener = self
+            .procfs
+            .resolve_listener_for_pid(port, child.child.id())?;
         if revalidated_listener != listener {
             return Err(DeployError::Probe(
                 "probe listener ownership changed during retained-pidfd inspection".to_string(),
@@ -919,7 +923,9 @@ impl ProbeBackend for RealProbeBackend {
     }
 
     fn listener_is_loopback(&mut self, child: &Self::Child, port: DeployPort) -> Result<bool> {
-        let listener = self.procfs.resolve_listener(port)?;
+        let listener = self
+            .procfs
+            .resolve_listener_for_pid(port, child.child.id())?;
         if listener.owner_pid != child.child.id() {
             return Err(DeployError::Probe(
                 "probe listener owner changed before address validation".to_string(),

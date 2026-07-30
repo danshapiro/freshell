@@ -748,7 +748,6 @@ fn rejects_supplied_runtime_that_does_not_match_live_process_provenance() {
         "Claude sidecar entry",
         "package.json",
         "package-lock.json",
-        "production dependencies",
         "Node",
     ] {
         let mut mismatched = identity(&runtime.old_executable);
@@ -765,9 +764,6 @@ fn rejects_supplied_runtime_that_does_not_match_live_process_provenance() {
             "Claude sidecar entry" => mismatched.runtime.claude_sidecar_entry = unrelated,
             "package.json" => mismatched.runtime.package_json = unrelated,
             "package-lock.json" => mismatched.runtime.package_lock = unrelated,
-            "production dependencies" => {
-                mismatched.runtime.production_node_modules = unrelated;
-            }
             "Node" => mismatched.runtime.node_executable = unrelated,
             _ => unreachable!(),
         }
@@ -783,6 +779,40 @@ fn rejects_supplied_runtime_that_does_not_match_live_process_provenance() {
                 if message.contains(field) && message.contains("live process provenance")
         ));
     }
+}
+
+#[test]
+fn bootstrap_captures_a_private_production_closure_without_claiming_it_is_the_live_dev_install() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let live_development_install = fixture.path().join("live-development-node_modules");
+    fs::create_dir(&live_development_install).unwrap();
+    fs::write(
+        live_development_install.join("development-only-package"),
+        "not part of rollback closure\n",
+    )
+    .unwrap();
+    let mut live = identity(&runtime.old_executable);
+    live.runtime.production_node_modules = live_development_install.display().to_string();
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+
+    let receipt = capture_legacy(
+        &store,
+        &request(&runtime),
+        &FakeProcessInspector::with_identities(&runtime.old_executable, vec![live]),
+        &FakeScratchProbe::passing(),
+    )
+    .expect("private npm ci closure is the captured rollback dependency closure");
+
+    let generation = store.verify_generation(&receipt.generation_id).unwrap();
+    assert!(generation
+        .path
+        .join("node_modules/production-package")
+        .is_dir());
+    assert!(!generation
+        .path
+        .join("node_modules/development-only-package")
+        .exists());
 }
 
 #[test]
@@ -1516,6 +1546,70 @@ fn linux_proc_fixture_maps_exact_listening_socket_inode_to_one_pid() {
         .expect("listener owner");
 
     assert_eq!(resolved, listener(PID));
+}
+
+#[test]
+fn exact_pid_listener_resolution_ignores_unrelated_uninspectable_processes() {
+    let proc = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proc.path().join("net")).unwrap();
+    fs::write(
+        proc.path().join("net/tcp"),
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+         0: 0100007F:0D7B 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 991122\n",
+    )
+    .unwrap();
+    fs::write(proc.path().join("net/tcp6"), "").unwrap();
+    fs::create_dir_all(proc.path().join(format!("{PID}/fd"))).unwrap();
+    fs::create_dir_all(proc.path().join(format!("{PID}/ns"))).unwrap();
+    symlink("socket:[991122]", proc.path().join(format!("{PID}/fd/9"))).unwrap();
+    symlink(
+        "net:[4026533111]",
+        proc.path().join(format!("{PID}/ns/net")),
+    )
+    .unwrap();
+    fs::create_dir(proc.path().join("160")).unwrap();
+    fs::write(
+        proc.path().join("160/fd"),
+        "an unrelated process whose descriptors cannot be enumerated",
+    )
+    .unwrap();
+
+    let resolved = LinuxProcfs::with_root(proc.path())
+        .resolve_listener_for_pid(DeployPort::new(PORT).unwrap(), PID)
+        .expect("exact hinted listener owner");
+
+    assert_eq!(resolved, listener(PID));
+}
+
+#[test]
+fn recorded_listener_continuity_does_not_reopen_the_process_fd_directory() {
+    let proc = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proc.path().join("net")).unwrap();
+    fs::write(
+        proc.path().join("net/tcp"),
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+         0: 0100007F:0D7B 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 991122\n",
+    )
+    .unwrap();
+    fs::write(proc.path().join("net/tcp6"), "").unwrap();
+    fs::create_dir_all(proc.path().join(format!("{PID}/ns"))).unwrap();
+    fs::write(
+        proc.path().join(format!("{PID}/fd")),
+        "the established process is no longer ptrace-inspectable",
+    )
+    .unwrap();
+    symlink(
+        "net:[4026533111]",
+        proc.path().join(format!("{PID}/ns/net")),
+    )
+    .unwrap();
+    let expected = listener(PID);
+
+    let resolved = LinuxProcfs::with_root(proc.path())
+        .resolve_recorded_listener(&expected)
+        .expect("durable listener continuity");
+
+    assert_eq!(resolved, expected);
 }
 
 #[test]

@@ -2,16 +2,23 @@
 
 mod activation;
 mod cli;
+mod controller;
+mod controller_command;
+mod deployment;
 mod durable;
 mod error;
 mod journal;
+mod launch_receipt;
 mod legacy;
+mod lifecycle;
 mod locks;
 mod manifest;
 mod paths;
 mod probe;
 mod process_control;
 mod process_identity;
+mod production_env;
+mod real_driver;
 mod receipts;
 mod recovery;
 mod rollback;
@@ -24,17 +31,22 @@ pub use activation::{
     LaunchAttemptObservation, LaunchSpec, PortState, ServiceState,
 };
 pub use cli::{execute_capture, CaptureCommand};
+pub use controller::{execute_controller, inspect_bootstrap_status, BootstrapStatus};
+pub use controller_command::{ControllerCommand, DeployCommand, ServerAssemblySources};
+pub use deployment::{assemble_generation, GenerationDescriptor};
 pub use error::{DeployError, Result};
 pub use journal::{
     ControlPaths, DurableTransactionJournal, LaunchAttempt, LaunchAttemptState, LaunchClaim,
     LaunchExecutorIdentity, LaunchLane, TransactionJournal, TransactionPhase, TransactionRecord,
     UpdateMode,
 };
+pub use launch_receipt::{LaunchAttemptReceipt, LaunchAttemptReceiptStore};
 pub use legacy::{
     capture_legacy, LegacyCaptureReceipt, LegacyCaptureRequest, LegacyRuntimeSources,
     NodePrerequisite, NonSecretLaunchMetadata, RealScratchProbe, RuntimeBindings, ScratchProbe,
     ScratchProbeRequest,
 };
+pub use lifecycle::execute_lifecycle_launch_helper;
 pub use locks::DeploymentLock;
 pub use manifest::{EntryKind, GenerationManifest, ManifestEntry};
 pub use paths::{DeployPort, StorePaths};
@@ -49,6 +61,7 @@ pub use process_identity::{
     FileIdentity, LinuxProcfs, ListenerIdentity, PinnedProcess, ProcessIdentity, ProcessInspector,
     RuntimeProvenance,
 };
+pub use real_driver::{execute_launch_helper, RealActivationDriver};
 pub use receipts::LiveReceipt;
 pub use recovery::RecoveryOutcome;
 pub use store::{Generation, GenerationStage, LockedStore, Store};

@@ -419,11 +419,6 @@ fn verify_live_runtime_sources(
             process.runtime.package_lock.as_str(),
         ),
         (
-            "production dependencies",
-            request.runtime.production_node_modules.as_path(),
-            process.runtime.production_node_modules.as_str(),
-        ),
-        (
             "Node",
             request.node.executable.as_path(),
             process.runtime.node_executable.as_str(),
@@ -509,8 +504,16 @@ fn inspect_legacy_bootstrap_prefix(store: &Store) -> Result<LegacyBootstrapPrefi
 }
 
 fn validate_runtime_sources(sources: &LegacyRuntimeSources) -> Result<()> {
+    validate_source_directory("client", &sources.client_dir)?;
+    validate_release_server_runtime_sources(sources, true)?;
+    Ok(())
+}
+
+fn validate_release_server_runtime_sources(
+    sources: &LegacyRuntimeSources,
+    forbid_nested_sidecar_dependencies: bool,
+) -> Result<()> {
     for (label, path) in [
-        ("client", &sources.client_dir),
         ("extensions", &sources.extensions_dir),
         ("compiled server", &sources.dist_server_dir),
         ("Claude sidecar", &sources.claude_sidecar_dir),
@@ -550,11 +553,29 @@ fn validate_runtime_sources(sources: &LegacyRuntimeSources) -> Result<()> {
         &sources.package_lock,
         &sources.production_node_modules,
     )?;
-    validate_sidecar_shared_dependency_contract(
-        &sources.claude_sidecar_dir,
-        &sources.package_json,
-        &sources.production_node_modules,
-    )
+    if forbid_nested_sidecar_dependencies {
+        validate_sidecar_shared_dependency_contract(
+            &sources.claude_sidecar_dir,
+            &sources.package_json,
+            &sources.production_node_modules,
+        )
+    } else {
+        validate_dependency_subset(
+            &sources.claude_sidecar_dir.join("package.json"),
+            &sources.claude_sidecar_dir.join("package-lock.json"),
+            &sources.package_json,
+            &sources.production_node_modules,
+        )
+    }
+}
+
+pub(crate) fn validate_release_runtime_sources(
+    sources: &LegacyRuntimeSources,
+    node: &NodePrerequisite,
+    forbid_nested_sidecar_dependencies: bool,
+) -> Result<()> {
+    validate_release_server_runtime_sources(sources, forbid_nested_sidecar_dependencies)?;
+    validate_node_prerequisite(node)
 }
 
 fn validate_source_directory(label: &str, path: &Path) -> Result<()> {
@@ -1900,7 +1921,7 @@ fn validate_scratch_ready_receipt(
 }
 
 fn validate_scratch_listener(port: DeployPort, child_pid: u32) -> Result<()> {
-    let listener = LinuxProcfs::default().resolve_listener(port)?;
+    let listener = LinuxProcfs::default().resolve_listener_for_pid(port, child_pid)?;
     if listener.owner_pid != child_pid {
         return Err(DeployError::LegacyCapture(format!(
             "scratch listener on port {port} belongs to pid {}, not spawned pid {child_pid}",

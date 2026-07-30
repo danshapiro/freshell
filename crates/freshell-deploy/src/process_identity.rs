@@ -155,6 +155,20 @@ pub trait ProcessInspector {
     type Pin;
 
     fn resolve_listener(&self, port: DeployPort) -> Result<ListenerIdentity>;
+    fn resolve_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ListenerIdentity> {
+        let listener = self.resolve_listener(port)?;
+        if listener.owner_pid != expected_pid {
+            return Err(DeployError::ProcessIdentity(format!(
+                "listener owner pid {} does not match expected pid {expected_pid}",
+                listener.owner_pid
+            )));
+        }
+        Ok(listener)
+    }
     fn open_pidfd(&self, pid: u32) -> Result<Self::Pin>;
     fn snapshot(&self, pin: &Self::Pin, listener: &ListenerIdentity) -> Result<ProcessIdentity>;
     fn open_executable(&self, pin: &Self::Pin) -> Result<File>;
@@ -170,7 +184,7 @@ pub struct PinnedProcess<'a, Inspector: ProcessInspector> {
 
 impl<'a, Inspector: ProcessInspector> PinnedProcess<'a, Inspector> {
     pub fn pin(inspector: &'a Inspector, pid_hint: u32, port: DeployPort) -> Result<Self> {
-        let listener = inspector.resolve_listener(port)?;
+        let listener = inspector.resolve_listener_for_pid(port, pid_hint)?;
         if listener.port != port {
             return Err(DeployError::ProcessIdentity(format!(
                 "listener resolver returned port {} for requested port {port}",
@@ -226,7 +240,12 @@ impl<'a, Inspector: ProcessInspector> PinnedProcess<'a, Inspector> {
         }
         // Keep listener ownership last so a listener transferred during the
         // more expensive executable hash invalidates the capture.
-        let listener = self.inspector.resolve_listener(self.port)?;
+        let listener = self
+            .inspector
+            .resolve_listener_for_pid(self.port, self.expected.pid)
+            .map_err(|error| {
+                DeployError::ProcessIdentity(format!("listener socket identity changed: {error}"))
+            })?;
         if listener != self.expected.listener {
             return Err(DeployError::ProcessIdentity(
                 "listener socket identity changed".to_string(),
@@ -252,6 +271,13 @@ fn validate_snapshot(
 #[derive(Debug, Clone)]
 pub struct LinuxProcfs {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpectedListenerObservation {
+    PortFree,
+    Expected(ListenerIdentity),
+    Foreign,
 }
 
 impl Default for LinuxProcfs {
@@ -336,6 +362,44 @@ impl LinuxProcfs {
         Ok(owners)
     }
 
+    fn pid_owns_socket(&self, pid: u32, socket_inode: &str) -> Result<bool> {
+        let process_root = self.root.join(pid.to_string());
+        let metadata = match fs::symlink_metadata(&process_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Ok(false);
+        }
+        let wanted = format!("socket:[{socket_inode}]");
+        let fd_dir = process_root.join("fd");
+        let descriptors = match fs::read_dir(&fd_dir) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(DeployError::ProcessIdentity(format!(
+                    "cannot inspect expected pid {pid} fd directory {}: {error}",
+                    fd_dir.display()
+                )));
+            }
+        };
+        for descriptor in descriptors {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            match fs::read_link(descriptor.path()) {
+                Ok(target) if target == Path::new(&wanted) => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn listener_is_loopback(
         &self,
         port: DeployPort,
@@ -364,24 +428,12 @@ impl LinuxProcfs {
     fn pid_path(&self, pid: u32, suffix: &str) -> PathBuf {
         self.root.join(pid.to_string()).join(suffix)
     }
-}
 
-pub struct LinuxPidFd {
-    pid: u32,
-    descriptor: OwnedFd,
-}
-
-impl LinuxPidFd {
-    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
-        self.descriptor.as_raw_fd()
-    }
-}
-
-impl ProcessInspector for LinuxProcfs {
-    type Pin = LinuxPidFd;
-
-    fn resolve_listener(&self, port: DeployPort) -> Result<ListenerIdentity> {
+    pub(crate) fn observe_listener(&self, port: DeployPort) -> Result<Option<ListenerIdentity>> {
         let inodes = self.listener_inodes(port)?;
+        if inodes.is_empty() {
+            return Ok(None);
+        }
         if inodes.len() != 1 {
             return Err(DeployError::ProcessIdentity(format!(
                 "requested port {port} has {} listening socket inodes; ownership is ambiguous",
@@ -408,12 +460,234 @@ impl ProcessInspector for LinuxProcfs {
                 DeployError::ProcessIdentity("network namespace is not UTF-8".to_string())
             })?
             .to_string();
-        Ok(ListenerIdentity {
+        Ok(Some(ListenerIdentity {
             port,
             socket_inode,
             owner_pid,
             network_namespace,
+        }))
+    }
+
+    pub(crate) fn observe_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ExpectedListenerObservation> {
+        let inodes = self.listener_inodes(port)?;
+        if inodes.is_empty() {
+            return Ok(ExpectedListenerObservation::PortFree);
+        }
+        if inodes.len() != 1 {
+            return Err(DeployError::ProcessIdentity(format!(
+                "requested port {port} has {} listening socket inodes; ownership is ambiguous",
+                inodes.len()
+            )));
+        }
+        let socket_inode = inodes.into_iter().next().expect("exactly one");
+        if !self.pid_owns_socket(expected_pid, &socket_inode)? {
+            return Ok(ExpectedListenerObservation::Foreign);
+        }
+        let namespace = fs::read_link(self.pid_path(expected_pid, "ns/net")).map_err(|error| {
+            DeployError::ProcessIdentity(format!(
+                "cannot read expected listener network namespace for pid {expected_pid}: {error}"
+            ))
+        })?;
+        let network_namespace = namespace
+            .to_str()
+            .ok_or_else(|| {
+                DeployError::ProcessIdentity("network namespace is not UTF-8".to_string())
+            })?
+            .to_string();
+        Ok(ExpectedListenerObservation::Expected(ListenerIdentity {
+            port,
+            socket_inode,
+            owner_pid: expected_pid,
+            network_namespace,
+        }))
+    }
+
+    pub fn resolve_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ListenerIdentity> {
+        match self.observe_listener_for_pid(port, expected_pid)? {
+            ExpectedListenerObservation::Expected(listener) => Ok(listener),
+            ExpectedListenerObservation::PortFree => Err(DeployError::ProcessIdentity(format!(
+                "requested port {port} has no listening socket"
+            ))),
+            ExpectedListenerObservation::Foreign => Err(DeployError::ProcessIdentity(format!(
+                "requested port {port} is not owned by expected pid {expected_pid}"
+            ))),
+        }
+    }
+
+    pub(crate) fn observe_recorded_listener(
+        &self,
+        expected: &ListenerIdentity,
+    ) -> Result<ExpectedListenerObservation> {
+        let inodes = self.listener_inodes(expected.port)?;
+        if inodes.is_empty() {
+            return Ok(ExpectedListenerObservation::PortFree);
+        }
+        if inodes.len() != 1 {
+            return Err(DeployError::ProcessIdentity(format!(
+                "requested port {} has {} listening socket inodes; ownership is ambiguous",
+                expected.port,
+                inodes.len()
+            )));
+        }
+        if inodes.first() != Some(&expected.socket_inode) {
+            return Ok(ExpectedListenerObservation::Foreign);
+        }
+        let namespace = match fs::read_link(self.pid_path(expected.owner_pid, "ns/net")) {
+            Ok(namespace) => namespace,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExpectedListenerObservation::Foreign)
+            }
+            Err(error) => {
+                return Err(DeployError::ProcessIdentity(format!(
+                    "cannot read recorded listener network namespace for pid {}: {error}",
+                    expected.owner_pid
+                )))
+            }
+        };
+        if namespace != Path::new(&expected.network_namespace) {
+            return Ok(ExpectedListenerObservation::Foreign);
+        }
+        Ok(ExpectedListenerObservation::Expected(expected.clone()))
+    }
+
+    pub fn resolve_recorded_listener(
+        &self,
+        expected: &ListenerIdentity,
+    ) -> Result<ListenerIdentity> {
+        match self.observe_recorded_listener(expected)? {
+            ExpectedListenerObservation::Expected(listener) => Ok(listener),
+            ExpectedListenerObservation::PortFree => Err(DeployError::ProcessIdentity(format!(
+                "recorded listener port {} has no listening socket",
+                expected.port
+            ))),
+            ExpectedListenerObservation::Foreign => Err(DeployError::ProcessIdentity(format!(
+                "recorded listener fingerprint no longer owns port {}",
+                expected.port
+            ))),
+        }
+    }
+
+    pub(crate) fn port_has_listener(&self, port: DeployPort) -> Result<bool> {
+        Ok(!self.listener_inodes(port)?.is_empty())
+    }
+
+    pub(crate) fn snapshot_listener(&self, listener: &ListenerIdentity) -> Result<ProcessIdentity> {
+        let pin = self.open_pidfd(listener.owner_pid)?;
+        self.snapshot(&pin, listener)
+    }
+
+    pub(crate) fn launch_executor_identity(
+        &self,
+        pid: u32,
+        expected_executable: FileIdentity,
+        expected_cwd: &Path,
+    ) -> Result<crate::journal::LaunchExecutorIdentity> {
+        if self.root != Path::new("/proc") {
+            return Err(DeployError::ProcessIdentity(
+                "launch executor identity requires live /proc".to_string(),
+            ));
+        }
+        let kernel_boot_id = fs::read_to_string(self.root.join("sys/kernel/random/boot_id"))?
+            .trim()
+            .to_string();
+        let stat = fs::read_to_string(self.pid_path(pid, "stat"))?;
+        let start_time_ticks = parse_start_time(&stat)?.to_string();
+        let cwd = fs::read_link(self.pid_path(pid, "cwd"))?;
+        if cwd != expected_cwd {
+            return Err(DeployError::ProcessIdentity(format!(
+                "launch helper cwd {} does not match generation root {}",
+                cwd.display(),
+                expected_cwd.display()
+            )));
+        }
+        let effective_uid = fs::symlink_metadata(self.root.join(pid.to_string()))?.uid();
+        Ok(crate::journal::LaunchExecutorIdentity {
+            pid,
+            kernel_boot_id,
+            start_time_ticks,
+            executable: expected_executable,
+            cwd: expected_cwd.display().to_string(),
+            effective_uid,
         })
+    }
+
+    pub(crate) fn executor_birth_is_alive(
+        &self,
+        executor: &crate::journal::LaunchExecutorIdentity,
+    ) -> Result<bool> {
+        let boot_id = fs::read_to_string(self.root.join("sys/kernel/random/boot_id"))?
+            .trim()
+            .to_string();
+        if boot_id != executor.kernel_boot_id {
+            return Ok(false);
+        }
+        let stat = match fs::read_to_string(self.pid_path(executor.pid, "stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if parse_start_time(&stat)?.to_string() != executor.start_time_ticks {
+            return Ok(false);
+        }
+        let cwd = match fs::read_link(self.pid_path(executor.pid, "cwd")) {
+            Ok(cwd) => cwd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let uid = match fs::symlink_metadata(self.root.join(executor.pid.to_string())) {
+            Ok(metadata) => metadata.uid(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(cwd == Path::new(&executor.cwd) && uid == executor.effective_uid)
+    }
+
+    pub(crate) fn process_birth_is_alive(&self, process: &ProcessIdentity) -> Result<bool> {
+        self.executor_birth_is_alive(&crate::journal::LaunchExecutorIdentity {
+            pid: process.pid,
+            kernel_boot_id: process.kernel_boot_id.clone(),
+            start_time_ticks: process.start_time_ticks.clone(),
+            executable: process.executable.clone(),
+            cwd: process.cwd.clone(),
+            effective_uid: process.effective_uid,
+        })
+    }
+}
+
+pub struct LinuxPidFd {
+    pid: u32,
+    descriptor: OwnedFd,
+}
+
+impl LinuxPidFd {
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.descriptor.as_raw_fd()
+    }
+}
+
+impl ProcessInspector for LinuxProcfs {
+    type Pin = LinuxPidFd;
+
+    fn resolve_listener(&self, port: DeployPort) -> Result<ListenerIdentity> {
+        self.observe_listener(port)?.ok_or_else(|| {
+            DeployError::ProcessIdentity(format!("requested port {port} has no listening socket"))
+        })
+    }
+
+    fn resolve_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ListenerIdentity> {
+        LinuxProcfs::resolve_listener_for_pid(self, port, expected_pid)
     }
 
     fn open_pidfd(&self, pid: u32) -> Result<Self::Pin> {

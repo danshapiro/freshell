@@ -1,186 +1,301 @@
 #!/usr/bin/env bash
-# Launch the Rust freshell server: build client + server, start in background.
-#
-# This is the canonical launcher for the self-hosted PRODUCTION Rust server
-# (default port 3002). See AGENTS.md "Rust Server (Self-Hosted Production)".
+# Canonical compatibility-aware Freshell launcher.
 #
 # Usage:
-#   scripts/launch-rust.sh                 # build client + server, start on port 3002
-#   scripts/launch-rust.sh --port 3499     # any other port (e.g. testing a branch)
-#   scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart --
-#                                          #   the server serves it from disk; just
-#                                          #   hard-refresh the browser)
-#   scripts/launch-rust.sh --skip-build    # start without rebuilding
-#   scripts/launch-rust.sh --restart       # stop the pid-file-verified instance on
-#                                          #   this port first, then start
-#   scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
+#   scripts/launch-rust.sh --restart
+#   scripts/launch-rust.sh --server-only --restart
+#   scripts/launch-rust.sh --client-only
+#   scripts/launch-rust.sh --skip-build
+#   scripts/launch-rust.sh --skip-build --restart
+#   scripts/launch-rust.sh --stop
+#   scripts/launch-rust.sh --port 3499 <mode>
 #
-# SAFETY (per AGENTS.md):
-#   * Restarting the LIVE self-hosted server (port 3002) requires explicit user
-#     approval ("APPROVED"). This script will never kill a process it did not
-#     start: it only stops PIDs recorded in its own pid file, and only after
-#     verifying the process is this repo's freshell-server binary.
-#   * If the port is held by an unknown process, it refuses and tells you.
+# The shell owns argument validation and private build outputs only. Immutable
+# generation assembly, compatibility checks, process ownership, activation,
+# recovery, and lifecycle receipts belong to the Rust deployment controller.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FRESHELL_HOME="${FRESHELL_HOME:-$HOME/.freshell}"
-
 PORT="${PORT:-3002}"
+PORT_SEEN=0
 CLIENT_ONLY=0
+SERVER_ONLY=0
 SKIP_BUILD=0
 RESTART=0
 STOP_ONLY=0
 
+die() {
+  echo "launch-rust: $*" >&2
+  exit 2
+}
+
+mark_once() {
+  local name="$1"
+  local value="$2"
+  [[ "$value" == 0 ]] || die "duplicate $name option"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port) PORT="$2"; shift 2 ;;
-    --port=*) PORT="${1#*=}"; shift ;;
-    --client-only) CLIENT_ONLY=1; shift ;;
-    --skip-build) SKIP_BUILD=1; shift ;;
-    --restart) RESTART=1; shift ;;
-    --stop) STOP_ONLY=1; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "Unknown argument: $1 (try --help)" >&2; exit 2 ;;
+    --port)
+      mark_once "--port" "$PORT_SEEN"
+      [[ $# -ge 2 ]] || die "missing value for --port"
+      PORT="$2"
+      PORT_SEEN=1
+      shift 2
+      ;;
+    --port=*)
+      mark_once "--port" "$PORT_SEEN"
+      PORT="${1#*=}"
+      PORT_SEEN=1
+      shift
+      ;;
+    --client-only)
+      mark_once "--client-only" "$CLIENT_ONLY"
+      CLIENT_ONLY=1
+      shift
+      ;;
+    --server-only)
+      mark_once "--server-only" "$SERVER_ONLY"
+      SERVER_ONLY=1
+      shift
+      ;;
+    --skip-build)
+      mark_once "--skip-build" "$SKIP_BUILD"
+      SKIP_BUILD=1
+      shift
+      ;;
+    --restart)
+      mark_once "--restart" "$RESTART"
+      RESTART=1
+      shift
+      ;;
+    --stop)
+      mark_once "--stop" "$STOP_ONLY"
+      STOP_ONLY=1
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,14s/^# \\{0,1\\}//p' "$0"
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1 (try --help)"
+      ;;
   esac
 done
 
-PID_FILE="$FRESHELL_HOME/rust-server-$PORT.pid"
-LOG_FILE="$FRESHELL_HOME/logs/rust-server-$PORT.log"
-BINARY="$REPO_ROOT/target/release/freshell-server"
+[[ "$PORT" =~ ^(0|[1-9][0-9]*)$ ]] || die "port must be canonical decimal"
+(( PORT >= 1 && PORT <= 65535 )) || die "port must be between 1 and 65535"
+
+(( CLIENT_ONLY + SERVER_ONLY <= 1 )) || die "--client-only and --server-only conflict"
+if (( CLIENT_ONLY == 1 && RESTART == 1 )); then
+  die "--client-only conflicts with --restart"
+fi
+if (( SERVER_ONLY == 1 && RESTART == 0 )); then
+  die "--server-only requires --restart"
+fi
+if (( SKIP_BUILD == 1 && (CLIENT_ONLY == 1 || SERVER_ONLY == 1 || STOP_ONLY == 1) )); then
+  die "--skip-build conflicts with component and stop modes"
+fi
+if (( STOP_ONLY == 1 && (RESTART == 1 || CLIENT_ONLY == 1 || SERVER_ONLY == 1) )); then
+  die "--stop conflicts with restart and component modes"
+fi
+if (( CLIENT_ONLY == 0 && SERVER_ONLY == 0 && SKIP_BUILD == 0 && STOP_ONLY == 0 && RESTART == 0 )); then
+  die "combined deployment requires --restart"
+fi
+
+PORT_ROOT="$REPO_ROOT/.freshell-deploy/ports/$PORT"
+CURRENT_CONTROLLER="$PORT_ROOT/current/controller/freshell-deploy"
+
+require_current_controller() {
+  [[ -x "$CURRENT_CONTROLLER" ]] || {
+    echo "launch-rust: no controller is stored in the selected generation for port $PORT" >&2
+    echo "launch-rust: complete a combined bootstrap before using this mode" >&2
+    exit 1
+  }
+}
+
+if (( STOP_ONLY == 1 )); then
+  require_current_controller
+  exec "$CURRENT_CONTROLLER" stop-current --checkout "$REPO_ROOT" --port "$PORT"
+fi
+
+if (( SKIP_BUILD == 1 )); then
+  require_current_controller
+  if (( RESTART == 1 )); then
+    exec "$CURRENT_CONTROLLER" restart-current --checkout "$REPO_ROOT" --port "$PORT"
+  fi
+  exec "$CURRENT_CONTROLLER" start-current --checkout "$REPO_ROOT" --port "$PORT"
+fi
+
+if (( CLIENT_ONLY == 1 )); then
+  require_current_controller
+fi
+
+BUILD_PARENT="${FRESHELL_DEPLOY_BUILD_PARENT:-${TMPDIR:-/tmp}/freshell-deploy-builds-${UID}}"
+[[ "$BUILD_PARENT" == /* ]] || die "FRESHELL_DEPLOY_BUILD_PARENT must be absolute"
+if [[ ! -e "$BUILD_PARENT" ]]; then
+  (
+    umask 077
+    mkdir -p "$BUILD_PARENT"
+  )
+fi
+[[ -d "$BUILD_PARENT" && ! -L "$BUILD_PARENT" ]] ||
+  die "FRESHELL_DEPLOY_BUILD_PARENT must be a real directory"
+BUILD_PARENT="$(readlink -f "$BUILD_PARENT")"
+[[ "$BUILD_PARENT" != "/" ]] ||
+  die "FRESHELL_DEPLOY_BUILD_PARENT must not be the filesystem root"
+case "$BUILD_PARENT/" in
+  "$REPO_ROOT/"*)
+    die "FRESHELL_DEPLOY_BUILD_PARENT must be outside the checkout and immutable store"
+    ;;
+esac
+BUILD_PARENT_UID="$(stat -c '%u' "$BUILD_PARENT")"
+BUILD_PARENT_MODE="$(stat -c '%a' "$BUILD_PARENT")"
+CURRENT_UID="$(id -u)"
+if [[ "$BUILD_PARENT_UID" != "$CURRENT_UID" ]] &&
+  (( (8#$BUILD_PARENT_MODE & 01000) == 0 )); then
+  die "FRESHELL_DEPLOY_BUILD_PARENT must be owned by the current user or sticky"
+fi
+if (( (8#$BUILD_PARENT_MODE & 00022) != 0 && (8#$BUILD_PARENT_MODE & 01000) == 0 )); then
+  die "FRESHELL_DEPLOY_BUILD_PARENT must not be writable by other users unless sticky"
+fi
+BUILD_DIR="$(mktemp -d "$BUILD_PARENT/launch-$PORT.XXXXXXXX")"
+chmod 700 "$BUILD_DIR"
+
+cleanup_build() {
+  rm -rf -- "$BUILD_DIR"
+}
+trap cleanup_build EXIT
+
+CLIENT_DIR="$BUILD_DIR/client"
+SERVER_BUILD_ROOT="$BUILD_DIR/server-build"
+DIST_SERVER_DIR="$SERVER_BUILD_ROOT/server"
+RUNTIME_ROOT="$BUILD_DIR/runtime"
+CARGO_TARGET_DIR_VALUE="$BUILD_DIR/cargo-target"
+CONTROLLER="$CURRENT_CONTROLLER"
+
+build_client() {
+  echo "Typechecking and building the client in private staging..."
+  npm run typecheck:client -- \
+    --incremental false \
+    --tsBuildInfoFile "$BUILD_DIR/tsconfig.client.tsbuildinfo"
+  FRESHELL_CLIENT_OUT_DIR="$CLIENT_DIR" npm run build:client
+}
+
+build_server_runtime() {
+  echo "Typechecking and building the server runtime in private staging..."
+  npm run typecheck:server -- \
+    --incremental false \
+    --tsBuildInfoFile "$BUILD_DIR/tsconfig.server.check.tsbuildinfo"
+  npm run build:server -- \
+    --outDir "$SERVER_BUILD_ROOT" \
+    --tsBuildInfoFile "$BUILD_DIR/tsconfig.server.build.tsbuildinfo"
+
+  mkdir -p "$RUNTIME_ROOT"
+  cp "$REPO_ROOT/package.json" "$RUNTIME_ROOT/package.json"
+  cp "$REPO_ROOT/package-lock.json" "$RUNTIME_ROOT/package-lock.json"
+  npm ci --omit=dev --prefix "$RUNTIME_ROOT"
+
+  CARGO_TARGET_DIR="$CARGO_TARGET_DIR_VALUE" \
+    cargo build --release -p freshell-server -p freshell-deploy
+  CONTROLLER="$CARGO_TARGET_DIR_VALUE/release/freshell-deploy"
+  [[ -x "$CONTROLLER" ]] || {
+    echo "launch-rust: private controller build did not produce $CONTROLLER" >&2
+    exit 1
+  }
+  [[ -x "$CARGO_TARGET_DIR_VALUE/release/freshell-server" ]] || {
+    echo "launch-rust: private server build did not produce freshell-server" >&2
+    exit 1
+  }
+}
+
+NODE_COMMAND="$(command -v node)"
+NODE_EXECUTABLE="$(readlink -f "$NODE_COMMAND")"
+[[ "$NODE_EXECUTABLE" == /* && -x "$NODE_EXECUTABLE" ]] || {
+  echo "launch-rust: Node executable could not be resolved to an absolute executable" >&2
+  exit 1
+}
+NODE_VERSION="$("$NODE_EXECUTABLE" --version)"
 
 cd "$REPO_ROOT"
 
-# --- helpers -----------------------------------------------------------------
-
-# True iff $1 is a live PID that is THIS repo's rust server (never match a
-# foreign process -- see AGENTS.md Process Safety).
-is_our_server_pid() {
-  local pid="$1" cwd="" args=""
-  kill -0 "$pid" 2>/dev/null || return 1
-  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
-  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-  [[ "$cwd" == "$REPO_ROOT" && "$args" == *"target/release/freshell-server"* ]]
-}
-
-port_in_use() {
-  ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$PORT\$"
-}
-
-stop_ours() {
-  if [[ ! -f "$PID_FILE" ]]; then
-    echo "No pid file at $PID_FILE -- nothing to stop." >&2
-    return 1
-  fi
-  local pid
-  pid="$(cat "$PID_FILE")"
-  if is_our_server_pid "$pid"; then
-    echo "Stopping freshell-server pid $pid (port $PORT)..."
-    kill "$pid"
-    for _ in $(seq 1 20); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.25
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "Process $pid did not exit after SIGTERM; NOT escalating automatically." >&2
-      return 1
-    fi
-    rm -f "$PID_FILE"
-  else
-    echo "Pid file $PID_FILE is stale (pid $pid is not this repo's server); removing." >&2
-    rm -f "$PID_FILE"
-    return 1
-  fi
-}
-
-# --- stop mode ---------------------------------------------------------------
-
-if [[ "$STOP_ONLY" == 1 ]]; then
-  stop_ours
-  exit $?
+if (( CLIENT_ONLY == 1 )); then
+  build_client
+  "$CONTROLLER" deploy \
+    --checkout "$REPO_ROOT" \
+    --port "$PORT" \
+    --mode client-only \
+    --client-dir "$CLIENT_DIR" \
+    --node-executable "$NODE_EXECUTABLE" \
+    --node-version "$NODE_VERSION"
+  echo "Client generation selected. Hard-refresh the browser to load it."
+  exit 0
 fi
 
-# --- build -------------------------------------------------------------------
-
-if [[ "$SKIP_BUILD" != 1 ]]; then
-  echo "Building client (typecheck + vite)..."
-  npm run typecheck:client
-  npm run build:client
-  if [[ "$CLIENT_ONLY" == 1 ]]; then
-    echo ""
-    echo "Client rebuilt at dist/client. The running server serves it from disk --"
-    echo "hard-refresh the browser to pick it up. No server restart needed."
-    exit 0
-  fi
-  echo "Building Rust server (cargo build --release -p freshell-server)..."
-  cargo build --release -p freshell-server
+if (( SERVER_ONLY == 1 )); then
+  build_server_runtime
+  "$CONTROLLER" deploy \
+    --checkout "$REPO_ROOT" \
+    --port "$PORT" \
+    --mode server \
+    --server-executable "$CARGO_TARGET_DIR_VALUE/release/freshell-server" \
+    --controller-executable "$CONTROLLER" \
+    --extensions-dir "$REPO_ROOT/extensions" \
+    --dist-server-dir "$DIST_SERVER_DIR" \
+    --mcp-entry-relative "mcp/server.js" \
+    --claude-sidecar-dir "$REPO_ROOT/crates/freshell-claude-sidecar" \
+    --claude-sidecar-entry-relative "index.mjs" \
+    --package-json "$RUNTIME_ROOT/package.json" \
+    --package-lock "$RUNTIME_ROOT/package-lock.json" \
+    --node-modules "$RUNTIME_ROOT/node_modules" \
+    --node-executable "$NODE_EXECUTABLE" \
+    --node-version "$NODE_VERSION"
+  exit 0
 fi
 
-[[ -x "$BINARY" ]] || { echo "Missing binary: $BINARY (build first)" >&2; exit 1; }
+build_client
+build_server_runtime
 
-# --- preflight ---------------------------------------------------------------
-
-# AUTH_TOKEN must be available (env or .env in repo root; the server loads .env
-# from its cwd and refuses to start without a token).
-AUTH_TOKEN_VALUE="${AUTH_TOKEN:-$(grep -m1 '^AUTH_TOKEN=' .env 2>/dev/null | cut -d= -f2- || true)}"
-if [[ -z "$AUTH_TOKEN_VALUE" ]]; then
-  echo "AUTH_TOKEN not set (env or $REPO_ROOT/.env). The server will refuse to start." >&2
+BOOTSTRAP_STATE="$("$CONTROLLER" bootstrap-status --checkout "$REPO_ROOT" --port "$PORT")"
+if [[ "$BOOTSTRAP_STATE" == "capture-required" ]]; then
+  FRESHELL_HOME_VALUE="${FRESHELL_HOME:-$HOME/.freshell}"
+  "$CONTROLLER" capture \
+    --checkout "$REPO_ROOT" \
+    --port "$PORT" \
+    --pid-file "$FRESHELL_HOME_VALUE/rust-server-$PORT.pid" \
+    --client-dir "$REPO_ROOT/dist/client" \
+    --extensions-dir "$REPO_ROOT/extensions" \
+    --dist-server-dir "$REPO_ROOT/dist/server" \
+    --mcp-entry-relative "mcp/server.js" \
+    --claude-sidecar-dir "$REPO_ROOT/crates/freshell-claude-sidecar" \
+    --claude-sidecar-entry-relative "index.mjs" \
+    --package-json "$REPO_ROOT/package.json" \
+    --package-lock "$REPO_ROOT/package-lock.json" \
+    --node-modules "$RUNTIME_ROOT/node_modules" \
+    --node-executable "$NODE_EXECUTABLE" \
+    --node-version "$NODE_VERSION"
+elif [[ "$BOOTSTRAP_STATE" != "captured-legacy" && "$BOOTSTRAP_STATE" != "managed" ]]; then
+  echo "launch-rust: controller returned unknown bootstrap state $BOOTSTRAP_STATE" >&2
   exit 1
 fi
 
-# Existing instance on this port?
-if [[ -f "$PID_FILE" ]]; then
-  saved_pid="$(cat "$PID_FILE")"
-  if is_our_server_pid "$saved_pid"; then
-    if [[ "$RESTART" == 1 ]]; then
-      stop_ours
-    else
-      echo "freshell-server already running on port $PORT (pid $saved_pid)."
-      echo "  URL: http://localhost:$PORT/?token=$AUTH_TOKEN_VALUE"
-      echo "  Use --restart to stop and relaunch it. NOTE: restarting the live"
-      echo "  self-hosted server (port 3002) requires explicit user approval."
-      exit 0
-    fi
-  else
-    rm -f "$PID_FILE"
-  fi
-fi
-
-if port_in_use; then
-  echo "Port $PORT is in use by a process this script did not start. Refusing." >&2
-  echo "(Never kill foreign processes -- see AGENTS.md Process Safety.)" >&2
-  exit 1
-fi
-
-# --- launch ------------------------------------------------------------------
-
-mkdir -p "$(dirname "$LOG_FILE")"
-echo "Starting freshell-server on port $PORT..."
-PORT="$PORT" nohup "$BINARY" >> "$LOG_FILE" 2>&1 &
-SERVER_PID=$!
-echo "$SERVER_PID" > "$PID_FILE"
-
-# Health check: /api/health is unauthenticated and rate-limit exempt.
-for _ in $(seq 1 60); do
-  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
-    echo ""
-    echo "freshell-server is ready! (pid $SERVER_PID, port $PORT)"
-    # The listening line includes the commit the binary was built from.
-    grep -m1 "freshell-server listening" "$LOG_FILE" | tail -1 || true
-    echo "  URL: http://localhost:$PORT/?token=$AUTH_TOKEN_VALUE"
-    echo "  Log: $LOG_FILE"
-    echo "  Pid: $PID_FILE"
-    exit 0
-  fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "Server exited during startup. Last log lines:" >&2
-    tail -20 "$LOG_FILE" >&2 || true
-    rm -f "$PID_FILE"
-    exit 1
-  fi
-  sleep 0.5
-done
-
-echo "Server started (pid $SERVER_PID) but /api/health not ready within 30s. Check $LOG_FILE" >&2
-exit 1
+"$CONTROLLER" deploy \
+  --checkout "$REPO_ROOT" \
+  --port "$PORT" \
+  --mode full \
+  --client-dir "$CLIENT_DIR" \
+  --server-executable "$CARGO_TARGET_DIR_VALUE/release/freshell-server" \
+  --controller-executable "$CONTROLLER" \
+  --extensions-dir "$REPO_ROOT/extensions" \
+  --dist-server-dir "$DIST_SERVER_DIR" \
+  --mcp-entry-relative "mcp/server.js" \
+  --claude-sidecar-dir "$REPO_ROOT/crates/freshell-claude-sidecar" \
+  --claude-sidecar-entry-relative "index.mjs" \
+  --package-json "$RUNTIME_ROOT/package.json" \
+  --package-lock "$RUNTIME_ROOT/package-lock.json" \
+  --node-modules "$RUNTIME_ROOT/node_modules" \
+  --node-executable "$NODE_EXECUTABLE" \
+  --node-version "$NODE_VERSION"

@@ -476,6 +476,125 @@ impl GenerationStage {
         Ok(())
     }
 
+    pub(crate) fn copy_tree_excluding_top_level(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        excluded: &Path,
+    ) -> Result<()> {
+        self.require_unsealed()?;
+        validate_relative_path(destination, true)?;
+        validate_relative_path(excluded, false)?;
+        if excluded.components().count() != 1 {
+            return Err(DeployError::UnsafeRelativePath(excluded.to_path_buf()));
+        }
+        let source = self
+            .store
+            .canonical_disjoint_tree_source(source, Some(&self.path))?;
+        let metadata = fs::symlink_metadata(&source)?;
+        let destination_root = self.path.join(destination);
+        if !destination.as_os_str().is_empty() {
+            let parent = destination_root
+                .parent()
+                .expect("non-empty stage destination has a parent");
+            create_stage_directories(&self.path, parent)?;
+            fs::create_dir(&destination_root)?;
+        }
+        copy_directory_contents_excluding(
+            &source,
+            &destination_root,
+            destination,
+            excluded.as_os_str(),
+        )?;
+        if !destination.as_os_str().is_empty() {
+            fs::set_permissions(
+                &destination_root,
+                fs::Permissions::from_mode(metadata.mode() & 0o7777),
+            )?;
+            sync_directory(&destination_root)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_generation_tree(
+        &mut self,
+        generation: &Generation,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        self.require_unsealed()?;
+        validate_relative_path(source, false)?;
+        validate_relative_path(destination, false)?;
+        let verified = self.store.verify_generation(&generation.id)?;
+        if verified.path != generation.path || verified.manifest != generation.manifest {
+            return Err(DeployError::InvalidManifest(
+                "generation composition source changed after verification".to_string(),
+            ));
+        }
+        let source_root = generation.path.join(source);
+        let metadata = fs::symlink_metadata(&source_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(DeployError::TypeMismatch(source_root));
+        }
+        let destination_root = self.path.join(destination);
+        let parent = destination_root
+            .parent()
+            .expect("validated destination has a parent");
+        create_stage_directories(&self.path, parent)?;
+        fs::create_dir(&destination_root)?;
+        copy_directory_contents(&source_root, &destination_root, destination)?;
+        fs::set_permissions(
+            &destination_root,
+            fs::Permissions::from_mode(metadata.mode() & 0o7777),
+        )?;
+        sync_directory(&destination_root)
+    }
+
+    pub(crate) fn copy_generation_file(
+        &mut self,
+        generation: &Generation,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        self.require_unsealed()?;
+        validate_relative_path(source, false)?;
+        validate_relative_path(destination, false)?;
+        let verified = self.store.verify_generation(&generation.id)?;
+        if verified.path != generation.path || verified.manifest != generation.manifest {
+            return Err(DeployError::InvalidManifest(
+                "generation composition source changed after verification".to_string(),
+            ));
+        }
+        let source_path = generation.path.join(source);
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DeployError::TypeMismatch(source_path));
+        }
+        self.copy_file(&source_path, destination, metadata.mode() & 0o7777)
+    }
+
+    pub(crate) fn merge_generation_assets(
+        &mut self,
+        generation: &Generation,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        self.require_unsealed()?;
+        validate_relative_path(source, false)?;
+        validate_relative_path(destination, false)?;
+        let verified = self.store.verify_generation(&generation.id)?;
+        if verified.path != generation.path || verified.manifest != generation.manifest {
+            return Err(DeployError::InvalidManifest(
+                "generation asset source changed after verification".to_string(),
+            ));
+        }
+        merge_missing_assets(
+            &generation.path.join(source),
+            &self.path.join(destination),
+            &self.path,
+        )
+    }
+
     pub fn copy_file(&mut self, source: &Path, destination: &Path, mode: u32) -> Result<()> {
         self.require_unsealed()?;
         validate_relative_path(destination, false)?;
@@ -658,6 +777,136 @@ fn copy_directory_contents(source: &Path, destination: &Path, relative_base: &Pa
         }
     }
     Ok(())
+}
+
+fn copy_directory_contents_excluding(
+    source: &Path,
+    destination: &Path,
+    relative_base: &Path,
+    excluded: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut children = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name().as_bytes().to_vec());
+    for child in children {
+        if child.file_name() == excluded {
+            continue;
+        }
+        copy_tree_entry(
+            &child.path(),
+            &destination.join(child.file_name()),
+            relative_base,
+        )?;
+    }
+    sync_directory(destination)
+}
+
+fn copy_tree_entry(source: &Path, destination: &Path, relative_parent: &Path) -> Result<()> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| DeployError::UnsafeStorePath(source.to_path_buf()))?;
+    let relative = relative_parent.join(name);
+    validate_relative_path(&relative, false)?;
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(source)?;
+        validate_symlink_target(&relative, &target)?;
+        symlink(target, destination)?;
+    } else if metadata.is_dir() {
+        fs::create_dir(destination)?;
+        copy_directory_contents(source, destination, &relative)?;
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode(metadata.mode() & 0o7777),
+        )?;
+        sync_directory(destination)?;
+    } else if metadata.is_file() {
+        copy_regular_file(source, destination, metadata.mode() & 0o7777)?;
+    } else {
+        return Err(DeployError::InvalidManifest(format!(
+            "special files are not allowed: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn merge_missing_assets(source: &Path, destination: &Path, stage_root: &Path) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(DeployError::InvalidManifest(
+            "selected client assets are not a real directory".to_string(),
+        ));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| DeployError::UnsafeStorePath(destination.to_path_buf()))?;
+            create_stage_directories(stage_root, parent)?;
+            fs::create_dir(destination)?;
+        }
+        _ => {
+            return Err(DeployError::InvalidManifest(
+                "candidate client assets are not a real directory".to_string(),
+            ))
+        }
+    }
+    let mut children = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name().as_bytes().to_vec());
+    for child in children {
+        let source_path = child.path();
+        let destination_path = destination.join(child.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path)?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(DeployError::InvalidManifest(format!(
+                "selected client asset is a symlink: {}",
+                source_path.display()
+            )));
+        }
+        match fs::symlink_metadata(&destination_path) {
+            Ok(destination_metadata) => {
+                if source_metadata.is_dir() && destination_metadata.is_dir() {
+                    merge_missing_assets(&source_path, &destination_path, stage_root)?;
+                } else if source_metadata.is_file()
+                    && destination_metadata.is_file()
+                    && source_metadata.mode() & 0o7555 == destination_metadata.mode() & 0o7555
+                    && crate::manifest::sha256_file(&source_path)?
+                        == crate::manifest::sha256_file(&destination_path)?
+                {
+                    continue;
+                } else {
+                    return Err(DeployError::InvalidManifest(format!(
+                        "candidate client asset conflicts with retained asset {}",
+                        destination_path.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if source_metadata.is_dir() {
+                    fs::create_dir(&destination_path)?;
+                    merge_missing_assets(&source_path, &destination_path, stage_root)?;
+                    fs::set_permissions(
+                        &destination_path,
+                        fs::Permissions::from_mode(source_metadata.mode() & 0o7777),
+                    )?;
+                } else if source_metadata.is_file() {
+                    copy_regular_file(
+                        &source_path,
+                        &destination_path,
+                        source_metadata.mode() & 0o7777,
+                    )?;
+                } else {
+                    return Err(DeployError::InvalidManifest(format!(
+                        "selected client asset is special: {}",
+                        source_path.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sync_directory(destination)
 }
 
 fn create_stage_directories(stage_root: &Path, destination: &Path) -> Result<()> {

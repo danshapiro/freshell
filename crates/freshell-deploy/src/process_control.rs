@@ -52,6 +52,29 @@ pub trait PidfdBackend {
     type Pidfd;
 
     fn resolve_listener(&self, port: DeployPort) -> Result<ListenerIdentity>;
+    fn resolve_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ListenerIdentity> {
+        let listener = self.resolve_listener(port)?;
+        if listener.owner_pid != expected_pid {
+            return Err(DeployError::ProcessControl(format!(
+                "listener owner pid {} does not match expected pid {expected_pid}",
+                listener.owner_pid
+            )));
+        }
+        Ok(listener)
+    }
+    fn resolve_recorded_listener(&self, expected: &ListenerIdentity) -> Result<ListenerIdentity> {
+        let listener = self.resolve_listener(expected.port)?;
+        if &listener != expected {
+            return Err(DeployError::ProcessControl(
+                "listener identity does not match the authoritative receipt".to_string(),
+            ));
+        }
+        Ok(listener)
+    }
     fn open_pidfd(&self, pid: u32) -> Result<Self::Pidfd>;
     fn snapshot(&self, pidfd: &Self::Pidfd, listener: &ListenerIdentity)
         -> Result<ProcessIdentity>;
@@ -69,7 +92,7 @@ pub struct VerifiedProcess<'a, Backend: PidfdBackend> {
 impl<'a, Backend: PidfdBackend> VerifiedProcess<'a, Backend> {
     pub fn bind(backend: &'a Backend, expected: &ProcessIdentity) -> Result<Self> {
         expected.validate()?;
-        let listener = backend.resolve_listener(expected.listener.port)?;
+        let listener = backend.resolve_recorded_listener(&expected.listener)?;
         if listener != expected.listener {
             return Err(DeployError::ProcessControl(
                 "listener identity does not match the authoritative receipt".to_string(),
@@ -91,7 +114,9 @@ impl<'a, Backend: PidfdBackend> VerifiedProcess<'a, Backend> {
 
     pub fn revalidate(&self) -> Result<()> {
         self.revalidate_process()?;
-        let listener = self.backend.resolve_listener(self.expected.listener.port)?;
+        let listener = self
+            .backend
+            .resolve_recorded_listener(&self.expected.listener)?;
         if listener != self.expected.listener {
             return Err(DeployError::ProcessControl(
                 "listener ownership changed after pidfd pinning".to_string(),
@@ -151,6 +176,18 @@ impl PidfdBackend for LinuxPidfdBackend {
 
     fn resolve_listener(&self, port: DeployPort) -> Result<ListenerIdentity> {
         self.procfs.resolve_listener(port)
+    }
+
+    fn resolve_listener_for_pid(
+        &self,
+        port: DeployPort,
+        expected_pid: u32,
+    ) -> Result<ListenerIdentity> {
+        self.procfs.resolve_listener_for_pid(port, expected_pid)
+    }
+
+    fn resolve_recorded_listener(&self, expected: &ListenerIdentity) -> Result<ListenerIdentity> {
+        self.procfs.resolve_recorded_listener(expected)
     }
 
     fn open_pidfd(&self, pid: u32) -> Result<Self::Pidfd> {

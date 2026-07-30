@@ -1295,6 +1295,7 @@ dependencies = [
 name = "freshell-deploy"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "freshell-deployment",
  "libc",
  "serde",
