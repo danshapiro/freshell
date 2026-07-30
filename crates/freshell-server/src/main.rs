@@ -20,6 +20,7 @@ mod boot;
 mod checkpoints;
 mod diag;
 mod existence;
+mod existence_by_id;
 mod extensions;
 mod files;
 mod identity_sink;
@@ -583,8 +584,8 @@ async fn main() -> ExitCode {
         // provider home resolves — mirrors `session_index`'s own `Option`
         // convention.
         session_existence: match &session_index {
-            Some(index) => std::sync::Arc::new(
-                existence::IndexExistenceProbe::new(
+            Some(index) => {
+                let probe = existence::IndexExistenceProbe::new(
                     std::sync::Arc::clone(index),
                     // P1.8 read 2: the durable ledger backs `ever_observed`, so a
                     // transcript deleted while the server was DOWN still derives
@@ -630,8 +631,34 @@ async fn main() -> ExitCode {
                 // (bounded deferral), never a false dead_session.
                 .with_opencode_session_locator(existence::opencode_db_locator(
                     freshell_sessions::parse::default_opencode_data_home(),
-                )),
-            ),
+                ));
+                // Amplifier by-id fallback (resume-validation): the SAME
+                // all-slugs disk scan the stub writer/attach arm trusts
+                // (amplifier_stub::session_on_disk), over the SAME home the
+                // stub writer resolves. Covers both a stale warm snapshot
+                // AND the cold index at boot (restore-time creates race the
+                // detached sweep). No resolvable home => probe behaves as
+                // today for amplifier.
+                let probe = match freshell_sessions::amplifier_stub::resolve_amplifier_home() {
+                    Some(amplifier_home) => probe.with_amplifier_session_locator(
+                        existence::amplifier_dir_locator(amplifier_home),
+                    ),
+                    None => probe,
+                };
+                // Codex by-id fallback (resume-validation): the gate-safe
+                // tri-state rollout walk over the SAME sessions root the
+                // ActivityHub's resume-time locator (above) walks —
+                // warm-Absent adjudication only (AD-4: ~1s on a real
+                // store, never on the cold path). No resolvable root =>
+                // probe behaves as today for codex.
+                let probe = match freshell_ws::codex_sessions_root() {
+                    Some(codex_sessions_root) => probe.with_codex_rollout_locator(
+                        existence::codex_rollout_existence_locator(codex_sessions_root),
+                    ),
+                    None => probe,
+                };
+                std::sync::Arc::new(probe)
+            }
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
         // §5.3 row 5: the ONE bounded index-warming deferral's budget
