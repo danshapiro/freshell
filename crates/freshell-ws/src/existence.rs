@@ -57,6 +57,17 @@ pub trait SessionExistenceProbe: Send + Sync {
     fn ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool {
         self.ever_observed(provider, session_id)
     }
+
+    /// Gate-caller variant of [`Self::exists`]: may perform EXPENSIVE by-id
+    /// disk work (the codex rollout walk, ~1s on a real store) to adjudicate
+    /// a warm-snapshot Absent. Callers MUST run it inside
+    /// `tokio::task::spawn_blocking` (A13: never inline on the async
+    /// runtime). `exists()` stays bounded for the sync reconcile path (the
+    /// ~250ms reconcile IO budget). Default: delegate to `exists()`, so
+    /// fakes and [`NoIndexProbe`] need no change.
+    fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
+        self.exists(provider, session_id)
+    }
 }
 
 /// The no-index fallback (mirrors `session_index: None` in

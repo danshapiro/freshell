@@ -124,9 +124,10 @@ pub struct IndexExistenceProbe {
     /// pure index answer.
     amplifier_session_locator: Option<AmplifierSessionLocator>,
     /// Codex by-id fallback (resume-validation): warm-Absent adjudication
-    /// ONLY — the rollout walk is ~1s on a real store, so the cold path
-    /// never consults it (AD-4: cold codex stays `Unknown`). `None` keeps
-    /// the pure index answer.
+    /// ONLY, and only from `exists_for_gate` — the rollout walk is ~1s on a
+    /// real store, so plain `exists()` (sync reconcile path, ~250ms budget)
+    /// and the cold path never consult it (AD-4: cold codex stays
+    /// `Unknown`). `None` keeps the pure index answer.
     codex_rollout_locator: Option<CodexRolloutExistenceLocator>,
 }
 
@@ -351,14 +352,20 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         }
                     }
                 }
-                // Amplifier/codex by-id fallbacks (resume-validation): a
-                // STALE warm snapshot must never adjudicate a real session
-                // absent — a session created moments before a restart may be
-                // missing from the snapshot, and `peek()` serves snapshots
+                // Amplifier by-id fallback (resume-validation): a STALE warm
+                // snapshot must never adjudicate a real session absent — a
+                // session created moments before a restart may be missing
+                // from the snapshot, and `peek()` serves snapshots
                 // regardless of TTL. Same adjudication point as the claude/
                 // opencode fallbacks above: only reached when the snapshot
-                // would otherwise answer Absent. After these arms, `Absent`
-                // for all four validated providers is POSITIVE absence.
+                // would otherwise answer Absent. The scan is CHEAP (one
+                // read_dir + one metadata per project slug), so it stays on
+                // this sync reconcile-consulted path. After this arm,
+                // `Absent` for claude/opencode/amplifier is POSITIVE
+                // absence; codex `Absent` from `exists()` is SNAPSHOT-ONLY
+                // (non-positive) — the ~1s rollout walk lives in
+                // `exists_for_gate` (below), so positive codex absence is
+                // the gate variant's job.
                 if provider == "amplifier" {
                     if let Some(locator) = &self.amplifier_session_locator {
                         match locator(session_id) {
@@ -366,21 +373,6 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                                 // A fallback hit is an on-disk observation:
                                 // feed the monotone observed-set (module-doc
                                 // invariant), same as the arms above.
-                                self.observed
-                                    .lock()
-                                    .expect("observed set lock")
-                                    .insert(format!("{provider}:{session_id}"));
-                                return SessionExistence::Present;
-                            }
-                            ByIdAnswer::Unreadable => return SessionExistence::Unknown,
-                            ByIdAnswer::Absent => {}
-                        }
-                    }
-                }
-                if provider == "codex" {
-                    if let Some(locator) = &self.codex_rollout_locator {
-                        match locator(session_id) {
-                            ByIdAnswer::Present => {
                                 self.observed
                                     .lock()
                                     .expect("observed set lock")
@@ -416,6 +408,38 @@ impl SessionExistenceProbe for IndexExistenceProbe {
             .lock()
             .expect("observed set lock")
             .contains(&format!("{provider}:{session_id}"))
+    }
+
+    /// Gate-caller variant (trait doc): `exists()` plus the EXPENSIVE codex
+    /// by-id rollout walk (~1s on a real store) on a warm-Absent answer.
+    /// The walk lives HERE and not in `exists()` because `exists()` is
+    /// consulted inline on the sync reconcile path, whose IO discipline is
+    /// ~250ms per consult (see `opencode_db_locator`); gate callers run this
+    /// variant inside `tokio::task::spawn_blocking` (A13: never inline on
+    /// the async runtime). AD-4 is preserved exactly: cold-index codex
+    /// answers `Unknown` from `exists()`, and the walk only runs on
+    /// `Absent`, so it still NEVER runs on the cold path.
+    fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
+        let base = self.exists(provider, session_id);
+        if base == SessionExistence::Absent && provider == "codex" {
+            if let Some(locator) = &self.codex_rollout_locator {
+                return match locator(session_id) {
+                    ByIdAnswer::Present => {
+                        // A fallback hit is an on-disk observation: feed the
+                        // monotone observed-set (module-doc invariant), same
+                        // as the fallback arms in `exists()`.
+                        self.observed
+                            .lock()
+                            .expect("observed set lock")
+                            .insert(format!("{provider}:{session_id}"));
+                        SessionExistence::Present
+                    }
+                    ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                    ByIdAnswer::Absent => SessionExistence::Absent,
+                };
+            }
+        }
+        base
     }
 }
 

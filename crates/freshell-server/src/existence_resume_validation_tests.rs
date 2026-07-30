@@ -156,13 +156,53 @@ async fn codex_absent_snapshot_rescued_by_rollout_locator() {
     let probe = probe.with_codex_rollout_locator(codex_rollout_existence_locator(root.clone()));
     index.warm().await;
     assert_eq!(
-        probe.exists("codex", session_id),
+        probe.exists_for_gate("codex", session_id),
         SessionExistence::Present,
         "the rollout exists on disk (the resume arm would find it) — a stale \
          warm snapshot must never adjudicate it absent"
     );
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Pins the exists()/exists_for_gate split (reconcile blocking-IO fix):
+/// plain `exists()` is consulted inline on the sync reconcile path (~250ms
+/// IO budget), so it must answer a warm-snapshot Absent for codex WITHOUT
+/// running the ~1s rollout walk; `exists_for_gate()` (spawn doors, wrapped
+/// in spawn_blocking per A13) runs the walk on the SAME probe and rescues
+/// the stale warm-Absent.
+#[tokio::test]
+async fn reconcile_exists_never_runs_codex_walk_gate_variant_does() {
+    use std::sync::atomic::AtomicBool;
+    let home = temp_claude_home("codex-gate-split");
+    let (probe, index) = probe_over(&home);
+    let walked = Arc::new(AtomicBool::new(false));
+    let walked_in = Arc::clone(&walked);
+    let probe = probe.with_codex_rollout_locator(Arc::new(move |_sid: &str| {
+        walked_in.store(true, TestOrdering::SeqCst);
+        ByIdAnswer::Present
+    }));
+    index.warm().await;
+    assert_eq!(
+        probe.exists("codex", "thread-gate-split"),
+        SessionExistence::Absent,
+        "plain exists() answers the snapshot Absent WITHOUT the ~1s walk \
+         (reconcile-path IO budget)"
+    );
+    assert!(
+        !walked.load(TestOrdering::SeqCst),
+        "the codex rollout walk must never run from exists() (reconcile path)"
+    );
+    assert_eq!(
+        probe.exists_for_gate("codex", "thread-gate-split"),
+        SessionExistence::Present,
+        "the gate variant runs the walk and rescues the stale warm-Absent"
+    );
+    assert!(
+        walked.load(TestOrdering::SeqCst),
+        "exists_for_gate must consult the codex rollout locator on warm-Absent"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// sessions root NotFound => Absent (AD-1: fresh install, parent readable);
@@ -179,7 +219,7 @@ async fn codex_missing_sessions_root_is_absent_and_unreadable_is_unknown() {
         probe.with_codex_rollout_locator(codex_rollout_existence_locator(missing_root.clone()));
     index.warm().await;
     assert_eq!(
-        probe.exists("codex", "thread-1"),
+        probe.exists_for_gate("codex", "thread-1"),
         SessionExistence::Absent,
         "missing sessions root with readable parent is positive absence (AD-1)"
     );
@@ -191,7 +231,7 @@ async fn codex_missing_sessions_root_is_absent_and_unreadable_is_unknown() {
     let probe2 = probe2.with_codex_rollout_locator(Arc::new(|_sid: &str| ByIdAnswer::Unreadable));
     index2.warm().await;
     assert_eq!(
-        probe2.exists("codex", "thread-2"),
+        probe2.exists_for_gate("codex", "thread-2"),
         SessionExistence::Unknown,
         "an unreadable store is honest Unknown — fail open, never Absent"
     );
@@ -260,7 +300,7 @@ fn codex_unreadable_date_subdir_answers_unreadable() {
         .build()
         .unwrap();
     rt.block_on(index.warm());
-    let probe_answer = probe.exists("codex", session_id);
+    let probe_answer = probe.exists_for_gate("codex", session_id);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(probe_answer, SessionExistence::Unknown);
     let _ = std::fs::remove_dir_all(&home);

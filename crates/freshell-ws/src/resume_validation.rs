@@ -62,7 +62,7 @@ pub fn validate_wire_resume(
     if !provider_validated(mode) {
         return passthrough(resume_session_id, launch_intent);
     }
-    let existence = map_existence(probe.exists(mode, &sid));
+    let existence = map_existence(probe.exists_for_gate(mode, &sid));
     let ever_on_disk = probe.ever_observed_on_disk(mode, &sid);
     match evaluate_resume_gate(mode, existence, ever_on_disk) {
         ResumeGateDecision::Proceed => passthrough(resume_session_id, launch_intent),

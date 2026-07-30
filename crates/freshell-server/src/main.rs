@@ -676,7 +676,7 @@ async fn main() -> ExitCode {
             std::sync::Arc::new(move |provider: &str, session_id: &str| {
                 use freshell_platform::resume_gate::{ResumeExistence, ResumeProbeAnswer};
                 use freshell_ws::existence::SessionExistence;
-                let existence = match probe.exists(provider, session_id) {
+                let existence = match probe.exists_for_gate(provider, session_id) {
                     SessionExistence::Present => ResumeExistence::Present,
                     SessionExistence::Absent => ResumeExistence::Absent,
                     SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
