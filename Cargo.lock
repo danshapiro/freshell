@@ -1292,6 +1292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-deploy"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "freshell-deployment"
 version = "0.1.0"
 dependencies = [

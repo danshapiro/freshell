@@ -9,6 +9,7 @@ nul
 
 .worktrees/
 .claude/worktrees/
+/.freshell-deploy/
 
 # Python (browser_use smoke runner)
 .venv/

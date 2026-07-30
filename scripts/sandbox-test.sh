@@ -47,6 +47,7 @@ fi
 DOCKER_ARGS=(
   run --rm
   --network "${NETWORK_NAME}"
+  --env FRESHELL_DESTRUCTIVE_TEST_SANDBOX=1
   --pids-limit 512
   --memory 8g
   -v "${REPO_ROOT}:/workspace"
