@@ -745,6 +745,19 @@ equivalent empty session either way (reconcile's amplifier Absent carve-out,
 which prevents PARKING such panes in the dead-sessions dialog, is untouched).
 Additive protocol field: optional `notice` on `terminal.created`.
 
+**Reconciliation note (2026-07-30, rebased onto 39010cb57):** codex managed
+launch (DEV-0006 S5.e) is now DEFAULT ON — every codex create/resume plans a
+sidecar app-server + remote proxy. The spawn-door gate runs BEFORE
+managed-launch planning at all three doors (WS create: gate → plan; headless
+respawn: gate → plan → uncancellable permit; REST: gate in
+`spawn_terminal_pane` before `settle_gated_create`'s plan-then-permit), so a
+definitively-absent codex id never consumes a sidecar planning slot; the
+fresh spawn it falls back to plans managed launch normally. Pinned by
+`managed_default_stale_codex_id_is_gated_before_planning` in
+`freshell-ws/tests/resume_validation_gate.rs`. The REST door additionally
+threads `claude_fresh_prealloc` through `RestResumeOutcome` so a gate-minted
+fresh claude id receives the #584 PIN 2 pre-spawn identity binding.
+
 **Why:** Production incident 2026-07-29 — after a server restart, freshell
 resumed stored amplifier session id 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 which
 existed nowhere under ~/.amplifier/projects/*/sessions/; the amplifier CLI
