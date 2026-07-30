@@ -449,15 +449,21 @@ fn a_fallback_exact_hit_for_a_higher_priority_token_beats_an_indexed_exact_of_a_
 
 #[test]
 fn a_failing_fallback_never_fails_the_resolve_it_degrades_with_a_provider_error() {
+    // Node production parity: the opencode worker boundary serializes only
+    // {name, message} (`opencode-by-id.worker.ts:41-42`) and the runner
+    // rebuilds the Error WITHOUT `.code` (`opencode-by-id-runner.ts:103-106`),
+    // so opencode provider errors are message-only on the wire — `code` is
+    // None here. (Code passthrough-when-present is exercised by the claude
+    // fallback's EACCES endpoint test in Task 6.)
     let broken = |_id: &str| -> Result<Option<OpencodeByIdHit>, ProviderFailure> {
-        Err(ProviderFailure { code: Some("SQLITE_CANTOPEN".into()), message: "unable to open database file".into() })
+        Err(ProviderFailure { code: None, message: "unable to open database file".into() })
     };
     let out = resolve(SES_ID, Some(&[]), None, Some(&broken));
     assert_eq!(out.status, ResumeResolveStatus::Degraded);
     assert!(out.matches.is_empty());
     assert_eq!(out.provider_errors.len(), 1);
     assert_eq!(out.provider_errors[0].provider, "opencode");
-    assert_eq!(out.provider_errors[0].code.as_deref(), Some("SQLITE_CANTOPEN"));
+    assert_eq!(out.provider_errors[0].code, None);
     assert_eq!(out.provider_errors[0].message.as_deref(), Some("unable to open database file"));
 }
 
@@ -1123,8 +1129,10 @@ fn db_without_a_project_table_still_resolves_with_null_project_path() { /* sessi
 fn missing_db_file_is_an_error_not_a_silent_miss() { /* empty temp dir →
     Err(OpencodeByIdError) with code Some("SQLITE_CANTOPEN") (Node:
     DatabaseSync open throws SQLITE_CANTOPEN; the provider is
-    present-but-unreadable, and silence here is the incident class — the
-    CODE must survive to the wire, see Task 6's degraded test) */ }
+    present-but-unreadable, and silence here is the incident class). The
+    code is INTERNAL — kept for structured logs and message fidelity; the
+    wire deliberately omits it for opencode (Node's worker boundary strips
+    `.code` before the wire — see Task 6 Step 3b) */ }
 
 #[test]
 fn corrupt_db_file_is_an_error() { /* write 64 bytes of garbage to
@@ -1160,9 +1168,14 @@ const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
 
 /// Code-PRESERVING error for the by-id query (the plain `OpencodeReadError`
 /// stays for its other consumers). Node's thrown sqlite errors carry a
-/// `.code` like `SQLITE_CANTOPEN`, and the wire's `providerErrors[].code`
-/// must carry it too — flattening to a bare string here would make Task 6's
-/// degraded wire test injected-only fiction.
+/// `.code` like `SQLITE_CANTOPEN` at the QUERY layer — but Node's production
+/// worker boundary then STRIPS it (`opencode-by-id.worker.ts:41-42`
+/// serializes only `{name, message}`; `opencode-by-id-runner.ts:103-106`
+/// rebuilds the Error without `.code`), so the code never reaches the wire.
+/// We keep the code HERE for structured logging and precise messages; the
+/// production closure (Task 6 Step 3b) deliberately maps it to
+/// `ProviderFailure { code: None, .. }` — wire parity is message-only for
+/// opencode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpencodeByIdError {
     pub code: Option<String>,
@@ -1319,7 +1332,7 @@ Node's route merges `codingCliIndexer.getScanFailures()` into `providerErrors` a
 **Files:**
 - Modify: `crates/freshell-sessions/src/directory_index.rs`
 - Modify: `crates/freshell-sessions/src/amplifier.rs` (provider_name + discover_checked on the amplifier source)
-- Modify: `crates/freshell-server/src/settings_store.rs`
+- Modify: `crates/freshell-server/src/settings_store.rs` (getter below, AND: the legacy-default migration's hard-coded `const DEFAULTS: [&str; 3] = ["claude", "codex", "opencode"]` (`settings_store.rs`, load-time migration ~lines 180-196) widens to `[&str; 4]` adding `"amplifier"` — it must mirror Node's four-provider `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:1-3`), otherwise a persisted legacy `["claude", "codex"]` list gains amplifier on Node but stays amplifier-less on Rust, leaving the provider unsearched and its indexed sessions filtered out; the migration's existing exact-legacy-match + gating logic is otherwise UNCHANGED)
 - Modify: `crates/freshell-server/src/settings.rs` (default `enabled_providers` gains `"amplifier"` — Node-default parity)
 - Test: unit tests inside `directory_index.rs`'s existing `#[cfg(test)]` module (follow its current test patterns) and `settings_store.rs`'s.
 
@@ -1417,7 +1430,7 @@ async fn a_failing_file_backed_root_listing_records_a_scan_failure_too() {
 }
 ```
 
-And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern; `#[tokio::test]` since the getter is async): load a store from a temp home whose `<home>/.freshell/config.json` contains the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}` (SettingsStore reads `config.json` and unwraps the top-level `settings` key — see `load_full_settings`; there is NO `settings.json`), assert `coding_cli_enabled_providers().await` returns exactly that; and for a FRESH temp home (no config file) assert the returned list is exactly `["claude", "codex", "opencode", "amplifier"]` — Node's authoritative `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:3`). This assertion FAILS against today's Rust default, which omits `amplifier` (`crates/freshell-server/src/settings.rs:38-44`) — that is a live parity defect this task closes in Step 2; do NOT weaken the assert to whatever the store currently returns.
+And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern; `#[tokio::test]` since the getter is async): load a store from a temp home whose `<home>/.freshell/config.json` contains the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}` (SettingsStore reads `config.json` and unwraps the top-level `settings` key — see `load_full_settings`; there is NO `settings.json`), assert `coding_cli_enabled_providers().await` returns exactly that; and for a FRESH temp home (no config file) assert the returned list is exactly `["claude", "codex", "opencode", "amplifier"]` — Node's authoritative `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:3`). This assertion FAILS against today's Rust default, which omits `amplifier` (`crates/freshell-server/src/settings.rs:38-44`) — that is a live parity defect this task closes in Step 2; do NOT weaken the assert to whatever the store currently returns. ALSO add a legacy-MIGRATION test in the same module (same temp-home pattern): persist a config whose `enabledProviders` is exactly the legacy pair `["claude", "codex"]`, load the store, and assert the migrated list gains `"amplifier"` under exactly the same conditions it already gains `"opencode"` (same availability gating the existing migration applies — mirror whatever the current opencode migration test asserts, extended to amplifier). This test FAILS against today's three-item `const DEFAULTS` in `settings_store.rs` — the second half of the same parity defect (Node migrates legacy lists using the four-provider `DEFAULT_ENABLED_CLI_PROVIDERS`, `server/settings-migrate.ts:35-46`).
 
 Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-server settings_store` — expected: compile FAILURE (methods missing).
 
@@ -1505,7 +1518,7 @@ Upgrade `POST /api/sessions/resolve` to the full hardened wire shape and route s
 
 **Interfaces:**
 - Consumes: Task 3's `ResumeResolveOutcome`/`ProviderFailure`, Task 4's `opencode_session_row_by_id`, Task 5's `scan_failures()`/`request_refresh()`/`coding_cli_enabled_providers()`.
-- Produces: the final wire response `{status, matches, hint, providerErrors, unsearchedProviders, homeDir}`; `freshell_freshagent::locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, std::io::Error>`.
+- Produces: the final wire response `{status, matches, hint, providerErrors, unsearchedProviders, homeDir}`; `freshell_freshagent::locate_transcript_checked(projects_roots: &[PathBuf], session_id: &str) -> Result<Option<PathBuf>, std::io::Error>` (roots supplied by the caller — see Step 3).
 
 - [ ] **Step 1: Write the failing endpoint tests (in `resolve.rs`'s `#[cfg(test)]`)**
 
@@ -1532,9 +1545,13 @@ async fn broken_opencode_store_degrades_with_a_provider_error_never_silent_not_f
     let dir = temp_dir("degraded");
     let index = fixture_index(vec![claude_fixture()]).await;
     let mut st = state(&dir, Some(index));
+    // Node production parity (`sessions-resolve-router.test.ts:308-320`): the
+    // opencode worker boundary strips `.code`, so the wire entry is
+    // message-only — `code` must be ABSENT, not null-with-key. The production
+    // closure (Step 3b) maps OpencodeByIdError to code: None accordingly.
     st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
         Err(freshell_sessions::resume_resolve::ProviderFailure {
-            code: Some("SQLITE_CANTOPEN".into()),
+            code: None,
             message: "unable to open database file".into(),
         })
     }));
@@ -1544,7 +1561,7 @@ async fn broken_opencode_store_degrades_with_a_provider_error_never_silent_not_f
     assert_eq!(body["matches"], serde_json::json!([]));
     assert_eq!(
         body["providerErrors"],
-        serde_json::json!([{ "provider": "opencode", "code": "SQLITE_CANTOPEN", "message": "unable to open database file" }])
+        serde_json::json!([{ "provider": "opencode", "message": "unable to open database file" }])
     );
 }
 
@@ -1728,9 +1745,36 @@ Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state 
 /// surface as a provider error, never a silent miss. A missing projects dir
 /// (`NotFound`) is a genuine miss for that root; any OTHER io error
 /// propagates.
-pub fn locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, std::io::Error> {
-    for root in claude_home_candidates() {
-        if let Some(path) = find_transcript_checked(&root, session_id)? {
+///
+/// The projects roots are a PARAMETER, exactly like Node's locator takes
+/// `projectsDir` (`claude-transcript-locator.ts:65-67`) — the CALLER resolves
+/// the environment. Do NOT resolve roots via `claude_home_candidates()`
+/// here: that helper adds `CLAUDE_CONFIG_DIR` and bare-`CLAUDE_HOME` roots
+/// that Node's resolver (`getSessionRoots()` = `getClaudeHome()/projects`,
+/// `providers/claude.ts:524-535`, `server/claude-home.ts:4-7`) and the Rust
+/// session index intentionally exclude — with an explicit `CLAUDE_HOME`
+/// override it would expose transcripts from a root Node never searches.
+/// Parameterizing the roots also keeps the unit tests hermetic: they pass
+/// temp dirs and never mutate process-global env.
+///
+/// Traversal order is Node's GLOBAL two-pass order
+/// (`claude-transcript-locator.ts:69-88`): PASS 1 probes the DIRECT layout
+/// across ALL roots, then PASS 2 probes the subagent layout across all roots
+/// — NOT per-root direct+subagent. (With roots `[A, B]`: A direct, B direct,
+/// A subagent, B subagent.)
+pub fn locate_transcript_checked(
+    projects_roots: &[PathBuf],
+    session_id: &str,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    // PASS 1 — direct layout across all roots.
+    for projects in projects_roots {
+        if let Some(path) = find_transcript_checked_direct(projects, session_id)? {
+            return Ok(Some(path));
+        }
+    }
+    // PASS 2 — subagent layout, only when the direct layout missed everywhere.
+    for projects in projects_roots {
+        if let Some(path) = find_transcript_checked_subagent(projects, session_id)? {
             return Ok(Some(path));
         }
     }
@@ -1738,7 +1782,7 @@ pub fn locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, st
 }
 ```
 
-and a `find_transcript_checked` that is `find_transcript` with error propagation: same id-shape guard (returns `Ok(None)`), then
+and `find_transcript_checked_direct` / `find_transcript_checked_subagent` helpers (one per Node layout pass) that are `find_transcript` with error propagation: same id-shape guard (returns `Ok(None)`), then
 
 ```rust
 /// Node parity (`claude-transcript-locator.ts:33-37`): expected absence is
@@ -1758,11 +1802,11 @@ let entries = match std::fs::read_dir(&projects) {
 };
 ```
 
-and the scan must construct the AUTHORITATIVE Node candidate layouts (`server/coding-cli/claude-transcript-locator.ts:39-48`): direct `<projects>/<project-dir>/<id>.jsonl` and subagent `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl`. CAUTION: the existing `find_transcript` probes `<project-dir>/<subdir>/<id>.jsonl` WITHOUT the `subagents` segment — that diverges from Node and misses child sessions; do NOT mirror it. The checked variant uses the Node layout (leave `find_transcript` itself untouched for its other consumers). Propagate errors that are not expected-absence (`is_expected_absence` above — NotFound OR NotADirectory, Node's `ENOENT || ENOTDIR`) from every `read_dir`, and probe candidate files with `std::fs::metadata` (expected absence ⇒ miss for that candidate; any OTHER error propagates) instead of the error-swallowing `Path::is_file()`.
+and the scan must construct the AUTHORITATIVE Node candidate layouts (`server/coding-cli/claude-transcript-locator.ts:39-48`): the direct helper probes `<projects>/<project-dir>/<id>.jsonl`, the subagent helper probes `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl` — and the caller runs the direct pass across ALL roots before ANY subagent probing (Node's global two-pass order above). CAUTION: the existing `find_transcript` probes `<project-dir>/<subdir>/<id>.jsonl` WITHOUT the `subagents` segment — that diverges from Node and misses child sessions; do NOT mirror it. The checked variant uses the Node layout (leave `find_transcript` itself untouched for its other consumers). Propagate errors that are not expected-absence (`is_expected_absence` above — NotFound OR NotADirectory, Node's `ENOENT || ENOTDIR`) from every `read_dir`, and probe candidate files with `std::fs::metadata` (expected absence ⇒ miss for that candidate; any OTHER error propagates) instead of the error-swallowing `Path::is_file()`.
 
-Also add `transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error>` beside `transcript_cwd` (which stays for other consumers): open error of expected-absence kind ⇒ `Ok(None)` (a raced deletion keeps the hit, cwd-less — Node behaves the same); any OTHER open/read error PROPAGATES (Node wraps these in `ClaudeTranscriptLocatorError`); malformed JSON lines are still skipped. BOUNDED READ (Node parity — `CWD_SCAN_BYTES = 64 * 1024`, `claude-transcript-locator.ts:30-31,131-135`): read AT MOST the first 64 KiB of the file (e.g. `std::io::Read::take(64 * 1024)` into a buffer), split that prefix on `\n`, drop the final partial line if the file is larger than the prefix, parse each line as JSON and return the first non-empty string `cwd`. Do NOT mirror the existing `transcript_cwd`'s unbounded `BufRead::lines()` loop — one resolve request against a multi-GB transcript (or a single enormous line) must not allocate or scan past the 64 KiB prefix. The 3b wiring below uses the checked variant — without it the "no longer swallowed" commit claim would be false, since `transcript_cwd` converts read errors to `None`.
+Also add `transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error>` beside `transcript_cwd` (which stays for other consumers): open error of expected-absence kind ⇒ `Ok(None)` (a raced deletion keeps the hit, cwd-less — Node behaves the same); any OTHER open/read error PROPAGATES (Node wraps these in `ClaudeTranscriptLocatorError`); malformed JSON lines are still skipped. BOUNDED READ (Node parity — `CWD_SCAN_BYTES = 64 * 1024`, `claude-transcript-locator.ts:30-31,131-135`): read AT MOST the first 64 KiB of the file (e.g. `std::io::Read::take(64 * 1024)` into a buffer), split that prefix on `\n`, and attempt to parse EVERY segment INCLUDING the final one — Node's `head.split('\n')` loop (`claude-transcript-locator.ts:141-149`) has no discard-the-truncated-tail rule: a fragment cut off at the 64 KiB boundary simply fails `JSON.parse` and is skipped by the `catch`, while a COMPLETE final line with no trailing newline (e.g. the last line of a small transcript) still parses. Do NOT drop the final segment. Parse each segment as JSON and return the first non-empty string `cwd`. Do NOT mirror the existing `transcript_cwd`'s unbounded `BufRead::lines()` loop — one resolve request against a multi-GB transcript (or a single enormous line) must not allocate or scan past the 64 KiB prefix. The 3b wiring below uses the checked variant — without it the "no longer swallowed" commit claim would be false, since `transcript_cwd` converts read errors to `None`.
 
-Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs` next to `locate_transcript`. Unit tests in the same file's test module: (a) gate the permission test with `#[cfg(unix)]` (`std::os::unix::fs::PermissionsExt` does not exist on Windows — an ungated test would not COMPILE there): chmod the projects dir to `0o000`, then FIRST probe `std::fs::read_dir(&projects)` directly — if the probe unexpectedly SUCCEEDS (running as root / CAP_DAC_OVERRIDE bypasses mode bits), restore permissions, `eprintln!("skipping: euid bypasses permission checks");` and `return`; otherwise assert `locate_transcript_checked` yields `Err` with `kind() == PermissionDenied`; restore permissions afterward so cleanup works; (b) a missing projects dir yields `Ok(None)`; (c) a transcript placed at `<projects>/<project>/<parent>/subagents/<id>.jsonl` IS found by `locate_transcript_checked` (the child-session layout); (d) ENOTDIR absence parity: a candidate path whose component is a REGULAR FILE (e.g. `<projects>/<project>` created as a file, so descending into it fails with `NotADirectory`) yields `Ok(None)`, not `Err` — Node reports a normal miss for `ENOTDIR` (`claude-transcript-locator.ts:33-37`); (e) bounded cwd scan: a transcript whose only `cwd`-bearing JSON line starts BEYOND the first 64 KiB (pad with ~65 KiB of valid no-cwd JSONL first) makes `transcript_cwd_checked` return `Ok(None)` — proving the 64 KiB prefix bound, Node parity.
+Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs` next to `locate_transcript`. Unit tests in the same file's test module — HERMETIC BY CONSTRUCTION: every test builds a temp projects dir and passes it via the `projects_roots` parameter; NO test mutates process-global env (`CLAUDE_HOME`/`CLAUDE_CONFIG_DIR`/`HOME`), so there is nothing to race against the crate's many existing env-mutating claude tests. (If a future test ever DOES need env mutation, it must hold the crate's shared `CLAUDE_ENV_LOCK` (`claude.rs`) and use the panic-safe `EnvVarsRestore` Drop-guard pattern (`claude_snapshot.rs:531-569`) — but none of the tests below need it.) The tests: (a) gate the permission test with `#[cfg(unix)]` (`std::os::unix::fs::PermissionsExt` does not exist on Windows — an ungated test would not COMPILE there): chmod the projects dir to `0o000`, then FIRST probe `std::fs::read_dir(&projects)` directly — if the probe unexpectedly SUCCEEDS (running as root / CAP_DAC_OVERRIDE bypasses mode bits), restore permissions, `eprintln!("skipping: euid bypasses permission checks");` and `return`; otherwise assert `locate_transcript_checked` yields `Err` with `kind() == PermissionDenied`; restore permissions afterward so cleanup works; (b) a missing projects dir yields `Ok(None)`; (c) a transcript placed at `<projects>/<project>/<parent>/subagents/<id>.jsonl` IS found by `locate_transcript_checked` (the child-session layout); (d) ENOTDIR absence parity: a candidate path whose component is a REGULAR FILE (e.g. `<projects>/<project>` created as a file, so descending into it fails with `NotADirectory`) yields `Ok(None)`, not `Err` — Node reports a normal miss for `ENOTDIR` (`claude-transcript-locator.ts:33-37`); (e) bounded cwd scan: a transcript whose only `cwd`-bearing JSON line starts BEYOND the first 64 KiB (pad with ~65 KiB of valid no-cwd JSONL first) makes `transcript_cwd_checked` return `Ok(None)` — proving the 64 KiB prefix bound, Node parity; (f) two-pass precedence: the SAME id present at BOTH the direct layout in one root AND the subagent layout — with a single root, and again with two roots where root A holds only the subagent copy and root B holds the direct copy — `locate_transcript_checked` returns the DIRECT path (B's direct copy beats A's subagent copy: pass 1 exhausts ALL roots first, Node's global order); (g) final-fragment parse parity: a transcript SMALLER than 64 KiB whose ONLY `cwd`-bearing JSON line is the LAST line and has NO trailing newline → `transcript_cwd_checked` returns `Ok(Some(cwd))` (Node's `split('\n')` parses the final segment); (h) truncated-tail tolerance: a JSON object that STRADDLES the 64 KiB boundary (starts inside the prefix, ends beyond it) is skipped without error — `Ok(None)` when no earlier line carries a cwd.
 
 3b. `crates/freshell-server/src/main.rs` — final wiring (replaces the Task-3/4 temporaries). Above the router construction:
 
@@ -1775,8 +1819,38 @@ Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs`
 // false misses after a live settings change and diverge from Node for
 // disabled-provider exact IDs.
 
-/// errno-ish code for a provider-error summary (Node's typed locator errors
-/// carry the fs errno in `.code`).
+/// Wire error code for a provider-error summary. Node preserves the ORIGINAL
+/// `cause.code` VERBATIM (`ClaudeTranscriptLocatorError`,
+/// `claude-transcript-locator.ts:19-27`): EPERM stays EPERM, EIO stays EIO.
+/// So derive the symbolic errno name from the RAW OS errno — do NOT map from
+/// `ErrorKind`, which would collapse EPERM into EACCES and drop EIO/EMFILE
+/// entirely. `libc` is already a freshell-server dependency
+/// (`crates/freshell-server/Cargo.toml`).
+#[cfg(unix)]
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    let raw = err.raw_os_error()?;
+    let name = match raw {
+        libc::EACCES => "EACCES",
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EIO => "EIO",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        libc::ELOOP => "ELOOP",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EBADF => "EBADF",
+        libc::EINVAL => "EINVAL",
+        _ => return None, // unknown errno ⇒ omit code, keep the message
+    };
+    Some(name.to_string())
+}
+
+/// Non-unix fallback: `raw_os_error()` is a Win32 code there, not an errno;
+/// map the coarse kinds Node's libuv also names. (The resolve fallbacks'
+/// primary target is unix; parity of the fine-grained codes is a unix
+/// concern.)
+#[cfg(not(unix))]
 fn errno_code(err: &std::io::Error) -> Option<String> {
     match err.kind() {
         std::io::ErrorKind::PermissionDenied => Some("EACCES".to_string()),
@@ -1785,6 +1859,8 @@ fn errno_code(err: &std::io::Error) -> Option<String> {
     }
 }
 ```
+
+Unit tests for `errno_code` in `main.rs`'s (or the module's) `#[cfg(test)]` module, `#[cfg(unix)]`-gated: `io::Error::from_raw_os_error(libc::EPERM)` → `Some("EPERM")` (NOT `"EACCES"` — both map to `ErrorKind::PermissionDenied`, which is exactly why the kind-based mapping was wrong), `from_raw_os_error(libc::EACCES)` → `Some("EACCES")`, `from_raw_os_error(libc::EIO)` → `Some("EIO")`, and a synthetic `io::Error::new(ErrorKind::PermissionDenied, "no raw errno")` → `None`.
 
 State fields:
 
@@ -1808,20 +1884,46 @@ opencode_session_by_id: Some({
                     last_activity_at: r.last_activity_at,
                 })
             })
-            .map_err(|e| freshell_sessions::resume_resolve::ProviderFailure {
-                // Code-preserving (Task 4's OpencodeByIdError): a real
-                // SQLITE_CANTOPEN/SQLITE_BUSY reaches the wire — this is what
-                // makes the degraded endpoint test's code assertion
-                // production-true, not injected-only fiction.
-                code: e.code,
-                message: e.message,
+            .map_err(|e| {
+                // Node production parity: the opencode worker boundary STRIPS
+                // `.code` — the worker serializes only {name, message}
+                // (`opencode-by-id.worker.ts:41-42`) and the runner rebuilds
+                // the Error without it (`opencode-by-id-runner.ts:103-106`),
+                // so Node's wire entry is message-only
+                // (`sessions-resolve-router.test.ts:308-320`). Emitting
+                // SQLITE_* codes here would DIVERGE from Node. Task 4's
+                // OpencodeByIdError still carries the code — log it
+                // (structured, with provider + code) for diagnosability,
+                // then drop it from the wire.
+                tracing::warn!(provider = "opencode", code = ?e.code, message = %e.message, "opencode by-id lookup failed");
+                freshell_sessions::resume_resolve::ProviderFailure {
+                    code: None,
+                    message: e.message,
+                }
             })
     }) as crate::resolve::OpencodeByIdLookup
 }),
 locate_claude_transcript: Some({
     std::sync::Arc::new(|session_id: &str| {
         let lowered = session_id.to_ascii_lowercase();
-        match freshell_freshagent::locate_transcript_checked(&lowered) {
+        // Node-parity root (`server/claude-home.ts:4-7` +
+        // `providers/claude.ts:524-535`): CLAUDE_HOME (non-empty) else
+        // $HOME/.claude, joined with "projects" — the SAME root the Rust
+        // session index uses (`session_directory::claude_home`). Note
+        // CLAUDE_HOME alone suffices even when HOME is unset (Node's
+        // getClaudeHome() honors it directly); no root ⇒ Ok(None), a miss.
+        let claude_home = match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
+            Some(v) => Some(std::path::PathBuf::from(v)),
+            None => std::env::var("HOME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".claude")),
+        };
+        let roots: Vec<std::path::PathBuf> = match claude_home {
+            Some(h) => vec![h.join("projects")],
+            None => return Ok(None),
+        };
+        match freshell_freshagent::locate_transcript_checked(&roots, &lowered) {
             Ok(Some(path)) => match freshell_freshagent::transcript_cwd_checked(&path) {
                 Ok(cwd) => Ok(Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
                     cwd,
@@ -1952,7 +2054,7 @@ Expected: push succeeds (the branch was local-only; this creates the remote bran
 
 **1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING (core + wire tests, Tasks 3+6) + shared dialog happy-path via shared e2e → Task 7 (degraded/retry/homeDir UI proven at the wire by Task 6 AND by the EXECUTED shared client suite — Task 7 Step 2 runs `test:client`, which includes `ResumeSessionDialog.test.tsx`, plus the shared contract test; the e2e spec covers visibility + exact resume only). Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
 
-**1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes, with the SQLITE_* codes asserted — `OpencodeByIdError` preserves rusqlite codes so the wire's `providerErrors[].code` is production-true), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
+**1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes, with the SQLITE_* codes asserted on the INTERNAL `OpencodeByIdError` — the wire deliberately carries message-only opencode errors, matching Node's worker boundary which strips `.code` in production (`opencode-by-id.worker.ts:41-42`, `opencode-by-id-runner.ts:103-106`); the endpoint test asserts the code-ABSENT wire shape and the internal code feeds structured logs), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
 
 **2. Placeholder scan:** Task 4 Step 1 and Task 6 Step 1 contain two test bodies described by full behavioral specification + fixture pattern reference rather than verbatim code (`scan_failure` literal test, disabled-provider test, opencode row-fixture bodies); each names the exact fixture pattern file to copy, the exact inputs, and the exact expected JSON/values — the implementer writes mechanical rusqlite/axum plumbing only. Checklist `<N>` slots are run-time evidence by design. No TBD/TODO/"handle edge cases" items remain.
 
