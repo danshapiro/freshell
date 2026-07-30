@@ -23,7 +23,8 @@
 - Rust tests: plain `cargo test -p <crate>` (no coordinator gate for Rust). Client tests: `npm run test:unit` (coordinator-gated; wait for the gate, never kill a foreign holder). Raw `npx vitest` is not a coordinated workflow.
 - Known pre-existing failure on main, unrelated: `terminal-font-settings.test.tsx` — note it if it appears in suite runs, do not chase it.
 - `port/AGENTS.md` mandates a `port/oracle/DEVIATIONS.md` entry for deliberate behavior changes vs the Node original — this feature is one (Task 9).
-- Protocol change is limited to ONE additive optional field (`notice` on `terminal.created`), mirrored in `crates/freshell-protocol` and the port contract schemas per repo convention. No new message types (the `SERVER_MESSAGE_TYPES` inventory is frozen).
+- Protocol change is limited to ONE additive optional field (`notice` on `terminal.created`), mirrored in `crates/freshell-protocol` AND `shared/ws-protocol.ts` (the schema's source of truth), with `port/contract/ws-server-messages.schema.json` REGENERATED via `npm run contract:generate` — never hand-edited (drift-guarded by `test/unit/port/ws-contract-freeze.test.ts`). No new message types (the `SERVER_MESSAGE_TYPES` inventory is frozen). No `server/` (Node) files change — the precedent commits for this exact pattern (`5c591843`, `a18dd4c6`) touched zero.
+- Gate calls are non-blocking (A13): the disk probe + by-id locators do real filesystem walks (the codex by-id walk measured ~0.9–1.1 s warm-cache on a real store — 20x earlier estimates), so every door runs the sync validation helper inside `tokio::task::spawn_blocking`. The pure gate policy (Task 1) stays sync/pure. This shape (sync helper, door wraps in `spawn_blocking`) is used consistently across all three doors (Tasks 6–8).
 - Amplifier existence is checked across ALL project slugs (`~/.amplifier/projects/*/sessions/<id>/`), not just the cwd-derived slug — a session may live under a different project slug than the current cwd if the tab moved. The index source already walks all projects; the new by-id fallback scans all project dirs too.
 
 ## Design Notes (read before Task 1)
@@ -44,14 +45,34 @@
 - `codex` / `opencode` → `resume_session_id = None` (fresh panes of these modes don't preallocate).
 
 **Carve-outs the gate must honor (fail-open bias):**
-- claude zero-turn: a claude session created by freshell that never conversed has no `.jsonl` on disk yet. `Absent` + `!ever_observed_on_disk` → Proceed (mirrors `reconcile.rs:365-403`). This is deliberately MORE fail-open than reconcile (no ledger-bound requirement).
+- claude zero-turn: a claude session created by freshell that never conversed has no `.jsonl` on disk yet. `Absent` + `!ever_observed_on_disk` → Proceed (mirrors `reconcile.rs:365-403`). This is deliberately MORE fail-open than reconcile (no ledger-bound requirement). Scope (AD-2): `ever_observed_on_disk` is a per-boot in-memory set (`existence.rs:293-298`, never persisted), so claude validation covers SAME-BOOT deletions only — a transcript deleted while the server was down is indistinguishable from never-conversed and fails open forever post-restart. Deliberate: `ever_observed` is NOT a sound swap (it ORs ledger `ever_bound`, which would break the zero-turn carve-out).
 - Preallocated fresh ids (claude Start prealloc, amplifier fresh prealloc) are intentionally not on disk — the gate only runs on ids that came from the wire (sessionRef / legacy resumeSessionId / claude restore ladder), never on ids the server just minted.
 - gemini/kimi: no `resumeArgs` at all and outside `KNOWN_PROVIDERS` — gate never consults the probe for them.
 
 **Notice visibility per door:**
-- Door 1 (WS create): new optional `notice` field on the `terminal.created` success frame; small client change renders it into the pane's xterm exactly like the reconcile notice.
+- Door 1 (WS create): new optional `notice` field on the `terminal.created` success frame; small client change renders it into the pane's xterm exactly like the reconcile notice AND clears the pane's persisted `sessionRef`/`resumeSessionId` (required for codex/opencode, whose gate-fired spawns carry no `sessionRef` — see the "not retried forever" story below).
 - Door 2 (headless respawn): no `out` sink exists; broadcast the existing `terminal.status{Recovering, reason}` frame (precedent `auto_resume.rs:604-628`) + `tracing::warn!`. Reason prose is not client-rendered today; this is the best available channel on a headless crash-recovery path where `Absent` is near-impossible (the session was alive moments ago). Documented, deliberate.
 - Door 3 (REST create): inject `reconcileNotice` into the returned `pane_content` (existing field, existing client rendering — no client change needed).
+
+**Validation findings incorporated (2026-07-29)** (9 evidence-gathering validators ran against this plan; ledger + reports in `.worktrees/.the-usual-logs/resume-validation/`):
+
+- **Non-blocking gate (A13 falsified):** the codex by-id walk measured ~0.9–1.1 s warm-cache on a real store. Validation helpers stay sync; every door runs them inside `tokio::task::spawn_blocking` (see Global Constraints). The Task 1 policy stays pure.
+- **Cold-index coverage (A1 falsified):** the index snapshot starts `None` every boot and the boot sweep is a detached task never awaited before the WS listener binds — restore-time creates can hit a cold index. Gate-facing per-provider coverage matrix:
+
+| Provider | Index COLD (`peek() == None`) | Index WARM (Absent adjudication; also covers TTL-stale snapshots) |
+|---|---|---|
+| amplifier | direct by-id dir scan (`session_on_disk`, cheap) → Present/Absent/Unknown | snapshot + by-id fallback |
+| claude | existing transcript locator (cheap) → Present/Absent/Unknown | snapshot + raw-file fallback (existing) |
+| codex | Unknown — fail open (AD-4) | snapshot + gate-safe by-id walk |
+| opencode | Unknown — fail open (AD-4) | snapshot + sqlite by-id (existing) |
+
+  The incident provider (amplifier) is covered even before warm-up. **AD-4 (accepted residual):** codex/opencode restores in the first seconds after boot fail open — the ~1 s codex walk stays on the warm-Absent adjudication path only. The cold-path `ProviderUnavailable` answer (provider root missing pre-warm) is untouched.
+- **Locator error contract (A3 falsified — six empirical false-Absent reproductions):** errors-seen accumulator. `Present` short-circuits; a scan that completes with ANY per-entry error (unreadable subdir, EACCES file, `read_dir` failure below root, first-line open/read failure) and no hit answers `Unreadable` → `Unknown` → fail open. Never adjudicate via `.is_dir()` (returns `false` on EACCES) or `fs::metadata(root)` (tests existence, not readability).
+- **Missing store root (AD-1):** store-root NotFound with a readable parent ⇒ `Absent` (positive absence — matches today's warm-path steady state and prevents the incident on fresh installs/secondary devices); any read/permission ERROR at the root ⇒ `Unreadable` (fail open).
+- **Claude scope (AD-2):** claude validation covers same-boot deletions only (per-boot in-memory `ever_observed_on_disk`; see the carve-out bullet above).
+- **Door 1 ordering (A11 falsified):** the gate runs AFTER the D7 cross-mode liveness guard and BEFORE the amplifier pre-create re-stub, with an in-gate liveness precondition for legacy carriers (Task 6).
+- **"Not retried forever" (A5 falsified-split):** four cooperating mechanisms — ledger `retire_missing` (server, all doors) + `terminal.created.sessionRef` overwrite (claude/amplifier, existing client fold) + notice-triggered clear of the pane's persisted `sessionRef`/`resumeSessionId` (codex/opencode, Task 5) + the mandatory `accepted_session_ref` guard at door 3 (Task 8).
+- **AD-3 (accepted):** after a gate-fired headless respawn, the auto-resume hub's `complete_claim` keeps the STALE locator's lease bound to the fresh terminal (`auto_resume.rs:529-547`) — convergent, documented with a code comment (Task 7).
 
 ## File Structure
 
@@ -60,14 +81,17 @@
 | `crates/freshell-platform/src/resume_gate.rs` | Create | Pure gate policy: provider list, `ResumeExistence`, `evaluate_resume_gate`, shared probe-fn types for freshagent injection |
 | `crates/freshell-platform/src/lib.rs` | Modify | `pub mod resume_gate;` |
 | `crates/freshell-sessions/src/amplifier_stub.rs` | Modify | Read-only `session_on_disk()` existence scan across all project slugs |
-| `crates/freshell-server/src/existence.rs` | Modify | Amplifier + codex by-id fallbacks on `IndexExistenceProbe` |
+| `crates/freshell-server/src/existence.rs` | Modify | Amplifier + codex by-id fallbacks on `IndexExistenceProbe`; gate-safe tri-state codex walk (`codex_rollout_on_disk`); cold-index amplifier/claude coverage in `exists()` |
 | `crates/freshell-server/src/main.rs` | Modify | Wire new locators into the probe; wire probe + retire callback into `FreshAgentState` |
 | `crates/freshell-ws/src/pane_ledger.rs` | Modify | `RetiredReason::SessionMissing` + `retire_missing()` |
 | `crates/freshell-ws/src/pane_ledger_tests.rs` | Modify | Tests for `retire_missing` |
 | `crates/freshell-protocol/src/server_messages.rs` | Modify | Optional `notice` on `TerminalCreated` |
-| `src/components/TerminalView.tsx` | Modify | Render `terminal.created` notice into xterm (locate the create-success handler near the `[Restore failed]` handling at `:4691`) |
-| `crates/freshell-ws/src/resume_validation.rs` | Create | Wire-resume validation helper shared by doors 1 & 2 (probe → gate → fallback outcome) |
-| `crates/freshell-ws/src/terminal.rs` | Modify | Doors 1 & 2 call the helper; retire + notice emission |
+| `shared/ws-protocol.ts` | Modify | Source of truth for the contract schema: optional `notice` on the `terminal.created` type (~`:725`) |
+| `port/contract/ws-server-messages.schema.json` | Regenerate | Via `npm run contract:generate` — never hand-edit (drift-guarded) |
+| `crates/freshell-protocol/tests/roundtrip.rs` | Modify | Wire test including `notice` (precedent commits `5c591843`, `a18dd4c6`) |
+| `src/components/TerminalView.tsx` | Modify | Render `terminal.created` notice into xterm (locate the create-success handler near the `[Restore failed]` handling at `:4691`) + clear the pane's persisted `sessionRef`/`resumeSessionId` when `notice` is present |
+| `crates/freshell-ws/src/resume_validation.rs` | Create | Wire-resume validation helper shared by doors 1 & 2 (probe → gate → fallback outcome); sync — doors run it inside `spawn_blocking` |
+| `crates/freshell-ws/src/terminal.rs` | Modify | Doors 1 & 2 run the helper via `spawn_blocking` (after D7, before the amplifier re-stub; in-gate liveness precondition); retire + notice emission |
 | `crates/freshell-ws/tests/resume_validation_gate.rs` | Create | Integration coverage for door 1 (and door 2 if the harness reaches it) |
 | `crates/freshell-freshagent/src/lib.rs` | Modify | `FreshAgentState`: `with_resume_probe`, `with_on_stale_resume` builders |
 | `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify | Door 3 gate + `reconcileNotice` injection |
@@ -93,6 +117,8 @@
   - `pub struct ResumeProbeAnswer { pub existence: ResumeExistence, pub ever_observed_on_disk: bool }`
   - `pub type ResumeProbeFn = std::sync::Arc<dyn Fn(&str, &str) -> ResumeProbeAnswer + Send + Sync>`
   - `pub fn stale_resume_notice(provider: &str, stale_id: &str) -> String`
+
+The gate policy stays synchronous and PURE — it never does IO. The disk-probe IO it consumes is gathered by the doors, which run the sync validation helpers inside `tokio::task::spawn_blocking` (Tasks 6–8; see Global Constraints).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -300,6 +326,16 @@ Add to the `#[cfg(test)] mod` in `amplifier_stub.rs` (create a helper mirroring 
         dir
     }
 
+    /// Permission tests are meaningless as root (root ignores mode bits) —
+    /// e.g. sandboxed/container suites. Skip (return early) when euid == 0.
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+            .unwrap_or(false)
+    }
+
     #[test]
     fn session_on_disk_present_under_cwd_slug() {
         let home = scan_temp_home("present");
@@ -354,12 +390,55 @@ Add to the `#[cfg(test)] mod` in `amplifier_stub.rs` (create a helper mirroring 
     #[test]
     fn session_on_disk_unreadable_projects_dir_fails_open() {
         use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // root ignores mode bits — test is meaningless
+        }
         let home = scan_temp_home("unreadable");
         let projects = home.join("projects");
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
         let answer = session_on_disk(&home, "sid-5");
         // Restore perms before asserting so cleanup works even on failure.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(answer, AmplifierSessionAnswer::Unreadable));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_on_disk_unreadable_project_subdir_fails_open() {
+        // V3 case E2a: a chmod-000 PROJECT dir with the session inside must
+        // answer Unreadable, never Absent (`.is_dir()` returns false on
+        // EACCES — the errors-seen accumulator catches the metadata error).
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let home = scan_temp_home("locked-project");
+        let locked = home.join("projects/-locked-proj");
+        std::fs::create_dir_all(locked.join("sessions/sid-7")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = session_on_disk(&home, "sid-7");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(answer, AmplifierSessionAnswer::Unreadable));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_on_disk_listable_not_traversable_projects_fails_open() {
+        // V3 case E2b: projects/ mode 444 — read_dir succeeds (needs r) but
+        // stat into children needs x, so every per-entry metadata call errors.
+        // Any-error-and-no-hit => Unreadable.
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return;
+        }
+        let home = scan_temp_home("no-traverse");
+        let projects = home.join("projects");
+        std::fs::create_dir_all(projects.join("-p/sessions/sid-8")).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let answer = session_on_disk(&home, "sid-8");
         std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(answer, AmplifierSessionAnswer::Unreadable));
         let _ = std::fs::remove_dir_all(&home);
@@ -395,12 +474,17 @@ Add beside `ensure_session` in `amplifier_stub.rs`:
 /// a different slug than the current cwd — see `ensure_session`'s divergent-
 /// slug handling). Never creates anything.
 ///
-/// Semantics (resume-validation feature):
-/// * session dir found under any project => `Present`;
-/// * `projects/` missing or scanned without a hit => `Absent`
-///   (store readable, definitively absent);
-/// * `projects/` unreadable (permissions, IO error) => `Unreadable`
-///   (callers must fail OPEN — treat as unknown, never as absent).
+/// Semantics (resume-validation feature — errors-seen accumulator, V3):
+/// * session dir found under any project => `Present` (short-circuits);
+/// * `projects/` missing (NotFound, parent readable) or scanned WITHOUT any
+///   error and without a hit => `Absent` (store readable, definitively
+///   absent — AD-1: missing root is positive absence, matching today's
+///   warm-path steady state);
+/// * `projects/` unreadable at the root, OR any per-entry error during the
+///   scan (unreadable project subdir, EACCES stat, dropped dir entry) with
+///   no hit => `Unreadable` (callers must fail OPEN — treat as unknown,
+///   never as absent). NEVER adjudicate via `.is_dir()` alone: it returns
+///   `false` on EACCES and would manufacture a false Absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmplifierSessionAnswer {
     Present,
@@ -416,16 +500,32 @@ pub fn session_on_disk(
     let entries = match std::fs::read_dir(&projects) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return AmplifierSessionAnswer::Absent;
+            return AmplifierSessionAnswer::Absent; // AD-1: root missing, parent readable
         }
         Err(_) => return AmplifierSessionAnswer::Unreadable,
     };
-    for entry in entries.flatten() {
-        if entry.path().join("sessions").join(session_id).is_dir() {
-            return AmplifierSessionAnswer::Present;
+    let mut saw_error = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                saw_error = true; // dropped dir entry (EIO, network fs) — cannot rule out
+                continue;
+            }
+        };
+        let candidate = entry.path().join("sessions").join(session_id);
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_dir() => return AmplifierSessionAnswer::Present,
+            Ok(_) => {} // stray FILE named like the id — not a session dir
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => saw_error = true, // EACCES etc. — the session may be hiding here
         }
     }
-    AmplifierSessionAnswer::Absent
+    if saw_error {
+        AmplifierSessionAnswer::Unreadable
+    } else {
+        AmplifierSessionAnswer::Absent
+    }
 }
 ```
 
@@ -434,7 +534,7 @@ Refactor step: `ensure_session`'s internal scan loop (`:134-148`) and this funct
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-sessions session_on_disk`
-Expected: PASS (6 tests; 5 on non-unix). Then `cargo test -p freshell-sessions` — full crate still green.
+Expected: PASS (8 tests; 5 on non-unix — the three permission tests are `#[cfg(unix)]` and additionally self-skip under root). Then `cargo test -p freshell-sessions` — full crate still green.
 
 - [ ] **Step 5: Commit**
 
@@ -445,9 +545,12 @@ git commit -m "feat(resume-validation): read-only amplifier session_on_disk scan
 
 ---
 
-### Task 3: Amplifier + codex by-id fallbacks on `IndexExistenceProbe`
+### Task 3: Amplifier + codex by-id fallbacks on `IndexExistenceProbe` + cold-index coverage
 
-Why: the probe's warm snapshot can be STALE — a session created moments before a restart may be missing from the snapshot. The claude arm already has a raw-file fallback for exactly this; without equivalents, the gate could misjudge a brand-new amplifier/codex session as `Absent` and wrongly block a working resume (violating the fail-open invariant). After this task, `Absent` for all four validated providers means POSITIVE absence.
+Why (two problems, one probe change):
+
+1. **Stale warm snapshots.** The probe's warm snapshot can be STALE — a session created moments before a restart may be missing from the snapshot, and `peek()` serves snapshots regardless of TTL. The claude arm already has a raw-file fallback for exactly this; without equivalents, the gate could misjudge a brand-new amplifier/codex session as `Absent` and wrongly block a working resume (violating the fail-open invariant). After this task, `Absent` for all four validated providers means POSITIVE absence.
+2. **Cold index at boot (A1 falsified).** The snapshot starts `None` EVERY boot (`directory_index.rs:687`) and the boot sweep is a detached `tokio::spawn` (`main.rs:796`) never awaited before the listener binds (`main.rs:1122`) — so restore-time creates routinely race a cold index. Today's cold `exists()` answers `Unknown` (root exists) → the gate would silently no-op in the EXACT incident scenario. Fix: when the index is COLD, `exists()` still runs the cheap direct by-id locators for amplifier (Task 2's `session_on_disk`) and claude (the existing transcript locator) — both are cheap directory checks — mapping Present/Absent/Unreadable → Present/Absent/Unknown. codex and opencode answer `Unknown` when cold (fail open; accepted residual AD-4 — the ~1 s codex walk must not run on every early-boot create). The incident provider (amplifier) is therefore covered even before warm-up. The cold-path `ProviderUnavailable` answer (provider root missing) stays untouched.
 
 **Files:**
 - Modify: `crates/freshell-server/src/existence.rs`
@@ -455,14 +558,16 @@ Why: the probe's warm snapshot can be STALE — a session created moments before
 - Test: inline `#[cfg(test)]` in `existence.rs` (mirror the existing hand-rolled temp-dir helpers at `existence.rs:307-318` and the existing fallback tests for claude/opencode)
 
 **Interfaces:**
-- Consumes: `freshell_sessions::amplifier_stub::{session_on_disk, AmplifierSessionAnswer}` (Task 2); `freshell_ws::codex_reconcile::locate_codex_rollout(sessions_root: &Path, session_id: &str) -> Option<PathBuf>` (existing, `codex_reconcile.rs:154`).
+- Consumes: `freshell_sessions::amplifier_stub::{session_on_disk, AmplifierSessionAnswer}` (Task 2). The codex rollout layout + ownership convention are taken from `freshell_ws::codex_reconcile::locate_codex_rollout`/`first_line_owns` (`codex_reconcile.rs:154-207`) as REFERENCE ONLY — that walk is fail-soft (silent `None` on per-entry errors, six false-Absent reproductions in V3) and MUST NOT be reused for the gate; reconcile's existing callers keep it unchanged.
 - Produces (wired in `main.rs`, consumed implicitly by every `probe.exists()` caller):
   - `pub enum ByIdAnswer { Present, Absent, Unreadable }` (one shared enum for both new locators; mirror `OpencodeDbAnswer`'s shape)
   - `pub type AmplifierSessionLocator = Arc<dyn Fn(&str) -> ByIdAnswer + Send + Sync>`
   - `pub type CodexRolloutExistenceLocator = Arc<dyn Fn(&str) -> ByIdAnswer + Send + Sync>`
   - `impl IndexExistenceProbe { pub fn with_amplifier_session_locator(self, l: AmplifierSessionLocator) -> Self; pub fn with_codex_rollout_locator(self, l: CodexRolloutExistenceLocator) -> Self }`
   - `pub fn amplifier_dir_locator(amplifier_home: PathBuf) -> AmplifierSessionLocator`
-  - `pub fn codex_rollout_existence_locator(sessions_root: PathBuf) -> CodexRolloutExistenceLocator`
+  - `pub fn codex_rollout_on_disk(sessions_root: &Path, session_id: &str) -> ByIdAnswer` — NEW gate-safe tri-state walk (errors-seen accumulator), lives in `freshell-server/src/existence.rs`
+  - `pub fn codex_rollout_existence_locator(sessions_root: PathBuf) -> CodexRolloutExistenceLocator` (wraps `codex_rollout_on_disk`)
+  - Cold-index behavior change in `exists()`: when `peek() == None` (after the untouched root-missing → `ProviderUnavailable` check), amplifier and claude consult their cheap by-id locators instead of answering `Unknown`; codex/opencode stay `Unknown` (AD-4)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -508,8 +613,63 @@ Add to the existing `#[cfg(test)] mod tests` in `existence.rs`, copying the cons
 
     #[test]
     fn codex_missing_sessions_root_is_absent_and_unreadable_is_unknown() {
-        // sessions root NotFound => Absent (fresh install, store readable-empty);
-        // locator returning Unreadable => probe answers Unknown.
+        // sessions root NotFound => Absent (AD-1: fresh install, parent
+        // readable); locator returning Unreadable => probe answers Unknown.
+        // Root readability MUST be established via read_dir, not
+        // fs::metadata — metadata tests existence, not readability (V3 E3).
+    }
+
+    #[test]
+    fn codex_zst_rollout_is_candidate_but_undecodable_answers_unreadable() {
+        // Future codex rollout compression (V2): a file named
+        // rollout-...-<id>.jsonl.zst whose name contains the id MUST pass the
+        // filename prefilter; its first line is not plain JSONL, so the
+        // ownership read fails => counts as an error => Unreadable (probe
+        // answers Unknown — fail open, never Absent for a CLI-resumable file).
+        // Setup: temp root with only the .zst candidate (zstd-magic bytes or
+        // arbitrary binary). Assert codex_rollout_on_disk(...) == Unreadable.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_unreadable_date_subdir_answers_unreadable() {
+        // V3 case E4: rollout lives under sessions/2026/07/29/ chmod 000.
+        // Skip when running as root (euid==0 — mode bits ignored); use the
+        // same running_as_root() helper pattern as Task 2's tests.
+        // Assert codex_rollout_on_disk(...) == Unreadable (per-entry error
+        // accumulated, no silent skip), and probe.exists(...) == Unknown.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_unreadable_candidate_file_answers_unreadable() {
+        // V3 case E7: the owning rollout file itself is chmod 000 — the
+        // first-line ownership read fails => error => Unreadable, never
+        // Absent. Skip when euid==0.
+    }
+
+    #[test]
+    fn cold_index_amplifier_uses_dir_locator() {
+        // Probe with NO warm snapshot (peek() == None, the every-boot state)
+        // but amplifier root present and .with_amplifier_session_locator(...)
+        // chained. Assert: session dir on disk => Present; readable-empty
+        // store => Absent; locator Unreadable => Unknown. (This is the
+        // incident scenario: restore-time create racing the boot sweep.)
+    }
+
+    #[test]
+    fn cold_index_claude_uses_transcript_locator() {
+        // Same shape via the EXISTING claude transcript locator: cold index +
+        // transcript file on disk => Present; readable store without it =>
+        // Absent (gate still Proceeds unless ever_observed_on_disk — Task 1).
+    }
+
+    #[test]
+    fn cold_index_codex_and_opencode_answer_unknown() {
+        // Cold index + locators chained: codex/opencode must NOT run their
+        // by-id lookups when cold (AD-4 — the codex walk is ~1 s on a real
+        // store). Assert Unknown for both. The root-missing =>
+        // ProviderUnavailable pre-check stays byte-for-byte today's behavior.
     }
 ```
 
@@ -546,21 +706,86 @@ pub fn amplifier_dir_locator(amplifier_home: std::path::PathBuf) -> AmplifierSes
     })
 }
 
+/// Gate-safe tri-state codex rollout walk (resume-validation feature).
+/// Deliberately a NEW walk, NOT a reuse of the fail-soft
+/// `freshell_ws::codex_reconcile::locate_codex_rollout` — that helper
+/// silently converts per-entry IO errors into `None`, which the gate would
+/// read as positive absence (six false-Absent reproductions in V3).
+/// Errors-seen accumulator: `Present` short-circuits; a walk that completes
+/// having seen ANY per-entry error and no hit answers `Unreadable`.
+pub fn codex_rollout_on_disk(
+    sessions_root: &std::path::Path,
+    session_id: &str,
+) -> ByIdAnswer {
+    // Root readability is established by read_dir itself: NotFound (parent
+    // readable) => Absent (AD-1); any other error => Unreadable. NOTE:
+    // `fs::metadata(root)` is NOT sufficient — it tests existence, not
+    // readability (a mode-111 root passes metadata but fails read_dir; V3 E3).
+    let mut stack = vec![sessions_root.to_path_buf()];
+    let mut saw_error = false;
+    let mut first_level = true;
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if first_level && err.kind() == std::io::ErrorKind::NotFound => {
+                return ByIdAnswer::Absent;
+            }
+            Err(_) if first_level => return ByIdAnswer::Unreadable,
+            Err(_) => {
+                saw_error = true; // unreadable subtree below the root — may hide the rollout
+                continue;
+            }
+        };
+        first_level = false;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    saw_error = true;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            // Never `.is_dir()` — false on EACCES (V3 E6).
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.is_dir() => stack.push(path),
+                Ok(_) => {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    // Filename prefilter: id-in-name (verified convention,
+                    // V2: 4459/4459 real rollouts + codex source constructs
+                    // the name from the id) — accept both `.jsonl` and
+                    // `.jsonl.zst` (future codex rollout compression, V2).
+                    if name.contains(session_id)
+                        && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+                    {
+                        // Ownership check: first-line session_meta id ==
+                        // session_id => Present (short-circuit). Mirror
+                        // `first_line_owns` (`codex_reconcile.rs:188-207`)
+                        // but tri-state: open/read/decode failure on a
+                        // candidate (incl. an undecodable `.jsonl.zst`)
+                        // counts as an ERROR (saw_error = true), never as
+                        // "not the owner"; only a VALID read whose id
+                        // differs keeps walking as a non-owner.
+                        // (Implement as a private fn returning
+                        // Result<bool, ()> and fold Err into saw_error.)
+                    }
+                }
+                Err(_) => saw_error = true,
+            }
+        }
+    }
+    if saw_error {
+        ByIdAnswer::Unreadable
+    } else {
+        ByIdAnswer::Absent
+    }
+}
+
 pub fn codex_rollout_existence_locator(
     sessions_root: std::path::PathBuf,
 ) -> CodexRolloutExistenceLocator {
-    Arc::new(move |session_id: &str| {
-        match std::fs::metadata(&sessions_root) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return ByIdAnswer::Absent,
-            Err(_) => return ByIdAnswer::Unreadable,
-            Ok(meta) if !meta.is_dir() => return ByIdAnswer::Unreadable,
-            Ok(_) => {}
-        }
-        match freshell_ws::codex_reconcile::locate_codex_rollout(&sessions_root, session_id) {
-            Some(_) => ByIdAnswer::Present,
-            None => ByIdAnswer::Absent,
-        }
-    })
+    Arc::new(move |session_id: &str| codex_rollout_on_disk(&sessions_root, session_id))
 }
 ```
 
@@ -589,7 +814,40 @@ Add two `Option<...>` fields to `IndexExistenceProbe` plus builder methods `with
         }
 ```
 
-(Place them at the same adjudication point as the existing fallbacks — only reached when the snapshot would otherwise answer `Absent`.)
+(Place them at the same adjudication point as the existing fallbacks — only reached when the snapshot would otherwise answer `Absent`. This warm-Absent adjudication also covers TTL-stale snapshots — `peek()` serves snapshots regardless of TTL, so a session created after the last publish reads a stale Absent and is rescued here.)
+
+Cold-index coverage (`exists()`, the `peek() == None` branch at `existence.rs:182-205`): keep the existing provider-root-missing → `ProviderUnavailable` pre-check byte-for-byte. Then, instead of returning `Unknown` unconditionally:
+
+```rust
+        None => {
+            if self.provider_roots.get(provider).is_some_and(|root| !root.exists()) {
+                return SessionExistence::ProviderUnavailable; // untouched cold-path answer
+            }
+            // Cold-index coverage (resume-validation, A1): the snapshot is None
+            // every boot and the warm sweep is detached — restore-time creates
+            // race it. amplifier + claude have CHEAP direct by-id locators; run
+            // them so the gate still fires in the incident scenario. codex/
+            // opencode stay Unknown when cold (AD-4: the codex walk is ~1 s on
+            // a real store — warm-Absent adjudication only).
+            if provider == "amplifier" {
+                if let Some(locator) = &self.amplifier_session_locator {
+                    return match locator(session_id) {
+                        ByIdAnswer::Present => SessionExistence::Present,
+                        ByIdAnswer::Absent => SessionExistence::Absent,
+                        ByIdAnswer::Unreadable => SessionExistence::Unknown,
+                    };
+                }
+            }
+            if provider == "claude" {
+                // Reuse the EXISTING claude transcript locator (raw-file
+                // check — cheap), mapping its answer the same way the warm
+                // fallback at :226 does.
+            }
+            SessionExistence::Unknown
+        }
+```
+
+(Adapt the claude arm to the existing transcript-locator field/return shape at `existence.rs:226` — same mapping, hit ⇒ `Present`, clean miss ⇒ `Absent`, error ⇒ `Unknown`.)
 
 In `main.rs`, at the probe construction site, chain the new builders:
 - `with_amplifier_session_locator(amplifier_dir_locator(home))` where `home` comes from `freshell_sessions::amplifier_stub::resolve_amplifier_home()` (skip chaining when it returns `None` — probe then behaves as today for amplifier).
@@ -691,16 +949,21 @@ git commit -m "feat(resume-validation): RetiredReason::SessionMissing + retire_m
 ### Task 5: `notice` field on `terminal.created` + client rendering
 
 **Files:**
-- Modify: `crates/freshell-protocol/src/server_messages.rs` (the `TerminalCreated` struct — locate `TerminalCreated` in the file)
-- Modify: port contract schema for `terminal.created` (locate via `grep -rn "terminal.created" port/ server/ --include="*.ts" --include="*.json" -l` and update whichever schema/zod/JSON-schema file mirrors the frame's fields — repo convention: protocol fields are mirrored in `crates/freshell-protocol` AND the port contract schemas)
+- Modify: `crates/freshell-protocol/src/server_messages.rs` (the `TerminalCreated` struct, `~:956` region)
+- Modify: `shared/ws-protocol.ts` (`~:725`, the `terminal.created` type) — this is the SOURCE OF TRUTH the contract schema is generated from
+- Regenerate: `port/contract/ws-server-messages.schema.json` via `npm run contract:generate` — NEVER hand-edit the generated JSON (drift-guarded by `test/unit/port/ws-contract-freeze.test.ts`, which byte-compares the committed file against a fresh regeneration)
+- Modify: `crates/freshell-protocol/tests/roundtrip.rs` — wire test including `notice`, per the precedent of commits `5c591843` (previousSessionId) and `a18dd4c6` (persisted/persistReason)
 - Modify: `src/components/TerminalView.tsx` — the `terminal.created` success handler (it lives near the create-`error` handling that renders `[Restore failed]` at `TerminalView.tsx:4691`)
 - Test: Rust serde test inline in `server_messages.rs` (or the protocol crate's existing test module for server messages); client test added to the existing test file that covers `[Restore failed]` rendering (find it: `grep -rln "Restore failed" test/`)
+- NO `server/` (Node) files change — both precedent commits touched zero; `shared/ws-protocol.ts` is shared client/server TYPING, not the Node server.
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces (used by Task 6): `TerminalCreated { …existing fields…, notice: Option<String> }` serialized as `"notice"` only when present (`#[serde(skip_serializing_if = "Option::is_none")]`). Client behavior: when `msg.notice` is a non-empty string, write it into the pane's xterm as its own line, styled exactly like the reconcile-notice write at `TerminalView.tsx:4336`/`:5053`.
+- Produces (used by Task 6): `TerminalCreated { …existing fields…, notice: Option<String> }` serialized as `"notice"` only when present (`#[serde(skip_serializing_if = "Option::is_none")]`). Client behavior when `msg.notice` is a non-empty string:
+  1. write it into the pane's xterm as its own line, styled exactly like the reconcile-notice write at `TerminalView.tsx:4336`/`:5053`;
+  2. ALSO clear the pane's persisted `sessionRef`/`resumeSessionId`. Why (A5, V5): claude/amplifier gate-fired spawns self-heal — `terminal.created.sessionRef` carries the fresh id and the client unconditionally overwrites the pane ref + clears `resumeSessionId` (`TerminalView.tsx:260-281`/`:4261-4288`, verified). codex/opencode gate-fired spawns carry NO `sessionRef` (fallback is `None`), so without this clear the stale persisted ref would re-fire the gate on EVERY restart; clearing on `notice` breaks the loop, and subsequent live identity capture can then associate the fresh session unimpeded.
 
-This is one additive optional field on an existing message type — the frozen `SERVER_MESSAGE_TYPES` inventory (57 entries) is unchanged. The Node server never sets the field; it is optional end-to-end.
+This is one additive optional field on an existing message type — the frozen `SERVER_MESSAGE_TYPES` inventory (57 entries) is unchanged. The Node server never sets the field; it is optional end-to-end (the SPA ingests frames via plain `JSON.parse` cast — no zod on server→client).
 
 - [ ] **Step 1: Write the failing Rust serde test**
 
@@ -743,7 +1006,14 @@ Expected: FAIL to compile — no `notice` field.
     pub notice: Option<String>,
 ```
 
-Add `notice: None` at every existing `TerminalCreated { … }` construction site (`cargo check` will enumerate them). Update the port contract schema for `terminal.created` with the optional `notice` string field. Run `cargo test -p freshell-protocol --locked` (the CI contract invocation) — green.
+Mirror sequence (order matters — the schema is GENERATED, and `roundtrip.rs` reads the committed schema from disk):
+
+1. Add the field to the Rust `TerminalCreated` (`crates/freshell-protocol/src/server_messages.rs`, `~:956` region) and `notice: None` at every existing `TerminalCreated { … }` construction site (`cargo check` enumerates them; expect `crates/freshell-terminal/src/registry.rs` plus ws/freshagent call sites).
+2. Add `notice?: string` to the `terminal.created` type in `shared/ws-protocol.ts` (`~:725`).
+3. REGENERATE `port/contract/ws-server-messages.schema.json` via `npm run contract:generate` and commit the regenerated file. NEVER hand-edit the JSON — `test/unit/port/ws-contract-freeze.test.ts` byte-compares it against a fresh regeneration and a hand-edit fails the drift guard. Verify the command runs cleanly in the worktree (it is repo tooling, not a Node-server change).
+4. Extend `crates/freshell-protocol/tests/roundtrip.rs` with a wire test including `notice`, per the precedent of commits `5c591843` (previousSessionId on `terminal.session.associated`) and `a18dd4c6` (persisted/persistReason on `tabs.sync.ack`).
+
+Run `cargo test -p freshell-protocol --locked` (the CI contract invocation) — green.
 
 - [ ] **Step 4: Write the failing client test, then render**
 
@@ -758,14 +1028,25 @@ it('writes the resume-validation notice into the terminal on terminal.created', 
   // Assert the xterm write buffer received a line containing
   // 'Saved amplifier session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1'.
 });
+
+it('clears the persisted sessionRef/resumeSessionId when terminal.created carries a notice', () => {
+  // Same arrangement, pane pre-seeded with a persisted stale
+  // sessionRef/resumeSessionId (codex/opencode shape: the created frame
+  // carries a notice but NO sessionRef — the gate's fallback for these
+  // modes is None, so no sessionRef overwrite will heal the pane).
+  // Dispatch terminal.created with notice set and no sessionRef.
+  // Assert the pane content update cleared sessionRef and resumeSessionId
+  // (breaking the every-restart gate re-fire loop; a later live identity
+  // capture can then associate the fresh session unimpeded).
+});
 ```
 
-Run it (`npm run test:vitest -- <that-file> --run`), watch it fail. GREEN: in `TerminalView.tsx`'s `terminal.created` handler, when `msg.notice` is a non-empty string, write it into the pane's xterm as its own line using the exact styling/write mechanism of the reconcile-notice write at `:4336`/`:5053`. Re-run the test — PASS. Also re-run the whole file to confirm no regressions.
+Run them (`npm run test:vitest -- <that-file> --run`), watch them fail. GREEN: in `TerminalView.tsx`'s `terminal.created` handler, when `msg.notice` is a non-empty string, (1) write it into the pane's xterm as its own line using the exact styling/write mechanism of the reconcile-notice write at `:4336`/`:5053`, and (2) clear the pane's persisted `sessionRef`/`resumeSessionId` in the same `updateContent` pass the handler already performs (`:4261-4288` region — when the frame ALSO carries a `sessionRef`, the existing overwrite fold wins; the clear only matters for the codex/opencode no-sessionRef case). Re-run the tests — PASS. Also re-run the whole file to confirm no regressions.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs src/ <port-contract-schema-file> test/
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/tests/roundtrip.rs shared/ws-protocol.ts port/contract/ws-server-messages.schema.json src/ test/
 git commit -m "feat(resume-validation): optional notice on terminal.created, rendered in the pane"
 ```
 
@@ -776,11 +1057,12 @@ git commit -m "feat(resume-validation): optional notice on terminal.created, ren
 **Files:**
 - Create: `crates/freshell-ws/src/resume_validation.rs`
 - Modify: `crates/freshell-ws/src/lib.rs` (add `pub mod resume_validation;`)
-- Modify: `crates/freshell-ws/src/terminal.rs` — `handle_create`, between the resume-id derivation block (ends `:1717`) and the amplifier pre-create block (starts `:1799`)
+- Modify: `crates/freshell-ws/src/terminal.rs` — `handle_create`, in the `:1787→:1789` slot: AFTER the D7 cross-mode liveness guard (`:1739-1787`, a pure predicate) and BEFORE the amplifier pre-create block (starts `:1798`)
 - Test: inline `#[cfg(test)]` in `resume_validation.rs`; integration: `crates/freshell-ws/tests/resume_validation_gate.rs`
 
 **Interfaces:**
 - Consumes: Task 1 (`resume_gate::*`), Task 4 (`retire_missing`), Task 5 (`notice` field), existing `SessionExistenceProbe` (`state.session_existence`), `LaunchIntent`, `uuid::Uuid`.
+- `validate_wire_resume` stays SYNC (unit tests stay synchronous); the doors run it inside `tokio::task::spawn_blocking` because the probe's by-id locators do real filesystem walks (A13 — the codex walk is ~1 s on a real store).
 - Produces (also used by Task 7):
 
 ```rust
@@ -1068,48 +1350,80 @@ RED: create `crates/freshell-ws/tests/resume_validation_gate.rs`. Reuse the harn
 1. `restore_true_amplifier_absent_spawns_fresh_with_notice`: state whose existence probe answers `Absent` for `("amplifier", "stale-amp")` (inject a fake `SharedExistenceProbe` — the harness sets `state.session_existence`; use a fake, not a real index) + a pane ledger containing a `Bound` row for that ref. Send `terminal.create { mode: "amplifier", restore: true, session_ref: {provider:"amplifier", sessionId:"stale-amp"}, cwd: <tempdir> }` (plus `FRESHELL_AMPLIFIER_HOME` pointed at an empty temp home so `ensure_session` runs against the temp store). Assert: the create SUCCEEDS (a `terminal.created` frame arrives, not an `error`); the `terminal.created` frame's `notice` contains `"stale-amp"`; the spawned resume id is NOT `stale-amp` (assert via the ledger: `load_binding("amplifier", "stale-amp")` is `Retired` with reason `SessionMissing`, and no amplifier session dir named `stale-amp` was created under the temp amplifier home — the fresh UUID dir exists instead).
 2. `restore_true_amplifier_present_resumes_unchanged`: probe answers `Present`; assert `terminal.created` has NO `notice` and the ledger row stays `Bound`.
 3. `restore_true_unknown_fails_open`: probe answers `Unknown`; assert no `notice`, row stays `Bound` (today's behavior preserved).
+4. `restore_true_live_absent_sessionref_hits_d7_not_the_gate`: registry/identity hold a RUNNING owner for `("amplifier", "stale-amp")` (set up the liveness state the way D7's own sibling tests do), probe answers `Absent`, ledger holds a `Bound` row. Send the same restore create as case 1. Assert: (a) the response is D7's `RestoreUnavailable` error frame ("still running"), NOT a `terminal.created` fresh spawn; (b) the `Bound` ledger row of the running session SURVIVES (`load_binding` still `Bound` — the gate never saw the create). This pins the after-D7 ordering (V8 §A11).
+5. `restore_true_live_absent_legacy_resume_id_fails_open`: same live state, but the create carries the id ONLY in legacy `resumeSessionId` (no `session_ref`) — this carrier bypasses D7 in every ordering. Assert: no `notice`, the row stays `Bound`, and the resume proceeds unchanged. This pins the in-gate liveness precondition.
 
-Run: `cargo test -p freshell-ws --test resume_validation_gate` — tests fail (no gate wired; notice absent, row stays bound in case 1).
+Run: `cargo test -p freshell-ws --test resume_validation_gate` — tests fail (no gate wired; notice absent, row stays bound in case 1; cases 4/5 fail once the gate exists if ordering/liveness are wrong — write them RED now so the GREEN wiring must satisfy them).
 
-GREEN — wire `handle_create` (`terminal.rs`), inside the resume-id derivation region:
+GREEN — wire `handle_create` (`terminal.rs`): a tracker in the resume-id derivation region (a), the gate itself in the `:1787→:1789` slot (b), then the stamping guard (c) and notice emission (d):
 
 a. In the derivation block (`:1617-1717`), add a tracker so the gate only sees wire-derived ids — in the `else` branch (the non-prealloc arm that reads `requested_ref` / `create.resume_session_id` / the claude restore ladder), set a new local `let mut resume_id_from_wire = true;` (declared `false` above the block).
 
-b. Immediately after the derivation block (before the D7 liveness guard at `:1739` and the amplifier pre-create at `:1799`), insert:
+b. Insert the gate in the `:1787→:1789` slot — AFTER the D7 cross-mode liveness guard (`:1739-1787`) and BEFORE the amplifier pre-create block (`:1798+`). Both bounds are load-bearing (V8 §A11):
+
+- **After D7:** gate-before-D7 would let a gate fire replace the resume id, which FALSIFIES D7's applicability filter (`resume_session_id == wire sid`) — its loud "still running" reject is silently bypassed and `retire_missing` destroys the `Bound` ledger row of a RUNNING session (breaking `pre_respawn_guard`). D7 is a pure predicate with zero state mutation, so the gate sees byte-identical inputs in the later slot.
+- **Before the amplifier pre-create:** the `ensure_session` re-stub (`:1800-1802`) would resurrect the stale dir under the very id the gate exists to catch.
 
 ```rust
     // Resume validation (docs/plans/2026-07-29-resume-validation.md): never
     // hand the CLI a resume id that is definitively absent from the
     // provider's on-disk store. Fail open on Unknown/ProviderUnavailable.
+    // Placed AFTER the D7 liveness guard (a gate fire would falsify D7's
+    // applicability filter and retire a running session's Bound row) and
+    // BEFORE the amplifier ensure_session re-stub (which would resurrect
+    // the stale dir).
     let mut resume_fallback_notice: Option<String> = None;
     if resume_id_from_wire {
-        let outcome = crate::resume_validation::validate_wire_resume(
-            &mode,
-            resume_session_id.take(),
-            launch_intent,
-            state.session_existence.as_ref(),
-        );
-        resume_session_id = outcome.resume_session_id;
-        launch_intent = outcome.launch_intent;
-        if outcome.claude_fresh_prealloc {
-            claude_fresh_prealloc = true;
-        }
-        if let Some(stale) = outcome.stale_session_id.as_deref() {
-            tracing::warn!(
-                mode = %mode,
-                stale_session_id = %stale,
-                "resume validation: cached session missing on disk; spawning fresh"
-            );
-            // Don't retry the stale id forever.
-            // (Use the same state.pane_ledger access pattern the claude
-            // restore ladder / binding writes in this file already use.)
-            let _ = state.pane_ledger.retire_missing(&mode, stale);
-            resume_fallback_notice = outcome.notice;
+        // In-gate liveness precondition: legacy resumeSessionId-only
+        // carriers bypass D7 in every ordering — a LIVE session must never
+        // gate. Same join D7 uses: registry.live_session_owner + the
+        // fresh-agent sidecar liveness consult (:1747-1758).
+        let candidate_is_live = resume_session_id.as_deref().is_some_and(|sid| {
+            /* registry.live_session_owner(Some(&state.identity), &mode, sid)
+               || <fresh-agent sidecar liveness>, copied from D7's join */
+        });
+        if !candidate_is_live {
+            // The probe's by-id locators do real filesystem walks (~1 s for
+            // codex on a real store) — never inline on the async runtime
+            // (A13). Run the sync helper in spawn_blocking.
+            let outcome = {
+                let probe = state.session_existence.clone();
+                let mode_for_gate = mode.clone();
+                let rid = resume_session_id.take();
+                let intent = launch_intent;
+                tokio::task::spawn_blocking(move || {
+                    crate::resume_validation::validate_wire_resume(
+                        &mode_for_gate,
+                        rid,
+                        intent,
+                        probe.as_ref(),
+                    )
+                })
+                .await
+                .expect("resume validation task panicked")
+            };
+            resume_session_id = outcome.resume_session_id;
+            launch_intent = outcome.launch_intent;
+            if outcome.claude_fresh_prealloc {
+                claude_fresh_prealloc = true;
+            }
+            if let Some(stale) = outcome.stale_session_id.as_deref() {
+                tracing::warn!(
+                    mode = %mode,
+                    stale_session_id = %stale,
+                    "resume validation: cached session missing on disk; spawning fresh"
+                );
+                // Don't retry the stale id forever.
+                // (Use the same state.pane_ledger access pattern the claude
+                // restore ladder / binding writes in this file already use.)
+                let _ = state.pane_ledger.retire_missing(&mode, stale);
+                resume_fallback_notice = outcome.notice;
+            }
         }
     }
 ```
 
-(Adapt the exact `state.pane_ledger` spelling to how `handle_create` already reaches the ledger — e.g. if it is an `Option`/`Arc`, follow the existing call sites in this file.)
+(Adapt the exact `state.pane_ledger` spelling to how `handle_create` already reaches the ledger — e.g. if it is an `Option`/`Arc`, follow the existing call sites in this file. Adapt the liveness join to D7's exact call shape at `:1747-1758` — do not reimplement it. `state.session_existence` is the shared `Arc<dyn SessionExistenceProbe + Send + Sync>`; clone the Arc into the closure.)
 
 c. Stale-ref stamping guard: from the gate insertion point onward, `handle_create` must not stamp the stale `create.session_ref` as the pane's identity. Grep every use of `create.session_ref` / `requested_ref` BELOW the insertion point in `handle_create`; for each one that records identity (ledger binding writes, identity registry, `terminal.created` session fields), switch it to a local `effective_session_ref` that is `None` when the gate fired (the fresh id — when one was minted — flows through `resume_session_id` exactly as the prealloc paths already do). The integration test's ledger assertions in case 1 pin this.
 
@@ -1119,7 +1433,7 @@ Run: `cargo test -p freshell-ws --test resume_validation_gate` — PASS. Then ru
 
 - [ ] **Step 5: Refactor + full-crate run**
 
-Refactor pass: keep `handle_create`'s addition to the ~25 lines above (all policy is in `resume_validation.rs` / `resume_gate.rs`). Run `cargo test -p freshell-ws` (whole crate) and `cargo clippy -p freshell-ws -- -D warnings`.
+Refactor pass: keep `handle_create`'s addition to roughly the block shown above — liveness precondition, `spawn_blocking` gate call, retire + notice bookkeeping (all POLICY stays in `resume_validation.rs` / `resume_gate.rs`; the door only orchestrates). Run `cargo test -p freshell-ws` (whole crate) and `cargo clippy -p freshell-ws -- -D warnings`.
 
 - [ ] **Step 6: Commit**
 
@@ -1137,8 +1451,8 @@ git commit -m "feat(resume-validation): gate WS terminal.create restore path on 
 - Test: extend the existing respawn integration coverage — `crates/freshell-ws/tests/auto_resume_respawn.rs` (reuse its harness/state setup verbatim)
 
 **Interfaces:**
-- Consumes: `validate_wire_resume` (Task 6), `retire_missing` (Task 4), existing `AgentRespawnRequest {mode, provider, session_id, create_request_id, cwd}` and the `emit_recovering`-style broadcast precedent (`auto_resume.rs:604-628`).
-- Produces: no new public API. Behavior contract: on positive absence the respawn proceeds WITHOUT resume args (fresh spawn, same cwd/mode), the stale ledger row is retired `SessionMissing`, a `terminal.status{Recovering, reason}` frame naming the stale id is broadcast, and a `tracing::warn!` is logged. On Present/Unknown, byte-for-byte today's behavior.
+- Consumes: `validate_wire_resume` (Task 6, sync — this door too runs it inside `tokio::task::spawn_blocking`, A13), `retire_missing` (Task 4), existing `AgentRespawnRequest {mode, provider, session_id, create_request_id, cwd}` and the `emit_recovering`-style broadcast precedent (`auto_resume.rs:604-628`).
+- Produces: no new public API. Behavior contract: on positive absence the respawn proceeds WITHOUT resume args (fresh spawn, same cwd/mode), the stale ledger row is retired `SessionMissing`, a `terminal.status{Recovering, reason}` frame naming the stale id is broadcast, and a `tracing::warn!` is logged. On Present/Unknown, byte-for-byte today's behavior. CRITICAL (V8 §A9): the gate replaces the `resume_session_id` LOCAL, not merely the launch args — the post-spawn bookkeeping (registry row `~:2951`, identity upsert `:3041`, ledger `record_binding` `:3060`) all read that local and must record the FRESH id, otherwise `record_binding` re-mints a Bound row for the stale id right after `retire_missing` and the respawn loop is real.
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -1162,7 +1476,12 @@ async fn respawn_with_absent_session_spawns_fresh_and_retires_binding() {
     //    home (ensure_session must not run for the stale id);
     // 4. a broadcast terminal.status frame with status "recovering" was sent
     //    whose reason contains "stale-amp" (subscribe to state.broadcast_tx
-    //    before the call, the way sibling tests capture broadcasts).
+    //    before the call, the way sibling tests capture broadcasts);
+    // 5. the NEW generation's bookkeeping carries the FRESH id, not the stale
+    //    one (V8 §A9 pin): the identity registry entry for the new terminal
+    //    id names the fresh uuid, ledger load_binding("amplifier", <fresh>)
+    //    is Bound, and NO new Bound row exists for "stale-amp" (it stays
+    //    Retired/SessionMissing — record_binding must not resurrect it).
 }
 
 #[tokio::test]
@@ -1185,13 +1504,29 @@ Replace the hardcoded assignment at `terminal.rs:2708-2710`:
     // Resume validation (docs/plans/2026-07-29-resume-validation.md): the
     // respawn id comes from the identity registry / pane ledger — cached
     // state — so it gets the same disk-existence gate as door 1.
+    // CRITICAL: the gate replaces this LOCAL, not merely the launch args —
+    // the post-spawn bookkeeping (registry row ~:2951, identity upsert
+    // :3041, ledger record_binding :3060) all read it and must record the
+    // FRESH id, or the stale id is re-minted as a Bound row right after
+    // retire_missing and the respawn loop is real (V8 §A9).
     let mut launch_intent = LaunchIntent::Resume;
-    let outcome = crate::resume_validation::validate_wire_resume(
-        &req.mode,
-        Some(req.session_id.clone()),
-        launch_intent,
-        state.session_existence.as_ref(),
-    );
+    let outcome = {
+        // Probe + by-id locators do real filesystem walks — never inline on
+        // the async runtime (A13); run the sync helper in spawn_blocking.
+        let probe = state.session_existence.clone();
+        let mode = req.mode.clone();
+        let sid = Some(req.session_id.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::resume_validation::validate_wire_resume(
+                &mode,
+                sid,
+                LaunchIntent::Resume,
+                probe.as_ref(),
+            )
+        })
+        .await
+        .expect("resume validation task panicked")
+    };
     let resume_session_id = outcome.resume_session_id;
     launch_intent = outcome.launch_intent;
     if let Some(stale) = outcome.stale_session_id.as_deref() {
@@ -1222,6 +1557,8 @@ Replace the hardcoded assignment at `terminal.rs:2708-2710`:
 Adapt the `TerminalStatus` field spellings/terminal-id source to the exact struct at `server_messages.rs:1102-1117` and to how `respawn_agent_terminal` names the terminal it is respawning (the sibling `emit_recovering` in `auto_resume.rs:604-628` is the template — if the respawned terminal id is available in scope, prefer it over `create_request_id`). Note `claude_fresh_prealloc` is intentionally unused here — for claude the outcome's `Start` intent + fresh id are honored by the same `CliLaunchInputs`, and this headless path has no prealloc bookkeeping to update (verify: the sibling tests + `cargo check` will surface any claude-specific respawn bookkeeping; if some exists, mirror door 1's handling).
 
 Downstream in this function, the amplifier `ensure_session` call (`:2846`) keys off `resume_session_id` — with the gate having replaced the stale id by a fresh UUID, it stubs the FRESH id, which is exactly the fresh-amplifier-pane shape. No further change needed there.
+
+Deliberate decision AD-3 (hub lease under the stale locator — document with a code comment at the wiring site, do NOT change behavior): after a gate-fired respawn, the auto-resume hub's `complete_claim` continues to bind the STALE locator's lease to the fresh terminal (`auto_resume.rs:529-547` → `registry.complete_session_ref_claim`). A later `terminal.create` carrying the stale ref then adopts the fresh terminal via `BoundElsewhere` WITHOUT door 1's notice. This is convergent (no loop, no duplicate pane, the user reaches the fresh terminal); the only cost is a missing notice on a rare second-order path. Accepted — releasing/rebinding the lease would mean new registry API surface for no user-visible gain.
 
 - [ ] **Step 3: Run tests to verify they pass**
 
@@ -1272,7 +1609,7 @@ fn validate_rest_resume(
 ) -> RestResumeOutcome
 ```
 
-  Behavior identical to `validate_wire_resume` (Task 6) including the per-provider fresh-fallback shapes (claude → new UUID + `Start`; amplifier → new UUID + `Resume`; codex/opencode → `None`), with one addition: `probe: None` (not wired) → passthrough.
+  Behavior identical to `validate_wire_resume` (Task 6) including the per-provider fresh-fallback shapes (claude → new UUID + `Start`; amplifier → new UUID + `Resume`; codex/opencode → `None`), with one addition: `probe: None` (not wired) → passthrough. The helper stays SYNC; the wiring site runs it inside `tokio::task::spawn_blocking` (A13). Minted UUIDs MUST be RFC-4122 v4 (`Uuid::new_v4()`, the crate's existing mint convention at `terminal_tabs.rs:831`) — `is_canonical_claude_session_id` enforces version `1..=5` + RFC-4122 variant, so a v7 or nil UUID would fail `plausible_resume_session_id` and break the healed identity stamping.
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -1349,6 +1686,25 @@ Add to the existing `#[cfg(test)]` module in `terminal_tabs.rs` (or its test spl
         assert!(out.resume_session_id.is_none());
         assert_eq!(out.stale_session_id.as_deref(), Some("stale-cx"));
     }
+
+    #[test]
+    fn rest_resume_minted_claude_id_is_v4_and_plausible() {
+        // Pins the Uuid::new_v4() requirement (V9): is_canonical_claude_
+        // session_id enforces version 1..=5 + RFC-4122 variant — v7/nil
+        // would fail and the healed pane_content stamping would silently
+        // fall through.
+        use freshell_platform::resume_gate::ResumeExistence;
+        let probe = probe_answering(ResumeExistence::Absent, true);
+        let out = validate_rest_resume(
+            "claude",
+            Some("stale-cl".into()),
+            LaunchIntent::Resume,
+            Some(&probe),
+        );
+        assert_eq!(out.launch_intent, LaunchIntent::Start);
+        let minted = out.resume_session_id.expect("fresh claude id minted");
+        assert!(plausible_resume_session_id("claude", &minted));
+    }
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -1360,27 +1716,49 @@ Expected: FAIL to compile — `validate_rest_resume` not defined.
 
 Implement `validate_rest_resume` (same body shape as `validate_wire_resume`, using `ResumeProbeFn` instead of the trait; `None` probe → passthrough; reuse `evaluate_resume_gate`, `provider_validated`, `stale_resume_notice` from freshell-platform; mint UUIDs via the crate's existing uuid dependency — check `Cargo.toml`, add `uuid` with `v4` feature if absent, matching the workspace version).
 
-Wire it in the create pipeline: immediately after the resume id is derived (`derive_resume_identity`, before the amplifier ensure at `:895` and the `CliLaunchInputs` construction feeding `:1355`):
+Wire it in the create pipeline — numbered, all steps MANDATORY:
+
+1. **Gate call** (inside `spawn_blocking` — A13): immediately after the resume id is derived (`derive_resume_identity`, before the amplifier ensure at `:895` and the `CliLaunchInputs` construction feeding `:1355`):
 
 ```rust
-    let rest_outcome = validate_rest_resume(
-        &mode,
-        resume_session_id.take(),
-        launch_intent,
-        state.resume_probe.as_ref(),
-    );
+    // Probe does real filesystem walks — never inline on the async runtime
+    // (A13); run the sync helper in spawn_blocking.
+    let rest_outcome = {
+        let probe = state.resume_probe.clone();
+        let mode_for_gate = mode.clone();
+        let rid = resume_session_id.take();
+        let intent = launch_intent;
+        tokio::task::spawn_blocking(move || {
+            validate_rest_resume(&mode_for_gate, rid, intent, probe.as_ref())
+        })
+        .await
+        .expect("resume validation task panicked")
+    };
     let resume_session_id = rest_outcome.resume_session_id;
     let launch_intent = rest_outcome.launch_intent;
     if let Some(stale) = rest_outcome.stale_session_id.as_deref() {
+        // MANDATORY stale-ref guard (V7 row 10): the pane_content identity
+        // stamping PREFERS accepted_session_ref (terminal_tabs.rs:1683-1685)
+        // — left in place, the STALE wire ref would be stamped into the new
+        // tab's pane_content, poisoning client persistence + tabs-sync
+        // replay and re-firing the gate every restart. Clearing it makes
+        // stamping fall through to the minted-ref branch (:1686-1692), so
+        // gate-fired claude/amplifier panes are born with the HEALED ref and
+        // codex/opencode panes with no ref.
+        accepted_session_ref = None;
         if let Some(cb) = &state.on_stale_resume {
             cb(&mode, stale);
         }
     }
 ```
 
-(Adapt local variable names/mutability to the surrounding pipeline code; the amplifier ensure at `:895` then keys off the fresh id, mirroring door 1. If this pipeline sets identity/binding from the requested session ref, apply the same stale-ref guard as Task 6 step 4c: when the gate fired, the stale ref must not be stamped.)
+(Adapt local variable names/mutability to the surrounding pipeline code; the amplifier ensure at `:895` then keys off the fresh id, mirroring door 1.)
 
-Notice: where the handler builds the response `pane_content` (the `reconcileNotice` injection precedent at `:1657`), when `rest_outcome.notice` is `Some`, insert it as `"reconcileNotice"` in the `pane_content` JSON so the existing client chip/xterm rendering shows it. Add/extend a unit test in the same module asserting the built `pane_content` carries the notice when the gate fires (clone the existing `:1657`-area test if one exists, otherwise assert on the handler's pane-content builder function directly).
+2. **Thread the intent**: the pipeline today HARDCODES `launch_intent: LaunchIntent::Resume` in the `CliLaunchInputs` construction (`~:1335`) — Task 8 must thread `rest_outcome.launch_intent` into the inputs explicitly so the claude fallback's `Start` reaches the resolver. Verified safe (V9): the REST pipeline consumes the SAME Arc'd `cli_commands` the WS door uses (`main.rs:363/:409/:632`), the claude spec has `createSessionArgs` (`extensions/claude-code/freshell.json:11`), so `Start` + minted id resolves — no `StartIntentUnsupported`.
+
+3. **Notice injection**: where the handler builds the response `pane_content` (the `reconcileNotice` injection precedent at `:1657`), when `rest_outcome.notice` is `Some`, insert it as `"reconcileNotice"` in the `pane_content` JSON so the existing client chip/xterm rendering shows it. (Caveat, accepted: a hidden/background tab defers the render until a later visible attach pass — the notice is preserved in pane content, never dropped.)
+
+4. **Tests for 1+3**: add/extend unit tests in the same module asserting that when the gate fires, the built `pane_content` (a) carries the notice, and (b) carries the HEALED ref — `pane_content.sessionRef.sessionId` equals the minted fresh id, NOT the stale wire ref (pin the fall-through to the `:1686-1692` minted-ref branch). Clone the existing `:1657`-area test if one exists, otherwise assert on the handler's pane-content builder function directly.
 
 Add the `FreshAgentState` fields + builders in `lib.rs` (copy the `with_opencode_locator` builder shape exactly).
 
@@ -1462,9 +1840,13 @@ absent) it spawns fresh in the same cwd/mode, surfaces an operator notice
 naming the stale id, and retires the pane-ledger binding
 (`RetiredReason::SessionMissing`). Unknown/unreadable stores fail OPEN
 (resume attempted, byte-for-byte Node behavior). Providers validated:
-claude (with a zero-turn carve-out: Absent + never observed on disk still
-resumes), codex, opencode, amplifier. gemini/kimi/third-party are never
-blocked. Additive protocol field: optional `notice` on `terminal.created`.
+claude — for SAME-BOOT deletions only (a zero-turn carve-out keeps
+Absent + never-observed-on-disk resuming, and the disk-observation signal
+is a per-boot in-memory set, so a transcript deleted while the server was
+DOWN is indistinguishable from never-conversed and fails OPEN post-restart;
+deliberate, fail-open) — codex, opencode, amplifier. gemini/kimi/third-party
+are never blocked. Additive protocol field: optional `notice` on
+`terminal.created`.
 
 **Why:** Production incident 2026-07-29 — after a server restart, freshell
 resumed stored amplifier session id 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 which
@@ -1473,11 +1855,16 @@ silently created a new empty session under that id and the user saw a broken
 restore with no explanation.
 
 **Pinning tests:** `freshell-platform` `resume_gate` unit tests;
-`freshell-ws/tests/resume_validation_gate.rs`;
+`freshell-ws/tests/resume_validation_gate.rs` (incl. the live-session/D7
+ordering and legacy-carrier liveness cases);
 `freshell-ws/tests/auto_resume_respawn.rs`
-(`respawn_with_absent_session_spawns_fresh_and_retires_binding`);
-`freshell-freshagent` `rest_resume_*` unit tests;
-`freshell-server` `existence.rs` amplifier/codex by-id fallback tests.
+(`respawn_with_absent_session_spawns_fresh_and_retires_binding`, incl. the
+fresh-id bookkeeping assertions);
+`freshell-freshagent` `rest_resume_*` unit tests (incl. minted-v4
+plausibility and healed pane_content stamping);
+`freshell-server` `existence.rs` amplifier/codex by-id fallback,
+cold-index, and sub-root permission tests;
+`freshell-protocol/tests/roundtrip.rs` `notice` wire test.
 ```
 
 - [ ] **Step 2: Full Rust verification**
@@ -1511,20 +1898,23 @@ git commit -m "docs(resume-validation): deviation ledger entry for spawn-door re
 
 ## Self-Review Record
 
+*(Re-run 2026-07-29 after incorporating the load-bearing-assumption validation findings — 9 validators, ledger in `.worktrees/.the-usual-logs/resume-validation/`.)*
+
 **1. Spec coverage:**
-- "Validate before constructing the resume command" → Tasks 6 (WS create/restore), 7 (auto-resume respawn), 8 (REST create) — all three call sites of `resolve_coding_cli_command` are gated. ✅
-- "If validation fails: don't pass the resume flag; spawn fresh in same cwd/mode" → fallback shapes in `validate_wire_resume`/`validate_rest_resume` mirror each mode's genuine fresh-pane spawn; cwd/mode inputs are untouched. ✅
-- "Operator-visible notice naming the stale id" → Task 5 (`notice` on `terminal.created` + xterm rendering, door 1), Task 8 (`reconcileNotice` in `pane_content`, door 3); door 2 broadcasts `terminal.status{Recovering, reason}` + warn-log — documented as the best available channel on a headless path (deliberate, stated in Design Notes). ✅
-- "Clear/mark the stale cached id so it isn't retried forever" → Task 4 `retire_missing` (`SessionMissing`), invoked at all three doors. ✅
-- "Fail open on Unknown/unreadable" → gate policy (Task 1) + probe `Unreadable→Unknown` mappings (Tasks 2–3) + explicit fail-open tests at every layer. ✅
-- "Amplifier MUST be covered; store = ~/.amplifier/projects/<slug>/sessions/<id>/; search all projects (documented)" → Tasks 2–3 + Global Constraints. ✅
-- "Cover providers freshell already reads; fail open for others" → claude/codex/opencode/amplifier validated; gemini/kimi/third-party never blocked (tested). ✅
-- "Rust server REQUIRED; Node only if cheap — if skipped, say so" → Node explicitly skipped with reasons (Global Constraints). ✅
-- "Non-goals respected" → no amplifier-CLI changes; no indexing subsystem changes beyond two by-id fallbacks the validation needs; protocol change limited to one additive optional field, mirrored per convention. ✅
+- "Validate before constructing the resume command" → Tasks 6 (WS create/restore), 7 (auto-resume respawn), 8 (REST create) — all three call sites of `resolve_coding_cli_command` are gated, and the gate now fires even against a COLD index for amplifier/claude (Task 3 cold coverage — the incident scenario is a cold-index race). ✅
+- "If validation fails: don't pass the resume flag; spawn fresh in same cwd/mode" → fallback shapes in `validate_wire_resume`/`validate_rest_resume` mirror each mode's genuine fresh-pane spawn; cwd/mode inputs are untouched; door 3 threads the claude `Start` intent explicitly past the `~:1335` hardcode (Task 8 step 2, V9-verified). ✅
+- "Operator-visible notice naming the stale id" → Task 5 (`notice` on `terminal.created` + xterm rendering, door 1), Task 8 (`reconcileNotice` in `pane_content`, door 3); door 2 broadcasts `terminal.status{Recovering, reason}` + warn-log — documented as the best available channel on a headless path (deliberate, stated in Design Notes). AD-3 residual (missing notice on the rare stale-ref-adopts-fresh-terminal path) is recorded in Task 7. ✅
+- "Clear/mark the stale cached id so it isn't retried forever" → four cooperating mechanisms, all required with tests: Task 4 `retire_missing` (all doors) + `terminal.created.sessionRef` overwrite (claude/amplifier, existing client fold, V5-verified) + Task 5 notice-triggered clear of persisted `sessionRef`/`resumeSessionId` (codex/opencode) + Task 8's mandatory `accepted_session_ref` guard (door 3). ✅
+- "Fail open on Unknown/unreadable" — invariant now STRONGER than the original plan: gate policy (Task 1) + errors-seen accumulator locator contracts (Tasks 2–3: ANY per-entry error with no hit ⇒ `Unreadable` ⇒ `Unknown` ⇒ Proceed; never `.is_dir()`/`fs::metadata(root)` adjudication) + AD-1 root semantics (NotFound-with-readable-parent ⇒ Absent, root ERROR ⇒ Unreadable) + in-gate liveness precondition and after-D7 ordering at door 1 (a LIVE session can never be gated or have its Bound row retired) + explicit fail-open tests at every layer incl. sub-root permission fixtures (euid-guarded). ✅
+- "Amplifier MUST be covered; store = ~/.amplifier/projects/<slug>/sessions/<id>/; search all projects (documented)" → Tasks 2–3 + Global Constraints; covered even before index warm-up (cold-coverage matrix in Design Notes). ✅
+- "Cover providers freshell already reads; fail open for others" → claude (same-boot deletions only — AD-2, honestly scoped in Design Notes + DEVIATIONS)/codex/opencode/amplifier validated; codex/opencode additionally fail open in the first seconds after boot (AD-4, accepted residual); gemini/kimi/third-party never blocked (tested). ✅
+- "Rust server REQUIRED; Node only if cheap — if skipped, say so" → Node explicitly skipped with reasons (Global Constraints); Task 5's mirror provably touches zero `server/` files (precedent commits `5c591843`/`a18dd4c6`). ✅
+- "Non-goals respected" → no amplifier-CLI changes; no indexing subsystem changes beyond the by-id fallbacks + the cold-branch consult the validation needs; protocol change limited to one additive optional field, mirrored via `shared/ws-protocol.ts` + regenerated contract schema (never hand-edited). ✅
 - "TDD, unit + e2e, coordinated test commands, worktree, no PR/deploy, known flaky test" → per-task RGR steps + Task 9 sweep + Global Constraints. ✅
+- Runtime discipline: no door blocks the async runtime — all probe/locator IO runs in `tokio::task::spawn_blocking` (one consistent shape: sync helpers, doors wrap; Tasks 6/7/8), and the expensive codex walk is confined to warm-Absent adjudication (A13/AD-4). ✅
 
-**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose own by-id fallback behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. No requirement was moved to known-limitations/future-work. NO UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals:** The production outcome that proves the feature: `resume_validation_gate.rs` case 1 drives the REAL `handle_create` restore path with a stale amplifier ref against a real (temp) amplifier store and asserts fresh spawn + notice + retired binding — no stub stands in for required behavior in production code paths. Behaviors the validation pass surfaced are now REQUIRED with pinning tests, not deferred: the codex/opencode notice-triggered client clear (Task 5 test), the door-3 `accepted_session_ref` guard + healed-ref stamping (Task 8 step 4 tests), the door-2 fresh-id bookkeeping (Task 7 assertion 5), the after-D7 ordering + in-gate liveness (Task 6 cases 4–5), and the minted-v4 plausibility pin (Task 8). The only accepted residuals are recorded decisions with rationale (AD-1…AD-4), not silent gaps. Test doubles used (fake `SessionExistenceProbe`/`ResumeProbeFn` in unit tests) are replaced in production by `IndexExistenceProbe`, whose by-id fallback, cold-index, and error-contract behavior is tested against real temp stores in Task 3; the `main.rs` wiring is exercised by `cargo test -p freshell-server` compile + probe tests and reviewed in Tasks 3/8. NO UNRESOLVED COVERAGE GAPS.
 
-**2. Placeholder scan:** Steps that intentionally clone an existing harness (Task 3 fallback tests, Task 6/7 integration tests, Task 5 client test, Task 4 ledger tests) each name the exact sibling file/test whose scaffolding to copy and spell out the complete required assertions — the behavior contract is fully specified; only mechanical harness reuse is deferred to the named files. No TBD/TODO/"handle edge cases" remain.
+**2. Placeholder scan:** Steps that intentionally clone an existing harness (Task 3 fallback/cold/permission tests, Task 6/7 integration tests, Task 5 client tests, Task 4 ledger tests) each name the exact sibling file/test whose scaffolding to copy and spell out the complete required assertions — the behavior contract is fully specified; only mechanical harness reuse is deferred to the named files. The Task 3 `codex_rollout_on_disk` snippet leaves ONE named private helper to mechanical implementation (the tri-state first-line ownership read) with its full contract spelled inline (valid-read-mismatch ⇒ non-owner; open/read/decode failure incl. `.jsonl.zst` ⇒ error). Task 6's liveness precondition explicitly copies D7's existing join (`:1747-1758`) rather than leaving it open. No TBD/TODO/"handle edge cases" remain.
 
-**3. Type consistency check:** `ResumeExistence{Present,Absent,Unknown}` and `ResumeGateDecision{Proceed,SpawnFresh}` (Task 1) used identically in Tasks 6–8; `ResumeProbeAnswer{existence, ever_observed_on_disk}`/`ResumeProbeFn` (Task 1) match Task 8's fake and main.rs closure; `AmplifierSessionAnswer{Present,Absent,Unreadable}` (Task 2) matches Task 3's `amplifier_dir_locator` mapping; `ByIdAnswer` (Task 3) used by both locators; `retire_missing(&self, provider: &str, session_id: &str) -> bool` (Task 4) matches every call site in Tasks 6–8; `validate_wire_resume(mode, Option<String>, LaunchIntent, &dyn SessionExistenceProbe) -> ResumeValidationOutcome` (Task 6) matches Task 7's call; `notice: Option<String>` field name consistent across Tasks 5 and 6. ✅
+**3. Type consistency check:** `ResumeExistence{Present,Absent,Unknown}` and `ResumeGateDecision{Proceed,SpawnFresh}` (Task 1) used identically in Tasks 6–8 — mapping unchanged by the validation edits; `ResumeProbeAnswer{existence, ever_observed_on_disk}`/`ResumeProbeFn` (Task 1) match Task 8's fake and main.rs closure; `AmplifierSessionAnswer{Present,Absent,Unreadable}` (Task 2, errors-seen accumulator) matches Task 3's `amplifier_dir_locator` mapping AND the cold-branch consult; `ByIdAnswer{Present,Absent,Unreadable}` (Task 3) is the single answer contract for both locators, with identical Unreadable⇒Unknown mapping at the warm-Absent adjudication and the cold branch; `retire_missing(&self, provider: &str, session_id: &str) -> bool` (Task 4) matches every call site in Tasks 6–8; `validate_wire_resume(mode, Option<String>, LaunchIntent, &dyn SessionExistenceProbe) -> ResumeValidationOutcome` stays SYNC and matches Task 7's call — both doors wrap it in `spawn_blocking` with an `Arc<dyn SessionExistenceProbe>` clone, and Task 8's sync `validate_rest_resume` is wrapped identically at its wiring site (one consistent async shape across all three doors; unit tests for all helpers stay synchronous); `notice: Option<String>` field name consistent across Tasks 5 and 6, and Task 5's client clear keys on the same field. ✅
