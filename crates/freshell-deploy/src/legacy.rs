@@ -255,6 +255,8 @@ pub fn capture_legacy<Inspector: ProcessInspector, Probe: ScratchProbe>(
             store.paths().checkout().display()
         )));
     }
+    verify_live_runtime_sources(&process, request)?;
+    verify_live_client(&pinned, &request.runtime.client_dir)?;
     let mut executable = pinned.open_verified_executable()?;
 
     let bindings = RuntimeBindings::legacy_layout(&request.runtime)?;
@@ -309,6 +311,7 @@ pub fn capture_legacy<Inspector: ProcessInspector, Probe: ScratchProbe>(
     let cleanup_result = scratch.cleanup();
     combine_scratch_results(probe_result, cleanup_result)?;
     pinned.revalidate()?;
+    verify_live_client(&pinned, &request.runtime.client_dir)?;
 
     let receipt = LegacyCaptureReceipt {
         schema_version: "1".to_string(),
@@ -365,6 +368,90 @@ pub fn capture_legacy<Inspector: ProcessInspector, Probe: ScratchProbe>(
     }
     locked.write_live(&live)?;
     Ok(receipt)
+}
+
+fn verify_live_runtime_sources(
+    process: &ProcessIdentity,
+    request: &LegacyCaptureRequest,
+) -> Result<()> {
+    let sidecar_entry = request
+        .runtime
+        .claude_sidecar_dir
+        .join(&request.runtime.claude_sidecar_entry_relative);
+    let mcp_entry = request
+        .runtime
+        .dist_server_dir
+        .join(&request.runtime.mcp_entry_relative);
+    for (label, supplied, live) in [
+        (
+            "client",
+            request.runtime.client_dir.as_path(),
+            process.runtime.client_dir.as_str(),
+        ),
+        (
+            "extensions",
+            request.runtime.extensions_dir.as_path(),
+            process.runtime.extensions_dir.as_str(),
+        ),
+        (
+            "compiled server",
+            request.runtime.dist_server_dir.as_path(),
+            process.runtime.dist_server_dir.as_str(),
+        ),
+        (
+            "MCP entry",
+            mcp_entry.as_path(),
+            process.runtime.mcp_entry.as_str(),
+        ),
+        (
+            "Claude sidecar entry",
+            sidecar_entry.as_path(),
+            process.runtime.claude_sidecar_entry.as_str(),
+        ),
+        (
+            "package.json",
+            request.runtime.package_json.as_path(),
+            process.runtime.package_json.as_str(),
+        ),
+        (
+            "package-lock.json",
+            request.runtime.package_lock.as_path(),
+            process.runtime.package_lock.as_str(),
+        ),
+        (
+            "production dependencies",
+            request.runtime.production_node_modules.as_path(),
+            process.runtime.production_node_modules.as_str(),
+        ),
+        (
+            "Node",
+            request.node.executable.as_path(),
+            process.runtime.node_executable.as_str(),
+        ),
+    ] {
+        let supplied = fs::canonicalize(supplied)?;
+        if supplied != Path::new(live) {
+            return Err(DeployError::LegacyCapture(format!(
+                "supplied {label} path {} does not match live process provenance {live}",
+                supplied.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_live_client<Inspector: ProcessInspector>(
+    pinned: &PinnedProcess<'_, Inspector>,
+    client_dir: &Path,
+) -> Result<()> {
+    let expected = fs::read(client_dir.join("index.html"))?;
+    let actual = pinned.read_live_client()?;
+    if actual != expected {
+        return Err(DeployError::LegacyCapture(
+            "supplied client does not match the bytes served by the live process".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 struct LegacyBootstrapPrefix {
@@ -1458,6 +1545,26 @@ impl<Child: ChildLifecycle> ChildGuard<Child> {
     }
 }
 
+fn validate_and_finish<Child, T>(
+    mut guard: ChildGuard<Child>,
+    label: &str,
+    validate: impl FnOnce(&mut ChildGuard<Child>) -> Result<T>,
+) -> Result<T>
+where
+    Child: ChildLifecycle,
+{
+    let validation = validate(&mut guard);
+    let cleanup = guard.finish(label);
+    match (validation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(validation_error), Err(cleanup_error)) => Err(DeployError::LegacyCapture(format!(
+            "{label} validation failed: {validation_error}; cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
 impl<Child: ChildLifecycle> Deref for ChildGuard<Child> {
     type Target = Child;
 
@@ -1500,20 +1607,27 @@ impl ScratchProbe for RealScratchProbe {
             .map_err(|error| {
                 DeployError::LegacyCapture(format!("cannot execute captured Node: {error}"))
             })?;
-        let mut version_child = ChildGuard::new(version_child);
-        wait_for_success(&mut version_child, self.timeout, "Node version probe")?;
-        let mut version = String::new();
-        version_child
-            .stdout
-            .as_mut()
-            .ok_or_else(|| DeployError::LegacyCapture("Node stdout unavailable".to_string()))?
-            .read_to_string(&mut version)?;
-        if version.trim() != request.node.version {
-            return Err(DeployError::LegacyCapture(
-                "captured Node executable/version prerequisite changed".to_string(),
-            ));
-        }
-        version_child.finish("Node version probe")?;
+        validate_and_finish(
+            ChildGuard::new(version_child),
+            "Node version probe",
+            |version_child| {
+                wait_for_success(version_child, self.timeout, "Node version probe")?;
+                let mut version = String::new();
+                version_child
+                    .stdout
+                    .as_mut()
+                    .ok_or_else(|| {
+                        DeployError::LegacyCapture("Node stdout unavailable".to_string())
+                    })?
+                    .read_to_string(&mut version)?;
+                if version.trim() != request.node.version {
+                    return Err(DeployError::LegacyCapture(
+                        "captured Node executable/version prerequisite changed".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        )?;
 
         let node_parent = request
             .node
@@ -1538,20 +1652,28 @@ impl ScratchProbe for RealScratchProbe {
                     "legacy bare `node` prerequisite could not execute: {error}"
                 ))
             })?;
-        let mut bare_child = ChildGuard::new(bare_child);
-        wait_for_success(&mut bare_child, self.timeout, "legacy bare Node probe")?;
-        let mut bare_version = String::new();
-        bare_child
-            .stdout
-            .as_mut()
-            .ok_or_else(|| DeployError::LegacyCapture("bare Node stdout unavailable".to_string()))?
-            .read_to_string(&mut bare_version)?;
-        if bare_version.trim() != request.node.version {
-            return Err(DeployError::LegacyCapture(
-                "legacy bare `node` version differs from the verified prerequisite".to_string(),
-            ));
-        }
-        bare_child.finish("legacy bare Node probe")?;
+        validate_and_finish(
+            ChildGuard::new(bare_child),
+            "legacy bare Node probe",
+            |bare_child| {
+                wait_for_success(bare_child, self.timeout, "legacy bare Node probe")?;
+                let mut bare_version = String::new();
+                bare_child
+                    .stdout
+                    .as_mut()
+                    .ok_or_else(|| {
+                        DeployError::LegacyCapture("bare Node stdout unavailable".to_string())
+                    })?
+                    .read_to_string(&mut bare_version)?;
+                if bare_version.trim() != request.node.version {
+                    return Err(DeployError::LegacyCapture(
+                        "legacy bare `node` version differs from the verified prerequisite"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        )?;
 
         verify_sidecar_import(request, self.timeout)?;
         verify_mcp_import(request, self.timeout)?;
@@ -1570,15 +1692,15 @@ fn verify_sidecar_import(request: &ScratchProbeRequest, timeout: Duration) -> Re
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| DeployError::LegacyCapture(format!("sidecar import failed: {error}")))?;
-    let mut child = ChildGuard::new(child);
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| DeployError::LegacyCapture("sidecar stdin unavailable".to_string()))?
-        .write_all(b"{\"type\":\"shutdown\"}\n")?;
-    drop(child.stdin.take());
-    wait_for_success(&mut child, timeout, "Claude sidecar import")?;
-    child.finish("Claude sidecar import")
+    validate_and_finish(ChildGuard::new(child), "Claude sidecar import", |child| {
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| DeployError::LegacyCapture("sidecar stdin unavailable".to_string()))?
+            .write_all(b"{\"type\":\"shutdown\"}\n")?;
+        drop(child.stdin.take());
+        wait_for_success(child, timeout, "Claude sidecar import")
+    })
 }
 
 fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result<()> {
@@ -1595,9 +1717,9 @@ fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| DeployError::LegacyCapture(format!("MCP import failed: {error}")))?;
-    let mut child = ChildGuard::new(child);
-    wait_for_success(&mut child, timeout, "MCP import")?;
-    child.finish("MCP import")?;
+    validate_and_finish(ChildGuard::new(child), "MCP import", |child| {
+        wait_for_success(child, timeout, "MCP import")
+    })?;
 
     let fallback_script = "const {readFile}=await import('node:fs/promises');\
          const {resolve}=await import('node:path');\
@@ -1618,13 +1740,11 @@ fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result
                 "pre-binding legacy MCP fallback import failed: {error}"
             ))
         })?;
-    let mut child = ChildGuard::new(child);
-    wait_for_success(
-        &mut child,
-        timeout,
+    validate_and_finish(
+        ChildGuard::new(child),
         "pre-binding legacy MCP fallback import",
-    )?;
-    child.finish("pre-binding legacy MCP fallback import")
+        |child| wait_for_success(child, timeout, "pre-binding legacy MCP fallback import"),
+    )
 }
 
 fn verify_scratch_server(request: &ScratchProbeRequest, timeout: Duration) -> Result<()> {
@@ -1648,50 +1768,49 @@ fn verify_scratch_server(request: &ScratchProbeRequest, timeout: Duration) -> Re
         DeployError::LegacyCapture(format!("scratch server could not start: {error}"))
     })?;
     let child_pid = child.id();
-    let mut child = ChildGuard::new(child);
-
-    let deadline = Instant::now() + timeout;
-    let mut address = None;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? {
-            return Err(DeployError::LegacyCapture(format!(
-                "scratch server exited before readiness: {status}; {}",
-                read_bounded_log(&log_path)
-            )));
-        }
-        match fs::read(&ready_path) {
-            Ok(raw) => {
-                address = Some(validate_scratch_ready_receipt(
-                    &raw,
-                    &nonce,
-                    &request.generation_id,
-                    child_pid,
-                )?);
+    validate_and_finish(ChildGuard::new(child), "scratch server", |child| {
+        let deadline = Instant::now() + timeout;
+        let mut address = None;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                return Err(DeployError::LegacyCapture(format!(
+                    "scratch server exited before readiness: {status}; {}",
+                    read_bounded_log(&log_path)
+                )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            match fs::read(&ready_path) {
+                Ok(raw) => {
+                    address = Some(validate_scratch_ready_receipt(
+                        &raw,
+                        &nonce,
+                        &request.generation_id,
+                        child_pid,
+                    )?);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            if address.is_none() {
+                address = parse_listening_address(&read_bounded_log(&log_path));
+            }
+            if address.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
         }
-        if address.is_none() {
-            address = parse_listening_address(&read_bounded_log(&log_path));
-        }
-        if address.is_some() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let address = address.ok_or_else(|| {
-        DeployError::LegacyCapture(format!(
-            "scratch server did not become ready; {}",
-            read_bounded_log(&log_path)
-        ))
-    })?;
-    let port = validate_scratch_loopback_address(address)?;
-    validate_scratch_listener(port, child_pid)?;
-    scratch_health(port, &auth_token)?;
-    scratch_client(port, request)?;
-    scratch_extensions(port, request, &auth_token)?;
-    validate_scratch_listener(port, child_pid)?;
-    child.finish("scratch server")
+        let address = address.ok_or_else(|| {
+            DeployError::LegacyCapture(format!(
+                "scratch server did not become ready; {}",
+                read_bounded_log(&log_path)
+            ))
+        })?;
+        let port = validate_scratch_loopback_address(address)?;
+        validate_scratch_listener(port, child_pid)?;
+        scratch_health(port, &auth_token)?;
+        scratch_client(port, request)?;
+        scratch_extensions(port, request, &auth_token)?;
+        validate_scratch_listener(port, child_pid)
+    })
 }
 
 fn scratch_server_environment(
@@ -2057,6 +2176,28 @@ mod tests {
 
         assert!(error.to_string().contains("terminate failure"));
         assert!(error.to_string().contains("reap failure"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["terminate", "reap", "terminate", "reap"]
+        );
+    }
+
+    #[test]
+    fn validation_and_cleanup_errors_are_combined_after_checked_cleanup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = validate_and_finish(
+            ChildGuard::new(FailingChildLifecycle {
+                events: Arc::clone(&events),
+            }),
+            "fake child",
+            |_| Err::<(), _>(DeployError::LegacyCapture("validation failure".to_string())),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("validation failure"));
+        assert!(message.contains("terminate failure"));
+        assert!(message.contains("reap failure"));
         assert_eq!(
             *events.lock().unwrap(),
             vec!["terminate", "reap", "terminate", "reap"]

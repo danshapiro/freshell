@@ -151,9 +151,7 @@ impl Store {
             ));
         }
         self.verify_generation(&receipt.selected_generation_id)?;
-        if let Some(id) = &receipt.running_server_generation_id {
-            self.verify_generation(id)?;
-        }
+        self.validate_running_binding(receipt)?;
         atomic_write(self.paths.live_receipt(), &receipt.to_json()?, 0o600)
     }
 
@@ -164,6 +162,7 @@ impl Store {
         };
         let receipt = LiveReceipt::from_json(&bytes)?;
         self.validate_process_port(receipt.process_identity.as_ref(), "live")?;
+        self.validate_running_binding(&receipt)?;
         Ok(Some(receipt))
     }
 
@@ -250,6 +249,94 @@ impl Store {
         }
         Ok(())
     }
+
+    fn validate_running_binding(&self, receipt: &LiveReceipt) -> Result<()> {
+        let (Some(generation_id), Some(process)) = (
+            receipt.running_server_generation_id.as_deref(),
+            receipt.process_identity.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let generation = self.verify_generation(generation_id)?;
+        let executable_path = generation.path.join("server/freshell-server");
+        let copied_executable = crate::process_identity::FileIdentity::from_path(&executable_path)
+            .map_err(|error| {
+                DeployError::InvalidReceipt(format!(
+                    "running generation server executable is invalid: {error}"
+                ))
+            })?;
+        if receipt.legacy {
+            let legacy = self.read_legacy_capture()?.ok_or_else(|| {
+                DeployError::InvalidReceipt(
+                    "legacy live binding requires authoritative legacy.json".to_string(),
+                )
+            })?;
+            if legacy.generation_id != generation_id || legacy.process != *process {
+                return Err(DeployError::InvalidReceipt(
+                    "legacy live process/generation binding disagrees with legacy.json".to_string(),
+                ));
+            }
+            if copied_executable.sha256 != process.executable.sha256
+                || copied_executable.mode != process.executable.mode & !0o222
+            {
+                return Err(DeployError::InvalidReceipt(
+                    "legacy generation executable does not match captured live process".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if copied_executable != process.executable {
+            return Err(DeployError::InvalidReceipt(
+                "running process executable is not the claimed generation executable".to_string(),
+            ));
+        }
+        if Path::new(&process.cwd) != generation.path {
+            return Err(DeployError::InvalidReceipt(
+                "running process cwd is not the claimed generation root".to_string(),
+            ));
+        }
+        for (label, actual, relative) in [
+            ("client", &process.runtime.client_dir, "client"),
+            ("extensions", &process.runtime.extensions_dir, "extensions"),
+            (
+                "compiled server",
+                &process.runtime.dist_server_dir,
+                "dist/server",
+            ),
+            (
+                "MCP entry",
+                &process.runtime.mcp_entry,
+                "dist/server/mcp/server.js",
+            ),
+            (
+                "Claude sidecar",
+                &process.runtime.claude_sidecar_entry,
+                "claude-sidecar/index.mjs",
+            ),
+            (
+                "package.json",
+                &process.runtime.package_json,
+                "package.json",
+            ),
+            (
+                "package-lock.json",
+                &process.runtime.package_lock,
+                "package-lock.json",
+            ),
+            (
+                "production dependencies",
+                &process.runtime.production_node_modules,
+                "node_modules",
+            ),
+        ] {
+            if Path::new(actual) != generation.path.join(relative) {
+                return Err(DeployError::InvalidReceipt(format!(
+                    "running process {label} provenance is outside the claimed generation"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_private_receipt(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -284,8 +371,13 @@ impl LockedStore<'_> {
         if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
             return Err(DeployError::UnsafeStorePath(source.to_path_buf()));
         }
+        let canonical_source = fs::canonicalize(source)?;
+        let store_root = self.store.paths.store_root();
+        if canonical_source.starts_with(store_root) || store_root.starts_with(&canonical_source) {
+            return Err(DeployError::UnsafeStorePath(canonical_source));
+        }
         let mut stage = self.begin_generation()?;
-        stage.copy_tree(source, Path::new(""))?;
+        stage.copy_tree(&canonical_source, Path::new(""))?;
         stage.seal()?;
         self.publish(stage)
     }

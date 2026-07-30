@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,39 @@ pub struct ProcessIdentity {
     pub argv0: String,
     pub argument_count: u32,
     pub effective_uid: u32,
+    pub runtime: RuntimeProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeProvenance {
+    pub client_dir: String,
+    pub extensions_dir: String,
+    pub dist_server_dir: String,
+    pub mcp_entry: String,
+    pub claude_sidecar_entry: String,
+    pub node_executable: String,
+    pub package_json: String,
+    pub package_lock: String,
+    pub production_node_modules: String,
+}
+
+impl RuntimeProvenance {
+    fn validate(&self) -> bool {
+        [
+            &self.client_dir,
+            &self.extensions_dir,
+            &self.dist_server_dir,
+            &self.mcp_entry,
+            &self.claude_sidecar_entry,
+            &self.node_executable,
+            &self.package_json,
+            &self.package_lock,
+            &self.production_node_modules,
+        ]
+        .into_iter()
+        .all(|path| Path::new(path).is_absolute())
+    }
 }
 
 impl ProcessIdentity {
@@ -107,6 +141,7 @@ impl ProcessIdentity {
             || !Path::new(&self.cwd).is_absolute()
             || self.argv0.is_empty()
             || self.argument_count == 0
+            || !self.runtime.validate()
         {
             return Err(DeployError::ProcessIdentity(
                 "process identity is incomplete or malformed".to_string(),
@@ -123,6 +158,7 @@ pub trait ProcessInspector {
     fn open_pidfd(&self, pid: u32) -> Result<Self::Pin>;
     fn snapshot(&self, pin: &Self::Pin, listener: &ListenerIdentity) -> Result<ProcessIdentity>;
     fn open_executable(&self, pin: &Self::Pin) -> Result<File>;
+    fn read_live_client(&self, port: DeployPort) -> Result<Vec<u8>>;
 }
 
 pub struct PinnedProcess<'a, Inspector: ProcessInspector> {
@@ -173,6 +209,10 @@ impl<'a, Inspector: ProcessInspector> PinnedProcess<'a, Inspector> {
             ));
         }
         Ok(executable)
+    }
+
+    pub fn read_live_client(&self) -> Result<Vec<u8>> {
+        self.inspector.read_live_client(self.port)
     }
 
     pub fn revalidate(&self) -> Result<()> {
@@ -396,6 +436,7 @@ impl ProcessInspector for LinuxProcfs {
             })?
             .to_string();
         let effective_uid = fs::symlink_metadata(self.root.join(pin.pid.to_string()))?.uid();
+        let runtime = self.runtime_provenance(pin.pid, Path::new(&cwd))?;
         Ok(ProcessIdentity {
             pid: pin.pid,
             kernel_boot_id: boot_id,
@@ -408,6 +449,7 @@ impl ProcessInspector for LinuxProcfs {
                 DeployError::ProcessIdentity("process argument count overflow".to_string())
             })?,
             effective_uid,
+            runtime,
         })
     }
 
@@ -415,6 +457,159 @@ impl ProcessInspector for LinuxProcfs {
         ensure_pidfd_alive(&pin.descriptor)?;
         Ok(File::open(self.pid_path(pin.pid, "exe"))?)
     }
+
+    fn read_live_client(&self, port: DeployPort) -> Result<Vec<u8>> {
+        read_loopback_http_body(port, "/")
+    }
+}
+
+impl LinuxProcfs {
+    fn runtime_provenance(&self, pid: u32, cwd: &Path) -> Result<RuntimeProvenance> {
+        let raw = fs::read(self.pid_path(pid, "environ"))?;
+        let mut environment = std::collections::BTreeMap::<String, String>::new();
+        for entry in raw
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let separator = entry.iter().position(|byte| *byte == b'=').ok_or_else(|| {
+                DeployError::ProcessIdentity("process environment is malformed".to_string())
+            })?;
+            let (name, value_with_separator) = entry.split_at(separator);
+            let value = &value_with_separator[1..];
+            let name = std::str::from_utf8(name).map_err(|_| {
+                DeployError::ProcessIdentity("process environment name is not UTF-8".to_string())
+            })?;
+            if !matches!(
+                name,
+                "FRESHELL_CLIENT_DIR"
+                    | "FRESHELL_EXTENSIONS_DIR"
+                    | "FRESHELL_CLAUDE_SIDECAR"
+                    | "FRESHELL_CLAUDE_NODE"
+                    | "FRESHELL_MCP_SERVER_ENTRY"
+                    | "PATH"
+            ) {
+                continue;
+            }
+            let value = std::str::from_utf8(value)
+                .map_err(|_| DeployError::ProcessIdentity(format!("{name} is not UTF-8")))?;
+            if environment
+                .insert(name.to_string(), value.to_string())
+                .is_some()
+            {
+                return Err(DeployError::ProcessIdentity(format!(
+                    "process environment contains duplicate {name}"
+                )));
+            }
+        }
+        let effective = |name: &str, fallback: PathBuf| -> Result<String> {
+            let path = environment
+                .get(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(fallback);
+            canonical_runtime_path(cwd, &path, name)
+        };
+        let node_path = environment
+            .get("FRESHELL_CLAUDE_NODE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("node"));
+        let node_path = if node_path.components().count() == 1 {
+            resolve_path_executable(
+                &node_path,
+                environment.get("PATH").map(String::as_str).unwrap_or(""),
+            )?
+        } else {
+            node_path
+        };
+        Ok(RuntimeProvenance {
+            client_dir: effective("FRESHELL_CLIENT_DIR", cwd.join("dist/client"))?,
+            extensions_dir: effective("FRESHELL_EXTENSIONS_DIR", cwd.join("extensions"))?,
+            dist_server_dir: canonical_runtime_path(
+                cwd,
+                &cwd.join("dist/server"),
+                "compiled server",
+            )?,
+            mcp_entry: effective(
+                "FRESHELL_MCP_SERVER_ENTRY",
+                cwd.join("dist/server/mcp/server.js"),
+            )?,
+            claude_sidecar_entry: effective(
+                "FRESHELL_CLAUDE_SIDECAR",
+                cwd.join("crates/freshell-claude-sidecar/index.mjs"),
+            )?,
+            node_executable: canonical_runtime_path(cwd, &node_path, "FRESHELL_CLAUDE_NODE")?,
+            package_json: canonical_runtime_path(cwd, &cwd.join("package.json"), "package.json")?,
+            package_lock: canonical_runtime_path(
+                cwd,
+                &cwd.join("package-lock.json"),
+                "package-lock.json",
+            )?,
+            production_node_modules: canonical_runtime_path(
+                cwd,
+                &cwd.join("node_modules"),
+                "node_modules",
+            )?,
+        })
+    }
+}
+
+fn canonical_runtime_path(cwd: &Path, path: &Path, label: &str) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    fs::canonicalize(&absolute)
+        .map_err(|error| {
+            DeployError::ProcessIdentity(format!(
+                "cannot resolve live {label} path {}: {error}",
+                absolute.display()
+            ))
+        })?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| DeployError::ProcessIdentity(format!("live {label} path is not UTF-8")))
+}
+
+fn resolve_path_executable(name: &Path, path: &str) -> Result<PathBuf> {
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(DeployError::ProcessIdentity(format!(
+        "cannot resolve live executable {} through process PATH",
+        name.display()
+    )))
+}
+
+fn read_loopback_http_body(port: DeployPort, path: &str) -> Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port.get())).map_err(|error| {
+        DeployError::ProcessIdentity(format!("cannot read live server client: {error}"))
+    })?;
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| {
+            DeployError::ProcessIdentity("live HTTP response is malformed".to_string())
+        })?;
+    let headers = std::str::from_utf8(&response[..split]).map_err(|_| {
+        DeployError::ProcessIdentity("live HTTP response headers are not UTF-8".to_string())
+    })?;
+    if !headers.starts_with("HTTP/1.1 200 ") && !headers.starts_with("HTTP/1.0 200 ") {
+        return Err(DeployError::ProcessIdentity(format!(
+            "live client request did not return 200: {}",
+            headers.lines().next().unwrap_or("missing status")
+        )));
+    }
+    Ok(response[split + 4..].to_vec())
 }
 
 fn parse_listener_table(raw: &str, port: DeployPort, output: &mut BTreeSet<String>) -> Result<()> {

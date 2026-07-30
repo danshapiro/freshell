@@ -50,6 +50,19 @@ impl LiveReceipt {
                 ));
             }
         }
+        if self.running_server_generation_id.is_some() && self.process_identity.is_none() {
+            return Err(DeployError::InvalidReceipt(
+                "runningServerGenerationId requires processIdentity".to_string(),
+            ));
+        }
+        if self.legacy
+            && (self.running_server_generation_id.is_none() || self.process_identity.is_none())
+        {
+            return Err(DeployError::InvalidReceipt(
+                "legacy live receipt requires a running generation and process identity"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 

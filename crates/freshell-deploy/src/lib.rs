@@ -23,6 +23,7 @@ pub use manifest::{EntryKind, GenerationManifest, ManifestEntry};
 pub use paths::{DeployPort, StorePaths};
 pub use process_identity::{
     FileIdentity, LinuxProcfs, ListenerIdentity, PinnedProcess, ProcessIdentity, ProcessInspector,
+    RuntimeProvenance,
 };
 pub use receipts::LiveReceipt;
 pub use store::{Generation, GenerationStage, LockedStore, Store};

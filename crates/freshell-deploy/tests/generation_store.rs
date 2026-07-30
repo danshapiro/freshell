@@ -9,8 +9,9 @@ use std::sync::{
 };
 
 use freshell_deploy::{
-    DeployError, DeployPort, DeploymentLock, Generation, GenerationManifest, GenerationStage,
-    LiveReceipt, Store, StorePaths,
+    DeployError, DeployPort, DeploymentLock, FileIdentity, Generation, GenerationManifest,
+    GenerationStage, ListenerIdentity, LiveReceipt, ProcessIdentity, RuntimeProvenance, Store,
+    StorePaths,
 };
 use tempfile::TempDir;
 
@@ -25,14 +26,63 @@ fn source_tree(parent: &Path, marker: &str) -> PathBuf {
     fs::create_dir(&root).expect("source root");
     fs::create_dir(root.join("client")).expect("client dir");
     fs::write(root.join("client/index.html"), marker).expect("client file");
-    fs::write(root.join("freshell-server"), format!("binary-{marker}")).expect("server file");
+    fs::create_dir(root.join("server")).expect("server dir");
+    fs::write(
+        root.join("server/freshell-server"),
+        format!("binary-{marker}"),
+    )
+    .expect("server file");
     fs::set_permissions(
-        root.join("freshell-server"),
+        root.join("server/freshell-server"),
         fs::Permissions::from_mode(0o755),
     )
     .expect("server mode");
+    for directory in [
+        "extensions",
+        "dist/server/mcp",
+        "claude-sidecar",
+        "node_modules",
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(root.join("dist/server/mcp/server.js"), "export {}").unwrap();
+    fs::write(root.join("claude-sidecar/index.mjs"), "export {}").unwrap();
+    fs::write(root.join("package.json"), "{}").unwrap();
+    fs::write(root.join("package-lock.json"), "{}").unwrap();
     symlink("client/index.html", root.join("entry-link")).expect("relative link");
     root
+}
+
+fn running_identity(generation: &Generation, port: u16) -> ProcessIdentity {
+    let path = |relative: &str| generation.path.join(relative).display().to_string();
+    ProcessIdentity {
+        pid: 42_424,
+        kernel_boot_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        start_time_ticks: "123456789".to_string(),
+        executable: FileIdentity::from_path(&generation.path.join("server/freshell-server"))
+            .unwrap(),
+        listener: ListenerIdentity {
+            port: DeployPort::new(port).unwrap(),
+            socket_inode: "991122".to_string(),
+            owner_pid: 42_424,
+            network_namespace: "net:[4026533111]".to_string(),
+        },
+        cwd: generation.path.display().to_string(),
+        argv0: "freshell-server".to_string(),
+        argument_count: 1,
+        effective_uid: unsafe { libc::geteuid() },
+        runtime: RuntimeProvenance {
+            client_dir: path("client"),
+            extensions_dir: path("extensions"),
+            dist_server_dir: path("dist/server"),
+            mcp_entry: path("dist/server/mcp/server.js"),
+            claude_sidecar_entry: path("claude-sidecar/index.mjs"),
+            node_executable: "/usr/bin/node".to_string(),
+            package_json: path("package.json"),
+            package_lock: path("package-lock.json"),
+            production_node_modules: path("node_modules"),
+        },
+    }
 }
 
 fn store(root: &Path, port: u16) -> Store {
@@ -178,6 +228,29 @@ fn import_stages_beside_generations_so_cross_device_sources_are_copied() {
 }
 
 #[test]
+fn import_rejects_either_direction_of_store_containment_before_staging() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3327);
+    let before = fs::read_dir(store.paths().generations_dir())
+        .unwrap()
+        .count();
+
+    for source in [fixture.path(), store.paths().port_root()] {
+        assert!(matches!(
+            import_tree(&store, source),
+            Err(DeployError::UnsafeStorePath(path)) if path == fs::canonicalize(source).unwrap()
+        ));
+        assert_eq!(
+            fs::read_dir(store.paths().generations_dir())
+                .unwrap()
+                .count(),
+            before,
+            "a rejected recursive import must not create a stage"
+        );
+    }
+}
+
+#[test]
 fn verification_rejects_digest_mismatch() {
     let fixture = checkout();
     let source = source_tree(fixture.path(), "digest");
@@ -207,7 +280,7 @@ fn verification_rejects_mode_mismatch() {
     let source = source_tree(fixture.path(), "mode");
     let store = store(fixture.path(), 3314);
     let published = import_tree(&store, &source).expect("publication");
-    let server = published.path.join("freshell-server");
+    let server = published.path.join("server/freshell-server");
     fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(matches!(
@@ -368,7 +441,12 @@ fn live_receipt_keeps_selected_and_running_server_generation_ids_separate() {
     select_generation(&store, &selected.id).unwrap();
     write_live(
         &store,
-        &LiveReceipt::new(selected.id.clone(), Some(running.id.clone()), false, None),
+        &LiveReceipt::new(
+            selected.id.clone(),
+            Some(running.id.clone()),
+            false,
+            Some(running_identity(&running, 3317)),
+        ),
     )
     .expect("write live receipt");
 
@@ -389,7 +467,12 @@ fn cleanup_refuses_the_distinct_still_running_server_generation() {
     select_generation(&store, &selected.id).unwrap();
     write_live(
         &store,
-        &LiveReceipt::new(selected.id.clone(), Some(running.id.clone()), false, None),
+        &LiveReceipt::new(
+            selected.id.clone(),
+            Some(running.id.clone()),
+            false,
+            Some(running_identity(&running, 3322)),
+        ),
     )
     .unwrap();
 
@@ -398,6 +481,107 @@ fn cleanup_refuses_the_distinct_still_running_server_generation() {
         Err(DeployError::RunningGeneration(id)) if id == running.id
     ));
     store.verify_generation(&running.id).unwrap();
+}
+
+#[test]
+fn live_receipt_rejects_a_process_claiming_an_unrelated_running_generation() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3328);
+    let actual = import_tree(&store, &source_tree(fixture.path(), "actual-running")).unwrap();
+    let claimed = import_tree(&store, &source_tree(fixture.path(), "claimed-running")).unwrap();
+    select_generation(&store, &claimed.id).unwrap();
+
+    assert!(matches!(
+        write_live(
+            &store,
+            &LiveReceipt::new(
+                claimed.id.clone(),
+                Some(claimed.id.clone()),
+                false,
+                Some(running_identity(&actual, 3328)),
+            ),
+        ),
+        Err(DeployError::InvalidReceipt(message))
+            if message.contains("executable") || message.contains("cwd")
+    ));
+    assert!(store.read_live().unwrap().is_none());
+}
+
+#[test]
+fn live_receipt_binds_generation_root_cwd_and_runtime_provenance() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3330);
+    let generation = import_tree(&store, &source_tree(fixture.path(), "bound-runtime")).unwrap();
+    select_generation(&store, &generation.id).unwrap();
+
+    let mut wrong_cwd = running_identity(&generation, 3330);
+    wrong_cwd.cwd = fixture.path().display().to_string();
+    assert!(matches!(
+        write_live(
+            &store,
+            &LiveReceipt::new(
+                generation.id.clone(),
+                Some(generation.id.clone()),
+                false,
+                Some(wrong_cwd),
+            ),
+        ),
+        Err(DeployError::InvalidReceipt(message)) if message.contains("cwd")
+    ));
+
+    let mut wrong_runtime = running_identity(&generation, 3330);
+    wrong_runtime.runtime.client_dir = fixture
+        .path()
+        .join("unrelated-client")
+        .display()
+        .to_string();
+    assert!(matches!(
+        write_live(
+            &store,
+            &LiveReceipt::new(
+                generation.id.clone(),
+                Some(generation.id.clone()),
+                false,
+                Some(wrong_runtime),
+            ),
+        ),
+        Err(DeployError::InvalidReceipt(message)) if message.contains("provenance")
+    ));
+}
+
+#[test]
+fn cleanup_fails_closed_if_a_stored_live_process_generation_binding_is_forged() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3329);
+    let actual = import_tree(&store, &source_tree(fixture.path(), "actual-forged")).unwrap();
+    let claimed = import_tree(&store, &source_tree(fixture.path(), "claimed-forged")).unwrap();
+    let obsolete = import_tree(&store, &source_tree(fixture.path(), "obsolete-forged")).unwrap();
+    select_generation(&store, &claimed.id).unwrap();
+    write_live(
+        &store,
+        &LiveReceipt::new(
+            claimed.id.clone(),
+            Some(actual.id.clone()),
+            false,
+            Some(running_identity(&actual, 3329)),
+        ),
+    )
+    .unwrap();
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.paths().live_receipt()).unwrap()).unwrap();
+    forged["runningServerGenerationId"] = serde_json::Value::String(claimed.id.clone());
+    fs::write(
+        store.paths().live_receipt(),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        remove_generation(&store, &obsolete.id),
+        Err(DeployError::InvalidReceipt(message))
+            if message.contains("executable") || message.contains("cwd")
+    ));
+    store.verify_generation(&obsolete.id).unwrap();
 }
 
 #[test]
@@ -412,7 +596,12 @@ fn cleanup_refuses_an_inconsistent_live_receipt_and_current_pointer() {
     select_generation(&store, &selected.id).unwrap();
     write_live(
         &store,
-        &LiveReceipt::new(selected.id.clone(), Some(running.id), false, None),
+        &LiveReceipt::new(
+            selected.id.clone(),
+            Some(running.id.clone()),
+            false,
+            Some(running_identity(&running, 3324)),
+        ),
     )
     .unwrap();
     let mut live: serde_json::Value =

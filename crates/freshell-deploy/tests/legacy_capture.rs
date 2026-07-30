@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use freshell_deploy::{
     capture_legacy, CaptureCommand, DeployError, DeployPort, FileIdentity, LegacyCaptureRequest,
     LegacyRuntimeSources, LinuxProcfs, ListenerIdentity, NodePrerequisite, ProcessIdentity,
-    ProcessInspector, ScratchProbe, ScratchProbeRequest, Store,
+    ProcessInspector, RealScratchProbe, RuntimeBindings, RuntimeProvenance, ScratchProbe,
+    ScratchProbeRequest, Store,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -249,6 +250,53 @@ fn identity(executable: &Path) -> ProcessIdentity {
         argv0: "freshell-server".to_string(),
         argument_count: 1,
         effective_uid: unsafe { libc::geteuid() },
+        runtime: RuntimeProvenance {
+            client_dir: checkout
+                .join("artifacts/client")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            extensions_dir: checkout
+                .join("artifacts/extensions")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            dist_server_dir: checkout
+                .join("artifacts/dist-server")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            mcp_entry: checkout
+                .join("artifacts/dist-server/mcp/server.js")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            claude_sidecar_entry: checkout
+                .join("artifacts/claude-sidecar/index.mjs")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            node_executable: checkout
+                .join("artifacts/node")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            package_json: checkout
+                .join("artifacts/package.json")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            package_lock: checkout
+                .join("artifacts/package-lock.json")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            production_node_modules: checkout
+                .join("artifacts/node_modules")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        },
     }
 }
 
@@ -256,6 +304,7 @@ struct FakeProcessInspector {
     listeners: Mutex<VecDeque<ListenerIdentity>>,
     identities: Mutex<VecDeque<ProcessIdentity>>,
     executable: PathBuf,
+    live_client: Vec<u8>,
     events: Mutex<Vec<String>>,
 }
 
@@ -300,6 +349,10 @@ impl ProcessInspector for MutatingProcessInspector {
     fn open_executable(&self, pin: &Self::Pin) -> freshell_deploy::Result<File> {
         self.inner.open_executable(pin)
     }
+
+    fn read_live_client(&self, port: DeployPort) -> freshell_deploy::Result<Vec<u8>> {
+        self.inner.read_live_client(port)
+    }
 }
 
 impl FakeProcessInspector {
@@ -308,6 +361,7 @@ impl FakeProcessInspector {
             listeners: Mutex::new(VecDeque::from([listener(PID)])),
             identities: Mutex::new(VecDeque::from([identity(executable)])),
             executable: executable.to_path_buf(),
+            live_client: fs::read(executable.parent().unwrap().join("client/index.html")).unwrap(),
             events: Mutex::new(Vec::new()),
         }
     }
@@ -319,9 +373,23 @@ impl FakeProcessInspector {
         }
     }
 
+    fn with_listeners(executable: &Path, listeners: Vec<ListenerIdentity>) -> Self {
+        Self {
+            listeners: Mutex::new(VecDeque::from(listeners)),
+            ..Self::stable(executable)
+        }
+    }
+
     fn with_identities(executable: &Path, identities: Vec<ProcessIdentity>) -> Self {
         Self {
             identities: Mutex::new(VecDeque::from(identities)),
+            ..Self::stable(executable)
+        }
+    }
+
+    fn with_live_client(executable: &Path, live_client: &[u8]) -> Self {
+        Self {
+            live_client: live_client.to_vec(),
             ..Self::stable(executable)
         }
     }
@@ -336,11 +404,15 @@ impl ProcessInspector for FakeProcessInspector {
 
     fn resolve_listener(&self, _port: DeployPort) -> freshell_deploy::Result<ListenerIdentity> {
         self.events.lock().unwrap().push("resolve_listener".into());
-        let values = self.listeners.lock().unwrap();
-        values
+        let mut values = self.listeners.lock().unwrap();
+        let value = values
             .front()
             .cloned()
-            .ok_or_else(|| DeployError::ProcessIdentity("listener unavailable".into()))
+            .ok_or_else(|| DeployError::ProcessIdentity("listener unavailable".into()))?;
+        if values.len() > 1 {
+            values.pop_front();
+        }
+        Ok(value)
     }
 
     fn open_pidfd(&self, pid: u32) -> freshell_deploy::Result<Self::Pin> {
@@ -368,6 +440,10 @@ impl ProcessInspector for FakeProcessInspector {
     fn open_executable(&self, _pin: &Self::Pin) -> freshell_deploy::Result<File> {
         self.events.lock().unwrap().push("open_executable".into());
         Ok(File::open(&self.executable)?)
+    }
+
+    fn read_live_client(&self, _port: DeployPort) -> freshell_deploy::Result<Vec<u8>> {
+        Ok(self.live_client.clone())
     }
 }
 
@@ -596,6 +672,48 @@ fn revalidates_boot_process_executable_and_socket_identity_after_copy() {
 }
 
 #[test]
+fn rejects_listener_ownership_transfer_after_copy() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    let stable = listener(PID);
+    let mut transferred = stable.clone();
+    transferred.socket_inode = "991123".to_string();
+    let inspector = FakeProcessInspector::with_listeners(
+        &runtime.old_executable,
+        vec![stable.clone(), stable, transferred],
+    );
+
+    assert!(matches!(
+        capture_legacy(&store, &request(&runtime), &inspector, &FakeScratchProbe::passing()),
+        Err(DeployError::ProcessIdentity(message)) if message.contains("listener socket identity changed")
+    ));
+    assert!(store.read_live().unwrap().is_none());
+    assert!(store.read_legacy_capture().unwrap().is_none());
+}
+
+#[test]
+fn rejects_listener_ownership_transfer_after_scratch_probe() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    let stable = listener(PID);
+    let mut transferred = stable.clone();
+    transferred.owner_pid = PID + 1;
+    let inspector = FakeProcessInspector::with_listeners(
+        &runtime.old_executable,
+        vec![stable.clone(), stable.clone(), stable, transferred],
+    );
+
+    assert!(matches!(
+        capture_legacy(&store, &request(&runtime), &inspector, &FakeScratchProbe::passing()),
+        Err(DeployError::ProcessIdentity(message)) if message.contains("listener socket identity changed")
+    ));
+    assert!(store.read_live().unwrap().is_none());
+    assert!(store.read_legacy_capture().unwrap().is_none());
+}
+
+#[test]
 fn rejects_a_listener_owner_running_from_a_different_checkout() {
     let fixture = checkout();
     let runtime = runtime_fixture(fixture.path());
@@ -615,6 +733,76 @@ fn rejects_a_listener_owner_running_from_a_different_checkout() {
         Err(DeployError::LegacyCapture(message)) if message.contains("cwd")
     ));
     assert!(store.selected_generation_id().unwrap().is_none());
+}
+
+#[test]
+fn rejects_supplied_runtime_that_does_not_match_live_process_provenance() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    for field in [
+        "client",
+        "extensions",
+        "compiled server",
+        "MCP entry",
+        "Claude sidecar entry",
+        "package.json",
+        "package-lock.json",
+        "production dependencies",
+        "Node",
+    ] {
+        let mut mismatched = identity(&runtime.old_executable);
+        let unrelated = fixture
+            .path()
+            .join(format!("unrelated-{}", field.replace(' ', "-")))
+            .display()
+            .to_string();
+        match field {
+            "client" => mismatched.runtime.client_dir = unrelated,
+            "extensions" => mismatched.runtime.extensions_dir = unrelated,
+            "compiled server" => mismatched.runtime.dist_server_dir = unrelated,
+            "MCP entry" => mismatched.runtime.mcp_entry = unrelated,
+            "Claude sidecar entry" => mismatched.runtime.claude_sidecar_entry = unrelated,
+            "package.json" => mismatched.runtime.package_json = unrelated,
+            "package-lock.json" => mismatched.runtime.package_lock = unrelated,
+            "production dependencies" => {
+                mismatched.runtime.production_node_modules = unrelated;
+            }
+            "Node" => mismatched.runtime.node_executable = unrelated,
+            _ => unreachable!(),
+        }
+
+        assert!(matches!(
+            capture_legacy(
+                &store,
+                &request(&runtime),
+                &FakeProcessInspector::with_identities(&runtime.old_executable, vec![mismatched]),
+                &FakeScratchProbe::passing()
+            ),
+            Err(DeployError::LegacyCapture(message))
+                if message.contains(field) && message.contains("live process provenance")
+        ));
+    }
+}
+
+#[test]
+fn rejects_supplied_client_that_differs_from_live_served_bytes() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+
+    assert!(matches!(
+        capture_legacy(
+            &store,
+            &request(&runtime),
+            &FakeProcessInspector::with_live_client(
+                &runtime.old_executable,
+                b"different live client"
+            ),
+            &FakeScratchProbe::passing()
+        ),
+        Err(DeployError::LegacyCapture(message)) if message.contains("bytes served")
+    ));
 }
 
 #[test]
@@ -1057,11 +1245,24 @@ fn captured_runtime_bindings_preserve_validated_explicit_entry_paths() {
     .unwrap();
     runtime.sources.claude_sidecar_entry_relative = PathBuf::from("alternate.mjs");
     let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    let mut live_identity = identity(&runtime.old_executable);
+    live_identity.runtime.mcp_entry = runtime
+        .sources
+        .dist_server_dir
+        .join("mcp/alternate.js")
+        .display()
+        .to_string();
+    live_identity.runtime.claude_sidecar_entry = runtime
+        .sources
+        .claude_sidecar_dir
+        .join("alternate.mjs")
+        .display()
+        .to_string();
 
     let receipt = capture_legacy(
         &store,
         &request(&runtime),
-        &FakeProcessInspector::stable(&runtime.old_executable),
+        &FakeProcessInspector::with_identities(&runtime.old_executable, vec![live_identity]),
         &FakeScratchProbe::passing(),
     )
     .unwrap();
@@ -1172,7 +1373,7 @@ fn cleanup_keeps_the_original_legacy_recovery_generation() {
     locked
         .write_live(&freshell_deploy::LiveReceipt::new(
             current.id.clone(),
-            Some(current.id),
+            None,
             false,
             None,
         ))
@@ -1234,6 +1435,34 @@ fn strict_legacy_receipt_rejects_an_invalid_nested_listener_port() {
 }
 
 #[test]
+fn legacy_live_binding_must_match_authoritative_legacy_process_exactly() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    capture_legacy(
+        &store,
+        &request(&runtime),
+        &FakeProcessInspector::stable(&runtime.old_executable),
+        &FakeScratchProbe::passing(),
+    )
+    .unwrap();
+    let mut live: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.paths().live_receipt()).unwrap()).unwrap();
+    live["processIdentity"]["runtime"]["clientDir"] =
+        serde_json::Value::String(fixture.path().join("forged-client").display().to_string());
+    fs::write(
+        store.paths().live_receipt(),
+        serde_json::to_vec(&live).unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.read_live(),
+        Err(DeployError::InvalidReceipt(message)) if message.contains("legacy.json")
+    ));
+}
+
+#[test]
 fn linux_proc_fixture_maps_exact_listening_socket_inode_to_one_pid() {
     let proc = tempfile::tempdir().unwrap();
     fs::create_dir_all(proc.path().join("net")).unwrap();
@@ -1290,11 +1519,167 @@ fn live_listener_helper() {
         .expect("numeric helper port");
     let ready =
         PathBuf::from(std::env::var_os("FRESHELL_DEPLOY_TEST_READY").expect("helper ready path"));
-    let _listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind helper listener");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind helper listener");
     fs::write(ready, "ready\n").expect("publish helper readiness");
-    loop {
-        std::thread::park_timeout(std::time::Duration::from_secs(60));
+    for stream in listener.incoming() {
+        let mut stream = stream.expect("accept helper request");
+        use std::io::Read as _;
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let client = fs::read(
+            PathBuf::from(std::env::var_os("FRESHELL_CLIENT_DIR").unwrap()).join("index.html"),
+        )
+        .unwrap();
+        use std::io::Write as _;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            client.len()
+        )
+        .unwrap();
+        stream.write_all(&client).unwrap();
     }
+}
+
+#[test]
+#[ignore = "Docker-only: executes and terminates real Node and scratch-server processes"]
+fn real_scratch_probe_executes_the_complete_captured_closure() {
+    require_destructive_test_sandbox();
+
+    let fixture = tempfile::tempdir().unwrap();
+    let generation = fixture.path().join("generation");
+    let home = fixture.path().join("home");
+    for directory in [
+        "server",
+        "client",
+        "extensions/terminal",
+        "dist/server/mcp",
+        "claude-sidecar",
+        "node_modules",
+    ] {
+        fs::create_dir_all(generation.join(directory)).unwrap();
+    }
+    fs::create_dir(&home).unwrap();
+    fs::write(generation.join("client/index.html"), b"real scratch client").unwrap();
+    fs::write(
+        generation.join("extensions/terminal/freshell.json"),
+        r#"{"name":"terminal"}"#,
+    )
+    .unwrap();
+    fs::write(
+        generation.join("package.json"),
+        r#"{"name":"scratch","type":"module"}"#,
+    )
+    .unwrap();
+    fs::write(generation.join("package-lock.json"), "{}").unwrap();
+    fs::write(
+        generation.join("dist/server/mcp/server.js"),
+        "export const scratch = true;\n",
+    )
+    .unwrap();
+    fs::write(
+        generation.join("claude-sidecar/index.mjs"),
+        "import readline from 'node:readline';\n\
+         const rl=readline.createInterface({input:process.stdin});\n\
+         rl.once('line',()=>{rl.close();process.exit(0)});\n",
+    )
+    .unwrap();
+
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("python3"))
+        .find(|candidate| candidate.is_file())
+        .expect("python3 in Docker image");
+    let server = generation.join("server/freshell-server");
+    let source = format!("#!{}\n", python.display())
+        + r#"import http.server,json,os,socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+  protocol_version='HTTP/1.1'
+  def log_message(self,*args): pass
+  def do_GET(self):
+    if self.path == '/api/health':
+      body=b'{"app":"freshell","ok":true,"ready":true}'
+    elif self.path == '/':
+      body=open(os.path.join(os.environ['FRESHELL_CLIENT_DIR'],'index.html'),'rb').read()
+    elif self.path == '/api/extensions':
+      body=b'[{"name":"terminal"}]'
+    else:
+      self.send_response(404); self.end_headers(); return
+    self.send_response(200); self.send_header('Content-Length',str(len(body)))
+    self.end_headers(); self.wfile.write(body)
+server=socketserver.TCPServer((os.environ['FRESHELL_BIND_HOST'],0),Handler)
+address='{}:{}'.format(*server.server_address)
+receipt={'schemaVersion':'1','nonce':os.environ['FRESHELL_DEPLOY_NONCE'],
+ 'actualAddress':address,'pid':os.getpid(),'bootId':'fixture-boot',
+ 'instanceId':'fixture-instance',
+ 'serverProcessGenerationId':os.environ['FRESHELL_DEPLOY_GENERATION_ID'],
+ 'serverComponentVersion':'fixture-version','buildCommit':'fixture-commit'}
+open(os.environ['FRESHELL_DEPLOY_READY_FILE'],'w').write(json.dumps(receipt))
+server.serve_forever()
+"#;
+    fs::write(&server, source).unwrap();
+    fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| fs::canonicalize(candidate).unwrap())
+        .expect("node in Docker image");
+    let version = std::process::Command::new(&node)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let request = ScratchProbeRequest {
+        generation_path: generation.clone(),
+        generation_id: "a".repeat(64),
+        isolated_home: home.clone(),
+        port: 0,
+        runtime: RuntimeBindings {
+            server_executable: "server/freshell-server".to_string(),
+            client_dir: "client".to_string(),
+            extensions_dir: "extensions".to_string(),
+            dist_server_dir: "dist/server".to_string(),
+            mcp_entry: "dist/server/mcp/server.js".to_string(),
+            claude_sidecar_entry: "claude-sidecar/index.mjs".to_string(),
+            package_json: "package.json".to_string(),
+            package_lock: "package-lock.json".to_string(),
+            production_node_modules: "node_modules".to_string(),
+        },
+        node: NodePrerequisite {
+            executable: node,
+            version: String::from_utf8(version.stdout)
+                .unwrap()
+                .trim()
+                .to_string(),
+        },
+    };
+
+    RealScratchProbe::default()
+        .verify(&request)
+        .expect("real scratch closure");
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
+    let pid = ready["pid"].as_u64().unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "successful validation must terminate and reap its scratch server"
+    );
+
+    fs::write(
+        generation.join("extensions/terminal/freshell.json"),
+        r#"{"name":"different"}"#,
+    )
+    .unwrap();
+    fs::remove_file(home.join("ready.json")).unwrap();
+    let error = RealScratchProbe::default().verify(&request).unwrap_err();
+    assert!(error.to_string().contains("extension registry"), "{error}");
+    let failed_ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
+    let failed_pid = failed_ready["pid"].as_u64().unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{failed_pid}")).exists(),
+        "an early HTTP validation failure must still terminate and reap its scratch server"
+    );
 }
 
 #[test]
@@ -1315,6 +1700,27 @@ fn actual_proc_capture_pins_the_unlinked_listener_executable() {
 
     let fixture = checkout();
     let runtime = runtime_fixture(fixture.path());
+    fs::create_dir(fixture.path().join("dist")).unwrap();
+    symlink(
+        &runtime.sources.dist_server_dir,
+        fixture.path().join("dist/server"),
+    )
+    .unwrap();
+    symlink(
+        &runtime.sources.package_json,
+        fixture.path().join("package.json"),
+    )
+    .unwrap();
+    symlink(
+        &runtime.sources.package_lock,
+        fixture.path().join("package-lock.json"),
+    )
+    .unwrap();
+    symlink(
+        &runtime.sources.production_node_modules,
+        fixture.path().join("node_modules"),
+    )
+    .unwrap();
     let listener_executable = fixture.path().join("freshell-listener");
     fs::copy(std::env::current_exe().unwrap(), &listener_executable).unwrap();
     fs::set_permissions(&listener_executable, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1335,6 +1741,26 @@ fn actual_proc_capture_pins_the_unlinked_listener_executable() {
         .current_dir(fixture.path())
         .env("FRESHELL_DEPLOY_TEST_PORT", port.to_string())
         .env("FRESHELL_DEPLOY_TEST_READY", &ready)
+        .env("FRESHELL_CLIENT_DIR", &runtime.sources.client_dir)
+        .env("FRESHELL_EXTENSIONS_DIR", &runtime.sources.extensions_dir)
+        .env(
+            "FRESHELL_CLAUDE_SIDECAR",
+            runtime
+                .sources
+                .claude_sidecar_dir
+                .join(&runtime.sources.claude_sidecar_entry_relative),
+        )
+        .env(
+            "FRESHELL_CLAUDE_NODE",
+            runtime.sources.package_json.parent().unwrap().join("node"),
+        )
+        .env(
+            "FRESHELL_MCP_SERVER_ENTRY",
+            runtime
+                .sources
+                .dist_server_dir
+                .join(&runtime.sources.mcp_entry_relative),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
