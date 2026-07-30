@@ -2808,8 +2808,79 @@ pub async fn respawn_agent_terminal(
     );
 
     // Spawn-time resume identity: intent is ALWAYS `Resume` on this path.
-    let launch_intent = LaunchIntent::Resume;
-    let resume_session_id = Some(req.session_id.clone());
+    // Resume validation (docs/plans/2026-07-29-resume-validation.md): the
+    // respawn id comes from the identity registry / pane ledger — cached
+    // state — so it gets the same disk-existence gate as door 1.
+    // CRITICAL (V8 §A9): the gate replaces these LOCALS, not merely the
+    // launch args — the post-spawn bookkeeping (registry row, identity
+    // upsert, ledger record_binding below) all read `resume_session_id` and
+    // must record the FRESH id, or the stale id is re-minted as a Bound row
+    // right after retire_missing and the respawn loop is real.
+    let outcome = {
+        // The probe's by-id locators do real filesystem walks — never inline
+        // on the async runtime (A13). Run the sync helper in spawn_blocking,
+        // the same shape as door 1.
+        let probe = state.session_existence.clone();
+        let gate_mode = mode.clone();
+        let sid = Some(req.session_id.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::resume_validation::validate_wire_resume(
+                &gate_mode,
+                sid,
+                LaunchIntent::Resume,
+                probe.as_ref(),
+            )
+        })
+        .await
+        .expect("resume validation task panicked")
+    };
+    let launch_intent = outcome.launch_intent;
+    let resume_session_id = outcome.resume_session_id;
+    if let Some(stale) = outcome.stale_session_id.as_deref() {
+        tracing::warn!(
+            mode = %req.mode,
+            stale_session_id = %stale,
+            "resume validation (respawn): cached session missing on disk; respawning fresh"
+        );
+        // Don't retry the stale id forever. Same blocking-pool discipline as
+        // door 1 (~15ms p50 fsyncs — past the async-worker budget).
+        {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let retire_provider = req.provider.clone();
+            let stale_id = stale.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                ledger.retire_missing(&retire_provider, &stale_id)
+            })
+            .await;
+        }
+        // Headless path: no per-create `out` sink. Broadcast the existing
+        // Recovering status frame (precedent: auto_resume.rs emit_recovering)
+        // with the notice as reason. Reason prose is presentational-only per
+        // the protocol doc; the typed fields carry no data change here.
+        //
+        // Deliberate decision AD-3 (accepted, documented — no behavior
+        // change): after this gate-fired respawn, the auto-resume hub's
+        // `complete_claim` keeps the STALE locator's lease bound to the FRESH
+        // terminal (auto_resume.rs → registry.complete_session_ref_claim). A
+        // later `terminal.create` carrying the stale ref then adopts the
+        // fresh terminal via `BoundElsewhere` WITHOUT door 1's notice. This
+        // is convergent (no loop, no duplicate pane, the user reaches the
+        // fresh terminal); the only cost is a missing notice on a rare
+        // second-order path. Releasing/rebinding the lease would mean new
+        // registry API surface for no user-visible gain.
+        let msg =
+            freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+                status: freshell_protocol::RuntimeStatus::Recovering,
+                terminal_id: terminal_id.clone(),
+                attempt: None,
+                max_attempts: None,
+                exit_code: None,
+                reason: outcome.notice.clone(),
+            });
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = state.broadcast_tx.send(json);
+        }
+    }
 
     // Launch params from state.settings EXACTLY as handle_create derives them
     // (BindingRow launch fields are hardcoded None for terminal panes —
@@ -2931,14 +3002,18 @@ pub async fn respawn_agent_terminal(
     };
     let child_env = build_child_env_from_process(&spec);
 
-    // Launcher-assigned amplifier identity: a respawn resumes req.session_id
-    // unconditionally — make that resume guaranteed-resumable first
-    // (ensure-after-GC; existing/used sessions are found and left
-    // untouched). Best-effort: a failure here must not veto the respawn —
-    // the CLI itself will fail loudly in-terminal if the dir is truly gone.
+    // Launcher-assigned amplifier identity: a respawn resumes the
+    // gate-validated `resume_session_id` (== req.session_id unless the gate
+    // above minted a fresh uuid) — make that resume guaranteed-resumable
+    // first (ensure-after-GC; existing/used sessions are found and left
+    // untouched). Keying off the LOCAL, not req.session_id, is load-bearing:
+    // a gate-fired respawn must stub the FRESH id, never resurrect the stale
+    // dir. Best-effort: a failure here must not veto the respawn — the CLI
+    // itself will fail loudly in-terminal if the dir is truly gone.
     let mut respawn_amplifier_stub_gc: Option<AmplifierStubGc> = None;
     if req.mode == "amplifier" {
-        if let (Some(amp_home), Some(cwd)) = (
+        if let (Some(sid), Some(amp_home), Some(cwd)) = (
+            resume_session_id.as_deref(),
             freshell_sessions::amplifier_stub::resolve_amplifier_home(),
             req.cwd
                 .as_deref()
@@ -2946,7 +3021,7 @@ pub async fn respawn_agent_terminal(
         ) {
             match freshell_sessions::amplifier_stub::ensure_session(
                 &amp_home,
-                &req.session_id,
+                sid,
                 cwd,
                 &terminal_id,
             ) {
