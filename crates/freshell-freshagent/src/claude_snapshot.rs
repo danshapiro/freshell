@@ -70,7 +70,7 @@ pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
 /// lines (100% of real user/assistant lines carry it -- ledger A5 census). Needed
 /// because the CLI's resume lookup is scoped to the original cwd's project slug
 /// (ledger A15). Reads lazily, stops at the first hit; malformed lines skipped.
-pub(crate) fn transcript_cwd(path: &Path) -> Option<String> {
+pub fn transcript_cwd(path: &Path) -> Option<String> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufReader::new(file).lines() {
