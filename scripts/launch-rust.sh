@@ -87,6 +87,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$PORT" =~ ^(0|[1-9][0-9]*)$ ]] || die "port must be canonical decimal"
+(( ${#PORT} <= 5 )) || die "port must be between 1 and 65535"
 (( PORT >= 1 && PORT <= 65535 )) || die "port must be between 1 and 65535"
 
 (( CLIENT_ONLY + SERVER_ONLY <= 1 )) || die "--client-only and --server-only conflict"

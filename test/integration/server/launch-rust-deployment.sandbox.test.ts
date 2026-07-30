@@ -264,6 +264,8 @@ describe('canonical launch-rust deployment wrapper', () => {
     { args: ['--port', '0'], message: /port/i },
     { args: ['--port=043127'], message: /port/i },
     { args: ['--port=65536'], message: /port/i },
+    { args: ['--port=18446744073709551617', '--stop'], message: /port/i },
+    { args: [`--port=${'9'.repeat(10_000)}`, '--stop'], message: /port/i },
     { args: ['--port=abc'], message: /port/i },
     { args: ['--port=43127', '--port=43128'], message: /duplicate/i },
     { args: [], message: /requires.*restart/i },
@@ -669,6 +671,38 @@ describe('real deployment controller boundary', () => {
       await waitForHttp(port, 'up')
 
       const common = ['--checkout', realCheckout, '--port', String(port)]
+      const fullDeployArgs = (client: string) => [
+        'deploy',
+        ...common,
+        '--mode',
+        'full',
+        '--client-dir',
+        client,
+        '--server-executable',
+        server,
+        '--controller-executable',
+        controller,
+        '--extensions-dir',
+        extensions,
+        '--dist-server-dir',
+        distServer,
+        '--mcp-entry-relative',
+        'mcp/server.js',
+        '--claude-sidecar-dir',
+        sidecar,
+        '--claude-sidecar-entry-relative',
+        'index.mjs',
+        '--package-json',
+        path.join(runtime, 'package.json'),
+        '--package-lock',
+        path.join(runtime, 'package-lock.json'),
+        '--node-modules',
+        path.join(runtime, 'node_modules'),
+        '--node-executable',
+        node,
+        '--node-version',
+        process.version,
+      ]
       expect(
         (await checkedAsync(controller, ['bootstrap-status', ...common], {
           cwd: realCheckout,
@@ -678,38 +712,7 @@ describe('real deployment controller boundary', () => {
 
       await checkedAsync(
         controller,
-        [
-          'deploy',
-          ...common,
-          '--mode',
-          'full',
-          '--client-dir',
-          candidateClient,
-          '--server-executable',
-          server,
-          '--controller-executable',
-          controller,
-          '--extensions-dir',
-          extensions,
-          '--dist-server-dir',
-          distServer,
-          '--mcp-entry-relative',
-          'mcp/server.js',
-          '--claude-sidecar-dir',
-          sidecar,
-          '--claude-sidecar-entry-relative',
-          'index.mjs',
-          '--package-json',
-          path.join(runtime, 'package.json'),
-          '--package-lock',
-          path.join(runtime, 'package-lock.json'),
-          '--node-modules',
-          path.join(runtime, 'node_modules'),
-          '--node-executable',
-          node,
-          '--node-version',
-          process.version,
-        ],
+        fullDeployArgs(candidateClient),
         { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
       )
       await waitForHttp(port, 'up')
@@ -724,8 +727,143 @@ describe('real deployment controller boundary', () => {
       expect(fullLive.legacy).toBe(false)
       expect(fullLive.runningServerGenerationId).toBe(fullLive.selectedGenerationId)
 
+      const boundaries = [
+        {
+          name: 'pre-commit',
+          phase: 'switch_current_intent',
+          selected: 'prior',
+          activated: false,
+          live: false,
+          finalized: false,
+        },
+        {
+          name: 'pointer-switch',
+          phase: 'switch_current_intent',
+          selected: 'target',
+          activated: false,
+          live: false,
+          finalized: false,
+        },
+        {
+          name: 'target-owned-receipt',
+          phase: 'activation_authorized',
+          selected: 'target',
+          activated: true,
+          live: false,
+          finalized: false,
+        },
+        {
+          name: 'live-receipt',
+          phase: 'activation_confirmed',
+          selected: 'target',
+          activated: true,
+          live: true,
+          finalized: false,
+        },
+        {
+          name: 'finalization',
+          phase: 'activation_confirmed',
+          selected: 'target',
+          activated: true,
+          live: true,
+          finalized: true,
+        },
+      ] as const
+      for (const boundary of boundaries) {
+        const priorLive = JSON.parse(readFileSync(liveFile, 'utf8'))
+        knownPids.add(priorLive.processIdentity.pid)
+        const interruptedClient = path.join(root, `interrupt-${boundary.name}`)
+        cpSync(candidateClient, interruptedClient, { recursive: true })
+        writeFileSync(
+          path.join(interruptedClient, 'task6-interruption-marker.txt'),
+          `${boundary.name}\n`,
+        )
+
+        await expect(
+          checkedAsync(controller, fullDeployArgs(interruptedClient), {
+            cwd: realCheckout,
+            env: {
+              ...realEnvironment,
+              FRESHELL_DESTRUCTIVE_SANDBOX: '1',
+              FRESHELL_DEPLOY_TEST_INTERRUPT_AFTER: boundary.name,
+            },
+            timeout: 300_000,
+          }),
+        ).rejects.toThrow()
+
+        const interrupted = JSON.parse(
+          readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+        )
+        if (interrupted.candidate?.process?.pid) {
+          knownPids.add(interrupted.candidate.process.pid)
+        }
+        const selected = path.basename(readlinkSync(path.join(portRoot, 'current')))
+        expect(interrupted.phase, boundary.name).toBe(boundary.phase)
+        expect(interrupted.finalized, boundary.name).toBe(boundary.finalized)
+        expect(selected, boundary.name).toBe(
+          boundary.selected === 'prior'
+            ? interrupted.priorGenerationId
+            : interrupted.targetGenerationId,
+        )
+        expect(existsSync(interrupted.controls.activatedFile), boundary.name).toBe(
+          boundary.activated,
+        )
+        const interruptedLive = JSON.parse(readFileSync(liveFile, 'utf8'))
+        expect(
+          interruptedLive.selectedGenerationId === interrupted.targetGenerationId,
+          boundary.name,
+        ).toBe(boundary.live)
+
+        if (boundary.name === 'pre-commit') {
+          writeFileSync(
+            path.join(realCheckout, '.env'),
+            `FRESHELL_HOME=${home}\n`,
+            { mode: 0o600 },
+          )
+          await expect(
+            checkedAsync(controller, ['bootstrap-status', ...common], {
+              cwd: realCheckout,
+              env: { ...realEnvironment, AUTH_TOKEN: undefined },
+            }),
+          ).rejects.toThrow(/AUTH_TOKEN/)
+          writeFileSync(
+            path.join(realCheckout, '.env'),
+            `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n`,
+            { mode: 0o600 },
+          )
+        }
+
+        expect(
+          (await checkedAsync(controller, ['bootstrap-status', ...common], {
+            cwd: realCheckout,
+            env: realEnvironment,
+            timeout: 300_000,
+          })).stdout.trim(),
+          boundary.name,
+        ).toBe('managed')
+        await checkedAsync(controller, fullDeployArgs(interruptedClient), {
+          cwd: realCheckout,
+          env: realEnvironment,
+          timeout: 300_000,
+        })
+        await waitForHttp(port, 'up')
+        const recovered = JSON.parse(
+          readFileSync(path.join(portRoot, 'transaction.json'), 'utf8'),
+        )
+        const recoveredLive = JSON.parse(readFileSync(liveFile, 'utf8'))
+        knownPids.add(recoveredLive.processIdentity.pid)
+        expect(recovered.finalized, boundary.name).toBe(true)
+        expect(recoveredLive.selectedGenerationId, boundary.name).toBe(
+          path.basename(readlinkSync(path.join(portRoot, 'current'))),
+        )
+        expect(recoveredLive.runningServerGenerationId, boundary.name).toBe(
+          recoveredLive.selectedGenerationId,
+        )
+      }
+
       cpSync(candidateClient, nextClient, { recursive: true })
       writeFileSync(path.join(nextClient, 'task6-client-marker.txt'), 'client-only\n')
+      const beforeClientLive = JSON.parse(readFileSync(liveFile, 'utf8'))
       let storedController = path.join(portRoot, 'current/controller/freshell-deploy')
       await checkedAsync(
         storedController,
@@ -744,20 +882,30 @@ describe('real deployment controller boundary', () => {
         { cwd: realCheckout, env: realEnvironment },
       )
       const clientLive = JSON.parse(readFileSync(liveFile, 'utf8'))
-      expect(clientLive.selectedGenerationId).not.toBe(fullLive.selectedGenerationId)
-      expect(clientLive.runningServerGenerationId).toBe(fullLive.runningServerGenerationId)
-      expect(clientLive.processIdentity.pid).toBe(fullLive.processIdentity.pid)
+      expect(clientLive.selectedGenerationId).not.toBe(beforeClientLive.selectedGenerationId)
+      expect(clientLive.runningServerGenerationId).toBe(beforeClientLive.runningServerGenerationId)
+      expect(clientLive.processIdentity.pid).toBe(beforeClientLive.processIdentity.pid)
 
       storedController = path.join(portRoot, 'current/controller/freshell-deploy')
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `FRESHELL_HOME=${home}\n`,
+        { mode: 0o600 },
+      )
       await checkedAsync(storedController, ['stop-current', ...common], {
         cwd: realCheckout,
-        env: realEnvironment,
+        env: { ...realEnvironment, AUTH_TOKEN: undefined },
       })
       await waitForHttp(port, 'down')
       const stopped = JSON.parse(readFileSync(liveFile, 'utf8'))
       expect(stopped.runningServerGenerationId).toBeNull()
       expect(stopped.processIdentity).toBeUndefined()
 
+      writeFileSync(
+        path.join(realCheckout, '.env'),
+        `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n`,
+        { mode: 0o600 },
+      )
       await checkedAsync(storedController, ['start-current', ...common], {
         cwd: realCheckout,
         env: realEnvironment,

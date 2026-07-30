@@ -450,9 +450,12 @@ where
         Some(process),
     );
     driver.write_live(&live)?;
+    crate::sandbox_interrupt::interrupt_after("live-receipt", &working);
     if !working.finalized {
         require_selected(driver, &working.target_generation_id)?;
-        journal.save(&working.finalized()?)?;
+        let finalized = working.finalized()?;
+        journal.save(&finalized)?;
+        crate::sandbox_interrupt::interrupt_after("finalization", &finalized);
     }
     Ok(())
 }
@@ -503,10 +506,9 @@ where
         require_selected(driver, &record.prior_generation_id)?;
         driver.write_live(&record.prior_live)?;
         require_selected(driver, &record.prior_generation_id)?;
-        let complete = record
-            .advanced(TransactionPhase::RollbackComplete)?
-            .finalized()?;
+        let complete = record.advanced(TransactionPhase::RollbackComplete)?;
         journal.save(&complete)?;
+        journal.save(&complete.finalized()?)?;
         return Ok(RecoveryOutcome::RolledBack);
     }
     if selected == record.target_generation_id {

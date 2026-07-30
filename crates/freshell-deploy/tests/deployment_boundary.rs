@@ -7,7 +7,8 @@ use std::process::Command;
 use freshell_deploy::{
     assemble_generation, inspect_bootstrap_status, BootstrapStatus, ControllerCommand,
     DeployCommand, FileIdentity, LaunchAttemptReceipt, LaunchAttemptReceiptStore, LaunchClaim,
-    LaunchExecutorIdentity, LaunchLane, LiveReceipt, NodePrerequisite, ServerAssemblySources,
+    LaunchExecutorIdentity, LaunchLane, LegacyCaptureReceipt, ListenerIdentity, LiveReceipt,
+    NodePrerequisite, ProcessIdentity, RuntimeBindings, RuntimeProvenance, ServerAssemblySources,
     Store, UpdateMode,
 };
 
@@ -438,6 +439,94 @@ fn bootstrap_status_requires_complete_receipts_and_recognizes_managed_state() {
     assert_eq!(
         inspect_bootstrap_status(&fixture.store).unwrap(),
         BootstrapStatus::Managed
+    );
+}
+
+#[test]
+fn bootstrap_status_routes_valid_legacy_capture_prefixes_back_through_capture() {
+    let fixture = assembly_fixture();
+    let generation = fixture.store.verify_generation(&fixture.prior_id).unwrap();
+    let legacy = LegacyCaptureReceipt {
+        schema_version: "1".to_string(),
+        generation_id: generation.id.clone(),
+        legacy: true,
+        process: ProcessIdentity {
+            pid: 43_127,
+            kernel_boot_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            start_time_ticks: "90071992547409931234".to_string(),
+            executable: FileIdentity::from_path(&generation.path.join("server/freshell-server"))
+                .unwrap(),
+            listener: ListenerIdentity {
+                port: freshell_deploy::DeployPort::new(43_127).unwrap(),
+                socket_inode: "991122".to_string(),
+                owner_pid: 43_127,
+                network_namespace: "net:[4026533111]".to_string(),
+            },
+            cwd: fixture.checkout.display().to_string(),
+            argv0: "freshell-server".to_string(),
+            argument_count: 1,
+            effective_uid: unsafe { libc::geteuid() },
+            runtime: RuntimeProvenance {
+                client_dir: generation.path.join("client").display().to_string(),
+                extensions_dir: generation.path.join("extensions").display().to_string(),
+                dist_server_dir: generation.path.join("dist/server").display().to_string(),
+                mcp_entry: generation
+                    .path
+                    .join("dist/server/mcp/server.js")
+                    .display()
+                    .to_string(),
+                claude_sidecar_entry: generation
+                    .path
+                    .join("claude-sidecar/index.mjs")
+                    .display()
+                    .to_string(),
+                node_executable: fixture.node.display().to_string(),
+                package_json: generation.path.join("package.json").display().to_string(),
+                package_lock: generation
+                    .path
+                    .join("package-lock.json")
+                    .display()
+                    .to_string(),
+                production_node_modules: generation.path.join("node_modules").display().to_string(),
+            },
+        },
+        runtime: RuntimeBindings {
+            server_executable: "server/freshell-server".to_string(),
+            client_dir: "client".to_string(),
+            extensions_dir: "extensions".to_string(),
+            dist_server_dir: "dist/server".to_string(),
+            mcp_entry: "dist/server/mcp/server.js".to_string(),
+            claude_sidecar_entry: "claude-sidecar/index.mjs".to_string(),
+            package_json: "package.json".to_string(),
+            package_lock: "package-lock.json".to_string(),
+            production_node_modules: "node_modules".to_string(),
+        },
+        node: NodePrerequisite {
+            executable: fixture.node.clone(),
+            version: "v22.0.0".to_string(),
+        },
+        launch: freshell_deploy::NonSecretLaunchMetadata {
+            cwd: fixture.checkout.display().to_string(),
+            argv0: "freshell-server".to_string(),
+            argument_count: 1,
+        },
+    };
+    fs::remove_file(fixture.store.paths().current_pointer()).unwrap();
+    let locked = fixture.store.lock().unwrap();
+    locked.write_legacy_capture(&legacy).unwrap();
+    drop(locked);
+
+    assert_eq!(
+        inspect_bootstrap_status(&fixture.store).unwrap(),
+        BootstrapStatus::CaptureRequired
+    );
+
+    let locked = fixture.store.lock().unwrap();
+    locked.select_generation(&legacy.generation_id).unwrap();
+    drop(locked);
+    assert_eq!(
+        inspect_bootstrap_status(&fixture.store).unwrap(),
+        BootstrapStatus::CaptureRequired
     );
 }
 

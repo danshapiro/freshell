@@ -126,10 +126,9 @@ where
     require_selected(driver, &working.prior_generation_id)?;
     driver.write_live(&live)?;
     require_selected(driver, &working.prior_generation_id)?;
-    let complete = working
-        .advanced(TransactionPhase::RollbackComplete)?
-        .finalized()?;
-    journal.save(&complete)
+    let complete = working.advanced(TransactionPhase::RollbackComplete)?;
+    journal.save(&complete)?;
+    journal.save(&complete.finalized()?)
 }
 
 pub(crate) fn validate_relaunched_process(

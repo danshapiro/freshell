@@ -503,6 +503,11 @@ fn inspect_legacy_bootstrap_prefix(store: &Store) -> Result<LegacyBootstrapPrefi
     })
 }
 
+pub(crate) fn legacy_bootstrap_is_incomplete(store: &Store) -> Result<bool> {
+    let prefix = inspect_legacy_bootstrap_prefix(store)?;
+    Ok(prefix.live.is_none() && (prefix.legacy.is_some() || prefix.selected.is_some()))
+}
+
 fn validate_runtime_sources(sources: &LegacyRuntimeSources) -> Result<()> {
     validate_source_directory("client", &sources.client_dir)?;
     validate_release_server_runtime_sources(sources, true)?;

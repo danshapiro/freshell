@@ -52,6 +52,9 @@ pub fn inspect_bootstrap_status(store: &Store) -> Result<BootstrapStatus> {
                 }
             }
         }
+        (_, _, Some(_)) if crate::legacy::legacy_bootstrap_is_incomplete(store)? => {
+            Ok(BootstrapStatus::CaptureRequired)
+        }
         _ => Err(DeployError::InvalidReceipt(
             "deployment bootstrap state is partial or internally inconsistent".to_string(),
         )),
@@ -61,7 +64,12 @@ pub fn inspect_bootstrap_status(store: &Store) -> Result<BootstrapStatus> {
 pub fn execute_controller(command: ControllerCommand) -> Result<String> {
     match command {
         ControllerCommand::BootstrapStatus { checkout, port } => {
+            crate::lifecycle::recover_pending(&checkout, port)?;
             let store = Store::open(&checkout, port)?;
+            if has_unfinished_transaction(&store)? {
+                let auth_token = load_auth_token(&checkout)?;
+                recover_unfinished(&store, &auth_token)?;
+            }
             Ok(inspect_bootstrap_status(&store)?.to_string())
         }
         ControllerCommand::Deploy(command) => {
@@ -152,15 +160,18 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
 }
 
 fn recover_unfinished(store: &Store, auth_token: &str) -> Result<()> {
-    let journal = DurableTransactionJournal::new(store.paths().transaction_journal())?;
-    let Some(record) = journal.load()? else {
-        return Ok(());
-    };
-    if record.finalized || record.phase == TransactionPhase::RollbackComplete {
+    if !has_unfinished_transaction(store)? {
         return Ok(());
     }
     let locked = store.lock()?;
     recover_unfinished_locked(store, &locked, auth_token)
+}
+
+pub(crate) fn has_unfinished_transaction(store: &Store) -> Result<bool> {
+    let journal = DurableTransactionJournal::new(store.paths().transaction_journal())?;
+    Ok(journal.load()?.is_some_and(|record| {
+        !record.finalized && record.phase != TransactionPhase::RollbackComplete
+    }))
 }
 
 pub(crate) fn recover_unfinished_locked(

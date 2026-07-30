@@ -413,11 +413,14 @@ where
             TransactionPhase::TargetReadyGated => {
                 require_target(&self.checked_port(&record)?, &record, ServiceState::Gated)?;
                 self.require_selected_generation(&record.prior_generation_id)?;
-                self.save(record.advanced(TransactionPhase::SwitchCurrentIntent)?)?;
+                let switching = record.advanced(TransactionPhase::SwitchCurrentIntent)?;
+                self.save(switching.clone())?;
+                crate::sandbox_interrupt::interrupt_after("pre-commit", &switching);
             }
             TransactionPhase::SwitchCurrentIntent => {
                 require_target(&self.checked_port(&record)?, &record, ServiceState::Gated)?;
                 self.switch_exact(&record.prior_generation_id, &record.target_generation_id)?;
+                crate::sandbox_interrupt::interrupt_after("pointer-switch", &record);
                 self.save(record.advanced(TransactionPhase::ActivationAuthorized)?)?;
             }
             TransactionPhase::ActivationAuthorized => {
@@ -458,6 +461,7 @@ where
                             ServiceState::Ordinary,
                         )?;
                         self.require_selected_generation(&record.target_generation_id)?;
+                        crate::sandbox_interrupt::interrupt_after("target-owned-receipt", &record);
                         self.save(record.advanced(TransactionPhase::Activated)?)?;
                     }
                     ActivationReceiptObservation::Malformed

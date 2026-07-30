@@ -22,6 +22,7 @@ mod real_driver;
 mod receipts;
 mod recovery;
 mod rollback;
+mod sandbox_interrupt;
 mod store;
 
 pub use activation::{

@@ -154,9 +154,11 @@ pub(crate) fn execute_start_current(
 
 pub(crate) fn execute_stop_current(checkout: &Path, port: DeployPort) -> Result<()> {
     let store = Store::open(checkout, port)?;
-    let auth_token = crate::controller::load_auth_token(checkout)?;
     let locked = store.lock()?;
-    crate::controller::recover_unfinished_locked(&store, &locked, &auth_token)?;
+    if crate::controller::has_unfinished_transaction(&store)? {
+        let auth_token = crate::controller::load_auth_token(checkout)?;
+        crate::controller::recover_unfinished_locked(&store, &locked, &auth_token)?;
+    }
     require_no_pending_lifecycle(&store)?;
     let selected = store
         .selected_generation_id()?
