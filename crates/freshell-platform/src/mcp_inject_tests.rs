@@ -13,10 +13,18 @@ struct McpEntryEnvGuard {
 }
 
 impl McpEntryEnvGuard {
-    fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let previous = std::env::var_os("FRESHELL_MCP_SERVER_ENTRY");
+    fn capture() -> Self {
+        Self {
+            previous: std::env::var_os("FRESHELL_MCP_SERVER_ENTRY"),
+        }
+    }
+
+    fn set(&self, value: impl AsRef<std::ffi::OsStr>) {
         std::env::set_var("FRESHELL_MCP_SERVER_ENTRY", value);
-        Self { previous }
+    }
+
+    fn unset(&self) {
+        std::env::remove_var("FRESHELL_MCP_SERVER_ENTRY");
     }
 }
 
@@ -100,7 +108,8 @@ fn explicit_mcp_server_entry_wins_over_checkout_fallback() {
     let scratch = Scratch::new("runtime-entry");
     let entry = scratch.path().join("server.mjs");
     std::fs::write(&entry, "export {};\n").unwrap();
-    let _entry_env = McpEntryEnvGuard::set(&entry);
+    let entry_env = McpEntryEnvGuard::capture();
+    entry_env.set(&entry);
 
     assert_eq!(
         RealMcpRuntime.server_command_args().unwrap(),
@@ -111,9 +120,10 @@ fn explicit_mcp_server_entry_wins_over_checkout_fallback() {
 #[test]
 fn empty_mcp_server_entry_preserves_the_existing_fallback() {
     let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("FRESHELL_MCP_SERVER_ENTRY");
+    let entry_env = McpEntryEnvGuard::capture();
+    entry_env.unset();
     let fallback = RealMcpRuntime.server_command_args();
-    let _entry_env = McpEntryEnvGuard::set("");
+    entry_env.set("");
 
     assert_eq!(RealMcpRuntime.server_command_args(), fallback);
 }
@@ -123,7 +133,8 @@ fn invalid_mcp_server_entry_fails_without_using_checkout_fallback() {
     let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let scratch = Scratch::new("missing-runtime-entry");
     let missing = scratch.path().join("missing-server.mjs");
-    let _entry_env = McpEntryEnvGuard::set(&missing);
+    let entry_env = McpEntryEnvGuard::capture();
+    entry_env.set(&missing);
 
     let error = RealMcpRuntime.server_command_args().unwrap_err();
     assert!(
@@ -506,6 +517,8 @@ fn filetime_set_old(path: &Path) -> bool {
 #[test]
 fn real_runtime_tsx_unresolvable_raises_reference_error() {
     let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let entry_env = McpEntryEnvGuard::capture();
+    entry_env.unset();
     let scratch = Scratch::new("tsxmissing");
     let prev = std::env::current_dir().unwrap();
     // Serialize against other cwd-sensitive tests via a best-effort chdir guard.
