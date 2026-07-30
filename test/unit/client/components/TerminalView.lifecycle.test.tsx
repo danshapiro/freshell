@@ -2676,6 +2676,159 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'execvp(3) failed.: No such file or directory')
   })
 
+  it('writes the resume-validation notice into the terminal on terminal.created', async () => {
+    const tabId = 'tab-resume-validation-notice'
+    const paneId = 'pane-resume-validation-notice'
+    const notice = 'Saved amplifier session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 could not be found on disk — started a fresh session instead.'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-resume-validation-notice',
+      status: 'creating',
+      mode: 'shell',
+      shell: 'system',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell',
+            status: 'creating',
+            title: 'Shell',
+            titleSetByUser: false,
+            createRequestId: 'req-resume-validation-notice',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    const term = terminalInstances[0]
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-resume-validation-notice',
+        terminalId: 'term-resume-validation-notice',
+        createdAt: Date.now(),
+        notice,
+      })
+    })
+
+    await waitFor(() => {
+      expectTerminalWriteContaining(term, 'Saved amplifier session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1')
+    })
+  })
+
+  it('clears the persisted sessionRef/resumeSessionId when terminal.created carries a notice', async () => {
+    const tabId = 'tab-resume-validation-clear'
+    const paneId = 'pane-resume-validation-clear'
+    const staleSessionRef = {
+      provider: 'codex',
+      sessionId: '8dab420a-f76b-407c-bcbe-dfb2a971c2e1',
+    }
+
+    // codex/opencode shape: the created frame carries a notice but NO
+    // sessionRef — the gate's fallback for these modes is None, so no
+    // sessionRef overwrite will heal the pane.
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-resume-validation-clear',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      sessionRef: staleSessionRef,
+      resumeSessionId: staleSessionRef.sessionId,
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'creating',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-resume-validation-clear',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-resume-validation-clear',
+        terminalId: 'term-resume-validation-clear',
+        createdAt: Date.now(),
+        notice: 'Saved codex session 8dab420a-f76b-407c-bcbe-dfb2a971c2e1 could not be found on disk — started a fresh session instead.',
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId]
+      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+      expect(layout.content.terminalId).toBe('term-resume-validation-clear')
+      expect(layout.content.sessionRef).toBeUndefined()
+      expect(layout.content.resumeSessionId).toBeUndefined()
+    })
+  })
+
   it('settles a clean restored attach startup exit as exited', async () => {
     const tabId = 'tab-clean-restore-attach-exit'
     const paneId = 'pane-clean-restore-attach-exit'
