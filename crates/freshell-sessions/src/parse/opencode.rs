@@ -424,6 +424,130 @@ pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, 
     }
 }
 
+/// A resume-resolve by-id fallback HIT: Node's `resolveOpencodeSessionRoots`
+/// walk resolved the requested id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeSessionDirectory {
+    /// The requested row's OWN `directory` column — the SPAWN cwd opencode
+    /// resumes in (`resolve-session.ts:77-84`: NOT the project root) — kept
+    /// only when TRUTHY (`opencode.ts:265-267, 281`). `None` for an empty or
+    /// NULL `directory` and for EVERY legacy-schema hit (Node's early return
+    /// never reads the row). `None` ⇒ the wire match OMITS `cwd`.
+    pub directory: Option<String>,
+}
+
+/// One row of the walk: `(directory, parent_id)` for an id, `None` = no row.
+type SessionRow = (Option<String>, Option<String>);
+
+fn fetch_session_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionRow>, OpencodeReadError> {
+    match conn.query_row(
+        "SELECT directory, parent_id FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    ) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(OpencodeReadError(e.to_string())),
+    }
+}
+
+/// Resume-resolve by-id lookup — a bug-for-bug port of Node's
+/// `OpencodeProvider.resolveOpencodeSessionRoots`
+/// (`server/coding-cli/providers/opencode.ts:239-323`, consumed by
+/// `resolve-session.ts:59-85`). This is deliberately NOT the attach-arm
+/// existence probe: Node walks the `parent_id` chain, and every quirk of
+/// that walk is wire-observable, so all are replicated:
+///
+/// - LEGACY schema (`session` lacks `parent_id`, detected with the same
+///   `PRAGMA table_info(session)` probe the listing uses): return a HIT with
+///   `directory: None` for ANY requested id — Node returns early
+///   (`opencode.ts:246-250`) with NO row query and NO existence check, so
+///   even nonexistent ids hit and existing directories are never read.
+/// - MODERN schema: fetch the requested row (missing row ⇒ `Ok(None)`);
+///   keep its OWN `directory` only if non-empty (truthy filter,
+///   `opencode.ts:265-267, 281`); then walk `parent_id` with a `seen` set —
+///   a missing parent row (`opencode.ts:292-295`) or a cycle
+///   (`opencode.ts:287-290`) marks the requested id unresolved ⇒ `Ok(None)`
+///   even though the row exists; reaching a root (`parent_id` NULL) ⇒ HIT.
+///
+/// Same read-only open and short busy timeout as [`session_exists_by_id`].
+/// `Err` for ANY read failure — the resolve endpoint treats `Err` as a miss
+/// (empty matches), never a 5xx (Node likewise degrades: 3 retries then all
+/// ids unresolved, `opencode.ts:239-322`).
+pub fn opencode_session_directory_by_id(
+    data_home: &Path,
+    session_id: &str,
+) -> Result<Option<OpencodeSessionDirectory>, OpencodeReadError> {
+    let db_path = data_home.join("opencode.db");
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        EXISTENCE_BY_ID_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+
+    // PRAGMA table_info(session) -> hasParentId (same detection as the
+    // listing's `run_opencode_query_inner`).
+    let has_parent_id = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(session)")
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| OpencodeReadError(e.to_string()))?;
+        let mut found = false;
+        for name in names {
+            if name.map_err(|e| OpencodeReadError(e.to_string()))? == "parent_id" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_parent_id {
+        // Node's legacy early return (`opencode.ts:246-250`): every requested
+        // id resolves as its own root — no row query, no existence check, no
+        // directory read. Bug-for-bug: nonexistent ids HIT, `cwd` omitted.
+        return Ok(Some(OpencodeSessionDirectory { directory: None }));
+    }
+
+    let Some((directory, first_parent)) = fetch_session_row(&conn, session_id)? else {
+        return Ok(None);
+    };
+    // Truthy filter (`opencode.ts:265-267, 281`): empty string ⇒ no cwd.
+    let directory = directory.filter(|d| !d.is_empty());
+
+    // Parent walk (`opencode.ts:283-303`): a missing parent or a cycle marks
+    // the REQUESTED id unresolved (`resolve-session.ts:66`) ⇒ miss, even
+    // though its own row exists and its directory was already collected.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(session_id.to_string());
+    let mut parent = first_parent;
+    while let Some(current) = parent {
+        if !seen.insert(current.clone()) {
+            return Ok(None); // cycle guard (`opencode.ts:287-290`)
+        }
+        match fetch_session_row(&conn, &current)? {
+            None => return Ok(None), // missing parent (`opencode.ts:292-295`)
+            Some((_, next_parent)) => parent = next_parent,
+        }
+    }
+    Ok(Some(OpencodeSessionDirectory { directory }))
+}
+
 /// `defaultOpencodeDataHome` — `$XDG_DATA_HOME/opencode` -> win `LOCALAPPDATA/opencode`
 /// -> `~/.local/share/opencode`.
 pub fn default_opencode_data_home() -> PathBuf {
