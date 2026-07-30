@@ -1507,7 +1507,9 @@ as an empty listing. Default enabledProviders now includes amplifier
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
 ```
 
----### Task 6: Hardened wire response + route merge + production fallback wiring (degraded-path proof)
+---
+
+### Task 6: Hardened wire response + route merge + production fallback wiring (degraded-path proof)
 
 Upgrade `POST /api/sessions/resolve` to the full hardened wire shape and route semantics (`sessions-router.ts:255-316`), wire the production fallbacks to REPORT failures instead of swallowing them, and prove the degraded path on the wire. Includes the async-hygiene verification (context §5).
 
