@@ -1683,6 +1683,204 @@ server.serve_forever()
 }
 
 #[test]
+#[ignore = "Docker-only: compiles, executes, and terminates a real fallback listener"]
+fn actual_proc_capture_uses_binary_compile_fallbacks_instead_of_launch_cwd() {
+    require_destructive_test_sandbox();
+
+    struct ChildCleanup(Option<std::process::Child>);
+
+    impl Drop for ChildCleanup {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let compiled = fixture.path().join("compiled-source");
+    for directory in [
+        "crates/freshell-server",
+        "crates/freshell-freshagent",
+        "crates/freshell-claude-sidecar",
+        "dist/client",
+    ] {
+        fs::create_dir_all(compiled.join(directory)).unwrap();
+    }
+    fs::write(
+        compiled.join("crates/freshell-server/Cargo.toml"),
+        "[package]\nname = \"freshell-server\"\n",
+    )
+    .unwrap();
+    fs::write(
+        compiled.join("dist/client/index.html"),
+        "compiled client closure",
+    )
+    .unwrap();
+    for file in ["index.mjs", "package.json", "package-lock.json"] {
+        fs::copy(
+            runtime.sources.claude_sidecar_dir.join(file),
+            compiled.join("crates/freshell-claude-sidecar").join(file),
+        )
+        .unwrap();
+    }
+    fs::write(
+        compiled.join("crates/freshell-claude-sidecar/index.mjs"),
+        "import 'sidecar-package'; // compiled sidecar closure\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(fixture.path().join("dist/client")).unwrap();
+    fs::write(
+        fixture.path().join("dist/client/index.html"),
+        "launch-cwd decoy client",
+    )
+    .unwrap();
+    symlink(
+        &runtime.sources.dist_server_dir,
+        fixture.path().join("dist/server"),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.path().join("crates/freshell-claude-sidecar")).unwrap();
+    fs::write(
+        fixture
+            .path()
+            .join("crates/freshell-claude-sidecar/index.mjs"),
+        "launch-cwd decoy sidecar",
+    )
+    .unwrap();
+    for (source, destination) in [
+        (
+            runtime.sources.package_json.as_path(),
+            fixture.path().join("package.json"),
+        ),
+        (
+            runtime.sources.package_lock.as_path(),
+            fixture.path().join("package-lock.json"),
+        ),
+        (
+            runtime.sources.production_node_modules.as_path(),
+            fixture.path().join("node_modules"),
+        ),
+    ] {
+        symlink(source, destination).unwrap();
+    }
+
+    let source = fixture.path().join("fallback-listener.rs");
+    fs::write(
+        &source,
+        r#"use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::Path;
+
+const SERVER_MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
+const SIDECAR: &str = concat!(
+    env!("FRESHELL_FRESHAGENT_MANIFEST_DIR"),
+    "/../freshell-claude-sidecar/index.mjs"
+);
+
+fn main() {
+    fs::metadata(SIDECAR).unwrap();
+    let port: u16 = std::env::var("FRESHELL_DEPLOY_TEST_PORT").unwrap().parse().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    fs::write(std::env::var_os("FRESHELL_DEPLOY_TEST_READY").unwrap(), "ready\n").unwrap();
+    for stream in listener.incoming() {
+        let mut stream = stream.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let client = fs::read(Path::new(SERVER_MANIFEST).join("../../dist/client/index.html")).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            client.len()
+        ).unwrap();
+        stream.write_all(&client).unwrap();
+    }
+}
+"#,
+    )
+    .unwrap();
+    let listener_executable = fixture.path().join("fallback-listener");
+    let compile = std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&listener_executable)
+        .env(
+            "CARGO_MANIFEST_DIR",
+            compiled.join("crates/freshell-server"),
+        )
+        .env(
+            "FRESHELL_FRESHAGENT_MANIFEST_DIR",
+            compiled.join("crates/freshell-freshagent"),
+        )
+        .status()
+        .expect("run rustc in Docker");
+    assert!(compile.success());
+
+    let port = {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let ready = fixture.path().join("fallback-listener-ready");
+    let child = std::process::Command::new(&listener_executable)
+        .current_dir(fixture.path())
+        .env("FRESHELL_DEPLOY_TEST_PORT", port.to_string())
+        .env("FRESHELL_DEPLOY_TEST_READY", &ready)
+        .env("FRESHELL_EXTENSIONS_DIR", &runtime.sources.extensions_dir)
+        .env(
+            "FRESHELL_CLAUDE_NODE",
+            runtime.sources.package_json.parent().unwrap().join("node"),
+        )
+        .env(
+            "FRESHELL_MCP_SERVER_ENTRY",
+            runtime
+                .sources
+                .dist_server_dir
+                .join(&runtime.sources.mcp_entry_relative),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = ChildCleanup(Some(child));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.is_file() && std::time::Instant::now() < deadline {
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(ready.is_file());
+
+    let store = Store::open(fixture.path(), DeployPort::new(port).unwrap()).unwrap();
+    let mut live_request = request(&runtime);
+    live_request.pid_hint = child.0.as_ref().unwrap().id();
+    live_request.port = DeployPort::new(port).unwrap();
+    live_request.runtime.client_dir = compiled.join("dist/client");
+    live_request.runtime.claude_sidecar_dir = compiled.join("crates/freshell-claude-sidecar");
+    let receipt = capture_legacy(
+        &store,
+        &live_request,
+        &LinuxProcfs::default(),
+        &FakeScratchProbe::passing(),
+    )
+    .expect("capture compile-time fallback closure");
+
+    let generation = store.verify_generation(&receipt.generation_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(generation.path.join("client/index.html")).unwrap(),
+        "compiled client closure"
+    );
+    assert_eq!(
+        fs::read_to_string(generation.path.join("claude-sidecar/index.mjs")).unwrap(),
+        "import 'sidecar-package'; // compiled sidecar closure\n"
+    );
+    assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+}
+
+#[test]
 #[ignore = "Docker-only: spawns, unlinks, and kills a real listener process"]
 fn actual_proc_capture_pins_the_unlinked_listener_executable() {
     require_destructive_test_sandbox();

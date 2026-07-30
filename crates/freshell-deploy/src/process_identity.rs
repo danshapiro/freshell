@@ -509,6 +509,41 @@ impl LinuxProcfs {
                 .unwrap_or(fallback);
             canonical_runtime_path(cwd, &path, name)
         };
+        let explicit_client = environment
+            .get("FRESHELL_CLIENT_DIR")
+            .filter(|value| !value.is_empty());
+        let explicit_sidecar = environment
+            .get("FRESHELL_CLAUDE_SIDECAR")
+            .filter(|value| !value.is_empty());
+        let compiled_root = if explicit_client.is_none() || explicit_sidecar.is_none() {
+            let executable = fs::read(self.pid_path(pid, "exe")).map_err(|error| {
+                DeployError::ProcessIdentity(format!(
+                    "cannot read observed executable for compiled runtime provenance: {error}"
+                ))
+            })?;
+            Some(infer_compiled_workspace_root(&executable)?)
+        } else {
+            None
+        };
+        let client_path = if let Some(path) = explicit_client {
+            PathBuf::from(path)
+        } else {
+            let compiled = compiled_root
+                .as_ref()
+                .expect("missing override inferred compile root")
+                .join("dist/client");
+            if compiled.exists() {
+                compiled
+            } else {
+                cwd.join("dist/client")
+            }
+        };
+        let sidecar_path = explicit_sidecar.map(PathBuf::from).unwrap_or_else(|| {
+            compiled_root
+                .as_ref()
+                .expect("missing override inferred compile root")
+                .join("crates/freshell-claude-sidecar/index.mjs")
+        });
         let node_path = environment
             .get("FRESHELL_CLAUDE_NODE")
             .filter(|value| !value.is_empty())
@@ -523,7 +558,7 @@ impl LinuxProcfs {
             node_path
         };
         Ok(RuntimeProvenance {
-            client_dir: effective("FRESHELL_CLIENT_DIR", cwd.join("dist/client"))?,
+            client_dir: canonical_runtime_path(cwd, &client_path, "FRESHELL_CLIENT_DIR")?,
             extensions_dir: effective("FRESHELL_EXTENSIONS_DIR", cwd.join("extensions"))?,
             dist_server_dir: canonical_runtime_path(
                 cwd,
@@ -534,9 +569,10 @@ impl LinuxProcfs {
                 "FRESHELL_MCP_SERVER_ENTRY",
                 cwd.join("dist/server/mcp/server.js"),
             )?,
-            claude_sidecar_entry: effective(
+            claude_sidecar_entry: canonical_runtime_path(
+                cwd,
+                &sidecar_path,
                 "FRESHELL_CLAUDE_SIDECAR",
-                cwd.join("crates/freshell-claude-sidecar/index.mjs"),
             )?,
             node_executable: canonical_runtime_path(cwd, &node_path, "FRESHELL_CLAUDE_NODE")?,
             package_json: canonical_runtime_path(cwd, &cwd.join("package.json"), "package.json")?,
@@ -552,6 +588,87 @@ impl LinuxProcfs {
             )?,
         })
     }
+}
+
+fn infer_compiled_workspace_root(executable: &[u8]) -> Result<PathBuf> {
+    let server_roots =
+        compiled_roots_for_marker(executable, "/crates/freshell-server", |root, candidate| {
+            let expected = root.join("crates/freshell-server");
+            if fs::canonicalize(candidate).ok()? != expected {
+                return None;
+            }
+            let manifest = fs::read_to_string(expected.join("Cargo.toml")).ok()?;
+            (manifest.lines().any(|line| line.trim() == "[package]")
+                && manifest
+                    .lines()
+                    .any(|line| line.trim() == "name = \"freshell-server\""))
+            .then_some(())
+        });
+    let sidecar_roots = compiled_roots_for_marker(
+        executable,
+        "/crates/freshell-freshagent/../freshell-claude-sidecar/index.mjs",
+        |root, candidate| {
+            let expected = root.join("crates/freshell-claude-sidecar/index.mjs");
+            (candidate.is_file() && fs::canonicalize(candidate).ok()? == expected).then_some(())
+        },
+    );
+    let roots: BTreeSet<PathBuf> = server_roots.intersection(&sidecar_roots).cloned().collect();
+    if roots.len() == 1 && server_roots.len() == 1 && sidecar_roots.len() == 1 {
+        return Ok(roots.into_iter().next().expect("exactly one"));
+    }
+    if server_roots.is_empty() || sidecar_roots.is_empty() || roots.is_empty() {
+        return Err(DeployError::ProcessIdentity(
+            "cannot prove the observed binary's compiled Freshell workspace root".to_string(),
+        ));
+    }
+    Err(DeployError::ProcessIdentity(format!(
+        "observed binary compiled Freshell workspace root is ambiguous: server={server_roots:?}, sidecar={sidecar_roots:?}"
+    )))
+}
+
+fn compiled_roots_for_marker(
+    executable: &[u8],
+    marker: &str,
+    validate_candidate: impl Fn(&Path, &Path) -> Option<()>,
+) -> BTreeSet<PathBuf> {
+    let marker = marker.as_bytes();
+    let mut roots = BTreeSet::new();
+    for marker_start in executable
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == marker).then_some(index))
+    {
+        let marker_end = marker_start + marker.len();
+        let lower_bound = marker_start.saturating_sub(4096);
+        for start in lower_bound..=marker_start {
+            if executable[start] != b'/' {
+                continue;
+            }
+            let Ok(raw) = std::str::from_utf8(&executable[start..marker_end]) else {
+                continue;
+            };
+            let candidate = Path::new(raw);
+            if !candidate.is_absolute()
+                || candidate
+                    .to_str()
+                    .is_none_or(|value| !value.ends_with(std::str::from_utf8(marker).unwrap()))
+            {
+                continue;
+            }
+            let Ok(root_raw) = std::str::from_utf8(&executable[start..marker_start]) else {
+                continue;
+            };
+            let root = Path::new(root_raw);
+            let Ok(canonical_root) = fs::canonicalize(root) else {
+                continue;
+            };
+            if canonical_root != root || validate_candidate(root, candidate).is_none() {
+                continue;
+            }
+            roots.insert(canonical_root);
+        }
+    }
+    roots
 }
 
 fn canonical_runtime_path(cwd: &Path, path: &Path, label: &str) -> Result<String> {
@@ -690,4 +807,183 @@ fn path_to_utf8(path: &Path, label: &str) -> Result<String> {
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| DeployError::ProcessIdentity(format!("{label} is not UTF-8")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const FIXTURE_PID: u32 = 41_337;
+
+    fn runtime_tree(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        for directory in [
+            "crates/freshell-server",
+            "crates/freshell-freshagent",
+            "crates/freshell-claude-sidecar",
+            "dist/client",
+            "dist/server/mcp",
+            "extensions",
+            "node_modules",
+        ] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(
+            root.join("crates/freshell-server/Cargo.toml"),
+            "[package]\nname = \"freshell-server\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/freshell-claude-sidecar/index.mjs"),
+            format!("// sidecar from {name}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/client/index.html"),
+            format!("client from {name}\n"),
+        )
+        .unwrap();
+        fs::write(root.join("dist/server/mcp/server.js"), "export {};\n").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        fs::write(root.join("package-lock.json"), "{}").unwrap();
+        fs::write(root.join("node"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(root.join("node"), fs::Permissions::from_mode(0o755)).unwrap();
+        root
+    }
+
+    fn proc_fixture(
+        fixture: &TempDir,
+        executable_strings: &[&Path],
+        environment: &[(&str, &Path)],
+    ) -> LinuxProcfs {
+        let proc_root = fixture.path().join("proc");
+        let pid_root = proc_root.join(FIXTURE_PID.to_string());
+        fs::create_dir_all(&pid_root).unwrap();
+        let mut executable = b"ELF fixture\0".to_vec();
+        for value in executable_strings {
+            executable.extend_from_slice(value.as_os_str().as_encoded_bytes());
+            executable.push(0);
+        }
+        fs::write(pid_root.join("exe"), executable).unwrap();
+        let mut environ = Vec::new();
+        for (name, value) in environment {
+            environ.extend_from_slice(name.as_bytes());
+            environ.push(b'=');
+            environ.extend_from_slice(value.as_os_str().as_encoded_bytes());
+            environ.push(0);
+        }
+        fs::write(pid_root.join("environ"), environ).unwrap();
+        LinuxProcfs::with_root(&proc_root)
+    }
+
+    fn manifest_markers(root: &Path) -> [PathBuf; 2] {
+        [
+            root.join("crates/freshell-server"),
+            root.join("crates/freshell-freshagent/../freshell-claude-sidecar/index.mjs"),
+        ]
+    }
+
+    #[test]
+    fn absent_overrides_use_the_binary_compile_root_not_launch_cwd() {
+        let fixture = tempfile::tempdir().unwrap();
+        let compiled = runtime_tree(fixture.path(), "compiled");
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let markers = manifest_markers(&compiled);
+        let node = launch_cwd.join("node");
+        let proc = proc_fixture(
+            &fixture,
+            &[markers[0].as_path(), markers[1].as_path()],
+            &[("FRESHELL_CLAUDE_NODE", node.as_path())],
+        );
+
+        let provenance = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .expect("unique compiled fallback provenance");
+
+        assert_eq!(
+            Path::new(&provenance.client_dir),
+            fs::canonicalize(compiled.join("dist/client")).unwrap()
+        );
+        assert_eq!(
+            Path::new(&provenance.claude_sidecar_entry),
+            fs::canonicalize(compiled.join("crates/freshell-claude-sidecar/index.mjs")).unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_overrides_reject_ambiguous_binary_compile_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let first = runtime_tree(fixture.path(), "first-compiled");
+        let second = runtime_tree(fixture.path(), "second-compiled");
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let first_markers = manifest_markers(&first);
+        let second_markers = manifest_markers(&second);
+        let node = launch_cwd.join("node");
+        let proc = proc_fixture(
+            &fixture,
+            &[
+                first_markers[0].as_path(),
+                first_markers[1].as_path(),
+                second_markers[0].as_path(),
+                second_markers[1].as_path(),
+            ],
+            &[("FRESHELL_CLAUDE_NODE", node.as_path())],
+        );
+
+        let error = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn absent_overrides_reject_unprovable_binary_compile_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let node = launch_cwd.join("node");
+        let proc = proc_fixture(&fixture, &[], &[("FRESHELL_CLAUDE_NODE", node.as_path())]);
+
+        let error = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot prove"));
+    }
+
+    #[test]
+    fn explicit_client_and_sidecar_overrides_do_not_require_compile_root_provenance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let explicit = runtime_tree(fixture.path(), "explicit");
+        let node = launch_cwd.join("node");
+        let client = explicit.join("dist/client");
+        let sidecar = explicit.join("crates/freshell-claude-sidecar/index.mjs");
+        let proc = proc_fixture(
+            &fixture,
+            &[],
+            &[
+                ("FRESHELL_CLAUDE_NODE", node.as_path()),
+                ("FRESHELL_CLIENT_DIR", client.as_path()),
+                ("FRESHELL_CLAUDE_SIDECAR", sidecar.as_path()),
+            ],
+        );
+
+        let provenance = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .expect("explicit overrides");
+
+        assert_eq!(
+            Path::new(&provenance.client_dir),
+            fs::canonicalize(client).unwrap()
+        );
+        assert_eq!(
+            Path::new(&provenance.claude_sidecar_entry),
+            fs::canonicalize(sidecar).unwrap()
+        );
+    }
 }
