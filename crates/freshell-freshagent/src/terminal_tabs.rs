@@ -4185,8 +4185,10 @@ mod tests {
         argv_file: &std::path::Path,
     ) -> freshell_platform::CliCommandSpec {
         let mut spec = recording_cli_spec("claude", argv_file);
-        spec.create_session_args =
-            Some(vec!["--session-id".to_string(), "{{sessionId}}".to_string()]);
+        spec.create_session_args = Some(vec![
+            "--session-id".to_string(),
+            "{{sessionId}}".to_string(),
+        ]);
         spec
     }
 
@@ -4231,7 +4233,10 @@ mod tests {
         let notice = pane_content["reconcileNotice"]
             .as_str()
             .expect("gate fire injects reconcileNotice");
-        assert!(notice.contains(STALE), "notice names the stale id: {notice}");
+        assert!(
+            notice.contains(STALE),
+            "notice names the stale id: {notice}"
+        );
         let healed = pane_content["sessionRef"]["sessionId"]
             .as_str()
             .expect("healed sessionRef stamped");
@@ -4250,7 +4255,10 @@ mod tests {
         let argv = read_argv_file_eventually(&argv_file).await;
         assert!(argv.contains("--session-id"), "Start argv: {argv}");
         assert!(argv.contains(healed), "minted id in argv: {argv}");
-        assert!(!argv.contains(STALE), "stale id must not reach argv: {argv}");
+        assert!(
+            !argv.contains(STALE),
+            "stale id must not reach argv: {argv}"
+        );
 
         registry.kill(&terminal_id);
         let _ = std::fs::remove_file(&argv_file);

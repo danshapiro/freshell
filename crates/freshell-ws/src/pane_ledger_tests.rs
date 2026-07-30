@@ -1076,14 +1076,20 @@ fn retire_missing_does_not_reretire() {
     let row_after_first = ledger.load_binding("amplifier", "sid").unwrap();
     let first_updated_at = row_after_first.updated_at;
     assert_eq!(row_after_first.state, RowState::Retired);
-    assert_eq!(row_after_first.retired_reason, Some(RetiredReason::SessionMissing));
+    assert_eq!(
+        row_after_first.retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
 
     // Second retire should fail (already retired)
     let second = ledger.retire_missing("amplifier", "sid");
     assert!(!second);
     let row_after_second = ledger.load_binding("amplifier", "sid").unwrap();
     assert_eq!(row_after_second.state, RowState::Retired);
-    assert_eq!(row_after_second.retired_reason, Some(RetiredReason::SessionMissing));
+    assert_eq!(
+        row_after_second.retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
     // Verify updated_at was not clobbered
     assert_eq!(row_after_second.updated_at, first_updated_at);
     std::fs::remove_dir_all(&root).ok();
@@ -1097,7 +1103,6 @@ fn session_missing_serde_round_trips() {
     assert_eq!(json, r#""session_missing""#);
 
     // Test deserialization
-    let deserialized: RetiredReason =
-        serde_json::from_str(&json).expect("deserialize");
+    let deserialized: RetiredReason = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized, RetiredReason::SessionMissing);
 }

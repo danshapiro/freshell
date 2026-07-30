@@ -213,7 +213,9 @@ fn codex_zst_rollout_is_candidate_but_undecodable_answers_unreadable() {
     let mut bytes = vec![0x28u8, 0xB5, 0x2F, 0xFD];
     bytes.extend_from_slice(&[0x00, 0xFF, 0x13, 0x37]);
     std::fs::write(
-        dated.join(format!("rollout-2026-07-29T10-00-00-{session_id}.jsonl.zst")),
+        dated.join(format!(
+            "rollout-2026-07-29T10-00-00-{session_id}.jsonl.zst"
+        )),
         bytes,
     )
     .expect("write zst candidate");

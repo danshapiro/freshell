@@ -68,6 +68,11 @@ pub use spawn_gate::{SpawnGate, SpawnGateError};
 /// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
 pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
+/// Door 3 (resume-validation): the gate-fired callback shape --
+/// `(provider, stale_session_id)`. In production, `freshell-server`'s main.rs
+/// implements it as pane-ledger `retire_missing` + `tracing::warn!`.
+pub type OnStaleResume = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Door 3 (resume-validation): the injected ASYNC sidecar-liveness probe --
 /// `(mode, session_id) -> is that session live inside a fresh-agent sidecar`.
 /// The REST create gate's registry consult is `TerminalRegistry`/PTY-scoped
@@ -79,11 +84,6 @@ pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Sen
 /// instances the WS door's D7 join consults, so this crate never imports
 /// `freshell-ws`. `None` (not wired, e.g. bare unit-test states) => the arm
 /// contributes false.
-/// Door 3 (resume-validation): the gate-fired callback shape --
-/// `(provider, stale_session_id)`. In production, `freshell-server`'s main.rs
-/// implements it as pane-ledger `retire_missing` + `tracing::warn!`.
-pub type OnStaleResume = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
-
 pub type SidecarLivenessProbe = std::sync::Arc<
     dyn Fn(&str, &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
