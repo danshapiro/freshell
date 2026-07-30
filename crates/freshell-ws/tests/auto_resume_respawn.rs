@@ -517,6 +517,45 @@ async fn respawn_with_absent_session_spawns_fresh_and_retires_binding() {
         "no recovering broadcast naming the stale id; frames: {frames:?}"
     );
 
+    // #582 interplay: a gate-fired respawn is ONE ordinary recovery cycle.
+    // (a) Exactly one Recovering status frame was broadcast for this respawn —
+    //     the gate must not add a second cycle's worth of status traffic.
+    let recovering_frames = frames
+        .iter()
+        .filter(|v| {
+            v["type"] == "terminal.status"
+                && v["status"] == "recovering"
+                && v["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("stale-amp"))
+        })
+        .count();
+    assert_eq!(
+        recovering_frames, 1,
+        "gate-fired respawn is a single recovery cycle"
+    );
+
+    // (b) The gate itself must not emit a breaker settle: no
+    //     terminal.status{status: exited, resumeCycles: Some(_)} frame
+    //     appears as part of this respawn.
+    assert!(
+        !frames.iter().any(|v| v["type"] == "terminal.status"
+            && v["status"] == "exited"
+            && !v["resumeCycles"].is_null()),
+        "gate must not synthesize a breaker settle frame"
+    );
+
+    // (c) auto_resume_cancels bookkeeping is untouched by the gate — the
+    //     harness state's cancel set/map remains empty (no phantom cancel).
+    assert!(
+        state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock")
+            .is_empty(),
+        "gate must not record a phantom autoResumeCancel"
+    );
+
     registry.kill_all();
 }
 
