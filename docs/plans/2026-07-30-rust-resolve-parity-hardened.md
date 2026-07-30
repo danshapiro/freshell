@@ -566,7 +566,7 @@ fn provider_identity_travels_with_the_fallback_not_its_position() {
 
 The COMPLETE 23-test mapping to the Node suite (every `it(...)` title in `test/unit/server/coding-cli/resolve-session.test.ts` at this worktree's HEAD, in file order — the Rust suite must cover ALL 23; legend: ✎ = verbatim body given above, ↻ = carry over/adapt the old Rust test body, ✚ = write new from the stated expectation):
 
-1. `exact match wins across all providers at once (claude UUID, no hint needed)` ✚ — index sessions for several providers, input = CLAUDE_ID → exactly 1 exact match, `hint` is `None`.
+1. `exact match wins across all providers at once (claude UUID, no hint needed)` ✚ — index sessions for several providers, input = CLAUDE_ID → exactly 1 exact match; `hint` is the parser's id-shape derivation, `Some(ResumeHint { provider: Claude, source: IdShape })` — a bare v4 UUID ALWAYS derives the claude id-shape hint on both parsers (`shared/resume-input-parser.ts:88-94`, `resume_input.rs:194-202`). Do NOT assert `hint == None`: the Node title's "no hint needed" means no explicit command hint is required in the INPUT (the id shape alone suffices); the Node test body never asserts on `hint` at all.
 2. `short hex prefix matches the amplifier session (spec row: 417e8345)` ✚ — index an amplifier session `417e8345aaaa`, input `417e8345` → 1 prefix match.
 3. `exact-id match is case-insensitive for UUID/hex tokens` ✎ `exact_id_match_is_case_insensitive_for_uuid_hex_tokens`
 4. `ses_ ids are case-SENSITIVE (base62): a case-variant does NOT match` ✎ `ses_ids_are_case_sensitive_a_case_variant_does_not_match`
@@ -1072,8 +1072,8 @@ Hardened Node replaced the #583 `resolveOpencodeSessionRoots` parent-walk with a
 - Modify: `crates/freshell-sessions/src/parse/mod.rs` (export the new names, drop the old)
 
 **Interfaces:**
-- Consumes: rusqlite (already a dependency), the existing `OpencodeReadError` and `to_opt_string`/`to_opt_i64` helpers in the same file.
-- Produces (Task 6 wires this): `pub fn opencode_session_row_by_id(data_home: &Path, session_id: &str) -> Result<Option<OpencodeByIdRow>, OpencodeReadError>` and `pub struct OpencodeByIdRow { pub session_id: String, pub cwd: Option<String>, pub title: Option<String>, pub created_at: Option<i64>, pub last_activity_at: Option<i64>, pub project_path: Option<String> }`.
+- Consumes: rusqlite (already a dependency; the pinned 0.31.0 exposes `Error::sqlite_error_code()`) and the existing `to_opt_string`/`to_opt_i64` helpers in the same file.
+- Produces (Task 6 wires this): `pub fn opencode_session_row_by_id(data_home: &Path, session_id: &str) -> Result<Option<OpencodeByIdRow>, OpencodeByIdError>`, `pub struct OpencodeByIdError { pub code: Option<String>, pub message: String }` (code-preserving — see Step 2; the existing `OpencodeReadError` stays untouched for its other consumers), and `pub struct OpencodeByIdRow { pub session_id: String, pub cwd: Option<String>, pub title: Option<String>, pub created_at: Option<i64>, pub last_activity_at: Option<i64>, pub project_path: Option<String> }`.
 
 - [ ] **Step 1: Write the failing tests (`crates/freshell-sessions/tests/opencode_row_by_id.rs`)**
 
@@ -1121,22 +1121,24 @@ fn db_without_a_project_table_still_resolves_with_null_project_path() { /* sessi
 
 #[test]
 fn missing_db_file_is_an_error_not_a_silent_miss() { /* empty temp dir →
-    Err(OpencodeReadError) (Node: DatabaseSync open throws SQLITE_CANTOPEN;
-    the provider is present-but-unreadable, and silence here is the incident
-    class) */ }
+    Err(OpencodeByIdError) with code Some("SQLITE_CANTOPEN") (Node:
+    DatabaseSync open throws SQLITE_CANTOPEN; the provider is
+    present-but-unreadable, and silence here is the incident class — the
+    CODE must survive to the wire, see Task 6's degraded test) */ }
 
 #[test]
 fn corrupt_db_file_is_an_error() { /* write 64 bytes of garbage to
-    opencode.db → Err */ }
+    opencode.db → Err with code Some("SQLITE_NOTADB") */ }
 
 #[test]
 fn locked_db_is_an_error_after_the_busy_timeout() { /* REAL contention proof
     for the load-bearing 500 ms busy timeout: build a valid fixture db with
     one row, open a SECOND rusqlite Connection to the same file and run
     `BEGIN EXCLUSIVE` (hold the txn open, do not commit); now call
-    opencode_session_row_by_id → expect Err (SQLITE_BUSY surfaces as
-    OpencodeReadError once the 500 ms busy_timeout expires — the read-only
-    open cannot acquire the shared lock). Optionally assert the call took
+    opencode_session_row_by_id → expect Err with code Some("SQLITE_BUSY")
+    (the busy error surfaces as OpencodeByIdError once the 500 ms
+    busy_timeout expires — the read-only open cannot acquire the shared
+    lock). Optionally assert the call took
     >= ~400 ms to show the timeout (not an instant failure), then ROLLBACK/
     drop the writer connection so the temp dir cleans up. */ }
 
@@ -1155,6 +1157,33 @@ In `crates/freshell-sessions/src/parse/opencode.rs`, add:
 /// SHORT busy timeout (`opencode-by-id-query.ts:12`): a locked DB must fail
 /// FAST — the failure surfaces as provider-unavailable, never "not found".
 const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
+
+/// Code-PRESERVING error for the by-id query (the plain `OpencodeReadError`
+/// stays for its other consumers). Node's thrown sqlite errors carry a
+/// `.code` like `SQLITE_CANTOPEN`, and the wire's `providerErrors[].code`
+/// must carry it too — flattening to a bare string here would make Task 6's
+/// degraded wire test injected-only fiction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpencodeByIdError {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// Map a rusqlite error to the Node-style `SQLITE_*` code name via
+/// `rusqlite::Error::sqlite_error_code()` (available in the pinned 0.31.0).
+fn by_id_err(e: rusqlite::Error) -> OpencodeByIdError {
+    use rusqlite::ffi::ErrorCode as C;
+    let code = e.sqlite_error_code().and_then(|c| match c {
+        C::CannotOpen => Some("SQLITE_CANTOPEN"),
+        C::DatabaseBusy => Some("SQLITE_BUSY"),
+        C::DatabaseLocked => Some("SQLITE_LOCKED"),
+        C::NotADatabase => Some("SQLITE_NOTADB"),
+        C::PermissionDenied => Some("SQLITE_PERM"),
+        C::ReadOnly => Some("SQLITE_READONLY"),
+        _ => None,
+    });
+    OpencodeByIdError { code: code.map(str::to_string), message: e.to_string() }
+}
 
 /// The hardened exact-id row (`OpencodeSessionRow` subset the by-id query
 /// selects). `last_activity_at` floored to integer ms (REAL columns possible).
@@ -1177,28 +1206,28 @@ pub struct OpencodeByIdRow {
 pub fn opencode_session_row_by_id(
     data_home: &Path,
     session_id: &str,
-) -> Result<Option<OpencodeByIdRow>, OpencodeReadError> {
+) -> Result<Option<OpencodeByIdRow>, OpencodeByIdError> {
     let db_path = data_home.join("opencode.db");
     let conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    .map_err(by_id_err)?;
     conn.busy_timeout(std::time::Duration::from_millis(
         OPENCODE_BYID_BUSY_TIMEOUT_MS,
     ))
-    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    .map_err(by_id_err)?;
 
     let table_names: std::collections::HashSet<String> = {
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-            .map_err(|e| OpencodeReadError(e.to_string()))?;
+            .map_err(by_id_err)?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| OpencodeReadError(e.to_string()))?;
+            .map_err(by_id_err)?;
         let mut set = std::collections::HashSet::new();
         for r in rows {
-            set.insert(r.map_err(|e| OpencodeReadError(e.to_string()))?);
+            set.insert(r.map_err(by_id_err)?);
         }
         set
     };
@@ -1231,7 +1260,7 @@ pub fn opencode_session_row_by_id(
     }) {
         Ok(row) => Ok(Some(row)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(OpencodeReadError(e.to_string())),
+        Err(e) => Err(by_id_err(e)),
     }
 }
 ```
@@ -1289,13 +1318,16 @@ Node's route merges `codingCliIndexer.getScanFailures()` into `providerErrors` a
 
 **Files:**
 - Modify: `crates/freshell-sessions/src/directory_index.rs`
+- Modify: `crates/freshell-sessions/src/amplifier.rs` (provider_name + discover_checked on the amplifier source)
 - Modify: `crates/freshell-server/src/settings_store.rs`
+- Modify: `crates/freshell-server/src/settings.rs` (default `enabled_providers` gains `"amplifier"` — Node-default parity)
 - Test: unit tests inside `directory_index.rs`'s existing `#[cfg(test)]` module (follow its current test patterns) and `settings_store.rs`'s.
 
 **Interfaces:**
 - Consumes: existing `SessionSource` trait, `refresh_snapshot` free function, `spawn_background_refresh`.
 - Produces (Task 6 depends on these EXACT names):
-  - `SessionSource::provider_name(&self) -> Option<&'static str>` (default `None`; `ClaudeSource` → `Some("claude")`, `CodexSource` → `Some("codex")`, `OpencodeSource` → `Some("opencode")`)
+  - `SessionSource::provider_name(&self) -> Option<&'static str>` (default `None`; the FOUR real sources all participate: `ClaudeSource` → `Some("claude")`, `CodexSource` → `Some("codex")`, `OpencodeSource` → `Some("opencode")`, the amplifier source in `amplifier.rs` → `Some("amplifier")`)
+  - `SessionSource::discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error>` (default `Ok(self.discover())`; the file-backed sources override it to PROPAGATE a root-listing failure — see Step 2)
   - `SessionIndex::scan_failures(&self) -> Vec<String>` (sorted, deduped)
   - `SessionIndex::request_refresh(&self)` (non-blocking, no-op if a sweep is already running)
   - `SettingsStore::coding_cli_enabled_providers(&self) -> Vec<String>` — **async** (`pub async fn`): `ServerSettings` lives in a `tokio::sync::RwLock`, so the getter mirrors `get()` (`self.inner.read().await...`); a sync getter is impossible without `blocking_read`, which can panic inside the runtime. (`session_overrides()` is NOT the pattern here — it reads a separate `std::sync::Mutex`.)
@@ -1347,9 +1379,45 @@ async fn a_failing_direct_list_records_a_scan_failure_and_recovery_clears_it() {
         "scan failure must clear once the source recovers"
     );
 }
+
+#[tokio::test]
+async fn a_failing_file_backed_root_listing_records_a_scan_failure_too() {
+    // FILE-BACKED parity (Node records listSessionFiles() throws for claude/
+    // codex/amplifier in scanFailures — session-indexer.ts:1250-1262 — and the
+    // route turns them into degraded providerErrors): a source whose
+    // discover_checked() errs must be recorded, NOT silently treated as an
+    // empty listing.
+    struct FlakyFileSource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl SessionSource for FlakyFileSource {
+        fn discover(&self) -> Vec<FileStat> { Vec::new() }
+        fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        fn parse(&self, _p: &Path) -> Option<IndexedSession> { None }
+        fn provider_name(&self) -> Option<&'static str> { Some("claude") }
+    }
+    let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let index = SessionIndex::with_ttl_and_cache_path(
+        vec![std::sync::Arc::new(FlakyFileSource(std::sync::Arc::clone(&broken))) as _],
+        std::time::Duration::ZERO,
+        None,
+    );
+    let _ = index.snapshot().await; // cold sweep is INLINE — deterministic
+    assert_eq!(index.scan_failures(), vec!["claude".to_string()]);
+    broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = index.snapshot().await; // stale-while-revalidate: poll for recovery
+    assert!(
+        wait_until(std::time::Duration::from_secs(2), || index.scan_failures().is_empty()).await,
+        "file-backed scan failure must clear once the root is listable again"
+    );
+}
 ```
 
-And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern; `#[tokio::test]` since the getter is async): load a store from a temp home whose `<home>/.freshell/config.json` contains the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}` (SettingsStore reads `config.json` and unwraps the top-level `settings` key — see `load_full_settings`; there is NO `settings.json`), assert `coding_cli_enabled_providers().await` returns exactly that; and for a FRESH temp home (no config file) assert the returned list equals whatever the store's default resolution yields — pin the actual observed default in the assert (run the test once to see it; the migration logic seeds from the discovered/known list — record what it returns, and note it in a comment).
+And for the settings getter (in `settings_store.rs` tests, following its temp-home pattern; `#[tokio::test]` since the getter is async): load a store from a temp home whose `<home>/.freshell/config.json` contains the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}` (SettingsStore reads `config.json` and unwraps the top-level `settings` key — see `load_full_settings`; there is NO `settings.json`), assert `coding_cli_enabled_providers().await` returns exactly that; and for a FRESH temp home (no config file) assert the returned list is exactly `["claude", "codex", "opencode", "amplifier"]` — Node's authoritative `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:3`). This assertion FAILS against today's Rust default, which omits `amplifier` (`crates/freshell-server/src/settings.rs:38-44`) — that is a live parity defect this task closes in Step 2; do NOT weaken the assert to whatever the store currently returns.
 
 Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-server settings_store` — expected: compile FAILURE (methods missing).
 
@@ -1362,9 +1430,17 @@ Run: `cargo test -p freshell-sessions directory_index && cargo test -p freshell-
   fn provider_name(&self) -> Option<&'static str> {
       None
   }
+
+  /// Discovery with ROOT-listing failure propagation (Node parity: a
+  /// throwing `listSessionFiles()` is RECORDED in scanFailures —
+  /// `session-indexer.ts:1250-1262` — never silently treated as empty).
+  /// Default wraps the infallible `discover()` for test sources.
+  fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+      Ok(self.discover())
+  }
   ```
-  Implement `Some("claude")`/`Some("codex")`/`Some("opencode")` on the three real sources.
-- `SessionIndex`: add field `scan_failures: Arc<StdMutex<HashSet<String>>>` (init empty in `with_ttl_and_cache_path`); pass `Arc::clone` of it into both `refresh_snapshot` call sites (inline + background — extend the free function's parameter list). Inside `refresh_snapshot`'s direct-listed branch: on `Ok`, `set.remove(name)`; on `Err`, `set.insert(name.to_string())` — only when `source.provider_name()` is `Some(name)`. RECORDED DEVIATION (document in a comment on `scan_failures()`): Rust file-based sources (claude/codex) are corruption-tolerant by design and never fail a listing wholesale, so only direct-listed sources (opencode — the incident-class store) can appear here; Node's file providers can also report listing failures. The wire contract is unchanged — the field is additive either way.
+  Implement `provider_name` = `Some("claude")`/`Some("codex")`/`Some("opencode")`/`Some("amplifier")` on the FOUR real sources (the amplifier source lives in `amplifier.rs`). Override `discover_checked` on the file-backed sources (claude `directory_index.rs:204-208`, codex `directory_index.rs:374-377`, amplifier `amplifier.rs:108-111`) to PROPAGATE the top-level root `read_dir` error instead of the current `else { return Vec::new() }` swallow (a missing root — `NotFound`/`NotADirectory` — stays `Ok(vec![])`: an absent provider is a genuine empty, matching Node's ENOENT tolerance; EACCES/EIO propagate). Per-file/nested errors stay tolerant — corruption-tolerance within a listable root is preserved.
+- `SessionIndex`: add field `scan_failures: Arc<StdMutex<HashSet<String>>>` (init empty in `with_ttl_and_cache_path`); pass `Arc::clone` of it into both `refresh_snapshot` call sites (inline + background — extend the free function's parameter list). Inside `refresh_snapshot`, for every source whose `provider_name()` is `Some(name)`: in the direct-listed branch, on `Ok` `set.remove(name)` / on `Err` `set.insert(name.to_string())`; in the file-backed branch, call `discover_checked()` instead of `discover()` — on `Ok(stats)` `set.remove(name)` and proceed as today, on `Err(_)` `set.insert(name.to_string())` and treat the listing as empty for this sweep. NODE PARITY NOTE (document in a comment on `scan_failures()`): Node behaves exactly this way — a throwing `listSessionFiles()` also yields an empty file list and lets the full-scan prune drop that provider's cached entries (`session-indexer.ts:1467-1475`, `:1499-1504`); what makes the outage VISIBLE is the recorded scan failure, which the route merges into `providerErrors` and marks the response `degraded` — never a silent healthy `ready + matches: []`. Both direct-listed (opencode) and file-backed (claude/codex/amplifier) outages must therefore be recorded.
 - Public accessors on `SessionIndex`:
   ```rust
   /// Providers whose MOST RECENT listing attempt failed (unsearchable, not
@@ -1403,13 +1479,15 @@ Expected: ALL PASS, clean. (Every test `SessionSource` impl in the workspace com
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/freshell-sessions/src/directory_index.rs crates/freshell-server/src/settings_store.rs
-git commit -m "feat(sessions): scan-failure tracking + fire-and-forget refresh on SessionIndex; enabled-providers reader on SettingsStore
+git add crates/freshell-sessions/src/directory_index.rs crates/freshell-sessions/src/amplifier.rs crates/freshell-server/src/settings_store.rs crates/freshell-server/src/settings.rs
+git commit -m "feat(sessions): scan-failure tracking + fire-and-forget refresh on SessionIndex; enabled-providers reader + Node-parity default on SettingsStore
 
 getScanFailures()/requestRefresh() parity plumbing for the hardened
-resolve route (SYNC-06). Only direct-listed sources participate in
-failure tracking (recorded deviation: rust file sources are
-corruption-tolerant and cannot fail a listing wholesale).
+resolve route (SYNC-06). All four real sources participate in failure
+tracking: direct-listed (opencode) and file-backed (claude/codex/
+amplifier) root-listing failures are recorded, never silently treated
+as an empty listing. Default enabledProviders now includes amplifier
+(DEFAULT_ENABLED_CLI_PROVIDERS parity).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -1431,7 +1509,7 @@ Upgrade `POST /api/sessions/resolve` to the full hardened wire shape and route s
 
 - [ ] **Step 1: Write the failing endpoint tests (in `resolve.rs`'s `#[cfg(test)]`)**
 
-Add these; also UPDATE the existing full-body asserts (`warming_with_hint_when_index_never_published`, `exact_match_returns_full_metadata_via_the_index`, fallback tests) to the new shape — every 200 body now carries `providerErrors` (array, default empty), `unsearchedProviders` (array), and `homeDir` (present when the state carries one). To keep expectations deterministic, extend the test `state()` helper: construct `SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into(), "opencode".into(), "amplifier".into()])` and set `home_dir: Some(Arc::new("/home/tester".to_string()))`, then run the settings-default probe once — if the fresh-store default enables all four discovered providers, baseline `unsearchedProviders` is `[]`; pin whatever the store actually returns (assert it explicitly in the first new test so a wrong guess fails loudly, then align the other expectations).
+Add these; also UPDATE the existing full-body asserts (`warming_with_hint_when_index_never_published`, `exact_match_returns_full_metadata_via_the_index`, fallback tests) to the new shape — every 200 body now carries `providerErrors` (array, default empty), `unsearchedProviders` (array), and `homeDir` (present when the state carries one). To keep expectations deterministic, extend the test `state()` helper: construct `SettingsStore::load(Some(dir), vec!["claude".into(), "codex".into(), "opencode".into(), "amplifier".into()])` and set `home_dir: Some(Arc::new("/home/tester".to_string()))`. Baseline `unsearchedProviders` is `[]`: Task 5 aligned the fresh-store default to Node's four-provider `DEFAULT_ENABLED_CLI_PROVIDERS` (and its settings test asserts exactly that), so with all four enabled nothing is unsearched — assert `body["unsearchedProviders"] == serde_json::json!([])` explicitly in the first new test so a regression fails loudly.
 
 ```rust
 #[tokio::test]
@@ -1509,9 +1587,47 @@ async fn disabled_providers_are_reported_unsearched_never_as_errors() {
        FailingDirectSource index; assert status "ready", providerErrors [],
        unsearchedProviders containing "codex","opencode","amplifier" */
 }
+
+#[tokio::test]
+async fn disabled_provider_indexed_sessions_do_not_resolve() {
+    // Node's INDEX excludes disabled providers (session-indexer.ts:1454-1467),
+    // so its resolution never sees their sessions (resolve-session.ts:85).
+    // Rust must filter the snapshot by the live enabled set BEFORE core
+    // resolution — a disabled provider's session resolving while that provider
+    // is listed in unsearchedProviders would be self-contradictory.
+    /* settings file with codingCli.enabledProviders = ["claude"]; index a
+       CODEX session under a v4 UUID; post that UUID (no fallbacks wired) →
+       status "ready", matches [], unsearchedProviders contains "codex" */
+}
+
+#[tokio::test]
+async fn a_disabled_provider_exact_id_still_resolves_via_fallback_node_parity() {
+    // Node wires ALL FOUR providers' exact-id fallbacks unconditionally
+    // (server/index.ts wiring; resolve-session.ts:127-156 invokes them
+    // regardless of settings) — settings gate INDEXING only. A disabled
+    // opencode's exact ses_ id must therefore still resolve via the fallback,
+    // while "opencode" stays listed in unsearchedProviders.
+    /* settings file with codingCli.enabledProviders = ["claude"]; empty index;
+       wire st.opencode_session_by_id returning a hit for SES_ID; post SES_ID →
+       status "ready", matches[0].sessionId == SES_ID,
+       unsearchedProviders contains "opencode" */
+}
+
+#[tokio::test]
+async fn degraded_response_schedules_a_refresh_and_retry_converges() {
+    // request_refresh() wiring proof END-TO-END (sessions-router.ts:293-305
+    // parity): a degraded response fire-and-forgets a refresh, so once the
+    // provider recovers, a client Retry converges back to ready.
+    /* reuse the FailingDirectSource index with its AtomicBool `broken` handle;
+       post once → assert status "degraded" (this response called
+       request_refresh()); set broken=false; then POLL: re-post the same input
+       (each degraded response re-schedules a refresh) until status == "ready"
+       with providerErrors [] within 2s (wait_until-style loop over posts);
+       assert convergence rather than sleeping once */
+}
 ```
 
-For `a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal` and `disabled_providers_are_reported_unsearched_never_as_errors`, write the bodies fully in the same style as the snippets above — the `FailingDirectSource` is the Task-5 test source with a fixed `Err`, and the settings file seeding writes `dir/.freshell/config.json` containing the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude"]}}}` (`SettingsStore` reads `<home>/.freshell/config.json` and unwraps the top-level `settings` key — see `load_full_settings` in `settings_store.rs`; there is NO `settings.json` and a bare `codingCli` object would be ignored, silently reading defaults).
+For the five commented tests (`a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal`, `disabled_providers_are_reported_unsearched_never_as_errors`, `disabled_provider_indexed_sessions_do_not_resolve`, `a_disabled_provider_exact_id_still_resolves_via_fallback_node_parity`, `degraded_response_schedules_a_refresh_and_retry_converges`), write the bodies fully in the same style as the snippets above — the `FailingDirectSource` is the Task-5 `FlakySource` test source (keep its toggleable `AtomicBool` so the refresh-convergence test can flip it to recovered; the tests that only need a fixed failure just leave it broken), and the settings file seeding writes `dir/.freshell/config.json` containing the WRAPPED document `{"version":1,"settings":{"codingCli":{"enabledProviders":["claude"]}}}` (`SettingsStore` reads `<home>/.freshell/config.json` and unwraps the top-level `settings` key — see `load_full_settings` in `settings_store.rs`; there is NO `settings.json` and a bare `codingCli` object would be ignored, silently reading defaults).
 
 Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state fields, wire fields missing).
 
@@ -1546,8 +1662,20 @@ Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state 
   /// (`shared/coding-cli-defaults.ts:3`).
   const KNOWN_RESUME_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
 
+  // Read the enabled set BEFORE dispatching the core resolve, and FILTER the
+  // snapshot with it: Node's index EXCLUDES disabled providers at scan time
+  // (session-indexer.ts:1454-1467), so its resolution never sees their
+  // sessions (resolve-session.ts:85). The Rust SessionIndex is built with all
+  // four sources unconditionally, so the route must apply the equivalent gate
+  // — otherwise a disabled provider's indexed session resolves while the same
+  // response lists that provider under unsearchedProviders. Fallbacks stay
+  // UNGATED (Node invokes all wired exact-id fallbacks regardless of
+  // settings — resolve-session.ts:127-156).
   let enabled: std::collections::HashSet<String> =
       state.settings.coding_cli_enabled_providers().await.into_iter().collect();
+  // ... before the spawn_blocking call: if the snapshot is Some(sessions),
+  // retain only sessions whose provider is in `enabled` (warming stays None);
+  // pass the FILTERED list into resolve_resume_input ...
   let unsearched_providers: Vec<String> = KNOWN_RESUME_PROVIDERS
       .iter()
       .filter(|name| !enabled.contains(**name))
@@ -1613,18 +1741,28 @@ pub fn locate_transcript_checked(session_id: &str) -> Result<Option<PathBuf>, st
 and a `find_transcript_checked` that is `find_transcript` with error propagation: same id-shape guard (returns `Ok(None)`), then
 
 ```rust
+/// Node parity (`claude-transcript-locator.ts:33-37`): expected absence is
+/// `ENOENT || ENOTDIR` — a missing dir OR a non-directory path component is
+/// a genuine miss; everything else is a provider failure.
+fn is_expected_absence(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 let entries = match std::fs::read_dir(&projects) {
     Ok(entries) => entries,
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) if is_expected_absence(&e) => return Ok(None),
     Err(e) => return Err(e),
 };
 ```
 
-and the scan must construct the AUTHORITATIVE Node candidate layouts (`server/coding-cli/claude-transcript-locator.ts:39-48`): direct `<projects>/<project-dir>/<id>.jsonl` and subagent `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl`. CAUTION: the existing `find_transcript` probes `<project-dir>/<subdir>/<id>.jsonl` WITHOUT the `subagents` segment — that diverges from Node and misses child sessions; do NOT mirror it. The checked variant uses the Node layout (leave `find_transcript` itself untouched for its other consumers). Propagate non-NotFound errors from every `read_dir`, and probe candidate files with `std::fs::metadata` (NotFound ⇒ miss for that candidate; any OTHER error propagates) instead of the error-swallowing `Path::is_file()`.
+and the scan must construct the AUTHORITATIVE Node candidate layouts (`server/coding-cli/claude-transcript-locator.ts:39-48`): direct `<projects>/<project-dir>/<id>.jsonl` and subagent `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl`. CAUTION: the existing `find_transcript` probes `<project-dir>/<subdir>/<id>.jsonl` WITHOUT the `subagents` segment — that diverges from Node and misses child sessions; do NOT mirror it. The checked variant uses the Node layout (leave `find_transcript` itself untouched for its other consumers). Propagate errors that are not expected-absence (`is_expected_absence` above — NotFound OR NotADirectory, Node's `ENOENT || ENOTDIR`) from every `read_dir`, and probe candidate files with `std::fs::metadata` (expected absence ⇒ miss for that candidate; any OTHER error propagates) instead of the error-swallowing `Path::is_file()`.
 
-Also add `transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error>` beside `transcript_cwd` (which stays for other consumers): open error of kind NotFound ⇒ `Ok(None)` (a raced deletion keeps the hit, cwd-less — Node behaves the same); any OTHER open/read error PROPAGATES (Node wraps these in `ClaudeTranscriptLocatorError`); malformed JSON lines are still skipped. The 3b wiring below uses the checked variant — without it the "no longer swallowed" commit claim would be false, since `transcript_cwd` converts read errors to `None`.
+Also add `transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error>` beside `transcript_cwd` (which stays for other consumers): open error of expected-absence kind ⇒ `Ok(None)` (a raced deletion keeps the hit, cwd-less — Node behaves the same); any OTHER open/read error PROPAGATES (Node wraps these in `ClaudeTranscriptLocatorError`); malformed JSON lines are still skipped. BOUNDED READ (Node parity — `CWD_SCAN_BYTES = 64 * 1024`, `claude-transcript-locator.ts:30-31,131-135`): read AT MOST the first 64 KiB of the file (e.g. `std::io::Read::take(64 * 1024)` into a buffer), split that prefix on `\n`, drop the final partial line if the file is larger than the prefix, parse each line as JSON and return the first non-empty string `cwd`. Do NOT mirror the existing `transcript_cwd`'s unbounded `BufRead::lines()` loop — one resolve request against a multi-GB transcript (or a single enormous line) must not allocate or scan past the 64 KiB prefix. The 3b wiring below uses the checked variant — without it the "no longer swallowed" commit claim would be false, since `transcript_cwd` converts read errors to `None`.
 
-Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs` next to `locate_transcript`. Unit tests in the same file's test module: (a) a projects dir with mode `0o000` (use `std::os::unix::fs::PermissionsExt`; restore permissions afterward so cleanup works) yields `Err` with `kind() == PermissionDenied`; (b) a missing projects dir yields `Ok(None)`; (c) a transcript placed at `<projects>/<project>/<parent>/subagents/<id>.jsonl` IS found by `locate_transcript_checked` (the child-session layout).
+Re-export `locate_transcript_checked` and `transcript_cwd_checked` from `lib.rs` next to `locate_transcript`. Unit tests in the same file's test module: (a) gate the permission test with `#[cfg(unix)]` (`std::os::unix::fs::PermissionsExt` does not exist on Windows — an ungated test would not COMPILE there): chmod the projects dir to `0o000`, then FIRST probe `std::fs::read_dir(&projects)` directly — if the probe unexpectedly SUCCEEDS (running as root / CAP_DAC_OVERRIDE bypasses mode bits), restore permissions, `eprintln!("skipping: euid bypasses permission checks");` and `return`; otherwise assert `locate_transcript_checked` yields `Err` with `kind() == PermissionDenied`; restore permissions afterward so cleanup works; (b) a missing projects dir yields `Ok(None)`; (c) a transcript placed at `<projects>/<project>/<parent>/subagents/<id>.jsonl` IS found by `locate_transcript_checked` (the child-session layout); (d) ENOTDIR absence parity: a candidate path whose component is a REGULAR FILE (e.g. `<projects>/<project>` created as a file, so descending into it fails with `NotADirectory`) yields `Ok(None)`, not `Err` — Node reports a normal miss for `ENOTDIR` (`claude-transcript-locator.ts:33-37`); (e) bounded cwd scan: a transcript whose only `cwd`-bearing JSON line starts BEYOND the first 64 KiB (pad with ~65 KiB of valid no-cwd JSONL first) makes `transcript_cwd_checked` return `Ok(None)` — proving the 64 KiB prefix bound, Node parity.
 
 3b. `crates/freshell-server/src/main.rs` — final wiring (replaces the Task-3/4 temporaries). Above the router construction:
 
@@ -1671,8 +1809,12 @@ opencode_session_by_id: Some({
                 })
             })
             .map_err(|e| freshell_sessions::resume_resolve::ProviderFailure {
-                code: None,
-                message: e.to_string(),
+                // Code-preserving (Task 4's OpencodeByIdError): a real
+                // SQLITE_CANTOPEN/SQLITE_BUSY reaches the wire — this is what
+                // makes the degraded endpoint test's code assertion
+                // production-true, not injected-only fiction.
+                code: e.code,
+                message: e.message,
             })
     }) as crate::resolve::OpencodeByIdLookup
 }),
@@ -1738,7 +1880,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ### Task 7: Full verification, shared e2e 2× both projects, SYNC-06 checklist evidence, push
 
-The `sessionResolve` flag and the shared client dialog's resume HAPPY PATH are proven by the SHARED e2e spec running against BOTH server kinds. Scope honesty: `resume-button.spec.ts` has exactly 3 tests (pinned-button visibility at scroll positions, mobile visibility, paste-then-Enter exact resume) — it does NOT exercise degraded UI, manual retry, or homeDir prefill. Those hardened behaviors are proven at the WIRE level by Task 6's endpoint tests, and the shared client's own #586 coverage (unchanged by this branch) proves the dialog's handling of that wire. Then record the evidence and push.
+The `sessionResolve` flag and the shared client dialog's resume HAPPY PATH are proven by the SHARED e2e spec running against BOTH server kinds. Scope honesty: `resume-button.spec.ts` has exactly 3 tests (pinned-button visibility at scroll positions, mobile visibility, paste-then-Enter exact resume) — it does NOT exercise degraded UI, manual retry, or homeDir prefill. Those hardened behaviors are proven at the WIRE level by Task 6's endpoint tests, and by the shared client's own #586 coverage (unchanged by this branch, but EXECUTED here — Step 2 runs `test:client`, which includes `ResumeSessionDialog.test.tsx`'s degraded/retry/homeDir/unsearched tests, and the shared contract test). Then record the evidence and push.
 
 **Files:**
 - Modify: `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` (SYNC-06 entry, line ~803)
@@ -1763,10 +1905,11 @@ Expected: every `test result:` line shows `0 failed`; fmt/clippy clean. (`set -o
 Run:
 ```bash
 npm run test:status
-npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run
+npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts test/unit/shared/resume-resolve-contract.test.ts --run
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/resolve-session.test.ts test/unit/server/coding-cli/resolve-fallbacks.test.ts test/integration/server/sessions-resolve-router.test.ts --run
+npm run test:client
 ```
-Expected: ALL PASS (the branch did not modify Node server code; these prove no accidental TS regressions). If `test:status` reports another session's run in progress, WAIT — never kill processes you did not spawn.
+Expected: ALL PASS (the branch did not modify Node server or client code; these prove no accidental TS regressions). The last two runs are VERIFICATION EVIDENCE for the hardened UI claims, not optional: `resume-resolve-contract.test.ts` proves the shared wire contract (degraded/providerErrors/unsearchedProviders/homeDir/legacy tolerance) the Rust server now emits, and `test:client` (the coordinator's `test/unit/client` suite) EXECUTES `ResumeSessionDialog.test.tsx` — warming/manual retry, degraded display + no auto-resume, homeDir prefill, unsearched-provider messaging. Citing those tests without running them is not evidence. If `test:status` reports another session's run in progress, WAIT — never kill processes you did not spawn.
 
 - [ ] **Step 3: Shared e2e, both projects, twice**
 
@@ -1807,9 +1950,9 @@ Expected: push succeeds (the branch was local-only; this creates the remote bran
 
 ## Self-Review Record
 
-**1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING (core + wire tests, Tasks 3+6) + shared dialog happy-path via shared e2e → Task 7 (degraded/retry/homeDir UI proven at the wire by Task 6; the e2e spec covers visibility + exact resume only). Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
+**1. Spec coverage** (context §"The delta to close" → tasks): §1 CONTRACT (degraded/providerErrors/unsearchedProviders/homeDir, camelCase, backward-tolerant) → Tasks 3+6. §2 RANKING (per-token exact→fallback→prefix, ses_ case-sensitive, subagents, sessionType default) → Task 3. §3 PARSER (known-family regex, cap-8, fixture extended, both sides pass) → Task 2. §4 PROVIDER HEALTH (degraded never-silent, disabled→unsearched, degraded-even-with-matches, match-cap verified: hardened Node keeps `RESOLVE_MATCH_CAP = 20`, so the branch's cap-20 pin stands) → Tasks 3+5+6. §5 ASYNC HYGIENE → Task 6 Step 4. §6 WARMING (core + wire tests, Tasks 3+6) + shared dialog happy-path via shared e2e → Task 7 (degraded/retry/homeDir UI proven at the wire by Task 6 AND by the EXECUTED shared client suite — Task 7 Step 2 runs `test:client`, which includes `ResumeSessionDialog.test.tsx`, plus the shared contract test; the e2e spec covers visibility + exact resume only). Acceptance items: rebase done (verified Task 1), fixture both-sides (Task 2), mirror suite updated (Task 3), degraded-path wire test (Task 6), e2e 2× both (Task 7), cargo+TS green (Tasks 1–7), SYNC-06 PARTIAL update (Task 7), branch pushed / no PR (Task 7). No unresolved coverage gaps.
 
-**1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
+**1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes, with the SQLITE_* codes asserted — `OpencodeByIdError` preserves rusqlite codes so the wire's `providerErrors[].code` is production-true), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
 
 **2. Placeholder scan:** Task 4 Step 1 and Task 6 Step 1 contain two test bodies described by full behavioral specification + fixture pattern reference rather than verbatim code (`scan_failure` literal test, disabled-provider test, opencode row-fixture bodies); each names the exact fixture pattern file to copy, the exact inputs, and the exact expected JSON/values — the implementer writes mechanical rusqlite/axum plumbing only. Checklist `<N>` slots are run-time evidence by design. No TBD/TODO/"handle edge cases" items remain.
 
