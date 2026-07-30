@@ -9,6 +9,7 @@
 //! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Tasks 3, 5, 6.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use freshell_sessions::directory_index::IndexedSession;
 use freshell_sessions::parse::OpencodeSessionDirectory;
@@ -461,6 +462,195 @@ fn uuid_matching_is_case_insensitive_but_returns_stored_ids() {
     // Node's `isCaseInsensitiveToken`.
     let body = as_json(&resolve(&CLAUDE_ID.to_uppercase(), &fixture_sessions()));
     assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+    assert_eq!(body["matches"][0]["matchKind"], "exact");
+}
+
+#[test]
+fn wrong_length_ses_token_never_reaches_the_opencode_fallback() {
+    // Node's fallback gate is the FULL-id shape `^ses_[0-9a-zA-Z]{26}$`
+    // (`FALLBACK_ID_SHAPES`, `resolve-fallbacks.ts`), NOT the parser's looser
+    // 8..=64 `xxx_` family shape. Load-bearing on a legacy-schema opencode
+    // DB, where the by-id lookup answers a universal HIT for any id it is
+    // asked about: an ungated wrong-length token would yield a FALSE exact
+    // hit (Node: miss, zero work).
+    let lookup = |_id: &str| -> Option<OpencodeSessionDirectory> {
+        panic!("opencode fallback must not run for a wrong-length ses_ token")
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    for wrong_length in [
+        "ses_short0000", // 9 base62 chars: parser candidate, not a full id
+        "ses_toolong000000000000000000000x", // 29 base62 chars
+        "ses_wrongchar000000000000000-", // 26 chars but '-' is not base62
+    ] {
+        let response = resolve_resume_input(
+            wrong_length,
+            &ResolveDeps {
+                sessions: Some(&sessions),
+                session_types: &types,
+                opencode_dir_by_id: Some(&lookup),
+                locate_claude_transcript: None,
+            },
+        );
+        let body = as_json(&response);
+        assert_eq!(body["status"], "ready", "input {wrong_length:?}");
+        assert_eq!(
+            body["matches"],
+            serde_json::json!([]),
+            "input {wrong_length:?}"
+        );
+    }
+}
+
+#[test]
+fn claude_fallback_gate_is_the_full_uuid_shape_in_any_case() {
+    // Node's claude gate `^[0-9a-fA-F]{8}-…-[0-9a-fA-F]{12}$` accepts a full
+    // UUID in ANY hex case…
+    let upper = "AAAAAAAA-1111-4222-8333-444444444444";
+    let locate = |id: &str| {
+        Some(ClaudeTranscriptHit {
+            session_id: id.to_ascii_lowercase(),
+            cwd: Some("/repo/gamma".to_string()),
+        })
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    let response = resolve_resume_input(
+        upper,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: None,
+            locate_claude_transcript: Some(&locate),
+        },
+    );
+    assert_eq!(
+        as_json(&response)["matches"][0]["sessionId"],
+        upper.to_ascii_lowercase()
+    );
+    // …and NOTHING shorter: a bare hex-prefix token must never invoke it.
+    let panicking = |_id: &str| -> Option<ClaudeTranscriptHit> {
+        panic!("claude fallback must not run for a non-full-uuid token")
+    };
+    let response = resolve_resume_input(
+        "aaaaaaaa11114222833344444444",
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: None,
+            locate_claude_transcript: Some(&panicking),
+        },
+    );
+    assert_eq!(as_json(&response)["matches"], serde_json::json!([]));
+}
+
+#[test]
+fn third_fallback_requiring_token_is_budget_gated_like_node() {
+    // Node's FALLBACK_BUDGET_PER_REQUEST = 2 (`resolve-fallbacks.ts`): the
+    // first two well-shaped ses_ tokens consume the opencode budget with
+    // real (missing) lookups; the THIRD would resolve, but must not even be
+    // looked up — Node answers not-found here, and so must the port. The
+    // budget is consumed by the invocation itself, hit or miss.
+    let third = "ses_third00000000000000000000d";
+    let calls = AtomicUsize::new(0);
+    let lookup = |id: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if id == third {
+            Some(OpencodeSessionDirectory {
+                directory: Some("/repo/x".to_string()),
+            })
+        } else {
+            None
+        }
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    let input = format!("ses_first00000000000000000000a ses_second0000000000000000000b {third}");
+    let response = resolve_resume_input(
+        &input,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: Some(&lookup),
+            locate_claude_transcript: None,
+        },
+    );
+    let body = as_json(&response);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["matches"], serde_json::json!([]));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "budget caps real lookups at 2"
+    );
+}
+
+#[test]
+fn shape_gated_tokens_do_not_consume_the_fallback_budget() {
+    // Node checks shape FIRST, budget SECOND ("order is load-bearing",
+    // `resolve-fallbacks.ts`): wrong-shape tokens ahead of the real id are
+    // free no-ops, so the valid third token still gets its real lookup.
+    let valid = "ses_valid00000000000000000000c";
+    let calls = AtomicUsize::new(0);
+    let lookup = |id: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(id, valid, "only the full-shape id may reach the lookup");
+        Some(OpencodeSessionDirectory {
+            directory: Some("/repo/x".to_string()),
+        })
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    let input = format!("ses_short0000 ses_short1111 {valid}");
+    let response = resolve_resume_input(
+        &input,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: Some(&lookup),
+            locate_claude_transcript: None,
+        },
+    );
+    let body = as_json(&response);
+    assert_eq!(body["matches"][0]["sessionId"], valid);
+    assert_eq!(body["matches"][0]["matchKind"], "exact");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fallback_budgets_are_tracked_per_provider() {
+    // Node's `withRequestBudget` keeps a SEPARATE `used` counter per fallback
+    // key: two opencode lookups must not exhaust the claude budget (or vice
+    // versa). Parser priority runs prefixed-id tokens before the uuid, so the
+    // two ses_ misses happen first.
+    let uuid = "aaaaaaaa-1111-4222-8333-444444444444";
+    let opencode_calls = AtomicUsize::new(0);
+    let lookup = |_id: &str| -> Option<OpencodeSessionDirectory> {
+        opencode_calls.fetch_add(1, Ordering::SeqCst);
+        None
+    };
+    let locate = |id: &str| {
+        Some(ClaudeTranscriptHit {
+            session_id: id.to_string(),
+            cwd: Some("/repo/gamma".to_string()),
+        })
+    };
+    let types = no_types();
+    let sessions = fixture_sessions();
+    let input = format!("ses_first00000000000000000000a ses_second0000000000000000000b {uuid}");
+    let response = resolve_resume_input(
+        &input,
+        &ResolveDeps {
+            sessions: Some(&sessions),
+            session_types: &types,
+            opencode_dir_by_id: Some(&lookup),
+            locate_claude_transcript: Some(&locate),
+        },
+    );
+    let body = as_json(&response);
+    assert_eq!(opencode_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(body["matches"][0]["provider"], "claude");
+    assert_eq!(body["matches"][0]["sessionId"], uuid);
     assert_eq!(body["matches"][0]["matchKind"], "exact");
 }
 

@@ -1129,14 +1129,18 @@ async fn main() -> ExitCode {
             // claude transcript exact-id fallback: the SAME ordered-roots scan
             // the attach arm and IndexExistenceProbe trust
             // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), paired with
-            // the original-cwd reader. Node's locator lowercases the id
+            // the BOUNDED original-cwd reader (Node's 64 KiB CWD_SCAN_BYTES,
+            // `claude-transcript-locator.ts` — one resolve request must never
+            // scan a multi-GB transcript). Node's locator lowercases the id
             // before scanning and returns the lowercased id — mirrored here.
+            // KNOWN DIVERGENCE (see resolve.rs module doc): this locator
+            // never probes Node's `<parent>/subagents/<id>.jsonl` layout.
             locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
                 let lowered = session_id.to_ascii_lowercase();
                 let path = freshell_freshagent::locate_transcript(&lowered)?;
                 Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
                     session_id: lowered,
-                    cwd: freshell_freshagent::transcript_cwd(&path),
+                    cwd: freshell_freshagent::transcript_cwd_bounded(&path),
                 })
             })),
         }))
