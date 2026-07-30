@@ -47,7 +47,7 @@
 | `crates/freshell-freshagent/tests/transcript_cwd_export.rs` | Create | Proves the export + first-non-empty-cwd semantics |
 | `crates/freshell-sessions/src/resume_resolve.rs` | Create | Resolve core: wire types (serde) + matching/dedupe/cap/fallback logic over `IndexedSession` |
 | `crates/freshell-sessions/tests/resume_resolve.rs` | Create | Logic tests mirroring `test/integration/server/sessions-resolve-router.test.ts` |
-| `crates/freshell-server/src/session_metadata.rs` | Modify | Un-gate the `get`/`get_all` read API (`#[cfg(test)]` → production) |
+| `crates/freshell-server/src/session_metadata.rs` | Modify | Un-gate the `get_all` read (`#[cfg(test)]` → production); `get` stays test-gated (no production caller) |
 | `crates/freshell-server/src/resolve.rs` | Create | HTTP endpoint: `ResolveState`, router, auth, validation, handler + in-file oneshot tests |
 | `crates/freshell-server/src/main.rs` | Modify | `mod resolve;` + wiring (index clone, metadata clone, settings-store clone for the deleted-override filter, fallback closures) + `sessionResolve` feature flag + flag test updates |
 | `server/platform-router.ts` | Modify | Comment-only: the "Rust omits this key" note is now stale |
@@ -87,7 +87,7 @@ Extract the TS parser test table into a JSON fixture that both suites will consu
 
 - [ ] **Step 1: Write the fixture**
 
-Every case asserts BOTH candidates and hint (a strict superset of the current suite's per-case assertions — the current suite checks one or the other). Cases 1–24 are the existing suite's inputs verbatim; 25–30 pin previously-untested port hazards (stable hex sort, non-`ses_` prefixed ids, uuid versions other than 4/7, case preservation, sub-8-char hex, `-rf` command-shape miss).
+Every case asserts BOTH candidates and hint (a strict superset of the current suite's per-case assertions — the current suite checks one or the other). Cases 1–25 are the existing suite's inputs verbatim — including the bare-v7-uuid case ("bare v7 uuid" below, the existing suite's `['uuid v7 shape', V7, { provider: 'codex', source: 'id-shape' }]` row), which is the ONLY case exercising the `version === '7' → codex` id-shape branch of `deriveHint` with a bare id (the other V7 inputs are `codex resume …` command-source hints, so dropping it would leave that branch uncovered in both languages); 26–31 pin previously-untested port hazards (stable hex sort, non-`ses_` prefixed ids, uuid versions other than 4/7, case preservation, sub-8-char hex, `-rf` command-shape miss).
 
 Create `test/fixtures/resume-input/parser-cases.json`:
 
@@ -106,6 +106,12 @@ Create `test/fixtures/resume-input/parser-cases.json`:
       "input": "ed2afda6-a340-443e-ba60-024a1b3554b4",
       "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
       "hint": { "provider": "claude", "source": "id-shape" }
+    },
+    {
+      "name": "bare v7 uuid",
+      "input": "019fac27-69d7-78a0-b972-b339d551042e",
+      "candidates": [{ "token": "019fac27-69d7-78a0-b972-b339d551042e", "kind": "uuid" }],
+      "hint": { "provider": "codex", "source": "id-shape" }
     },
     {
       "name": "bare opencode id",
@@ -312,7 +318,7 @@ const { cases } = JSON.parse(
 
 describe('parseResumeInput — shared fixture parity', () => {
   it('fixture is non-trivial', () => {
-    expect(cases.length).toBeGreaterThanOrEqual(30)
+    expect(cases.length).toBeGreaterThanOrEqual(31)
   })
 
   it.each(cases.map((c) => [c.name, c] as const))('%s', (_name, c) => {
@@ -330,7 +336,7 @@ cd /home/dan/code/freshell/.worktrees/rust-resolve-parity
 npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/resume-input-parser.test.ts --run
 ```
 
-Expected: 31 passed (30 cases + the non-trivial guard), 0 failed. If any case fails, the FIXTURE is wrong (the TS parser is the reference — do not change it); re-derive the expected value from `shared/resume-input-parser.ts` semantics and fix the fixture.
+Expected: 32 passed (31 cases + the non-trivial guard), 0 failed. If any case fails, the FIXTURE is wrong (the TS parser is the reference — do not change it); re-derive the expected value from `shared/resume-input-parser.ts` semantics and fix the fixture.
 
 - [ ] **Step 4: Commit**
 
@@ -392,7 +398,7 @@ fn parser_matches_every_shared_fixture_case() {
     let raw = std::fs::read_to_string(&path).expect("read shared parser fixture");
     let fixture: Fixture = serde_json::from_str(&raw).expect("parse fixture json");
     assert!(
-        fixture.cases.len() >= 30,
+        fixture.cases.len() >= 31,
         "shared fixture unexpectedly small: {}",
         fixture.cases.len()
     );
@@ -1953,7 +1959,7 @@ git commit -m "feat(sessions): resume-resolve matching core with Node-parity sem
 The axum route: auth → zod-shaped validation → readiness gate → resolve core (in `spawn_blocking`, because the fallbacks do sqlite/filesystem IO). New focused module — do not touch `sessions.rs`.
 
 **Files:**
-- Modify: `crates/freshell-server/src/session_metadata.rs` (un-gate reads)
+- Modify: `crates/freshell-server/src/session_metadata.rs` (un-gate the `get_all` read)
 - Create: `crates/freshell-server/src/resolve.rs`
 - Modify: `crates/freshell-server/src/main.rs` (module registration + wiring)
 
@@ -1965,11 +1971,12 @@ The axum route: auth → zod-shaped validation → readiness gate → resolve co
   - `pub type ClaudeLocator = Arc<dyn Fn(&str) -> Option<ClaudeTranscriptHit> + Send + Sync>;`
   - `pub fn router(state: ResolveState) -> Router`
 
-- [ ] **Step 1: Un-gate the session-metadata read API**
+- [ ] **Step 1: Un-gate the session-metadata `get_all` read**
 
 In `crates/freshell-server/src/session_metadata.rs`:
-1. Around lines 30-31, the `use std::collections::HashMap;` import is gated behind `#[cfg(test)]` — remove the gate so it is a plain import (merge into the top-level use block if rustfmt prefers).
-2. Remove the `#[cfg(test)]` attribute from `pub async fn get(...)` (line ~121) and from `pub async fn get_all(...)` (line ~137). Both bodies are unchanged. Add one doc-comment line above `get_all`:
+1. Around lines 30-31, the `use std::collections::HashMap;` import is gated behind `#[cfg(test)]` — remove the gate so it is a plain import (`get_all`'s return type needs it in the non-test build now; merge into the top-level use block if rustfmt prefers).
+2. Remove the `#[cfg(test)]` attribute from `pub async fn get_all(...)` (line ~137) ONLY. Do NOT un-gate `pub async fn get(...)` (line ~121): this plan gives it no production caller, and `freshell-server` is a binary crate (no lib target, no `dead_code` allowances), so an un-gated `get` would trip rustc's `dead_code` lint on the non-test build and fail the `cargo clippy ... -D warnings` gates in Step 6 and Task 9. Its existing doc comment ("when that lands, the compiler will force this gate off") remains accurate — leave it as is.
+3. `get_all`'s body is unchanged. Replace its stale doc line `/// Test-only today — see \`get\` above.` with:
 
 ```rust
     /// Production read (SYNC-06): the resolve endpoint overlays match
@@ -1977,7 +1984,7 @@ In `crates/freshell-server/src/session_metadata.rs`:
     /// `session-indexer.ts:1159-1161` overlay. Keyed `"{provider}:{session_id}"`.
 ```
 
-Verify: `cargo test -p freshell-server session_metadata` still green (the existing tests already call `get`/`get_all`).
+Verify: `cargo test -p freshell-server session_metadata` still green (the existing tests already call `get`/`get_all`; `get` stays available to them under `#[cfg(test)]`, and `resolve.rs`'s test module in this same crate can also see it if needed).
 
 - [ ] **Step 2: Write the endpoint module with its tests**
 
@@ -3073,7 +3080,7 @@ npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/shared/
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/sessions-resolve-router.test.ts --run
 ```
 
-Expected: typecheck clean; 31 passed; 14 passed.
+Expected: typecheck clean; 32 passed; 14 passed.
 
 - [ ] **Step 3: Checklist evidence entry**
 
@@ -3086,7 +3093,7 @@ In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, KEEP the S
 ```markdown
 - [ ] **SYNC-06 — Session resume-by-id parity: `POST /api/sessions/resolve` + `sessionResolve` feature flag.** The Node server (`server/sessions-router.ts`) resolves pasted session ids/resume commands across claude/codex/opencode/amplifier and gates the sidebar Resume button via the `sessionResolve` flag in `detectFeatureFlags()`. See `docs/plans/2026-07-29-resume-session-button.md`.
   - **Playwright validation (`PW-RUST`, `PW-TAURI-WIN`):** With the flag declared, the sidebar shows the pinned Resume button; pasting a known session id resumes it in a tab (mirror `test/e2e-browser/specs/resume-button.spec.ts`).
-  - PARTIAL (<date>, commit `<sha>`): Rust endpoint `crates/freshell-server/src/resolve.rs` (`POST /api/sessions/resolve`: auth/400-validation pinned to zod 4.3.6 wire literals/warming/exact/prefix/cap-20/dedupe/deleted-override filter/opencode-walk+claude exact-id fallbacks) + `crates/freshell-sessions/{resume_input.rs,resume_resolve.rs}`; flag declared in `build_platform_payload` (`main.rs`). Cross-language anti-drift: `test/fixtures/resume-input/parser-cases.json` (30 cases) consumed by BOTH `test/unit/shared/resume-input-parser.test.ts` (31 passed) and `crates/freshell-sessions/tests/resume_input_parser_parity.rs` (green). Logic parity: `crates/freshell-sessions/tests/resume_resolve.rs` mirrors `test/integration/server/sessions-resolve-router.test.ts` (14 passed, unchanged). `cargo test --workspace`: <counts> passed, 0 failed; `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean. E2E (`PW-RUST` half): `test/e2e-browser/specs/resume-button.spec.ts` moved into `MATRIX_SPECS` with the legacy-only skip guard DELETED — all 3 tests (pinned visibility at scroll, fullWidth mobile visibility, paste-then-Enter real resume with argv proof) green on BOTH projects (legacy-chromium and rust-chromium), 2 runs each. MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half of the named validation — left to dependent tickets, per the SYNC-05/SAFE-11 PARTIAL convention.
+  - PARTIAL (<date>, commit `<sha>`): Rust endpoint `crates/freshell-server/src/resolve.rs` (`POST /api/sessions/resolve`: auth/400-validation pinned to zod 4.3.6 wire literals/warming/exact/prefix/cap-20/dedupe/deleted-override filter/opencode-walk+claude exact-id fallbacks) + `crates/freshell-sessions/{resume_input.rs,resume_resolve.rs}`; flag declared in `build_platform_payload` (`main.rs`). Cross-language anti-drift: `test/fixtures/resume-input/parser-cases.json` (31 cases) consumed by BOTH `test/unit/shared/resume-input-parser.test.ts` (32 passed) and `crates/freshell-sessions/tests/resume_input_parser_parity.rs` (green). Logic parity: `crates/freshell-sessions/tests/resume_resolve.rs` mirrors `test/integration/server/sessions-resolve-router.test.ts` (14 passed, unchanged). `cargo test --workspace`: <counts> passed, 0 failed; `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` clean. E2E (`PW-RUST` half): `test/e2e-browser/specs/resume-button.spec.ts` moved into `MATRIX_SPECS` with the legacy-only skip guard DELETED — all 3 tests (pinned visibility at scroll, fullWidth mobile visibility, paste-then-Enter real resume with argv proof) green on BOTH projects (legacy-chromium and rust-chromium), 2 runs each. MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half of the named validation — left to dependent tickets, per the SYNC-05/SAFE-11 PARTIAL convention.
 ```
 
 - [ ] **Step 4: Final commit**
