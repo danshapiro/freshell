@@ -509,9 +509,16 @@ impl LinuxProcfs {
                 .unwrap_or(fallback);
             canonical_runtime_path(cwd, &path, name)
         };
-        let explicit_client = environment
+        if environment
             .get("FRESHELL_CLIENT_DIR")
-            .filter(|value| !value.is_empty());
+            .is_some_and(String::is_empty)
+        {
+            return Err(DeployError::ProcessIdentity(
+                "FRESHELL_CLIENT_DIR is present but empty; live client closure is ambiguous"
+                    .to_string(),
+            ));
+        }
+        let explicit_client = environment.get("FRESHELL_CLIENT_DIR");
         let explicit_sidecar = environment
             .get("FRESHELL_CLAUDE_SIDECAR")
             .filter(|value| !value.is_empty());
@@ -887,6 +894,17 @@ mod tests {
         ]
     }
 
+    fn replace_environment(proc: &LinuxProcfs, entries: &[(&str, &[u8])]) {
+        let mut environment = Vec::new();
+        for (name, value) in entries {
+            environment.extend_from_slice(name.as_bytes());
+            environment.push(b'=');
+            environment.extend_from_slice(value);
+            environment.push(0);
+        }
+        fs::write(proc.pid_path(FIXTURE_PID, "environ"), environment).unwrap();
+    }
+
     #[test]
     fn absent_overrides_use_the_binary_compile_root_not_launch_cwd() {
         let fixture = tempfile::tempdir().unwrap();
@@ -984,6 +1002,58 @@ mod tests {
         assert_eq!(
             Path::new(&provenance.claude_sidecar_entry),
             fs::canonicalize(sidecar).unwrap()
+        );
+    }
+
+    #[test]
+    fn present_but_empty_client_override_fails_closed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let compiled = runtime_tree(fixture.path(), "compiled");
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let markers = manifest_markers(&compiled);
+        let node = launch_cwd.join("node");
+        let proc = proc_fixture(&fixture, &[markers[0].as_path(), markers[1].as_path()], &[]);
+        replace_environment(
+            &proc,
+            &[
+                ("FRESHELL_CLIENT_DIR", b""),
+                ("FRESHELL_CLAUDE_NODE", node.as_os_str().as_encoded_bytes()),
+            ],
+        );
+
+        let error = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("FRESHELL_CLIENT_DIR"));
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn present_but_empty_sidecar_override_uses_compiled_fallback() {
+        let fixture = tempfile::tempdir().unwrap();
+        let compiled = runtime_tree(fixture.path(), "compiled");
+        let launch_cwd = runtime_tree(fixture.path(), "launch");
+        let markers = manifest_markers(&compiled);
+        let node = launch_cwd.join("node");
+        let client = launch_cwd.join("dist/client");
+        let proc = proc_fixture(&fixture, &[markers[0].as_path(), markers[1].as_path()], &[]);
+        replace_environment(
+            &proc,
+            &[
+                ("FRESHELL_CLIENT_DIR", client.as_os_str().as_encoded_bytes()),
+                ("FRESHELL_CLAUDE_SIDECAR", b""),
+                ("FRESHELL_CLAUDE_NODE", node.as_os_str().as_encoded_bytes()),
+            ],
+        );
+
+        let provenance = proc
+            .runtime_provenance(FIXTURE_PID, &launch_cwd)
+            .expect("empty sidecar override follows compiled fallback");
+
+        assert_eq!(
+            Path::new(&provenance.claude_sidecar_entry),
+            fs::canonicalize(compiled.join("crates/freshell-claude-sidecar/index.mjs")).unwrap()
         );
     }
 }

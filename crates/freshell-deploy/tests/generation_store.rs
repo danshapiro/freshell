@@ -251,6 +251,22 @@ fn import_rejects_either_direction_of_store_containment_before_staging() {
 }
 
 #[test]
+fn stage_copy_rejects_a_canonical_source_inside_the_store() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3331);
+    let source = store.paths().store_root().join("runtime-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("index.html"), "store-contained source").unwrap();
+    let mut stage = begin_generation(&store).unwrap();
+
+    assert!(matches!(
+        stage.copy_tree(&source, Path::new("client")),
+        Err(DeployError::UnsafeStorePath(path)) if path == fs::canonicalize(&source).unwrap()
+    ));
+    assert!(!stage.path().join("client").exists());
+}
+
+#[test]
 fn verification_rejects_digest_mismatch() {
     let fixture = checkout();
     let source = source_tree(fixture.path(), "digest");

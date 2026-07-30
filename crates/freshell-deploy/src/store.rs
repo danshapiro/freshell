@@ -72,6 +72,24 @@ impl Store {
         })
     }
 
+    fn canonical_disjoint_tree_source(
+        &self,
+        source: &Path,
+        stage: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let source_metadata = fs::symlink_metadata(source)?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+            return Err(DeployError::UnsafeStorePath(source.to_path_buf()));
+        }
+        let canonical_source = fs::canonicalize(source)?;
+        for protected in [Some(self.paths.store_root()), stage].into_iter().flatten() {
+            if canonical_source.starts_with(protected) || protected.starts_with(&canonical_source) {
+                return Err(DeployError::UnsafeStorePath(canonical_source));
+            }
+        }
+        Ok(canonical_source)
+    }
+
     pub fn generation_path(&self, id: &str) -> Result<PathBuf> {
         validate_generation_id(id)?;
         Ok(self.paths.generations_dir().join(id))
@@ -367,15 +385,7 @@ impl LockedStore<'_> {
     }
 
     pub fn import_tree(&self, source: &Path) -> Result<Generation> {
-        let source_metadata = fs::symlink_metadata(source)?;
-        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
-            return Err(DeployError::UnsafeStorePath(source.to_path_buf()));
-        }
-        let canonical_source = fs::canonicalize(source)?;
-        let store_root = self.store.paths.store_root();
-        if canonical_source.starts_with(store_root) || store_root.starts_with(&canonical_source) {
-            return Err(DeployError::UnsafeStorePath(canonical_source));
-        }
+        let canonical_source = self.store.canonical_disjoint_tree_source(source, None)?;
         let mut stage = self.begin_generation()?;
         stage.copy_tree(&canonical_source, Path::new(""))?;
         stage.seal()?;
@@ -433,10 +443,10 @@ impl GenerationStage {
     pub fn copy_tree(&mut self, source: &Path, destination: &Path) -> Result<()> {
         self.require_unsealed()?;
         validate_relative_path(destination, true)?;
-        let metadata = fs::symlink_metadata(source)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(DeployError::UnsafeStorePath(source.to_path_buf()));
-        }
+        let source = self
+            .store
+            .canonical_disjoint_tree_source(source, Some(&self.path))?;
+        let metadata = fs::symlink_metadata(&source)?;
         let destination_root = self.path.join(destination);
         if !destination.as_os_str().is_empty() {
             let parent = destination_root
@@ -445,7 +455,7 @@ impl GenerationStage {
             create_stage_directories(&self.path, parent)?;
             fs::create_dir(&destination_root)?;
         }
-        copy_directory_contents(source, &destination_root, destination)?;
+        copy_directory_contents(&source, &destination_root, destination)?;
         if !destination.as_os_str().is_empty() {
             fs::set_permissions(
                 &destination_root,

@@ -806,6 +806,35 @@ fn rejects_supplied_client_that_differs_from_live_served_bytes() {
 }
 
 #[test]
+fn legacy_capture_rejects_a_runtime_directory_inside_its_store_before_copying() {
+    let fixture = checkout();
+    let mut runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    let store_client = store.paths().store_root().join("runtime-client");
+    fs::create_dir(&store_client).unwrap();
+    fs::write(store_client.join("index.html"), "legacy client").unwrap();
+    runtime.sources.client_dir = store_client.clone();
+    let mut live = identity(&runtime.old_executable);
+    live.runtime.client_dir = fs::canonicalize(&store_client)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert!(matches!(
+        capture_legacy(
+            &store,
+            &request(&runtime),
+            &FakeProcessInspector::with_identities(&runtime.old_executable, vec![live]),
+            &FakeScratchProbe::passing(),
+        ),
+        Err(DeployError::UnsafeStorePath(path)) if path == fs::canonicalize(&store_client).unwrap()
+    ));
+    assert!(store.selected_generation_id().unwrap().is_none());
+    assert!(store.read_live().unwrap().is_none());
+    assert!(store.read_legacy_capture().unwrap().is_none());
+}
+
+#[test]
 fn requires_every_runtime_member_and_lockfile_derived_production_dependencies() {
     type SourceMutation = Box<dyn Fn(&mut LegacyRuntimeSources)>;
     let required: Vec<(&str, SourceMutation)> = vec![
