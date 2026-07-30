@@ -21,13 +21,14 @@ pub use activation::{
     publish_activation_authorization, publish_activation_cancellation, read_activation_receipt,
     read_cancellation_receipt, ActivationController, ActivationDriver, ActivationProgress,
     ActivationReceiptObservation, ActivationRequest, CancellationReceiptObservation,
-    LaunchAttemptObservation, PortState, ServiceState,
+    LaunchAttemptObservation, LaunchSpec, PortState, ServiceState,
 };
 pub use cli::{execute_capture, CaptureCommand};
 pub use error::{DeployError, Result};
 pub use journal::{
-    ControlPaths, DurableTransactionJournal, LaunchAttempt, LaunchLane, TransactionJournal,
-    TransactionPhase, TransactionRecord, UpdateMode,
+    ControlPaths, DurableTransactionJournal, LaunchAttempt, LaunchAttemptState, LaunchClaim,
+    LaunchExecutorIdentity, LaunchLane, TransactionJournal, TransactionPhase, TransactionRecord,
+    UpdateMode,
 };
 pub use legacy::{
     capture_legacy, LegacyCaptureReceipt, LegacyCaptureRequest, LegacyRuntimeSources,

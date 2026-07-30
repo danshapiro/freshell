@@ -37,6 +37,50 @@ pub struct ActivationRequest {
     pub controls: ControlPaths,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSpec {
+    pub transaction_id: String,
+    pub nonce: String,
+    pub port: DeployPort,
+    pub lane: crate::journal::LaunchLane,
+    pub generation_id: String,
+    pub generation_root: PathBuf,
+    pub runtime: RuntimeProvenance,
+    pub node: NodePrerequisite,
+    pub controls: ControlPaths,
+}
+
+impl LaunchSpec {
+    pub(crate) fn for_attempt(record: &TransactionRecord, attempt: &LaunchAttempt) -> Result<Self> {
+        let (generation_id, generation_root, runtime, node) = match attempt.lane {
+            crate::journal::LaunchLane::PriorRollback => (
+                &record.prior_generation_id,
+                &record.prior_generation_root,
+                &record.prior_runtime,
+                &record.prior_node,
+            ),
+            crate::journal::LaunchLane::TargetGated
+            | crate::journal::LaunchLane::TargetRollForward => (
+                &record.target_generation_id,
+                &record.target_generation_root,
+                &record.target_runtime,
+                &record.target_node,
+            ),
+        };
+        Ok(Self {
+            transaction_id: record.transaction_id.clone(),
+            nonce: record.nonce.clone(),
+            port: record.port,
+            lane: attempt.lane,
+            generation_id: generation_id.clone(),
+            generation_root: generation_root.clone(),
+            runtime: crate::journal::live_runtime(runtime, generation_root)?,
+            node: node.clone(),
+            controls: record.controls.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     Gated,
@@ -62,11 +106,19 @@ pub enum PortState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchAttemptObservation {
-    Absent,
-    DefinitelyNotStarted,
-    Gated(CandidateEvidence),
-    Ordinary(ProcessIdentity),
+    Unclaimed,
+    Owned(crate::journal::LaunchClaim),
+    DefinitelyNotStarted(crate::journal::LaunchClaim),
+    Gated {
+        claim: crate::journal::LaunchClaim,
+        candidate: CandidateEvidence,
+    },
+    Ordinary {
+        claim: crate::journal::LaunchClaim,
+        process: ProcessIdentity,
+    },
     Malformed,
+    StorageAmbiguous,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,38 +228,23 @@ pub trait ActivationDriver {
     fn verify_running(&mut self, process: &ProcessIdentity) -> Result<()>;
     fn verify_exited(&mut self, process: &ProcessIdentity) -> Result<()>;
     fn observe_port(&mut self, record: &TransactionRecord) -> Result<PortState>;
-    fn observe_launch_attempt(
-        &mut self,
-        attempt: &LaunchAttempt,
-        record: &TransactionRecord,
-    ) -> Result<LaunchAttemptObservation>;
     fn stop(&mut self, process: &ProcessIdentity) -> Result<()>;
-    /// Start a gated target for a previously journaled deterministic attempt.
+    /// Ensure execution of a previously journaled deterministic attempt.
     ///
-    /// Before a child can outlive this call, it must durably self-publish
-    /// exact `CandidateEvidence` at `attempt.ready_file`. A failure before
-    /// spawn may be replayed as `DefinitelyNotStarted` only when that outcome
-    /// is itself durably proven by the launcher.
-    fn start_gated(
+    /// This is one recoverably idempotent claim/execute operation, not an
+    /// observe-then-spawn pair. With `claim_if_unclaimed`, it atomically
+    /// publishes a complete durable `Owned` receipt before any process can
+    /// escape, or returns the existing owner/outcome when another executor
+    /// won. Without it, an unclaimed attempt is observed without mutation.
+    /// The owner must eventually publish exact started evidence before
+    /// serving, or durable `DefinitelyNotStarted` only after proving that no
+    /// process for the attempt can survive.
+    fn ensure_launch_attempt(
         &mut self,
-        generation_root: &Path,
-        generation_id: &str,
-        runtime: &RuntimeProvenance,
-        node: &NodePrerequisite,
-        controls: &ControlPaths,
+        spec: &LaunchSpec,
         attempt: &LaunchAttempt,
-    ) -> Result<CandidateEvidence>;
-    /// Start ordinary service under the same durable self-receipt contract as
-    /// `start_gated`; the receipt must recover the exact process even after it
-    /// has closed its listener and drained off-port.
-    fn start_ordinary(
-        &mut self,
-        generation_root: &Path,
-        generation_id: &str,
-        runtime: &RuntimeProvenance,
-        node: &NodePrerequisite,
-        attempt: &LaunchAttempt,
-    ) -> Result<ProcessIdentity>;
+        claim_if_unclaimed: bool,
+    ) -> Result<LaunchAttemptObservation>;
     fn selected_generation(&mut self) -> Result<String>;
     fn switch_generation(&mut self, expected: &str, target: &str) -> Result<()>;
     fn authorize(&mut self, candidate: &CandidateEvidence, controls: &ControlPaths) -> Result<()>;
@@ -358,64 +395,20 @@ where
             }
             TransactionPhase::StartTargetIntent => {
                 let mut working = record.clone();
-                let created = working.pending_launch_attempt().is_none();
-                if created {
+                if working.pending_launch_attempt().is_none() {
                     working =
                         working.with_new_launch_attempt(crate::journal::LaunchLane::TargetGated)?;
                     self.save(working.clone())?;
                 }
-                let attempt = working
-                    .pending_launch_attempt()
-                    .expect("new gated launch attempt")
-                    .clone();
-                let candidate = match self.checked_port(&working)? {
-                    PortState::Free => {
-                        self.driver
-                            .verify_exited(working.expected_prior_process())?;
-                        self.require_selected_generation(&working.prior_generation_id)?;
-                        match self.driver.observe_launch_attempt(&attempt, &working)? {
-                            LaunchAttemptObservation::Absent if created => {
-                                self.driver.start_gated(
-                                    &working.target_generation_root,
-                                    &working.target_generation_id,
-                                    &crate::journal::live_runtime(
-                                        &working.target_runtime,
-                                        &working.target_generation_root,
-                                    )?,
-                                    &working.target_node,
-                                    &working.controls,
-                                    &attempt,
-                                )?
-                            }
-                            LaunchAttemptObservation::Absent => {
-                                return Err(DeployError::Activation(
-                                    "unbound gated launch attempt has no recoverable receipt"
-                                        .to_string(),
-                                ))
-                            }
-                            LaunchAttemptObservation::Gated(candidate) => candidate,
-                            _ => return Err(DeployError::Activation(
-                                "gated launch receipt is malformed or names an ordinary process"
-                                    .to_string(),
-                            )),
-                        }
-                    }
-                    PortState::Target {
-                        candidate,
-                        service: ServiceState::Gated,
-                    } => {
-                        self.require_selected_generation(&working.prior_generation_id)?;
-                        candidate
-                    }
-                    _ => {
-                        return Err(DeployError::Activation(
-                            "live port is not free for the gated target".to_string(),
-                        ))
-                    }
-                };
-                validate_candidate(&working, &candidate)?;
-                self.require_selected_generation(&working.prior_generation_id)?;
-                self.save(working.with_bound_gated_candidate(candidate)?)?;
+                working =
+                    crate::recovery::reconcile_pending_launch(self.journal, self.driver, &working)?;
+                if working.phase != TransactionPhase::TargetReadyGated
+                    && working.pending_launch_attempt().is_some()
+                {
+                    return Err(DeployError::Activation(
+                        "gated launch executor is still in progress".to_string(),
+                    ));
+                }
             }
             TransactionPhase::TargetReadyGated => {
                 require_target(&self.checked_port(&record)?, &record, ServiceState::Gated)?;

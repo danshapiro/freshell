@@ -77,34 +77,14 @@ where
                         .with_new_launch_attempt(crate::journal::LaunchLane::PriorRollback)?;
                     journal.save(&working)?;
                 }
-                let attempt = working
-                    .pending_launch_attempt()
-                    .ok_or_else(|| {
-                        DeployError::Recovery(
-                            "prior relaunch attempt was unexpectedly already bound".to_string(),
-                        )
-                    })?
-                    .clone();
-                if !created {
-                    return Err(DeployError::Recovery(
-                        "unbound prior relaunch attempt has no recoverable receipt".to_string(),
-                    ));
-                }
-                let runtime = crate::journal::live_runtime(
-                    &working.prior_runtime,
-                    &working.prior_generation_root,
-                )?;
                 require_selected(driver, &working.prior_generation_id)?;
-                let process = driver.start_ordinary(
-                    &working.prior_generation_root,
-                    &working.prior_generation_id,
-                    &runtime,
-                    &working.prior_node,
-                    &attempt,
-                )?;
+                working = crate::recovery::reconcile_pending_launch(journal, driver, &working)?;
+                let process = working.active_relaunch_process().cloned().ok_or_else(|| {
+                    DeployError::Recovery(
+                        "prior launch executor did not produce a started outcome".to_string(),
+                    )
+                })?;
                 validate_relaunched_process(&working, &process, true)?;
-                working = working.with_bound_relaunch_attempt(process.clone())?;
-                journal.save(&working)?;
                 (process, true)
             }
             PortState::Prior {

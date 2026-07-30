@@ -226,7 +226,7 @@ where
     Ok(RecoveryOutcome::RolledBack)
 }
 
-fn reconcile_pending_launch<J, D>(
+pub(crate) fn reconcile_pending_launch<J, D>(
     journal: &mut J,
     driver: &mut D,
     record: &TransactionRecord,
@@ -238,24 +238,64 @@ where
     let Some(attempt) = record.pending_launch_attempt().cloned() else {
         return Ok(record.clone());
     };
-    match driver.observe_launch_attempt(&attempt, record)? {
-        crate::activation::LaunchAttemptObservation::Absent => Err(DeployError::Recovery(
-            "unbound launch attempt has no recoverable receipt".to_string(),
+    let mut observation = ensure_launch_attempt(driver, &attempt, record, false)?;
+    if matches!(
+        observation,
+        crate::activation::LaunchAttemptObservation::Unclaimed
+    ) {
+        if !matches!(attempt.state, crate::journal::LaunchAttemptState::Unclaimed) {
+            return Err(DeployError::Recovery(
+                "journaled launch owner disappeared".to_string(),
+            ));
+        }
+        require_unclaimed_launch_safety(driver, record, attempt.lane)?;
+        observation = ensure_launch_attempt(driver, &attempt, record, true)?;
+    }
+    let observed_claim = match &observation {
+        crate::activation::LaunchAttemptObservation::Owned(claim)
+        | crate::activation::LaunchAttemptObservation::DefinitelyNotStarted(claim)
+        | crate::activation::LaunchAttemptObservation::Gated { claim, .. }
+        | crate::activation::LaunchAttemptObservation::Ordinary { claim, .. } => {
+            Some(claim.clone())
+        }
+        crate::activation::LaunchAttemptObservation::Unclaimed
+        | crate::activation::LaunchAttemptObservation::Malformed
+        | crate::activation::LaunchAttemptObservation::StorageAmbiguous => None,
+    };
+
+    let mut working = record.clone();
+    if matches!(attempt.state, crate::journal::LaunchAttemptState::Unclaimed) {
+        let claim = observed_claim.clone().ok_or_else(|| {
+            DeployError::Recovery(
+                "launch executor did not publish an exact durable ownership claim".to_string(),
+            )
+        })?;
+        working = working.with_launch_owned(claim)?;
+        journal.save(&working)?;
+    } else if attempt.claim() != observed_claim.as_ref() {
+        return Err(DeployError::Recovery(
+            "launch ownership changed or disappeared during recovery".to_string(),
+        ));
+    }
+
+    match observation {
+        crate::activation::LaunchAttemptObservation::Owned(_) => Err(DeployError::Recovery(
+            "launch executor still owns the attempt; waiting for a terminal outcome".to_string(),
         )),
-        crate::activation::LaunchAttemptObservation::DefinitelyNotStarted => {
-            let resolved = record.with_launch_definitely_not_started()?;
+        crate::activation::LaunchAttemptObservation::DefinitelyNotStarted(claim) => {
+            let resolved = working.with_launch_definitely_not_started(claim)?;
             journal.save(&resolved)?;
             Ok(resolved)
         }
-        crate::activation::LaunchAttemptObservation::Gated(candidate)
+        crate::activation::LaunchAttemptObservation::Gated { claim, candidate }
             if attempt.lane == crate::journal::LaunchLane::TargetGated =>
         {
-            crate::journal::validate_candidate(record, &candidate)?;
-            let bound = record.with_bound_gated_candidate(candidate)?;
+            crate::journal::validate_candidate(&working, &candidate)?;
+            let bound = working.with_bound_gated_candidate(claim, candidate)?;
             journal.save(&bound)?;
             Ok(bound)
         }
-        crate::activation::LaunchAttemptObservation::Ordinary(process)
+        crate::activation::LaunchAttemptObservation::Ordinary { claim, process }
             if matches!(
                 attempt.lane,
                 crate::journal::LaunchLane::PriorRollback
@@ -263,18 +303,52 @@ where
             ) =>
         {
             crate::journal::validate_generation_process(
-                record,
+                &working,
                 &process,
                 attempt.lane == crate::journal::LaunchLane::PriorRollback,
             )?;
-            let bound = record.with_bound_relaunch_attempt(process)?;
+            let bound = working.with_bound_relaunch_attempt(claim, process)?;
             journal.save(&bound)?;
             Ok(bound)
         }
         _ => Err(DeployError::Recovery(
-            "launch attempt receipt is malformed or belongs to the wrong lane".to_string(),
+            "launch attempt state is ambiguous, malformed, or belongs to the wrong lane"
+                .to_string(),
         )),
     }
+}
+
+fn require_unclaimed_launch_safety<D: ActivationDriver>(
+    driver: &mut D,
+    record: &TransactionRecord,
+    lane: crate::journal::LaunchLane,
+) -> Result<()> {
+    let expected = match lane {
+        crate::journal::LaunchLane::TargetGated | crate::journal::LaunchLane::PriorRollback => {
+            &record.prior_generation_id
+        }
+        crate::journal::LaunchLane::TargetRollForward => &record.target_generation_id,
+    };
+    require_selected(driver, expected)?;
+    let state = driver.observe_port(record)?;
+    validate_port_state(record, &state)?;
+    if !matches!(state, PortState::Free) {
+        return Err(DeployError::Recovery(
+            "unclaimed launch attempt requires an exactly free port".to_string(),
+        ));
+    }
+    verify_owned_predecessors_exited(driver, record)?;
+    require_selected(driver, expected)
+}
+
+fn ensure_launch_attempt<D: ActivationDriver>(
+    driver: &mut D,
+    attempt: &crate::journal::LaunchAttempt,
+    record: &TransactionRecord,
+    claim_if_unclaimed: bool,
+) -> Result<crate::activation::LaunchAttemptObservation> {
+    let spec = crate::activation::LaunchSpec::for_attempt(record, attempt)?;
+    driver.ensure_launch_attempt(&spec, attempt, claim_if_unclaimed)
 }
 
 pub(crate) fn roll_forward_confirmed<J, D>(
@@ -335,33 +409,13 @@ where
                     .with_new_launch_attempt(crate::journal::LaunchLane::TargetRollForward)?;
                 journal.save(&working)?;
             }
-            let attempt = working
-                .pending_launch_attempt()
-                .ok_or_else(|| {
-                    DeployError::Recovery(
-                        "target relaunch attempt was unexpectedly already bound".to_string(),
-                    )
-                })?
-                .clone();
-            if !created {
-                return Err(DeployError::Recovery(
-                    "unbound target relaunch attempt has no recoverable receipt".to_string(),
-                ));
-            }
-            let runtime = crate::journal::live_runtime(
-                &working.target_runtime,
-                &working.target_generation_root,
-            )?;
-            let process = driver.start_ordinary(
-                &working.target_generation_root,
-                &working.target_generation_id,
-                &runtime,
-                &working.target_node,
-                &attempt,
-            )?;
+            working = reconcile_pending_launch(journal, driver, &working)?;
+            let process = working.active_relaunch_process().cloned().ok_or_else(|| {
+                DeployError::Recovery(
+                    "target launch executor did not produce a started outcome".to_string(),
+                )
+            })?;
             validate_relaunched_process(&working, &process, false)?;
-            working = working.with_bound_relaunch_attempt(process.clone())?;
-            journal.save(&working)?;
             (process, true)
         }
         PortState::Prior { .. } | PortState::Foreign => {
