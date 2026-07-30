@@ -85,6 +85,17 @@ Extract the TS parser test table into a JSON fixture that both suites will consu
 - Consumes: `parseResumeInput(text: string): { candidates: {token, kind}[], hint: {provider, source} | null }` from `@shared/resume-input-parser` (unchanged).
 - Produces: `test/fixtures/resume-input/parser-cases.json` with shape `{ "cases": [{ "name", "input", "candidates": [{"token","kind"}], "hint": {"provider","source"} | null }] }` — Task 2's Rust test reads this exact file at this exact path.
 
+- [ ] **Step 0: Install node deps in the worktree (precondition for EVERY npm/vitest step in this plan)**
+
+The worktree starts with NO `node_modules`. `npm run test:vitest` shells through `tsx` (an uninstalled devDependency), so Step 3 below — and every later npm/typecheck/vitest step, and any `cargo test -p freshell-server` run that spawns the committed Node fixture `fake-app-server.mjs` (it imports `ws`) — needs deps installed first:
+
+```bash
+cd /home/dan/code/freshell/.worktrees/rust-resolve-parity
+test -d node_modules || npm ci --no-audit --no-fund
+```
+
+This guard is idempotent; later tasks repeat it defensively for fresh-implementer safety, but it MUST run here first.
+
 - [ ] **Step 1: Write the fixture**
 
 Every case asserts BOTH candidates and hint (a strict superset of the current suite's per-case assertions — the current suite checks one or the other). Cases 1–25 are the existing suite's inputs verbatim — including the bare-v7-uuid case ("bare v7 uuid" below, the existing suite's `['uuid v7 shape', V7, { provider: 'codex', source: 'id-shape' }]` row), which is the ONLY case exercising the `version === '7' → codex` id-shape branch of `deriveHint` with a bare id (the other V7 inputs are `codex resume …` command-source hints, so dropping it would leave that branch uncovered in both languages); 26–31 pin previously-untested port hazards (stable hex sort, non-`ses_` prefixed ids, uuid versions other than 4/7, case preservation, sub-8-char hex, `-rf` command-shape miss).
@@ -704,7 +715,10 @@ pub fn parse_resume_input(text: &str) -> ResumeInputParse {
         .filter(|token| token.bytes().any(|b| b.is_ascii_digit()))
         .collect();
     // STABLE sort (like JS Array.sort): equal lengths keep text order.
-    hex_tokens.sort_by(|a, b| b.len().cmp(&a.len()));
+    // NOTE: sort_by_key(Reverse(len)) — not sort_by(|a, b| b.len().cmp(&a.len())),
+    // which trips clippy's warn-by-default `unnecessary_sort_by` under the
+    // -D warnings gate. Vec::sort_by_key is equally stable; behavior identical.
+    hex_tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut candidates: Vec<ResumeCandidate> = Vec::new();
@@ -2275,7 +2289,9 @@ async fn resolve_session(
     let claude = state.locate_claude_transcript.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let deps = ResolveDeps {
-            sessions: snapshot.as_ref().map(|s| s.as_slice()),
+            // as_deref (Option<Vec<T>> -> Option<&[T]>): as_ref().map(|s| s.as_slice())
+            // trips clippy's warn-by-default `option_as_ref_deref` under -D warnings.
+            sessions: snapshot.as_deref(),
             session_types: &session_types,
             opencode_dir_by_id: opencode.as_deref(),
             locate_claude_transcript: claude.as_deref(),
@@ -2834,7 +2850,10 @@ Note: `session_metadata_store` is constructed at ~line 980, i.e. AFTER `resolve_
 
 - [ ] **Step 5: Build + full crate test**
 
+Node deps must be present (`tests/safe11_term22_shutdown_reaping.rs` spawns the committed Node fixture `fake-app-server.mjs`, which imports `ws`) — the guard is a no-op if Task 1 Step 0 already ran:
+
 ```bash
+test -d node_modules || npm ci --no-audit --no-fund
 cargo test -p freshell-server
 ```
 
@@ -2944,9 +2963,10 @@ with:
     sessionResolve: true,
 ```
 
-Comment-only change; verify with:
+Comment-only change; verify with (deps guard is a no-op if Task 1 Step 0 already ran):
 
 ```bash
+test -d node_modules || npm ci --no-audit --no-fund
 npm run typecheck
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/sessions-resolve-router.test.ts --run
 ```
