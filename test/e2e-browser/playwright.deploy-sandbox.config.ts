@@ -18,7 +18,7 @@ if (
 
 export default defineConfig({
   testDir: '.',
-  testMatch: /deployment-compatibility\.spec\.ts$/,
+  testMatch: /(deployment-compatibility|sandbox-playwright-cache\.smoke)\.spec\.ts$/,
   fullyParallel: false,
   workers: 1,
   retries: 0,

@@ -67,13 +67,15 @@ RUN if getent passwd "${UID}" >/dev/null 2>&1; then \
     fi \
     && chown -R "${UID}:${GID}" /usr/local/cargo /usr/local/rustup
 
-# Playwright's own installer needs its system dependency list resolved once
-# a browser version is known (that happens per-run from package.json at
-# runtime), so we only pre-install the OS libraries here as a cache-friendly
-# base layer; browser binaries are fetched into a cache volume on first use.
-RUN npx --yes playwright@1.52.0 install-deps chromium || true
+# The build wrapper resolves this exact version from package-lock.json and
+# includes it in the image-definition digest. System libraries therefore stay
+# in a reusable image layer while following Playwright lockfile upgrades.
+ARG PLAYWRIGHT_VERSION
+RUN test -n "${PLAYWRIGHT_VERSION}" \
+    && npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium
 
 COPY --chmod=755 entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+COPY --chmod=755 ensure-playwright-cache.sh /usr/local/bin/ensure-playwright-cache.sh
 
 WORKDIR /workspace
 

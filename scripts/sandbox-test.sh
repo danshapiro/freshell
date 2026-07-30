@@ -9,6 +9,7 @@
 # Usage:
 #   scripts/sandbox-test.sh "cargo test -p freshell-ws"
 #   scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored perf"
+#   scripts/sandbox-test.sh --fresh-playwright-cache "npx playwright test ..."
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
@@ -17,23 +18,47 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+PLAYWRIGHT_VERSION="$(
+  node -e '
+    const lock = require(process.argv[1])
+    const version = lock.packages?.["node_modules/playwright"]?.version
+    if (!version) throw new Error("package-lock.json does not resolve playwright")
+    process.stdout.write(version)
+  ' "${REPO_ROOT}/package-lock.json"
+)"
 DEFINITION_SHA256="$(
-  sha256sum \
-    "${REPO_ROOT}/docker/sandbox/Dockerfile" \
-    "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
+  {
+    sha256sum \
+      "${REPO_ROOT}/docker/sandbox/Dockerfile" \
+      "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
+      "${REPO_ROOT}/docker/sandbox/ensure-playwright-cache.sh"
+    printf 'playwright=%s\n' "${PLAYWRIGHT_VERSION}"
+  } \
   | awk '{print $1}' \
   | sha256sum \
   | awk '{print $1}'
 )"
 
 MOUNT_CORPUS=0
-if [ "${1:-}" = "--corpus" ]; then
-  MOUNT_CORPUS=1
-  shift
-fi
+FRESH_PLAYWRIGHT_CACHE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --corpus)
+    MOUNT_CORPUS=1
+    shift
+    ;;
+  --fresh-playwright-cache)
+    FRESH_PLAYWRIGHT_CACHE=1
+    shift
+    ;;
+  *)
+    break
+    ;;
+  esac
+done
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: $0 [--corpus] \"<command to run inside the sandbox>\"" >&2
+  echo "usage: $0 [--corpus] [--fresh-playwright-cache] \"<command to run inside the sandbox>\"" >&2
   exit 2
 fi
 CMD="$1"
@@ -69,8 +94,16 @@ DOCKER_ARGS=(
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
   -v freshell-sandbox-cargo-target:/workspace/target
   -v freshell-sandbox-node-modules:/workspace/node_modules
-  -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
 )
+if [ "${FRESH_PLAYWRIGHT_CACHE}" -eq 1 ]; then
+  # An anonymous cache volume is empty on entry and is removed automatically
+  # with `docker run --rm`. The normal named cache remains untouched.
+  DOCKER_ARGS+=(-v /home/sandbox/.cache/ms-playwright)
+else
+  DOCKER_ARGS+=(
+    -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
+  )
+fi
 
 if [ "${MOUNT_CORPUS}" -eq 1 ]; then
   if [ -d "${HOME}/.codex/sessions" ]; then

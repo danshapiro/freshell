@@ -50,7 +50,11 @@ of each is slower — see below):
 - `freshell-sandbox-node-modules` — **sandbox-owned**, populated via `npm ci` inside the
   container on first use. The host's `node_modules` has host-built native modules (e.g.
   `node-pty`) that won't run inside the container's different environment.
-- `freshell-sandbox-playwright-cache` — downloaded browser binaries.
+- `freshell-sandbox-playwright-cache` — downloaded browser binaries. The
+  entrypoint installs Chromium from the lockfile-resolved Playwright version
+  and reuses it while that version remains current. Use
+  `--fresh-playwright-cache` to prove a browser run from an empty disposable
+  cache without deleting the shared cache.
 
 Reset everything (forces a clean re-warm on next run):
 

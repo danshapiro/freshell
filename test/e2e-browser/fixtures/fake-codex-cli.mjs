@@ -26,15 +26,33 @@ const argv = process.argv.slice(2)
 function appendArgvLog() {
   const logPath = process.env.FAKE_CODEX_ARGV_LOG
   if (!logPath) return
-  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8')
-  const commandEnd = stat.lastIndexOf(')')
-  if (commandEnd < 0) throw new Error(`could not parse /proc/${process.pid}/stat`)
-  const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
+  let exactBirthIdentity = {}
+  if (process.env.FAKE_CODEX_EXACT_BIRTH_LOG === '1') {
+    const procRoot = process.env.FAKE_CODEX_PROC_ROOT ?? '/proc'
+    try {
+      const stat = fs.readFileSync(path.join(procRoot, String(process.pid), 'stat'), 'utf8')
+      const commandEnd = stat.lastIndexOf(')')
+      if (commandEnd < 0) {
+        throw new Error(`could not parse ${path.join(procRoot, String(process.pid), 'stat')}`)
+      }
+      const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ')
+      exactBirthIdentity = {
+        kernelBootId: fs.readFileSync(
+          path.join(procRoot, 'sys/kernel/random/boot_id'),
+          'utf8',
+        ).trim(),
+        startTimeTicks: fieldsAfterCommand[19],
+      }
+    } catch {
+      // Ordinary fixture consumers also run on macOS and native Windows.
+      // Exact Linux birth identity is an opt-in Task 7 sandbox enhancement;
+      // argv logging must remain useful when /proc is unavailable.
+    }
+  }
   fs.mkdirSync(path.dirname(logPath), { recursive: true })
   fs.appendFileSync(logPath, `${JSON.stringify({
     pid: process.pid,
-    kernelBootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
-    startTimeTicks: fieldsAfterCommand[19],
+    ...exactBirthIdentity,
     t: Date.now(),
     argv,
   })}\n`)

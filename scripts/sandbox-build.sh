@@ -9,10 +9,22 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+PLAYWRIGHT_VERSION="$(
+  node -e '
+    const lock = require(process.argv[1])
+    const version = lock.packages?.["node_modules/playwright"]?.version
+    if (!version) throw new Error("package-lock.json does not resolve playwright")
+    process.stdout.write(version)
+  ' "${REPO_ROOT}/package-lock.json"
+)"
 DEFINITION_SHA256="$(
-  sha256sum \
-    "${REPO_ROOT}/docker/sandbox/Dockerfile" \
-    "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
+  {
+    sha256sum \
+      "${REPO_ROOT}/docker/sandbox/Dockerfile" \
+      "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
+      "${REPO_ROOT}/docker/sandbox/ensure-playwright-cache.sh"
+    printf 'playwright=%s\n' "${PLAYWRIGHT_VERSION}"
+  } \
   | awk '{print $1}' \
   | sha256sum \
   | awk '{print $1}'
@@ -30,6 +42,7 @@ docker build \
   --network=host \
   --build-arg "UID=$(id -u)" \
   --build-arg "GID=$(id -g)" \
+  --build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}" \
   --build-arg "FRESHELL_SANDBOX_DEFINITION_SHA256=${DEFINITION_SHA256}" \
   -t "${IMAGE_TAG}" \
   "${REPO_ROOT}/docker/sandbox"

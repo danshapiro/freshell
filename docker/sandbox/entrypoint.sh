@@ -50,4 +50,6 @@ if [ -f package-lock.json ]; then
   fi
 fi
 
+/usr/local/bin/ensure-playwright-cache.sh
+
 exec gosu sandbox "$@"

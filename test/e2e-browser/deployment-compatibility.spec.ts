@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { TestHarness } from './helpers/test-harness.js'
 import { TerminalHelper } from './helpers/terminal-helpers.js'
 import { declarationDigest } from '../../scripts/deployment-compatibility.mjs'
+import { stopOwnedChildBeforeIdentity } from '../helpers/owned-child-process.js'
 
 if (process.env.FRESHELL_DESTRUCTIVE_SANDBOX !== '1') {
   throw new Error(
@@ -263,61 +264,66 @@ function copyCheckout(source: string, destination: string) {
 }
 
 async function setupRig(): Promise<Rig> {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'freshell-deploy-browser-'))
-  const checkout = path.join(root, 'checkout')
-  const home = path.join(root, 'home')
-  const bootstrapTarget = path.join(root, 'bootstrap-target')
-  const legacyClient = path.join(root, 'legacy-client')
-  const runtime = path.join(root, 'legacy-runtime')
-  const distServer = path.join(runtime, 'dist-server')
-  const sidecar = path.join(runtime, 'sidecar')
-  const nodeModules = path.join(runtime, 'node_modules')
-  const bin = path.join(root, 'bin')
-  const pidFile = path.join(root, 'legacy.pid')
-  const logFile = path.join(root, 'legacy.log')
-  const codexArgvLog = path.join(root, 'fake-codex-invocations.jsonl')
-  const token = `task7-browser-${Date.now()}-token`
-  const clientMarker = `task7-browser-client-${Date.now()}`
-  let port = await unusedPort()
-  while (port === 3002) port = await unusedPort()
-  const portRoot = path.join(checkout, '.freshell-deploy/ports', String(port))
-  const node = realpathSync(process.execPath)
-  const environment = {
-    ...process.env,
-    AUTH_TOKEN: token,
-    FRESHELL_HOME: home,
-    HOME: home,
-    FRESHELL_CODEX_MANAGED_LAUNCH: '0',
-    FAKE_CODEX_ARGV_LOG: codexArgvLog,
-    CARGO_BUILD_JOBS: '2',
-    CMAKE_BUILD_PARALLEL_LEVEL: '2',
-    FRESHELL_DEPLOY_BUILD_PARENT: path.join(root, 'builds'),
-  }
-  const sentinel = spawn(
-    node,
-    ['--eval', 'setInterval(() => {}, 1000)'],
-    { stdio: 'ignore' },
-  )
-  if (!sentinel.pid) throw new Error('unrelated sentinel did not start')
-  const rig: Rig = {
-    root,
-    checkout,
-    home,
-    bootstrapTarget,
-    port,
-    token,
-    baseUrl: `http://127.0.0.1:${port}`,
-    portRoot,
-    pidFile,
-    codexArgvLog,
-    environment,
-    knownProcesses: new Map(),
-    sentinel,
-    sentinelIdentity: readProcessIdentity(sentinel.pid),
-  }
-  rememberProcess(rig, rig.sentinelIdentity)
-
+  let root: string | undefined
+  let sentinel: ChildProcess | undefined
+  let rig: Rig | undefined
   try {
+    root = mkdtempSync(path.join(os.tmpdir(), 'freshell-deploy-browser-'))
+    const checkout = path.join(root, 'checkout')
+    const home = path.join(root, 'home')
+    const bootstrapTarget = path.join(root, 'bootstrap-target')
+    const legacyClient = path.join(root, 'legacy-client')
+    const runtime = path.join(root, 'legacy-runtime')
+    const distServer = path.join(runtime, 'dist-server')
+    const sidecar = path.join(runtime, 'sidecar')
+    const nodeModules = path.join(runtime, 'node_modules')
+    const bin = path.join(root, 'bin')
+    const pidFile = path.join(root, 'legacy.pid')
+    const logFile = path.join(root, 'legacy.log')
+    const codexArgvLog = path.join(root, 'fake-codex-invocations.jsonl')
+    const token = `task7-browser-${Date.now()}-token`
+    const clientMarker = `task7-browser-client-${Date.now()}`
+    let port = await unusedPort()
+    while (port === 3002) port = await unusedPort()
+    const portRoot = path.join(checkout, '.freshell-deploy/ports', String(port))
+    const node = realpathSync(process.execPath)
+    const environment = {
+      ...process.env,
+      AUTH_TOKEN: token,
+      FRESHELL_HOME: home,
+      HOME: home,
+      FRESHELL_CODEX_MANAGED_LAUNCH: '0',
+      FAKE_CODEX_ARGV_LOG: codexArgvLog,
+      FAKE_CODEX_EXACT_BIRTH_LOG: '1',
+      CARGO_BUILD_JOBS: '2',
+      CMAKE_BUILD_PARALLEL_LEVEL: '2',
+      FRESHELL_DEPLOY_BUILD_PARENT: path.join(root, 'builds'),
+    }
+    sentinel = spawn(
+      node,
+      ['--eval', 'setInterval(() => {}, 1000)'],
+      { stdio: 'ignore' },
+    )
+    if (!sentinel.pid) throw new Error('unrelated sentinel did not start')
+    const sentinelIdentity = readProcessIdentity(sentinel.pid)
+    rig = {
+      root,
+      checkout,
+      home,
+      bootstrapTarget,
+      port,
+      token,
+      baseUrl: `http://127.0.0.1:${port}`,
+      portRoot,
+      pidFile,
+      codexArgvLog,
+      environment,
+      knownProcesses: new Map(),
+      sentinel,
+      sentinelIdentity,
+    }
+    rememberProcess(rig, sentinelIdentity)
+
     copyCheckout(repository, checkout)
   mkdirSync(home)
   mkdirSync(bin)
@@ -418,7 +424,8 @@ async function setupRig(): Promise<Rig> {
     path.join(checkout, '.env'),
     `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\nCODEX_CMD=${path.join(bin, 'codex')}\n` +
       'FRESHELL_CODEX_MANAGED_LAUNCH=0\n' +
-      `FAKE_CODEX_ARGV_LOG=${codexArgvLog}\n`,
+      `FAKE_CODEX_ARGV_LOG=${codexArgvLog}\n` +
+      'FAKE_CODEX_EXACT_BIRTH_LOG=1\n',
     { mode: 0o600 },
   )
 
@@ -534,17 +541,47 @@ async function setupRig(): Promise<Rig> {
 
     return rig
   } catch (error) {
-    if (existsSync(pidFile)) {
+    if (rig && existsSync(rig.pidFile)) {
       try {
-        rememberProcess(rig, readProcessIdentity(Number(readFileSync(pidFile, 'utf8').trim())))
+        rememberProcess(
+          rig,
+          readProcessIdentity(Number(readFileSync(rig.pidFile, 'utf8').trim())),
+        )
       } catch {
         // The exact legacy birth is already gone or was never fully published.
       }
     }
-    try {
-      await cleanupRig(rig)
-    } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], 'Task 7 rig setup and cleanup both failed')
+    if (rig) {
+      try {
+        await cleanupRig(rig)
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Task 7 rig setup and cleanup both failed',
+        )
+      }
+    } else {
+      const cleanupErrors: unknown[] = []
+      if (sentinel?.pid && sentinel.exitCode === null) {
+        try {
+          await stopOwnedChildBeforeIdentity(sentinel, 'Task 7 browser sentinel')
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError)
+        }
+      }
+      if (root) {
+        try {
+          rmSync(root, { recursive: true, force: true })
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError)
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          'Task 7 initial rig ownership and cleanup both failed',
+        )
+      }
     }
     throw error
   }

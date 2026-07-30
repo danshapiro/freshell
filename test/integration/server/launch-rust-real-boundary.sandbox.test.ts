@@ -21,6 +21,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { stopOwnedChildBeforeIdentity } from '../../helpers/owned-child-process.js'
 
 function isStrictlyBeneath(root: string, candidate: string) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate))
@@ -776,40 +777,56 @@ describe('canonical launch-rust deployment wrapper', () => {
 
 describe('real deployment controller boundary', () => {
   it('captures, activates, updates, stops, starts, and restarts exact real processes', async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), 'freshell-real-deploy-task6-'))
-    const realCheckout = path.join(root, 'checkout')
-    const home = path.join(root, 'home')
-    const runtime = path.join(root, 'runtime')
-    const candidateClient = path.join(root, 'candidate-client')
-    const nextClient = path.join(root, 'next-client')
-    const cargoTarget = path.join(root, 'cargo-target')
-    const distServer = path.join(runtime, 'dist-server')
-    const sidecar = path.join(runtime, 'sidecar')
-    const nodeModules = path.join(runtime, 'node_modules')
-    const pidFile = path.join(root, 'legacy.pid')
-    const logFile = path.join(root, 'legacy.log')
-    const token = `task6-real-sandbox-${Date.now()}-token`
-    const clientMarker = `task7-real-client-${Date.now()}`
-    const node = realpathSync(process.execPath)
-    let port = await unusedPort()
-    while (port === 3002) port = await unusedPort()
     const knownProcesses = new Map<string, RecordedProcessIdentity>()
-    const unrelatedSentinel = spawn(
-      node,
-      ['--eval', 'setInterval(() => {}, 1000)'],
-      { stdio: 'ignore' },
-    )
-    if (!unrelatedSentinel.pid) throw new Error('unrelated sentinel did not start')
-    const unrelatedSentinelIdentity = readProcessIdentity(unrelatedSentinel.pid)
-    rememberProcess(knownProcesses, unrelatedSentinelIdentity)
-    const realEnvironment = {
-      ...process.env,
-      AUTH_TOKEN: token,
-      FRESHELL_HOME: home,
-      HOME: home,
-    }
-
+    const cleanupContext: {
+      root?: string
+      realCheckout?: string
+      port?: number
+      pidFile?: string
+      environment?: NodeJS.ProcessEnv
+      unrelatedSentinel?: ReturnType<typeof spawn>
+      unrelatedSentinelIdentity?: RecordedProcessIdentity
+    } = {}
     try {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'freshell-real-deploy-task6-'))
+      cleanupContext.root = root
+      const realCheckout = path.join(root, 'checkout')
+      cleanupContext.realCheckout = realCheckout
+      const home = path.join(root, 'home')
+      const runtime = path.join(root, 'runtime')
+      const candidateClient = path.join(root, 'candidate-client')
+      const nextClient = path.join(root, 'next-client')
+      const cargoTarget = path.join(root, 'cargo-target')
+      const distServer = path.join(runtime, 'dist-server')
+      const sidecar = path.join(runtime, 'sidecar')
+      const nodeModules = path.join(runtime, 'node_modules')
+      const pidFile = path.join(root, 'legacy.pid')
+      cleanupContext.pidFile = pidFile
+      const logFile = path.join(root, 'legacy.log')
+      const token = `task6-real-sandbox-${Date.now()}-token`
+      const clientMarker = `task7-real-client-${Date.now()}`
+      const node = realpathSync(process.execPath)
+      let port = await unusedPort()
+      while (port === 3002) port = await unusedPort()
+      cleanupContext.port = port
+      const unrelatedSentinel = spawn(
+        node,
+        ['--eval', 'setInterval(() => {}, 1000)'],
+        { stdio: 'ignore' },
+      )
+      cleanupContext.unrelatedSentinel = unrelatedSentinel
+      if (!unrelatedSentinel.pid) throw new Error('unrelated sentinel did not start')
+      const unrelatedSentinelIdentity = readProcessIdentity(unrelatedSentinel.pid)
+      cleanupContext.unrelatedSentinelIdentity = unrelatedSentinelIdentity
+      rememberProcess(knownProcesses, unrelatedSentinelIdentity)
+      const realEnvironment = {
+        ...process.env,
+        AUTH_TOKEN: token,
+        FRESHELL_HOME: home,
+        HOME: home,
+      }
+      cleanupContext.environment = realEnvironment
+
       mkdirSync(realCheckout, { recursive: true })
     mkdirSync(home)
     mkdirSync(path.join(distServer, 'mcp'), { recursive: true })
@@ -1540,47 +1557,76 @@ describe('real deployment controller boundary', () => {
       await waitForHttp(port, 'down')
     } finally {
       const cleanupErrors: string[] = []
-      const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
-      const liveFile = path.join(portRoot, 'live.json')
-      if (existsSync(liveFile)) {
+      const {
+        root,
+        realCheckout,
+        port,
+        pidFile,
+        environment: realEnvironment,
+        unrelatedSentinel,
+        unrelatedSentinelIdentity,
+      } = cleanupContext
+      if (
+        unrelatedSentinel
+        && !unrelatedSentinelIdentity
+        && unrelatedSentinel.exitCode === null
+      ) {
         try {
-          const live = JSON.parse(readFileSync(liveFile, 'utf8'))
-          if (live.processIdentity?.pid) {
-            rememberProcess(knownProcesses, live.processIdentity)
-          }
-          const storedController = path.join(
-            portRoot,
-            'current/controller/freshell-deploy',
+          await stopOwnedChildBeforeIdentity(
+            unrelatedSentinel,
+            'real-boundary unrelated sentinel',
           )
-          if (existsSync(storedController)) {
-            try {
-              await checkedAsync(
-                storedController,
-                [
-                  'stop-current',
-                  '--checkout',
-                  realCheckout,
-                  '--port',
-                  String(port),
-                ],
-                { cwd: realCheckout, env: realEnvironment, timeout: 60_000 },
-              )
-            } catch (error) {
-              cleanupErrors.push(`controller stop failed: ${String(error)}`)
-            }
-          }
         } catch (error) {
-          cleanupErrors.push(`could not inspect live receipt: ${String(error)}`)
+          cleanupErrors.push(`could not stop unidentified owned sentinel: ${String(error)}`)
         }
       }
-      if (existsSync(pidFile)) {
-        try {
-          rememberProcess(
-            knownProcesses,
-            readProcessIdentity(Number(readFileSync(pidFile, 'utf8').trim())),
-          )
-        } catch {
-          // The exact captured birth is already gone.
+      if (realCheckout && port !== undefined) {
+        const portRoot = path.join(realCheckout, '.freshell-deploy/ports', String(port))
+        const liveFile = path.join(portRoot, 'live.json')
+        if (existsSync(liveFile)) {
+          try {
+            const live = JSON.parse(readFileSync(liveFile, 'utf8'))
+            if (live.processIdentity?.pid) {
+              rememberProcess(knownProcesses, live.processIdentity)
+            }
+            const storedController = path.join(
+              portRoot,
+              'current/controller/freshell-deploy',
+            )
+            if (existsSync(storedController)) {
+              try {
+                await checkedAsync(
+                  storedController,
+                  [
+                    'stop-current',
+                    '--checkout',
+                    realCheckout,
+                    '--port',
+                    String(port),
+                  ],
+                  {
+                    cwd: realCheckout,
+                    env: realEnvironment ?? process.env,
+                    timeout: 60_000,
+                  },
+                )
+              } catch (error) {
+                cleanupErrors.push(`controller stop failed: ${String(error)}`)
+              }
+            }
+          } catch (error) {
+            cleanupErrors.push(`could not inspect live receipt: ${String(error)}`)
+          }
+        }
+        if (pidFile && existsSync(pidFile)) {
+          try {
+            rememberProcess(
+              knownProcesses,
+              readProcessIdentity(Number(readFileSync(pidFile, 'utf8').trim())),
+            )
+          } catch {
+            // The exact captured birth is already gone.
+          }
         }
       }
 
@@ -1608,14 +1654,18 @@ describe('real deployment controller boundary', () => {
           cleanupErrors.push(`recorded process remained alive: ${processIdentityKey(identity)}`)
         }
       }
-      try {
-        await waitForHttp(port, 'down')
-        await waitForPortFree(port)
-      } catch (error) {
-        cleanupErrors.push(`port ${port} was not proved free: ${String(error)}`)
+      if (port !== undefined) {
+        try {
+          await waitForHttp(port, 'down')
+          await waitForPortFree(port)
+        } catch (error) {
+          cleanupErrors.push(`port ${port} was not proved free: ${String(error)}`)
+        }
       }
-      spawnSync('chmod', ['-R', 'u+rwX', root], { encoding: 'utf8' })
-      rmSync(root, { recursive: true, force: true })
+      if (root) {
+        spawnSync('chmod', ['-R', 'u+rwX', root], { encoding: 'utf8' })
+        rmSync(root, { recursive: true, force: true })
+      }
       if (cleanupErrors.length > 0) {
         throw new Error(`real deployment cleanup was incomplete:\n${cleanupErrors.join('\n')}`)
       }
