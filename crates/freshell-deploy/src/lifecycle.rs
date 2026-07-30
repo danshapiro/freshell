@@ -183,7 +183,22 @@ pub(crate) fn execute_stop_current(checkout: &Path, port: DeployPort) -> Result<
 }
 
 pub(crate) fn recover_pending(checkout: &Path, port: DeployPort) -> Result<()> {
+    recover_pending_with(checkout, port, || {}, recover_launch)
+}
+
+fn recover_pending_with<BeforeLock, Recover>(
+    checkout: &Path,
+    port: DeployPort,
+    before_lock: BeforeLock,
+    recover: Recover,
+) -> Result<()>
+where
+    BeforeLock: FnOnce(),
+    Recover: FnOnce(&Store, &LockedStore<'_>, &str, LifecycleLaunchRecord) -> Result<()>,
+{
     let store = Store::open(checkout, port)?;
+    before_lock();
+    let locked = store.lock()?;
     let path = lifecycle_path(&store);
     let Some(record) = read_record(&store, &path)? else {
         return Ok(());
@@ -192,8 +207,7 @@ pub(crate) fn recover_pending(checkout: &Path, port: DeployPort) -> Result<()> {
         return Ok(());
     }
     let auth_token = crate::controller::load_auth_token(checkout)?;
-    let locked = store.lock()?;
-    recover_launch(&store, &locked, &auth_token, record)
+    recover(&store, &locked, &auth_token, record)
 }
 
 fn recover_or_start(
@@ -796,4 +810,176 @@ fn port_from_lifecycle_path(path: &Path) -> Result<DeployPort> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| DeployError::UnsafeStorePath(path.to_path_buf()))?;
     DeployPort::parse(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    use super::*;
+    use crate::process_identity::ListenerIdentity;
+
+    fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) {
+        let path = path.as_ref();
+        fs::create_dir_all(path.parent().expect("fixture path has parent")).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn executable(path: impl AsRef<Path>, body: &str) {
+        let path = path.as_ref();
+        write(path, format!("#!/bin/sh\n{body}\n"));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn managed_store() -> (tempfile::TempDir, Store, LifecycleLaunchRecord) {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkout = fixture.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        write(checkout.join(".git"), "gitdir: /tmp/fixture.git\n");
+        write(
+            checkout.join(".env"),
+            "AUTH_TOKEN=lifecycle-concurrency-test\n",
+        );
+
+        let node = fixture.path().join("node");
+        executable(&node, "echo v22.0.0");
+        let source = fixture.path().join("generation");
+        executable(source.join("server/freshell-server"), "exit 0");
+        executable(source.join("controller/freshell-deploy"), "exit 0");
+        write(source.join("client/index.html"), "fixture\n");
+        write(source.join("extensions/fixture.json"), "{}\n");
+        write(source.join("dist/server/mcp/server.js"), "export {}\n");
+        write(source.join("claude-sidecar/index.mjs"), "process.exit(0)\n");
+        write(source.join("package.json"), "{}\n");
+        write(source.join("package-lock.json"), "{}\n");
+        write(
+            source.join("node_modules/fixture/package.json"),
+            "{\"name\":\"fixture\"}\n",
+        );
+        write(
+            source.join("deployment.json"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "schemaVersion": "1",
+                    "controllerExecutable": "controller/freshell-deploy",
+                    "runtime": {
+                        "serverExecutable": "server/freshell-server",
+                        "clientDir": "client",
+                        "extensionsDir": "extensions",
+                        "distServerDir": "dist/server",
+                        "mcpEntry": "dist/server/mcp/server.js",
+                        "claudeSidecarEntry": "claude-sidecar/index.mjs",
+                        "packageJson": "package.json",
+                        "packageLock": "package-lock.json",
+                        "productionNodeModules": "node_modules"
+                    },
+                    "node": {
+                        "executable": node,
+                        "version": "v22.0.0"
+                    }
+                })
+            ),
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = DeployPort::new(listener.local_addr().unwrap().port()).unwrap();
+        drop(listener);
+        let store = Store::open(&checkout, port).unwrap();
+        let locked = store.lock().unwrap();
+        let generation = locked.import_tree(&source).unwrap();
+        locked.select_generation(&generation.id).unwrap();
+        drop(locked);
+        let record = LifecycleLaunchRecord::new(&store).unwrap();
+        write_record(&store, &lifecycle_path(&store), &record).unwrap();
+        (fixture, store, record)
+    }
+
+    fn fake_running_process(record: &LifecycleLaunchRecord) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: u32::MAX - 1,
+            kernel_boot_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            start_time_ticks: "90071992547409931234".to_string(),
+            executable: record.server_executable.clone(),
+            listener: ListenerIdentity {
+                port: record.port,
+                socket_inode: "991122".to_string(),
+                owner_pid: u32::MAX - 1,
+                network_namespace: "net:[4026533111]".to_string(),
+            },
+            cwd: record.generation_root.display().to_string(),
+            argv0: "freshell-server".to_string(),
+            argument_count: 1,
+            effective_uid: unsafe { libc::geteuid() },
+            runtime: record.runtime.clone(),
+        }
+    }
+
+    #[test]
+    fn delayed_recovery_rereads_completed_operation_after_a_later_exact_stop() {
+        let (_fixture, store, initial) = managed_store();
+        let original_operation = initial.operation_id.clone();
+        let checkout = store.paths().checkout().to_path_buf();
+        let port = store.paths().port();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let recovery_starts = Arc::new(AtomicUsize::new(0));
+        let observed_starts = Arc::clone(&recovery_starts);
+        let delayed_checkout = checkout.clone();
+
+        let delayed = thread::spawn(move || {
+            recover_pending_with(
+                &delayed_checkout,
+                port,
+                || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+                |store, _locked, _token, _stale_record| {
+                    observed_starts.fetch_add(1, Ordering::SeqCst);
+                    let replacement = LifecycleLaunchRecord::new(store)?;
+                    write_record(store, &lifecycle_path(store), &replacement)
+                },
+            )
+        });
+        paused_rx.recv().unwrap();
+
+        let locked = store.lock().unwrap();
+        let mut completed = read_record(&store, &lifecycle_path(&store))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.operation_id, original_operation);
+        completed.complete = true;
+        locked
+            .write_live(&LiveReceipt::new(
+                completed.generation_id.clone(),
+                Some(completed.generation_id.clone()),
+                false,
+                Some(fake_running_process(&completed)),
+            ))
+            .unwrap();
+        write_record(&store, &lifecycle_path(&store), &completed).unwrap();
+        drop(locked);
+
+        execute_stop_current(&checkout, port).unwrap();
+        let stopped = store.read_live().unwrap().unwrap();
+        assert!(stopped.process_identity.is_none());
+        assert!(stopped.running_server_generation_id.is_none());
+
+        resume_tx.send(()).unwrap();
+        delayed.join().unwrap().unwrap();
+
+        let authoritative = read_record(&store, &lifecycle_path(&store))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(authoritative.operation_id, original_operation);
+        assert!(authoritative.complete);
+        let still_stopped = store.read_live().unwrap().unwrap();
+        assert!(still_stopped.process_identity.is_none());
+        assert!(still_stopped.running_server_generation_id.is_none());
+    }
 }
