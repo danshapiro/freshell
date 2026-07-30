@@ -531,13 +531,17 @@ pub(crate) fn derive_resume_identity(
 
 /// Door 3 (resume-validation): what [`validate_rest_resume`] decided for a
 /// REST create's cached resume id. Mirrors `freshell-ws`'s
-/// `ResumeValidationOutcome` (Task 6) minus the claude-prealloc flag (the
-/// REST pipeline has no fresh-claude preallocation path; the healed
-/// pane_content stamping falls out of `plausible_resume_session_id` on the
-/// minted id instead).
+/// `ResumeValidationOutcome` (Task 6), including the claude-prealloc flag
+/// (the healed pane_content stamping falls out of
+/// `plausible_resume_session_id` on the minted id instead).
 struct RestResumeOutcome {
     resume_session_id: Option<String>,
     launch_intent: LaunchIntent,
+    /// True when the gate minted a fresh claude id as an absence fallback.
+    /// The REST consumer must run the PIN 2 pre-spawn ledger write exactly
+    /// as a natural fresh-claude create would (main #584), even though a
+    /// resume_session_id is present (it is minted, not resumed).
+    claude_fresh_prealloc: bool,
     /// Some(stale_id) iff the gate fired: caller clears the accepted wire
     /// ref (never stamp the stale sessionRef), invokes `on_stale_resume`,
     /// and injects the notice into the returned `paneContent`.
@@ -554,6 +558,7 @@ fn rest_resume_passthrough(
     RestResumeOutcome {
         resume_session_id,
         launch_intent,
+        claude_fresh_prealloc: false,
         stale_session_id: None,
         notice: None,
     }
@@ -596,16 +601,23 @@ fn validate_rest_resume(
         ResumeGateDecision::Proceed => rest_resume_passthrough(resume_session_id, launch_intent),
         ResumeGateDecision::SpawnFresh => {
             let notice = stale_resume_notice(mode, &sid);
-            let (fresh_id, intent) = match mode {
+            let (fresh_id, intent, claude_fresh_prealloc) = match mode {
                 // Mirror the genuine fresh-pane shapes (same per-provider
-                // fallbacks as the WS door's validate_wire_resume).
-                "claude" => (Some(Uuid::new_v4().to_string()), LaunchIntent::Start),
-                "amplifier" => (Some(Uuid::new_v4().to_string()), LaunchIntent::Resume),
-                _ => (None, LaunchIntent::Resume),
+                // fallbacks as the WS door's validate_wire_resume). The
+                // claude arm MINTS a fresh id, so it must also carry the
+                // prealloc marker (PIN 2 coupling, main #584).
+                "claude" => (Some(Uuid::new_v4().to_string()), LaunchIntent::Start, true),
+                "amplifier" => (
+                    Some(Uuid::new_v4().to_string()),
+                    LaunchIntent::Resume,
+                    false,
+                ),
+                _ => (None, LaunchIntent::Resume, false),
             };
             RestResumeOutcome {
                 resume_session_id: fresh_id,
                 launch_intent: intent,
+                claude_fresh_prealloc,
                 stale_session_id: Some(sid),
                 notice: Some(notice),
             }
@@ -967,15 +979,25 @@ pub(crate) async fn spawn_terminal_pane(
     // the id — the pre-spawn ledger write and its spawn-failure delete (Task 5
     // call sites in settle_gated_create) are BOTH gated on this exact flag,
     // never on `mode == "claude"`.
-    let claude_fresh_prealloc = freshell_platform::should_preallocate_fresh_claude(
+    //
+    // The MINT stays keyed on main's raw predicate ("no resume id"): a
+    // gate-fired create already carries the gate-minted id, and re-minting
+    // would overwrite it with a second UUID.
+    let claude_prealloc_mint = freshell_platform::should_preallocate_fresh_claude(
         &mode,
         body.get("restore").and_then(serde_json::Value::as_bool),
         session_ref_locator_present,
         resume_session_id.as_deref(),
     );
-    if claude_fresh_prealloc {
+    if claude_prealloc_mint {
         resume_session_id = Some(Uuid::new_v4().to_string());
     }
+    // Door 3 (resume-validation) × PIN 2: a gate-fired claude fallback ALSO
+    // minted a fresh id (in `validate_rest_resume`), so it must get the same
+    // PIN 2 pre-spawn write / failure delete / `Start` intent as a natural
+    // fresh claude create — fold the outcome flag in (WS door parity:
+    // freshell-ws/src/terminal.rs does this exact OR-fold).
+    let claude_fresh_prealloc = claude_prealloc_mint || rest_outcome.claude_fresh_prealloc;
 
     // Hoisted spawn-environment inputs, computed ONCE (Task 8's WS pattern,
     // REST twin): the amplifier windows-arm guard below and the spawn-spec
@@ -5039,6 +5061,94 @@ mod tests {
         );
 
         registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// PIN 2 coupling (main #584 × Door 3): a gate-fired claude fallback
+    /// carries a gate-MINTED `resume_session_id`, so main's
+    /// `should_preallocate_fresh_claude` (keyed on "no resume id") returns
+    /// false — without the outcome's `claude_fresh_prealloc` fold the minted
+    /// fresh pane silently skips the pre-spawn ledger binding every natural
+    /// fresh claude create gets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_gate_fired_claude_fallback_preallocates_fresh_identity() {
+        // Same arrangement as rest_gate_fire_heals_pane_content_ref_and_
+        // injects_notice (claude REST create carrying a stale resume id,
+        // probe answers Absent + ever_observed_on_disk=true, gate fires and
+        // mints a fresh id) — PLUS the #584 identity seam wired so the PIN 2
+        // write is observable (skipped entirely when no binder is wired).
+        const STALE: &str = "99999999-8888-4777-8666-555555555555";
+        let argv_file = unique_argv_file("door3-claude-prealloc");
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![claude_recording_cli_spec_with_start(
+                &argv_file,
+            )]))
+            .with_resume_probe(probe_answering(
+                freshell_platform::resume_gate::ResumeExistence::Absent,
+                true,
+            ))
+            .with_on_stale_resume(on_stale)
+            .with_pane_identity_binder(binder.clone());
+        let registry = state.terminal_registry.clone().unwrap();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": STALE },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "precondition: the gate fired"
+        );
+
+        // Extract the minted id from the healed pane content, as the
+        // neighbor test does.
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        let minted = msg["payload"]["paneContent"]["sessionRef"]["sessionId"]
+            .as_str()
+            .expect("healed sessionRef stamped")
+            .to_string();
+        assert_ne!(minted, STALE, "stale wire ref must never be stamped");
+
+        // The gate-minted fresh claude pane must get the same PIN 2
+        // pre-spawn treatment as a natural fresh claude create.
+        let events = binder.events();
+        let prespawn = events
+            .iter()
+            .position(|e| e == &format!("prespawn:{tid}:{minted}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "gate-minted fresh claude id must receive the PIN 2 pre-spawn \
+                     identity binding: {events:?}"
+                )
+            });
+        let register = events
+            .iter()
+            .position(|e| e == &format!("register:{tid}:claude:{minted}"))
+            .unwrap_or_else(|| panic!("register event missing: {events:?}"));
+        assert!(
+            prespawn < register,
+            "PIN 2: durability before registration: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("delete:")),
+            "no failure-delete on success: {events:?}"
+        );
+
+        registry.kill(&tid);
         let _ = std::fs::remove_file(&argv_file);
     }
 
