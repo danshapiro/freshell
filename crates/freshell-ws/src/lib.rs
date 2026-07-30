@@ -41,6 +41,7 @@ pub mod pane_identity_binder;
 pub mod pane_ledger;
 pub mod reconcile;
 pub mod reconcile_freshagent;
+pub mod resume_validation;
 pub mod screenshot;
 pub mod spawn_gate;
 pub mod tabs;
