@@ -1610,6 +1610,8 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
 /// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
 /// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
+/// `featureFlags.sessionResolve` is the unconditional literal both servers
+/// declare now that `POST /api/sessions/resolve` exists here too (SYNC-06).
 fn build_platform_payload(
     available_clis: serde_json::Value,
     env: &dyn freshell_platform::Env,
@@ -1619,7 +1621,7 @@ fn build_platform_payload(
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env) },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env), "sessionResolve": true },
     })
 }
 
@@ -2231,13 +2233,15 @@ mod tests {
 
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
-        // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled }`,
-        // camelCase, no extra fields — mirrored 1:1 in the Rust payload.
+        // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
+        // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
+        // Rust payload. `sessionResolve` is an unconditional literal on both
+        // servers (SYNC-06).
         let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
         );
     }
 
@@ -2247,7 +2251,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
         );
     }
 
