@@ -44,11 +44,6 @@ const FAKE_APP_SERVER_SOURCE = path.resolve(
   '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 )
 
-const RUST_SKIP =
-  'KNOWN DIVERGENCE: the Rust server has no POST /api/sessions/resolve and does not ' +
-  'declare the sessionResolve feature flag (button hidden there by design) — ' +
-  'out of scope, see docs/plans/2026-07-29-resume-session-button.md.'
-
 /** The known target id among the seeded sessions (a real uuid so the parser extracts it). */
 const RESUME_ID = '4e3f2a10-9d1c-4b7e-8a55-0c9f6b2d7e31'
 /** Filler sessions so the sidebar list genuinely scrolls. */
@@ -230,8 +225,6 @@ async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<Res
 test.setTimeout(90_000)
 
 test('resume button stays visible at top/middle/bottom scroll', async ({ page, e2eServerKind }) => {
-  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
-
   const scenario = await bootResumeScenario(e2eServerKind)
   try {
     await bootAndConnect(page, scenario.info)
@@ -261,8 +254,6 @@ test('resume button stays visible at top/middle/bottom scroll', async ({ page, e
 })
 
 test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServerKind }) => {
-  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
-
   const scenario = await bootResumeScenario(e2eServerKind)
   try {
     await page.setViewportSize({ width: 390, height: 844 })
@@ -281,8 +272,6 @@ test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServ
 })
 
 test('paste-then-Enter resumes the session with the right agent', async ({ page, e2eServerKind }) => {
-  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
-
   const scenario = await bootResumeScenario(e2eServerKind)
   try {
     const harness = await bootAndConnect(page, scenario.info)
