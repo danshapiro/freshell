@@ -1362,36 +1362,6 @@ pub(crate) fn fail_json_code(status: StatusCode, code: &str, message: String) ->
         .into_response()
 }
 
-/// [`fail_json_code`] + machine-readable retry guidance for 429-family
-/// rejections. The window rides BOTH the HTTP `Retry-After` header (whole
-/// seconds, floor 1 — HTTP convention) and a `retryAfterMs` body field
-/// (house convention, session-lease SESSION_RESERVED): body-only consumers
-/// like the MCP bridge never see headers, HTTP-conventional clients never
-/// read bodies. Lives here so the `{status:"error", code, message}` envelope
-/// shape stays owned by ONE file.
-pub(crate) fn fail_json_code_retry_after(
-    status: StatusCode,
-    code: &str,
-    message: String,
-    retry_after: std::time::Duration,
-) -> Response {
-    let mut response = (
-        status,
-        Json(json!({
-            "status": "error",
-            "code": code,
-            "message": message,
-            "retryAfterMs": retry_after.as_millis() as u64,
-        })),
-    )
-        .into_response();
-    response.headers_mut().insert(
-        axum::http::header::RETRY_AFTER,
-        axum::http::HeaderValue::from(retry_after.as_secs().max(1)),
-    );
-    response
-}
-
 /// The error status the original maps serve failures to (`agentRouteErrorStatus`): a
 /// bounded cold-start failure / transport error is a 5xx; everything else 500 here.
 fn serve_error_status(err: &ServeError) -> StatusCode {
