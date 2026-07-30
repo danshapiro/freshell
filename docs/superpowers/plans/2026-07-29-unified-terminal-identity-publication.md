@@ -10,6 +10,18 @@
 > five explicit user product decisions. Do not resurrect the previous revision's
 > lifecycle semantics, residual-race language, or task ordering.
 
+> **Revision 2 (Fresh Eyes round 1 + PR #584 reconciliation):** An independent
+> Fresh Eyes review failed the previous revision with one critical and ten
+> major findings (all encoded below — see the "Fresh Eyes Round 1" table), and
+> PR #584 (`fix/rest-terminal-session-identity`, kata `hbsa`) plus PR #583
+> merged into `origin/main` while that revision was being written. The base is
+> now `6147c700`; the original `gf ui` incident is **fixed on main**; Slice E1
+> landed verbatim; and the landed `PaneIdentityBinder` seam is absorbed, not
+> avoided (see "Reconciliation with Merged PR #584"). This plan file was
+> **renamed** to `2026-07-29-unified-terminal-identity-publication.md`; the old
+> path `docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md`
+> now holds PR #584's own historical plan document — never edit that file.
+
 **Goal:** Give every authoritative terminal session identity—accepted resume,
 server-preallocated fresh identity, provider-discovered identity, or
 existence-validated legacy resume—one provider-aware publication pipeline that
@@ -20,8 +32,14 @@ admission a single atomic claim so two writers can never open one provider
 session file.
 
 **Architecture:** Take over and generalize the existing
-`PaneIdentitySink`/`LedgerIdentitySink` design instead of adding the separate
-`PaneIdentityBinder` proposed by the Claude-only plan. Provider policy produces
+`PaneIdentitySink`/`LedgerIdentitySink` design, **absorbing** the
+`PaneIdentityBinder` seam that PR #584 landed (trait in
+`crates/freshell-terminal/src/registry.rs:655-703`, production
+`LedgerPaneIdentityBinder` in `crates/freshell-ws/src/pane_identity_binder.rs`
+\u2014 already the crate placement LB18 requires). The binder's four REST call
+sites migrate onto the extended sink, its landed unit tests move with them,
+and the binder trait + module are deleted once no call sites remain (Slice
+E2; see "Reconciliation with Merged PR #584"). Provider policy produces
 an identity candidate with explicit provenance; the shared sink authorizes it
 (live-owner checks strictly before existence mapping), publishes the in-memory
 identity through new atomic `TerminalRegistry` primitives, persists it
@@ -40,8 +58,12 @@ provider-owned id.
 post-spawn pane-ledger write completed and a newly constructed `PaneLedger`
 over the same root reloads the binding after an ordinary server/process
 restart. It does not promise survival of arbitrary power loss,
-controller-cache failure, or filesystem corruption. There are no pre-spawn
-ledger writes in this design (see Lifecycle Corrections, LB5).
+controller-cache failure, or filesystem corruption. The single pre-spawn
+ledger write in the system is the established **PIN2 fresh-Claude minted-id
+binding** (WS door `crates/freshell-ws/src/terminal.rs:2198`; REST door landed
+in #584) \u2014 a bounded, exclusive-by-construction exception documented under
+Lifecycle Corrections (LB5). No other pre-spawn ledger writes exist or may be
+added.
 
 **Tech Stack:** Rust 2021 (toolchain 1.96.0), Axum, Tokio,
 `freshell-terminal`, `freshell-freshagent`, `freshell-ws`,
@@ -75,7 +97,15 @@ Implementers and reviewers must encode them, not relitigate them.
   branch.** The `SessionAdmission` extraction and REST-door protection are
   sequenced as Slice B0, before every publication slice, so the deterministic
   corruption hole on current `origin/main` closes first. No separate hotfix
-  PR.
+  PR. **Updated factual basis after #584 (decision unchanged):** the landed
+  A13 pins (`crates/freshell-ws/tests/rest_claude_identity.rs`, "A13 refusal
+  of REST-live sessions") close only the *reverse* direction — fresh-agent and
+  signal doors now refuse sessions owned by a live REST terminal, because REST
+  creates finally publish identity rows. The REST *terminal* door still
+  performs no cross-kind check (`terminal_tabs.rs` contains no
+  `has_live_session` reference on `6147c700`), and #584's own plan records its
+  LB-11 residual cross-kind race as explicitly out of its scope, so the
+  deterministic hole D4 targets is still open and B0 still closes it.
 - **D5 — Remove legacy (non-negotiated) WS session-carrying creates.** A
   `terminal.create` that carries session identity on a connection that did not
   negotiate `pane_reconcile_v1` is rejected with a deterministic structured
@@ -114,9 +144,9 @@ Every architectural rule below traces to a validated finding. Summary:
 | LB1 strong Arc cycle | Falsified | Lifecycle Corrections; Slice D (weak probes + teardown test) |
 | LB2 sink wiring unproven | Falsified as invariant | Slice D (5-consumer wired + `Arc::ptr_eq` boot asserts) |
 | LB3 lock order | Confirmed under contract | Callback Contract; Slices B/D |
-| LB4 gate on error/unwind | Inconclusive → must design | Slice B (guard-on-drop, duplicate-id, panic tests) |
-| LB5 pre-spawn Bound window | Falsified | No pre-spawn ledger writes (decision below) |
-| LB6 exit races settlement | Falsified | Slice B (caller-held finalization guard) |
+| LB4 gate on error/unwind | Inconclusive → must design | Slice B (guard-on-drop, duplicate-id, abort-wrapper tests) |
+| LB5 pre-spawn Bound window | Falsified | No new pre-spawn ledger writes; PIN2 minted-Claude lane kept as the one bounded exception (Lifecycle Corrections) |
+| LB6 exit races settlement | Falsified | Slice B (settlement-owner-held finalization guard; FE9 detached-task ownership) |
 | LB7 blanket Closed retirement | Falsified | Exit-cause model; Slices D/E2/F4 |
 | LB8 terminal-id-only cleanup | Falsified | Slice C (`retire_closed_if_owned`, epoch-keyed pending) |
 | LB9 retired OpenCode missing row | Falsified | Slice F3 (absent-row retired lane preserved) |
@@ -132,18 +162,35 @@ Every architectural rule below traces to a validated finding. Summary:
 | LB19 task graph infeasible | Confirmed | Slices A–J (G5's corrected graph) |
 | LB20 amplifier stub adoption | Confirmed (contract holds) | Pinned contract version (Slice I) |
 
+### Fresh Eyes Round 1 (GPT; verdict: failed — every finding encoded here)
+
+| # | Finding (condensed) | Resolution — encoded in |
+| --- | --- | --- |
+| FE1 (critical) | Publisher panic under the registry `std::sync::Mutex` poisons it; every later `.lock().expect` panics; the PTY is stranded | Callback Contract: panic-free-by-construction + abort-on-panic wrapper (never `catch_unwind`-and-continue); Slice B tests |
+| FE2 | Base pinned to stale `537d7d09`; the rebase onto `6147c700` is already done | Global Constraints; Preflight; Slice E1 marked landed; E2 reframed (old RED tuple impossible) |
+| FE3 | Plan forbade `PaneIdentityBinder`, which main now ships with an awaited pre-spawn Claude binding | "Reconciliation with Merged PR #584": absorb + migrate + delete; LB5 rescoped to the PIN2 exception; Slices D/E2 |
+| FE4 | `SessionRefClaim::OwnedByFreshAgent` breaks `auto_resume.rs:651-681`'s exhaustive match | Slice B0 file inventory + refusal arm + test |
+| FE5 | New `WsState` field breaks ~38 struct-literal construction sites | Slice D enumerates every site + `null_sink_for_tests()` one-liner; full `--all-targets` compile gate |
+| FE6 | Warm-looking `Absent` can come from a stale snapshot (`server/existence.rs:181-215`); `SessionExistence` carries no freshness | Probe contract gains `exists_with_freshness`; stale `Absent` is deferrable, fresh `Absent` permanent (Authorization Ordering; Slices D/F5) |
+| FE7 | `ProviderUnavailable` classified deferrable but a missing root "will never warm up" and no refresh-completion API exists | Reclassified **permanent**; F5's deferral trigger is a bounded fresh-answer requery schedule (no new subscription API) |
+| FE8 | Plan required a "REST explicit-close door" that does not exist (pane/tab DELETEs keep PTYs; `DELETE /api/terminals/:id` only hides) | `Closed` retirement scoped to WS `handle_kill` only; REST kill route explicitly out of scope (Lifecycle Corrections LB7) |
+| FE9 | Caller-held guard dies with the HTTP handler on client abort, opening the gate prematurely | Guard held by the **detached settle task** (the settlement owner, which already survives client aborts); cancellation test in Slice E2 |
+| FE10 | Two invalid REST claude shapes launch bare unresumable processes (restore:true w/o identity; cross-provider parsed ref) | REST rejection ladder: 400 `SESSION_REF_PROVIDER_MISMATCH`, 422 `CLAUDE_RESTORE_UNRESOLVED` (WS `error_claude_restore_unresolved` mirror) + route-matrix tests (Slice E2) |
+| FE11 | Same-kind `BoundLive` "adopt" is unsafe at discovery time (different owner, same provider) | `claim_discovered` distinguishes exact-same-owner (idempotent) from **any** different owner (atomic refusal, loud error, process left running — D3); Slice B0 tests |
+
 ## Global Constraints
 
 - Work only in
   `/home/dan/code/freshell/.worktrees/rest-codex-terminal-identity` on branch
-  `fix/rest-terminal-identity-publication`, now rebased onto `origin/main`
-  `537d7d09`.
-- **Preflight baseline (required before Slice A):** the previously recorded
-  9,585-pass baseline was run on the stale base `4c04dc9c` and proves nothing
-  about `537d7d09`. Before any implementation commit, run the repo-supported
-  baseline on the current base per `AGENTS.md` (broad suites go through the
-  shared test coordinator; never kill a foreign holder), record the result,
-  and stop if the base is not green.
+  `fix/rest-terminal-identity-publication`, rebased onto `origin/main`
+  `6147c700` (= `537d7d09` + PR #583 + PR #584). **That rebase is already
+  done** — verify it, do not redo it.
+- **Preflight baseline (required before the first implementation slice):** no
+  recorded baseline exists for `6147c700` (the old 9,585-pass evidence was for
+  the long-stale `4c04dc9c`). Before any implementation commit, run the
+  repo-supported baseline on the current base per `AGENTS.md` (broad suites go
+  through the shared test coordinator; never kill a foreign holder), record
+  the result, and stop if the base is not green.
 - Use red/green/refactor TDD with **runtime reds only**: every slice lands its
   test surface together with a compiling minimal stub, so each RED is a
   genuine assertion failure, never a missing-symbol compile error. No commit
@@ -194,16 +241,26 @@ Every architectural rule below traces to a validated finding. Summary:
   awaited outside the registry lock; announcements are enqueued only after
   that outcome settles.
 - **Finalization ordering:** the PTY exit hook must not run until the create
-  caller's settlement (provider adoption, durable write, announcement
-  enqueue) completes; the caller holds a finalization guard whose drop —
-  on every success, error, and unwind path — releases the exit hook. A
-  locator result racing with exit cannot publish identity to a missing or
-  non-running terminal.
+  settlement (provider adoption, durable write, announcement enqueue)
+  completes; the **settlement owner** holds a finalization guard whose drop —
+  on every success, error, and unwind path — releases the exit hook. The
+  settlement owner is the WS handler task on the WS door and the **detached
+  settle task** on the REST door (`terminal_tabs.rs` runs spawn + settlement
+  on a detached Tokio task that owns the spawn permit precisely so a client
+  abort drops only the HTTP handler future, never settlement — FE9). The
+  guard must never be held by, returned to, or awaited from the HTTP handler
+  future. A locator result racing with exit cannot publish identity to a
+  missing or non-running terminal.
 - **Exit-cause discipline:** durable ledger rows become `Closed` only on
-  explicit user close. Natural PTY exit, auto-resume settlement, and graceful
-  shutdown leave rows `Bound`. In-memory identity is marked retired (retained,
-  not deleted) on every exit so the trusted retired-signal lane keeps working.
-  New exit machinery must not race or suppress the current
+  explicit user kill — today that is exactly the WS `terminal.kill` door
+  (`handle_kill`). **No REST route kills a PTY** (pane/tab DELETEs keep PTYs
+  for reattach; `DELETE /api/terminals/:id` only patches a `deleted` settings
+  override, `crates/freshell-server/src/terminals.rs:1033-1050`), so no REST
+  code path may call the `ExplicitClose` retirement; adding a REST kill route
+  is out of scope (FE8). Natural PTY exit, auto-resume settlement, and
+  graceful shutdown leave rows `Bound`. In-memory identity is marked retired
+  (retained, not deleted) on every exit so the trusted retired-signal lane
+  keeps working. New exit machinery must not race or suppress the current
   `auto_resume_cancels`/settle-frame behavior.
 - **Epoch-conditional cleanup:** every delayed mutation (ledger retire,
   pending delete, admission binding clear) carries the owning terminal id
@@ -267,6 +324,20 @@ The failure chain is exact:
 5. The selector correctly emitted the pane's real session key and the
    unidentified terminal's synthetic fallback key. Both focused the same tab.
 
+**Status on `6147c700`: the incident itself is FIXED.** PR #584's
+`LedgerPaneIdentityBinder` post-spawn identity-registration block in
+`terminal_tabs.rs` writes the identity row and ledger binding for every
+non-shell session-carrying REST create, and
+`crates/freshell-ws/tests/rest_locator_identity.rs` pins the codex/opencode
+REST create → identity row + ledger binding end to end (claude:
+`rest_claude_identity.rs`). The incident is retained here as the motivating
+shape and becomes a permanent **green pin** (Slice I) — the old E2 RED tuple
+`(None, None, Some("981008-old-gf-ui"))` can no longer occur. What remains is
+the architecture that makes the fix principled (provenance + authorization —
+the landed binder publishes even unvalidated legacy raw ids) plus the holes
+#584 explicitly left open (its plan's LB-11 documents the residual cross-kind
+admission race as out of scope).
+
 Additional established constraints:
 
 - `/api/terminals` currently treats non-Codex `mode + resume_session_id` as a
@@ -303,7 +374,7 @@ claim before spawn (Slice B0); the matrix shows identity/publication behavior.
 
 | Provider/create shape | Launch-time session source | Launch behavior | Authoritative provenance | Durability timing | Client announcement (enqueue order) |
 | --- | --- | --- | --- | --- | --- |
-| Fresh Claude | Freshell UUID | `Start`, `--session-id <uuid>` | `ServerPreallocated` | Post-spawn awaited write | `terminals.changed`, then `terminal.meta.updated` |
+| Fresh Claude | Freshell UUID (minting landed in #584) | `Start`, `--session-id <uuid>` | `ServerPreallocated` | Awaited PIN2 pre-spawn binding (LB5 exception) + post-spawn awaited write | `terminals.changed`, then `terminal.meta.updated` |
 | Explicit Claude `sessionRef` | Accepted matching ref | `Resume`, `--resume <id>` | `AcceptedSessionRef` | Post-spawn | Same create announcement |
 | Fresh Amplifier | Freshell UUID + provider stub | `Resume`, existing stub/cwd rules | `ServerPreallocated` | Post-spawn | Same create announcement |
 | Explicit Amplifier `sessionRef` | Accepted matching ref | Existing resume/stub rules | `AcceptedSessionRef` | Post-spawn | Same create announcement |
@@ -312,8 +383,10 @@ claim before spawn (Slice B0); the matrix shows identity/publication behavior.
 | Fresh Codex | None at launch | Existing plain/managed fresh launch + rollout locator | None until locator | Pending marker after spawn; binding after discovery | Association, changed, metadata |
 | Explicit Codex `sessionRef` | Accepted matching ref | Existing plain/managed resume | `AcceptedSessionRef` | Post-spawn | Create announcement |
 | Legacy raw resume, indexed `Present` | Raw field | Existing provider resume argv | `ExistenceValidatedLegacyResume` | Post-spawn | Create announcement |
-| Legacy raw resume, `Unknown`/`ProviderUnavailable` | Raw field | Compatibility launch; row keeps the launch hint | Not yet authoritative; **deferred re-authorization** re-runs on index warm and publishes via the discovered pipeline on `Present` | None until re-authorized | `terminals.changed` at create; `associated -> changed -> meta` on late authorization |
-| Legacy raw resume, `Absent` (warm index) | Raw field | Compatibility launch; row keeps the launch hint | Permanently non-authoritative; structured warning | None | `terminals.changed` only |
+| Legacy raw resume, `Unknown` (cold index) or `Absent` from a **stale** snapshot (FE6) | Raw field | Compatibility launch; row keeps the launch hint | Not yet authoritative; **deferred re-authorization** (bounded fresh-answer requery, Slice F5) publishes via the discovered pipeline on fresh `Present` | None until re-authorized | `terminals.changed` at create; `associated -> changed -> meta` on late authorization |
+| Legacy raw resume, `Absent` from a **fresh** index, or `ProviderUnavailable` (missing provider root — the probe contract says it never warms on this machine, FE7) | Raw field | Compatibility launch; row keeps the launch hint | Permanently non-authoritative; structured warning | None | `terminals.changed` only |
+| Parsed `sessionRef` whose provider ≠ mode (any of the four providers, FE10) | — | **Rejected before spawn:** REST 400 `SESSION_REF_PROVIDER_MISMATCH`; WS keeps its existing mismatch rejection | — | — | Error response only |
+| Claude `restore: true` with no accepted ref and no resume id (FE10) | — | **Rejected before spawn:** REST 422 `CLAUDE_RESTORE_UNRESOLVED` (mirror of WS `error_claude_restore_unresolved`, `terminal.rs:1708`). Amplifier's documented restore-bare carve-out is unchanged | — | — | Error response only |
 | Gemini/Kimi (any restore shape) | Raw field | Existing launch, **entirely unchanged** (D1 carve-out) | Outside the model; directory synthesis and pane promotion retained verbatim | Existing behavior | Existing behavior |
 | Shell/custom identityless mode | None | Existing launch | None | None | `terminals.changed` only |
 
@@ -346,7 +419,9 @@ pub enum BoundOwner { Terminal { terminal_id: String }, FreshAgent { live_sessio
 pub enum AdmissionClaim {
     Acquired,
     Held { retry_after_ms: u64 },
-    BoundLive { owner: BoundOwner },      // adopt if same kind; refuse if cross-kind
+    // Idempotent ONLY for the exact same owner; every DIFFERENT owner —
+    // same kind or cross kind — refuses (FE11; see "Owner-conflict answers").
+    BoundLive { owner: BoundOwner },
     ExpiredNeedsKill { handle: KillHandle },
 }
 
@@ -379,21 +454,32 @@ shared `SpawnGate` and `FreshAgentSessionLeases` (`main.rs:236-261`). Facade
 preservation must keep the existing 900-line lease suite and the D8 registry
 tests green without semantic edits.
 
-**Cross-kind answers (D2/D3):**
+**Owner-conflict answers (D2/D3, FE11):**
 
-- Same-kind `BoundLive` → existing adopt/attach behavior, unchanged.
+- Create/attach doors, same-kind `BoundLive` → existing behavior unchanged:
+  terminal doors keep their `BoundElsewhere` semantics; the fresh-agent
+  attach flow adopts only **its own** completed binding.
 - Cross-kind `BoundLive` → deterministic refusal, never adoption: terminal
   doors answer `RESTORE_UNAVAILABLE` (409 on REST, the error frame on WS);
   fresh-agent doors answer `SESSION_RESERVED { retryable: true }`. A new
   `SessionRefClaim::OwnedByFreshAgent` variant carries this through the
-  registry facade.
+  registry facade. **Every exhaustive `SessionRefClaim` match gains the new
+  arm in the same slice (FE4)** — including
+  `auto_resume.rs::claim_session` (`crates/freshell-ws/src/auto_resume.rs:651-681`),
+  which answers `false` (a fresh-agent-owned session is never auto-respawned).
 - Cross-kind `ExpiredNeedsKill` → v1 answers `Held`/409; the holder's own
   kind performs its kill. No cross-kind sweeping.
-- `claim_discovered` cross-kind conflict → refuse the binding atomically,
-  leave the process running, `tracing::error!(target: "invariant")`, and a
-  user-visible client notification via the same loud surface as the existing
-  D8 duplicate-session alarm (`alarm_if_duplicate_session_ref`). Never kill
-  (D3).
+- `claim_discovered(provider, sid, owner)` — discovery-time adoption (FE11):
+  binding absent → bind atomically. Binding present with the **exact same
+  owner** (same `BoundOwner` variant and same terminal id / live-session
+  key) → idempotent success (re-publication of an established fact). Binding
+  present with **any different owner — same kind or cross kind** → refuse the
+  binding atomically, leave the process running,
+  `tracing::error!(target: "invariant")`, and a user-visible client
+  notification via the same loud surface as the existing D8 duplicate-session
+  alarm (`alarm_if_duplicate_session_ref`). Never kill (D3). A second
+  same-provider process on one session is exactly the two-writer shape this
+  plan kills; "same kind" is never a license to steal a binding.
 
 **Spawn-door inventory routed through the claim:** WS `terminal.create`
 (negotiated; legacy session-carrying creates are removed per D5), REST
@@ -475,25 +561,59 @@ the two-writer shape LB13/LB14 exist to kill.
    defense is the door's `SessionAdmission` claim; authorization ordering
    makes the sink safe for discovered candidates and keeps liveness
    independent of a warm disk index.)
-3. Only for `LegacyResume`, map existence:
-   `Present → ExistenceValidatedLegacyResume`,
-   `Absent → LegacyIdentityAbsent` (permanent),
-   `Unknown → LegacyIdentityUnconfirmed` (deferrable),
-   `ProviderUnavailable → ProviderUnavailable` (deferrable).
+3. Only for `LegacyResume`, map existence **with freshness** (FE6 — the
+   probe contract gains `exists_with_freshness`, below):
+   `Present → ExistenceValidatedLegacyResume`;
+   `Absent` from a **fresh** index → `LegacyIdentityAbsent` (permanent);
+   `Absent` from a **stale** snapshot → `LegacyIdentityUnconfirmed`
+   (deferrable — `IndexExistenceProbe::exists` returns `Absent` from a stale
+   snapshot right after kicking a detached refresh,
+   `crates/freshell-server/src/existence.rs:181-215`, proven convergent by
+   `session_written_after_cold_read_resolves_present_on_requery`;
+   `SessionExistence` alone carries no freshness, so `Absent` may never be
+   treated as permanent without the freshness bit);
+   `Unknown → LegacyIdentityUnconfirmed` (deferrable);
+   `ProviderUnavailable → ProviderUnavailable` (**permanent** — FE7: the
+   probe contract states a known provider whose session root does not exist
+   on this machine "will NEVER warm up"; there is nothing to defer to).
 4. All other authoritative sources convert directly to matching provenance.
 
+**Probe-contract extension (Slice D, FE6):** `SessionExistenceProbe` gains
+
+```rust
+pub struct ExistenceAnswer {
+    pub existence: SessionExistence,
+    pub index_fresh: bool,
+}
+
+fn exists_with_freshness(&self, provider: &str, session_id: &str)
+    -> ExistenceAnswer;
+```
+
+with a default body delegating to `exists` with `index_fresh: false`
+(conservative: an unknown-freshness `Absent` defers instead of permanently
+rejecting). `IndexExistenceProbe` implements it by capturing
+`self.index.is_fresh()` in the same call that peeks the snapshot. The
+`SharedExistenceProbe` alias in `crates/freshell-ws/src/existence.rs`
+carries the same shape. Authorization uses only `exists_with_freshness`.
+
 **Deferred re-authorization (Slice F5):** a launched-but-unconfirmed legacy
-candidate (`Unknown`/`ProviderUnavailable`) is recorded as an unconfirmed
-marker `{candidate, terminal_id, create_request_id}` owned by the sink. The
-existing probe contract already converges on re-query
-(`existence.rs` module doc; test
-`session_written_after_cold_read_resolves_present_on_requery`). A bounded
-requery worker re-runs authorization after index warm/refresh; on `Present`
-it publishes through the discovered pipeline
+candidate (`Unknown` or stale-`Absent`) is recorded as an unconfirmed
+marker `{candidate, terminal_id, create_request_id}` owned by the sink.
+**Trigger (FE7 — specified exactly):** no refresh-completion subscription
+API exists today and this plan does not add one. The F5 worker instead runs
+a **bounded fresh-answer requery schedule** per marker: requery
+`exists_with_freshness` with capped exponential backoff (1s, 2s, 4s, … cap
+30s, at most 8 attempts) — each `exists` call itself kicks the detached
+refresh (`existence.rs` module doc), which is what makes the schedule
+converge — and stop early on the first answer with `index_fresh: true`.
+Fresh `Present` → publish through the discovered pipeline
 (`publish_running_session_identity` + sink persist/announce) with provenance
-`ExistenceValidatedLegacyResume`. Warm `Absent` drops the marker permanently
-with a structured warning. Markers are dropped on terminal exit.
-`Absent` at create time is never deferred.
+`ExistenceValidatedLegacyResume`. Fresh `Absent` → drop the marker
+permanently with a structured warning. Attempts exhausted without a fresh
+answer → drop with a structured warning (the client's re-present loop is
+the remaining manual path). Markers are dropped on terminal exit. Fresh
+`Absent` or `ProviderUnavailable` at create time is never deferred.
 
 ## Amplifier Probe-Before-Stub (LB15)
 
@@ -510,15 +630,41 @@ crashed prior create — or Freshell's own just-written stub — cannot
 self-authorize a caller-provided id. Implementation should check
 `amplifier_stub.rs` for an existing non-creating lookup before adding one.
 
-## Callback Contract and Lock Order (LB3)
+## Callback Contract and Lock Order (LB3, FE1)
 
-Confirmed safe only under this permanent contract — document it on the trait
-and test the final adapter:
+The synchronous publication callback runs while `RegistryInner`'s
+`std::sync::Mutex` is held, and every other registry operation acquires that
+mutex with `.lock().expect(...)`. An unwinding callback would therefore
+poison the mutex **after** the `PtyTerminal` is inserted: every later
+registry call panics and the PTY is stranded with no kill or attach path.
+The previous revision's "permit the panic and test with `catch_unwind`"
+stance is deleted. The contract is **panic-free by construction, enforced by
+an abort-on-panic wrapper** — document it on the trait and test the final
+adapter:
 
+- The callback body is exactly one leaf in-memory write
+  (`upsert_with_retirement` — a `RwLock`-guarded map insert). It does no
+  broadcast, no ledger I/O, no runtime probing, no await, no
+  terminal-registry re-entry, and no fallible work beyond cloning the row
+  fields.
+- The registry invokes **every** publication callback (create, running
+  transition, retired transition) through an abort-on-panic guard: a drop
+  bomb armed before the call and disarmed on normal return, whose
+  unwind-path drop calls `std::process::abort()`. An unwind out of the
+  callback is a fatal invariant violation; the process aborts **instead of**
+  poisoning the registry.
+- Rationale (document it on the wrapper): a poisoned registry strands every
+  running PTY with no kill path while the server limps on; an abort closes
+  every PTY master fd, delivering SIGHUP/EIO to the child process groups,
+  and lets supervision restart cleanly. Abort is strictly the safer failure.
+- Tests (Slice B): a **subprocess-based abort test** (re-exec the current
+  test binary with an env var arming a panicking publisher; assert the child
+  terminates abnormally via abort, not via an ordinary unwinding panic or a
+  poisoned-mutex panic) plus non-panic error-path tests proving registry
+  usability and row rollback for every *reachable* failure — duplicate
+  terminal id and publish refusals are error returns, never unwinds.
 - `upsert_with_retirement` remains a leaf write-lock operation on the
   identity registry.
-- The synchronous publication callback does no broadcast, no ledger I/O, no
-  runtime probing, no await, and no terminal-registry re-entry.
 - No identity-registry method calls terminal-registry code while retaining an
   identity guard.
 - Registry inner/terminal locks are taken strictly before the admission lock,
@@ -527,32 +673,47 @@ and test the final adapter:
 
 ## Lifecycle Corrections (G1)
 
-- **No pre-spawn ledger writes (LB5 decision).** The previous revision's
-  guarded pre-spawn `record_binding` wrote an ordinary `Bound` row that
-  recovery inventory exposes as `ledgerOnly`
-  (`recovery_inventory.rs:254-265`), opening a competing-recovery window.
-  G1 offered a durable prepared state *if pre-spawn durability is required*.
-  It is not: the only asset protected is the pane↔session binding for a
-  crash inside the create window, and the provider-side session (which the
-  minted-id process itself creates) is independently recoverable through the
-  history index. This plan therefore performs **all** ledger writes
-  post-spawn, deleting the prepared-state machinery, the pre/post settlement
-  aggregation, and the pre-spawn failure-cleanup delete. Spawn failure writes
-  nothing and releases the admission lease via RAII.
-- **Caller-held finalization guard (LB6).** `create_with_publication` returns
-  a `CreateFinalizationGuard`. The wrapped exit hook waits on it; the caller
-  holds it through provider settlement, the awaited durable write, and the
-  announcement enqueue, then drops it. Drop (any path, including unwind)
-  opens the gate. Exit cleanup can therefore never resurrect a row after
+- **Pre-spawn ledger writes: exactly one bounded exception (LB5 + FE3).**
+  The previous revision's *general* guarded pre-spawn `record_binding` stays
+  deleted: an ordinary pre-spawn `Bound` row for a resume create is exposed
+  by recovery inventory as `ledgerOnly` (`recovery_inventory.rs:254-265`),
+  opening a competing-recovery window, and G1's prepared-state machinery is
+  not needed. However, production already ships — and #584 extended to the
+  REST door — the **PIN2 fresh-Claude minted-id pre-spawn binding** (WS
+  `terminal.rs:2198` `PIN2_CLAUDE_PRE_SPAWN_BINDING` with its spawn-failure
+  delete twin at `:2277`; REST twin gated on `claude_fresh_prealloc` only;
+  pinned by the `rest_claude_identity.rs` durability e2e). This lane is
+  **kept, not migrated away**: the id is minted by this create, so no
+  competing writer and no meaningful competing-recovery offer can exist
+  before the spawn (the UUID is unknown to every other actor), and the
+  crash-before-spawn residue is one inert `Bound` row for a session that was
+  never created — resuming it fails loudly; it is not a two-writer shape.
+  LB5's rule is therefore rescoped: **no pre-spawn ledger write may exist
+  except the PIN2 minted-fresh-Claude lane**, and none may be added for
+  resumes, other providers, or discovered ids. The sink absorbs the two
+  binder pre-spawn methods behind typed trait methods (Slice D) so the
+  exception stays visible and testable. All other spawn failures write
+  nothing and release the admission lease via RAII.
+- **Settlement-owner-held finalization guard (LB6, FE9).**
+  `create_with_publication` returns a `CreateFinalizationGuard`. The wrapped
+  exit hook waits on it; the **settlement owner** holds it through provider
+  settlement, the awaited durable write, and the announcement enqueue, then
+  drops it. Drop (any path, including unwind) opens the gate. On the REST
+  door the settlement owner is the **detached settle task** — the guard
+  lives inside that task's scope and is never returned to the HTTP handler
+  future, so a client abort (which drops only the handler future) cannot
+  open the gate early or skip bookkeeping; a cancellation test proves it
+  (Slice E2). Exit cleanup can therefore never resurrect a row after
   retirement, delete a pending marker before it is written, or announce a
   retired terminal as created.
-- **Gate opens on every error path (LB4).** The guard is created immediately
-  after successful PTY creation, before registry insertion. Duplicate
-  terminal ids are rejected without replacing or dropping a `PtyTerminal`
-  while `RegistryInner` is held (the current insert ignores a replaced map
-  value — fix that). Barrier tests cover the duplicate-error path and a
-  `catch_unwind` publisher panic, proving the gate opens before every
-  possible PTY join.
+- **Gate opens on every error path (LB4, FE1).** The guard is created
+  immediately after successful PTY creation, before registry insertion, and
+  its drop opens the gate on every return path. Duplicate terminal ids are
+  rejected without replacing or dropping a `PtyTerminal` while
+  `RegistryInner` is held (the current insert ignores a replaced map value —
+  fix that). Publisher panics are **not** a gate path: they abort the
+  process (Callback Contract). Tests cover the duplicate-error path, the
+  spawn-failure path, and the subprocess abort test.
 - **Exit-cause model (LB7).**
 
   ```rust
@@ -566,8 +727,12 @@ and test the final adapter:
   exhausted auto-resume, and graceful shutdown leave rows `Bound`
   (`auto_resume.rs` doc: a still-Bound row is the not-closed signal;
   `retire_closed`'s single production call site today is `handle_kill`,
-  `ws/terminal.rs:3880/3895` — that discipline is preserved and extended to
-  the REST close door). Graceful shutdown calls no new retirement.
+  `ws/terminal.rs:3880/3895` — that discipline is preserved and **stays
+  WS-only**). **FE8: there is no REST close door.** Pane/tab DELETEs keep
+  PTYs for reattach and `DELETE /api/terminals/:id` only hides
+  (`terminals.rs:1033-1050`), so no REST code path may pass `ExplicitClose`;
+  a REST kill route is explicitly out of scope. Graceful shutdown calls no
+  new retirement.
 - **Epoch-conditional cleanup (LB8).** `retire_closed_if_owned(provider,
   session_id, terminal_id, create_request_id)` and epoch-keyed pending
   markers with `delete_pending_if_owned`. Comparison and mutation happen
@@ -594,7 +759,11 @@ and test the final adapter:
 
 - The production `LedgerIdentitySink` moves from bin-only
   `crates/freshell-server/src/identity_sink.rs` into a new
-  `crates/freshell-ws/src/identity_sink.rs`. Verified feasible with no cycle:
+  `crates/freshell-ws/src/identity_sink.rs`. #584 independently proved this
+  placement: its production write impl `LedgerPaneIdentityBinder` already
+  lives in `crates/freshell-ws/src/pane_identity_binder.rs`, and the new
+  sink absorbs its logic (the binder module is deleted in Slice E2).
+  Verified feasible with no cycle:
   `freshell-ws` already depends on `freshell-freshagent` (owner of
   `PaneIdentitySink`) and already owns `PaneLedger`,
   `TerminalIdentityRegistry`, and the `SharedExistenceProbe` trait
@@ -622,6 +791,8 @@ known create (REST or WS, negotiated):
   -> derive candidate + authorize
      (live-owner checks -> existence mapping)     [Slices A, D, E2]
   -> [amplifier legacy: probe-only existence BEFORE stub; then stub]
+  -> [fresh claude minted id only: awaited PIN2 pre-spawn binding
+      (kept; the one LB5 exception — deleted again on spawn failure)]
   -> spawn PTY; finalization guard created
   -> registry row insert + identity upsert (one registry critical section)
   -> provider-specific settle/adoption/admission complete(BoundOwner)
@@ -662,8 +833,10 @@ frames.
 - Create `crates/freshell-terminal/src/session_admission.rs`: shared
   cross-kind admission table.
 - Modify `crates/freshell-terminal/src/registry.rs`: D8 facade over
-  `SessionAdmission`; `create_with_publication` + finalization guard; atomic
-  running/retired identity transitions; duplicate-id rejection fix.
+  `SessionAdmission`; `create_with_publication` + finalization guard +
+  abort-on-panic publication wrapper; atomic running/retired identity
+  transitions; duplicate-id rejection fix; **remove the `PaneIdentityBinder`
+  trait** once its call sites migrate (Slice E2).
 - Modify `crates/freshell-terminal/src/lib.rs`: export the admission module.
 - Modify `crates/freshell-freshagent/src/session_lease.rs`:
   `FreshAgentSessionLeases` becomes a facade over the shared table.
@@ -671,7 +844,8 @@ frames.
   pure classifier (four providers only), trait extension, extended
   `FakeIdentitySink`.
 - Modify `crates/freshell-freshagent/src/lib.rs`: re-exports; loud sink
-  wiring; `identity_sink_wired()`.
+  wiring; `identity_sink_wired()`; **remove `with_pane_identity_binder` and
+  the `pane_identity` field** when the binder is absorbed (Slice E2).
 - Modify `crates/freshell-freshagent/src/terminal_tabs.rs`: provenance-aware
   derivation, fresh Claude mint, admission claim on the legacy rung,
   probe-before-stub ordering, known-identity create publication, pending
@@ -681,14 +855,20 @@ frames.
   sink setters/getters for boot assertions; lease facade call sites
   unchanged.
 - Create `crates/freshell-ws/src/identity_sink.rs`: the production
-  `LedgerIdentitySink` (moved per LB18) with authorization ordering,
-  exit-cause retirement, deferred-marker storage, announcement/revision
-  ownership.
+  `LedgerIdentitySink` (moved per LB18; absorbs `LedgerPaneIdentityBinder`'s
+  write logic and ported unit tests) with authorization ordering, exit-cause
+  retirement, deferred-marker storage, announcement/revision ownership, and
+  the `null_sink_for_tests()` helper (FE5).
+- Delete `crates/freshell-ws/src/pane_identity_binder.rs` (Slice E2, after
+  its call sites and tests migrate into the sink).
+- Modify `crates/freshell-ws/src/auto_resume.rs`: `claim_session` gains the
+  `SessionRefClaim::OwnedByFreshAgent` refusal arm (FE4, Slice B0).
 - Create `crates/freshell-ws/src/terminal_identity_publication.rs`:
   `publish_discovered_terminal_identity` / `publish_retired_signal_identity`
   helpers and the deferred re-authorization worker.
 - Modify `crates/freshell-ws/src/lib.rs`: `WsState` carries the sink;
-  `identity_sink_wired()`.
+  `identity_sink_wired()`. FE5: every `WsState` struct literal in the
+  workspace (~38 sites, enumerated in Slice D) is updated in the same slice.
 - Modify `crates/freshell-ws/src/identity.rs`: `upsert_with_retirement`
   (leaf single-write-lock).
 - Modify `crates/freshell-ws/src/pane_ledger.rs` (+ `pane_ledger_tests.rs`):
@@ -707,18 +887,20 @@ frames.
 - Modify `crates/freshell-ws/src/reconcile.rs`: scope the promoted-claim echo
   to gemini/kimi; four providers read published identity only.
 - Modify `crates/freshell-server/src/identity_sink.rs`: shrink to
-  construction glue; keep the bin unit-test harness (gf_ui incident, boot
-  wiring/teardown tests).
+  construction glue; keep the bin unit-test harness (boot wiring/teardown
+  tests; the gf_ui incident pin lives in the Slice I integration suite).
 - Modify `crates/freshell-server/src/main.rs`: one `SessionAdmission`, one
   sink, five-consumer injection, wired + `Arc::ptr_eq` boot assertions, weak
   owner probes.
 - Modify `crates/freshell-server/src/terminals.rs`: authority-only projection
   for the four providers; gemini/kimi synthesis retained.
-- Modify `crates/freshell-server/src/existence.rs`: probe-only /
-  legacy-adjudication variant that ignores zero-turn broker-shaped stubs
-  (trait touch in `crates/freshell-ws/src/existence.rs` if required).
-- Modify `crates/freshell-platform/src/cli_launch.rs` + `lib.rs`: shared
-  fresh-Claude preallocation predicate.
+- Modify `crates/freshell-server/src/existence.rs`: `exists_with_freshness`
+  impl (FE6); probe-only / legacy-adjudication variant that ignores
+  zero-turn broker-shaped stubs (trait extension in
+  `crates/freshell-ws/src/existence.rs`).
+- `crates/freshell-platform/src/cli_launch.rs`: **no change** — the shared
+  fresh-Claude preallocation predicate landed in #584 (Slice E1 is
+  verify-only).
 - Create `crates/freshell-ws/tests/cross_kind_admission.rs`:
   barrier-synchronized cross-kind exactly-one-winner suite (extends the
   harness patterns of `cross_kind_liveness.rs`,
@@ -734,23 +916,79 @@ frames.
   version-gated OpenCode contract.
 - Do not modify `src/store/selectors/sidebarSelectors.ts`.
 
-## Harvesting the Claude-Focused Branch
+## Reconciliation with Merged PR #584 (base `6147c700`)
 
-Branch `fix/rest-terminal-session-identity` (worktree
-`/home/dan/code/freshell/.worktrees/rest-terminal-session-identity`, head
-`4d46c86a`) contains reviewed work. Do not merge wholesale; compare per
-commit and reuse where invariants still hold:
+PR #584 (`fix/rest-terminal-session-identity`, kata `hbsa`) and PR #583
+merged into `origin/main` while the previous revision was being written; the
+old "harvest the Claude-focused branch" guidance is obsolete. This section is
+the authoritative delta. Implementers must study
+`git log --stat 537d7d09..6147c700` before starting.
 
-- `180a15e9` "shared fresh-claude preallocation predicate for both create
-  doors" maps directly onto **Slice E1** — compare/cherry-pick rather than
-  rewrite.
-- `4d46c86a` "REST claude creates mint a preallocated --session-id" overlaps
-  **Slice E2**'s fresh-Claude arm; reuse its tests where they match this
-  plan's publication pipeline.
-- Its plan-fix commits (`4709ee8a` retire-on-natural-exit correction) agree
-  with this plan's LB7 stance; treat them as corroboration.
+**Landed — verify, do not redo:**
 
-Never edit that worktree; it may be owned by another agent.
+- **Slice E1 is DONE.** `freshell_platform::should_preallocate_fresh_claude`
+  plus its truth table (`crates/freshell-platform/src/cli_launch.rs:601-726`),
+  already consumed by both doors.
+- **REST fresh-Claude minting is DONE** (`4d46c86a`): REST claude creates
+  mint a preallocated `--session-id` with `LaunchIntent::Start`;
+  `derive_resume_identity` already returns the pre-provider-filter parse
+  result; `claude_fresh_prealloc` flows through `GatedSettleInputs`; split
+  and respawn mint pins landed in `terminal_tabs.rs` tests.
+- **The exact `gf ui` incident is FIXED** (`1bc31c5f` + pins in
+  `crates/freshell-ws/tests/rest_locator_identity.rs` and
+  `rest_claude_identity.rs`). See the incident section; it becomes a green
+  pin in Slice I.
+- **PIN2 pre-spawn Claude binding on the REST door** (awaited,
+  `spawn_blocking`, `claude_fresh_prealloc`-gated, with the spawn-failure
+  delete) — kept per the LB5 rescope in Lifecycle Corrections.
+
+**Landed — absorb and migrate (FE3):**
+
+- `PaneIdentityBinder`: trait at
+  `crates/freshell-terminal/src/registry.rs:655-703`, production impl
+  `LedgerPaneIdentityBinder` at
+  `crates/freshell-ws/src/pane_identity_binder.rs`, wiring via
+  `FreshAgentState::with_pane_identity_binder` (`freshagent/lib.rs:475`) and
+  `main.rs:305`. Its crate placement independently confirms LB18. It is,
+  however, a second, **provenance-blind** write seam:
+  `register_create_identity` publishes an identity row and ledger binding
+  for *any* session-carrying create — including unvalidated legacy raw ids —
+  which conflicts with this plan's authority model (a raw id becomes
+  authoritative only on `Present` existence). Migration (Slice E2, after the
+  sink exists in Slice D): move each of the four binder call sites
+  (`record_prespawn_claude_binding`, `delete_prespawn_claude_binding`,
+  `register_create_identity`, `retire_pane_identity`) onto the extended
+  `PaneIdentitySink` — the pre-spawn pair as the typed PIN2 exception; the
+  post-spawn write through candidate → authorize → publish → persist; the
+  exit hook through `retire_terminal_identity(id, NaturalExit)` (the
+  binder's natural-exit-leaves-`Bound` behavior already matches LB7). Port
+  the binder's unit tests into the ws `identity_sink::tests` module — they
+  pin load-bearing behavior (natural exit leaves the ledger `Bound`, write
+  failure never blocks a create, pending markers for `MARKER_MODES`, shell
+  no-op). Then delete `pane_identity_binder.rs`, the trait, and the
+  `with_pane_identity_binder` wiring in the same slice. The landed
+  integration pins must stay green through the migration — **except** where
+  this plan deliberately changes behavior (legacy raw ids no longer publish
+  without existence validation): if a landed pin asserts raw-id publication,
+  rescope it to an accepted-ref or `Present`-existence fixture and record
+  the delta in the implementation report.
+- The binder's warn-and-proceed failure policy maps onto this plan's typed
+  `Degraded` durability plus exactly one `durability.degraded` frame.
+
+**Landed — narrows a hole but does not close it:**
+
+- The A13 e2e pins refuse fresh-agent/signal claims on sessions owned by
+  live REST terminals — possible now that REST creates publish identity
+  rows. The REST **terminal** door still claims nothing cross-kind
+  (`terminal_tabs.rs` has no `has_live_session` reference on `6147c700`),
+  and #584's own plan records its LB-11 residual cross-kind race as out of
+  scope. Slice B0 (D4) remains fully necessary.
+
+**Superseded planning artifacts:**
+
+- Main's `docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md`
+  is #584's historical plan document. Do not edit it and do not re-implement
+  its tasks; everything still relevant from it is subsumed here.
 
 ---
 
@@ -765,10 +1003,13 @@ across a slice boundary (defaults flipped to required within one slice);
 earlier slice.
 
 - [ ] **Preflight (before Slice A):** confirm branch/base
-  (`git log --oneline -3` shows this plan's commits atop `537d7d09`), then run
-  the repo-supported baseline on this base via the shared test coordinator
-  per `AGENTS.md`. Record counts in the implementation report. Stop on a red
-  base.
+  (`git log --oneline -5` shows this plan's commits atop `6147c700`), confirm
+  the landed E1 predicate
+  (`cargo test -p freshell-platform fresh_claude_preallocation_predicate_truth_table -- --exact`),
+  study `git log --stat 537d7d09..6147c700` (Reconciliation section), then
+  run the repo-supported baseline on this base via the shared test
+  coordinator per `AGENTS.md`. Record counts in the implementation report.
+  Stop on a red base.
 
 ---
 
@@ -841,7 +1082,9 @@ pub enum TerminalIdentityAuthorization {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalDurabilityPhase { Postspawn, Discovery, Pending, Cleanup }
+pub enum TerminalDurabilityPhase { Prespawn, Postspawn, Discovery, Pending, Cleanup }
+// `Prespawn` exists solely for the PIN2 minted-fresh-Claude lane (LB5
+// rescope, FE3) so its typed degradation is machine-distinct.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalDurabilityDegradation {
@@ -967,7 +1210,11 @@ Session Admission" above and **D5**.
 `crates/freshell-terminal/src/{lib,registry}.rs`,
 `crates/freshell-freshagent/src/session_lease.rs`,
 `crates/freshell-freshagent/src/terminal_tabs.rs`,
-`crates/freshell-ws/src/terminal.rs`, `crates/freshell-server/src/main.rs`;
+`crates/freshell-ws/src/terminal.rs`,
+`crates/freshell-ws/src/auto_resume.rs` (FE4 — its `claim_session` has an
+exhaustive `SessionRefClaim` match at `auto_resume.rs:651-681` that stops
+compiling the moment the new variant lands, so it is handled in the same
+step), `crates/freshell-server/src/main.rs`;
 create `crates/freshell-ws/tests/cross_kind_admission.rs`.
 
 - [ ] **Step 1 (B0.1 RED):** land `SessionAdmission` with `claim` stubbed to
@@ -980,6 +1227,11 @@ create `crates/freshell-ws/tests/cross_kind_admission.rs`.
   - `claim_across_complete_answers_bound_live`
   - `cross_kind_bound_live_is_never_adoptable`
   - `claim_discovered_vs_lease_is_atomic`
+  - `claim_discovered_same_exact_owner_is_idempotent` (FE11)
+  - `claim_discovered_any_different_owner_is_refused` (FE11: a second
+    same-kind terminal owner and a cross-kind owner both refuse; the
+    process-left-running + loud-surface halves are asserted at the door
+    level in Step 6 and Slice F)
   - `clear_binding_requires_owner_match`
   - `release_for_conn_releases_only_terminal_holders`
   - `force_release_requires_confirmed_kill`
@@ -1019,23 +1271,34 @@ cargo test -p freshell-freshagent terminal_tabs::tests::rest_legacy_raw_resume_c
 
 - [ ] **Step 4 (B0.2 GREEN):** convert both lease stores to facades over one
   injected `Arc<SessionAdmission>` (public APIs and signatures preserved);
-  add `SessionRefClaim::OwnedByFreshAgent`; map it to 409/`SESSION_RESERVED`
-  per D2 at each door; extend the REST door's claim to the legacy rung; wire
-  the single instance in `main.rs`. Facade preservation gates:
+  add `SessionRefClaim::OwnedByFreshAgent` — **and, in this same step, every
+  exhaustive `SessionRefClaim` match gains the new arm so `cargo check`
+  stays green (FE4):** the WS door (`terminal.rs:1496-1534`) and REST door
+  (`terminal_tabs.rs:1061-1075`) map it to the D2 errors, and
+  `auto_resume.rs::claim_session` (`auto_resume.rs:651-681`) answers
+  `false` — a fresh-agent-owned session is never auto-respawned — with unit
+  test `auto_resume_claim_refuses_fresh_agent_owned_session` (fake registry
+  binding, hub-level claim returns `false`, no respawn attempt). Map the
+  claim to 409/`SESSION_RESERVED` per D2 at each door; extend the REST
+  door's claim to the legacy rung; wire the single instance in `main.rs`.
+  Facade preservation gates:
 
 ```bash
 cargo test -p freshell-freshagent session_lease -- --nocapture
 cargo test -p freshell-terminal session_ref -- --nocapture
 cargo test -p freshell-ws --test freshagent_session_lease
 cargo test -p freshell-ws --test cross_kind_liveness
+cargo test -p freshell-ws auto_resume -- --nocapture
 cargo test -p freshell-freshagent terminal_tabs::tests::rest_terminal_resume_of_live_fresh_agent_session_returns_409 -- --exact --nocapture
 cargo test -p freshell-freshagent terminal_tabs::tests::rest_legacy_raw_resume_claims_admission_before_spawn -- --exact --nocapture
+cargo check -p freshell-ws
 cargo check -p freshell-server
 git add crates/freshell-terminal/src/session_admission.rs \
   crates/freshell-terminal/src/registry.rs \
   crates/freshell-freshagent/src/session_lease.rs \
   crates/freshell-freshagent/src/terminal_tabs.rs \
   crates/freshell-ws/src/terminal.rs \
+  crates/freshell-ws/src/auto_resume.rs \
   crates/freshell-server/src/main.rs
 git commit -m "fix(rest): atomic cross-kind session admission closes the REST two-writer hole"
 ```
@@ -1173,11 +1436,13 @@ Semantics:
   `RegistryInner`; run duplicate-resume checks; **reject a duplicate
   terminal id without replacing or dropping a `PtyTerminal` under the lock**
   (LB4 — fix the ignored-replacement insert at `registry.rs:979-986`); insert
-  the row; invoke `publish` synchronously while the row is hidden behind the
-  lock (leaf Callback Contract); bump the revision; drop the lock; preserve
+  the row; invoke `publish` synchronously **through the abort-on-panic
+  wrapper** while the row is hidden behind the lock (Callback Contract, FE1:
+  the callback is a leaf in-memory write; an unwind aborts the process and
+  can never poison the mutex); bump the revision; drop the lock; preserve
   reservation release, structured log, and `ActivityEvent::Created` order;
-  return the guard to the caller. `create` delegates with `|_| {}` and drops
-  the guard immediately (legacy behavior preserved).
+  return the guard to the settlement owner. `create` delegates with `|_| {}`
+  and drops the guard immediately (legacy behavior preserved).
 - `publish_running_session_identity` under one `RegistryInner` lock: reject
   missing/non-running rows; require `entry.mode == provider`;
   `AlreadyPublished` (no callback, no revision) when ids match; first
@@ -1194,16 +1459,28 @@ Semantics:
   rows.
 
 - [ ] **Step 1 (RED):** land the types and **naive stubs** (delegate to
-  `create` then invoke the publisher outside the lock; guard opens
-  immediately; publish methods return `Missing`) together with all twelve
-  tests, using barriers/channels, never sleeps:
+  `create` then invoke the publisher outside the lock without the abort
+  wrapper; guard opens immediately; publish methods return `Missing`)
+  together with all thirteen tests, using barriers/channels, never sleeps:
 
   - `create_publication_hides_row_until_identity_callback_completes`
   - `immediate_exit_waits_for_finalization_guard`
-  - `exit_hook_cannot_run_before_caller_settlement_completes` (LB6: caller
-    holds the guard across a barrier standing in for durable-write +
-    announcement; exit hook order-asserted after)
-  - `finalization_guard_opens_on_publisher_panic` (LB4, `catch_unwind`)
+  - `exit_hook_cannot_run_before_caller_settlement_completes` (LB6: the
+    settlement owner holds the guard across a barrier standing in for
+    durable-write + announcement; exit hook order-asserted after)
+  - `publisher_panic_aborts_the_process` (FE1, subprocess test: re-exec the
+    current test binary — `std::env::current_exe()` — with
+    `FRESHELL_TEST_PANICKING_PUBLISHER=1` selecting a helper test that
+    installs a panicking publisher; assert the child terminates abnormally
+    by **abort** (`!status.success()` and, on unix, `SIGABRT`), and that
+    stderr shows the abort wrapper's invariant message, not an ordinary
+    unwinding panic or a poisoned-mutex panic. RED against the naive stub:
+    the child unwinds normally instead of aborting, so the assertion fails
+    at runtime.)
+  - `registry_remains_usable_after_duplicate_id_rejection` (FE1 error path:
+    a duplicate create fails with an error return; a subsequent create,
+    list, and kill on the same registry all succeed — no poisoning, no
+    leftover row from the rejected create)
   - `duplicate_terminal_id_rejects_without_dropping_running_pty` (LB4)
   - `discovered_identity_updates_running_row_and_callback_atomically`
   - `discovered_identity_cannot_publish_after_exit` (calls
@@ -1214,18 +1491,19 @@ Semantics:
   - `retired_rebind_requires_expected_previous_identity`
   - `create_wrapper_preserves_legacy_behavior`
 
-  RED: atomicity/ordering/result assertions fail at runtime against the
-  naive stubs.
+  RED: atomicity/ordering/result/abort assertions fail at runtime against
+  the naive stubs.
 
-- [ ] **Step 2 (GREEN + refactor):** implement the gate/lock ordering and
-  transitions; run **all twelve** focused (no drift — every declared test is
-  run):
+- [ ] **Step 2 (GREEN + refactor):** implement the gate/lock ordering, the
+  abort-on-panic wrapper, and the transitions; run **all thirteen** focused
+  (no drift — every declared test is run):
 
 ```bash
 cargo test -p freshell-terminal registry::tests::create_publication_hides_row_until_identity_callback_completes -- --exact --nocapture
 cargo test -p freshell-terminal registry::tests::immediate_exit_waits_for_finalization_guard -- --exact --nocapture
 cargo test -p freshell-terminal registry::tests::exit_hook_cannot_run_before_caller_settlement_completes -- --exact --nocapture
-cargo test -p freshell-terminal registry::tests::finalization_guard_opens_on_publisher_panic -- --exact --nocapture
+cargo test -p freshell-terminal registry::tests::publisher_panic_aborts_the_process -- --exact --nocapture
+cargo test -p freshell-terminal registry::tests::registry_remains_usable_after_duplicate_id_rejection -- --exact --nocapture
 cargo test -p freshell-terminal registry::tests::duplicate_terminal_id_rejects_without_dropping_running_pty -- --exact --nocapture
 cargo test -p freshell-terminal registry::tests::discovered_identity_updates_running_row_and_callback_atomically -- --exact --nocapture
 cargo test -p freshell-terminal registry::tests::discovered_identity_cannot_publish_after_exit -- --exact --nocapture
@@ -1369,13 +1647,24 @@ fn defer_legacy_reauthorization(&self, candidate: TerminalIdentityCandidate);
 fn drop_legacy_reauthorization(&self, terminal_id: &str);
 
 fn announce_terminal_identity(&self, announcement: TerminalIdentityAnnouncement);
+
+// PIN2 exception (LB5 rescope, FE3): the ONLY pre-spawn durable write,
+// absorbed from the landed binder; minted-fresh-Claude lane only. The
+// delete twin runs on spawn failure.
+fn persist_prespawn_minted_claude_binding(
+    &self,
+    identity: AuthorizedTerminalIdentity, // provenance == ServerPreallocated
+) -> TerminalDurabilityWrite;
+fn delete_prespawn_minted_claude_binding(&self, session_id: String)
+    -> TerminalDurabilityWrite;
 ```
 
 (`TerminalAuthorization`/`TerminalDurabilityWrite` are the existing
-boxed-future aliases. There is **no** `delete_terminal_binding_if_owned`
-trait method: with pre-spawn writes removed, its only consumer is gone;
-epoch-guarded cleanup goes through `retire_terminal_identity`'s
-`ExplicitClose` lane and the C1 primitives.)
+boxed-future aliases. There is **no** general
+`delete_terminal_binding_if_owned` trait method: with general pre-spawn
+writes removed, its only consumer is gone; the sole pre-spawn delete is the
+typed PIN2 twin above, and epoch-guarded cleanup goes through
+`retire_terminal_identity`'s `ExplicitClose` lane and the C1 primitives.)
 
 **Production sink** (`crates/freshell-ws/src/identity_sink.rs`):
 
@@ -1438,6 +1727,33 @@ construct `WsState` with a clone → assert **all five**
 `identity_sink_wired()` **and** `Arc::ptr_eq` against the constructed sink,
 alongside the existing spawn-gate assertion (`main.rs:509-516` template).
 
+**`WsState` blast radius (FE5):** `WsState` gains
+`pub identity_sink: Arc<dyn PaneIdentitySink>`. `WsState` is constructed by
+struct literal in **~38 places**, and every one must be updated in this
+slice or the workspace stops compiling. Source sites:
+`crates/freshell-server/src/main.rs` (1), `crates/freshell-ws/src/lib.rs`
+(incl. the `state()` unit-test helper), `spawn_gate.rs` (1),
+`terminal.rs` (2), `codex_association.rs` (1), `opencode_association.rs`
+(1). Test sites: `crates/freshell-ws/tests/common/mod.rs` (**8** literals)
+and one literal each in `claude_session_rebind.rs`,
+`codex_managed_launch_e2e.rs`, `codex_session_ref_resume.rs`,
+`cross_kind_liveness.rs`, `diag01_lifecycle_events.rs`,
+`freshagent_claude_attach.rs`, `freshagent_claude_kill_interrupt.rs`,
+`freshagent_session_lease.rs`, `hello_timeout.rs`, `keepalive.rs`,
+`max_payload.rs`, `opencode_switch_rebind.rs`, `origin_policy.rs`,
+`pane_reconcile_freshagent.rs`, `pane_reconcile.rs`,
+`rest_claude_identity.rs`, `rest_locator_identity.rs`,
+`restore_spawn_gate.rs`, `rest_ws_shared_gate.rs`,
+`safe08_restore_diagnostics.rs`, `term09_output_queue.rs`. Containment:
+export `freshell_ws::identity_sink::null_sink_for_tests() ->
+Arc<dyn PaneIdentitySink>` (a cheap always-compiled recording no-op,
+`#[doc(hidden)]`; it also seeds Slice F0's `RecordingSink`) so each literal
+adds exactly one line. Do **not** introduce a `Default`/builder for
+`WsState` here — most fields are not defaultable; enumeration plus the
+one-liner is the contained fix. `cargo test -p freshell-ws --all-targets`
+(compile + run) is part of this slice's GREEN gate, precisely to catch any
+missed literal.
+
 - [ ] **Step 1 (RED):** land trait methods with temporary default bodies
   (authorize → always `Reject(ProviderUnavailable)`, persist → `Degraded`,
   retire/defer/announce → recording no-ops), the extended
@@ -1461,9 +1777,23 @@ alongside the existing spawn-gate assertion (`main.rs:509-516` template).
   - `amplifier_uses_the_provider_aware_no_runtime_arm`
   - `legacy_adjudication_ignores_zero_turn_broker_stubs` (LB15 probe arm,
     fake existence source)
+  - `stale_snapshot_absent_is_deferrable_and_fresh_absent_is_permanent`
+    (FE6: fake probe answers `Absent` with `index_fresh: false` →
+    `LegacyIdentityUnconfirmed`; `index_fresh: true` →
+    `LegacyIdentityAbsent`)
+  - `provider_unavailable_is_a_permanent_rejection` (FE7)
+  - `prespawn_minted_claude_binding_writes_bound_row_and_delete_removes_it`
+    (ported from the landed binder unit tests; PIN2 exception via the sink)
   - `natural_exit_retires_memory_but_leaves_ledger_bound` (LB7)
   - `explicit_close_retires_ledger_via_epoch_guard` (LB7/LB8)
   - `retirement_retires_memory_then_runs_ledger_cleanup_off_reader_thread`
+
+  freshell-server bin (`existence::tests`):
+  - `exists_with_freshness_reports_stale_snapshot_absent_as_unfresh` (FE6:
+    seeded index, session written after the snapshot; `exists` alone says
+    `Absent`, `exists_with_freshness` says `Absent` + `index_fresh: false`;
+    companion to the existing
+    `session_written_after_cold_read_resolves_present_on_requery`)
 
   freshell-server bin (`identity_sink::tests`):
   - `boot_wires_one_pointer_identical_sink_into_all_five_consumers` (LB2)
@@ -1481,6 +1811,8 @@ alongside the existing spawn-gate assertion (`main.rs:509-516` template).
 cargo test -p freshell-freshagent identity_sink::tests -- --nocapture
 cargo test -p freshell-ws identity_sink::tests -- --nocapture
 cargo test -p freshell-server identity_sink::tests -- --nocapture
+cargo test -p freshell-server existence::tests -- --nocapture
+cargo test -p freshell-ws --all-targets   # FE5 gate: every WsState literal updated
 cargo check -p freshell-server
 cargo fmt --all --check
 cargo clippy -p freshell-freshagent -p freshell-ws -p freshell-server --all-targets -- -D warnings
@@ -1505,58 +1837,44 @@ git commit -m "feat(ws): shared terminal identity sink with typed durability and
 
 ---
 
-### Slice E1 — Fresh-Claude preallocation predicate
+### Slice E1 — Fresh-Claude preallocation predicate — **LANDED in #584 (verify only)**
 
-**Files:** `crates/freshell-platform/src/cli_launch.rs`,
-`crates/freshell-platform/src/lib.rs`.
+PR #584 landed exactly this slice:
+`freshell_platform::should_preallocate_fresh_claude`
+(`crates/freshell-platform/src/cli_launch.rs:616-626`) with the truth-table
+test `fresh_claude_preallocation_predicate_truth_table` (`cli_launch.rs:693+`),
+already consumed by **both** doors (WS `terminal.rs` and REST
+`terminal_tabs.rs`). There is no work in this slice and no commit.
 
-Compare with Claude-branch commit `180a15e9` first; cherry-pick/adapt if its
-predicate and truth table match this signature.
-
-```rust
-pub fn should_preallocate_fresh_claude(
-    mode: &str,
-    restore: Option<bool>,
-    has_parsed_session_ref: bool,
-    resume_session_id: Option<&str>,
-) -> bool
-```
-
-- [ ] **Step 1 (RED):** land the predicate stubbed `false` + the truth table
-  test `fresh_claude_preallocation_truth_table` (the two `assert!(p(...))`
-  rows fail at runtime):
-
-```rust
-assert!(p("claude", None, false, None));
-assert!(p("claude", Some(false), false, Some("")));
-assert!(!p("claude", Some(true), false, None));
-assert!(!p("claude", None, true, None));
-assert!(!p("claude", None, false, Some(CLAUDE_ID)));
-assert!(!p("codex", None, false, None));
-assert!(!p("opencode", None, false, None));
-assert!(!p("amplifier", None, false, None));
-```
-
-- [ ] **Step 2 (GREEN + commit):**
+- [ ] **Verify only:**
 
 ```bash
-cargo test -p freshell-platform fresh_claude_preallocation_truth_table -- --exact --nocapture
-cargo test -p freshell-platform --all-targets
-cargo fmt --all --check
-cargo clippy -p freshell-platform --all-targets -- -D warnings
-git add crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/lib.rs
-git commit -m "feat(platform): fresh-claude preallocation predicate"
+cargo test -p freshell-platform fresh_claude_preallocation_predicate_truth_table -- --exact --nocapture
 ```
 
 ---
 
-### Slice E2 — REST known-identity publication + the exact `gf ui` incident
+### Slice E2 — REST provenance-aware publication (absorbs the landed binder)
+
+The incident fix itself landed in #584 (see Reconciliation) — the old RED
+tuple `(None, None, Some("981008-old-gf-ui"))` is impossible on `6147c700`,
+and the exact `gf ui` shape becomes a green acceptance pin in Slice I.
+Genuine runtime REDs remain because the landed binder is provenance-blind
+(it publishes even unvalidated legacy raw ids), and the REST door still
+lacks the FE10 rejection ladder, authorization ordering, deferred markers,
+cause-aware retirement, atomic publication, and scoped pane promotion.
 
 **Files:** `crates/freshell-freshagent/src/terminal_tabs.rs`,
-`crates/freshell-server/src/identity_sink.rs` (gf_ui test harness),
-`crates/freshell-server/src/main.rs` (wiring only if needed).
+`crates/freshell-freshagent/src/lib.rs` (remove `with_pane_identity_binder`
+and the `pane_identity` field), **delete**
+`crates/freshell-ws/src/pane_identity_binder.rs`,
+`crates/freshell-terminal/src/registry.rs` (remove the `PaneIdentityBinder`
+trait), `crates/freshell-ws/src/identity_sink.rs` (receive the ported binder
+unit tests), `crates/freshell-server/src/main.rs` (wiring swap: binder out,
+nothing new in — the sink is already wired from Slice D).
 
-**Interfaces:**
+**Interfaces:** the landed `derive_resume_identity` already returns the
+pre-provider-filter parse result (#584); extend its return shape as needed:
 
 ```rust
 pub(crate) struct DerivedResumeIdentity {
@@ -1569,52 +1887,19 @@ pub(crate) struct DerivedResumeIdentity {
 
 plus `authorized_identity: Option<AuthorizedTerminalIdentity>` and
 `durability: Option<TerminalIdentityDurability>` threaded through the owned
-settle inputs/spawn result as needed.
+settle inputs/spawn result as needed (`GatedSettleInputs` already carries
+`claude_fresh_prealloc`).
 
-- [ ] **Step 1 (RED, all runtime, all in-slice):**
-
-  In `crates/freshell-server/src/identity_sink.rs` tests, the exact incident
-  reproduction `gf_ui_rest_recovery_publishes_directory_memory_and_durable_identity`:
-  merged in-process router over one real `TerminalRegistry`,
-  `TerminalIdentityRegistry`, enabled temp-root `PaneLedger`, directory
-  state, broadcast bus, and a recording Codex executable. Seed the old
-  binding:
-
-```rust
-ledger.record_binding(&BindingWrite {
-    provider: "codex",
-    session_id: "019f9cb3-f11e-79f3-a968-287a5bc5798c",
-    terminal_id: "981008-old-gf-ui",
-    mode: "codex",
-    cwd: Some("/home/dan/code/glowforge"),
-    create_request_id: Some("old-gf-ui"),
-    now_ms: 1,
-})?;
-```
-
-  POST `{"name":"gf ui","mode":"codex","cwd":"<temp>/glowforge",
-  "createRequestId":"gf-ui-rest-recovery","sessionRef":{"provider":"codex",
-  "sessionId":"019f9cb3-f11e-79f3-a968-287a5bc5798c"}}` and assert the
-  three-way tuple (directory ref, identity `session_ref_for`, live ledger
-  terminal) all name the new terminal and the incident session, plus exactly
-  one resume invocation in the recording executable.
-
-  Run and record the genuine RED tuple:
-
-```bash
-cargo test -p freshell-server identity_sink::tests::gf_ui_rest_recovery_publishes_directory_memory_and_durable_identity -- --exact --nocapture
-```
-
-  Expected current tuple: `(None, None, Some("981008-old-gf-ui"))`. Save the
-  exact output for the implementation report.
-
-  In `terminal_tabs::tests`, the route matrix (against the Slice D sink API,
-  which exists — genuine runtime REDs):
+- [ ] **Step 1 (RED, all runtime, all in-slice):** in `terminal_tabs::tests`,
+  the route matrix (against the Slice D sink API, which exists — genuine
+  runtime REDs):
 
   - `fresh_claude_rest_create_uses_start_and_publishes_minted_identity`
+    (minting landed in #584; the *publication-through-the-sink* assertion is
+    the RED)
   - `explicit_claude_codex_opencode_and_amplifier_refs_publish_identity`
     (four recording CLI specs; directory/identity/reloaded-ledger all equal
-    the request ref per provider)
+    the request ref per provider, with provenance `AcceptedSessionRef`)
   - `fresh_amplifier_preserves_stub_before_spawn_and_publishes_minted_identity`
     (recording executable checks `events.jsonl` existed at process start and
     argv carries the minted UUID in resume position)
@@ -1623,27 +1908,57 @@ cargo test -p freshell-server identity_sink::tests::gf_ui_rest_recovery_publishe
     happens first; rescope/replace the old
     `requested_amplifier_resume_with_missing_dir_is_restubbed_under_same_id`
     expectation for the legacy arm — accepted/minted arms unchanged)
-  - `raw_resume_publishes_only_after_present_existence`
-  - `raw_resume_unknown_existence_launches_and_records_deferred_marker`
-    (LB12 arm: launch OK, no published identity, marker recorded via fake
-    sink; no pane `sessionRef` promotion)
+  - `raw_resume_publishes_only_after_present_existence` (**genuine RED on
+    `6147c700`:** the landed binder publishes any session-carrying create;
+    under this plan a raw id publishes only on `Present`)
+  - `raw_resume_unknown_or_stale_absent_launches_and_records_deferred_marker`
+    (LB12/FE6 arm: launch OK, no published identity, marker recorded via
+    fake sink; no pane `sessionRef` promotion)
+  - `raw_resume_fresh_absent_or_provider_unavailable_warns_permanently`
+    (FE6/FE7: launch OK, structured warning, no marker, never deferred)
+  - `cross_provider_session_ref_is_rejected_400_before_spawn` (FE10: POST
+    `mode:"claude"` with a codex `sessionRef` → 400
+    `SESSION_REF_PROVIDER_MISMATCH`, zero PTY spawns — today this launches a
+    bare unresumable claude)
+  - `claude_restore_true_without_identity_is_rejected_422` (FE10: mirror of
+    the WS `error_claude_restore_unresolved` ladder → 422
+    `CLAUDE_RESTORE_UNRESOLVED`, zero spawns — today this launches a bare
+    claude with neither `--session-id` nor `--resume`)
+  - `amplifier_restore_true_without_id_still_launches_bare` (pin of the
+    landed, documented amplifier restore-bare carve-out — deliberate, not
+    an FE10 defect)
   - `pane_content_session_ref_is_stamped_only_for_authorized_identities`
     (four providers; gemini/kimi promotion untouched — carve-out pin)
-  - `spawn_failure_writes_no_binding_and_frees_admission` (post-spawn-only
-    durability: nothing durable exists to clean; admission lease released)
+  - `spawn_failure_deletes_prespawn_row_writes_nothing_else_and_frees_admission`
+    (post-spawn-only durability except PIN2: the minted-claude pre-spawn row
+    is deleted by the landed failure-delete twin, now via the sink; the
+    admission lease is released)
   - `immediate_exit_retires_after_atomic_publication`
-  - `natural_exit_leaves_ledger_bound_explicit_close_retires` (route-level
-    LB7: exit hook passes `NaturalExit`; REST close path passes
-    `ExplicitClose`)
-  - `tab_split_and_respawn_share_the_known_identity_pipeline`
+  - `natural_exit_leaves_ledger_bound` (route-level LB7; `ExplicitClose` is
+    WS-only per FE8 — no REST path may pass it, asserted by the absence of
+    any `ExplicitClose` call in `terminal_tabs.rs`)
+  - `client_abort_mid_create_still_completes_settlement` (FE9: start a
+    create against a barrier-gated recording CLI, drop the HTTP
+    handler/response future mid-flight, release the barrier; assert identity
+    published, durable write completed, announcement frames enqueued, and
+    the finalization guard dropped only after settlement — the detached
+    settle task owns the guard)
+  - `tab_split_and_respawn_share_the_known_identity_pipeline` (the landed
+    split/respawn mint pins stay green alongside)
 
 - [ ] **Step 2 (GREEN):** implement in `terminal_tabs.rs`:
 
   1. `DerivedResumeIdentity` (use `parsed_session_ref_present`, not raw JSON
-     field presence; `"sessionRef": null` is absent and still mints; a
-     parsed ref for any provider disables minting).
-  2. Fresh-Claude policy via `should_preallocate_fresh_claude`:
-     minted UUID, `ServerPreallocated`, `LaunchIntent::Start`.
+     field presence; `"sessionRef": null` is absent and still mints — landed
+     semantics). **FE10 rejection ladder, before any spawn work:** a parsed
+     ref whose provider ≠ mode → 400 `SESSION_REF_PROVIDER_MISMATCH` (all
+     four providers); claude `restore: true` with no accepted ref and no
+     resume id → 422 `CLAUDE_RESTORE_UNRESOLVED`; the amplifier restore-bare
+     carve-out and `INVALID_RAW_CODEX_RESUME_MESSAGE` behavior stay
+     verbatim.
+  2. Fresh-Claude minting: landed in #584 — keep; route the PIN2 pre-spawn
+     binding and its failure delete through the sink's typed methods
+     (migrated binder call sites).
   3. Amplifier: preserve mint/stub/cwd logic; `ServerPreallocated` only when
      this request minted the UUID; **legacy raw ids run probe-only existence
      authorization before `ensure_session`** (LB15); stub still precedes
@@ -1653,39 +1968,53 @@ cargo test -p freshell-server identity_sink::tests::gf_ui_rest_recovery_publishe
      `LiveFreshAgentOwner` → existing planned-launch/stub cleanup +
      `409 RESTORE_UNAVAILABLE`. On deferrable legacy rejection → launch,
      `authorized_identity = None`, `defer_legacy_reauthorization`, structured
-     log. On permanent `LegacyIdentityAbsent` → launch, structured warning
-     only. Managed-Codex planner id mismatch → 500 before spawn.
+     log. On permanent rejection (`LegacyIdentityAbsent` fresh,
+     `ProviderUnavailable`) → launch, structured warning only.
+     Managed-Codex planner id mismatch → 500 before spawn.
   5. `create_with_publication` with the synchronous memory-publish callback
-     (`debug_assert_eq!` terminal ids); hold the returned
-     `CreateFinalizationGuard` through settlement; exit hook calls
-     `retire_terminal_identity(id, NaturalExit)` after `finish_pty_exit`;
-     the REST explicit-close door calls the `ExplicitClose` retire.
+     (`debug_assert_eq!` terminal ids); the **detached settle task** holds
+     the returned `CreateFinalizationGuard` through settlement (FE9 — never
+     the HTTP handler); exit hook calls
+     `retire_terminal_identity(id, NaturalExit)` after `finish_pty_exit`.
+     No REST code path passes `ExplicitClose` (FE8).
   6. Post-spawn awaited `persist_terminal_identity(…, Postspawn)` for every
-     authorized identity (no pre-spawn writes, no settlement aggregation —
-     single result). `persist_terminal_pending` for identityless fresh
-     Codex/OpenCode creates, epoch-keyed.
+     authorized identity (single result, no settlement aggregation).
+     `persist_terminal_pending` for identityless fresh Codex/OpenCode
+     creates, epoch-keyed.
   7. Scoped pane promotion per LB10 consumer table.
+  8. **Binder absorption (FE3):** swap the four binder call sites to the
+     sink; port the binder unit tests into ws `identity_sink::tests`; delete
+     `pane_identity_binder.rs`, the `PaneIdentityBinder` trait, the
+     `pane_identity` field, and the `main.rs` binder wiring — all in this
+     slice, leaving no parallel write path. The landed integration pins
+     (`rest_claude_identity.rs`, `rest_locator_identity.rs`,
+     `pane_ledger_restore.rs`) must stay green; if one asserts unvalidated
+     raw-id publication, rescope it to an accepted-ref or
+     `Present`-existence fixture and record the delta in the report.
 
 ```bash
-cargo test -p freshell-platform fresh_claude_preallocation_truth_table -- --exact --nocapture
 cargo test -p freshell-freshagent terminal_tabs::tests -- --nocapture
-cargo test -p freshell-server identity_sink::tests::gf_ui_rest_recovery_publishes_directory_memory_and_durable_identity -- --exact --nocapture
+cargo test -p freshell-ws identity_sink::tests -- --nocapture
+cargo test -p freshell-ws --test rest_claude_identity
+cargo test -p freshell-ws --test rest_locator_identity
+cargo test -p freshell-ws --test pane_ledger_restore
 cargo test -p freshell-freshagent --all-targets
+cargo check -p freshell-ws
 cargo fmt --all --check
-cargo clippy -p freshell-freshagent -p freshell-server --all-targets -- -D warnings
+cargo clippy -p freshell-freshagent -p freshell-ws -p freshell-terminal -p freshell-server --all-targets -- -D warnings
 ```
 
-  The `gf ui` tuple must now name the new terminal in all three positions;
-  record the GREEN tuple next to the RED one.
-
-- [ ] **Step 3 (Commit — the incident test lands green in the same commit
-  that fixes it):**
+- [ ] **Step 3 (Commit):**
 
 ```bash
 git add crates/freshell-freshagent/src/terminal_tabs.rs \
-  crates/freshell-server/src/identity_sink.rs \
+  crates/freshell-freshagent/src/lib.rs \
+  crates/freshell-ws/src/pane_identity_binder.rs \
+  crates/freshell-ws/src/identity_sink.rs \
+  crates/freshell-ws/src/lib.rs \
+  crates/freshell-terminal/src/registry.rs \
   crates/freshell-server/src/main.rs
-git commit -m "fix(rest): publish authoritative terminal identities"
+git commit -m "fix(rest): provenance-aware terminal identity publication absorbs the binder"
 ```
 
 ---
@@ -1733,10 +2062,10 @@ if and only if the retained retired identity entry matches the exact
 only — no fabricated row, no `registry.set_meta`, no `terminal.created`, no
 live activity event. Emits `associated -> changed -> retired meta`.
 
-- [ ] **F0:** add a ws-local `RecordingSink` test double (or promote
-  freshagent's `FakeIdentitySink` behind a `test-util` feature — pick one;
-  the freshagent fake is `#[cfg(test)] pub(crate)` and invisible to
-  `freshell-ws`). Commit
+- [ ] **F0:** add a ws-local `RecordingSink` test double, building on Slice
+  D's always-compiled `null_sink_for_tests()` no-op (the freshagent fake is
+  `#[cfg(test)] pub(crate)` and invisible to `freshell-ws`, so it cannot be
+  reused directly). Commit
   `test(ws): recording identity sink test double`.
 - [ ] **F1 (OpenCode locator):** RED — land the helper stubbed to
   authorize-and-return-`Missing` plus tests
@@ -1821,16 +2150,22 @@ git add crates/freshell-ws/src/terminal.rs
 git commit -m "refactor(ws): share known-create terminal identity publication"
 ```
 
-- [ ] **F5 (deferred re-authorization, LB12):** RED —
+- [ ] **F5 (deferred re-authorization, LB12/FE6/FE7):** RED —
   `unknown_legacy_resume_authorizes_late_and_publishes_via_discovered_pipeline`
   (fake existence probe answers `Unknown`, terminal launches with a deferred
-  marker, probe flips to `Present`, worker publishes; assert
+  marker, probe flips to fresh `Present`, worker publishes; assert
   `associated -> changed -> meta` and the published
-  `ExistenceValidatedLegacyResume` identity) and
-  `absent_legacy_resume_is_permanently_rejected_without_requery` fail
-  against the stub worker. GREEN — implement the bounded requery worker in
-  `terminal_identity_publication.rs` over the sink's deferred markers,
-  triggered by index warm/refresh completion; markers dropped on exit.
+  `ExistenceValidatedLegacyResume` identity),
+  `stale_absent_defers_then_fresh_absent_drops_permanently` (fake probe:
+  `Absent`+stale → marker retained and requeried; `Absent`+fresh → marker
+  dropped with a structured warning), and
+  `fresh_absent_and_provider_unavailable_are_never_deferred` fail against
+  the stub worker. GREEN — implement the **bounded fresh-answer requery
+  worker** in `terminal_identity_publication.rs` over the sink's deferred
+  markers, exactly per "Deferred re-authorization" (capped backoff, ≤ 8
+  attempts, stop on the first `index_fresh: true` answer, drop-with-warning
+  on exhaustion; the fake probe drives the schedule deterministically via
+  injected clock/attempt hooks — no sleeps); markers dropped on exit.
 
 ```bash
 cargo test -p freshell-ws unknown_legacy_resume_authorizes_late_and_publishes_via_discovered_pipeline -- --nocapture
@@ -1987,10 +2322,17 @@ modify `test/integration/real/coding-cli-session-contract.test.ts`; create
   one `TempDir`.
 - [ ] **Step 2:** the exact incident test
   `gf_ui_rest_recovery_is_one_process_one_identity_one_sidebar_key`
-  (`multi_thread` flavor): one process invocation, one tab/pane, new row +
-  identity registry + live ledger + fresh-`PaneLedger` reload all naming the
-  exact Codex ref, and ordered changed/meta frames **enqueued before the
-  response completes** (test-subscriber observation).
+  (`multi_thread` flavor): seed the old `981008-old-gf-ui` binding, POST the
+  exact incident create (`gf ui`, codex,
+  `019f9cb3-f11e-79f3-a968-287a5bc5798c`), then assert one process
+  invocation, one tab/pane, new row + identity registry + live ledger +
+  fresh-`PaneLedger` reload all naming the exact Codex ref, provenance
+  `AcceptedSessionRef`, and ordered changed/meta frames **enqueued before
+  the response completes** (test-subscriber observation). **Expected GREEN
+  on first run** — the incident fix landed in #584 (see Reconciliation);
+  this is a permanent acceptance pin that additionally covers what the
+  landed pins don't (provenance, enqueue order, ledger reload), not a red
+  phase.
 - [ ] **Step 3:** provider matrix (`multi_thread`):
   - `explicit_refs_publish_for_all_four_terminal_providers`
   - `fresh_claude_is_preallocated_and_restart_durable`
@@ -2141,17 +2483,31 @@ git log --oneline --decorate origin/main..HEAD
 - [ ] **Step 7 (report + stop):** do not push unless asked; no PR, merge,
   deploy, restart, or worktree removal. Report:
 
-  - worktree, branch, base SHA (`537d7d09`), head SHA, and the fresh
+  - worktree, branch, base SHA (`6147c700`), head SHA, and the fresh
     baseline evidence from Preflight
   - focused commits per slice
-  - exact `gf ui` RED and GREEN tuples
+  - `gf ui` green-pin evidence (Slice I) with reference to #584's landed
+    pins (`rest_locator_identity.rs`, `rest_claude_identity.rs`) — there is
+    no RED tuple anymore; the incident fix landed in #584
+  - binder-absorption evidence (FE3): `pane_identity_binder.rs` and the
+    trait deleted, ported unit tests green, landed integration pins green,
+    and any deliberately rescoped raw-id-authority pin recorded as a delta
+  - publisher-abort subprocess test evidence (FE1) and the
+    registry-usable-after-error evidence
+  - client-abort settlement evidence (FE9:
+    `client_abort_mid_create_still_completes_settlement`)
+  - the FE10 rejection-ladder evidence (400 provider mismatch, 422
+    unresolved claude restore, amplifier restore-bare carve-out pin)
   - cross-kind admission barrier-test evidence (exactly-one-winner for
     claude/codex/opencode on both doors, both orders) — this replaces the
-    old "residual race" report item, which no longer exists
+    old "residual race" report item, which no longer exists — plus the
+    `auto_resume` `OwnedByFreshAgent` refusal test (FE4) and the
+    `claim_discovered` owner-distinction tests (FE11)
   - the D5 legacy-WS removal evidence (reject + plain-shell-allowed tests)
   - provider matrix outcomes; OpenCode no-preallocation evidence/version;
     pinned amplifier contract version and the key-gated skip status
-  - deferred re-authorization evidence (Unknown→Present convergence)
+  - deferred re-authorization evidence (Unknown/stale-Absent → fresh-Present
+    convergence; fresh-Absent permanence; bounded-schedule exhaustion)
   - ordinary-restart ledger reload evidence
   - enqueue-order assertions and the adverse-interleaving convergence test
   - focused and broad verification commands/outcomes; review rounds
@@ -2159,10 +2515,15 @@ git log --oneline --decorate origin/main..HEAD
 
 ## Acceptance Summary
 
-1. The exact `gf ui` Codex recovery shape begins RED as
-   `(None, None, "981008-old-gf-ui")` and ends with directory, memory
-   registry, and disk-reloaded ledger all naming the new terminal and
-   `019f9cb3-f11e-79f3-a968-287a5bc5798c`.
+1. The exact `gf ui` Codex recovery shape — fixed on main by #584 — is
+   pinned permanently green: directory, memory registry, and disk-reloaded
+   ledger all name the new terminal and
+   `019f9cb3-f11e-79f3-a968-287a5bc5798c`, with provenance
+   `AcceptedSessionRef` and ordered enqueue (Slice I pin on top of the
+   landed `rest_locator_identity.rs`/`rest_claude_identity.rs` pins). The
+   landed provenance-blind binder is absorbed and deleted: no parallel
+   identity write path remains, and legacy raw ids publish only after
+   `Present` existence.
 2. **Cross-kind admission is atomic:** one `SessionAdmission` table admits
    terminal and fresh-agent creates; barrier-synchronized tests prove
    exactly-one-winner and exactly-one-writer for claude, codex, and opencode
@@ -2193,9 +2554,14 @@ git log --oneline --decorate origin/main..HEAD
    invalidation pipeline; fresh Codex adoption and rebind tails use the same
    pipeline without changing discovery policy.
 9. A legacy raw resume id becomes authoritative only on `Present` existence
-   — immediately or through deferred re-authorization on index warm;
-   `Absent` on a warm index is permanent; a live owner refuses the launch
-   before existence is even consulted.
+   — immediately or through deferred re-authorization (bounded fresh-answer
+   requery); `Absent` from a **fresh** index and `ProviderUnavailable` are
+   permanent, while `Unknown` and stale-snapshot `Absent` defer (FE6/FE7); a
+   live owner refuses the launch before existence is even consulted. Invalid
+   REST create shapes are rejected before spawn: 400
+   `SESSION_REF_PROVIDER_MISMATCH` for a cross-provider ref, 422
+   `CLAUDE_RESTORE_UNRESOLVED` for an unresolvable claude restore (FE10);
+   the amplifier restore-bare carve-out is pinned as deliberate.
 10. `/api/terminals` projects `sessionRef` only from the shared identity
     registry for claude/codex/opencode/amplifier, and retains the documented
     `mode + resume_session_id` synthesis for gemini/kimi (D1). Reconcile no
@@ -2203,14 +2569,20 @@ git log --oneline --decorate origin/main..HEAD
     legacy-unknown restore yields exactly one sidebar key.
 11. A terminal registry row and its in-memory identity are never observably
     split; the exit hook cannot run before create settlement completes (the
-    caller-held finalization guard opens on every success, error, and unwind
-    path, proven by duplicate-id and publisher-panic tests); a
-    discovery/exit race cannot resurrect stale identity.
-12. Durable rows become `Closed` only on explicit user close; natural exit,
-    auto-resume settlement, and graceful shutdown leave rows `Bound`
-    (auto-resume e2e pins stay green); all delayed cleanup is
-    epoch-conditional and cannot erase a replacement owner; the retired
-    OpenCode missing-row rebind lane still works after explicit kill.
+    settlement-owner-held finalization guard opens on every success, error,
+    and unwind path, proven by duplicate-id and client-abort tests, and on
+    the REST door the guard lives in the detached settle task); the
+    publication callback is panic-free by construction and a publisher
+    unwind **aborts the process** rather than poisoning the registry (FE1,
+    proven by the subprocess abort test); a discovery/exit race cannot
+    resurrect stale identity.
+12. Durable rows become `Closed` only on explicit user kill — the WS
+    `terminal.kill` door exclusively (FE8; no REST close/kill door exists or
+    is added); natural exit, auto-resume settlement, and graceful shutdown
+    leave rows `Bound` (auto-resume e2e pins stay green); all delayed
+    cleanup is epoch-conditional and cannot erase a replacement owner; the
+    retired OpenCode missing-row rebind lane still works after explicit
+    kill.
 13. Enabled writes reload after an ordinary restart. Disabled ledger, I/O
     failure, and blocking-task failure are typed degradations, preserve
     success, and emit exactly one live warning per identity event.
@@ -2224,5 +2596,9 @@ git log --oneline --decorate origin/main..HEAD
     eventual one-key convergence; handshake-inventory resync is the
     documented recovery invariant.
 16. Focused, workspace, contract, lint, coordinated JS, and Rust-browser E2E
-    gates pass on the fresh `537d7d09` baseline; all changes remain
-    committed locally, undeployed, and without a PR.
+    gates pass on the fresh `6147c700` baseline; the landed #584 pins
+    (`rest_claude_identity.rs`, `rest_locator_identity.rs`,
+    `pane_ledger_restore.rs`) stay green (with any deliberate raw-id
+    rescope recorded); the `PaneIdentityBinder` module/trait/wiring are
+    gone; all changes remain committed locally, undeployed, and without a
+    PR.
