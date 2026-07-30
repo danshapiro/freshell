@@ -32,6 +32,7 @@ mod recovery_inventory;
 mod repo_icon;
 mod repo_icon_detect;
 mod repo_icon_git;
+mod resolve;
 mod screenshots;
 mod serve_client;
 mod session_directory;
@@ -910,6 +911,9 @@ async fn main() -> ExitCode {
             freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root),
         );
     }
+    // SYNC-06: the resolve endpoint reads the SAME session index the History
+    // surfaces read (clone before the move below into `session_directory_state`).
+    let resolve_session_index = session_index.clone();
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
@@ -994,7 +998,7 @@ async fn main() -> ExitCode {
     let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
-        store: session_metadata_store,
+        store: session_metadata_store.clone(),
         // W5 fix-forward: the SAME shared `sessions.changed` bus + revision
         // counter minted above (and already wired into
         // `ws_state`/`fresh_agent_state`/`sessions::SessionsState`) so a
@@ -1100,6 +1104,41 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
+        }))
+        .merge(resolve::router(resolve::ResolveState {
+            auth_token: Arc::clone(&auth_token),
+            // SYNC-06 deleted-override filter: the SAME settings store the
+            // sidebar overlay (`SessionDirectoryState.settings`) and
+            // `PATCH /api/sessions/{id}` write path use (constructed once
+            // at ~line 196; Clone shares the Arc-backed innards).
+            settings: settings_store.clone(),
+            session_index: resolve_session_index,
+            // SYNC-06 sessionType overlay: the SAME store `POST
+            // /api/session-metadata` writes (Node overlays it in
+            // `session-indexer.ts:1159-1161`).
+            session_metadata: session_metadata_store.clone(),
+            // opencode `ses_*` exact-id fallback: the SAME data home the
+            // OpencodeSource uses. Read errors (`Err`) are a resolve miss,
+            // never a 5xx — the endpoint's never-5xx contract.
+            opencode_dir_by_id: Some(std::sync::Arc::new(|session_id: &str| {
+                let data_home = freshell_sessions::parse::default_opencode_data_home();
+                freshell_sessions::parse::opencode_session_directory_by_id(&data_home, session_id)
+                    .ok()
+                    .flatten()
+            })),
+            // claude transcript exact-id fallback: the SAME ordered-roots scan
+            // the attach arm and IndexExistenceProbe trust
+            // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), paired with
+            // the original-cwd reader. Node's locator lowercases the id
+            // before scanning and returns the lowercased id — mirrored here.
+            locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
+                let lowered = session_id.to_ascii_lowercase();
+                let path = freshell_freshagent::locate_transcript(&lowered)?;
+                Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    session_id: lowered,
+                    cwd: freshell_freshagent::transcript_cwd(&path),
+                })
+            })),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))

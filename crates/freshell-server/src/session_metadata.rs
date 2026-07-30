@@ -27,7 +27,6 @@
 //! `GET /api/session-metadata` route either (confirmed by exhaustive grep of
 //! `server/sessions-router.ts` and `server/index.ts` — only the `POST` exists).
 
-#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,8 +132,9 @@ impl SessionMetadataStore {
     /// `getAll()` (`session-metadata-store.ts:113-122`): flattened `provider:sessionId` →
     /// entry map.
     ///
-    /// Test-only today — see `get` above.
-    #[cfg(test)]
+    /// Production read (SYNC-06): the resolve endpoint overlays match
+    /// `sessionType` from this store, mirroring Node's
+    /// `session-indexer.ts:1159-1161` overlay. Keyed `"{provider}:{session_id}"`.
     pub async fn get_all(&self) -> HashMap<String, Value> {
         let mut guard = self.inner.lock().await;
         let data = Self::load_locked(&mut guard, &self.path).await;
