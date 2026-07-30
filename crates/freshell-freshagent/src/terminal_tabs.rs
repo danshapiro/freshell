@@ -4962,12 +4962,15 @@ mod tests {
         assert!(plausible_resume_session_id("claude", &minted));
     }
 
-    /// Counting `on_stale_resume` fake: the Bound ledger row of a running
-    /// session must survive, so the live-session tests pin "never invoked".
-    fn counting_on_stale_resume() -> (
+    /// Invocation counter + callback pair returned by `counting_on_stale_resume`.
+    type CountingStaleResume = (
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>,
-    ) {
+    );
+
+    /// Counting `on_stale_resume` fake: the Bound ledger row of a running
+    /// session must survive, so the live-session tests pin "never invoked".
+    fn counting_on_stale_resume() -> CountingStaleResume {
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cb = {
             let count = std::sync::Arc::clone(&count);
