@@ -18,13 +18,16 @@
 //! The reference injects `node` + args resolved from the **Node repo layout**
 //! (`buildMcpServerCommandArgs`, `cw:89-107`). The Rust port ships no MCP
 //! server of its own, so this port adopts **option (a)**: resolve the SAME
-//! Node-repo layout — repo root found by walking up from the process cwd
+//! explicit `FRESHELL_MCP_SERVER_ENTRY` deployment binding, or the Node-repo
+//! layout — repo root found by walking up from the process cwd
 //! looking for a `package.json` with `"name": "freshell"` (the reference walks
 //! from `server/mcp/`; both resolve the same root when the server runs from
 //! the repo checkout, which is the deployment under test) — and inject the
 //! reference-identical `node --import <root>/node_modules/tsx/dist/loader.mjs
 //! <root>/server/mcp/server.ts` (dev) or `<root>/dist/server/mcp/server.js`
-//! (production build present + `NODE_ENV=production`). When `tsx` cannot be
+//! (production build present + `NODE_ENV=production`). An explicit non-empty
+//! binding must name an existing file; it never falls back to checkout files.
+//! When `tsx` cannot be
 //! resolved the reference-exact error is raised (`cw:72-79`). The golden tests
 //! inject [`McpRuntime::server_command_args`] as a seam, so they remain valid
 //! under any future re-decision (e.g. a Rust MCP server binary).
@@ -108,6 +111,20 @@ impl McpRuntime for RealMcpRuntime {
     }
 
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
+        if let Some(entry) =
+            std::env::var_os("FRESHELL_MCP_SERVER_ENTRY").filter(|value| !value.is_empty())
+        {
+            let entry = PathBuf::from(entry);
+            if !entry.is_file() {
+                return Err(McpInjectError::new(format!(
+                    "FRESHELL_MCP_SERVER_ENTRY must point to an existing MCP server entry file: {}",
+                    entry.display()
+                )));
+            }
+            return Ok(vec![McpServerArg::Path(
+                entry.to_string_lossy().into_owned(),
+            )]);
+        }
         let repo_root = find_repo_root();
         let built = repo_root.join("dist/server/mcp/server.js");
         let node_env_production = std::env::var("NODE_ENV")

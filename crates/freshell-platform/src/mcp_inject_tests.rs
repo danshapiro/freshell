@@ -6,6 +6,28 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MCP_ENTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct McpEntryEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl McpEntryEnvGuard {
+    fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os("FRESHELL_MCP_SERVER_ENTRY");
+        std::env::set_var("FRESHELL_MCP_SERVER_ENTRY", value);
+        Self { previous }
+    }
+}
+
+impl Drop for McpEntryEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("FRESHELL_MCP_SERVER_ENTRY", value),
+            None => std::env::remove_var("FRESHELL_MCP_SERVER_ENTRY"),
+        }
+    }
+}
 
 /// A unique scratch dir under the OS temp dir (removed on drop).
 struct Scratch(PathBuf);
@@ -70,6 +92,46 @@ fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
         wsl,
         args: mcp_unix_args(),
     }
+}
+
+#[test]
+fn explicit_mcp_server_entry_wins_over_checkout_fallback() {
+    let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = Scratch::new("runtime-entry");
+    let entry = scratch.path().join("server.mjs");
+    std::fs::write(&entry, "export {};\n").unwrap();
+    let _entry_env = McpEntryEnvGuard::set(&entry);
+
+    assert_eq!(
+        RealMcpRuntime.server_command_args().unwrap(),
+        vec![McpServerArg::Path(entry.to_string_lossy().into_owned())]
+    );
+}
+
+#[test]
+fn empty_mcp_server_entry_preserves_the_existing_fallback() {
+    let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("FRESHELL_MCP_SERVER_ENTRY");
+    let fallback = RealMcpRuntime.server_command_args();
+    let _entry_env = McpEntryEnvGuard::set("");
+
+    assert_eq!(RealMcpRuntime.server_command_args(), fallback);
+}
+
+#[test]
+fn invalid_mcp_server_entry_fails_without_using_checkout_fallback() {
+    let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = Scratch::new("missing-runtime-entry");
+    let missing = scratch.path().join("missing-server.mjs");
+    let _entry_env = McpEntryEnvGuard::set(&missing);
+
+    let error = RealMcpRuntime.server_command_args().unwrap_err();
+    assert!(
+        error.message.contains("FRESHELL_MCP_SERVER_ENTRY"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains(missing.to_string_lossy().as_ref()));
 }
 
 #[test]
@@ -443,6 +505,7 @@ fn filetime_set_old(path: &Path) -> bool {
 /// injecting a bogus path.
 #[test]
 fn real_runtime_tsx_unresolvable_raises_reference_error() {
+    let _lock = MCP_ENTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let scratch = Scratch::new("tsxmissing");
     let prev = std::env::current_dir().unwrap();
     // Serialize against other cwd-sensitive tests via a best-effort chdir guard.
