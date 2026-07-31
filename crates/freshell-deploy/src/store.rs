@@ -210,6 +210,39 @@ impl Store {
         Ok(Some(receipt))
     }
 
+    pub(crate) fn install_legacy_controller(&self, source: &Path) -> Result<()> {
+        let canonical_source = fs::canonicalize(source)?;
+        let source_metadata = fs::symlink_metadata(&canonical_source)?;
+        if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+            return Err(DeployError::UnsafeStorePath(canonical_source));
+        }
+        let bytes = fs::read(&canonical_source)?;
+        let destination = self.paths.legacy_controller();
+        match fs::symlink_metadata(destination) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o7777 != 0o500
+                {
+                    return Err(DeployError::UnsafeStorePath(destination.to_path_buf()));
+                }
+                let installed = crate::process_identity::FileIdentity::from_path(destination)?;
+                let source = crate::manifest::sha256_bytes(&bytes);
+                if installed.sha256 != source {
+                    return Err(DeployError::InvalidReceipt(
+                        "captured legacy recovery controller is immutable and differs from the executing controller"
+                            .to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        atomic_write_new(destination, &bytes, 0o500)
+    }
+
     fn remove_generation_locked(&self, id: &str) -> Result<()> {
         let generation = self.verify_generation(id)?;
         if let Some(transaction) =

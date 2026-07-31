@@ -36,6 +36,78 @@ enum ExpectedProcessObservation {
     Foreign,
 }
 
+struct SelectedLaunchContract {
+    server_executable: FileIdentity,
+    controller_executable: PathBuf,
+    runtime: RuntimeProvenance,
+    node: NodePrerequisite,
+    captured_legacy: bool,
+}
+
+fn selected_launch_contract(
+    store: &Store,
+    generation: &crate::store::Generation,
+) -> Result<SelectedLaunchContract> {
+    match GenerationDescriptor::read(generation) {
+        Ok(descriptor) => {
+            let mut runtime = descriptor.runtime_provenance(&generation.path);
+            runtime.client_dir = store
+                .paths()
+                .current_pointer()
+                .join("client")
+                .display()
+                .to_string();
+            Ok(SelectedLaunchContract {
+                server_executable: FileIdentity::from_path(
+                    &descriptor.server_executable(&generation.path),
+                )?,
+                controller_executable: descriptor.controller(&generation.path),
+                runtime,
+                node: descriptor.node,
+                captured_legacy: false,
+            })
+        }
+        Err(descriptor_error) => {
+            let legacy = store.read_legacy_capture()?.ok_or(descriptor_error)?;
+            if legacy.generation_id != generation.id {
+                return Err(DeployError::Activation(
+                    "descriptor-less current generation is not the captured legacy recovery generation"
+                        .to_string(),
+                ));
+            }
+            let controller_executable = store.paths().legacy_controller().to_path_buf();
+            let controller_metadata = fs::symlink_metadata(&controller_executable)?;
+            if controller_metadata.file_type().is_symlink()
+                || !controller_metadata.is_file()
+                || controller_metadata.uid() != unsafe { libc::geteuid() }
+                || controller_metadata.mode() & 0o7777 != 0o500
+            {
+                return Err(DeployError::UnsafeStorePath(controller_executable));
+            }
+            let mut runtime = crate::real_driver::runtime_from_bindings(
+                &generation.path,
+                &legacy.runtime,
+                &legacy.node,
+            );
+            runtime.client_dir = store
+                .paths()
+                .current_pointer()
+                .join("client")
+                .display()
+                .to_string();
+            Ok(SelectedLaunchContract {
+                server_executable: FileIdentity::from_path(
+                    &generation.path.join(&legacy.runtime.server_executable),
+                )?,
+                controller_executable,
+                runtime,
+                node: legacy.node,
+                captured_legacy: true,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LifecycleLaunchRecord {
@@ -62,29 +134,20 @@ impl LifecycleLaunchRecord {
             .selected_generation_id()?
             .ok_or_else(|| DeployError::Activation("current generation is missing".to_string()))?;
         let generation = store.verify_generation(&generation_id)?;
-        let descriptor = GenerationDescriptor::read(&generation)?;
+        let contract = selected_launch_contract(store, &generation)?;
         let operation_id = Uuid::new_v4().to_string();
         let controls =
             ControlPaths::create_private(store.paths(), &format!("lifecycle-{operation_id}"))?;
-        let mut runtime = descriptor.runtime_provenance(&generation.path);
-        runtime.client_dir = store
-            .paths()
-            .current_pointer()
-            .join("client")
-            .display()
-            .to_string();
         let record = Self {
             schema_version: "1".to_string(),
             operation_id,
             port: store.paths().port(),
             generation_id,
             generation_root: generation.path.clone(),
-            server_executable: FileIdentity::from_path(
-                &descriptor.server_executable(&generation.path),
-            )?,
-            controller_executable: descriptor.controller(&generation.path),
-            runtime,
-            node: descriptor.node,
+            server_executable: contract.server_executable,
+            controller_executable: contract.controller_executable,
+            runtime: contract.runtime,
+            node: contract.node,
             nonce: Uuid::new_v4().to_string(),
             claim_file: controls.directory.join("launch.json"),
             ready_file: controls.ready_file,
@@ -107,24 +170,16 @@ impl LifecycleLaunchRecord {
             ));
         }
         let generation = store.verify_generation(&self.generation_id)?;
-        let descriptor = GenerationDescriptor::read(&generation)?;
+        let contract = selected_launch_contract(store, &generation)?;
         let controls = store
             .paths()
             .transactions_dir()
             .join(format!("lifecycle-{}", self.operation_id));
-        let mut expected_runtime = descriptor.runtime_provenance(&generation.path);
-        expected_runtime.client_dir = store
-            .paths()
-            .current_pointer()
-            .join("client")
-            .display()
-            .to_string();
         if self.generation_root != generation.path
-            || self.controller_executable != descriptor.controller(&generation.path)
-            || self.server_executable
-                != FileIdentity::from_path(&descriptor.server_executable(&generation.path))?
-            || self.runtime != expected_runtime
-            || self.node != descriptor.node
+            || self.controller_executable != contract.controller_executable
+            || self.server_executable != contract.server_executable
+            || self.runtime != contract.runtime
+            || self.node != contract.node
             || self.claim_file != controls.join("launch.json")
             || self.ready_file != controls.join("ready.json")
         {
@@ -137,7 +192,11 @@ impl LifecycleLaunchRecord {
             if process.listener.port != self.port
                 || process.effective_uid != unsafe { libc::geteuid() }
                 || process.executable.sha256 != self.server_executable.sha256
-                || process.executable.mode != self.server_executable.mode
+                || if contract.captured_legacy {
+                    process.executable.mode & !0o222 != self.server_executable.mode
+                } else {
+                    process.executable.mode != self.server_executable.mode
+                }
             {
                 return Err(DeployError::Journal(
                     "lifecycle restart process does not match the selected managed server"

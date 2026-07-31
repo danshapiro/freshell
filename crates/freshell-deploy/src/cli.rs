@@ -131,6 +131,7 @@ impl CaptureCommand {
 pub fn execute_capture(command: CaptureCommand) -> Result<LegacyCaptureReceipt> {
     let pid_hint = command.pid_hint()?;
     let store = Store::open(&command.checkout, command.port)?;
+    store.install_legacy_controller(&std::env::current_exe()?)?;
     let request = LegacyCaptureRequest {
         pid_hint,
         port: command.port,

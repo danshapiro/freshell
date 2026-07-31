@@ -109,30 +109,36 @@ fi
 
 PORT_ROOT="$REPO_ROOT/.freshell-deploy/ports/$PORT"
 CURRENT_CONTROLLER="$PORT_ROOT/current/controller/freshell-deploy"
+LEGACY_CONTROLLER="$PORT_ROOT/legacy-controller"
+CONTROLLER=""
 
-require_current_controller() {
-  [[ -x "$CURRENT_CONTROLLER" ]] || {
+resolve_stored_controller() {
+  if [[ -x "$CURRENT_CONTROLLER" ]]; then
+    CONTROLLER="$CURRENT_CONTROLLER"
+  elif [[ -x "$LEGACY_CONTROLLER" ]]; then
+    CONTROLLER="$LEGACY_CONTROLLER"
+  else
     echo "launch-rust: no controller is stored in the selected generation for port $PORT" >&2
     echo "launch-rust: complete a combined bootstrap before using this mode" >&2
     exit 1
-  }
+  fi
 }
 
 if (( STOP_ONLY == 1 )); then
-  require_current_controller
-  exec "$CURRENT_CONTROLLER" stop-current --checkout "$REPO_ROOT" --port "$PORT"
+  resolve_stored_controller
+  exec "$CONTROLLER" stop-current --checkout "$REPO_ROOT" --port "$PORT"
 fi
 
 if (( SKIP_BUILD == 1 )); then
-  require_current_controller
+  resolve_stored_controller
   if (( RESTART == 1 )); then
-    exec "$CURRENT_CONTROLLER" restart-current --checkout "$REPO_ROOT" --port "$PORT"
+    exec "$CONTROLLER" restart-current --checkout "$REPO_ROOT" --port "$PORT"
   fi
-  exec "$CURRENT_CONTROLLER" start-current --checkout "$REPO_ROOT" --port "$PORT"
+  exec "$CONTROLLER" start-current --checkout "$REPO_ROOT" --port "$PORT"
 fi
 
 if (( CLIENT_ONLY == 1 )); then
-  require_current_controller
+  resolve_stored_controller
 fi
 
 BUILD_PARENT="${FRESHELL_DEPLOY_BUILD_PARENT:-${TMPDIR:-/tmp}/freshell-deploy-builds-${UID}}"
@@ -175,7 +181,6 @@ SERVER_BUILD_ROOT="$BUILD_DIR/server-build"
 DIST_SERVER_DIR="$SERVER_BUILD_ROOT/server"
 RUNTIME_ROOT="$BUILD_DIR/runtime"
 CARGO_TARGET_DIR_VALUE="$BUILD_DIR/cargo-target"
-CONTROLLER="$CURRENT_CONTROLLER"
 
 build_client() {
   echo "Typechecking and building the client in private staging..."

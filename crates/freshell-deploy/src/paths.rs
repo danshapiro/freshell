@@ -68,6 +68,7 @@ pub struct StorePaths {
     current: PathBuf,
     live: PathBuf,
     legacy: PathBuf,
+    legacy_controller: PathBuf,
     transaction: PathBuf,
     lock: PathBuf,
 }
@@ -111,6 +112,7 @@ impl StorePaths {
             current: port_root.join("current"),
             live: port_root.join("live.json"),
             legacy: port_root.join("legacy.json"),
+            legacy_controller: port_root.join("legacy-controller"),
             transaction: port_root.join("transaction.json"),
             lock: port_root.join("deploy.lock"),
             store_root,
@@ -161,6 +163,10 @@ impl StorePaths {
 
     pub fn legacy_receipt(&self) -> &Path {
         &self.legacy
+    }
+
+    pub fn legacy_controller(&self) -> &Path {
+        &self.legacy_controller
     }
 
     pub fn transaction_journal(&self) -> &Path {

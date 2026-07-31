@@ -883,6 +883,12 @@ describe('real deployment controller boundary', () => {
       cleanupContext.environment = realEnvironment
 
       mkdirSync(realCheckout, { recursive: true })
+    mkdirSync(path.join(realCheckout, 'scripts'))
+    copyFileSync(
+      path.join(repository, 'scripts/launch-rust.sh'),
+      path.join(realCheckout, 'scripts/launch-rust.sh'),
+    )
+    chmodSync(path.join(realCheckout, 'scripts/launch-rust.sh'), 0o755)
     mkdirSync(home)
     mkdirSync(path.join(distServer, 'mcp'), { recursive: true })
     mkdirSync(sidecar)
@@ -1111,6 +1117,9 @@ describe('real deployment controller boundary', () => {
       const legacyReceiptFile = path.join(portRoot, 'legacy.json')
       const legacyReceiptBytes = readFileSync(legacyReceiptFile, 'utf8')
       const legacyReceipt = JSON.parse(legacyReceiptBytes)
+      const legacyController = path.join(portRoot, 'legacy-controller')
+      expect(statSync(legacyController).mode & 0o777).toBe(0o500)
+      expect(readFileSync(legacyController)).toEqual(readFileSync(controller))
       expect(legacyReceipt).toMatchObject({
         schemaVersion: '1',
         generationId: capturedLegacy.selectedGenerationId,
@@ -1198,6 +1207,26 @@ describe('real deployment controller boundary', () => {
         capturedLegacy.processIdentity.pid,
       )
       expect(restoredLegacy.processIdentity.executable.sha256).toBe(
+        capturedLegacyExecutableDigest,
+      )
+      await checkedAsync(
+        path.join(realCheckout, 'scripts/launch-rust.sh'),
+        ['--port', String(port), '--skip-build', '--restart'],
+        { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
+      )
+      await waitForHttp(port, 'up')
+      const emergencyRestartedLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
+      rememberProcess(knownProcesses, emergencyRestartedLegacy.processIdentity)
+      expect(emergencyRestartedLegacy.selectedGenerationId).toBe(
+        capturedLegacy.selectedGenerationId,
+      )
+      expect(emergencyRestartedLegacy.runningServerGenerationId).toBe(
+        capturedLegacy.selectedGenerationId,
+      )
+      expect(emergencyRestartedLegacy.processIdentity.pid).not.toBe(
+        restoredLegacy.processIdentity.pid,
+      )
+      expect(emergencyRestartedLegacy.processIdentity.executable.sha256).toBe(
         capturedLegacyExecutableDigest,
       )
       expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
