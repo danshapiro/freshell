@@ -1803,8 +1803,49 @@ fn real_scratch_probe_executes_the_complete_captured_closure() {
     require_destructive_test_sandbox();
 
     let fixture = tempfile::tempdir().unwrap();
-    let generation = fixture.path().join("generation");
-    let home = fixture.path().join("home");
+    write_real_scratch_fixture(fixture.path(), false, true);
+    let request = real_scratch_request(fixture.path());
+    let generation = request.generation_path.clone();
+    let home = request.isolated_home.clone();
+
+    RealScratchProbe::default()
+        .verify(&request)
+        .expect("real scratch closure");
+    let ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
+    let pid = ready["pid"].as_u64().unwrap();
+    assert_process_is_gone(pid, "successful validation scratch server");
+    let descendant: u64 = fs::read_to_string(home.join("descendant.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_process_is_gone(descendant, "successful validation scratch descendant");
+
+    fs::write(
+        generation.join("extensions/terminal/freshell.json"),
+        r#"{"name":"different"}"#,
+    )
+    .unwrap();
+    fs::remove_file(home.join("ready.json")).unwrap();
+    fs::remove_file(home.join("descendant.pid")).unwrap();
+    let error = RealScratchProbe::default().verify(&request).unwrap_err();
+    assert!(error.to_string().contains("extension registry"), "{error}");
+    let failed_ready: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
+    let failed_pid = failed_ready["pid"].as_u64().unwrap();
+    assert_process_is_gone(failed_pid, "failed validation scratch server");
+    let failed_descendant: u64 = fs::read_to_string(home.join("descendant.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_process_is_gone(failed_descendant, "failed validation scratch descendant");
+}
+
+fn write_real_scratch_fixture(root: &Path, stall_health: bool, spawn_descendant: bool) {
+    let generation = root.join("generation");
+    let home = root.join("home");
     for directory in [
         "server",
         "client",
@@ -1848,11 +1889,19 @@ fn real_scratch_probe_executes_the_complete_captured_closure() {
     let server = generation.join("server/freshell-server");
     let source = format!("#!{}\n", python.display())
         + r#"import http.server,json,os,socketserver
+if __SPAWN_DESCENDANT__:
+  import subprocess
+  descendant=subprocess.Popen(['/bin/sleep','300'])
+  open(os.path.join(os.environ['HOME'],'descendant.pid'),'w').write(str(descendant.pid))
 class Handler(http.server.BaseHTTPRequestHandler):
   protocol_version='HTTP/1.1'
   def log_message(self,*args): pass
   def do_GET(self):
     if self.path == '/api/health':
+      if __STALL_HEALTH__:
+        open(os.path.join(os.environ['HOME'],'health-entered'),'w').write('ready')
+        import time
+        time.sleep(300)
       body=b'{"app":"freshell","ok":true,"ready":true}'
     elif self.path == '/':
       body=open(os.path.join(os.environ['FRESHELL_CLIENT_DIR'],'index.html'),'rb').read()
@@ -1872,9 +1921,22 @@ receipt={'schemaVersion':'1','nonce':os.environ['FRESHELL_DEPLOY_NONCE'],
 open(os.environ['FRESHELL_DEPLOY_READY_FILE'],'w').write(json.dumps(receipt))
 server.serve_forever()
 "#;
+    let source = source
+        .replace(
+            "__SPAWN_DESCENDANT__",
+            if spawn_descendant { "True" } else { "False" },
+        )
+        .replace(
+            "__STALL_HEALTH__",
+            if stall_health { "True" } else { "False" },
+        );
     fs::write(&server, source).unwrap();
     fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+}
 
+fn real_scratch_request(root: &Path) -> ScratchProbeRequest {
+    let generation = root.join("generation");
+    let home = root.join("home");
     let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
         .find(|candidate| candidate.is_file())
@@ -1885,7 +1947,7 @@ server.serve_forever()
         .output()
         .unwrap();
     assert!(version.status.success());
-    let request = ScratchProbeRequest {
+    ScratchProbeRequest {
         generation_path: generation.clone(),
         generation_id: "a".repeat(64),
         isolated_home: home.clone(),
@@ -1908,34 +1970,87 @@ server.serve_forever()
                 .trim()
                 .to_string(),
         },
-    };
+    }
+}
 
+fn process_is_running(pid: u64) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, suffix)| suffix.chars().next())
+        != Some('Z')
+}
+
+fn assert_process_is_gone(pid: u64, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while process_is_running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if process_is_running(pid) {
+        // Do not leak the intentionally destructive red-phase process.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        panic!("{label} {pid} survived containment cleanup");
+    }
+}
+
+#[test]
+#[ignore = "Docker-only helper: runs a real scratch probe until its controller is killed"]
+fn real_scratch_probe_abrupt_controller_helper() {
+    require_destructive_test_sandbox();
+    let root = PathBuf::from(
+        std::env::var_os("FRESHELL_SCRATCH_ABRUPT_ROOT").expect("abrupt fixture root"),
+    );
     RealScratchProbe::default()
-        .verify(&request)
-        .expect("real scratch closure");
+        .verify(&real_scratch_request(&root))
+        .expect("the parent test kills this controller during health validation");
+}
+
+#[test]
+#[ignore = "Docker-only: abruptly kills a controller running a real scratch probe"]
+fn abrupt_controller_death_leaves_no_live_scratch_process() {
+    require_destructive_test_sandbox();
+    let fixture = tempfile::tempdir().unwrap();
+    write_real_scratch_fixture(fixture.path(), true, false);
+    let home = fixture.path().join("home");
+    let mut controller = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "real_scratch_probe_abrupt_controller_helper",
+            "--test-threads=1",
+        ])
+        .env(DESTRUCTIVE_SANDBOX_SENTINEL, "1")
+        .env("FRESHELL_SCRATCH_ABRUPT_ROOT", fixture.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn scratch controller");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !home.join("health-entered").is_file() && std::time::Instant::now() < deadline {
+        assert!(
+            controller.try_wait().unwrap().is_none(),
+            "scratch controller exited before the interruption boundary"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        home.join("health-entered").is_file(),
+        "scratch server never entered health validation"
+    );
     let ready: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
-    let pid = ready["pid"].as_u64().unwrap();
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "successful validation must terminate and reap its scratch server"
-    );
+    let scratch_pid = ready["pid"].as_u64().unwrap();
 
-    fs::write(
-        generation.join("extensions/terminal/freshell.json"),
-        r#"{"name":"different"}"#,
-    )
-    .unwrap();
-    fs::remove_file(home.join("ready.json")).unwrap();
-    let error = RealScratchProbe::default().verify(&request).unwrap_err();
-    assert!(error.to_string().contains("extension registry"), "{error}");
-    let failed_ready: serde_json::Value =
-        serde_json::from_slice(&fs::read(home.join("ready.json")).unwrap()).unwrap();
-    let failed_pid = failed_ready["pid"].as_u64().unwrap();
-    assert!(
-        !Path::new(&format!("/proc/{failed_pid}")).exists(),
-        "an early HTTP validation failure must still terminate and reap its scratch server"
-    );
+    unsafe {
+        libc::kill(controller.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let status = controller.wait().unwrap();
+    assert!(!status.success(), "controller must die abruptly");
+    assert_process_is_gone(scratch_pid, "abruptly interrupted scratch server");
 }
 
 #[test]

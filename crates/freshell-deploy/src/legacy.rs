@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -19,6 +20,7 @@ use crate::durable::sync_directory;
 use crate::error::{DeployError, Result};
 use crate::manifest::{sha256_file, snapshot_tree_entries, ManifestEntry};
 use crate::paths::{validate_relative_path, validate_symlink_target, DeployPort};
+use crate::process_containment::{contain_process_group_spawn, signal_process_group};
 use crate::process_identity::{LinuxProcfs, PinnedProcess, ProcessIdentity, ProcessInspector};
 use crate::receipts::validate_generation_id;
 use crate::receipts::LiveReceipt;
@@ -1534,10 +1536,7 @@ trait ChildLifecycle {
 
 impl ChildLifecycle for std::process::Child {
     fn terminate(&mut self) -> std::io::Result<()> {
-        if self.try_wait()?.is_none() {
-            self.kill()?;
-        }
-        Ok(())
+        signal_process_group(self.id())
     }
 
     fn reap(&mut self, timeout: Duration) -> std::io::Result<()> {
@@ -1652,15 +1651,16 @@ impl Default for RealScratchProbe {
 
 impl ScratchProbe for RealScratchProbe {
     fn verify(&self, request: &ScratchProbeRequest) -> Result<()> {
-        let version_child = Command::new(&request.node.executable)
+        let mut version_command = Command::new(&request.node.executable);
+        version_command
             .arg("--version")
             .env_clear()
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                DeployError::LegacyCapture(format!("cannot execute captured Node: {error}"))
-            })?;
+            .stderr(Stdio::piped());
+        contain_process_group_spawn(&mut version_command);
+        let version_child = version_command.spawn().map_err(|error| {
+            DeployError::LegacyCapture(format!("cannot execute captured Node: {error}"))
+        })?;
         validate_and_finish(
             ChildGuard::new(version_child),
             "Node version probe",
@@ -1694,18 +1694,19 @@ impl ScratchProbe for RealScratchProbe {
                 "legacy bare `node` does not resolve to the verified Node prerequisite".to_string(),
             ));
         }
-        let bare_child = Command::new("node")
+        let mut bare_command = Command::new("node");
+        bare_command
             .arg("--version")
             .env_clear()
             .env("PATH", node_parent)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                DeployError::LegacyCapture(format!(
-                    "legacy bare `node` prerequisite could not execute: {error}"
-                ))
-            })?;
+            .stderr(Stdio::piped());
+        contain_process_group_spawn(&mut bare_command);
+        let bare_child = bare_command.spawn().map_err(|error| {
+            DeployError::LegacyCapture(format!(
+                "legacy bare `node` prerequisite could not execute: {error}"
+            ))
+        })?;
         validate_and_finish(
             ChildGuard::new(bare_child),
             "legacy bare Node probe",
@@ -1736,14 +1737,17 @@ impl ScratchProbe for RealScratchProbe {
 }
 
 fn verify_sidecar_import(request: &ScratchProbeRequest, timeout: Duration) -> Result<()> {
-    let child = Command::new(&request.node.executable)
+    let mut command = Command::new(&request.node.executable);
+    command
         .arg(request.claude_sidecar_entry())
         .current_dir(&request.generation_path)
         .env_clear()
         .env("HOME", &request.isolated_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    contain_process_group_spawn(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| DeployError::LegacyCapture(format!("sidecar import failed: {error}")))?;
     validate_and_finish(ChildGuard::new(child), "Claude sidecar import", |child| {
@@ -1760,7 +1764,8 @@ fn verify_sidecar_import(request: &ScratchProbeRequest, timeout: Duration) -> Re
 fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result<()> {
     let script = "const {pathToFileURL}=await import('node:url');\
                   await import(pathToFileURL(process.argv[1]).href);process.exit(0)";
-    let child = Command::new(&request.node.executable)
+    let mut command = Command::new(&request.node.executable);
+    command
         .args(["--input-type=module", "--eval", script])
         .arg(request.mcp_entry())
         .current_dir(&request.generation_path)
@@ -1768,7 +1773,9 @@ fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result
         .env("HOME", &request.isolated_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    contain_process_group_spawn(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| DeployError::LegacyCapture(format!("MCP import failed: {error}")))?;
     validate_and_finish(ChildGuard::new(child), "MCP import", |child| {
@@ -1780,20 +1787,21 @@ fn verify_mcp_import(request: &ScratchProbeRequest, timeout: Duration) -> Result
          const {pathToFileURL}=await import('node:url');\
          JSON.parse(await readFile(resolve('package.json'),'utf8'));\
          await import(pathToFileURL(resolve('dist/server/mcp/server.js')).href);process.exit(0)";
-    let child = Command::new(&request.node.executable)
+    let mut command = Command::new(&request.node.executable);
+    command
         .args(["--input-type=module", "--eval", fallback_script])
         .current_dir(&request.generation_path)
         .env_clear()
         .env("HOME", &request.isolated_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            DeployError::LegacyCapture(format!(
-                "pre-binding legacy MCP fallback import failed: {error}"
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    contain_process_group_spawn(&mut command);
+    let child = command.spawn().map_err(|error| {
+        DeployError::LegacyCapture(format!(
+            "pre-binding legacy MCP fallback import failed: {error}"
+        ))
+    })?;
     validate_and_finish(
         ChildGuard::new(child),
         "pre-binding legacy MCP fallback import",
@@ -1818,6 +1826,7 @@ fn verify_scratch_server(request: &ScratchProbeRequest, timeout: Duration) -> Re
     for (name, value) in scratch_server_environment(request, &ready_path, &nonce, &auth_token) {
         command.env(name, value);
     }
+    contain_process_group_spawn(&mut command);
     let child = command.spawn().map_err(|error| {
         DeployError::LegacyCapture(format!("scratch server could not start: {error}"))
     })?;
@@ -1826,7 +1835,7 @@ fn verify_scratch_server(request: &ScratchProbeRequest, timeout: Duration) -> Re
         let deadline = Instant::now() + timeout;
         let mut address = None;
         while Instant::now() < deadline {
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = peek_exit_status(child)? {
                 return Err(DeployError::LegacyCapture(format!(
                     "scratch server exited before readiness: {status}; {}",
                     read_bounded_log(&log_path)
@@ -1971,7 +1980,14 @@ fn wait_for_success(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = peek_exit_status(child)? {
+            // The unreaped leader still reserves its process-group id, making
+            // this numeric group signal safe from PID reuse.
+            signal_process_group(child.id()).map_err(|error| {
+                DeployError::LegacyCapture(format!(
+                    "cannot terminate {label} process group: {error}"
+                ))
+            })?;
             if status.success() {
                 return Ok(());
             }
@@ -1989,6 +2005,43 @@ fn wait_for_success(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn peek_exit_status(
+    child: &std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    // SAFETY: zero is the required sentinel for WNOHANG's no-state-change
+    // result, and waitid initializes the siginfo on an observed transition.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let pid = libc::id_t::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "child pid exceeds id_t")
+    })?;
+    // SAFETY: the pid names our retained Child. WNOWAIT observes termination
+    // without reaping it, so its PID/process-group id remains reserved until
+    // cleanup has signaled the complete group.
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: si_pid and si_status read the Linux SIGCHLD siginfo fields
+    // initialized by waitid. A zero pid is WNOHANG's "still running" result.
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    let raw = if info.si_code == libc::CLD_EXITED {
+        status << 8
+    } else {
+        status
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
 }
 
 fn scratch_health(port: DeployPort, auth_token: &str) -> Result<()> {

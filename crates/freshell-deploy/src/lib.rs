@@ -16,6 +16,7 @@ mod locks;
 mod manifest;
 mod paths;
 mod probe;
+mod process_containment;
 mod process_control;
 mod process_identity;
 mod production_env;
