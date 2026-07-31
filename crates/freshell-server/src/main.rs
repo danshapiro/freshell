@@ -588,9 +588,10 @@ fn try_activate_with_ops(
     }
 
     // All server-side fallible work ends here. This exact durable target-owned
-    // receipt is the deployment commit boundary: controller recovery may
-    // confirm it and relaunch this generation even if this process exits after
-    // publication. The gate flip itself remains infallible.
+    // receipt is evidence the controller can validate; it is not the deployment
+    // commit boundary. Commit authority comes from the controller durably
+    // recording activation_confirmed after it verifies the selected target is
+    // still the live ordinary service. The gate flip itself remains infallible.
     publish_durable_json_with_ops(&activation.activated_file, receipt, ops)
         .map_err(ActivationError::Publication)?;
     gate.activate();
