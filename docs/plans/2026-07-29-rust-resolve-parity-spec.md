@@ -58,6 +58,12 @@ Rust endpoint's JSON must be wire-compatible with what the client already consum
    /api/sessions/resolve` answer 405 on the merged Rust router where Express would
    dispatch `:sessionId="resolve"` to another route. Everything else in this
    requirement is met identically.]
+   [ERRATA 2026-07-31: a FOURTH divergence existed unrecorded until the
+   Content-Type gating fix — the Rust route parsed the body as JSON regardless of
+   `Content-Type`, so a valid object under e.g. `text/plain` resolved on Rust while
+   Node's `express.json()` (default `type: 'application/json'`) skips it and 400s
+   with the missing-`input` issue; the Rust route now gates parsing on the same
+   matcher (parity restored, not ledgered as accepted).]
 2. **Parser parity.** Port `shared/resume-input-parser.ts` semantics to Rust exactly:
    token extraction, candidate ordering, and hint derivation must produce the same
    results for the same inputs. To prevent silent drift between the TS and Rust parsers,

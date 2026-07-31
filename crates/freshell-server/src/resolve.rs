@@ -545,15 +545,37 @@ fn project_session_through_overrides(
     Some(projected)
 }
 
+/// Does the request's `Content-Type` match what Node's global
+/// `express.json()` (`server/index.ts:185`, express 4.22.1 / body-parser
+/// 1.20.4, default `type: 'application/json'`) actually parses? type-is
+/// semantics for that default: strip media-type parameters (`; charset=...`),
+/// lowercase, then require the EXACT `application/json` media type —
+/// `mimeMatch` only widens on `*` patterns, so `application/*+json` (e.g.
+/// `application/vnd.api+json`) does NOT match, and an absent or unparseable
+/// `Content-Type` never matches.
+fn content_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
 /// `POST /api/sessions/resolve`. Body taken as raw bytes (never an
-/// axum-flavored rejection): an ABSENT or UNPARSEABLE body becomes `{}` —
-/// the same value Express's `req.body ?? {}` hands zod for an absent body —
-/// so it 400s with the missing-`input` issue. Parsed non-object values
+/// axum-flavored rejection), parsed as JSON ONLY when the `Content-Type`
+/// matches Node's `express.json()` matcher ([`content_type_is_json`]): a
+/// skipped (non-JSON/absent Content-Type), ABSENT, or UNPARSEABLE body
+/// becomes `{}` — body-parser 1.20.x leaves `req.body = {}` when it skips,
+/// and Express's `req.body ?? {}` hands zod that same value — so it 400s
+/// with the missing-`input` issue. Parsed non-object values
 /// (array/string/number/bool/null) flow to the invalid_type-object branch.
 /// Recorded deviation (module doc): Express's strict body parser answers
 /// malformed JSON and JSON scalars with an HTML 400 before zod ever runs;
 /// this port answers those with the zod-shaped JSON 400 (status parity only
 /// — no consumer reads 400 bodies). Arrays reach zod on both sides.
+/// ERRATA: until this commit the bytes were parsed REGARDLESS of
+/// Content-Type, so a valid object under `text/plain` resolved on Rust
+/// while Node 400s it — an unrecorded divergence, now closed.
 async fn resolve_session(
     State(state): State<ResolveState>,
     headers: HeaderMap,
@@ -562,7 +584,11 @@ async fn resolve_session(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or_else(|_| Value::Object(Map::new()));
+    let parsed: Value = if content_type_is_json(&headers) {
+        serde_json::from_slice(&body).unwrap_or_else(|_| Value::Object(Map::new()))
+    } else {
+        Value::Object(Map::new())
+    };
     let input = match validate_resolve_body(&parsed) {
         Ok(input) => input,
         Err(details) => {
@@ -947,11 +973,26 @@ mod tests {
         body: serde_json::Value,
         with_auth: bool,
     ) -> (StatusCode, serde_json::Value) {
+        post_with_content_type(state, body, Some("application/json"), with_auth).await
+    }
+
+    /// Like [`post`] but with an arbitrary (or absent) `Content-Type` header
+    /// — the Node reference (`express.json()` at `server/index.ts:185`) only
+    /// parses JSON-typed bodies, so the route tests must be able to send
+    /// non-JSON media types.
+    async fn post_with_content_type(
+        state: super::ResolveState,
+        body: serde_json::Value,
+        content_type: Option<&str>,
+        with_auth: bool,
+    ) -> (StatusCode, serde_json::Value) {
         let app = super::router(state);
         let mut builder = Request::builder()
             .method("POST")
-            .uri("/api/sessions/resolve")
-            .header("content-type", "application/json");
+            .uri("/api/sessions/resolve");
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
         if with_auth {
             builder = builder.header("x-auth-token", "tok");
         }
@@ -963,6 +1004,89 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         (status, value)
+    }
+
+    /// The zod issue Node emits when `req.body` was never populated:
+    /// `express.json()` skipped the body (non-JSON or absent Content-Type),
+    /// body-parser 1.20.x leaves `req.body = {}`, and
+    /// `safeParse(req.body ?? {})` reports the missing `input`.
+    fn missing_input_details() -> serde_json::Value {
+        serde_json::json!([{
+            "expected": "string",
+            "code": "invalid_type",
+            "path": ["input"],
+            "message": "Invalid input: expected string, received undefined"
+        }])
+    }
+
+    #[tokio::test]
+    async fn non_json_content_type_body_is_never_parsed() {
+        // Node's global `express.json()` (`server/index.ts:185`, default
+        // `type: 'application/json'`) skips non-matching media types —
+        // type-is requires the EXACT `application/json` media type, so
+        // `application/*+json` is skipped too — leaving `req.body = {}` and
+        // the route 400s with the missing-`input` issue
+        // (`sessions-router.ts:259-264`). A valid JSON object under
+        // `text/plain` must NOT resolve.
+        for ct in ["text/plain", "application/vnd.api+json"] {
+            let dir = temp_dir("ctgate");
+            let (status, body) = post_with_content_type(
+                state(&dir, None),
+                serde_json::json!({ "input": CLAUDE_ID }),
+                Some(ct),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "content-type {ct}");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "Invalid resolve request",
+                    "details": missing_input_details()
+                }),
+                "content-type {ct}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn json_content_type_with_parameters_or_case_still_parses() {
+        // type-is strips parameters and lowercases before matching, so
+        // `application/json; charset=utf-8` (and case variants) still parse.
+        for ct in ["application/json; charset=utf-8", "Application/JSON"] {
+            let dir = temp_dir("ctok");
+            let (status, body) = post_with_content_type(
+                state(&dir, None),
+                serde_json::json!({ "input": CLAUDE_ID }),
+                Some(ct),
+                true,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "content-type {ct}");
+            assert_eq!(body["status"], "warming", "content-type {ct}"); // no index in this state
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_is_treated_as_an_unparsed_body() {
+        // No Content-Type header: type-is cannot match, `express.json()`
+        // skips, `req.body = {}` — same missing-`input` 400 as `text/plain`.
+        let dir = temp_dir("ctnone");
+        let (status, body) = post_with_content_type(
+            state(&dir, None),
+            serde_json::json!({ "input": CLAUDE_ID }),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "Invalid resolve request",
+                "details": missing_input_details()
+            })
+        );
     }
 
     #[tokio::test]
