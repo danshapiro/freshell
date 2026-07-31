@@ -434,24 +434,23 @@ async fn session_directory(
 /// the real user home) made claude/codex sessions invisible -- they were
 /// looked up under `<FRESHELL_HOME>/.claude` / `.codex`, which don't exist.
 ///
-/// Windows/Tauri parity: Node derives these via `os.homedir()`, which reads
-/// `USERPROFILE` on Windows -- and production Tauri deliberately inherits the
-/// desktop environment WITHOUT setting `HOME` (`freshell-tauri/src/lib.rs`,
-/// `home: None`). Reading only `HOME` left `session_index: None` on native
-/// Windows (route permanently `warming`, exact-id fallbacks never invoked),
-/// while the `homeDir` wire field (`main.rs`) already recognized
-/// `USERPROFILE`. Resolution is HOME-then-USERPROFILE (identical on Unix,
-/// where HOME is always set).
+/// Windows/Tauri parity: Node derives these via `os.homedir()` (libuv
+/// `uv_os_homedir`), whose PLATFORM semantics matter -- production Tauri
+/// deliberately inherits the desktop environment WITHOUT setting `HOME`
+/// (`freshell-tauri/src/lib.rs`, `home: None`). On Windows, `os.homedir()`
+/// reads `USERPROFILE` (HOME is NEVER consulted); on POSIX it reads `HOME`
+/// when set and non-empty, else the effective user's passwd-entry home
+/// (`getpwuid_r`) -- so the POSIX result is Some even with HOME unset, and
+/// `main.rs` still constructs a real session index (no permanent `warming`).
+/// Rust's `std::env::home_dir()` (un-deprecated since 1.87, MSRV here is
+/// 1.96) implements exactly these platform rules -- USERPROFILE-else-profile
+/// API on Windows, non-empty-HOME-else-`getpwuid_r` on unix, never an empty
+/// path -- so this delegates to it. An earlier interim version approximated
+/// this as HOME-then-USERPROFILE on ALL platforms; that both consulted
+/// USERPROFILE on POSIX (Node never does) and preferred HOME on Windows
+/// (Node never reads it).
 pub(crate) fn provider_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("USERPROFILE")
-                .ok()
-                .filter(|value| !value.is_empty())
-        })
-        .map(PathBuf::from)
+    std::env::home_dir()
 }
 
 /// Serializes tests (crate-wide) that mutate the process-global
@@ -463,6 +462,32 @@ pub(crate) fn provider_home() -> Option<PathBuf> {
 /// `provider_home()` tests.
 #[cfg(test)]
 pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only oracle for the effective user's passwd-entry home directory
+/// (`getpwuid_r`) — the Node `os.homedir()` POSIX fallback when `HOME` is
+/// unset or empty. `pub(crate)` so `main.rs`'s resolve-wiring tests assert
+/// against the SAME fallback value [`provider_home`] must produce.
+#[cfg(all(test, unix))]
+pub(crate) fn passwd_entry_home() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let uid = unsafe { libc::geteuid() };
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    assert_eq!(rc, 0, "getpwuid_r must succeed for the effective uid");
+    assert!(!result.is_null(), "effective uid must have a passwd entry");
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()))
+}
 
 /// `getClaudeHome()` (`server/claude-home.ts:4-7`): `CLAUDE_HOME` env else
 /// `<home>/.claude`. `pub(crate)` so `main.rs` (boot-time `SessionIndex`
@@ -1306,6 +1331,7 @@ mod tests {
     // resolve-wiring tests serialize with these.
     use super::HOME_ENV_TEST_LOCK as PROVIDER_HOME_ENV_LOCK;
 
+    #[cfg(unix)]
     #[test]
     fn provider_home_ignores_freshell_home_uses_real_home() {
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
@@ -1331,8 +1357,15 @@ mod tests {
         }
     }
 
+    // Node `os.homedir()` platform semantics (libuv `uv_os_homedir`): on
+    // POSIX an unset (or empty) HOME falls back to the EFFECTIVE USER'S
+    // passwd-entry home (`getpwuid_r`) — USERPROFILE is NEVER consulted, and
+    // the result is still Some, so `main.rs` still constructs a real session
+    // index instead of `session_index: None` (permanent `warming`). On
+    // Windows only USERPROFILE is read (HOME is never consulted).
+    #[cfg(unix)]
     #[test]
-    fn provider_home_none_when_home_and_userprofile_unset() {
+    fn provider_home_unix_uses_passwd_entry_when_home_and_userprofile_unset() {
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
         let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
         let saved_home = std::env::var("HOME").ok();
@@ -1342,7 +1375,16 @@ mod tests {
         std::env::remove_var("HOME");
         std::env::remove_var("USERPROFILE");
 
-        assert_eq!(provider_home(), None);
+        let resolved = provider_home();
+        assert!(
+            resolved.is_some(),
+            "POSIX must still resolve a home with HOME unset (passwd-entry fallback)"
+        );
+        assert_eq!(
+            resolved,
+            Some(super::passwd_entry_home()),
+            "an unset HOME must fall back to the passwd-entry home (Node os.homedir() POSIX semantics)"
+        );
 
         match saved_freshell_home {
             Some(v) => std::env::set_var("FRESHELL_HOME", v),
@@ -1358,14 +1400,9 @@ mod tests {
         }
     }
 
-    // Native Windows/Tauri parity (`os.homedir()` reads `USERPROFILE` on
-    // Windows; Node's index and the Rust `homeDir` wire field both resolve
-    // it): production Tauri inherits the desktop environment WITHOUT setting
-    // `HOME` (`freshell-tauri/src/lib.rs`, `home: None`), so a
-    // USERPROFILE-only environment must still build a real session index
-    // instead of `session_index: None` (permanent `warming`).
+    #[cfg(unix)]
     #[test]
-    fn provider_home_falls_back_to_userprofile_when_home_unset() {
+    fn provider_home_unix_ignores_userprofile_when_home_unset() {
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
         let saved_home = std::env::var("HOME").ok();
         let saved_userprofile = std::env::var("USERPROFILE").ok();
@@ -1373,10 +1410,16 @@ mod tests {
         std::env::remove_var("HOME");
         std::env::set_var("USERPROFILE", "/Users/win-fixture");
 
-        assert_eq!(
-            provider_home(),
+        let resolved = provider_home();
+        assert_ne!(
+            resolved,
             Some(PathBuf::from("/Users/win-fixture")),
-            "provider_home() must fall back to USERPROFILE when HOME is unset (Node os.homedir() parity)"
+            "POSIX must NEVER consult USERPROFILE (Node os.homedir() reads it on Windows only)"
+        );
+        assert_eq!(
+            resolved,
+            Some(super::passwd_entry_home()),
+            "with HOME unset, POSIX must resolve the passwd-entry home"
         );
 
         match saved_home {
@@ -1389,13 +1432,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn provider_home_treats_empty_home_as_unset_falling_back_to_userprofile() {
+    fn provider_home_unix_treats_empty_home_as_unset_using_passwd_entry() {
         // A lingering `HOME=""` (empty, not unset) must behave exactly like
         // an unset HOME — Node's `os.homedir()` never returns an empty
-        // string, so an empty HOME accepted verbatim would resolve provider
-        // roots (and the `homeDir` wire field, which routes through this
-        // helper) against `""`.
+        // string; on POSIX it falls back to the passwd-entry home, never
+        // USERPROFILE.
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
         let saved_home = std::env::var("HOME").ok();
         let saved_userprofile = std::env::var("USERPROFILE").ok();
@@ -1405,8 +1448,8 @@ mod tests {
 
         assert_eq!(
             provider_home(),
-            Some(PathBuf::from("/Users/win-fixture-empty")),
-            "an EMPTY HOME must fall through to USERPROFILE"
+            Some(super::passwd_entry_home()),
+            "an EMPTY HOME must behave like unset HOME: passwd-entry fallback, never USERPROFILE"
         );
 
         match saved_home {
@@ -1419,8 +1462,9 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn provider_home_prefers_home_over_userprofile() {
+    fn provider_home_unix_prefers_home_and_never_consults_userprofile() {
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
         let saved_home = std::env::var("HOME").ok();
         let saved_userprofile = std::env::var("USERPROFILE").ok();
@@ -1431,7 +1475,36 @@ mod tests {
         assert_eq!(
             provider_home(),
             Some(PathBuf::from("/home/real-user-fixture")),
-            "HOME must win when both HOME and USERPROFILE are set"
+            "a set, non-empty HOME must win on POSIX (USERPROFILE is never consulted)"
+        );
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    // Native Windows/Tauri parity: `os.homedir()` reads USERPROFILE on
+    // Windows and NEVER consults HOME — a process with both variables set
+    // must index against USERPROFILE, not HOME.
+    #[cfg(windows)]
+    #[test]
+    fn provider_home_windows_uses_userprofile_never_home() {
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_userprofile = std::env::var("USERPROFILE").ok();
+
+        std::env::set_var("HOME", "C:\\never-consulted");
+        std::env::set_var("USERPROFILE", "C:\\Users\\win-fixture");
+
+        assert_eq!(
+            provider_home(),
+            Some(PathBuf::from("C:\\Users\\win-fixture")),
+            "Windows must read USERPROFILE and never consult HOME (Node os.homedir() parity)"
         );
 
         match saved_home {

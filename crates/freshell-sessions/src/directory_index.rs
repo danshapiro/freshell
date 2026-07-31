@@ -3343,9 +3343,12 @@ mod tests {
     /// neither is set -- disabling persistence rather than erroring.
     #[test]
     fn default_persist_path_resolves_freshell_home_then_home_then_none() {
-        // Serialize env-var mutation: this is the ONLY test in this crate
-        // that touches FRESHELL_HOME/HOME, so no cross-test interference is
-        // possible even under the default parallel test harness.
+        // Serialize env-var mutation on the crate-wide lock:
+        // `parse::opencode`'s `home_dir()` tests also mutate HOME, and cargo
+        // runs tests in parallel THREADS within one process.
+        let _lock = crate::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior_freshell_home = std::env::var("FRESHELL_HOME").ok();
         let prior_home = std::env::var("HOME").ok();
 

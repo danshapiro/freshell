@@ -23,7 +23,8 @@
 //! beyond the RECORDED DEVIATIONS documented in the HTTP layer's module doc
 //! (`resolve.rs`): an explicit 500 on a resolver panic (Node has no defined
 //! behavior there), and `homeDir` omitted when the server has no resolvable
-//! home (HOME/USERPROFILE unset).
+//! home (Node `os.homedir()` platform semantics: USERPROFILE on Windows;
+//! HOME else the passwd-entry home on POSIX).
 //!
 //! Wire parity notes:
 //! - Field ORDER in `ResumeResolveMatch` matches the Node object literals —

@@ -587,63 +587,151 @@ pub fn default_opencode_data_home() -> PathBuf {
         .join("opencode")
 }
 
+/// Node `os.homedir()` platform semantics (libuv `uv_os_homedir`): Windows
+/// reads `USERPROFILE` (HOME is NEVER consulted); POSIX reads `HOME` when
+/// set and non-empty, else the effective user's passwd-entry home
+/// (`getpwuid_r`). Rust's `std::env::home_dir()` (un-deprecated since 1.87,
+/// MSRV here is 1.96) implements exactly these platform rules, so this
+/// delegates to it — same contract as `session_directory::provider_home()`
+/// in `freshell-server`. An earlier interim version approximated this as
+/// HOME-then-USERPROFILE on ALL platforms.
 fn home_dir() -> Option<PathBuf> {
-    home_dir_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
-}
-
-/// HOME then USERPROFILE (Node `os.homedir()` parity — USERPROFILE-backed on
-/// native Windows, where Tauri deliberately leaves HOME unset). Pure so the
-/// empty-as-unset contract is testable without mutating process env.
-fn home_dir_from(
-    home: Option<std::ffi::OsString>,
-    userprofile: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    home.filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| userprofile.filter(|v| !v.is_empty()).map(PathBuf::from))
+    std::env::home_dir()
 }
 
 #[cfg(test)]
 mod home_dir_tests {
-    use super::home_dir_from;
-    use std::ffi::OsString;
+    use super::home_dir;
+    use crate::HOME_ENV_TEST_LOCK;
     use std::path::PathBuf;
 
     // This helper feeds `default_opencode_data_home()`, which the resolve
-    // route's opencode exact-id fallback resolves PER CALL — the same
-    // HOME→USERPROFILE, empty-treated-as-unset contract as
-    // `session_directory::provider_home()` (Node `os.homedir()` never
-    // returns an empty string).
+    // route's opencode exact-id fallback resolves PER CALL — the same Node
+    // `os.homedir()` platform contract as
+    // `session_directory::provider_home()` in `freshell-server`: Windows
+    // reads USERPROFILE (HOME never consulted); POSIX reads HOME when set
+    // and non-empty, else the passwd-entry home (USERPROFILE never
+    // consulted). Tests mutate real process env, so they serialize on the
+    // crate-wide `HOME_ENV_TEST_LOCK` and save/restore each var.
 
+    /// Save-and-restore guard for one env var; restores on drop, panic
+    /// included (same shape as `main.rs`'s `EnvVarGuard` in
+    /// `freshell-server`).
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
+
+        fn set(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// The effective user's passwd-entry home (`getpwuid_r`) — the Node
+    /// `os.homedir()` POSIX fallback when `HOME` is unset or empty.
+    #[cfg(unix)]
+    fn passwd_entry_home() -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let uid = unsafe { libc::geteuid() };
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        assert_eq!(rc, 0, "getpwuid_r must succeed for the effective uid");
+        assert!(!result.is_null(), "effective uid must have a passwd entry");
+        let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+        PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()))
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn empty_home_falls_through_to_userprofile() {
+    fn unix_empty_home_uses_passwd_entry_never_userprofile() {
+        let _lock = HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture");
         assert_eq!(
-            home_dir_from(
-                Some(OsString::from("")),
-                Some(OsString::from("/Users/win-fixture"))
-            ),
+            home_dir(),
+            Some(passwd_entry_home()),
+            "an EMPTY HOME must behave like unset HOME: passwd-entry fallback, never USERPROFILE"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_unset_home_ignores_userprofile_using_passwd_entry() {
+        let _lock = HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::unset("HOME");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture");
+        let resolved = home_dir();
+        assert_ne!(
+            resolved,
             Some(PathBuf::from("/Users/win-fixture")),
-            "an EMPTY HOME must be treated as unset"
+            "POSIX must NEVER consult USERPROFILE (Node os.homedir() reads it on Windows only)"
+        );
+        assert_eq!(
+            resolved,
+            Some(passwd_entry_home()),
+            "with HOME unset, POSIX must resolve the passwd-entry home"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn empty_userprofile_is_also_treated_as_unset() {
+    fn unix_home_wins_when_both_are_set() {
+        let _lock = HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "/home/real");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture");
         assert_eq!(
-            home_dir_from(None, Some(OsString::from(""))),
-            None,
-            "an EMPTY USERPROFILE must not resolve to a home"
+            home_dir(),
+            Some(PathBuf::from("/home/real")),
+            "a set, non-empty HOME must win on POSIX (USERPROFILE is never consulted)"
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn home_wins_when_both_are_set() {
+    fn windows_uses_userprofile_never_home() {
+        let _lock = HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "C:\\never-consulted");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "C:\\Users\\win-fixture");
         assert_eq!(
-            home_dir_from(
-                Some(OsString::from("/home/real")),
-                Some(OsString::from("/Users/win-fixture"))
-            ),
-            Some(PathBuf::from("/home/real"))
+            home_dir(),
+            Some(PathBuf::from("C:\\Users\\win-fixture")),
+            "Windows must read USERPROFILE and never consult HOME (Node os.homedir() parity)"
         );
     }
 }

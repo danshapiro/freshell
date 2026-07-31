@@ -1183,7 +1183,8 @@ async fn main() -> ExitCode {
                 resolve_claude_exact_id_fallback(session_id)
             }) as crate::resolve::ClaudeLocator),
             // See `resolve_wire_home_dir` for the Node `os.homedir()` parity
-            // derivation (HOME then USERPROFILE, empty treated as unset).
+            // derivation (USERPROFILE on Windows; HOME else passwd-entry
+            // home on POSIX).
             home_dir: resolve_wire_home_dir(),
             // Node's hard 15 s by-id runner timeout, applied as the route's
             // outer deadline on the whole blocking resolver (see
@@ -1601,9 +1602,10 @@ fn resolve_home() -> Option<PathBuf> {
 
 /// The `homeDir` wire field for `POST /api/sessions/resolve`. Node sends
 /// `os.homedir()` (`sessions-router.ts:306-314`) — the USER's home, which on
-/// Windows is `USERPROFILE`-backed. Resolved via the SAME
+/// Windows is `USERPROFILE`-backed and on POSIX is HOME (set and non-empty)
+/// else the passwd-entry home. Resolved via the SAME
 /// `session_directory::provider_home()` helper the session index sources use
-/// (HOME then USERPROFILE, an EMPTY var treated as unset). Do NOT reuse
+/// (it implements exactly those platform semantics). Do NOT reuse
 /// `resolve_home()`: it prefers `FRESHELL_HOME`, a config/storage root that
 /// can differ from the real home, and the dialog would prefill a cwd-less
 /// resume into the wrong directory.
@@ -1621,10 +1623,11 @@ fn resolve_wire_home_dir() -> Option<Arc<String>> {
 /// Root resolution is Node-parity (`server/claude-home.ts:4-7` +
 /// `providers/claude.ts:524-535`): `CLAUDE_HOME` (non-empty) else
 /// `<home>/.claude`, joined with `projects` — the SAME
-/// `session_directory::provider_home()` root (HOME then USERPROFILE, empty
-/// treated as unset — Node's `os.homedir()` is USERPROFILE-backed on native
-/// Windows, where Tauri deliberately leaves HOME unset) the session index
-/// uses. Note CLAUDE_HOME alone suffices even when no home resolves (Node's
+/// `session_directory::provider_home()` root the session index uses (Node
+/// `os.homedir()` platform semantics: USERPROFILE on Windows, where Tauri
+/// deliberately leaves HOME unset; on POSIX HOME when set and non-empty,
+/// else the passwd-entry home — USERPROFILE is never consulted there).
+/// Note CLAUDE_HOME alone suffices even when no home resolves (Node's
 /// `getClaudeHome()` honors it directly); no root ⇒ `Ok(None)`, a miss.
 /// Deliberately NOT `claude_home_candidates()`: its extra
 /// CLAUDE_CONFIG_DIR/bare-CLAUDE_HOME roots would expose transcripts from
@@ -2327,35 +2330,62 @@ mod tests {
         dir
     }
 
-    // -- Native Windows/Tauri parity for the resolve wiring (reviewer
-    // finding, iteration 2): production Tauri inherits the desktop
-    // environment WITHOUT setting `HOME` (`freshell-tauri/src/lib.rs`,
-    // `home: None`) — Node resolves `os.homedir()`, which is
-    // USERPROFILE-backed there. Every home consumer on the resolve path
-    // (the exact-id claude fallback, the `homeDir` wire field) must fall
-    // back HOME → USERPROFILE with an EMPTY var treated as unset, exactly
-    // like `session_directory::provider_home()`.
+    // -- Node `os.homedir()` platform parity for the resolve wiring
+    // (reviewer findings, iterations 2 + 3): production Tauri inherits the
+    // desktop environment WITHOUT setting `HOME` on native Windows, where
+    // Node's `os.homedir()` reads USERPROFILE (HOME is never consulted); on
+    // POSIX it reads HOME when set and non-empty, else the effective user's
+    // passwd-entry home — USERPROFILE is never consulted there. Every home
+    // consumer on the resolve path (the exact-id claude fallback, the
+    // `homeDir` wire field) routes through
+    // `session_directory::provider_home()`, which implements exactly those
+    // platform semantics.
 
+    #[cfg(unix)]
     #[test]
-    fn wire_home_dir_treats_empty_home_as_unset_falling_back_to_userprofile() {
+    fn wire_home_dir_unix_treats_empty_home_as_unset_using_passwd_entry() {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarGuard::set("HOME", "");
         let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture-wire");
+        let resolved = resolve_wire_home_dir().map(|h| h.as_str().to_string());
+        assert_ne!(
+            resolved.as_deref(),
+            Some("/Users/win-fixture-wire"),
+            "POSIX must NEVER consult USERPROFILE (Node os.homedir() reads it on Windows only)"
+        );
         assert_eq!(
-            resolve_wire_home_dir().map(|h| h.as_str().to_string()),
-            Some("/Users/win-fixture-wire".to_string()),
-            "an EMPTY HOME must be treated as unset, falling back to USERPROFILE (Node os.homedir() parity)"
+            resolved,
+            Some(
+                crate::session_directory::passwd_entry_home()
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "an EMPTY HOME must fall back to the passwd-entry home (Node os.homedir() POSIX parity)"
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn claude_exact_id_fallback_finds_transcript_in_a_userprofile_only_environment() {
-        // The documented Tauri environment: HOME unset (also covered empty in
-        // the wire-home-dir test above), USERPROFILE = the real user home
-        // containing `.claude/projects/...`. The exact-id fallback itself —
-        // not just `provider_home()` — must find the transcript there, or a
+    fn wire_home_dir_windows_uses_userprofile_never_home() {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "C:\\never-consulted");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "C:\\Users\\win-fixture-wire");
+        assert_eq!(
+            resolve_wire_home_dir().map(|h| h.as_str().to_string()),
+            Some("C:\\Users\\win-fixture-wire".to_string()),
+            "Windows must read USERPROFILE and never consult HOME (Node os.homedir() parity)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_exact_id_fallback_finds_transcript_under_home() {
+        // The exact-id fallback itself — not just `provider_home()` — must
+        // find the transcript under `<home>/.claude/projects`, or a
         // cwd-less/subagent transcript omitted from the index produces a
         // healthy-looking ready-empty where Node (os.homedir()) finds it.
         const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
@@ -2363,7 +2393,72 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = env_test_temp_dir("claude-fallback");
+        let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+
+        let project = home.join(".claude").join("projects").join("-repo-alpha");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/alpha\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure")
+            .expect("fallback must FIND the transcript under HOME/.claude");
+        assert_eq!(hit.session_id, SESSION_ID.to_ascii_lowercase());
+        assert_eq!(hit.cwd.as_deref(), Some("/repo/alpha"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_exact_id_fallback_unix_never_reads_userprofile() {
+        // Node's `os.homedir()` on POSIX never consults USERPROFILE: with
+        // HOME unset, the fallback root is the passwd-entry home — a
+        // transcript living ONLY under `USERPROFILE/.claude` must NOT be
+        // surfaced (the pre-fix HOME||USERPROFILE approximation found it).
+        const SESSION_ID: &str = "0C7B39D1-52E4-4F0F-9E7C-4E2B7A11D9AA";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = env_test_temp_dir("claude-fallback-userprofile");
         let _home = EnvVarGuard::unset("HOME");
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", profile.to_str().unwrap());
+
+        let project = profile.join(".claude").join("projects").join("-repo-beta");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/beta\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure");
+        assert!(
+            hit.is_none(),
+            "POSIX must resolve the passwd-entry home, never USERPROFILE/.claude"
+        );
+
+        std::fs::remove_dir_all(&profile).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_exact_id_fallback_finds_transcript_in_a_userprofile_only_environment() {
+        // The documented Tauri environment: USERPROFILE = the real user home
+        // containing `.claude/projects/...` (Node's `os.homedir()` is
+        // USERPROFILE-backed on Windows). The exact-id fallback itself —
+        // not just `provider_home()` — must find the transcript there.
+        const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = env_test_temp_dir("claude-fallback");
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
         let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
 
