@@ -53,7 +53,10 @@ pub use claude::FreshClaudeState;
 // shares with the attach arm, and the original-cwd reader the resume-resolve
 // claude fallback pairs with it (`claude-transcript-locator.ts` parity).
 // Keep the rest of claude_snapshot crate-private.
-pub use claude_snapshot::{locate_transcript, transcript_cwd, transcript_cwd_bounded};
+pub use claude_snapshot::{
+    locate_transcript, locate_transcript_checked, transcript_cwd, transcript_cwd_bounded,
+    transcript_cwd_checked,
+};
 pub use codex::FreshCodexState;
 pub use identity_sink::{
     FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,

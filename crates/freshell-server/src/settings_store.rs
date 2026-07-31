@@ -286,11 +286,9 @@ impl SettingsStore {
     }
 
     /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
-    /// — the resolve route's unsearched-provider computation reads this. Async
-    /// because the settings tree is behind a tokio RwLock (same as `get()`).
-    // TODO(rust-resolve-parity Task 6): the resolve route's wire upgrade
-    // consumes this (`unsearchedProviders`); until then only tests call it.
-    #[allow(dead_code)]
+    /// — the resolve route's unsearched-provider computation and snapshot
+    /// provider gate read this (`resolve.rs`). Async because the settings
+    /// tree is behind a tokio RwLock (same as `get()`).
     pub async fn coding_cli_enabled_providers(&self) -> Vec<String> {
         self.inner.read().await.coding_cli.enabled_providers.clone()
     }
