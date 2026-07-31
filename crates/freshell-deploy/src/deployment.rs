@@ -317,7 +317,7 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
                 .as_deref()
                 .expect("parsed full command has client");
             let provenance = ClientAssetProvenance::from_candidate(client)?;
-            stage.copy_tree(client, Path::new("client"))?;
+            copy_candidate_client(&mut stage, client, &prior)?;
             stage.write_bytes(
                 Path::new(CLIENT_ASSET_PROVENANCE_FILE),
                 &provenance.to_json()?,

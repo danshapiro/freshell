@@ -941,18 +941,26 @@ test('compatibility-checked deployment preserves one connected browser and rejec
       path.join(rig.checkout, 'server/task7-deploy-generation-marker.ts'),
       'export const task7DeployGenerationMarker = true\n',
     )
+    const editorSource = path.join(rig.checkout, 'src/components/panes/EditorPane.tsx')
+    const editorBeforeFullUpdate = readFileSync(editorSource, 'utf8')
+    const editorAfterFullUpdate = editorBeforeFullUpdate.replace(
+      'data-testid="editor-pane"',
+      'data-testid="editor-pane"\n      data-deployment-generation="after-full-update"',
+    )
+    expect(editorAfterFullUpdate).not.toBe(editorBeforeFullUpdate)
+    writeFileSync(editorSource, editorAfterFullUpdate)
     const restart = await result(
       path.join(rig.checkout, 'scripts/launch-rust.sh'),
-      ['--port', String(rig.port), '--server-only', '--restart'],
+      ['--port', String(rig.port), '--restart'],
       { cwd: rig.checkout, env: rig.environment, timeout: 1_800_000 },
     )
     expect(restart.code, `${restart.stdout}\n${restart.stderr}`).toBe(0)
-    console.log('task7 deploy sandbox: canonical server-only restart completed')
+    console.log('task7 deploy sandbox: canonical full restart completed')
     await harness.waitForConnection(60_000)
     const after = await deploymentIdentity(rig)
     const acceptedTransaction = JSON.parse(after.transaction)
     expect(acceptedTransaction).toMatchObject({
-      mode: 'server',
+      mode: 'full',
       priorGenerationId: initial.live.selectedGenerationId,
       targetGenerationId: after.live.selectedGenerationId,
       phase: 'activation_confirmed',
@@ -1028,6 +1036,8 @@ test('compatibility-checked deployment preserves one connected browser and rejec
         'client',
       ),
     )
+    await expect(page.locator('[data-testid="editor-pane"]'))
+      .not.toHaveAttribute('data-deployment-generation', 'after-full-update')
 
     const assertRejectedWithoutMutation = async (
       attempt: () => Promise<CommandResult>,

@@ -544,6 +544,20 @@ fn client_command(fixture: &AssemblyFixture, client: &Path) -> DeployCommand {
     }
 }
 
+fn full_command(fixture: &AssemblyFixture, client: &Path, server_label: &str) -> DeployCommand {
+    DeployCommand {
+        checkout: fixture.checkout.clone(),
+        port: freshell_deploy::DeployPort::new(43_127).unwrap(),
+        mode: UpdateMode::Full,
+        client_dir: Some(client.to_path_buf()),
+        server: Some(server_sources(fixture, server_label)),
+        node: NodePrerequisite {
+            executable: fixture.node.clone(),
+            version: "v22.0.0".to_string(),
+        },
+    }
+}
+
 fn server_sources(fixture: &AssemblyFixture, label: &str) -> ServerAssemblySources {
     let root = fixture.sources.join(label);
     make_executable(root.join("freshell-server"), label);
@@ -678,6 +692,65 @@ fn sequential_client_only_assemblies_retain_only_the_direct_predecessor_assets()
 }
 
 #[test]
+fn sequential_full_assemblies_retain_only_the_direct_predecessor_assets() {
+    let fixture = assembly_fixture();
+
+    let first_client = fixture.sources.join("first-full-client");
+    write(first_client.join("index.html"), b"first\n");
+    write(first_client.join("assets/first.js"), b"first asset\n");
+    write(first_client.join("deployment-compatibility.json"), b"{}\n");
+    let first = assemble_generation(
+        &fixture.store,
+        &full_command(&fixture, &first_client, "first-full-server"),
+    )
+    .unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .select_generation(&first.id)
+        .unwrap();
+
+    let second_client = fixture.sources.join("second-full-client");
+    write(second_client.join("index.html"), b"second\n");
+    write(second_client.join("assets/second.js"), b"second asset\n");
+    write(second_client.join("deployment-compatibility.json"), b"{}\n");
+    let second = assemble_generation(
+        &fixture.store,
+        &full_command(&fixture, &second_client, "second-full-server"),
+    )
+    .unwrap();
+    assert!(
+        second.path.join("client/assets/first.js").is_file(),
+        "a full update must preserve the direct predecessor's browser assets"
+    );
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .select_generation(&second.id)
+        .unwrap();
+
+    let third_client = fixture.sources.join("third-full-client");
+    write(third_client.join("index.html"), b"third\n");
+    write(third_client.join("assets/third.js"), b"third asset\n");
+    write(third_client.join("deployment-compatibility.json"), b"{}\n");
+    let third = assemble_generation(
+        &fixture.store,
+        &full_command(&fixture, &third_client, "third-full-server"),
+    )
+    .unwrap();
+
+    assert!(third.path.join("client/assets/third.js").is_file());
+    assert!(third.path.join("client/assets/second.js").is_file());
+    assert!(
+        !third.path.join("client/assets/first.js").exists(),
+        "assets from the grandparent generation must retire"
+    );
+    assert!(!third.path.join("client/assets/prior.js").exists());
+}
+
+#[test]
 fn client_asset_merge_rejects_same_path_with_different_bytes() {
     let fixture = assembly_fixture();
     let client = fixture.sources.join("client");
@@ -787,17 +860,7 @@ fn combined_assembly_uses_only_private_generation_storage() {
     let client = fixture.sources.join("combined-client");
     write(client.join("index.html"), b"combined\n");
     write(client.join("deployment-compatibility.json"), b"{}\n");
-    let command = DeployCommand {
-        checkout: fixture.checkout.clone(),
-        port: freshell_deploy::DeployPort::new(43_127).unwrap(),
-        mode: UpdateMode::Full,
-        client_dir: Some(client),
-        server: Some(server_sources(&fixture, "combined")),
-        node: NodePrerequisite {
-            executable: fixture.node.clone(),
-            version: "v22.0.0".to_string(),
-        },
-    };
+    let command = full_command(&fixture, &client, "combined");
     let target = assemble_generation(&fixture.store, &command).unwrap();
     assert!(target.path.starts_with(
         fixture
