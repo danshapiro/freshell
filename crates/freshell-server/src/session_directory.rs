@@ -454,6 +454,16 @@ pub(crate) fn provider_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Serializes tests (crate-wide) that mutate the process-global
+/// `HOME`/`USERPROFILE`/`CLAUDE_HOME`/`FRESHELL_HOME` env vars: cargo runs
+/// tests in parallel THREADS within one process, so two tests racing to
+/// mutate the SAME vars would otherwise flake (one test's assertion
+/// observing the OTHER test's in-flight env state). Shared `pub(crate)` so
+/// `main.rs`'s resolve-wiring tests serialize with this module's
+/// `provider_home()` tests.
+#[cfg(test)]
+pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `getClaudeHome()` (`server/claude-home.ts:4-7`): `CLAUDE_HOME` env else
 /// `<home>/.claude`. `pub(crate)` so `main.rs` (boot-time `SessionIndex`
 /// wiring) and `sessions.rs` (the cross-router override-overlay test) resolve
@@ -1291,8 +1301,10 @@ mod tests {
     // `PROVIDER_HOME_ENV_LOCK` because cargo runs tests in parallel THREADS
     // within one process: two tests racing to mutate the SAME process-global
     // `HOME`/`FRESHELL_HOME` vars would otherwise flake (one test's assertion
-    // observing the OTHER test's in-flight env state).
-    static PROVIDER_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // observing the OTHER test's in-flight env state). The lock itself is the
+    // crate-wide `HOME_ENV_TEST_LOCK` (module level, above) so `main.rs`'s
+    // resolve-wiring tests serialize with these.
+    use super::HOME_ENV_TEST_LOCK as PROVIDER_HOME_ENV_LOCK;
 
     #[test]
     fn provider_home_ignores_freshell_home_uses_real_home() {
@@ -1365,6 +1377,36 @@ mod tests {
             provider_home(),
             Some(PathBuf::from("/Users/win-fixture")),
             "provider_home() must fall back to USERPROFILE when HOME is unset (Node os.homedir() parity)"
+        );
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    #[test]
+    fn provider_home_treats_empty_home_as_unset_falling_back_to_userprofile() {
+        // A lingering `HOME=""` (empty, not unset) must behave exactly like
+        // an unset HOME — Node's `os.homedir()` never returns an empty
+        // string, so an empty HOME accepted verbatim would resolve provider
+        // roots (and the `homeDir` wire field, which routes through this
+        // helper) against `""`.
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_userprofile = std::env::var("USERPROFILE").ok();
+
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "/Users/win-fixture-empty");
+
+        assert_eq!(
+            provider_home(),
+            Some(PathBuf::from("/Users/win-fixture-empty")),
+            "an EMPTY HOME must fall through to USERPROFILE"
         );
 
         match saved_home {

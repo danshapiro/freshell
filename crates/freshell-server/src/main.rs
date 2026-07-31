@@ -1179,67 +1179,22 @@ async fn main() -> ExitCode {
             // (Node preserves `cause.code` verbatim). Node's locator
             // lowercases the id before scanning and returns the lowercased
             // id — mirrored here.
-            locate_claude_transcript: Some({
-                std::sync::Arc::new(|session_id: &str| {
-                    let lowered = session_id.to_ascii_lowercase();
-                    // Node-parity root (`server/claude-home.ts:4-7` +
-                    // `providers/claude.ts:524-535`): CLAUDE_HOME (non-empty)
-                    // else $HOME/.claude, joined with "projects" — the SAME
-                    // root the Rust session index uses
-                    // (`session_directory::claude_home`). Note CLAUDE_HOME
-                    // alone suffices even when HOME is unset (Node's
-                    // getClaudeHome() honors it directly); no root ⇒
-                    // Ok(None), a miss. Deliberately NOT
-                    // `claude_home_candidates()`: its extra
-                    // CLAUDE_CONFIG_DIR/bare-CLAUDE_HOME roots would expose
-                    // transcripts from roots Node never searches.
-                    let claude_home =
-                        match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
-                            Some(v) => Some(std::path::PathBuf::from(v)),
-                            None => std::env::var("HOME")
-                                .ok()
-                                .filter(|v| !v.is_empty())
-                                .map(|h| std::path::PathBuf::from(h).join(".claude")),
-                        };
-                    let roots: Vec<std::path::PathBuf> = match claude_home {
-                        Some(h) => vec![h.join("projects")],
-                        None => return Ok(None),
-                    };
-                    match freshell_freshagent::locate_transcript_checked(&roots, &lowered) {
-                        Ok(Some(path)) => {
-                            match freshell_freshagent::transcript_cwd_checked(&path) {
-                                Ok(cwd) => Ok(Some(
-                                    freshell_sessions::resume_resolve::ClaudeTranscriptHit {
-                                        cwd,
-                                        session_id: lowered,
-                                    },
-                                )),
-                                Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
-                                    code: errno_code(&e),
-                                    message: format!("Claude transcript read failed: {e}"),
-                                }),
-                            }
-                        }
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
-                            code: errno_code(&e),
-                            message: format!("Claude transcript scan failed: {e}"),
-                        }),
-                    }
-                }) as crate::resolve::ClaudeLocator
-            }),
-            // Node sends os.homedir() (`sessions-router.ts:306-314`) — the
-            // USER's home. Do NOT reuse resolve_home(): it prefers
-            // FRESHELL_HOME, a config/storage root that can differ from the
-            // real home, and the dialog would prefill a cwd-less resume into
-            // the wrong directory.
-            home_dir: std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|h| Arc::new(h.to_string_lossy().into_owned())),
+            locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
+                resolve_claude_exact_id_fallback(session_id)
+            }) as crate::resolve::ClaudeLocator),
+            // See `resolve_wire_home_dir` for the Node `os.homedir()` parity
+            // derivation (HOME then USERPROFILE, empty treated as unset).
+            home_dir: resolve_wire_home_dir(),
             // Node's hard 15 s by-id runner timeout, applied as the route's
             // outer deadline on the whole blocking resolver (see
             // `resolve.rs` for the abandonment semantics).
             resolve_deadline: resolve::RESOLVE_OUTER_DEADLINE,
+            // Admission cap on concurrent blocking resolver tasks — see
+            // `RESOLVE_MAX_CONCURRENCY` for why abandoned (uncancellable)
+            // blocking tasks must be bounded in COUNT, not just latency.
+            resolve_permits: Arc::new(tokio::sync::Semaphore::new(
+                resolve::RESOLVE_MAX_CONCURRENCY,
+            )),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
@@ -1642,6 +1597,72 @@ fn resolve_home() -> Option<PathBuf> {
         .or_else(|| std::env::var("HOME").ok())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+/// The `homeDir` wire field for `POST /api/sessions/resolve`. Node sends
+/// `os.homedir()` (`sessions-router.ts:306-314`) — the USER's home, which on
+/// Windows is `USERPROFILE`-backed. Resolved via the SAME
+/// `session_directory::provider_home()` helper the session index sources use
+/// (HOME then USERPROFILE, an EMPTY var treated as unset). Do NOT reuse
+/// `resolve_home()`: it prefers `FRESHELL_HOME`, a config/storage root that
+/// can differ from the real home, and the dialog would prefill a cwd-less
+/// resume into the wrong directory.
+fn resolve_wire_home_dir() -> Option<Arc<String>> {
+    session_directory::provider_home().map(|h| Arc::new(h.to_string_lossy().into_owned()))
+}
+
+/// The production claude exact-id fallback body (`crate::resolve::ClaudeLocator`):
+/// the CHECKED locator over Node's authoritative two layouts (direct +
+/// `<parent>/subagents/<id>.jsonl`) with the CHECKED bounded cwd reader —
+/// read errors REPORT as `Err(ProviderFailure)` carrying the symbolic errno
+/// (Node preserves `cause.code` verbatim). Node's locator lowercases the id
+/// before scanning and returns the lowercased id — mirrored here.
+///
+/// Root resolution is Node-parity (`server/claude-home.ts:4-7` +
+/// `providers/claude.ts:524-535`): `CLAUDE_HOME` (non-empty) else
+/// `<home>/.claude`, joined with `projects` — the SAME
+/// `session_directory::provider_home()` root (HOME then USERPROFILE, empty
+/// treated as unset — Node's `os.homedir()` is USERPROFILE-backed on native
+/// Windows, where Tauri deliberately leaves HOME unset) the session index
+/// uses. Note CLAUDE_HOME alone suffices even when no home resolves (Node's
+/// `getClaudeHome()` honors it directly); no root ⇒ `Ok(None)`, a miss.
+/// Deliberately NOT `claude_home_candidates()`: its extra
+/// CLAUDE_CONFIG_DIR/bare-CLAUDE_HOME roots would expose transcripts from
+/// roots Node never searches.
+fn resolve_claude_exact_id_fallback(
+    session_id: &str,
+) -> Result<
+    Option<freshell_sessions::resume_resolve::ClaudeTranscriptHit>,
+    freshell_sessions::resume_resolve::ProviderFailure,
+> {
+    let lowered = session_id.to_ascii_lowercase();
+    let claude_home = match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
+        Some(v) => Some(std::path::PathBuf::from(v)),
+        None => session_directory::provider_home().map(|h| h.join(".claude")),
+    };
+    let roots: Vec<std::path::PathBuf> = match claude_home {
+        Some(h) => vec![h.join("projects")],
+        None => return Ok(None),
+    };
+    match freshell_freshagent::locate_transcript_checked(&roots, &lowered) {
+        Ok(Some(path)) => match freshell_freshagent::transcript_cwd_checked(&path) {
+            Ok(cwd) => Ok(Some(
+                freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    cwd,
+                    session_id: lowered,
+                },
+            )),
+            Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                code: errno_code(&e),
+                message: format!("Claude transcript read failed: {e}"),
+            }),
+        },
+        Ok(None) => Ok(None),
+        Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+            code: errno_code(&e),
+            message: format!("Claude transcript scan failed: {e}"),
+        }),
+    }
 }
 
 /// P1.8 tombstone-deletion gate (V10.md): `true` ONLY when a DIRECT
@@ -2261,6 +2282,107 @@ mod sessions_sweep_tests {
 mod tests {
     use super::*;
     use freshell_platform::MapEnv;
+
+    /// Save-and-restore guard for one env var (tests below mutate real
+    /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them
+    /// crate-wide). Restores on drop, panic included.
+    struct EnvVarGuard {
+        name: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
+
+        fn set(name: &'static str, value: &str) -> Self {
+            let saved = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frs-main-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir temp dir");
+        dir
+    }
+
+    // -- Native Windows/Tauri parity for the resolve wiring (reviewer
+    // finding, iteration 2): production Tauri inherits the desktop
+    // environment WITHOUT setting `HOME` (`freshell-tauri/src/lib.rs`,
+    // `home: None`) — Node resolves `os.homedir()`, which is
+    // USERPROFILE-backed there. Every home consumer on the resolve path
+    // (the exact-id claude fallback, the `homeDir` wire field) must fall
+    // back HOME → USERPROFILE with an EMPTY var treated as unset, exactly
+    // like `session_directory::provider_home()`.
+
+    #[test]
+    fn wire_home_dir_treats_empty_home_as_unset_falling_back_to_userprofile() {
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarGuard::set("HOME", "");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", "/Users/win-fixture-wire");
+        assert_eq!(
+            resolve_wire_home_dir().map(|h| h.as_str().to_string()),
+            Some("/Users/win-fixture-wire".to_string()),
+            "an EMPTY HOME must be treated as unset, falling back to USERPROFILE (Node os.homedir() parity)"
+        );
+    }
+
+    #[test]
+    fn claude_exact_id_fallback_finds_transcript_in_a_userprofile_only_environment() {
+        // The documented Tauri environment: HOME unset (also covered empty in
+        // the wire-home-dir test above), USERPROFILE = the real user home
+        // containing `.claude/projects/...`. The exact-id fallback itself —
+        // not just `provider_home()` — must find the transcript there, or a
+        // cwd-less/subagent transcript omitted from the index produces a
+        // healthy-looking ready-empty where Node (os.homedir()) finds it.
+        const SESSION_ID: &str = "AB2AFDA6-A340-443E-BA60-024A1B3554B4";
+        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = env_test_temp_dir("claude-fallback");
+        let _home = EnvVarGuard::unset("HOME");
+        let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
+        let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
+
+        let project = home.join(".claude").join("projects").join("-repo-alpha");
+        std::fs::create_dir_all(&project).expect("mkdir claude project dir");
+        std::fs::write(
+            project.join(format!("{}.jsonl", SESSION_ID.to_ascii_lowercase())),
+            "{\"cwd\":\"/repo/alpha\"}\n",
+        )
+        .expect("write transcript fixture");
+
+        let hit = resolve_claude_exact_id_fallback(SESSION_ID)
+            .expect("fallback must not report a provider failure")
+            .expect("fallback must FIND the transcript under USERPROFILE/.claude");
+        assert_eq!(hit.session_id, SESSION_ID.to_ascii_lowercase());
+        assert_eq!(hit.cwd.as_deref(), Some("/repo/alpha"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     // -- Task 6 (resolve parity): errno-name derivation for provider errors.
     // Node preserves the ORIGINAL `cause.code` VERBATIM

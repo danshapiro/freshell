@@ -588,7 +588,62 @@ pub fn default_opencode_data_home() -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    home_dir_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// HOME then USERPROFILE (Node `os.homedir()` parity — USERPROFILE-backed on
+/// native Windows, where Tauri deliberately leaves HOME unset). Pure so the
+/// empty-as-unset contract is testable without mutating process env.
+fn home_dir_from(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    home.filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| userprofile.filter(|v| !v.is_empty()).map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod home_dir_tests {
+    use super::home_dir_from;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    // This helper feeds `default_opencode_data_home()`, which the resolve
+    // route's opencode exact-id fallback resolves PER CALL — the same
+    // HOME→USERPROFILE, empty-treated-as-unset contract as
+    // `session_directory::provider_home()` (Node `os.homedir()` never
+    // returns an empty string).
+
+    #[test]
+    fn empty_home_falls_through_to_userprofile() {
+        assert_eq!(
+            home_dir_from(
+                Some(OsString::from("")),
+                Some(OsString::from("/Users/win-fixture"))
+            ),
+            Some(PathBuf::from("/Users/win-fixture")),
+            "an EMPTY HOME must be treated as unset"
+        );
+    }
+
+    #[test]
+    fn empty_userprofile_is_also_treated_as_unset() {
+        assert_eq!(
+            home_dir_from(None, Some(OsString::from(""))),
+            None,
+            "an EMPTY USERPROFILE must not resolve to a home"
+        );
+    }
+
+    #[test]
+    fn home_wins_when_both_are_set() {
+        assert_eq!(
+            home_dir_from(
+                Some(OsString::from("/home/real")),
+                Some(OsString::from("/Users/win-fixture"))
+            ),
+            Some(PathBuf::from("/home/real"))
+        );
+    }
 }
