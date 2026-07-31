@@ -938,15 +938,28 @@ impl SessionIndex {
         let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
             let direct_cache = Arc::clone(&direct_cache);
+            let scan_failures = Arc::clone(&scan_failures);
             move || {
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
-                let mut failures = scan_failures.lock().unwrap();
-                refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures)
+                // Clone the failure set in a SHORT lock and mutate the LOCAL
+                // copy during the sweep — `scan_failures()` is a sync
+                // accessor called from async route handlers right after a
+                // stale-while-revalidate `snapshot()`, so holding this mutex
+                // across a multi-second sweep would block a runtime thread
+                // exactly when degraded responses are being served. The
+                // updated set is swapped back in at publish time below,
+                // alongside the snapshot publish. Lost updates are
+                // impossible: `refresh_lock` guarantees at most one sweep
+                // at a time.
+                let mut failures = scan_failures.lock().unwrap().clone();
+                let (items, changed) =
+                    refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures);
+                (items, changed, failures)
             }
         })
         .await;
-        let (items, changed) = match sweep_result {
+        let (items, changed, failures) = match sweep_result {
             Ok(result) => result,
             Err(join_err) => {
                 // `discover`/`parse` are documented never-panic (every
@@ -979,10 +992,16 @@ impl SessionIndex {
                 fetched_at: Instant::now(),
             });
         } // guard dropped here — never held across an .await.
-          // Opportunistic persistence: gated (threshold/debounce) and, when
-          // warranted, saved via a DETACHED task -- never awaited here, so
-          // neither an HTTP request handler NOR this refresh itself is
-          // delayed by a disk write.
+          // Publish the sweep's failure bookkeeping in its own SHORT lock,
+          // alongside the snapshot publish (see the sweep closure above for
+          // why the mutex is not held during the sweep itself). The panic
+          // (JoinError) path above deliberately leaves the shared set
+          // untouched, mirroring its preserve-the-published-snapshot stance.
+        *scan_failures.lock().unwrap() = failures;
+        // Opportunistic persistence: gated (threshold/debounce) and, when
+        // warranted, saved via a DETACHED task -- never awaited here, so
+        // neither an HTTP request handler NOR this refresh itself is
+        // delayed by a disk write.
         if let Some((path, cache_snapshot)) = take_pending_save_from_parts(
             &persist_path,
             &persist_state,
@@ -3314,6 +3333,85 @@ mod tests {
                 .is_empty())
             .await,
             "file-backed scan failure must clear once the root is listable again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_failures_is_readable_while_a_sweep_is_in_flight() {
+        // Regression test for the sweep-long mutex hold: `perform_refresh`
+        // must NOT hold the `scan_failures` mutex across the whole
+        // discovery+parse sweep, or the sync accessor `scan_failures()`
+        // (called from async route handlers right after a stale-while-
+        // revalidate `snapshot()`) blocks a runtime thread for the full
+        // sweep duration — multi-second on a large home ("5s problem").
+        //
+        // A source whose discover_checked() BLOCKS until released simulates
+        // a slow sweep; scan_failures() must still return promptly mid-sweep.
+        struct BlockingSource {
+            entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl SessionSource for BlockingSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                self.entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+                Ok(Vec::new())
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let index = std::sync::Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(BlockingSource {
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            }) as _],
+            std::time::Duration::ZERO,
+            None,
+        ));
+        // Detached sweep (never awaited by any caller) — exactly the
+        // stale-while-revalidate shape the resolve route sees.
+        index.request_refresh();
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || entered
+                .load(std::sync::atomic::Ordering::SeqCst))
+            .await,
+            "sweep must have entered discover_checked"
+        );
+        // Mid-sweep read, off the runtime so a regression blocks THIS task,
+        // not the whole test executor. Must complete well within the timeout.
+        let reader = {
+            let index = std::sync::Arc::clone(&index);
+            tokio::task::spawn_blocking(move || index.scan_failures())
+        };
+        let read_result = tokio::time::timeout(std::time::Duration::from_millis(500), reader).await;
+        // ALWAYS release the sweep (and the possibly-still-blocked reader)
+        // before asserting, so a failure never leaks a stuck thread.
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        let failures = read_result
+            .expect("scan_failures() must not block while a sweep is in flight")
+            .expect("reader task must not panic");
+        assert!(
+            failures.is_empty(),
+            "no failure recorded yet — the sweep hasn't published anything"
         );
     }
 }
