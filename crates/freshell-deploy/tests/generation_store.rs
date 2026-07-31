@@ -116,6 +116,13 @@ fn remove_generation(store: &Store, id: &str) -> freshell_deploy::Result<()> {
     store.lock()?.remove_generation(id)
 }
 
+fn prune_generations(
+    store: &Store,
+    retain_unprotected: usize,
+) -> freshell_deploy::Result<Vec<String>> {
+    store.lock()?.prune_generations(retain_unprotected)
+}
+
 #[test]
 fn rejects_invalid_ports_before_creating_store_paths() {
     for invalid in ["", "0", "00", "03", "65536", "-1", "+1", " 3002", "3002 "] {
@@ -487,6 +494,7 @@ fn cleanup_refuses_the_distinct_still_running_server_generation() {
     let store = store(fixture.path(), 3322);
     let running = import_tree(&store, &source_tree(fixture.path(), "running-retained")).unwrap();
     let selected = import_tree(&store, &source_tree(fixture.path(), "selected-retained")).unwrap();
+    let obsolete = import_tree(&store, &source_tree(fixture.path(), "obsolete-retained")).unwrap();
     select_generation(&store, &selected.id).unwrap();
     write_live(
         &store,
@@ -504,6 +512,46 @@ fn cleanup_refuses_the_distinct_still_running_server_generation() {
         Err(DeployError::RunningGeneration(id)) if id == running.id
     ));
     store.verify_generation(&running.id).unwrap();
+    assert_eq!(prune_generations(&store, 0).unwrap(), vec![obsolete.id]);
+    store.verify_generation(&selected.id).unwrap();
+    store.verify_generation(&running.id).unwrap();
+}
+
+#[test]
+fn retention_bounds_complete_unprotected_generations() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3331);
+    let generations = (0..6)
+        .map(|index| {
+            import_tree(
+                &store,
+                &source_tree(fixture.path(), &format!("retention-{index}")),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let selected = generations.last().unwrap();
+    select_generation(&store, &selected.id).unwrap();
+    write_live(
+        &store,
+        &LiveReceipt::new(selected.id.clone(), None, false, None),
+    )
+    .unwrap();
+
+    let removed = prune_generations(&store, 2).unwrap();
+    assert_eq!(removed.len(), 3);
+    assert!(store.verify_generation(&selected.id).is_ok());
+    let complete_generations = fs::read_dir(store.paths().generations_dir())
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            (!entry.file_name().to_string_lossy().starts_with(".stage-")).then_some(entry)
+        })
+        .count();
+    assert_eq!(
+        complete_generations, 3,
+        "selected plus the two newest unprotected generations are retained"
+    );
 }
 
 #[test]
@@ -661,7 +709,7 @@ fn cleanup_refuses_to_remove_a_generation_with_any_unmanifested_path() {
 }
 
 #[test]
-fn cleanup_refuses_when_the_authoritative_receipt_set_is_missing() {
+fn cleanup_does_not_require_a_legacy_receipt_for_a_managed_fresh_store() {
     let fixture = checkout();
     let store = store(fixture.path(), 3326);
     let selected =
@@ -670,11 +718,16 @@ fn cleanup_refuses_when_the_authoritative_receipt_set_is_missing() {
         import_tree(&store, &source_tree(fixture.path(), "obsolete-no-receipts")).unwrap();
     select_generation(&store, &selected.id).unwrap();
 
+    write_live(
+        &store,
+        &LiveReceipt::new(selected.id.clone(), None, false, None),
+    )
+    .unwrap();
+    remove_generation(&store, &obsolete.id).unwrap();
     assert!(matches!(
-        remove_generation(&store, &obsolete.id),
-        Err(DeployError::InvalidReceipt(message)) if message.contains("authoritative")
+        store.verify_generation(&obsolete.id),
+        Err(DeployError::GenerationMissing(id)) if id == obsolete.id
     ));
-    store.verify_generation(&obsolete.id).unwrap();
 }
 
 #[test]

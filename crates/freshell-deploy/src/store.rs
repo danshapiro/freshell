@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -10,12 +11,14 @@ use crate::durable::{
     atomic_symlink, atomic_write, atomic_write_new, rename_noreplace, sync_directory,
 };
 use crate::error::{DeployError, Result};
-use crate::journal::{DurableTransactionJournal, TransactionJournal, TransactionPhase};
+use crate::journal::{DurableTransactionJournal, TransactionJournal};
 use crate::legacy::LegacyCaptureReceipt;
 use crate::locks::DeploymentLock;
 use crate::manifest::{copy_open_file, copy_regular_file, GenerationManifest, MANIFEST_FILE_NAME};
 use crate::paths::{validate_relative_path, validate_symlink_target, DeployPort, StorePaths};
 use crate::receipts::{validate_generation_id, LiveReceipt};
+
+pub const DEFAULT_RETAINED_UNPROTECTED_GENERATIONS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct Generation {
@@ -248,11 +251,7 @@ impl Store {
         if let Some(transaction) =
             DurableTransactionJournal::new(self.paths.transaction_journal())?.load()?
         {
-            let unfinished =
-                !transaction.finalized && transaction.phase != TransactionPhase::RollbackComplete;
-            if unfinished
-                && (transaction.prior_generation_id == id || transaction.target_generation_id == id)
-            {
+            if transaction.prior_generation_id == id || transaction.target_generation_id == id {
                 return Err(DeployError::TransactionGeneration(id.to_string()));
             }
         }
@@ -276,15 +275,11 @@ impl Store {
                 return Err(DeployError::RunningGeneration(id.to_string()));
             }
         }
-        let legacy = self.read_legacy_capture()?.ok_or_else(|| {
-            DeployError::InvalidReceipt(
-                "authoritative legacy recovery receipt is missing; cleanup fails closed"
-                    .to_string(),
-            )
-        })?;
-        self.verify_generation(&legacy.generation_id)?;
-        if legacy.generation_id == id {
-            return Err(DeployError::LegacyGeneration(id.to_string()));
+        if let Some(legacy) = self.read_legacy_capture()? {
+            self.verify_generation(&legacy.generation_id)?;
+            if legacy.generation_id == id {
+                return Err(DeployError::LegacyGeneration(id.to_string()));
+            }
         }
         remove_manifested_tree(&generation.path, &generation.manifest)?;
         sync_directory(self.paths.generations_dir()).map_err(|error| {
@@ -294,6 +289,81 @@ impl Store {
                 cause: error.to_string(),
             }
         })
+    }
+
+    fn prune_generations_locked(&self, retain_unprotected: usize) -> Result<Vec<String>> {
+        let selected = self.selected_generation_id()?;
+        let live = self.read_live()?;
+        if let Some(live) = &live {
+            if selected.as_deref() != Some(live.selected_generation_id.as_str()) {
+                return Err(DeployError::InvalidReceipt(
+                    "live selectedGenerationId does not match current".to_string(),
+                ));
+            }
+        } else if selected.is_some() && self.read_legacy_capture()?.is_some() {
+            return Err(DeployError::InvalidReceipt(
+                "captured legacy selection is missing its authoritative live receipt".to_string(),
+            ));
+        }
+
+        let mut protected = BTreeSet::new();
+        if let Some(selected) = selected {
+            protected.insert(selected);
+        }
+        if let Some(live) = live {
+            if let Some(running) = live.running_server_generation_id {
+                self.verify_generation(&running)?;
+                protected.insert(running);
+            }
+        }
+        if let Some(legacy) = self.read_legacy_capture()? {
+            self.verify_generation(&legacy.generation_id)?;
+            protected.insert(legacy.generation_id);
+        }
+        if let Some(transaction) =
+            DurableTransactionJournal::new(self.paths.transaction_journal())?.load()?
+        {
+            self.verify_generation(&transaction.prior_generation_id)?;
+            self.verify_generation(&transaction.target_generation_id)?;
+            protected.insert(transaction.prior_generation_id);
+            protected.insert(transaction.target_generation_id);
+        }
+
+        let mut unprotected = Vec::new();
+        for entry in fs::read_dir(self.paths.generations_dir())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str() else {
+                return Err(DeployError::UnsafeStorePath(entry.path()));
+            };
+            if id.starts_with(".stage-") {
+                continue;
+            }
+            validate_generation_id(id)?;
+            let generation = self.verify_generation(id)?;
+            if !protected.contains(id) {
+                unprotected.push((
+                    fs::symlink_metadata(&generation.path)?.modified()?,
+                    id.to_string(),
+                    generation,
+                ));
+            }
+        }
+        unprotected.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
+        let mut removed = Vec::new();
+        for (_, id, generation) in unprotected.into_iter().skip(retain_unprotected) {
+            remove_manifested_tree(&generation.path, &generation.manifest)?;
+            sync_directory(self.paths.generations_dir()).map_err(|error| {
+                DeployError::StorageAmbiguous {
+                    operation: "generation retention parent sync",
+                    path: generation.path,
+                    cause: error.to_string(),
+                }
+            })?;
+            removed.push(id);
+        }
+        Ok(removed)
     }
 
     fn validate_process_port(
@@ -459,6 +529,10 @@ impl LockedStore<'_> {
 
     pub fn remove_generation(&self, id: &str) -> Result<()> {
         self.store.remove_generation_locked(id)
+    }
+
+    pub fn prune_generations(&self, retain_unprotected: usize) -> Result<Vec<String>> {
+        self.store.prune_generations_locked(retain_unprotected)
     }
 
     fn require_own_stage(&self, stage: &GenerationStage) -> Result<()> {

@@ -107,6 +107,9 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let store = Store::open(&command.checkout, command.port)?;
     let auth_token = load_auth_token(&command.checkout)?;
     recover_unfinished(&store, &auth_token)?;
+    store
+        .lock()?
+        .prune_generations(crate::store::DEFAULT_RETAINED_UNPROTECTED_GENERATIONS)?;
     let prior_id = store.selected_generation_id()?;
     let live = store.read_live()?;
     let legacy = store.read_legacy_capture()?;

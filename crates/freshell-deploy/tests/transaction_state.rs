@@ -4312,6 +4312,15 @@ fn unfinished_transaction_retains_both_generations_for_recovery() {
         .begin(&record)
         .unwrap();
 
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .prune_generations(0)
+            .unwrap()
+            .is_empty(),
+        "retention must keep both sides of an unfinished transaction"
+    );
     for generation in [&prior, &target] {
         assert!(matches!(
             store.lock().unwrap().remove_generation(&generation.id),
