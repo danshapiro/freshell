@@ -2078,6 +2078,7 @@ mod sessions_sweep_tests {
             provider: "claude".to_string(),
             project_path: "/tmp".to_string(),
             title: None,
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at,

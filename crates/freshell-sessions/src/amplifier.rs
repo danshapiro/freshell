@@ -259,6 +259,10 @@ pub fn parse_amplifier_metadata(content: &str) -> ParsedSessionMeta {
             .map(str::to_string),
         created_at,
         last_activity_at,
+        // Node: `titleSource: name ? 'provider-generated' : undefined`
+        // (`providers/amplifier.ts:93`) — the amplifier `name` IS
+        // provider-generated whenever present.
+        title_provider_generated: title.is_some(),
         title,
         summary,
         is_subagent: Some(is_subagent),
@@ -344,6 +348,7 @@ fn indexed_from_meta(
         // is not currently ported for any provider).
         project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
         title: meta.title.clone(),
+        title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
         last_activity_at,

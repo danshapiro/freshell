@@ -485,6 +485,9 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
         created_at,
         last_activity_at,
         title,
+        // Node's codex provider never marks a parsed title provider-generated
+        // (no `titleSource` write anywhere in `providers/codex.ts`).
+        title_provider_generated: false,
         summary,
         first_user_message,
         message_count: lines.len() as i64,

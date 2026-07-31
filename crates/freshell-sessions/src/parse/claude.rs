@@ -503,12 +503,20 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         }
     });
 
+    // Node's parse-layer title provenance (`providers/claude.ts:505`):
+    // `titleSource = 'provider-generated'` iff a custom-title / agent-name /
+    // generated-summary-title record was seen. Node's third input
+    // (`extractClaudeGeneratedTitleFromJsonlObject`) has no ported extraction
+    // here, so no Rust-parsed title can originate from it.
+    let title_provider_generated = custom_title.is_some() || agent_name.is_some();
+
     ParsedSessionMeta {
         session_id,
         cwd,
         created_at,
         last_activity_at,
         title: custom_title.or(agent_name).or(title),
+        title_provider_generated,
         summary,
         first_user_message,
         message_count: lines.len() as i64,

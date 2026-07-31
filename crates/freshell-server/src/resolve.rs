@@ -508,12 +508,12 @@ fn lookup_session_override<'a>(
 /// The other fields Node merges (`summaryOverride`, `createdAtOverride`,
 /// `archived`) never reach a resolve match — matches carry only
 /// title/cwd/lastActivityAt/sessionType/firstUserMessage — so they are not
-/// projected here. Node's provider-generated-title suppression
-/// (`titleSource === 'provider-generated'` vs an override sourced
-/// `dir`/`first-message`) is not portable: the Rust index does not track a
-/// parsed `titleSource` (the sidebar overlay,
-/// `session_directory.rs::apply_session_overrides`, shares this recorded
-/// divergence).
+/// projected here. Node's provider-generated-title suppression is ported too
+/// (`session-indexer.ts:210-211`): when the CURRENT parsed title is
+/// provider-generated (`IndexedSession::title_provider_generated`, Node's
+/// cached `titleSource === 'provider-generated'`) and the stored override's
+/// recorded `titleSource` is `dir` or `first-message`, the override is NOT
+/// applied — the provider's own title survives, exactly as Node preserves it.
 fn project_session_through_overrides(
     session: &IndexedSession,
     overrides: &Map<String, Value>,
@@ -525,10 +525,20 @@ fn project_session_through_overrides(
         return None;
     }
     let mut projected = session.clone();
+    // Node's `shouldApplyTitleOverride` (`session-indexer.ts:210-211`): the
+    // negated conjunction suppresses the override ONLY when the current title
+    // is provider-generated AND the override was recorded under the `dir` or
+    // `first-message` source — every other source (`user`, `ai`, `legacy`,
+    // absent) still substitutes.
+    let suppressed = session.title_provider_generated
+        && matches!(
+            ov.get("titleSource").and_then(Value::as_str),
+            Some("dir" | "first-message")
+        );
     if let Some(title) = ov
         .get("titleOverride")
         .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty() && !suppressed)
     {
         projected.title = Some(title.to_string());
     }
@@ -879,6 +889,7 @@ mod tests {
             provider: "claude".to_string(),
             project_path: "/repo/alpha".to_string(),
             title: Some("Fix the parser".to_string()),
+            title_provider_generated: false,
             summary: None,
             first_user_message: Some("fix the parser".to_string()),
             last_activity_at: 400,
@@ -1328,6 +1339,85 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+        assert_eq!(body["matches"][0]["title"], "Renamed by user");
+    }
+
+    /// `claude_fixture()` whose title the PROVIDER generated (Node's
+    /// parse-layer `titleSource: 'provider-generated'`,
+    /// `providers/claude.ts:505`).
+    fn claude_fixture_provider_titled() -> IndexedSession {
+        IndexedSession {
+            title: Some("Provider generated title".to_string()),
+            title_provider_generated: true,
+            ..claude_fixture()
+        }
+    }
+
+    /// Shared body for the suppression pair: a session whose CURRENT title is
+    /// provider-generated, with a stored override recorded under
+    /// `titleSource: {override_source}` — Node's `applyOverride`
+    /// (`session-indexer.ts:210-211`) must PRESERVE the provider title.
+    async fn assert_provider_title_survives_override(tag: &str, override_source: &str) {
+        let dir = temp_dir(tag);
+        let index = fixture_index(vec![claude_fixture_provider_titled()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{CLAUDE_ID}"),
+                &[
+                    (
+                        "titleOverride",
+                        Some(serde_json::json!("stale placeholder")),
+                    ),
+                    ("titleSource", Some(serde_json::json!(override_source))),
+                ],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+        assert_eq!(
+            body["matches"][0]["title"], "Provider generated title",
+            "a {override_source}-sourced override must not clobber a provider-generated title"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_generated_title_survives_dir_sourced_override() {
+        // Node's suppression branch (`session-indexer.ts:210-211`): a stale
+        // `dir`-sourced override never replaces a CURRENT provider-generated
+        // title on the projected (pre-matching) session view.
+        assert_provider_title_survives_override("provdir", "dir").await;
+    }
+
+    #[tokio::test]
+    async fn provider_generated_title_survives_first_message_sourced_override() {
+        // Same branch, second suppressed source: `first-message`.
+        assert_provider_title_survives_override("provfirstmsg", "first-message").await;
+    }
+
+    #[tokio::test]
+    async fn user_rename_still_overrides_a_provider_generated_title() {
+        // The suppression is SCOPED to `dir`/`first-message` override sources:
+        // an explicit user rename (`titleSource: 'user'`) substitutes even
+        // over a provider-generated title (`session-indexer.ts:210-211` —
+        // the negated conjunction only matches those two sources).
+        let dir = temp_dir("provuser");
+        let index = fixture_index(vec![claude_fixture_provider_titled()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{CLAUDE_ID}"),
+                &[
+                    ("titleOverride", Some(serde_json::json!("Renamed by user"))),
+                    ("titleSource", Some(serde_json::json!("user"))),
+                ],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
         assert_eq!(body["matches"][0]["title"], "Renamed by user");
     }
 
