@@ -1085,6 +1085,13 @@ Hardened Node replaced the #583 `resolveOpencodeSessionRoots` parent-walk with a
 
 Reuse the DB-fixture helpers from the old `opencode_directory_by_id.rs` (it builds real sqlite files in temp dirs — copy its `temp dir` + schema-setup helpers verbatim, adjusting the schema to include `time_created`, `time_updated`, `time_archived`, `title` columns and a `project` table). Test set (complete expectations; adapt helper names to what you copied):
 
+> **POST-EXECUTION NOTE (2026-07-31):** this block is a behavioral SPEC, not a
+> paste-ready verifier — every body below ends in `unimplemented!()` so a literal
+> paste FAILS loudly instead of passing vacuously. The real assertions landed,
+> under these exact test names, in
+> `crates/freshell-sessions/tests/opencode_row_by_id.rs`; read that file for the
+> executable versions.
+
 ```rust
 //! Hardened (#586) opencode exact-id lookup parity: mirrors
 //! `server/coding-cli/providers/opencode-by-id-query.ts` — a DIRECT by-id
@@ -1102,60 +1109,88 @@ use freshell_sessions::parse::{opencode_session_row_by_id, OpencodeByIdRow};
 // plus insert_session(...) / insert_project(...) row insert helpers.
 
 #[test]
-fn resolves_a_root_row_with_full_metadata() { /* insert root row with title
-    "beta", directory "/repo/beta", time_updated 1234, project worktree
-    "/repo"; expect Ok(Some(row)) with session_id, cwd Some("/repo/beta"),
-    title Some("beta"), last_activity_at Some(1234), project_path Some("/repo") */ }
+fn resolves_a_root_row_with_full_metadata() {
+    // insert root row with title "beta", directory "/repo/beta", time_updated
+    // 1234, project worktree "/repo"; expect Ok(Some(row)) with session_id,
+    // cwd Some("/repo/beta"), title Some("beta"), last_activity_at Some(1234),
+    // project_path Some("/repo") — the landed test asserts the FULL
+    // OpencodeByIdRow struct equality.
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn resolves_a_child_row_the_listing_hides() { /* insert parent + child with
-    parent_id set; query the CHILD id; expect Ok(Some(..)) — NO parent walk */ }
+fn resolves_a_child_row_the_listing_hides() {
+    // insert parent + child with parent_id set; query the CHILD id; expect
+    // Ok(Some(..)) — NO parent walk.
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn resolves_an_archived_row() { /* time_archived NOT NULL still resolves */ }
+fn resolves_an_archived_row() {
+    // time_archived NOT NULL still resolves.
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn missing_row_is_ok_none() { /* valid db, unknown id → Ok(None) */ }
+fn missing_row_is_ok_none() {
+    // valid db, unknown id → Ok(None).
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn db_without_a_session_table_is_ok_none() { /* db with only an unrelated
-    table → Ok(None) (Node: `if (!tableNames.has('session')) return null`) */ }
+fn db_without_a_session_table_is_ok_none() {
+    // db with only an unrelated table → Ok(None)
+    // (Node: `if (!tableNames.has('session')) return null`).
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn db_without_a_project_table_still_resolves_with_null_project_path() { /* session
-    table only; expect Ok(Some(row)) with project_path None */ }
+fn db_without_a_project_table_still_resolves_with_null_project_path() {
+    // session table only; expect Ok(Some(row)) with project_path None.
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn missing_db_file_is_an_error_not_a_silent_miss() { /* empty temp dir →
-    Err(OpencodeByIdError) with code Some("SQLITE_CANTOPEN") (Node:
-    DatabaseSync open throws SQLITE_CANTOPEN; the provider is
-    present-but-unreadable, and silence here is the incident class). The
-    code is INTERNAL — kept for structured logs and message fidelity; the
-    wire deliberately omits it for opencode (Node's worker boundary strips
-    `.code` before the wire — see Task 6 Step 3b) */ }
+fn missing_db_file_is_an_error_not_a_silent_miss() {
+    // empty temp dir → Err(OpencodeByIdError) with code
+    // Some("SQLITE_CANTOPEN") (Node: DatabaseSync open throws
+    // SQLITE_CANTOPEN; the provider is present-but-unreadable, and silence
+    // here is the incident class). The code is INTERNAL — kept for
+    // structured logs and message fidelity; the wire deliberately omits it
+    // for opencode (Node's worker boundary strips `.code` before the wire —
+    // see Task 6 Step 3b).
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn corrupt_db_file_is_an_error() { /* write 64 bytes of garbage to
-    opencode.db → Err with code Some("SQLITE_NOTADB") */ }
+fn corrupt_db_file_is_an_error() {
+    // write 64 bytes of garbage to opencode.db → Err with code
+    // Some("SQLITE_NOTADB").
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn locked_db_is_an_error_after_the_busy_timeout() { /* REAL contention proof
-    for the load-bearing 500 ms busy timeout: build a valid fixture db with
-    one row, open a SECOND rusqlite Connection to the same file and run
-    `BEGIN EXCLUSIVE` (hold the txn open, do not commit); now call
-    opencode_session_row_by_id → expect Err with code Some("SQLITE_BUSY")
-    (the busy error surfaces as OpencodeByIdError once the 500 ms
-    busy_timeout expires — the read-only open cannot acquire the shared
-    lock). Optionally assert the call took
-    >= ~400 ms to show the timeout (not an instant failure), then ROLLBACK/
-    drop the writer connection so the temp dir cleans up. */ }
+fn locked_db_is_an_error_after_the_busy_timeout() {
+    // REAL contention proof for the load-bearing 500 ms busy timeout: build
+    // a valid fixture db with one row, open a SECOND rusqlite Connection to
+    // the same file and run `BEGIN EXCLUSIVE` (hold the txn open, do not
+    // commit); now call opencode_session_row_by_id → expect Err with code
+    // Some("SQLITE_BUSY") (the busy error surfaces as OpencodeByIdError once
+    // the 500 ms busy_timeout expires — the read-only open cannot acquire
+    // the shared lock). Optionally assert the call took >= ~400 ms to show
+    // the timeout (not an instant failure), then ROLLBACK/drop the writer
+    // connection so the temp dir cleans up.
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 
 #[test]
-fn real_time_updated_is_floored_to_integer_ms() { /* insert with
-    time_updated = 1234.9 (REAL) → last_activity_at Some(1234) */ }
+fn real_time_updated_is_floored_to_integer_ms() {
+    // insert with time_updated = 1234.9 (REAL) → last_activity_at Some(1234).
+    unimplemented!("spec only — landed as this test name in opencode_row_by_id.rs");
+}
 ```
 
-Write each body out fully using the copied helpers (they are short rusqlite calls; the old test file shows the pattern). Run: `cargo test -p freshell-sessions --test opencode_row_by_id` — expected: compile FAILURE (function does not exist).
+Write each body out fully using the copied helpers (they are short rusqlite calls; the old test file shows the pattern), REPLACING every `unimplemented!()` marker with the real fixture setup + assertions described in its comment — a body left as `unimplemented!()` fails the test run, by design. Run: `cargo test -p freshell-sessions --test opencode_row_by_id` — expected: compile FAILURE (function does not exist). (Post-execution: all ten bodies landed with real assertions in `crates/freshell-sessions/tests/opencode_row_by_id.rs`.)
 
 - [ ] **Step 2: Implement `opencode_session_row_by_id`**
 
@@ -1311,7 +1346,7 @@ Expected: ALL PASS, clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/freshell-sessions/src/parse/ crates/freshell-sessions/tests/ crates/freshell-server/src/ 
+git add crates/freshell-sessions/src/parse/ crates/freshell-sessions/tests/ crates/freshell-server/src/
 git commit -m "feat(sessions): hardened opencode exact-id lookup — direct by-id row query (archived+child included, errors propagate)
 
 Ports opencode-by-id-query.ts, replacing the #583 parent-walk. Full row
@@ -1585,26 +1620,37 @@ async fn degraded_even_with_matches_when_a_higher_priority_fallback_failed() {
     assert_eq!(body["matches"][0]["sessionId"], "417e8345aaaa");
 }
 
+// POST-EXECUTION NOTE (2026-07-31): the five bodies below are behavioral
+// SPECS, not paste-ready verifiers — each ends in `unimplemented!()` so a
+// literal paste fails loudly instead of passing vacuously. The real
+// assertions landed, under these exact test names, in the test module of
+// `crates/freshell-server/src/resolve.rs`; read that module for the
+// executable versions.
+
 #[tokio::test]
 async fn a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal() {
     // Index whose direct-listed source errs → scan_failures ["opencode"] →
     // degraded + {provider:"opencode", message:"session scan failed"} even
     // though no fallback ran. Build the index from a FailingDirectSource
     // (provider_name Some("opencode"), direct_list Err) alongside the claude
-    // fixture source, warm it, then post a claude-uuid input.
-    /* ... assert status "degraded", providerErrors == 
-       [{"provider":"opencode","message":"session scan failed"}] ... */
+    // fixture source, warm it, then post a claude-uuid input. Assert status
+    // "degraded" and providerErrors ==
+    // [{"provider":"opencode","message":"session scan failed"}]; the landed
+    // test additionally asserts the exact index hit still rides along
+    // (matches[0].sessionId == CLAUDE_ID — degraded ≠ empty).
+    unimplemented!("spec only — landed as this test name in resolve.rs tests");
 }
 
 #[tokio::test]
 async fn disabled_providers_are_reported_unsearched_never_as_errors() {
     // Settings with enabledProviders ["claude"]: unsearchedProviders lists
     // the other three; a scan failure for DISABLED opencode is excluded from
-    // providerErrors and the response stays "ready".
-    /* build the settings file under dir/.freshell/ the way settings_store
-       tests do, with codingCli.enabledProviders = ["claude"]; reuse the
-       FailingDirectSource index; assert status "ready", providerErrors [],
-       unsearchedProviders containing "codex","opencode","amplifier" */
+    // providerErrors and the response stays "ready". Build the settings file
+    // under dir/.freshell/ the way settings_store tests do, with
+    // codingCli.enabledProviders = ["claude"]; reuse the FailingDirectSource
+    // index; assert status "ready", providerErrors [], unsearchedProviders
+    // containing "codex","opencode","amplifier".
+    unimplemented!("spec only — landed as this test name in resolve.rs tests");
 }
 
 #[tokio::test]
@@ -1614,9 +1660,10 @@ async fn disabled_provider_indexed_sessions_do_not_resolve() {
     // Rust must filter the snapshot by the live enabled set BEFORE core
     // resolution — a disabled provider's session resolving while that provider
     // is listed in unsearchedProviders would be self-contradictory.
-    /* settings file with codingCli.enabledProviders = ["claude"]; index a
-       CODEX session under a v4 UUID; post that UUID (no fallbacks wired) →
-       status "ready", matches [], unsearchedProviders contains "codex" */
+    // Settings file with codingCli.enabledProviders = ["claude"]; index a
+    // CODEX session under a v4 UUID; post that UUID (no fallbacks wired) →
+    // status "ready", matches [], unsearchedProviders contains "codex".
+    unimplemented!("spec only — landed as this test name in resolve.rs tests");
 }
 
 #[tokio::test]
@@ -1626,10 +1673,11 @@ async fn a_disabled_provider_exact_id_still_resolves_via_fallback_node_parity() 
     // regardless of settings) — settings gate INDEXING only. A disabled
     // opencode's exact ses_ id must therefore still resolve via the fallback,
     // while "opencode" stays listed in unsearchedProviders.
-    /* settings file with codingCli.enabledProviders = ["claude"]; empty index;
-       wire st.opencode_session_by_id returning a hit for SES_ID; post SES_ID →
-       status "ready", matches[0].sessionId == SES_ID,
-       unsearchedProviders contains "opencode" */
+    // Settings file with codingCli.enabledProviders = ["claude"]; empty index;
+    // wire st.opencode_session_by_id returning a hit for SES_ID; post SES_ID →
+    // status "ready", matches[0].sessionId == SES_ID,
+    // unsearchedProviders contains "opencode".
+    unimplemented!("spec only — landed as this test name in resolve.rs tests");
 }
 
 #[tokio::test]
@@ -1637,12 +1685,13 @@ async fn degraded_response_schedules_a_refresh_and_retry_converges() {
     // request_refresh() wiring proof END-TO-END (sessions-router.ts:293-305
     // parity): a degraded response fire-and-forgets a refresh, so once the
     // provider recovers, a client Retry converges back to ready.
-    /* reuse the FailingDirectSource index with its AtomicBool `broken` handle;
-       post once → assert status "degraded" (this response called
-       request_refresh()); set broken=false; then POLL: re-post the same input
-       (each degraded response re-schedules a refresh) until status == "ready"
-       with providerErrors [] within 2s (wait_until-style loop over posts);
-       assert convergence rather than sleeping once */
+    // Reuse the FailingDirectSource index with its AtomicBool `broken` handle;
+    // post once → assert status "degraded" (this response called
+    // request_refresh()); set broken=false; then POLL: re-post the same input
+    // (each degraded response re-schedules a refresh) until status == "ready"
+    // with providerErrors [] within 2s (wait_until-style loop over posts);
+    // assert convergence rather than sleeping once.
+    unimplemented!("spec only — landed as this test name in resolve.rs tests");
 }
 ```
 
@@ -2058,6 +2107,6 @@ Expected: push succeeds (the branch was local-only; this creates the remote bran
 
 **1b. No silent deferrals:** Injected-closure tests in Tasks 3/6 are complemented by production-behavior proof: Task 4 tests hit REAL sqlite files (corrupt/missing/locked classes, with the SQLITE_* codes asserted on the INTERNAL `OpencodeByIdError` — the wire deliberately carries message-only opencode errors, matching Node's worker boundary which strips `.code` in production (`opencode-by-id.worker.ts:41-42`, `opencode-by-id-runner.ts:103-106`); the endpoint test asserts the code-ABSENT wire shape and the internal code feeds structured logs), Task 6 Step 3 wires the REAL closures with failure reporting and tests the checked locator against a real unreadable directory, and Task 7's shared e2e exercises the full production path against the real Rust server. The one intentionally-remaining gap (PW-TAURI-WIN) is the checklist's long-standing recorded convention, explicitly restated — not a new deferral introduced by this plan.
 
-**2. Placeholder scan:** Task 4 Step 1 and Task 6 Step 1 contain two test bodies described by full behavioral specification + fixture pattern reference rather than verbatim code (`scan_failure` literal test, disabled-provider test, opencode row-fixture bodies); each names the exact fixture pattern file to copy, the exact inputs, and the exact expected JSON/values — the implementer writes mechanical rusqlite/axum plumbing only. Checklist `<N>` slots are run-time evidence by design. No TBD/TODO/"handle edge cases" items remain.
+**2. Placeholder scan (CORRECTED 2026-07-31):** the original self-review understated this: Task 4 Step 1 shipped TEN comment-only test bodies and Task 6 Step 1 shipped FIVE — fifteen syntactically valid tests whose bodies were only comments, i.e. unresolved placeholders that would have PASSED VACUOUSLY if pasted as-is (an independent review flagged this, and flagged that this line falsely declared no placeholders remained). Each did name the fixture pattern, exact inputs, and expected JSON/values, but the blocks themselves were not enforcing verifiers. Both blocks now carry `unimplemented!()` markers (a literal paste fails loudly) plus post-execution notes pointing at the real verifiers, which landed with full assertions in `crates/freshell-sessions/tests/opencode_row_by_id.rs` and the test module of `crates/freshell-server/src/resolve.rs` under the same test names. Checklist `<N>` slots are run-time evidence by design.
 
 **3. Type consistency check:** `ResumeResolveOutcome{status,matches,hint,provider_errors}` produced in Task 3 = consumed in Task 6. `OpencodeByIdHit{session_id,cwd,title,last_activity_at}` (Task 3) is built from `OpencodeByIdRow` (Task 4) in Task 6's closure — field names verified 1:1. `ProviderFailure{code,message}` used identically in Tasks 3/4/6. `scan_failures()->Vec<String>`, `request_refresh()`, `async coding_cli_enabled_providers()->Vec<String>` (Task 5) match Task 6's call sites (awaited in the async route/main). `MAX_RESUME_CANDIDATES` (Task 2) referenced in Task 6's hygiene note. State field `opencode_session_by_id` renamed once in Task 3 and used consistently after.

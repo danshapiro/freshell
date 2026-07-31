@@ -25,9 +25,13 @@ Rust endpoint's JSON must be wire-compatible with what the client already consum
   codes, auth) and `server/coding-cli/resolve-session.ts` (matching semantics, ordering,
   result cap, fallbacks).
 - Input parsing + hints: `shared/resume-input-parser.ts` (token shapes: full UUIDs any
-  case; `ses_` + 26 base62 opencode ids; short hex prefixes ≥8 chars containing ≥1 digit;
-  noise stripping for command lines/quotes/prompts; candidate ordering; provider hints
-  from command shapes, agent words, and id-shape heuristics).
+  case; known `xxx_`-prefixed id families — the NINE prefixes
+  `ses|sess|session|thread|thr|run|msg|task|amp` each followed by an 8–64-char
+  `[0-9A-Za-z]` suffix (`PREFIXED_ID_RE`), of which `ses_` + 26 base62 is opencode's
+  first-class shape [CORRECTED 2026-07-31: this line originally named only the `ses_`
+  family]; short hex prefixes 8–32 chars containing ≥1 digit; noise stripping for
+  command lines/quotes/prompts; candidate ordering; provider hints from command shapes,
+  agent words, and id-shape heuristics).
 - Existing Rust infra: the session index and existence machinery in
   `crates/freshell-server/src/existence.rs` (exact-match `IndexExistenceProbe`, opencode
   by-id DB fallback `session_exists_by_id`, Unknown/warming states) and the per-provider
@@ -37,9 +41,21 @@ Rust endpoint's JSON must be wire-compatible with what the client already consum
 ## Requirements
 
 1. **Endpoint parity.** `POST /api/sessions/resolve` on the Rust server: same path, same
-   auth requirements as the Rust server's other API routes, same request validation
-   (reject missing/empty/oversized `input` and unknown body keys with the same status
-   codes/error shapes the Node router uses), same response schema.
+   auth requirements as the Rust server's other API routes, same response schema, and —
+   for JSON-object bodies — the same request validation (reject missing/empty/oversized
+   `input` and unknown body keys with the same status codes/error shapes the Node
+   router uses). [CORRECTED 2026-07-31: the original blanket "same validation and error
+   shapes" wording overstated what was required and what landed. Three narrow
+   divergences are DELIBERATE and ledgered in the "Accepted deviations" module doc of
+   `crates/freshell-server/src/resolve.rs` — all preserve status-code parity, differ
+   only in bodies/routing unreachable by any known client (the dialog treats any
+   non-2xx as request-failed without reading the body): (a) payloads Express's strict
+   body parser rejects with an HTML 400 before zod runs (malformed JSON; JSON scalars
+   string/number/bool/null) get a zod-shaped JSON 400 from Rust; (b) axum's default
+   2 MB body-size limit vs Express `json({limit:'1mb'})`; (c) `PATCH`/`GET
+   /api/sessions/resolve` answer 405 on the merged Rust router where Express would
+   dispatch `:sessionId="resolve"` to another route. Everything else in this
+   requirement is met identically.]
 2. **Parser parity.** Port `shared/resume-input-parser.ts` semantics to Rust exactly:
    token extraction, candidate ordering, and hint derivation must produce the same
    results for the same inputs. To prevent silent drift between the TS and Rust parsers,
