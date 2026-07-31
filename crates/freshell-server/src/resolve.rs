@@ -51,15 +51,17 @@
 //!   no-candidate responses — is bounded THREE ways (Node scopes its 15 s
 //!   timeout to the individual by-id worker, `opencode-by-id-runner.ts`;
 //!   its cheap paths never wait on worker availability): (1)
-//!   [`RESOLVE_FALLBACK_DEADLINE`] bounds each dispatch — permit wait AND
-//!   fallback — and on elapse the fallback task is ABANDONED (blocking
-//!   tasks cannot be killed — recorded deviation from Node's
-//!   `worker.terminate()`) with a timeout `ProviderFailure` blaming ONLY
-//!   that provider; (2) a [`RESOLVE_MAX_CONCURRENCY`]-permit semaphore
-//!   whose permit MOVES INTO the fallback task caps how many (abandoned or
-//!   live) fallback tasks can exist at once — a permit-starved dispatch
-//!   degrades with the same timeout-shaped provider error instead of
-//!   queueing; (3) the per-provider budget (`FALLBACK_BUDGET_PER_REQUEST`
+//!   [`RESOLVE_FALLBACK_DEADLINE`] bounds each admitted fallback task, and
+//!   on elapse the task is ABANDONED (blocking tasks cannot be killed —
+//!   recorded deviation from Node's `worker.terminate()`) with a timeout
+//!   `ProviderFailure` blaming ONLY that provider; (2) a
+//!   [`RESOLVE_MAX_CONCURRENCY`]-permit semaphore whose permit MOVES INTO
+//!   the fallback task caps how many (abandoned or live) fallback tasks
+//!   can exist at once — admission is a SYNCHRONOUS `try_acquire_owned()`
+//!   BEFORE the fallback task exists, so a permit-starved dispatch fails
+//!   fast with a concurrency-limit provider error instead of queueing (it
+//!   never parks the resolver's blocking worker on the semaphore); (3)
+//!   the per-provider budget (`FALLBACK_BUDGET_PER_REQUEST`
 //!   = 2) caps how many dispatches — and therefore abandoned tasks — one
 //!   request can produce. Each dispatch is bounded INDEPENDENTLY: a
 //!   timeout blames only the provider whose dispatch elapsed, and later
@@ -71,6 +73,11 @@
 //!   ffa4aac1a shared one cooperative cancel flag across both providers,
 //!   so one timeout skipped every later fallback and fabricated timeouts
 //!   for providers never dispatched; corrected to per-dispatch scoping.
+//!   ERRATA: through commit 37be35b9a admission awaited `acquire_owned()`
+//!   INSIDE the outer resolver worker, so under saturation each dispatch
+//!   pinned an unbounded blocking-pool worker for its full deadline —
+//!   the exact exhaustion the semaphore exists to prevent; corrected to
+//!   fail-fast admission before any fallback task exists.
 //! - RECORDED DEVIATION: a `JoinError` (the resolver PANICKED) answers an
 //!   explicit 500 `{"error":"Resolve failed"}`. Node has no defined behavior
 //!   here — a top-level resolver throw becomes an unhandled rejection in the
@@ -138,8 +145,9 @@ use crate::settings_store::SettingsStore;
 /// zod `.max(20000)` on `input` (`shared/resume-resolve-contract.ts`).
 const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 
-/// Deadline on EACH blocking fallback dispatch (permit wait + the fallback
-/// itself), mirroring Node's hard per-worker by-id timeout
+/// Deadline on EACH admitted blocking fallback task (admission itself is a
+/// synchronous fail-fast `try_acquire`, never a wait), mirroring Node's hard
+/// per-worker by-id timeout
 /// (`opencode-by-id-runner.ts` `DEFAULT_TIMEOUT_MS = 15_000`; the listing
 /// runner uses the same value). Node scopes this timeout to the individual
 /// worker — its parsing/index paths never wait on it — and so does this
@@ -161,9 +169,14 @@ pub const RESOLVE_FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::
 /// its underlying op returns — stalled-task accumulation is therefore capped
 /// at this count, and the worst case degrades ONLY fallback-requiring
 /// resolve requests: parsing, index-only resolution, warming, and
-/// no-candidate responses never acquire a permit. 8 permits comfortably
-/// exceed any realistic resolve concurrency (one interactive dialog per
-/// user) while staying a small fraction of the pool.
+/// no-candidate responses never acquire a permit. Admission is a
+/// SYNCHRONOUS `try_acquire_owned()` performed BEFORE the fallback task
+/// exists: a starved dispatch fails fast with a degraded provider error
+/// rather than parking its resolver worker on the semaphore (queueing there
+/// would pin one unbounded outer blocking-pool worker per dispatch for the
+/// full deadline — the exact exhaustion this cap exists to prevent).
+/// 8 permits comfortably exceed any realistic resolve concurrency (one
+/// interactive dialog per user) while staying a small fraction of the pool.
 pub const RESOLVE_MAX_CONCURRENCY: usize = 8;
 
 /// opencode `ses_*` by-id fallback: `Ok(Some(hit))` = the lookup resolved the
@@ -200,8 +213,8 @@ pub struct ResolveState {
     /// — lets the client prefill a CONCRETE cwd instead of the `~` sentinel.
     /// `None` (no resolvable home) omits `homeDir` from the wire.
     pub home_dir: Option<Arc<String>>,
-    /// Deadline for EACH blocking fallback dispatch (permit wait + the
-    /// fallback itself) — never the resolver around it. Production wires
+    /// Deadline for EACH admitted blocking fallback task (admission fails
+    /// fast, never waits) — never the resolver around it. Production wires
     /// [`RESOLVE_FALLBACK_DEADLINE`] (Node's 15 s by-id worker timeout);
     /// injectable so tests exercise the timeout path without waiting 15 s.
     pub resolve_deadline: std::time::Duration,
@@ -346,9 +359,11 @@ fn validate_resolve_body(body: &Value) -> Result<String, Value> {
 
 /// Wrap ONE provider's exact-id fallback closure in the bounded dispatch
 /// that ports Node's per-worker containment (`opencode-by-id-runner.ts`):
-/// each invocation runs on its OWN `spawn_blocking` task, bounded by
-/// `deadline` (permit wait + fallback, Node's hard 15 s worker timeout) and
-/// admitted by `permits` ([`RESOLVE_MAX_CONCURRENCY`]).
+/// admission is a SYNCHRONOUS `try_acquire_owned()` on `permits`
+/// ([`RESOLVE_MAX_CONCURRENCY`]) — a starved dispatch fails fast with a
+/// degraded provider error, never queues — and only an admitted invocation
+/// runs on its OWN `spawn_blocking` task, bounded by `deadline` (Node's
+/// hard 15 s worker timeout).
 ///
 /// The deadline is scoped to THIS dispatch alone — a timeout here never
 /// affects later fallback invocations in the same request. Node bounds
@@ -371,9 +386,10 @@ fn validate_resolve_body(body: &Value) -> Result<String, Value> {
 /// resumed on the caller thread so the resolver task's JoinError still
 /// answers the explicit 500.
 ///
-/// Called from the resolver's blocking thread: `handle.block_on` re-enters
-/// the runtime for the permit + timeout machinery (never from an async
-/// worker thread — the resolver always runs under `spawn_blocking`).
+/// Called from the resolver's blocking thread: admission is synchronous
+/// (no runtime needed), then `handle.block_on` re-enters the runtime for
+/// the timeout machinery only (never from an async worker thread — the
+/// resolver always runs under `spawn_blocking`).
 fn bounded_fallback<T: Send + 'static>(
     inner: FallbackFn<T>,
     handle: tokio::runtime::Handle,
@@ -381,22 +397,41 @@ fn bounded_fallback<T: Send + 'static>(
     deadline: std::time::Duration,
 ) -> FallbackFn<T> {
     Arc::new(move |id: &str| {
+        // Admission FIRST, synchronously, BEFORE any queueing or fallback
+        // task exists: a starved dispatch fails fast into the degraded
+        // provider-error shape instead of parking this (unbounded) outer
+        // resolver worker on the semaphore for up to the full deadline.
+        // ERRATA: commits bb357a598..37be35b9a awaited `acquire_owned()`
+        // inside the deadline from this thread, so full saturation pinned
+        // one outer blocking-pool worker per dispatch for the entire
+        // deadline — enough crafted requests could exhaust the pool, the
+        // exact failure the semaphore exists to prevent; corrected to this
+        // fail-fast `try_acquire_owned()`. (Node has no analogue of this
+        // state: it never caps admission because `worker.terminate()`
+        // reclaims a stalled worker at its timeout.)
+        let permit = match Arc::clone(&permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_no_permits) => {
+                // The semaphore is never closed, so this is NoPermits:
+                // every permit is held by live or abandoned fallbacks.
+                tracing::warn!(
+                    "resolve fallback rejected: concurrency limit reached; failing fast"
+                );
+                return Err(ProviderFailure {
+                    code: None,
+                    message: "resolve concurrency limit reached".to_string(),
+                });
+            }
+        };
         // Node's worker-timeout rejection shape: message-only providerError.
         let message = format!("resolve timed out after {}ms", deadline.as_millis());
         let id = id.to_string();
         let inner = Arc::clone(&inner);
-        let permits = Arc::clone(&permits);
-        let joined = handle.block_on(tokio::time::timeout(deadline, async move {
-            let permit = permits
-                .acquire_owned()
-                .await
-                .expect("resolve semaphore is never closed");
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                inner(&id)
-            })
-            .await
-        }));
+        let task = handle.spawn_blocking(move || {
+            let _permit = permit;
+            inner(&id)
+        });
+        let joined = handle.block_on(tokio::time::timeout(deadline, task));
         match joined {
             Ok(Ok(result)) => result,
             Ok(Err(join_error)) => {
@@ -412,12 +447,12 @@ fn bounded_fallback<T: Send + 'static>(
                 })
             }
             Err(_elapsed) => {
-                // Deadline elapsed — EITHER no permit became available
-                // (admission cap saturated by earlier abandoned fallbacks)
-                // or the fallback itself stalled. Abandon it and blame ONLY
-                // this provider; later dispatches in the same request run
-                // with their own bounds (Node continues through later
-                // candidates/providers, `resolve-session.ts:133-156`).
+                // Deadline elapsed — the fallback itself stalled (the
+                // permit was already held before the task was spawned, so
+                // admission can never consume this budget). Abandon it and
+                // blame ONLY this provider; later dispatches in the same
+                // request run with their own bounds (Node continues through
+                // later candidates/providers, `resolve-session.ts:133-156`).
                 tracing::warn!(
                     deadline_ms = deadline.as_millis() as u64,
                     "resolve fallback timed out; abandoning its blocking task"
@@ -1920,17 +1955,18 @@ mod tests {
     async fn saturated_permits_degrade_the_next_request_without_spawning_another_resolver() {
         // Admission-control proof, scoped to the FALLBACK phase: an
         // ABANDONED fallback task keeps its permit until its underlying op
-        // returns, and a fallback dispatch that cannot get a permit within
-        // the deadline degrades WITHOUT spawning an (N+1)th blocking
-        // fallback task. With permits = 1: request A's fallback stalls
-        // (holding the permit past its own deadline), request B — another
-        // FALLBACK-REQUIRING request — must answer the SAME degraded
-        // timeout shape while the injected fallback body was invoked
-        // exactly ONCE — the invocation count staying at 1 IS the proof
-        // that no second blocking fallback ran. Request C — an exact
-        // in-memory index hit — must answer `ready` while the permit is
-        // STILL held: only fallback-requiring requests degrade under
-        // saturation (Node's cheap paths never queue behind a worker).
+        // returns, and a fallback dispatch that cannot get a permit FAILS
+        // FAST — synchronously, WITHOUT spawning an (N+1)th blocking
+        // fallback task and WITHOUT queueing toward its deadline. With
+        // permits = 1: request A's fallback stalls (holding the permit
+        // past its own deadline), request B — another FALLBACK-REQUIRING
+        // request — must answer the degraded concurrency-limit shape
+        // promptly while the injected fallback body was invoked exactly
+        // ONCE — the invocation count staying at 1 IS the proof that no
+        // second blocking fallback ran. Request C — an exact in-memory
+        // index hit — must answer `ready` while the permit is STILL held:
+        // only fallback-requiring requests degrade under saturation
+        // (Node's cheap paths never queue behind a worker).
         let dir = temp_dir("permits");
         let index = fixture_index(vec![claude_fixture()]).await;
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1959,22 +1995,31 @@ mod tests {
         );
 
         // The abandoned task still holds the ONLY permit. Request B must
-        // degrade at ITS deadline without the fallback body ever running.
+        // fail admission FAST — synchronously, before any fallback task
+        // exists — never queue toward its deadline. Its deadline is set
+        // GENEROUS (10 s) precisely so the strict elapsed bound below
+        // FAILS an implementation that queues for the deadline (reviewer
+        // finding, iteration 5: the previous 5 s allowance against a
+        // 100 ms deadline let a full-deadline queuer pass).
+        let mut st_b = st.clone();
+        st_b.resolve_deadline = std::time::Duration::from_secs(10);
         let started = std::time::Instant::now();
-        let (status_b, body_b) = post(st.clone(), body, true).await;
+        let (status_b, body_b) = post(st_b, body, true).await;
+        let waited = started.elapsed();
         assert_eq!(status_b, StatusCode::OK);
         assert_eq!(body_b["status"], "degraded", "request B: {body_b}");
         assert_eq!(
             body_b["providerErrors"],
             serde_json::json!([
-                { "provider": "opencode", "message": "resolve timed out after 100ms" }
+                { "provider": "opencode", "message": "resolve concurrency limit reached" }
             ]),
-            "permit starvation must answer the SAME timeout-shaped degradation, \
+            "permit starvation must answer the degraded provider-error shape, \
              blaming ONLY the provider whose fallback was attempted: {body_b}"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "request B must degrade promptly, not queue behind the stalled permit"
+            waited < std::time::Duration::from_secs(2),
+            "request B must fail admission fast, never queue toward its \
+             10 s deadline behind the stalled permit (took {waited:?})"
         );
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
@@ -2008,6 +2053,62 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn permit_starvation_fails_fast_without_pinning_an_outer_worker_for_the_deadline() {
+        // Reviewer finding (iteration 5): admission used to run INSIDE the
+        // outer resolver `spawn_blocking` via `block_on(acquire_owned())`,
+        // so under full permit saturation each fallback dispatch pinned
+        // that unbounded outer blocking worker for its ENTIRE deadline —
+        // enough crafted requests could exhaust Tokio's blocking pool, the
+        // exact failure the semaphore exists to prevent. Corrected:
+        // admission is a synchronous `try_acquire_owned()` BEFORE any
+        // fallback task exists, so a starved dispatch degrades
+        // immediately. The deadline here is GENEROUS (5 s) precisely so an
+        // implementation that queues for the deadline visibly FAILS the
+        // strict elapsed bound below.
+        let dir = temp_dir("starve-fast");
+        let index = fixture_index(Vec::new()).await;
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut st = state(&dir, Some(index));
+        st.resolve_deadline = std::time::Duration::from_secs(5);
+        st.resolve_permits = Arc::new(tokio::sync::Semaphore::new(0));
+        st.opencode_session_by_id = Some({
+            let counter = Arc::clone(&counter);
+            Arc::new(move |_id: &str| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            })
+        });
+        let started = std::time::Instant::now();
+        let (status, body) = post(
+            st,
+            serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            true,
+        )
+        .await;
+        let waited = started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded", "response: {body}");
+        assert_eq!(
+            body["providerErrors"],
+            serde_json::json!([
+                { "provider": "opencode", "message": "resolve concurrency limit reached" }
+            ]),
+            "a starved dispatch blames ONLY the provider it would have run: {body}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "a permit-starved fallback dispatch must fail fast, never occupy \
+             an outer blocking worker while queueing toward its 5 s deadline \
+             (took {waited:?})"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the fallback body must never run without a permit"
+        );
     }
 
     #[tokio::test]

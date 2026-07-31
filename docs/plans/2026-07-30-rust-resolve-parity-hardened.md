@@ -33,6 +33,12 @@
 >   parity via `provider_home()`; resolve admission rescoped to the fallback
 >   dispatch) — the `POST-EXECUTION NOTE` blocks in the body mark where the
 >   landed implementation diverged from the original planned text.
+> - ERRATA (2026-07-31): the interim admission design (through `37be35b9a`)
+>   awaited the semaphore INSIDE the outer resolver blocking worker, so permit
+>   starvation pinned an unbounded blocking-pool worker per dispatch for the
+>   full deadline — the exhaustion the semaphore claimed to prevent; fixed by
+>   this commit with synchronous fail-fast `try_acquire` admission before the
+>   fallback task exists.
 >
 > **DO NOT EXECUTE.** Re-running these steps against HEAD would fail on
 > already-landed APIs and unmet "expected failure" gates.
