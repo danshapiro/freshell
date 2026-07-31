@@ -33,7 +33,7 @@
     {
       "dir": "in",
       "type": "settings.updated",
-      "raw": "{\"type\":\"settings.updated\",\"settings\":{\"logging\":{\"debug\":false},\"safety\":{\"autoKillIdleMinutes\":15},\"terminal\":{\"scrollback\":10000},\"panes\":{\"defaultNewPane\":\"ask\"},\"sidebar\":{\"excludeFirstChatSubstrings\":[],\"excludeFirstChatMustStart\":false,\"autoGenerateTitles\":true},\"ai\":{},\"codingCli\":{\"enabledProviders\":[\"claude\",\"codex\",\"opencode\"],\"providers\":{\"claude\":{\"permissionMode\":\"default\"},\"codex\":{}},\"mcpServer\":true,\"knownProviders\":[]},\"editor\":{\"externalEditor\":\"auto\"},\"freshAgent\":{\"enabled\":false,\"defaultPlugins\":[],\"providers\":{}},\"extensions\":{\"disabled\":[]},\"network\":{\"host\":\"127.0.0.1\",\"configured\":true}}}",
+      "raw": "{\"type\":\"settings.updated\",\"settings\":{\"logging\":{\"debug\":false},\"safety\":{\"autoKillIdleMinutes\":15},\"terminal\":{\"scrollback\":10000},\"panes\":{\"defaultNewPane\":\"ask\"},\"sidebar\":{\"excludeFirstChatSubstrings\":[],\"excludeFirstChatMustStart\":false,\"autoGenerateTitles\":true},\"ai\":{},\"codingCli\":{\"enabledProviders\":[\"claude\",\"codex\",\"opencode\",\"amplifier\"],\"providers\":{\"claude\":{\"permissionMode\":\"default\"},\"codex\":{}},\"mcpServer\":true,\"knownProviders\":[]},\"editor\":{\"externalEditor\":\"auto\"},\"freshAgent\":{\"enabled\":false,\"defaultPlugins\":[],\"providers\":{}},\"extensions\":{\"disabled\":[]},\"network\":{\"host\":\"127.0.0.1\",\"configured\":true}}}",
       "parsed": {
         "type": "settings.updated",
         "settings": {
@@ -59,7 +59,8 @@
             "enabledProviders": [
               "claude",
               "codex",
-              "opencode"
+              "opencode",
+              "amplifier"
             ],
             "providers": {
               "claude": {

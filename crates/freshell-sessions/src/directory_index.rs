@@ -33,7 +33,7 @@
 //! `IndexedSession` / `SessionSource` / `ClaudeSource` / `SessionIndex` existed,
 //! so this test module failed to compile.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -149,6 +149,41 @@ pub trait SessionSource: Send + Sync {
     fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
         Ok(Vec::new())
     }
+
+    /// Provider identity for scan-failure reporting (`getScanFailures` parity).
+    /// `None` (default) = this source does not participate in failure tracking.
+    fn provider_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Discovery with ROOT-listing failure propagation (Node parity: a
+    /// throwing `listSessionFiles()` is RECORDED in scanFailures —
+    /// `session-indexer.ts:1250-1262` — never silently treated as empty).
+    /// Default wraps the infallible `discover()` for test sources.
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        Ok(self.discover())
+    }
+}
+
+/// Shared root-listing probe for the file-backed sources' `discover_checked`
+/// overrides: a MISSING root (`NotFound`/`NotADirectory`) is a genuine empty
+/// (an absent provider — matches Node's ENOENT tolerance), while any other
+/// listing failure (EACCES/EIO/...) PROPAGATES so the sweep records it as a
+/// scan failure instead of silently serving an empty listing. `pub(crate)`
+/// so `amplifier.rs`'s source can reuse it.
+pub(crate) fn ensure_root_listable(root: &Path) -> Result<(), std::io::Error> {
+    match std::fs::read_dir(root) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Claude source: walks `<claude_home>/projects/*/…*.jsonl` (top-level =
@@ -182,6 +217,18 @@ impl ClaudeSource {
 impl SessionSource for ClaudeSource {
     fn discover(&self) -> Vec<FileStat> {
         discover_claude_home(&self.claude_home)
+    }
+
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("claude")
+    }
+
+    /// Root-listing failure propagation: an unlistable `<claude_home>/projects`
+    /// (EACCES/EIO — not a merely-absent one) is a scan failure, never a
+    /// silent empty listing. Per-project/nested errors stay tolerant.
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        ensure_root_listable(&self.claude_home.join("projects"))?;
+        Ok(self.discover())
     }
 
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
@@ -361,6 +408,18 @@ impl SessionSource for CodexSource {
         stats
     }
 
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("codex")
+    }
+
+    /// Root-listing failure propagation: an unlistable `<codex_home>/sessions`
+    /// (EACCES/EIO — not a merely-absent one) is a scan failure, never a
+    /// silent empty listing. Nested-directory errors stay tolerant.
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        ensure_root_listable(&self.codex_home.join("sessions"))?;
+        Ok(self.discover())
+    }
+
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
         parse_codex_file(path)
     }
@@ -481,6 +540,10 @@ impl SessionSource for OpencodeSource {
 
     fn parse(&self, _path: &Path) -> Option<IndexedSession> {
         None
+    }
+
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("opencode")
     }
 
     fn direct_change_token(&self) -> Option<i64> {
@@ -624,6 +687,11 @@ pub struct SessionIndex {
     /// background refresh needs to update the save-debounce bookkeeping
     /// without borrowing `&SessionIndex`.
     persist_state: Arc<StdMutex<PersistState>>,
+    /// Providers whose most recent listing attempt FAILED (`getScanFailures`
+    /// parity — see [`Self::scan_failures`]). Updated by every sweep
+    /// (`refresh_snapshot`); `Arc`-wrapped for the same detached-refresh
+    /// reason `snapshot` is.
+    scan_failures: Arc<StdMutex<HashSet<String>>>,
 }
 
 struct CachedSnapshot {
@@ -690,6 +758,33 @@ impl SessionIndex {
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
             persist_path,
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
+            scan_failures: Arc::new(StdMutex::new(HashSet::new())),
+        }
+    }
+
+    /// Providers whose MOST RECENT listing attempt failed (unsearchable, not
+    /// empty) — `codingCliIndexer.getScanFailures()` parity. Sorted, deduped.
+    ///
+    /// NODE PARITY NOTE: Node behaves exactly like `refresh_snapshot` here —
+    /// a throwing `listSessionFiles()` also yields an empty file list and
+    /// lets the full-scan prune drop that provider's cached entries
+    /// (`session-indexer.ts:1467-1475`, `:1499-1504`); what makes the outage
+    /// VISIBLE is the recorded scan failure, which the route merges into
+    /// `providerErrors` and marks the response `degraded` — never a silent
+    /// healthy `ready + matches: []`. Both direct-listed (opencode) and
+    /// file-backed (claude/codex/amplifier) outages are therefore recorded.
+    pub fn scan_failures(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.scan_failures.lock().unwrap().iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Fire-and-forget refresh (`requestRefresh` parity): gives a degraded
+    /// response's Retry a chance to converge once a failed provider recovers.
+    /// No-op if a sweep is already running.
+    pub fn request_refresh(&self) {
+        if let Ok(guard) = Arc::clone(&self.refresh_lock).try_lock_owned() {
+            self.spawn_background_refresh(guard);
         }
     }
 
@@ -790,6 +885,7 @@ impl SessionIndex {
             Arc::clone(&self.snapshot),
             self.persist_path.clone(),
             Arc::clone(&self.persist_state),
+            Arc::clone(&self.scan_failures),
         )
         .await;
         drop(guard);
@@ -808,6 +904,7 @@ impl SessionIndex {
         let snapshot = Arc::clone(&self.snapshot);
         let persist_path = self.persist_path.clone();
         let persist_state = Arc::clone(&self.persist_state);
+        let scan_failures = Arc::clone(&self.scan_failures);
         tokio::spawn(async move {
             let _ = Self::perform_refresh(
                 sources,
@@ -816,6 +913,7 @@ impl SessionIndex {
                 snapshot,
                 persist_path,
                 persist_state,
+                scan_failures,
             )
             .await;
             drop(guard);
@@ -835,6 +933,7 @@ impl SessionIndex {
         snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
         persist_path: Option<PathBuf>,
         persist_state: Arc<StdMutex<PersistState>>,
+        scan_failures: Arc<StdMutex<HashSet<String>>>,
     ) -> Arc<Vec<IndexedSession>> {
         let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
@@ -842,7 +941,8 @@ impl SessionIndex {
             move || {
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
-                refresh_snapshot(&sources, &mut cache, &mut direct)
+                let mut failures = scan_failures.lock().unwrap();
+                refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures)
             }
         })
         .await;
@@ -995,6 +1095,7 @@ fn refresh_snapshot(
     sources: &[Arc<dyn SessionSource>],
     cache: &mut HashMap<PathBuf, FileEntry>,
     direct_cache: &mut HashMap<usize, DirectEntry>,
+    scan_failures: &mut HashSet<String>,
 ) -> (Vec<IndexedSession>, usize) {
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     // Count of files re-parsed + direct-listed sources re-queried this
@@ -1009,10 +1110,19 @@ fn refresh_snapshot(
             if !unchanged {
                 match source.direct_list() {
                     Ok(items) => {
+                        if let Some(name) = source.provider_name() {
+                            scan_failures.remove(name);
+                        }
                         direct_cache.insert(idx, DirectEntry { token, items });
                         changed += 1;
                     }
                     Err(err) => {
+                        // Record the outage (`getScanFailures` parity) so the
+                        // resolve route can surface it as a degraded
+                        // providerError instead of a silent healthy empty.
+                        if let Some(name) = source.provider_name() {
+                            scan_failures.insert(name.to_string());
+                        }
                         // Preserve whatever was cached from the last
                         // successful listing (e.g. a locked/mid-write
                         // sqlite db) -- never drop this provider's sessions
@@ -1028,7 +1138,31 @@ fn refresh_snapshot(
             continue;
         }
 
-        for stat in source.discover() {
+        // File-backed: a ROOT-listing failure is recorded, then treated as an
+        // empty listing for this sweep (Node parity -- a throwing
+        // `listSessionFiles()` also yields an empty list and lets the
+        // full-scan prune drop that provider's cached entries,
+        // `session-indexer.ts:1467-1475`, `:1499-1504`; the recorded scan
+        // failure is what keeps the outage visible).
+        let stats = match source.discover_checked() {
+            Ok(stats) => {
+                if let Some(name) = source.provider_name() {
+                    scan_failures.remove(name);
+                }
+                stats
+            }
+            Err(err) => {
+                if let Some(name) = source.provider_name() {
+                    scan_failures.insert(name.to_string());
+                }
+                eprintln!(
+                    "session-directory: source #{idx} root listing failed \
+                     (treating as empty this sweep): {err}"
+                );
+                Vec::new()
+            }
+        };
+        for stat in stats {
             let unchanged = cache
                 .get(&stat.path)
                 .is_some_and(|entry| entry.mtime_ms == stat.mtime_ms && entry.size == stat.size);
@@ -2036,6 +2170,7 @@ mod tests {
             Arc::clone(&snapshot),
             None,
             Arc::clone(&persist_state),
+            Arc::new(StdMutex::new(HashSet::new())),
         )
         .await;
 
@@ -3078,5 +3213,107 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    // -- Task 5 (resolve parity): scan-failure channel ----------------------
+
+    #[tokio::test]
+    async fn a_failing_direct_list_records_a_scan_failure_and_recovery_clears_it() {
+        // A direct-listed source whose direct_list() can be toggled to Err.
+        struct FlakySource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl SessionSource for FlakySource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("opencode")
+            }
+            // A CHANGING token each call, so every sweep re-queries.
+            fn direct_change_token(&self) -> Option<i64> {
+                use std::sync::atomic::{AtomicI64, Ordering};
+                static N: AtomicI64 = AtomicI64::new(0);
+                Some(N.fetch_add(1, Ordering::SeqCst))
+            }
+            fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("unable to open database file".to_string())
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(FlakySource(std::sync::Arc::clone(&broken))) as _],
+            std::time::Duration::ZERO, // every snapshot() sweeps
+            None,
+        );
+        // COLD cache: the first snapshot() sweeps INLINE, so this assert is
+        // deterministic.
+        let _ = index.snapshot().await;
+        assert_eq!(index.scan_failures(), vec!["opencode".to_string()]);
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        // WARM-but-stale cache: snapshot() returns stale data immediately and
+        // refreshes DETACHED (stale-while-revalidate) — recovery must be observed
+        // by POLLING. Reuse the module's existing `wait_until` test helper.
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || index
+                .scan_failures()
+                .is_empty())
+            .await,
+            "scan failure must clear once the source recovers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_file_backed_root_listing_records_a_scan_failure_too() {
+        // FILE-BACKED parity (Node records listSessionFiles() throws for claude/
+        // codex/amplifier in scanFailures — session-indexer.ts:1250-1262 — and the
+        // route turns them into degraded providerErrors): a source whose
+        // discover_checked() errs must be recorded, NOT silently treated as an
+        // empty listing.
+        struct FlakyFileSource(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl SessionSource for FlakyFileSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "denied",
+                    ))
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                None
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let broken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![std::sync::Arc::new(FlakyFileSource(std::sync::Arc::clone(&broken))) as _],
+            std::time::Duration::ZERO,
+            None,
+        );
+        let _ = index.snapshot().await; // cold sweep is INLINE — deterministic
+        assert_eq!(index.scan_failures(), vec!["claude".to_string()]);
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = index.snapshot().await; // stale-while-revalidate: poll for recovery
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || index
+                .scan_failures()
+                .is_empty())
+            .await,
+            "file-backed scan failure must clear once the root is listable again"
+        );
     }
 }
