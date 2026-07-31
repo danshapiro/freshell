@@ -634,6 +634,50 @@ fn client_only_assembly_reuses_exact_server_closure_and_retains_prior_assets() {
 }
 
 #[test]
+fn sequential_client_only_assemblies_retain_only_the_direct_predecessor_assets() {
+    let fixture = assembly_fixture();
+
+    let first_client = fixture.sources.join("first-client");
+    write(first_client.join("index.html"), b"first\n");
+    write(first_client.join("assets/first.js"), b"first asset\n");
+    write(first_client.join("deployment-compatibility.json"), b"{}\n");
+    let first =
+        assemble_generation(&fixture.store, &client_command(&fixture, &first_client)).unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .select_generation(&first.id)
+        .unwrap();
+
+    let second_client = fixture.sources.join("second-client");
+    write(second_client.join("index.html"), b"second\n");
+    write(second_client.join("assets/second.js"), b"second asset\n");
+    write(second_client.join("deployment-compatibility.json"), b"{}\n");
+    let second =
+        assemble_generation(&fixture.store, &client_command(&fixture, &second_client)).unwrap();
+    assert!(second.path.join("client/assets/first.js").is_file());
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .select_generation(&second.id)
+        .unwrap();
+
+    let third_client = fixture.sources.join("third-client");
+    write(third_client.join("index.html"), b"third\n");
+    write(third_client.join("assets/third.js"), b"third asset\n");
+    write(third_client.join("deployment-compatibility.json"), b"{}\n");
+    let third =
+        assemble_generation(&fixture.store, &client_command(&fixture, &third_client)).unwrap();
+
+    assert!(third.path.join("client/assets/third.js").is_file());
+    assert!(third.path.join("client/assets/second.js").is_file());
+    assert!(!third.path.join("client/assets/first.js").exists());
+    assert!(!third.path.join("client/assets/prior.js").exists());
+}
+
+#[test]
 fn client_asset_merge_rejects_same_path_with_different_bytes() {
     let fixture = assembly_fixture();
     let client = fixture.sources.join("client");

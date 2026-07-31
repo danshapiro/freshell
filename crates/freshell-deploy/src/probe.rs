@@ -168,10 +168,11 @@ pub fn validate_compatibility_artifacts(
 }
 
 /// Prove a client-only generation changes no server/runtime/dependency bytes
-/// and retains every previously published hashed browser asset.
+/// and retains the browser assets owned by its direct predecessor.
 pub fn validate_client_only_entries(
     prior: &[ManifestEntry],
     target: &[ManifestEntry],
+    required_predecessor_assets: &[String],
 ) -> Result<()> {
     let by_path = |entries: &[ManifestEntry]| {
         entries
@@ -197,13 +198,20 @@ pub fn validate_client_only_entries(
         ));
     }
 
-    for (path, expected) in prior
-        .iter()
-        .filter(|(path, _)| path.starts_with("client/assets/"))
-    {
+    for path in required_predecessor_assets {
+        if !path.starts_with("client/assets/") {
+            return Err(DeployError::Probe(format!(
+                "required predecessor asset escaped client/assets: {path}"
+            )));
+        }
+        let expected = prior.get(path.as_str()).ok_or_else(|| {
+            DeployError::Probe(format!(
+                "required predecessor asset is absent from the prior generation: {path}"
+            ))
+        })?;
         if target.get(path.as_str()) != Some(expected) {
             return Err(DeployError::Probe(format!(
-                "client-only target did not retain prior hashed asset {path}"
+                "client-only target did not retain direct predecessor asset {path}"
             )));
         }
     }

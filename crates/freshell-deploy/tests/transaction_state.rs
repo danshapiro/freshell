@@ -3671,7 +3671,8 @@ fn client_only_requires_byte_identical_server_runtime_and_retains_hashed_assets(
     valid_target.push(entry("client/index.html", "e"));
     valid_target.push(entry("client/assets/new-hash.js", "f"));
 
-    validate_client_only_entries(&prior, &valid_target).unwrap();
+    let required_assets = vec!["client/assets/old-hash.js".to_string()];
+    validate_client_only_entries(&prior, &valid_target, &required_assets).unwrap();
 
     let mut changed_server = valid_target.clone();
     changed_server
@@ -3679,11 +3680,11 @@ fn client_only_requires_byte_identical_server_runtime_and_retains_hashed_assets(
         .find(|entry| entry.path == "server/freshell-server")
         .unwrap()
         .sha256 = Some("9".repeat(64));
-    assert!(validate_client_only_entries(&prior, &changed_server).is_err());
+    assert!(validate_client_only_entries(&prior, &changed_server, &required_assets).is_err());
 
     let mut dropped_old_asset = valid_target;
     dropped_old_asset.retain(|entry| entry.path != "client/assets/old-hash.js");
-    assert!(validate_client_only_entries(&prior, &dropped_old_asset).is_err());
+    assert!(validate_client_only_entries(&prior, &dropped_old_asset, &required_assets).is_err());
 }
 
 #[test]

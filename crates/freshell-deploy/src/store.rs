@@ -595,6 +595,49 @@ impl GenerationStage {
         )
     }
 
+    pub(crate) fn merge_generation_asset_file(
+        &mut self,
+        generation: &Generation,
+        path: &Path,
+    ) -> Result<()> {
+        self.require_unsealed()?;
+        validate_relative_path(path, false)?;
+        let verified = self.store.verify_generation(&generation.id)?;
+        if verified.path != generation.path || verified.manifest != generation.manifest {
+            return Err(DeployError::InvalidManifest(
+                "generation asset source changed after verification".to_string(),
+            ));
+        }
+        let source = generation.path.join(path);
+        let source_metadata = fs::symlink_metadata(&source)?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(DeployError::InvalidManifest(format!(
+                "selected client asset is not a regular file: {}",
+                source.display()
+            )));
+        }
+        let destination = self.path.join(path);
+        match fs::symlink_metadata(&destination) {
+            Ok(destination_metadata)
+                if destination_metadata.is_file()
+                    && !destination_metadata.file_type().is_symlink()
+                    && source_metadata.mode() & 0o7555 == destination_metadata.mode() & 0o7555
+                    && crate::manifest::sha256_file(&source)?
+                        == crate::manifest::sha256_file(&destination)? =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(DeployError::InvalidManifest(format!(
+                "candidate client asset conflicts with retained asset {}",
+                destination.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.copy_file(&source, path, source_metadata.mode() & 0o7777)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn copy_file(&mut self, source: &Path, destination: &Path, mode: u32) -> Result<()> {
         self.require_unsealed()?;
         validate_relative_path(destination, false)?;

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,85 @@ use crate::process_identity::RuntimeProvenance;
 use crate::store::{Generation, GenerationStage, Store};
 
 const DESCRIPTOR_FILE: &str = "deployment.json";
+const CLIENT_ASSET_PROVENANCE_FILE: &str = "client/.freshell-asset-provenance.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClientAssetProvenance {
+    schema_version: String,
+    owned_assets: Vec<String>,
+}
+
+impl ClientAssetProvenance {
+    fn from_candidate(candidate: &Path) -> Result<Self> {
+        match fs::symlink_metadata(candidate.join(".freshell-asset-provenance.json")) {
+            Ok(_) => {
+                return Err(DeployError::InvalidReceipt(
+                    "candidate client contains the reserved asset provenance file".to_string(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut owned_assets = Vec::new();
+        collect_asset_files(&candidate.join("assets"), Path::new(""), &mut owned_assets)?;
+        owned_assets.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        let provenance = Self {
+            schema_version: "1".to_string(),
+            owned_assets,
+        };
+        provenance.validate()?;
+        Ok(provenance)
+    }
+
+    fn read(prior: &Generation) -> Result<Option<Self>> {
+        let path = prior.path.join(CLIENT_ASSET_PROVENANCE_FILE);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.mode() & 0o7777 != 0o444
+        {
+            return Err(DeployError::InvalidReceipt(
+                "client asset provenance is not an immutable regular file".to_string(),
+            ));
+        }
+        let provenance: Self = serde_json::from_slice(&fs::read(path)?)
+            .map_err(|error| DeployError::InvalidReceipt(error.to_string()))?;
+        provenance.validate()?;
+        Ok(Some(provenance))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != "1" {
+            return Err(DeployError::InvalidReceipt(
+                "client asset provenance schemaVersion must be \"1\"".to_string(),
+            ));
+        }
+        let mut prior: Option<&str> = None;
+        for asset in &self.owned_assets {
+            validate_relative_path(Path::new(asset), false)?;
+            if prior.is_some_and(|previous| previous.as_bytes() >= asset.as_bytes()) {
+                return Err(DeployError::InvalidReceipt(
+                    "client asset provenance paths must be unique and bytewise sorted".to_string(),
+                ));
+            }
+            prior = Some(asset);
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = serde_json::to_vec(self)
+            .map_err(|error| DeployError::InvalidReceipt(error.to_string()))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -192,6 +272,11 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
     match command.mode {
         UpdateMode::ClientOnly => {
             let descriptor = prior_descriptor?;
+            let client = command
+                .client_dir
+                .as_deref()
+                .expect("parsed client-only command has client");
+            let provenance = ClientAssetProvenance::from_candidate(client)?;
             if command.node != descriptor.node {
                 return Err(DeployError::Activation(
                     "client-only update must retain the selected server Node prerequisite"
@@ -199,13 +284,11 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
                 ));
             }
             copy_managed_server_closure(&mut stage, &prior)?;
-            copy_candidate_client(
-                &mut stage,
-                command
-                    .client_dir
-                    .as_deref()
-                    .expect("parsed client-only command has client"),
-                &prior,
+            copy_candidate_client(&mut stage, client, &prior)?;
+            stage.write_bytes(
+                Path::new(CLIENT_ASSET_PROVENANCE_FILE),
+                &provenance.to_json()?,
+                0o644,
             )?;
             stage.write_bytes(Path::new(DESCRIPTOR_FILE), &descriptor.to_json()?, 0o644)?;
         }
@@ -229,12 +312,16 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
             )?;
         }
         UpdateMode::Full => {
-            stage.copy_tree(
-                command
-                    .client_dir
-                    .as_deref()
-                    .expect("parsed full command has client"),
-                Path::new("client"),
+            let client = command
+                .client_dir
+                .as_deref()
+                .expect("parsed full command has client");
+            let provenance = ClientAssetProvenance::from_candidate(client)?;
+            stage.copy_tree(client, Path::new("client"))?;
+            stage.write_bytes(
+                Path::new(CLIENT_ASSET_PROVENANCE_FILE),
+                &provenance.to_json()?,
+                0o644,
             )?;
             let sources = command
                 .server
@@ -272,13 +359,90 @@ fn copy_candidate_client(
     prior: &Generation,
 ) -> Result<()> {
     stage.copy_tree(candidate, Path::new("client"))?;
-    let prior_assets = prior.path.join("client/assets");
-    if prior_assets.exists() {
-        stage.merge_generation_assets(
-            prior,
-            Path::new("client/assets"),
-            Path::new("client/assets"),
-        )?;
+    match ClientAssetProvenance::read(prior)? {
+        Some(provenance) => {
+            for asset in provenance.owned_assets {
+                stage
+                    .merge_generation_asset_file(prior, &Path::new("client/assets").join(asset))?;
+            }
+        }
+        None if prior.path.join("client/assets").exists() => {
+            // Generations created before asset provenance was introduced get
+            // one conservative handoff. The newly assembled generation then
+            // records only its own build assets, bounding later retention.
+            stage.merge_generation_assets(
+                prior,
+                Path::new("client/assets"),
+                Path::new("client/assets"),
+            )?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn required_predecessor_client_assets(prior: &Generation) -> Result<Vec<String>> {
+    match ClientAssetProvenance::read(prior)? {
+        Some(provenance) => Ok(provenance
+            .owned_assets
+            .into_iter()
+            .map(|asset| {
+                Path::new("client/assets")
+                    .join(asset)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()),
+        None => Ok(prior
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.path.starts_with("client/assets/")
+                    && entry.kind == crate::manifest::EntryKind::File
+            })
+            .map(|entry| entry.path.clone())
+            .collect()),
+    }
+}
+
+fn collect_asset_files(root: &Path, relative: &Path, assets: &mut Vec<String>) -> Result<()> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && relative.as_os_str().is_empty() =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DeployError::InvalidReceipt(
+            "candidate client assets must be a real directory".to_string(),
+        ));
+    }
+    let mut children = fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
+    children.sort_by_key(|entry| entry.file_name().as_bytes().to_vec());
+    for child in children {
+        let child_relative = relative.join(child.file_name());
+        let child_path = child.path();
+        let child_metadata = fs::symlink_metadata(&child_path)?;
+        if child_metadata.file_type().is_symlink() {
+            return Err(DeployError::InvalidReceipt(format!(
+                "candidate client asset is a symlink: {}",
+                child_path.display()
+            )));
+        }
+        if child_metadata.is_dir() {
+            collect_asset_files(&child_path, &child_relative, assets)?;
+        } else if child_metadata.is_file() {
+            assets.push(path_string(&child_relative)?);
+        } else {
+            return Err(DeployError::InvalidReceipt(format!(
+                "candidate client asset is special: {}",
+                child_path.display()
+            )));
+        }
     }
     Ok(())
 }

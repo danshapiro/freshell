@@ -17,7 +17,7 @@ use crate::activation::{
     read_cancellation_receipt, ActivationDriver, ActivationReceiptObservation,
     CancellationReceiptObservation, LaunchAttemptObservation, LaunchSpec, PortState, ServiceState,
 };
-use crate::deployment::GenerationDescriptor;
+use crate::deployment::{required_predecessor_client_assets, GenerationDescriptor};
 use crate::error::{DeployError, Result};
 use crate::journal::{
     ControlPaths, DurableTransactionJournal, LaunchAttempt, LaunchAttemptState, LaunchClaim,
@@ -321,7 +321,12 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
             .store
             .verify_generation(&request.target_generation_id)?;
         if request.mode == crate::journal::UpdateMode::ClientOnly {
-            validate_client_only_entries(&prior.manifest.entries, &target.manifest.entries)?;
+            let required_assets = required_predecessor_client_assets(&prior)?;
+            validate_client_only_entries(
+                &prior.manifest.entries,
+                &target.manifest.entries,
+                &required_assets,
+            )?;
             let process = request
                 .prior_live
                 .process_identity
