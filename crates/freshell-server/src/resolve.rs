@@ -9,27 +9,49 @@
 //! `freshell-sessions/src/resume_resolve.rs`; tracked in
 //! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
 //! `sessionResolve` capability flag is held `false` (`main.rs`) until this
-//! list is empty. The resolve CORE is hardened (degraded status, provider
-//! errors, budgeted shape-gated fallbacks, sessionType overlay+default);
-//! what remains is this route's wire surface and the `main.rs` wiring:
-//! - wire surface (plan Tasks 5, 6): this route still serializes the legacy
-//!   `{status, matches, hint}` shape (`LegacyWire` below) — the core's
-//!   `provider_errors` are computed but DROPPED here, and there is no
-//!   `unsearchedProviders`/`homeDir` field or scan-failure/warming-default
-//!   merge yet. The fallbacks wired in `main.rs` also still map read errors
-//!   to an `Ok(None)` MISS, never an `Err(ProviderFailure)`, so `degraded`
-//!   is unreachable in production until Task 6 rewires them.
-//! - the opencode by-id fallback now runs Node's hardened direct row query
-//!   (`opencode_session_row_by_id`, `providers/opencode-by-id-query.ts` —
-//!   archived + child rows hit, `title`/`lastActivityAt` returned), but its
-//!   read errors are still mapped to an `Ok(None)` miss (see above) — the
-//!   `Err(ProviderFailure)` rewire is plan Task 6.
-//! - the claude fallback's `locate_transcript` never probes Node's
-//!   `<project>/<parent>/subagents/<id>.jsonl` layout (subagent child
-//!   transcripts miss) — the checked locator is plan Task 6; its cwd read IS
-//!   bounded to Node's 64 KiB (`transcript_cwd_bounded`).
+//! list is empty. The wire surface, the failure-reporting production
+//! fallbacks (checked claude locator, propagating opencode by-id query), and
+//! the scan-failure/unsearched-provider route merge all landed in plan
+//! Task 6; what remains:
+//! - the `sessionResolve` capability flag itself is still held `false` and
+//!   the e2e resolve matrix has not yet run against this route (plan Task 7).
 //!
 //! Behavior contract:
+//! - wire shape (`ResumeResolveResponseSchema`, `sessions-router.ts:306-314`):
+//!   `{status, matches, hint, providerErrors, unsearchedProviders, homeDir}`
+//!   — `providerErrors`/`unsearchedProviders` always present, `homeDir`
+//!   omitted only when the server has no resolvable home.
+//! - `providerErrors` = the core's fallback failures merged with the index's
+//!   scan failures (enabled providers only; fallback errors win the dedupe —
+//!   they carry the more specific message/code). A DISABLED provider is
+//!   reported in `unsearchedProviders`, never as an error — otherwise a
+//!   failed-then-disabled provider would stick degraded forever.
+//! - `status`: warming stays warming; otherwise any provider error makes the
+//!   response `degraded` — EVEN WITH matches (a failed provider means a
+//!   higher-priority exact match may have been missed, so the client must
+//!   never auto-resume a surviving lower-priority match). A degraded
+//!   response fire-and-forgets `SessionIndex::request_refresh()` so a client
+//!   Retry can converge once the provider recovers.
+//! - disabled providers are filtered OUT of the index snapshot BEFORE core
+//!   resolution (Node's index excludes them at scan time,
+//!   `session-indexer.ts:1454-1467`); the exact-id FALLBACKS stay ungated
+//!   (Node invokes all wired fallbacks regardless of settings,
+//!   `resolve-session.ts:127-156`).
+//! - async hygiene: the ENTIRE `resolve_resume_input` call — including both
+//!   blocking fallback closures (rusqlite query, transcript directory walk)
+//!   — runs inside `tokio::task::spawn_blocking`; no DB/FS wait ever blocks
+//!   the async runtime, and per-request work is bounded by
+//!   `MAX_RESUME_CANDIDATES` (8) × `FALLBACK_BUDGET_PER_REQUEST` (2 per
+//!   provider) fallback calls + one index scan per token. Keep any new
+//!   closure invocation inside that block.
+//! - RECORDED DEVIATION: a `JoinError` (the resolver PANICKED) answers an
+//!   explicit 500 `{"error":"Resolve failed"}`. Node has no defined behavior
+//!   here — a top-level resolver throw becomes an unhandled rejection in the
+//!   async Express 4 handler (no response at all) — so the explicit 500 is
+//!   the honest port, not a wire mismatch; fabricating ready-empty would
+//!   present an unsearchable state as a healthy "not found".
+//!
+//! Behavior contract (validation/readiness):
 //! - auth: same `x-auth-token` / `freshell-auth` cookie check as every other
 //!   `/api` route (`boot::is_authed`), 401 `{"error":"Unauthorized"}`.
 //! - validation: strict body `{ input: string 1..=20000 }` (UTF-16 code
@@ -76,9 +98,10 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
+use freshell_sessions::resume_input::ResumeHint;
 use freshell_sessions::resume_resolve::{
     resolve_resume_input, ClaudeTranscriptHit, OpencodeByIdHit, ProviderFailure, ResolveDeps,
-    ResumeResolveOutcome, ResumeResolveStatus,
+    ResumeResolveMatch, ResumeResolveProviderError, ResumeResolveStatus,
 };
 
 use crate::boot::{is_authed, unauthorized};
@@ -91,8 +114,7 @@ const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 /// opencode `ses_*` by-id fallback: `Ok(Some(hit))` = the lookup resolved the
 /// id, `Ok(None)` = miss, `Err(ProviderFailure)` = the provider store could
 /// not be searched (recorded as a provider error, result degrades — never a
-/// 5xx). The wiring in `main.rs` still maps read errors to `Ok(None)` until
-/// Task 6 (see the module doc's divergence list).
+/// 5xx).
 pub type OpencodeByIdLookup =
     Arc<dyn Fn(&str) -> Result<Option<OpencodeByIdHit>, ProviderFailure> + Send + Sync>;
 
@@ -113,6 +135,36 @@ pub struct ResolveState {
     pub session_metadata: SessionMetadataStore,
     pub opencode_session_by_id: Option<OpencodeByIdLookup>,
     pub locate_claude_transcript: Option<ClaudeLocator>,
+    /// The USER's home (Node sends `os.homedir()`, `sessions-router.ts:306-314`)
+    /// — lets the client prefill a CONCRETE cwd instead of the `~` sentinel.
+    /// `None` (no resolvable home) omits `homeDir` from the wire.
+    pub home_dir: Option<Arc<String>>,
+}
+
+/// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
+/// (`shared/coding-cli-defaults.ts:3`). The indexer scans ONLY
+/// settings-enabled providers, so a disabled provider's sessions can never
+/// be found — report those as UNSEARCHED so "not found" never overclaims.
+/// Order matches the canonical provider list.
+const KNOWN_RESUME_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
+
+/// Wire response (`ResumeResolveResponseSchema`): the core outcome plus the
+/// router-level provider-health fields. `providerErrors`/`unsearchedProviders`
+/// are always present (zod defaults exist for legacy tolerance, but Node
+/// always sends them); `homeDir` is omitted only when the server has no
+/// resolvable home. Struct field order IS wire key order (workspace-wide
+/// `preserve_order`) — it matches the Node object literal,
+/// `sessions-router.ts:306-314`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveWireResponse {
+    status: ResumeResolveStatus,
+    matches: Vec<ResumeResolveMatch>,
+    hint: Option<ResumeHint>,
+    provider_errors: Vec<ResumeResolveProviderError>,
+    unsearched_providers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_dir: Option<String>,
 }
 
 pub fn router(state: ResolveState) -> Router {
@@ -272,10 +324,27 @@ async fn resolve_session(
     // exact-id FALLBACKS below intentionally BYPASS this filter — Node's
     // fallbacks read sqlite/the filesystem directly and never consult
     // overrides — bug-for-bug.
+    // Read the enabled set BEFORE dispatching the core resolve, and FILTER
+    // the snapshot with it: Node's index EXCLUDES disabled providers at scan
+    // time (`session-indexer.ts:1454-1467`), so its resolution never sees
+    // their sessions (`resolve-session.ts:85`). The Rust SessionIndex is
+    // built with all four sources unconditionally, so the route must apply
+    // the equivalent gate — otherwise a disabled provider's indexed session
+    // resolves while the same response lists that provider under
+    // `unsearchedProviders`. Fallbacks stay UNGATED (Node invokes all wired
+    // exact-id fallbacks regardless of settings — `resolve-session.ts:127-156`).
+    let enabled: std::collections::HashSet<String> = state
+        .settings
+        .coding_cli_enabled_providers()
+        .await
+        .into_iter()
+        .collect();
+
     let snapshot: Option<Vec<IndexedSession>> = snapshot.map(|sessions| {
         let overrides = state.settings.session_overrides();
         sessions
             .iter()
+            .filter(|session| enabled.contains(&session.provider))
             .filter(|session| {
                 overrides
                     .get(&session.key())
@@ -320,29 +389,70 @@ async fn resolve_session(
     })
     .await;
 
-    // JoinError = the resolve task panicked. Express would 500 here; this
-    // port answers a benign ready-empty (Global Constraint: never 5xx) and
-    // the panic is already on stderr for diagnosis.
-    let outcome = joined.unwrap_or(ResumeResolveOutcome {
-        status: ResumeResolveStatus::Ready,
-        matches: Vec::new(),
-        hint: None,
-        provider_errors: Vec::new(),
-    });
+    // JoinError = the resolve task PANICKED. RECORDED DEVIATION (module
+    // doc): Node has no defined behavior here (unhandled rejection, no
+    // response); the explicit 500 is the honest port — the hardened
+    // contract forbids presenting an unsearchable state as a healthy
+    // "not found", so NEVER fabricate a ready-empty result. The panic
+    // itself is already on stderr for diagnosis.
+    let outcome = match joined {
+        Ok(outcome) => outcome,
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "resolve task panicked");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Resolve failed" })),
+            )
+                .into_response();
+        }
+    };
 
-    // TASK-6: replaced by the full hardened wire response — until then this
-    // route keeps today's `{status, matches, hint}` shape and DROPS the
-    // core's provider_errors (see the module doc's divergence list).
-    #[derive(serde::Serialize)]
-    struct LegacyWire {
-        status: freshell_sessions::resume_resolve::ResumeResolveStatus,
-        matches: Vec<freshell_sessions::resume_resolve::ResumeResolveMatch>,
-        hint: Option<freshell_sessions::resume_input::ResumeHint>,
+    // Router-level merge (`sessions-router.ts:280-314`).
+    let unsearched_providers: Vec<String> = KNOWN_RESUME_PROVIDERS
+        .iter()
+        .filter(|name| !enabled.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect();
+    // Scan failures: enabled-only, fallback errors win the dedupe (more
+    // specific code/message). A DISABLED provider is unsearched (reported
+    // above), never a provider error — otherwise a failed-then-disabled
+    // provider would keep responses degraded forever (no successful scan
+    // could ever clear it).
+    let mut provider_errors = outcome.provider_errors;
+    if let Some(index) = state.session_index.as_ref() {
+        for name in index.scan_failures() {
+            if !enabled.contains(&name) || provider_errors.iter().any(|e| e.provider == name) {
+                continue;
+            }
+            provider_errors.push(ResumeResolveProviderError {
+                provider: name,
+                code: None,
+                message: Some("session scan failed".to_string()),
+            });
+        }
     }
-    Json(LegacyWire {
-        status: outcome.status,
+    // degraded = something FAILED — even when matches exist: a failed
+    // provider means a HIGHER-priority exact match may have been missed, so
+    // the client must never auto-resume a surviving lower-priority match.
+    let status = match outcome.status {
+        ResumeResolveStatus::Warming => ResumeResolveStatus::Warming,
+        _ if !provider_errors.is_empty() => ResumeResolveStatus::Degraded,
+        _ => ResumeResolveStatus::Ready,
+    };
+    // Fire-and-forget: give the user's Retry a chance to converge once a
+    // failed provider recovers (scan failures only clear on a new scan).
+    if status == ResumeResolveStatus::Degraded {
+        if let Some(index) = state.session_index.as_ref() {
+            index.request_refresh();
+        }
+    }
+    Json(ResolveWireResponse {
+        status,
         matches: outcome.matches,
         hint: outcome.hint,
+        provider_errors,
+        unsearched_providers,
+        home_dir: state.home_dir.as_ref().map(|h| h.as_str().to_string()),
     })
     .into_response()
 }
@@ -381,13 +491,81 @@ mod tests {
     }
 
     async fn fixture_index(sessions: Vec<IndexedSession>) -> Arc<SessionIndex> {
+        fixture_index_with_sources(vec![
+            Arc::new(FixtureSource(sessions)) as Arc<dyn SessionSource>
+        ])
+        .await
+    }
+
+    async fn fixture_index_with_sources(sources: Vec<Arc<dyn SessionSource>>) -> Arc<SessionIndex> {
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
-            vec![Arc::new(FixtureSource(sessions)) as Arc<dyn SessionSource>],
+            sources,
             std::time::Duration::from_secs(3600),
             None,
         ));
         index.warm().await;
         index
+    }
+
+    /// The Task-5 `FlakySource` shape (`directory_index.rs` tests): a
+    /// direct-listed opencode source whose `direct_list()` errs while
+    /// `broken` is true. The change token CHANGES every call so each sweep
+    /// re-queries — recovery is observable after `broken` flips to false.
+    struct FailingDirectSource {
+        broken: Arc<std::sync::atomic::AtomicBool>,
+        counter: std::sync::atomic::AtomicI64,
+    }
+
+    impl FailingDirectSource {
+        fn new(broken: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            Self {
+                broken,
+                counter: std::sync::atomic::AtomicI64::new(0),
+            }
+        }
+    }
+
+    impl SessionSource for FailingDirectSource {
+        fn discover(&self) -> Vec<FileStat> {
+            Vec::new()
+        }
+        fn parse(&self, _path: &std::path::Path) -> Option<IndexedSession> {
+            None
+        }
+        fn provider_name(&self) -> Option<&'static str> {
+            Some("opencode")
+        }
+        fn direct_change_token(&self) -> Option<i64> {
+            Some(
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+        fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                Err("unable to open database file".to_string())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Seed `<dir>/.freshell/config.json` with the WRAPPED settings document
+    /// (`SettingsStore` unwraps the top-level `settings` key — see
+    /// `load_full_settings` in `settings_store.rs`; a bare `codingCli`
+    /// object would be silently ignored, reading defaults).
+    fn seed_enabled_providers(dir: &std::path::Path, providers: &[&str]) {
+        let cfg_dir = dir.join(".freshell");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir .freshell");
+        std::fs::write(
+            cfg_dir.join("config.json"),
+            serde_json::json!({
+                "version": 1,
+                "settings": { "codingCli": { "enabledProviders": providers } }
+            })
+            .to_string(),
+        )
+        .expect("seed config.json");
     }
 
     fn claude_fixture() -> IndexedSession {
@@ -425,12 +603,24 @@ mod tests {
             auth_token: Arc::new("tok".into()),
             // Isolated home: overrides read/write under `<dir>/.freshell/`,
             // never the developer's real config (same pattern as the
-            // session_directory router tests).
-            settings: crate::settings_store::SettingsStore::load(Some(dir), vec!["claude".into()]),
+            // session_directory router tests). All four Node providers are
+            // discovered, and the fresh-store default enables all four
+            // (Node's `DEFAULT_ENABLED_CLI_PROVIDERS`), so the baseline
+            // `unsearchedProviders` is `[]` — deterministic expectations.
+            settings: crate::settings_store::SettingsStore::load(
+                Some(dir),
+                vec![
+                    "claude".into(),
+                    "codex".into(),
+                    "opencode".into(),
+                    "amplifier".into(),
+                ],
+            ),
             session_index: index,
             session_metadata: crate::session_metadata::SessionMetadataStore::new(dir),
             opencode_session_by_id: None,
             locate_claude_transcript: None,
+            home_dir: Some(Arc::new("/home/tester".to_string())),
         }
     }
 
@@ -634,7 +824,10 @@ mod tests {
             serde_json::json!({
                 "status": "warming",
                 "matches": [],
-                "hint": { "provider": "claude", "source": "command" }
+                "hint": { "provider": "claude", "source": "command" },
+                "providerErrors": [],
+                "unsearchedProviders": [],
+                "homeDir": "/home/tester"
             })
         );
     }
@@ -820,5 +1013,261 @@ mod tests {
                 "message": "Invalid input: expected string, received undefined"
             }])
         );
+    }
+
+    // -- Task 6 (resolve parity): hardened wire surface ---------------------
+
+    #[tokio::test]
+    async fn wire_shape_carries_the_hardened_provider_health_fields() {
+        let dir = temp_dir("wire");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": CLAUDE_ID }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["providerErrors"], serde_json::json!([]));
+        assert!(body["unsearchedProviders"].is_array());
+        // Baseline is [] — the fresh-store default enables all FOUR Node
+        // providers (`DEFAULT_ENABLED_CLI_PROVIDERS` incl. amplifier); a
+        // regression in that default must fail loudly here.
+        assert_eq!(body["unsearchedProviders"], serde_json::json!([]));
+        assert_eq!(body["homeDir"], "/home/tester");
+    }
+
+    #[tokio::test]
+    async fn broken_opencode_store_degrades_with_a_provider_error_never_silent_not_found() {
+        // THE acceptance test (context §4): an unreadable provider store yields
+        // degraded + providerErrors on the wire — matches stay empty, status is
+        // NOT "ready".
+        let dir = temp_dir("degraded");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let mut st = state(&dir, Some(index));
+        // Node production parity (`sessions-resolve-router.test.ts:308-320`): the
+        // opencode worker boundary strips `.code`, so the wire entry is
+        // message-only — `code` must be ABSENT, not null-with-key. The production
+        // closure (main.rs) maps OpencodeByIdError to code: None accordingly.
+        st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+            Err(freshell_sessions::resume_resolve::ProviderFailure {
+                code: None,
+                message: "unable to open database file".into(),
+            })
+        }));
+        let (status, body) = post(
+            st,
+            serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["matches"], serde_json::json!([]));
+        assert_eq!(
+            body["providerErrors"],
+            serde_json::json!([{ "provider": "opencode", "message": "unable to open database file" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_even_with_matches_when_a_higher_priority_fallback_failed() {
+        // ses_ fallback fails; the later hex token still prefix-matches the index
+        // — the response carries the match AND stays degraded (no auto-resume).
+        let dir = temp_dir("degmatch");
+        let mut amp = claude_fixture();
+        amp.provider = "amplifier".to_string();
+        amp.session_id = "417e8345aaaa".to_string();
+        let index = fixture_index(vec![amp]).await;
+        let mut st = state(&dir, Some(index));
+        st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+            Err(freshell_sessions::resume_resolve::ProviderFailure {
+                code: None,
+                message: "locked".into(),
+            })
+        }));
+        let (_, body) = post(
+            st,
+            serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa 417e8345" }),
+            true,
+        )
+        .await;
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["matches"][0]["sessionId"], "417e8345aaaa");
+    }
+
+    #[tokio::test]
+    async fn a_provider_scan_failure_reports_degraded_with_the_scan_failed_literal() {
+        // Index whose direct-listed source errs → scan_failures ["opencode"] →
+        // degraded + {provider:"opencode", message:"session scan failed"} even
+        // though no fallback ran.
+        let dir = temp_dir("scanfail");
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = fixture_index_with_sources(vec![
+            Arc::new(FixtureSource(vec![claude_fixture()])) as Arc<dyn SessionSource>,
+            Arc::new(FailingDirectSource::new(broken)) as Arc<dyn SessionSource>,
+        ])
+        .await;
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": CLAUDE_ID }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(
+            body["providerErrors"],
+            serde_json::json!([{ "provider": "opencode", "message": "session scan failed" }])
+        );
+        // degraded ≠ empty: the exact index hit still rides along.
+        assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+    }
+
+    #[tokio::test]
+    async fn disabled_providers_are_reported_unsearched_never_as_errors() {
+        // Settings with enabledProviders ["claude"]: unsearchedProviders lists
+        // the other three; a scan failure for DISABLED opencode is excluded
+        // from providerErrors and the response stays "ready" (a
+        // failed-then-disabled provider must not stick degraded forever).
+        let dir = temp_dir("disabled");
+        seed_enabled_providers(&dir, &["claude"]);
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = fixture_index_with_sources(vec![
+            Arc::new(FixtureSource(vec![claude_fixture()])) as Arc<dyn SessionSource>,
+            Arc::new(FailingDirectSource::new(broken)) as Arc<dyn SessionSource>,
+        ])
+        .await;
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": CLAUDE_ID }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["providerErrors"], serde_json::json!([]));
+        let unsearched = body["unsearchedProviders"].as_array().unwrap();
+        for name in ["codex", "opencode", "amplifier"] {
+            assert!(
+                unsearched.iter().any(|v| v == name),
+                "{name} must be listed unsearched, got {unsearched:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_indexed_sessions_do_not_resolve() {
+        // Node's INDEX excludes disabled providers (session-indexer.ts:1454-1467),
+        // so its resolution never sees their sessions (resolve-session.ts:85).
+        // Rust must filter the snapshot by the live enabled set BEFORE core
+        // resolution — a disabled provider's session resolving while that
+        // provider is listed in unsearchedProviders would be self-contradictory.
+        let dir = temp_dir("disidx");
+        seed_enabled_providers(&dir, &["claude"]);
+        let codex_id = "0198c0de-aaaa-4bbb-8ccc-1234567890ab";
+        let mut codex = claude_fixture();
+        codex.provider = "codex".to_string();
+        codex.session_id = codex_id.to_string();
+        let index = fixture_index(vec![codex]).await;
+        let (status, body) = post(
+            state(&dir, Some(index)),
+            serde_json::json!({ "input": codex_id }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"], serde_json::json!([]));
+        let unsearched = body["unsearchedProviders"].as_array().unwrap();
+        assert!(
+            unsearched.iter().any(|v| v == "codex"),
+            "codex must be listed unsearched, got {unsearched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_provider_exact_id_still_resolves_via_fallback_node_parity() {
+        // Node wires ALL FOUR providers' exact-id fallbacks unconditionally
+        // (server/index.ts wiring; resolve-session.ts:127-156 invokes them
+        // regardless of settings) — settings gate INDEXING only. A disabled
+        // opencode's exact ses_ id must therefore still resolve via the
+        // fallback, while "opencode" stays listed in unsearchedProviders.
+        const SES_ID: &str = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let dir = temp_dir("disfb");
+        seed_enabled_providers(&dir, &["claude"]);
+        let index = fixture_index(Vec::new()).await;
+        let mut st = state(&dir, Some(index));
+        st.opencode_session_by_id = Some(Arc::new(|id: &str| {
+            Ok(Some(freshell_sessions::resume_resolve::OpencodeByIdHit {
+                session_id: id.to_string(),
+                cwd: Some("/repo/delta".to_string()),
+                title: None,
+                last_activity_at: None,
+            }))
+        }));
+        let (status, body) = post(st, serde_json::json!({ "input": SES_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"][0]["sessionId"], SES_ID);
+        let unsearched = body["unsearchedProviders"].as_array().unwrap();
+        assert!(
+            unsearched.iter().any(|v| v == "opencode"),
+            "opencode must be listed unsearched, got {unsearched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_response_schedules_a_refresh_and_retry_converges() {
+        // request_refresh() wiring proof END-TO-END (sessions-router.ts:293-305
+        // parity): a degraded response fire-and-forgets a refresh, so once the
+        // provider recovers, a client Retry converges back to ready. Assert
+        // convergence by POLLING re-posts (each degraded response re-schedules
+        // a refresh) rather than sleeping once.
+        let dir = temp_dir("refresh");
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let index = fixture_index_with_sources(vec![
+            Arc::new(FixtureSource(vec![claude_fixture()])) as Arc<dyn SessionSource>,
+            Arc::new(FailingDirectSource::new(Arc::clone(&broken))) as Arc<dyn SessionSource>,
+        ])
+        .await;
+        let st = state(&dir, Some(index));
+        let (_, body) = post(st.clone(), serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(body["status"], "degraded", "first response: {body}");
+        broken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let (_, body) = post(st.clone(), serde_json::json!({ "input": CLAUDE_ID }), true).await;
+            if body["status"] == "ready" && body["providerErrors"] == serde_json::json!([]) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "must converge to ready within 2s; last body: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicked_resolver_answers_500_never_a_fabricated_ready_empty() {
+        // RECORDED DEVIATION (module doc): Node has no defined behavior for a
+        // top-level resolver throw (unhandled rejection in the async Express 4
+        // handler — no response at all); the explicit 500 is the honest port.
+        // The hardened contract forbids presenting an unsearchable state as a
+        // healthy "not found", so a JoinError must NEVER fabricate ready-empty.
+        let dir = temp_dir("panic");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let mut st = state(&dir, Some(index));
+        st.opencode_session_by_id = Some(Arc::new(|_id: &str| panic!("resolver crashed")));
+        let (status, body) = post(
+            st,
+            serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({ "error": "Resolve failed" }));
     }
 }

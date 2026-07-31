@@ -12,30 +12,15 @@
 //! `sessionResolve` capability flag is held `false` until it is empty. The
 //! CORE below is at parity with the hardened Node core (matching order, case
 //! rules, subagent gating, sessionType overlay+default, provider-error
-//! channel, shape gates, budgets); what remains diverging is the WIRING and
-//! the WIRE SURFACE around it:
+//! channel, shape gates, budgets). The wire surface
+//! (`providerErrors`/`unsearchedProviders`/`homeDir`, scan-failure merge,
+//! degraded fire-and-forget refresh) and the failure-REPORTING production
+//! fallbacks (checked claude locator `locate_transcript_checked`,
+//! error-propagating opencode by-id query) landed in plan Task 6
+//! (`resolve.rs` + `main.rs`); what remains:
 //!
-//! - Wire surface (plan Tasks 5, 6): the HTTP layer still serializes the
-//!   legacy `{status, matches, hint}` shape — the [`ResumeResolveOutcome`]'s
-//!   `provider_errors` are computed but DROPPED by `resolve.rs`, and there is
-//!   no `unsearchedProviders`/`homeDir` field or scan-failure/warming
-//!   readiness merge yet.
-//! - opencode by-id fallback ERROR mapping (plan Task 6): the closure
-//!   `main.rs` supplies runs the hardened direct row query
-//!   (`parse::opencode_session_row_by_id`, Node's
-//!   `server/coding-cli/providers/opencode-by-id-query.ts` — archived +
-//!   child sessions included, full row with `title`/`lastActivityAt`
-//!   returned), but still maps read errors to `Ok(None)` misses instead of
-//!   `Err(ProviderFailure)` — `degraded` stays unreachable in production
-//!   until Task 6 rewires it.
-//! - claude fallback WIRING (plan Task 6): the wired `locate_transcript`
-//!   (`freshell-freshagent`) probes `<projects>/<project>/<subdir>/<id>.jsonl`
-//!   and never Node's `<projects>/<project>/<parent>/subagents/<id>.jsonl`
-//!   layout (`claude-transcript-locator.ts`), so subagent child transcripts
-//!   are a Rust MISS; it also swallows read errors as `Ok(None)` misses
-//!   instead of `Err(ProviderFailure)`. The cwd read itself IS bounded to
-//!   Node's 64 KiB (`transcript_cwd_bounded`). The checked locator lands in
-//!   Task 6 (`locate_transcript_checked`).
+//! - the `sessionResolve` capability flag itself is still held `false` and
+//!   the e2e resolve matrix has not yet run against the route (plan Task 7).
 //!
 //! Wire parity notes:
 //! - Field ORDER in `ResumeResolveMatch` matches the Node object literals —
@@ -182,8 +167,9 @@ pub struct ResolveDeps<'a> {
 }
 
 /// Core result (`ResolveResumeResult` in `resolve-session.ts:31-36`).
-/// `provider_errors` carries FALLBACK failures only; the HTTP layer merges in
-/// index scan failures and adds `unsearchedProviders`/`homeDir` (Task 6).
+/// `provider_errors` carries FALLBACK failures only; the HTTP layer
+/// (`crates/freshell-server/src/resolve.rs`) merges in index scan failures
+/// and adds `unsearchedProviders`/`homeDir`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeResolveOutcome {
     pub status: ResumeResolveStatus,

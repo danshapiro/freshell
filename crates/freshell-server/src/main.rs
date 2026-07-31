@@ -1117,64 +1117,125 @@ async fn main() -> ExitCode {
             // /api/session-metadata` writes (Node overlays it in
             // `session-indexer.ts:1159-1161`).
             session_metadata: session_metadata_store.clone(),
+            // Resolve fallbacks mirror Node's buildResolveFallbacks over the
+            // FIXED provider registry (server/index.ts wires ALL FOUR
+            // codingCliProviders into it unconditionally): settings do NOT
+            // gate the exact-id fallbacks — they only gate INDEXING and feed
+            // unsearchedProviders. Both closures are therefore ALWAYS wired;
+            // gating them on boot-time settings would produce false misses
+            // after a live settings change and diverge from Node for
+            // disabled-provider exact IDs.
+            //
             // opencode `ses_*` exact-id fallback: the SAME data home the
             // OpencodeSource uses, answered by the hardened direct by-id row
             // query (`opencode_session_row_by_id`, Node's
             // `opencode-by-id-query.ts`) — archived + child sessions
-            // included, full row (title/lastActivityAt) returned. KNOWN
-            // DIVERGENCE (see resolve.rs module doc): read errors are still
-            // mapped to an `Ok(None)` miss instead of `Err(ProviderFailure)`
-            // — the full health channel is wired in Task 6.
-            opencode_session_by_id: Some(std::sync::Arc::new(
-                |session_id: &str| -> Result<
-                    Option<freshell_sessions::resume_resolve::OpencodeByIdHit>,
-                    freshell_sessions::resume_resolve::ProviderFailure,
-                > {
-                    use freshell_sessions::resume_resolve::OpencodeByIdHit;
+            // included, full row (title/lastActivityAt) returned. Read
+            // errors REPORT as `Err(ProviderFailure)` (the provider-health
+            // channel) — never a silent `Ok(None)` miss.
+            opencode_session_by_id: Some({
+                std::sync::Arc::new(|session_id: &str| {
                     let data_home = freshell_sessions::parse::default_opencode_data_home();
-                    match freshell_sessions::parse::opencode_session_row_by_id(
-                        &data_home, session_id,
-                    ) {
-                        Ok(row) => Ok(row.map(|r| OpencodeByIdHit {
-                            session_id: r.session_id,
-                            cwd: r.cwd,
-                            title: r.title,
-                            last_activity_at: r.last_activity_at,
-                        })),
-                        // TASK-6 upgrades this to Err(ProviderFailure{..})
-                        // once the wire carries providerErrors; until then a
-                        // read failure stays a miss.
-                        Err(_) => Ok(None),
-                    }
-                },
-            )),
-            // claude transcript exact-id fallback: the SAME ordered-roots scan
-            // the attach arm and IndexExistenceProbe trust
-            // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), paired with
-            // the BOUNDED original-cwd reader (Node's 64 KiB CWD_SCAN_BYTES,
-            // `claude-transcript-locator.ts` — one resolve request must never
-            // scan a multi-GB transcript). Node's locator lowercases the id
-            // before scanning and returns the lowercased id — mirrored here.
-            // KNOWN DIVERGENCE (see resolve.rs module doc): this locator
-            // never probes Node's `<parent>/subagents/<id>.jsonl` layout and
-            // still swallows read errors as `Ok(None)` misses — the checked
-            // locator + `Err(ProviderFailure)` reporting is wired in Task 6.
-            locate_claude_transcript: Some(std::sync::Arc::new(
-                |session_id: &str| -> Result<
-                    Option<freshell_sessions::resume_resolve::ClaudeTranscriptHit>,
-                    freshell_sessions::resume_resolve::ProviderFailure,
-                > {
-                    let lowered = session_id.to_ascii_lowercase();
-                    Ok(
-                        freshell_freshagent::locate_transcript(&lowered).map(|path| {
-                            freshell_sessions::resume_resolve::ClaudeTranscriptHit {
-                                session_id: lowered.clone(),
-                                cwd: freshell_freshagent::transcript_cwd_bounded(&path),
+                    freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
+                        .map(|row| {
+                            row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
+                                session_id: r.session_id,
+                                cwd: r.cwd,
+                                title: r.title,
+                                last_activity_at: r.last_activity_at,
+                            })
+                        })
+                        .map_err(|e| {
+                            // Node production parity: the opencode worker
+                            // boundary STRIPS `.code` — the worker serializes
+                            // only {name, message}
+                            // (`opencode-by-id.worker.ts:41-42`) and the
+                            // runner rebuilds the Error without it
+                            // (`opencode-by-id-runner.ts:103-106`), so Node's
+                            // wire entry is message-only
+                            // (`sessions-resolve-router.test.ts:308-320`).
+                            // Emitting SQLITE_* codes here would DIVERGE from
+                            // Node. Task 4's OpencodeByIdError still carries
+                            // the code — log it (structured, with provider +
+                            // code) for diagnosability, then drop it from the
+                            // wire.
+                            tracing::warn!(
+                                provider = "opencode",
+                                code = ?e.code,
+                                message = %e.message,
+                                "opencode by-id lookup failed"
+                            );
+                            freshell_sessions::resume_resolve::ProviderFailure {
+                                code: None,
+                                message: e.message,
                             }
+                        })
+                }) as crate::resolve::OpencodeByIdLookup
+            }),
+            // claude transcript exact-id fallback: the CHECKED locator over
+            // Node's authoritative two layouts (direct + `<parent>/subagents/
+            // <id>.jsonl`) with the CHECKED bounded cwd reader — read errors
+            // REPORT as `Err(ProviderFailure)` carrying the symbolic errno
+            // (Node preserves `cause.code` verbatim). Node's locator
+            // lowercases the id before scanning and returns the lowercased
+            // id — mirrored here.
+            locate_claude_transcript: Some({
+                std::sync::Arc::new(|session_id: &str| {
+                    let lowered = session_id.to_ascii_lowercase();
+                    // Node-parity root (`server/claude-home.ts:4-7` +
+                    // `providers/claude.ts:524-535`): CLAUDE_HOME (non-empty)
+                    // else $HOME/.claude, joined with "projects" — the SAME
+                    // root the Rust session index uses
+                    // (`session_directory::claude_home`). Note CLAUDE_HOME
+                    // alone suffices even when HOME is unset (Node's
+                    // getClaudeHome() honors it directly); no root ⇒
+                    // Ok(None), a miss. Deliberately NOT
+                    // `claude_home_candidates()`: its extra
+                    // CLAUDE_CONFIG_DIR/bare-CLAUDE_HOME roots would expose
+                    // transcripts from roots Node never searches.
+                    let claude_home =
+                        match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
+                            Some(v) => Some(std::path::PathBuf::from(v)),
+                            None => std::env::var("HOME")
+                                .ok()
+                                .filter(|v| !v.is_empty())
+                                .map(|h| std::path::PathBuf::from(h).join(".claude")),
+                        };
+                    let roots: Vec<std::path::PathBuf> = match claude_home {
+                        Some(h) => vec![h.join("projects")],
+                        None => return Ok(None),
+                    };
+                    match freshell_freshagent::locate_transcript_checked(&roots, &lowered) {
+                        Ok(Some(path)) => {
+                            match freshell_freshagent::transcript_cwd_checked(&path) {
+                                Ok(cwd) => Ok(Some(
+                                    freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                                        cwd,
+                                        session_id: lowered,
+                                    },
+                                )),
+                                Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                                    code: errno_code(&e),
+                                    message: format!("Claude transcript read failed: {e}"),
+                                }),
+                            }
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(freshell_sessions::resume_resolve::ProviderFailure {
+                            code: errno_code(&e),
+                            message: format!("Claude transcript scan failed: {e}"),
                         }),
-                    )
-                },
-            )),
+                    }
+                }) as crate::resolve::ClaudeLocator
+            }),
+            // Node sends os.homedir() (`sessions-router.ts:306-314`) — the
+            // USER's home. Do NOT reuse resolve_home(): it prefers
+            // FRESHELL_HOME, a config/storage root that can differ from the
+            // real home, and the dialog would prefill a cwd-less resume into
+            // the wrong directory.
+            home_dir: std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| Arc::new(h.to_string_lossy().into_owned())),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
@@ -1530,6 +1591,45 @@ fn resolve_amplifier_events_path(projects_root: &Path, session_id: &str) -> Opti
         }
     }
     None
+}
+
+/// Wire error code for a provider-error summary. Node preserves the ORIGINAL
+/// `cause.code` VERBATIM (`ClaudeTranscriptLocatorError`,
+/// `claude-transcript-locator.ts:19-27`): EPERM stays EPERM, EIO stays EIO.
+/// So derive the symbolic errno name from the RAW OS errno — do NOT map from
+/// `ErrorKind`, which would collapse EPERM into EACCES and drop EIO/EMFILE
+/// entirely.
+#[cfg(unix)]
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    let raw = err.raw_os_error()?;
+    let name = match raw {
+        libc::EACCES => "EACCES",
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EIO => "EIO",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        libc::ELOOP => "ELOOP",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EBADF => "EBADF",
+        libc::EINVAL => "EINVAL",
+        _ => return None, // unknown errno ⇒ omit code, keep the message
+    };
+    Some(name.to_string())
+}
+
+/// Non-unix fallback: `raw_os_error()` is a Win32 code there, not an errno;
+/// map the coarse kinds Node's libuv also names. (The resolve fallbacks'
+/// primary target is unix; parity of the fine-grained codes is a unix
+/// concern.)
+#[cfg(not(unix))]
+fn errno_code(err: &std::io::Error) -> Option<String> {
+    match err.kind() {
+        std::io::ErrorKind::PermissionDenied => Some("EACCES".to_string()),
+        std::io::ErrorKind::NotFound => Some("ENOENT".to_string()),
+        _ => None,
+    }
 }
 
 fn resolve_home() -> Option<PathBuf> {
@@ -2158,6 +2258,38 @@ mod sessions_sweep_tests {
 mod tests {
     use super::*;
     use freshell_platform::MapEnv;
+
+    // -- Task 6 (resolve parity): errno-name derivation for provider errors.
+    // Node preserves the ORIGINAL `cause.code` VERBATIM
+    // (`ClaudeTranscriptLocatorError`, `claude-transcript-locator.ts:19-27`):
+    // EPERM stays EPERM — a kind-based mapping would collapse it into EACCES
+    // (both are `ErrorKind::PermissionDenied`) and drop EIO entirely.
+
+    #[cfg(unix)]
+    #[test]
+    fn errno_code_preserves_the_raw_errno_name_verbatim() {
+        use std::io;
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EPERM)).as_deref(),
+            Some("EPERM")
+        );
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EACCES)).as_deref(),
+            Some("EACCES")
+        );
+        assert_eq!(
+            errno_code(&io::Error::from_raw_os_error(libc::EIO)).as_deref(),
+            Some("EIO")
+        );
+        // Synthetic error without a raw errno: omit the code, keep the message.
+        assert_eq!(
+            errno_code(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "no raw errno"
+            )),
+            None
+        );
+    }
 
     // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
     // (V10.md). Deletion is the destructive branch, so every uncertain path

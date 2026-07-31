@@ -105,9 +105,8 @@ const CWD_SCAN_BYTES: u64 = 64 * 1024;
 /// unbounded `BufRead::lines()` loop.
 ///
 /// Errors are swallowed to `None` like [`transcript_cwd`]; the
-/// error-PROPAGATING `transcript_cwd_checked` (provider-error channel) is
-/// the deferred Task-3 work in
-/// `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`.
+/// error-PROPAGATING variant for the provider-error channel is
+/// [`transcript_cwd_checked`].
 pub fn transcript_cwd_bounded(path: &Path) -> Option<String> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
@@ -177,6 +176,179 @@ pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<Pa
         }
     }
     None
+}
+
+/// Error-AWARE variant of [`locate_transcript`] for the resolve endpoint's
+/// provider-health channel (#586 parity): an unreadable claude store must
+/// surface as a provider error, never a silent miss. A missing projects dir
+/// (`NotFound`) is a genuine miss for that root; any OTHER io error
+/// propagates.
+///
+/// The projects roots are a PARAMETER, exactly like Node's locator takes
+/// `projectsDir` (`claude-transcript-locator.ts:65-67`) — the CALLER resolves
+/// the environment. Do NOT resolve roots via `claude_home_candidates()`
+/// here: that helper adds `CLAUDE_CONFIG_DIR` and bare-`CLAUDE_HOME` roots
+/// that Node's resolver (`getSessionRoots()` = `getClaudeHome()/projects`,
+/// `providers/claude.ts:524-535`, `server/claude-home.ts:4-7`) and the Rust
+/// session index intentionally exclude — with an explicit `CLAUDE_HOME`
+/// override it would expose transcripts from a root Node never searches.
+/// Parameterizing the roots also keeps the unit tests hermetic: they pass
+/// temp dirs and never mutate process-global env.
+///
+/// Traversal order is Node's GLOBAL two-pass order
+/// (`claude-transcript-locator.ts:69-88`): PASS 1 probes the DIRECT layout
+/// across ALL roots, then PASS 2 probes the subagent layout across all roots
+/// — NOT per-root direct+subagent. (With roots `[A, B]`: A direct, B direct,
+/// A subagent, B subagent.)
+pub fn locate_transcript_checked(
+    projects_roots: &[PathBuf],
+    session_id: &str,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    // PASS 1 — direct layout across all roots.
+    for projects in projects_roots {
+        if let Some(path) = find_transcript_checked_direct(projects, session_id)? {
+            return Ok(Some(path));
+        }
+    }
+    // PASS 2 — subagent layout, only when the direct layout missed everywhere.
+    for projects in projects_roots {
+        if let Some(path) = find_transcript_checked_subagent(projects, session_id)? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Node parity (`claude-transcript-locator.ts:33-37`): expected absence is
+/// `ENOENT || ENOTDIR` — a missing dir OR a non-directory path component is
+/// a genuine miss; everything else is a provider failure.
+fn is_expected_absence(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// The traversal guard [`find_transcript`] applies, shared by the checked
+/// helpers: reject ids that could escape the store root.
+fn is_safe_session_id(session_id: &str) -> bool {
+    !(session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains(".."))
+}
+
+/// Sorted entry paths of `dir` — Node's `readdirOrEmpty`
+/// (`claude-transcript-locator.ts:95-102`): expected absence reads as an
+/// EMPTY listing; any other error PROPAGATES. No file-type filtering: Node
+/// probes every entry and lets a non-directory read as an ENOTDIR miss at
+/// the candidate probe. Sorted for determinism (the unchecked
+/// `find_transcript` convention).
+fn read_dir_sorted_or_empty(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if is_expected_absence(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        out.push(entry?.path());
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// One candidate probe (Node's `probeTranscript` stat,
+/// `claude-transcript-locator.ts:105-113`): `Ok(true)` iff a regular file
+/// exists at `path`; expected absence (incl. ENOTDIR from a file path
+/// component) is a miss; any OTHER error propagates. `std::fs::metadata`,
+/// never the error-swallowing `Path::is_file()`.
+fn candidate_is_file(path: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(e) if is_expected_absence(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// PASS-1 helper: Node's DIRECT layout `<projects>/<project-dir>/<id>.jsonl`
+/// (`claude-transcript-locator.ts:39-44,71-76`), with error propagation.
+/// CAUTION: intentionally NOT the unchecked [`find_transcript`] layout — that
+/// one probes `<project-dir>/<subdir>/<id>.jsonl` without the `subagents`
+/// segment, which diverges from Node and misses child sessions.
+fn find_transcript_checked_direct(
+    projects: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    if !is_safe_session_id(session_id) {
+        return Ok(None);
+    }
+    let filename = format!("{session_id}.jsonl");
+    for dir in read_dir_sorted_or_empty(projects)? {
+        let candidate = dir.join(&filename);
+        if candidate_is_file(&candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// PASS-2 helper: Node's SUBAGENT layout
+/// `<projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl`
+/// (`claude-transcript-locator.ts:45-48,78-88`), with error propagation.
+fn find_transcript_checked_subagent(
+    projects: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    if !is_safe_session_id(session_id) {
+        return Ok(None);
+    }
+    let filename = format!("{session_id}.jsonl");
+    for dir in read_dir_sorted_or_empty(projects)? {
+        for parent in read_dir_sorted_or_empty(&dir)? {
+            let candidate = parent.join("subagents").join(&filename);
+            if candidate_is_file(&candidate)? {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Error-AWARE variant of [`transcript_cwd_bounded`] for the resolve
+/// endpoint's provider-health channel. An open error of expected-absence
+/// kind is `Ok(None)` — the file existed a moment ago (the locate probe
+/// succeeded), so absence = raced deletion and the hit survives, cwd-less
+/// (Node behaves the same, `claude-transcript-locator.ts:121-129`); any
+/// OTHER open/read error PROPAGATES (Node wraps these in
+/// `ClaudeTranscriptLocatorError`). Same 64 KiB bounded read + tolerant
+/// per-segment parse as [`transcript_cwd_bounded`] — malformed lines are
+/// skipped, the final unterminated segment is still attempted.
+pub fn transcript_cwd_checked(path: &Path) -> Result<Option<String>, std::io::Error> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if is_expected_absence(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut head = Vec::new();
+    file.take(CWD_SCAN_BYTES).read_to_end(&mut head)?;
+    let head = String::from_utf8_lossy(&head);
+    for segment in head.split('\n') {
+        let trimmed = segment.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+            if !cwd.is_empty() {
+                return Ok(Some(cwd.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Why a claude snapshot could not be served.
@@ -563,6 +735,164 @@ mod tests {
             transcript_cwd_bounded(&home.path().join("absent.jsonl")),
             None
         );
+    }
+
+    // -- Task 6 (resolve parity): checked locator + checked cwd reader ------
+    //
+    // HERMETIC BY CONSTRUCTION: every test below builds a temp projects dir
+    // and passes it via the `projects_roots` parameter; NO test mutates
+    // process-global env (CLAUDE_HOME/CLAUDE_CONFIG_DIR/HOME), so there is
+    // nothing to race against the crate's env-mutating claude tests.
+
+    #[test]
+    fn locate_transcript_checked_misses_on_an_absent_projects_dir() {
+        let home = temp_home();
+        let roots = vec![home.path().join("projects")]; // never created
+        assert_eq!(
+            locate_transcript_checked(&roots, "11111111-1111-4111-8111-111111111111").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn locate_transcript_checked_finds_the_subagent_child_layout() {
+        // Node layout pass 2 (`claude-transcript-locator.ts:39-48`):
+        // <projects>/<project-dir>/<parent-session>/subagents/<id>.jsonl.
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        let sub = projects
+            .join("-repo-alpha")
+            .join("99999999-9999-4999-8999-999999999999")
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("22222222-2222-4222-8222-222222222222.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        assert_eq!(
+            locate_transcript_checked(&[projects], "22222222-2222-4222-8222-222222222222").unwrap(),
+            Some(file)
+        );
+    }
+
+    #[test]
+    fn locate_transcript_checked_treats_a_file_project_entry_as_a_miss_enotdir_parity() {
+        // Node reports ENOTDIR as a normal miss (`claude-transcript-locator
+        // .ts:33-37`): a candidate path whose component is a REGULAR FILE
+        // (descending into it fails NotADirectory) yields Ok(None), not Err.
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("-not-a-dir"), "i am a file\n").unwrap();
+        assert_eq!(
+            locate_transcript_checked(&[projects], "33333333-3333-4333-8333-333333333333").unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locate_transcript_checked_propagates_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let projects = home.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root / CAP_DAC_OVERRIDE bypasses mode bits — probe first.
+        if std::fs::read_dir(&projects).is_ok() {
+            std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: euid bypasses permission checks");
+            return;
+        }
+        let err = locate_transcript_checked(
+            std::slice::from_ref(&projects),
+            "44444444-4444-4444-8444-444444444444",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // Restore so TempDir cleanup works.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn locate_transcript_checked_probes_direct_across_all_roots_before_any_subagent() {
+        // Node's GLOBAL two-pass order (`claude-transcript-locator.ts:69-88`):
+        // with roots [A, B], a DIRECT hit in B outranks a SUBAGENT hit in A —
+        // NOT per-root direct+subagent.
+        let home = temp_home();
+        let root_a = home.path().join("a-projects");
+        let root_b = home.path().join("b-projects");
+        let id = "55555555-5555-4555-8555-555555555555";
+        let sub = root_a
+            .join("-repo")
+            .join("88888888-8888-4888-8888-888888888888")
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        let direct_dir = root_b.join("-repo");
+        std::fs::create_dir_all(&direct_dir).unwrap();
+        let direct = direct_dir.join(format!("{id}.jsonl"));
+        std::fs::write(&direct, "{}\n").unwrap();
+        assert_eq!(
+            locate_transcript_checked(&[root_a, root_b], id).unwrap(),
+            Some(direct)
+        );
+    }
+
+    #[test]
+    fn transcript_cwd_checked_is_bounded_to_the_64kib_prefix() {
+        // Node parity (`CWD_SCAN_BYTES`, `claude-transcript-locator.ts:30-31,
+        // 131-135`): a cwd line starting beyond the first 64 KiB is invisible.
+        let home = temp_home();
+        let file = home.path().join("big.jsonl");
+        let filler_line = "{\"type\":\"noise\"}\n";
+        let mut content = String::new();
+        while content.len() <= 64 * 1024 {
+            content.push_str(filler_line);
+        }
+        content.push_str("{\"type\":\"user\",\"cwd\":\"/beyond/prefix\"}\n");
+        std::fs::write(&file, &content).unwrap();
+        assert_eq!(transcript_cwd_checked(&file).unwrap(), None);
+        // A COMPLETE final line with no trailing newline still parses — Node's
+        // `head.split('\n')` loop has no discard-the-tail rule.
+        let small = home.path().join("small.jsonl");
+        std::fs::write(
+            &small,
+            "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"/home/user/proj\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_cwd_checked(&small).unwrap(),
+            Some("/home/user/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_cwd_checked_treats_a_raced_deletion_as_a_cwdless_hit() {
+        // Expected-absence open error ⇒ Ok(None): the locate hit survives,
+        // cwd-less — Node behaves the same (`claude-transcript-locator.ts:
+        // 121-129`).
+        let home = temp_home();
+        assert_eq!(
+            transcript_cwd_checked(&home.path().join("absent.jsonl")).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_cwd_checked_propagates_a_permission_denied_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let file = home.path().join("locked.jsonl");
+        std::fs::write(&file, "{\"cwd\":\"/x\"}\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!("skipping: euid bypasses permission checks");
+            return;
+        }
+        let err = transcript_cwd_checked(&file).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     const SAMPLE_TRANSCRIPT: &str = include_str!(concat!(
