@@ -1209,11 +1209,23 @@ describe('real deployment controller boundary', () => {
       expect(restoredLegacy.processIdentity.executable.sha256).toBe(
         capturedLegacyExecutableDigest,
       )
-      await checkedAsync(
-        path.join(realCheckout, 'scripts/launch-rust.sh'),
-        ['--port', String(port), '--skip-build', '--restart'],
-        { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
-      )
+      try {
+        await checkedAsync(
+          path.join(realCheckout, 'scripts/launch-rust.sh'),
+          ['--port', String(port), '--skip-build', '--restart'],
+          { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
+        )
+      } catch (error) {
+        const lifecycleLog = path.join(portRoot, 'server.log')
+        const lifecycleRecord = path.join(portRoot, 'lifecycle.json')
+        throw new Error(
+          `${String(error)}\nserver.log:\n${
+            existsSync(lifecycleLog) ? readFileSync(lifecycleLog, 'utf8') : '<missing>'
+          }\nlifecycle.json:\n${
+            existsSync(lifecycleRecord) ? readFileSync(lifecycleRecord, 'utf8') : '<missing>'
+          }`,
+        )
+      }
       await waitForHttp(port, 'up')
       const emergencyRestartedLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
       rememberProcess(knownProcesses, emergencyRestartedLegacy.processIdentity)

@@ -301,8 +301,8 @@ fn recover_or_start(
         .selected_generation_id()?
         .ok_or_else(|| DeployError::Activation("current generation is missing".to_string()))?;
     let generation = store.verify_generation(&selected)?;
-    let descriptor = GenerationDescriptor::read(&generation)?;
-    verify_node_prerequisite(&descriptor.node, &generation.path)?;
+    let contract = selected_launch_contract(store, &generation)?;
+    verify_node_prerequisite(&contract.node, &generation.path)?;
     let live = store.read_live()?.ok_or_else(|| {
         DeployError::Activation("authoritative live receipt is missing".to_string())
     })?;
