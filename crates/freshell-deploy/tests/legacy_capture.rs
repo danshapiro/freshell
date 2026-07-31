@@ -184,6 +184,39 @@ fn create_root_dependency_closure(root: &Path) {
     }
 }
 
+fn add_dev_dependency_to_closure(runtime: &LegacyRuntimeSources, name: &str) {
+    let mut package: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime.package_json).unwrap()).unwrap();
+    package["devDependencies"][name] = json!("9.0.0");
+    fs::write(&runtime.package_json, serde_json::to_vec(&package).unwrap()).unwrap();
+
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime.package_lock).unwrap()).unwrap();
+    lock["packages"][""]["devDependencies"][name] = json!("9.0.0");
+    lock["packages"][format!("node_modules/{name}")] = json!({
+        "version": "9.0.0",
+        "resolved": format!("https://registry.invalid/{name}.tgz"),
+        "integrity": format!("sha512-{name}"),
+        "dev": true
+    });
+    let lock_bytes = serde_json::to_vec(&lock).unwrap();
+    fs::write(&runtime.package_lock, &lock_bytes).unwrap();
+    fs::write(
+        runtime.production_node_modules.join(".package-lock.json"),
+        lock_bytes,
+    )
+    .unwrap();
+    fs::create_dir(runtime.production_node_modules.join(name)).unwrap();
+    fs::write(
+        runtime
+            .production_node_modules
+            .join(name)
+            .join("package.json"),
+        serde_json::to_vec(&json!({ "name": name, "version": "9.0.0" })).unwrap(),
+    )
+    .unwrap();
+}
+
 fn sidecar_lockfile_bytes() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "name": "freshell-claude-sidecar",
@@ -782,7 +815,7 @@ fn rejects_supplied_runtime_that_does_not_match_live_process_provenance() {
 }
 
 #[test]
-fn bootstrap_captures_a_private_production_closure_without_claiming_it_is_the_live_dev_install() {
+fn rejects_a_fresh_install_substituted_for_the_live_dependency_closure() {
     let fixture = checkout();
     let runtime = runtime_fixture(fixture.path());
     let live_development_install = fixture.path().join("live-development-node_modules");
@@ -796,23 +829,40 @@ fn bootstrap_captures_a_private_production_closure_without_claiming_it_is_the_li
     live.runtime.production_node_modules = live_development_install.display().to_string();
     let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
 
+    assert!(matches!(
+        capture_legacy(
+            &store,
+            &request(&runtime),
+            &FakeProcessInspector::with_identities(&runtime.old_executable, vec![live]),
+            &FakeScratchProbe::passing(),
+        ),
+        Err(DeployError::LegacyCapture(message))
+            if message.contains("production dependencies")
+                && message.contains("live process provenance")
+    ));
+    assert!(store.selected_generation_id().unwrap().is_none());
+}
+
+#[test]
+fn captures_the_exact_live_dependency_closure_including_dev_packages() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    add_dev_dependency_to_closure(&runtime.sources, "live-dev-package");
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+
     let receipt = capture_legacy(
         &store,
         &request(&runtime),
-        &FakeProcessInspector::with_identities(&runtime.old_executable, vec![live]),
+        &FakeProcessInspector::stable(&runtime.old_executable),
         &FakeScratchProbe::passing(),
     )
-    .expect("private npm ci closure is the captured rollback dependency closure");
+    .expect("the exact live dependency closure should be captured");
 
     let generation = store.verify_generation(&receipt.generation_id).unwrap();
     assert!(generation
         .path
-        .join("node_modules/production-package")
-        .is_dir());
-    assert!(!generation
-        .path
-        .join("node_modules/development-only-package")
-        .exists());
+        .join("node_modules/live-dev-package/package.json")
+        .is_file());
 }
 
 #[test]

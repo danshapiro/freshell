@@ -419,6 +419,11 @@ fn verify_live_runtime_sources(
             process.runtime.package_lock.as_str(),
         ),
         (
+            "production dependencies",
+            request.runtime.production_node_modules.as_path(),
+            process.runtime.production_node_modules.as_str(),
+        ),
+        (
             "Node",
             request.node.executable.as_path(),
             process.runtime.node_executable.as_str(),
@@ -510,13 +515,14 @@ pub(crate) fn legacy_bootstrap_is_incomplete(store: &Store) -> Result<bool> {
 
 fn validate_runtime_sources(sources: &LegacyRuntimeSources) -> Result<()> {
     validate_source_directory("client", &sources.client_dir)?;
-    validate_release_server_runtime_sources(sources, true)?;
+    validate_server_runtime_sources(sources, true, DependencyClosureKind::ExactLive)?;
     Ok(())
 }
 
-fn validate_release_server_runtime_sources(
+fn validate_server_runtime_sources(
     sources: &LegacyRuntimeSources,
     forbid_nested_sidecar_dependencies: bool,
+    dependency_closure_kind: DependencyClosureKind,
 ) -> Result<()> {
     for (label, path) in [
         ("extensions", &sources.extensions_dir),
@@ -557,6 +563,7 @@ fn validate_release_server_runtime_sources(
         &sources.package_json,
         &sources.package_lock,
         &sources.production_node_modules,
+        dependency_closure_kind,
     )?;
     if forbid_nested_sidecar_dependencies {
         validate_sidecar_shared_dependency_contract(
@@ -579,7 +586,11 @@ pub(crate) fn validate_release_runtime_sources(
     node: &NodePrerequisite,
     forbid_nested_sidecar_dependencies: bool,
 ) -> Result<()> {
-    validate_release_server_runtime_sources(sources, forbid_nested_sidecar_dependencies)?;
+    validate_server_runtime_sources(
+        sources,
+        forbid_nested_sidecar_dependencies,
+        DependencyClosureKind::Production,
+    )?;
     validate_node_prerequisite(node)
 }
 
@@ -668,7 +679,12 @@ struct DependencyClosureSnapshot {
 
 impl DependencyClosureSnapshot {
     fn capture(package_json: &Path, package_lock: &Path, node_modules: &Path) -> Result<Self> {
-        validate_dependency_closure(package_json, package_lock, node_modules)?;
+        validate_dependency_closure(
+            package_json,
+            package_lock,
+            node_modules,
+            DependencyClosureKind::ExactLive,
+        )?;
         Ok(Self {
             package_json: snapshot_dependency_file(package_json)?,
             package_lock: snapshot_dependency_file(package_lock)?,
@@ -866,10 +882,17 @@ fn snapshot_dependency_file(path: &Path) -> Result<DependencyFileSnapshot> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyClosureKind {
+    ExactLive,
+    Production,
+}
+
 fn validate_dependency_closure(
     package_json: &Path,
     package_lock: &Path,
     node_modules: &Path,
+    kind: DependencyClosureKind,
 ) -> Result<()> {
     let package: Value = serde_json::from_slice(&fs::read(package_json)?).map_err(|error| {
         DeployError::LegacyCapture(format!(
@@ -979,7 +1002,9 @@ fn validate_dependency_closure(
                 "production dependency lockfile entry {path} must be an object"
             ))
         })?;
-        if package.get("dev").and_then(Value::as_bool) == Some(true) {
+        if kind == DependencyClosureKind::Production
+            && package.get("dev").and_then(Value::as_bool) == Some(true)
+        {
             return Err(DeployError::LegacyCapture(format!(
                 "production dependency lockfile contains dev-only package {path}"
             )));

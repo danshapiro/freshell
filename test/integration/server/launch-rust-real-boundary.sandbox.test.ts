@@ -479,6 +479,7 @@ beforeEach(() => {
     path.join(checkout, 'package-lock.json'),
     '{"name":"fixture","lockfileVersion":3,"packages":{"":{"name":"fixture"}}}\n',
   )
+  mkdirSync(path.join(checkout, 'node_modules'))
   writeFileSync(path.join(checkout, 'extensions', 'fixture.json'), '{}\n')
   writeFileSync(path.join(checkout, 'crates/freshell-claude-sidecar', 'index.mjs'), 'process.exit(0)\n')
   writeFileSync(path.join(checkout, 'crates/freshell-claude-sidecar', 'package.json'), '{"name":"sidecar"}\n')
@@ -812,8 +813,15 @@ describe('canonical launch-rust deployment wrapper', () => {
     const combined = run(['--port', '43127', '--restart'])
     expect(combined.status, combined.stderr).toBe(0)
     const commands = events()
-    expect(commands.findIndex((event) => event.command === 'controller' && event.args[0] === 'capture'))
+    const capture = commands.find(
+      (event) => event.command === 'controller' && event.args[0] === 'capture',
+    )
+    expect(capture).toBeDefined()
+    expect(commands.indexOf(capture!))
       .toBeLessThan(commands.findIndex((event) => event.command === 'controller' && event.args[0] === 'deploy'))
+    const nodeModulesIndex = capture?.args.indexOf('--node-modules') ?? -1
+    expect(nodeModulesIndex).toBeGreaterThan(0)
+    expect(capture?.args[nodeModulesIndex + 1]).toBe(path.join(checkout, 'node_modules'))
     expect(state().legacy).toBe(false)
   })
 

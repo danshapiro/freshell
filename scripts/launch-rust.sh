@@ -307,6 +307,10 @@ build_server_runtime
 BOOTSTRAP_STATE="$("$CONTROLLER" bootstrap-status --checkout "$REPO_ROOT" --port "$PORT")"
 if [[ "$BOOTSTRAP_STATE" == "capture-required" ]]; then
   FRESHELL_HOME_VALUE="${FRESHELL_HOME:-$HOME/.freshell}"
+  LIVE_NODE_MODULES="$(readlink -f "$REPO_ROOT/node_modules")" ||
+    die "live node_modules dependency closure is unavailable"
+  [[ -d "$LIVE_NODE_MODULES" ]] ||
+    die "live node_modules dependency closure is unavailable"
   "$CONTROLLER" capture \
     --checkout "$REPO_ROOT" \
     --port "$PORT" \
@@ -319,7 +323,7 @@ if [[ "$BOOTSTRAP_STATE" == "capture-required" ]]; then
     --claude-sidecar-entry-relative "index.mjs" \
     --package-json "$REPO_ROOT/package.json" \
     --package-lock "$REPO_ROOT/package-lock.json" \
-    --node-modules "$RUNTIME_ROOT/node_modules" \
+    --node-modules "$LIVE_NODE_MODULES" \
     --node-executable "$NODE_EXECUTABLE" \
     --node-version "$NODE_VERSION"
 elif [[ "$BOOTSTRAP_STATE" != "fresh" && "$BOOTSTRAP_STATE" != "captured-legacy" && "$BOOTSTRAP_STATE" != "managed" ]]; then
