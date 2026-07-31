@@ -1647,14 +1647,68 @@ describe('real deployment controller boundary', () => {
       rememberProcess(knownProcesses, started.processIdentity)
       expect(started.runningServerGenerationId).toBe(started.selectedGenerationId)
 
-      await checkedAsync(storedController, ['restart-current', ...common], {
+      const interruptedRestart = spawnSync(
+        storedController,
+        ['restart-current', ...common],
+        {
+          cwd: realCheckout,
+          encoding: 'utf8',
+          env: {
+            ...realEnvironment,
+            FRESHELL_DEPLOY_TEST_INTERRUPT_AFTER: 'lifecycle_restart_intent',
+          },
+        },
+      )
+      expect(interruptedRestart.status).toBeNull()
+      expect(interruptedRestart.signal).toBe('SIGKILL')
+      await waitForHttp(port, 'up')
+      const pendingRestart = JSON.parse(
+        readFileSync(path.join(portRoot, 'lifecycle.json'), 'utf8'),
+      )
+      expect(pendingRestart.complete).toBe(false)
+      expect(pendingRestart.processToStop).toEqual(started.processIdentity)
+      expect(JSON.parse(readFileSync(liveFile, 'utf8'))).toEqual(started)
+
+      await checkedAsync(storedController, ['bootstrap-status', ...common], {
+        cwd: realCheckout,
+        env: realEnvironment,
+      })
+      await waitForHttp(port, 'up')
+      const firstRestarted = JSON.parse(readFileSync(liveFile, 'utf8'))
+      rememberProcess(knownProcesses, firstRestarted.processIdentity)
+      expect(firstRestarted.processIdentity.pid).not.toBe(started.processIdentity.pid)
+
+      const interruptedAfterStop = spawnSync(
+        storedController,
+        ['restart-current', ...common],
+        {
+          cwd: realCheckout,
+          encoding: 'utf8',
+          env: {
+            ...realEnvironment,
+            FRESHELL_DEPLOY_TEST_INTERRUPT_AFTER:
+              'lifecycle_restart_process_stopped',
+          },
+        },
+      )
+      expect(interruptedAfterStop.status).toBeNull()
+      expect(interruptedAfterStop.signal).toBe('SIGKILL')
+      await waitForHttp(port, 'down')
+      const stoppedRestart = JSON.parse(
+        readFileSync(path.join(portRoot, 'lifecycle.json'), 'utf8'),
+      )
+      expect(stoppedRestart.complete).toBe(false)
+      expect(stoppedRestart.processToStop).toEqual(firstRestarted.processIdentity)
+      expect(JSON.parse(readFileSync(liveFile, 'utf8'))).toEqual(firstRestarted)
+
+      await checkedAsync(storedController, ['bootstrap-status', ...common], {
         cwd: realCheckout,
         env: realEnvironment,
       })
       await waitForHttp(port, 'up')
       const restarted = JSON.parse(readFileSync(liveFile, 'utf8'))
       rememberProcess(knownProcesses, restarted.processIdentity)
-      expect(restarted.processIdentity.pid).not.toBe(started.processIdentity.pid)
+      expect(restarted.processIdentity.pid).not.toBe(firstRestarted.processIdentity.pid)
       expect(restarted.runningServerGenerationId).toBe(restarted.selectedGenerationId)
 
       await checkedAsync(storedController, ['stop-current', ...common], {

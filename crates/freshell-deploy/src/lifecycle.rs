@@ -51,11 +51,13 @@ struct LifecycleLaunchRecord {
     nonce: String,
     claim_file: PathBuf,
     ready_file: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_to_stop: Option<ProcessIdentity>,
     complete: bool,
 }
 
 impl LifecycleLaunchRecord {
-    fn new(store: &Store) -> Result<Self> {
+    fn new(store: &Store, process_to_stop: Option<ProcessIdentity>) -> Result<Self> {
         let generation_id = store
             .selected_generation_id()?
             .ok_or_else(|| DeployError::Activation("current generation is missing".to_string()))?;
@@ -86,6 +88,7 @@ impl LifecycleLaunchRecord {
             nonce: Uuid::new_v4().to_string(),
             claim_file: controls.directory.join("launch.json"),
             ready_file: controls.ready_file,
+            process_to_stop,
             complete: false,
         };
         record.validate(store)?;
@@ -128,6 +131,19 @@ impl LifecycleLaunchRecord {
             return Err(DeployError::Journal(
                 "lifecycle launch record escaped the exact selected generation".to_string(),
             ));
+        }
+        if let Some(process) = &self.process_to_stop {
+            process.validate()?;
+            if process.listener.port != self.port
+                || process.effective_uid != unsafe { libc::geteuid() }
+                || process.executable.sha256 != self.server_executable.sha256
+                || process.executable.mode != self.server_executable.mode
+            {
+                return Err(DeployError::Journal(
+                    "lifecycle restart process does not match the selected managed server"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -236,17 +252,20 @@ fn recover_or_start(
             "live receipt disagrees with current generation".to_string(),
         ));
     }
-    if let Some(expected) = live.process_identity.as_ref() {
+    let process_to_stop = if let Some(expected) = live.process_identity.as_ref() {
         match observe_recorded_process(expected)? {
             ExpectedProcessObservation::Expected(actual) if *actual == *expected => {
                 require_ordinary(store.paths().port())?;
                 if !restart {
                     return Ok(());
                 }
-                stop_receipt_process(expected)?;
+                Some(expected.clone())
             }
             ExpectedProcessObservation::PortFree
-                if !LinuxProcfs::default().process_birth_is_alive(expected)? => {}
+                if !LinuxProcfs::default().process_birth_is_alive(expected)? =>
+            {
+                Some(expected.clone())
+            }
             ExpectedProcessObservation::Expected(_) | ExpectedProcessObservation::Foreign => {
                 return Err(DeployError::Activation(
                     "live listener is not the receipt-proven running process".to_string(),
@@ -258,24 +277,78 @@ fn recover_or_start(
                 ))
             }
         }
-        locked.write_live(&LiveReceipt::new(selected.clone(), None, false, None))?;
     } else if LinuxProcfs::default().port_has_listener(store.paths().port())? {
         return Err(DeployError::Activation(
             "live port is occupied without authoritative lifecycle ownership".to_string(),
         ));
+    } else {
+        None
+    };
+
+    let record = LifecycleLaunchRecord::new(store, process_to_stop)?;
+    write_record(store, &path, &record)?;
+    if restart && record.process_to_stop.is_some() {
+        crate::sandbox_interrupt::interrupt_lifecycle_after(
+            "lifecycle_restart_intent",
+            store.paths().port(),
+            store.paths().port_root(),
+        );
+    }
+    recover_launch(store, locked, auth_token, record)
+}
+
+fn prepare_restart_process(
+    store: &Store,
+    locked: &LockedStore<'_>,
+    mut record: LifecycleLaunchRecord,
+) -> Result<LifecycleLaunchRecord> {
+    let Some(expected) = record.process_to_stop.as_ref() else {
+        return Ok(record);
+    };
+    let live = store.read_live()?.ok_or_else(|| {
+        DeployError::Activation("authoritative live receipt is missing".to_string())
+    })?;
+    if live.selected_generation_id != record.generation_id {
+        return Err(DeployError::Activation(
+            "restart intent disagrees with the selected live generation".to_string(),
+        ));
+    }
+    match live.process_identity.as_ref() {
+        Some(actual) if actual == expected => {}
+        None if live.running_server_generation_id.is_none() => {}
+        _ => {
+            return Err(DeployError::Activation(
+                "restart intent no longer matches the authoritative live process".to_string(),
+            ))
+        }
     }
 
-    let record = LifecycleLaunchRecord::new(store)?;
-    write_record(store, &path, &record)?;
-    recover_launch(store, locked, auth_token, record)
+    stop_receipt_process(expected)?;
+    crate::sandbox_interrupt::interrupt_lifecycle_after(
+        "lifecycle_restart_process_stopped",
+        store.paths().port(),
+        store.paths().port_root(),
+    );
+    if live.process_identity.is_some() {
+        locked.write_live(&LiveReceipt::new(
+            record.generation_id.clone(),
+            None,
+            false,
+            None,
+        ))?;
+    }
+    record.process_to_stop = None;
+    write_record(store, &lifecycle_path(store), &record)?;
+    Ok(record)
 }
 
 fn recover_launch(
     store: &Store,
     locked: &LockedStore<'_>,
     auth_token: &str,
-    mut record: LifecycleLaunchRecord,
+    record: LifecycleLaunchRecord,
 ) -> Result<()> {
+    let mut record = prepare_restart_process(store, locked, record)?;
     record.validate(store)?;
     if store.selected_generation_id()?.as_deref() != Some(&record.generation_id) {
         return Err(DeployError::Activation(
@@ -328,7 +401,7 @@ fn recover_launch(
         Some(LaunchAttemptReceipt::DefinitelyNotStarted { .. }) => {
             // A terminal attempt is never reused. Publish a fresh operation
             // before allowing another helper to execute.
-            record = LifecycleLaunchRecord::new(store)?;
+            record = LifecycleLaunchRecord::new(store, None)?;
             write_record(store, &lifecycle_path(store), &record)?;
             spawn_lifecycle_helper(&record, auth_token)?;
         }
@@ -341,7 +414,7 @@ fn recover_launch(
             let procfs = LinuxProcfs::default();
             if !procfs.executor_birth_is_alive(&claim.executor)? {
                 claim_store.mark_definitely_not_started(&claim)?;
-                record = LifecycleLaunchRecord::new(store)?;
+                record = LifecycleLaunchRecord::new(store, None)?;
                 write_record(store, &lifecycle_path(store), &record)?;
                 spawn_lifecycle_helper(&record, auth_token)?;
             }
@@ -893,7 +966,7 @@ mod tests {
         let generation = locked.import_tree(&source).unwrap();
         locked.select_generation(&generation.id).unwrap();
         drop(locked);
-        let record = LifecycleLaunchRecord::new(&store).unwrap();
+        let record = LifecycleLaunchRecord::new(&store, None).unwrap();
         write_record(&store, &lifecycle_path(&store), &record).unwrap();
         (fixture, store, record)
     }
@@ -940,7 +1013,7 @@ mod tests {
                 },
                 |store, _locked, _token, _stale_record| {
                     observed_starts.fetch_add(1, Ordering::SeqCst);
-                    let replacement = LifecycleLaunchRecord::new(store)?;
+                    let replacement = LifecycleLaunchRecord::new(store, None)?;
                     write_record(store, &lifecycle_path(store), &replacement)
                 },
             )
