@@ -305,15 +305,28 @@ async fn resolve_session(
     };
 
     // Readiness gate = Node's `getIndexReadiness()`: a never-published (or
-    // absent) index answers `warming`. When a snapshot exists, `snapshot()`
-    // returns it immediately (stale-while-revalidate) — it only blocks when
-    // truly cold, which `peek()` has already excluded.
-    let snapshot = match state.session_index.as_ref() {
+    // absent) index answers `warming`. When a snapshot exists,
+    // `snapshot_with_failures()` returns it immediately
+    // (stale-while-revalidate) — it only blocks when truly cold, which
+    // `peek()` has already excluded.
+    //
+    // ONE COHERENT READ: the snapshot AND its scan failures come from the
+    // SAME published generation, in one lock acquisition. Reading them
+    // separately (snapshot here, `scan_failures()` after the resolve task)
+    // opened a window where a background sweep published in between — the
+    // response could pair a failed-scan empty snapshot with a subsequently
+    // cleared failure set (a healthy-looking `ready + matches: []` lie), or
+    // a recovered snapshot with stale failures. A warming index has no
+    // published generation, hence no failures.
+    let (snapshot, scan_failure_names) = match state.session_index.as_ref() {
         Some(index) => match index.peek() {
-            Some(_) => Some(index.snapshot().await),
-            None => None,
+            Some(_) => {
+                let (items, failures) = index.snapshot_with_failures().await;
+                (Some(items), failures)
+            }
+            None => (None, Vec::new()),
         },
-        None => None,
+        None => (None, Vec::new()),
     };
 
     // Deleted-override filter: Node's resolve reads the POST-filter project
@@ -420,18 +433,20 @@ async fn resolve_session(
     // above), never a provider error — otherwise a failed-then-disabled
     // provider would keep responses degraded forever (no successful scan
     // could ever clear it).
+    // `scan_failure_names` was captured atomically WITH the snapshot above
+    // (one generation, one lock) — never re-read here, where a background
+    // sweep completing mid-request could pair the earlier snapshot with a
+    // newer (cleared or stale) failure set.
     let mut provider_errors = outcome.provider_errors;
-    if let Some(index) = state.session_index.as_ref() {
-        for name in index.scan_failures() {
-            if !enabled.contains(&name) || provider_errors.iter().any(|e| e.provider == name) {
-                continue;
-            }
-            provider_errors.push(ResumeResolveProviderError {
-                provider: name,
-                code: None,
-                message: Some("session scan failed".to_string()),
-            });
+    for name in scan_failure_names {
+        if !enabled.contains(&name) || provider_errors.iter().any(|e| e.provider == name) {
+            continue;
         }
+        provider_errors.push(ResumeResolveProviderError {
+            provider: name,
+            code: None,
+            message: Some("session scan failed".to_string()),
+        });
     }
     // degraded = something FAILED — even when matches exist: a failed
     // provider means a HIGHER-priority exact match may have been missed, so
