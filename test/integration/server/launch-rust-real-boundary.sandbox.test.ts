@@ -1907,11 +1907,38 @@ describe('real deployment controller boundary', () => {
       expect(stopped.runningServerGenerationId).toBeNull()
       expect(stopped.processIdentity).toBeUndefined()
 
+      const stoppedCombinedClient = path.join(root, 'stopped-combined-client')
+      cpSync(nextClient, stoppedCombinedClient, { recursive: true })
+      writeFileSync(
+        path.join(stoppedCombinedClient, 'stopped-combined-marker.txt'),
+        'changed combined deployment from a stopped selection\n',
+      )
       writeFileSync(
         path.join(realCheckout, '.env'),
         `AUTH_TOKEN=${token}\nFRESHELL_HOME=${home}\n`,
         { mode: 0o600 },
       )
+      await checkedAsync(storedController, fullDeployArgs(stoppedCombinedClient), {
+        cwd: realCheckout,
+        env: realEnvironment,
+        timeout: 300_000,
+      })
+      await waitForHttp(port, 'up')
+      const deployedFromStopped = JSON.parse(readFileSync(liveFile, 'utf8'))
+      rememberProcess(knownProcesses, deployedFromStopped.processIdentity)
+      expect(deployedFromStopped.selectedGenerationId).not.toBe(
+        stopped.selectedGenerationId,
+      )
+      expect(deployedFromStopped.runningServerGenerationId).toBe(
+        deployedFromStopped.selectedGenerationId,
+      )
+
+      storedController = path.join(portRoot, 'current/controller/freshell-deploy')
+      await checkedAsync(storedController, ['stop-current', ...common], {
+        cwd: realCheckout,
+        env: realEnvironment,
+      })
+      await waitForHttp(port, 'down')
       await checkedAsync(storedController, ['start-current', ...common], {
         cwd: realCheckout,
         env: { ...realEnvironment, FRESHELL_BIND_HOST: '0.0.0.0' },

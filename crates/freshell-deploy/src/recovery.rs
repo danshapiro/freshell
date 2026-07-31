@@ -465,7 +465,10 @@ pub(crate) fn verify_owned_predecessors_exited<D: ActivationDriver>(
     driver: &mut D,
     record: &TransactionRecord,
 ) -> Result<()> {
-    let mut processes = vec![record.expected_prior_process()];
+    let mut processes = Vec::new();
+    if let Some(prior) = record.expected_prior_process() {
+        processes.push(prior);
+    }
     if let Some(candidate) = &record.candidate {
         processes.push(&candidate.process);
     }

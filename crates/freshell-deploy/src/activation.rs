@@ -372,22 +372,29 @@ where
                 // the last possible moment before live interruption.
                 self.driver
                     .probe_prior(&record.prior_generation_root, &record.prior_generation_id)?;
-                match self.checked_port(&record)? {
-                    PortState::Prior {
-                        process,
-                        service: ServiceState::Ordinary,
-                    } => {
+                let state = self.checked_port(&record)?;
+                match (record.expected_prior_process(), state) {
+                    (
+                        Some(expected),
+                        PortState::Prior {
+                            process,
+                            service: ServiceState::Ordinary,
+                        },
+                    ) if &process == expected => {
                         self.driver.verify_running(&process)?;
                         self.require_selected_generation(&record.prior_generation_id)?;
                         self.driver.stop(&process)?;
                     }
-                    PortState::Free => {
-                        self.driver.verify_exited(record.expected_prior_process())?;
+                    (Some(expected), PortState::Free) => {
+                        self.driver.verify_exited(expected)?;
+                        self.require_selected_generation(&record.prior_generation_id)?;
+                    }
+                    (None, PortState::Free) => {
                         self.require_selected_generation(&record.prior_generation_id)?;
                     }
                     _ => {
                         return Err(DeployError::Activation(
-                            "old server is not the exact ordinary prior process".to_string(),
+                            "old server state does not match the exact prior receipt".to_string(),
                         ))
                     }
                 }
@@ -595,7 +602,10 @@ pub(crate) fn validate_port_state(record: &TransactionRecord, state: &PortState)
     match state {
         PortState::Free | PortState::Foreign => Ok(()),
         PortState::Prior { process, .. } => {
-            if process != record.expected_prior_process() {
+            let is_recorded_prior = record.expected_prior_process() == Some(process);
+            let is_owned_prior_relaunch = record.active_relaunch_process() == Some(process)
+                && record.active_relaunch_lane() == Some(crate::journal::LaunchLane::PriorRollback);
+            if !is_recorded_prior && !is_owned_prior_relaunch {
                 return Err(DeployError::Recovery(
                     "port process labeled prior does not match prior receipt".to_string(),
                 ));
@@ -657,7 +667,7 @@ pub(crate) fn require_prior_ordinary<'a>(
         PortState::Prior {
             process,
             service: ServiceState::Ordinary,
-        } if process == record.expected_prior_process() => Ok(process),
+        } if record.expected_prior_process() == Some(process) => Ok(process),
         _ => Err(DeployError::Recovery(
             "exact prior ordinary process is not on the live port".to_string(),
         )),

@@ -152,7 +152,7 @@ fn classify_prior(
         validate_generation_process(record, process, true)?;
         return Ok(true);
     }
-    if process == record.expected_prior_process() {
+    if record.expected_prior_process() == Some(process) {
         return Ok(false);
     }
     // A crash can occur after start_ordinary returns but before its exact

@@ -453,7 +453,7 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
     fn observe_port(&mut self, record: &TransactionRecord) -> Result<PortState> {
         let expected_processes = distinct_expected_processes(
             [
-                Some(record.expected_prior_process()),
+                record.expected_prior_process(),
                 record
                     .candidate
                     .as_ref()
@@ -476,7 +476,7 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
                 }
                 ExpectedProcessObservation::Expected(process) => process,
             };
-            if *process == *record.expected_prior_process() {
+            if record.expected_prior_process() == Some(&*process) {
                 return Ok(PortState::Prior {
                     process: *process,
                     service: ServiceState::Ordinary,
@@ -504,7 +504,11 @@ impl ActivationDriver for RealActivationDriver<'_, '_> {
             }
             return Ok(PortState::Foreign);
         }
-        Ok(PortState::Foreign)
+        if self.procfs.port_has_listener(record.port)? {
+            Ok(PortState::Foreign)
+        } else {
+            Ok(PortState::Free)
+        }
     }
 
     fn stop(&mut self, process: &ProcessIdentity) -> Result<()> {

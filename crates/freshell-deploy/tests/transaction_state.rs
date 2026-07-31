@@ -1000,6 +1000,100 @@ fn preparation_finishes_all_preflight_before_the_first_durable_phase() {
 }
 
 #[test]
+fn stopped_prior_can_activate_a_changed_server_without_a_phantom_process_identity() {
+    let port = 3564;
+    let mut request = request(UpdateMode::Full, port);
+    request.prior_live = LiveReceipt::new(PRIOR_ID.to_string(), None, false, None);
+    let mut journal = MemoryJournal::default();
+    let mut driver = FakeDriver::server(port);
+    driver.state = PortState::Free;
+    driver.live = request.prior_live.clone();
+
+    let mut controller = ActivationController::new(&mut journal, &mut driver);
+    controller.begin(request).unwrap();
+    assert_eq!(
+        controller.run_with_timeout(Duration::from_secs(1)).unwrap(),
+        ActivationProgress::Complete
+    );
+
+    assert_eq!(driver.selected, TARGET_ID);
+    assert_eq!(
+        driver.live.selected_generation_id,
+        driver.live.running_server_generation_id.clone().unwrap()
+    );
+    assert!(
+        driver
+            .events
+            .iter()
+            .all(|event| !matches!(event, Event::Stop(5101) | Event::VerifyExited(5101))),
+        "a stopped selection has no prior process to stop or wait for"
+    );
+}
+
+#[test]
+fn failed_activation_from_a_stopped_prior_relaunches_the_exact_rollback_generation() {
+    let port = 3565;
+    let mut request = request(UpdateMode::Server, port);
+    request.prior_live = LiveReceipt::new(PRIOR_ID.to_string(), None, false, None);
+    let mut journal = MemoryJournal::default();
+    let mut driver = FakeDriver::server(port);
+    driver.state = PortState::Free;
+    driver.live = request.prior_live.clone();
+    driver.fail_once = Some((DriverOperation::StartGated, FailureTiming::Before));
+    driver.relaunch_with_new_identity = true;
+
+    let mut controller = ActivationController::new(&mut journal, &mut driver);
+    controller.begin(request).unwrap();
+    assert!(controller.run_with_timeout(Duration::from_secs(1)).is_err());
+
+    assert_eq!(driver.selected, PRIOR_ID);
+    assert_eq!(
+        driver.live.running_server_generation_id.as_deref(),
+        Some(PRIOR_ID)
+    );
+    assert_eq!(
+        driver.live.process_identity.as_ref().unwrap().cwd,
+        generation_root(port, PRIOR_ID).display().to_string()
+    );
+    assert!(driver.events.iter().any(|event| matches!(
+        event,
+        Event::StartOrdinary(root) if root == &generation_root(port, PRIOR_ID).display().to_string()
+    )));
+}
+
+#[test]
+fn stopped_prior_never_treats_an_unrecorded_listener_as_safe_to_replace() {
+    let port = 3566;
+    let mut request = request(UpdateMode::Full, port);
+    request.prior_live = LiveReceipt::new(PRIOR_ID.to_string(), None, false, None);
+    let mut journal = MemoryJournal::default();
+    let mut driver = FakeDriver::server(port);
+    driver.state = PortState::Foreign;
+    driver.live = request.prior_live.clone();
+
+    let mut controller = ActivationController::new(&mut journal, &mut driver);
+    controller.begin(request).unwrap();
+    assert!(controller.run_with_timeout(Duration::from_secs(1)).is_err());
+
+    assert_eq!(driver.selected, PRIOR_ID);
+    assert!(driver.events.iter().all(|event| !matches!(
+        event,
+        Event::Stop(_) | Event::StartGated(_) | Event::StartOrdinary(_)
+    )));
+}
+
+#[test]
+fn client_only_update_still_requires_an_exact_running_prior_process() {
+    let mut request = request(UpdateMode::ClientOnly, 3567);
+    request.prior_live = LiveReceipt::new(PRIOR_ID.to_string(), None, false, None);
+
+    let error = TransactionRecord::prepared(&request).unwrap_err();
+
+    assert!(error.to_string().contains("client-only"));
+    assert!(error.to_string().contains("running process"));
+}
+
+#[test]
 fn preparation_io_failures_never_publish_or_mutate_a_transaction() {
     for operation in [
         DriverOperation::Preflight,

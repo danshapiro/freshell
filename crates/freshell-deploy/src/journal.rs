@@ -146,7 +146,7 @@ impl LaunchClaim {
             || self.port != record.port
             || Path::new(&self.executor.cwd) != expected_root
             || &self.executor.executable != expected_executable
-            || self.executor.effective_uid != record.expected_prior_process().effective_uid
+            || self.executor.effective_uid != record.expected_executor_effective_uid()
         {
             return Err(DeployError::Journal(
                 "launch claim is not exactly bound to its transaction, attempt, lane, and executor"
@@ -446,13 +446,14 @@ impl TransactionRecord {
             ));
         }
         self.prior_live.validate()?;
-        if self.prior_live.selected_generation_id != self.prior_generation_id
-            || self.prior_live.running_server_generation_id.is_none()
-            || self.prior_live.process_identity.is_none()
-        {
+        if self.prior_live.selected_generation_id != self.prior_generation_id {
             return Err(DeployError::Journal(
-                "prior live receipt is not bound to the prior selected generation and an exact running process"
-                    .to_string(),
+                "prior live receipt is not bound to the prior selected generation".to_string(),
+            ));
+        }
+        if self.mode == UpdateMode::ClientOnly && self.prior_live.process_identity.is_none() {
+            return Err(DeployError::Journal(
+                "client-only prior live receipt requires an exact running process".to_string(),
             ));
         }
         if let Some(candidate) = &self.candidate {
@@ -823,11 +824,16 @@ impl TransactionRecord {
         Ok(next)
     }
 
-    pub(crate) fn expected_prior_process(&self) -> &crate::process_identity::ProcessIdentity {
-        self.prior_live
-            .process_identity
-            .as_ref()
-            .expect("validated prior process identity")
+    pub(crate) fn expected_prior_process(
+        &self,
+    ) -> Option<&crate::process_identity::ProcessIdentity> {
+        self.prior_live.process_identity.as_ref()
+    }
+
+    pub(crate) fn expected_executor_effective_uid(&self) -> u32 {
+        self.expected_prior_process()
+            .map(|process| process.effective_uid)
+            .unwrap_or_else(|| unsafe { libc::geteuid() })
     }
 
     pub(crate) fn prior_running_generation_id(&self) -> &str {
