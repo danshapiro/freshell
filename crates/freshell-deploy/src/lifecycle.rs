@@ -724,10 +724,6 @@ fn lifecycle_environment(
     for (key, value) in [
         (OsString::from("AUTH_TOKEN"), OsString::from(auth_token)),
         (
-            OsString::from("FRESHELL_BIND_HOST"),
-            OsString::from("0.0.0.0"),
-        ),
-        (
             OsString::from("FRESHELL_CLAUDE_NODE"),
             record.node.executable.as_os_str().to_owned(),
         ),
@@ -959,6 +955,8 @@ fn port_from_lifecycle_path(path: &Path) -> Result<DeployPort> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1195,6 +1193,30 @@ mod tests {
             store.read_legacy_capture().unwrap().unwrap().process,
             captured_process,
             "stop must not rewrite the capture evidence"
+        );
+    }
+
+    #[test]
+    fn lifecycle_launch_preserves_operator_bind_host_and_leaves_native_default_unset() {
+        let (_fixture, _store, record) = managed_store();
+
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            let environment = lifecycle_environment(
+                &record,
+                "token",
+                BTreeMap::from([(OsString::from("FRESHELL_BIND_HOST"), OsString::from(host))]),
+            )
+            .unwrap();
+            assert_eq!(
+                environment.get(OsStr::new("FRESHELL_BIND_HOST")),
+                Some(&OsString::from(host))
+            );
+        }
+
+        let environment = lifecycle_environment(&record, "token", BTreeMap::new()).unwrap();
+        assert!(
+            !environment.contains_key(OsStr::new("FRESHELL_BIND_HOST")),
+            "an absent operator override must leave bind selection to the server"
         );
     }
 

@@ -99,6 +99,26 @@ function readProcessIdentity(pid: number): RecordedProcessIdentity {
   }
 }
 
+function readIpv4ListenerHost(pid: number, socketInode: string) {
+  const row = readFileSync(`/proc/${pid}/net/tcp`, 'utf8')
+    .trim()
+    .split('\n')
+    .slice(1)
+    .map((line) => line.trim().split(/\s+/))
+    .find((fields) => fields[9] === socketInode)
+  if (!row) throw new Error(`listener socket ${socketInode} was not found for pid ${pid}`)
+  const address = row[1].split(':')[0]
+  if (address === '0100007F') return '127.0.0.1'
+  if (address === '00000000') return '0.0.0.0'
+  throw new Error(`listener socket ${socketInode} has unexpected IPv4 address ${address}`)
+}
+
+function nativeDefaultBindHost() {
+  return /microsoft/i.test(readFileSync('/proc/version', 'utf8'))
+    ? '0.0.0.0'
+    : '127.0.0.1'
+}
+
 function run(args: string[], extraEnvironment: NodeJS.ProcessEnv = {}) {
   return spawnSync(path.join(checkout, 'scripts/launch-rust.sh'), args, {
     cwd: checkout,
@@ -1096,6 +1116,12 @@ describe('real deployment controller boundary', () => {
         selectedGenerationId: freshLive.runningServerGenerationId,
         legacy: false,
       })
+      expect(
+        readIpv4ListenerHost(
+          freshLive.processIdentity.pid,
+          freshLive.processIdentity.listener.socketInode,
+        ),
+      ).toBe(nativeDefaultBindHost())
       await checkedAsync(controller, ['stop-current', ...freshCommon], {
         cwd: realCheckout,
         env: realEnvironment,
@@ -1377,7 +1403,11 @@ describe('real deployment controller boundary', () => {
       await checkedAsync(
         controller,
         fullDeployArgs(candidateClient),
-        { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
+        {
+          cwd: realCheckout,
+          env: { ...realEnvironment, FRESHELL_BIND_HOST: '127.0.0.1' },
+          timeout: 300_000,
+        },
       )
       await waitForHttp(port, 'up')
 
@@ -1405,6 +1435,12 @@ describe('real deployment controller boundary', () => {
         ).toBe(true)
       }
       assertExactManagedGeneration(portRoot, fullLive, port, node)
+      expect(
+        readIpv4ListenerHost(
+          fullLive.processIdentity.pid,
+          fullLive.processIdentity.listener.socketInode,
+        ),
+      ).toBe('127.0.0.1')
 
       const healthResponse = await fetch(`http://127.0.0.1:${port}/api/health`)
       const health = await healthResponse.json()
@@ -1880,12 +1916,35 @@ describe('real deployment controller boundary', () => {
       )
       await checkedAsync(storedController, ['start-current', ...common], {
         cwd: realCheckout,
-        env: realEnvironment,
+        env: { ...realEnvironment, FRESHELL_BIND_HOST: '0.0.0.0' },
+      })
+      await waitForHttp(port, 'up')
+      const wildcardStarted = JSON.parse(readFileSync(liveFile, 'utf8'))
+      rememberProcess(knownProcesses, wildcardStarted.processIdentity)
+      expect(wildcardStarted.runningServerGenerationId).toBe(
+        wildcardStarted.selectedGenerationId,
+      )
+      expect(
+        readIpv4ListenerHost(
+          wildcardStarted.processIdentity.pid,
+          wildcardStarted.processIdentity.listener.socketInode,
+        ),
+      ).toBe('0.0.0.0')
+
+      await checkedAsync(storedController, ['restart-current', ...common], {
+        cwd: realCheckout,
+        env: { ...realEnvironment, FRESHELL_BIND_HOST: '127.0.0.1' },
       })
       await waitForHttp(port, 'up')
       const started = JSON.parse(readFileSync(liveFile, 'utf8'))
       rememberProcess(knownProcesses, started.processIdentity)
-      expect(started.runningServerGenerationId).toBe(started.selectedGenerationId)
+      expect(started.processIdentity.pid).not.toBe(wildcardStarted.processIdentity.pid)
+      expect(
+        readIpv4ListenerHost(
+          started.processIdentity.pid,
+          started.processIdentity.listener.socketInode,
+        ),
+      ).toBe('127.0.0.1')
 
       const interruptedRestart = spawnSync(
         storedController,
@@ -1917,6 +1976,12 @@ describe('real deployment controller boundary', () => {
       const firstRestarted = JSON.parse(readFileSync(liveFile, 'utf8'))
       rememberProcess(knownProcesses, firstRestarted.processIdentity)
       expect(firstRestarted.processIdentity.pid).not.toBe(started.processIdentity.pid)
+      expect(
+        readIpv4ListenerHost(
+          firstRestarted.processIdentity.pid,
+          firstRestarted.processIdentity.listener.socketInode,
+        ),
+      ).toBe(nativeDefaultBindHost())
 
       const interruptedAfterStop = spawnSync(
         storedController,

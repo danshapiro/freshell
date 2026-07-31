@@ -703,10 +703,6 @@ fn launch_environment(
     for (key, value) in [
         (OsString::from("AUTH_TOKEN"), OsString::from(auth_token)),
         (
-            OsString::from("FRESHELL_BIND_HOST"),
-            OsString::from("0.0.0.0"),
-        ),
-        (
             OsString::from("FRESHELL_CLAUDE_NODE"),
             spec.node.executable.as_os_str().to_owned(),
         ),
@@ -907,7 +903,14 @@ pub(crate) fn runtime_from_bindings(
 
 #[cfg(test)]
 mod tests {
-    use super::distinct_expected_processes;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
+    use std::path::PathBuf;
+
+    use super::{distinct_expected_processes, launch_environment};
+    use crate::activation::LaunchSpec;
+    use crate::journal::{ControlPaths, LaunchAttempt, LaunchAttemptState, LaunchLane};
+    use crate::legacy::NodePrerequisite;
     use crate::paths::DeployPort;
     use crate::process_identity::{
         FileIdentity, ListenerIdentity, ProcessIdentity, RuntimeProvenance,
@@ -961,5 +964,61 @@ mod tests {
         let distinct = distinct_expected_processes([&stale, &reused, &reused]);
 
         assert_eq!(distinct, vec![&stale, &reused]);
+    }
+
+    #[test]
+    fn activation_launch_preserves_operator_bind_host_and_leaves_native_default_unset() {
+        let root = PathBuf::from("/tmp/freshell-bind-host-test");
+        let runtime_path = |name: &str| root.join(name).display().to_string();
+        let spec = LaunchSpec {
+            transaction_id: "transaction".to_string(),
+            nonce: "nonce".to_string(),
+            port: DeployPort::new(43_127).unwrap(),
+            lane: LaunchLane::TargetRollForward,
+            generation_id: "a".repeat(64),
+            generation_root: root.clone(),
+            runtime: RuntimeProvenance {
+                client_dir: runtime_path("client"),
+                extensions_dir: runtime_path("extensions"),
+                dist_server_dir: runtime_path("dist/server"),
+                mcp_entry: runtime_path("dist/server/mcp/server.js"),
+                claude_sidecar_entry: runtime_path("sidecar/index.mjs"),
+                node_executable: "/usr/bin/node".to_string(),
+                package_json: runtime_path("package.json"),
+                package_lock: runtime_path("package-lock.json"),
+                production_node_modules: runtime_path("node_modules"),
+            },
+            node: NodePrerequisite {
+                executable: PathBuf::from("/usr/bin/node"),
+                version: "v22.0.0".to_string(),
+            },
+            controls: ControlPaths::new(root.join("controls")),
+        };
+        let attempt = LaunchAttempt {
+            attempt_id: "target-0".to_string(),
+            ready_file: root.join("controls/launch.json"),
+            lane: LaunchLane::TargetRollForward,
+            state: LaunchAttemptState::Unclaimed,
+        };
+
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            let environment = launch_environment(
+                &spec,
+                &attempt,
+                "token",
+                BTreeMap::from([(OsString::from("FRESHELL_BIND_HOST"), OsString::from(host))]),
+            )
+            .unwrap();
+            assert_eq!(
+                environment.get(OsStr::new("FRESHELL_BIND_HOST")),
+                Some(&OsString::from(host))
+            );
+        }
+
+        let environment = launch_environment(&spec, &attempt, "token", BTreeMap::new()).unwrap();
+        assert!(
+            !environment.contains_key(OsStr::new("FRESHELL_BIND_HOST")),
+            "an absent operator override must leave bind selection to the server"
+        );
     }
 }

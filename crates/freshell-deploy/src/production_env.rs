@@ -46,7 +46,6 @@ fn is_controller_owned(key: &OsStr) -> bool {
             "AUTH_TOKEN"
                 | "PORT"
                 | "NODE_ENV"
-                | "FRESHELL_BIND_HOST"
                 | "FRESHELL_CLAUDE_NODE"
                 | "FRESHELL_CLAUDE_SIDECAR"
                 | "FRESHELL_CLIENT_DIR"
@@ -66,6 +65,10 @@ mod tests {
         )));
         assert!(is_controller_owned(OsStr::new("FRESHELL_CLIENT_DIR")));
         assert!(is_controller_owned(OsStr::new("PORT")));
+        assert!(
+            !is_controller_owned(OsStr::new("FRESHELL_BIND_HOST")),
+            "the bind host is operator configuration, not a deployment binding"
+        );
         assert!(!is_controller_owned(OsStr::new("PATH")));
         assert!(!is_controller_owned(OsStr::new("ALLOWED_ORIGINS")));
         assert!(!is_controller_owned(OsStr::new("CODEX_HOME")));
