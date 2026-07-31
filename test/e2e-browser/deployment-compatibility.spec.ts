@@ -23,6 +23,7 @@ import { TestHarness } from './helpers/test-harness.js'
 import { TerminalHelper } from './helpers/terminal-helpers.js'
 import { declarationDigest } from '../../scripts/deployment-compatibility.mjs'
 import { stopOwnedChildBeforeIdentity } from '../helpers/owned-child-process.js'
+import { waitForHttp } from './helpers/wait-for-http.js'
 
 if (process.env.FRESHELL_DESTRUCTIVE_SANDBOX !== '1') {
   throw new Error(
@@ -172,17 +173,6 @@ async function result(
       stderr: `${error.stderr ?? ''}\n[execFile failure: ${diagnostic}]`,
     }
   }
-}
-
-async function waitForHttp(port: number, expected: 'up' | 'down', timeout = 60_000) {
-  await expect(async () => {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`)
-      expect(expected === 'up' && response.status === 200).toBe(true)
-    } catch {
-      expect(expected).toBe('down')
-    }
-  }).toPass({ timeout, intervals: [50, 100, 250, 500] })
 }
 
 function isRecordedProcessRunning(identity: {
