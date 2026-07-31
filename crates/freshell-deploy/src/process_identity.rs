@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
+use std::io::{Seek, SeekFrom};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::bounded_http::{get as bounded_http_get, HttpLimits};
 use crate::error::{DeployError, Result};
 use crate::manifest::sha256_reader;
 use crate::paths::DeployPort;
@@ -1089,30 +1090,31 @@ fn resolve_path_executable(name: &Path, path: &str) -> Result<PathBuf> {
 }
 
 fn read_loopback_http_body(port: DeployPort, path: &str) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port.get())).map_err(|error| {
+    read_loopback_http_body_with_limits(port, path, HttpLimits::default())
+}
+
+fn read_loopback_http_body_with_limits(
+    port: DeployPort,
+    path: &str,
+    limits: HttpLimits,
+) -> Result<Vec<u8>> {
+    let response = bounded_http_get(
+        SocketAddr::from(([127, 0, 0, 1], port.get())),
+        "127.0.0.1",
+        path,
+        None,
+        limits,
+    )
+    .map_err(|error| {
         DeployError::ProcessIdentity(format!("cannot read live server client: {error}"))
     })?;
-    stream.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes(),
-    )?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            DeployError::ProcessIdentity("live HTTP response is malformed".to_string())
-        })?;
-    let headers = std::str::from_utf8(&response[..split]).map_err(|_| {
-        DeployError::ProcessIdentity("live HTTP response headers are not UTF-8".to_string())
-    })?;
-    if !headers.starts_with("HTTP/1.1 200 ") && !headers.starts_with("HTTP/1.0 200 ") {
+    if response.status != 200 {
         return Err(DeployError::ProcessIdentity(format!(
             "live client request did not return 200: {}",
-            headers.lines().next().unwrap_or("missing status")
+            response.status
         )));
     }
-    Ok(response[split + 4..].to_vec())
+    Ok(response.body)
 }
 
 fn parse_listener_table(raw: &str, port: DeployPort, output: &mut BTreeSet<String>) -> Result<()> {
@@ -1261,13 +1263,77 @@ fn path_to_utf8(path: &Path, label: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
 
     use super::*;
+    use crate::bounded_http::HttpLimits;
 
     const FIXTURE_PID: u32 = 41_337;
+
+    fn identity_http_limits(total_timeout: Duration, max_body_bytes: usize) -> HttpLimits {
+        HttpLimits {
+            connect_timeout: Duration::from_millis(100),
+            total_timeout,
+            max_header_bytes: 1024,
+            max_body_bytes,
+        }
+    }
+
+    #[test]
+    fn first_adoption_client_read_has_a_total_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = DeployPort::new(listener.local_addr().unwrap().port()).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            for _ in 0..30 {
+                thread::sleep(Duration::from_millis(20));
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let error = read_loopback_http_body_with_limits(
+            port,
+            "/",
+            identity_http_limits(Duration::from_millis(120), 128),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn first_adoption_client_read_rejects_an_oversized_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = DeployPort::new(listener.local_addr().unwrap().port()).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n")
+                .unwrap();
+        });
+
+        let error = read_loopback_http_body_with_limits(
+            port,
+            "/",
+            identity_http_limits(Duration::from_millis(200), 16),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
+        server.join().unwrap();
+    }
 
     fn runtime_tree(parent: &Path, name: &str) -> PathBuf {
         let root = parent.join(name);
