@@ -156,9 +156,8 @@ esac
 BUILD_PARENT_UID="$(stat -c '%u' "$BUILD_PARENT")"
 BUILD_PARENT_MODE="$(stat -c '%a' "$BUILD_PARENT")"
 CURRENT_UID="$(id -u)"
-if [[ "$BUILD_PARENT_UID" != "$CURRENT_UID" ]] &&
-  (( (8#$BUILD_PARENT_MODE & 01000) == 0 )); then
-  die "FRESHELL_DEPLOY_BUILD_PARENT must be owned by the current user or sticky"
+if [[ "$BUILD_PARENT_UID" != "$CURRENT_UID" ]]; then
+  die "FRESHELL_DEPLOY_BUILD_PARENT must be owned by the current user"
 fi
 if (( (8#$BUILD_PARENT_MODE & 00022) != 0 && (8#$BUILD_PARENT_MODE & 01000) == 0 )); then
   die "FRESHELL_DEPLOY_BUILD_PARENT must not be writable by other users unless sticky"

@@ -622,6 +622,21 @@ describe('canonical launch-rust deployment wrapper', () => {
     expect(events()).toEqual([])
   })
 
+  it('rejects the foreign-owned sticky staging trust boundary behind the predictable default-parent attack', () => {
+    initialize()
+    const foreignStickyParent = os.tmpdir()
+    expect(statSync(foreignStickyParent).uid).not.toBe(process.getuid?.())
+    expect(statSync(foreignStickyParent).mode & 0o1777).toBe(0o1777)
+
+    const result = run(
+      ['--port', '43127', '--client-only'],
+      { FRESHELL_DEPLOY_BUILD_PARENT: foreignStickyParent },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toMatch(/owned by the current user/i)
+    expect(events()).toEqual([])
+  })
+
   it('builds the complete server runtime but not the client for server-only', () => {
     initialize()
     const result = run(['--port=43127', '--server-only', '--restart'])
