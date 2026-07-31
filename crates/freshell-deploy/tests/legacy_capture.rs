@@ -1582,7 +1582,7 @@ fn exact_pid_listener_resolution_ignores_unrelated_uninspectable_processes() {
 }
 
 #[test]
-fn recorded_listener_continuity_does_not_reopen_the_process_fd_directory() {
+fn recorded_listener_continuity_fails_closed_when_process_socket_ownership_cannot_be_proved() {
     let proc = tempfile::tempdir().unwrap();
     fs::create_dir_all(proc.path().join("net")).unwrap();
     fs::write(
@@ -1605,11 +1605,16 @@ fn recorded_listener_continuity_does_not_reopen_the_process_fd_directory() {
     .unwrap();
     let expected = listener(PID);
 
-    let resolved = LinuxProcfs::with_root(proc.path())
+    let error = LinuxProcfs::with_root(proc.path())
         .resolve_recorded_listener(&expected)
-        .expect("durable listener continuity");
+        .expect_err("recorded pid must still prove ownership of the listener socket");
 
-    assert_eq!(resolved, expected);
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("cannot inspect expected pid {PID} fd directory")),
+        "{error}"
+    );
 }
 
 #[test]

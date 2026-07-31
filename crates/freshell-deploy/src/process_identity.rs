@@ -540,6 +540,9 @@ impl LinuxProcfs {
         if inodes.first() != Some(&expected.socket_inode) {
             return Ok(ExpectedListenerObservation::Foreign);
         }
+        if !self.pid_owns_socket(expected.owner_pid, &expected.socket_inode)? {
+            return Ok(ExpectedListenerObservation::Foreign);
+        }
         let namespace = match fs::read_link(self.pid_path(expected.owner_pid, "ns/net")) {
             Ok(namespace) => namespace,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
