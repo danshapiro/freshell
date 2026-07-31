@@ -338,10 +338,12 @@ struct RealDurablePublishOps;
 impl DurablePublishOps for RealDurablePublishOps {
     fn write_and_sync_new(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(0o600)
             .open(path)?;
         file.write_all(bytes)?;
         file.sync_all()
@@ -2866,6 +2868,7 @@ mod sessions_sweep_tests {
 mod tests {
     use super::*;
     use freshell_platform::MapEnv;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn deployment_identity_is_compile_time_metadata_not_product_version() {
@@ -2928,6 +2931,38 @@ mod tests {
                 "serverComponentVersion": "0.7.0",
                 "buildCommit": "abc123"
             })
+        );
+    }
+
+    #[test]
+    fn durable_receipts_are_private_under_permissive_umask() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::durable_receipt_mode_worker",
+                "--nocapture",
+            ])
+            .env("FRESHELL_TEST_DURABLE_RECEIPT_MODE_WORKER", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn durable_receipt_mode_worker() {
+        if std::env::var_os("FRESHELL_TEST_DURABLE_RECEIPT_MODE_WORKER").is_none() {
+            return;
+        }
+
+        unsafe {
+            libc::umask(0);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activated.json");
+        publish_durable_json(&path, &deployment_receipt()).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
