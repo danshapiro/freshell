@@ -3,9 +3,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -706,6 +707,9 @@ pub struct RealProbeBackend {
     procfs: LinuxProcfs,
 }
 
+const MAX_PROBE_COMMAND_STREAM_BYTES: usize = 1024 * 1024;
+const PROBE_COMMAND_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 trait ParentDeathOps {
     fn arm_kill(&self) -> std::io::Result<()>;
     fn parent_pid(&self) -> libc::pid_t;
@@ -771,7 +775,8 @@ impl ProbeBackend for RealProbeBackend {
                 Stdio::piped()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
         contain_spawn(&mut process);
         let mut child = process
             .spawn()
@@ -789,49 +794,47 @@ impl ProbeBackend for RealProbeBackend {
             }
         };
         let backend = LinuxPidfdBackend::new(self.procfs.clone());
-        if !command.stdin.is_empty() {
-            let write = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| DeployError::Probe("probe command stdin unavailable".to_string()))?
-                .write_all(&command.stdin);
-            if let Err(error) = write {
-                let cleanup =
-                    kill_reap_owned_child(&mut child, &backend, &pidfd, Duration::from_secs(2));
-                return combine_probe_cleanup(Err(error.into()), cleanup);
+        let mut pipes = match ProbeCommandPipes::take_from(&mut child) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                let cleanup = kill_reap_probe_command(&mut child, &backend, &pidfd);
+                return combine_probe_cleanup(Err(error), cleanup);
             }
-            drop(child.stdin.take());
-        }
-        let deadline = Instant::now() + timeout;
+        };
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            DeployError::Probe("probe command timeout exceeds monotonic range".to_string())
+        })?;
         loop {
-            let status = match child.try_wait() {
-                Ok(status) => status,
+            if let Err(error) = pipes.pump(&command.stdin) {
+                let cleanup = kill_reap_probe_command(&mut child, &backend, &pidfd);
+                return combine_probe_cleanup(Err(error), cleanup);
+            }
+            if pipes.output_limit_exceeded() {
+                let cleanup = kill_reap_probe_command(&mut child, &backend, &pidfd);
+                return combine_probe_cleanup(Err(output_limit_error()), cleanup);
+            }
+            let exited = match backend.wait_exited(&pidfd, Duration::ZERO) {
+                Ok(exited) => exited,
                 Err(error) => {
-                    let cleanup =
-                        kill_reap_owned_child(&mut child, &backend, &pidfd, Duration::from_secs(2));
-                    return combine_probe_cleanup(Err(error.into()), cleanup);
+                    let cleanup = kill_reap_probe_command(&mut child, &backend, &pidfd);
+                    return combine_probe_cleanup(Err(error), cleanup);
                 }
             };
-            if let Some(status) = status {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(pipe) = child.stdout.as_mut() {
-                    pipe.read_to_end(&mut stdout)?;
-                }
-                if let Some(pipe) = child.stderr.as_mut() {
-                    pipe.read_to_end(&mut stderr)?;
-                }
-                if !status.success() {
-                    return Err(DeployError::Probe(format!(
-                        "probe command failed with {status}: {}",
-                        String::from_utf8_lossy(&stderr)
-                    )));
-                }
-                return Ok(ProbeCommandOutput { stdout, stderr });
+            if exited {
+                pipes.close_stdin();
+                // The unreaped leader still reserves its exact PID/process
+                // group, so numeric process-group signaling cannot target a
+                // subsequently reused identity.
+                let group_cleanup = signal_probe_command_group(child.id());
+                let status = child.wait().map_err(DeployError::from);
+                let pipe_cleanup = pipes.finish_after_exit();
+                let cleanup = combine_cleanup_results(group_cleanup, pipe_cleanup);
+                let result = status.and_then(|status| pipes.into_result(status));
+                return combine_probe_cleanup(result, cleanup);
             }
             if Instant::now() >= deadline {
-                let cleanup =
-                    kill_reap_owned_child(&mut child, &backend, &pidfd, Duration::from_secs(2));
+                pipes.close_stdin();
+                let cleanup = kill_reap_probe_command(&mut child, &backend, &pidfd);
                 return combine_probe_cleanup(
                     Err(DeployError::Probe("probe command timed out".to_string())),
                     cleanup,
@@ -979,6 +982,224 @@ impl ProbeBackend for RealProbeBackend {
             StopPolicy::new(timeout, Duration::from_secs(2)),
         )
     }
+}
+
+struct ProbeCommandPipes {
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    stdin_offset: usize,
+    stdout_bytes: Vec<u8>,
+    stderr_bytes: Vec<u8>,
+    stdout_overflow: bool,
+    stderr_overflow: bool,
+}
+
+impl ProbeCommandPipes {
+    fn take_from(child: &mut std::process::Child) -> Result<Self> {
+        let pipes = Self {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            stdin_offset: 0,
+            stdout_bytes: Vec::new(),
+            stderr_bytes: Vec::new(),
+            stdout_overflow: false,
+            stderr_overflow: false,
+        };
+        for (name, fd) in [
+            ("stdin", pipes.stdin.as_ref().map(AsRawFd::as_raw_fd)),
+            ("stdout", pipes.stdout.as_ref().map(AsRawFd::as_raw_fd)),
+            ("stderr", pipes.stderr.as_ref().map(AsRawFd::as_raw_fd)),
+        ] {
+            let Some(fd) = fd else {
+                continue;
+            };
+            set_nonblocking(fd).map_err(|error| {
+                DeployError::Probe(format!(
+                    "cannot make probe command {name} nonblocking: {error}"
+                ))
+            })?;
+        }
+        Ok(pipes)
+    }
+
+    fn pump(&mut self, stdin_bytes: &[u8]) -> Result<()> {
+        self.write_stdin(stdin_bytes)?;
+        self.drain_outputs()
+    }
+
+    fn write_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some(pipe) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        while self.stdin_offset < bytes.len() {
+            match pipe.write(&bytes[self.stdin_offset..]) {
+                Ok(0) => {
+                    return Err(DeployError::Probe(
+                        "probe command stdin closed before the request was written".to_string(),
+                    ))
+                }
+                Ok(written) => self.stdin_offset += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.close_stdin();
+        Ok(())
+    }
+
+    fn drain_outputs(&mut self) -> Result<()> {
+        drain_command_pipe(
+            &mut self.stdout,
+            &mut self.stdout_bytes,
+            &mut self.stdout_overflow,
+        )?;
+        drain_command_pipe(
+            &mut self.stderr,
+            &mut self.stderr_bytes,
+            &mut self.stderr_overflow,
+        )
+    }
+
+    fn output_limit_exceeded(&self) -> bool {
+        self.stdout_overflow || self.stderr_overflow
+    }
+
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn finish_after_exit(&mut self) -> Result<()> {
+        let deadline = Instant::now()
+            .checked_add(PROBE_COMMAND_CLEANUP_TIMEOUT)
+            .ok_or_else(|| {
+                DeployError::Probe("probe pipe cleanup deadline overflowed".to_string())
+            })?;
+        loop {
+            self.drain_outputs()?;
+            if self.stdout.is_none() && self.stderr.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(DeployError::Probe(
+                    "probe command output pipes remained open after process-group cleanup"
+                        .to_string(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn into_result(self, status: ExitStatus) -> Result<ProbeCommandOutput> {
+        if self.output_limit_exceeded() {
+            return Err(output_limit_error());
+        }
+        if !status.success() {
+            return Err(DeployError::Probe(format!(
+                "probe command failed with {status}: {}",
+                String::from_utf8_lossy(&self.stderr_bytes)
+            )));
+        }
+        Ok(ProbeCommandOutput {
+            stdout: self.stdout_bytes,
+            stderr: self.stderr_bytes,
+        })
+    }
+}
+
+fn set_nonblocking(fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fd is owned by a live Child pipe. F_GETFL and F_SETFL do not
+    // transfer ownership, and preserve all existing status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn drain_command_pipe<Reader: Read>(
+    pipe: &mut Option<Reader>,
+    output: &mut Vec<u8>,
+    overflow: &mut bool,
+) -> Result<()> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(());
+    };
+    let mut reached_eof = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                reached_eof = true;
+                break;
+            }
+            Ok(read) => {
+                let remaining = MAX_PROBE_COMMAND_STREAM_BYTES.saturating_sub(output.len());
+                output.extend_from_slice(&chunk[..read.min(remaining)]);
+                *overflow |= read > remaining;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if reached_eof {
+        drop(pipe.take());
+    }
+    Ok(())
+}
+
+fn signal_probe_command_group(pid: u32) -> Result<()> {
+    let pgid = libc::pid_t::try_from(pid)
+        .map_err(|_| DeployError::Probe("probe command pid exceeds pid_t".to_string()))?;
+    // SAFETY: the child was placed in a process group whose id is its pid.
+    // A negative pid addresses that exact group. ESRCH means it is already gone.
+    if unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(DeployError::Probe(format!(
+            "cannot terminate probe command process group {pgid}: {error}"
+        )))
+    }
+}
+
+fn kill_reap_probe_command(
+    child: &mut std::process::Child,
+    backend: &LinuxPidfdBackend,
+    pidfd: &LinuxPidFd,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = signal_probe_command_group(child.id()) {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = kill_reap_owned_child(child, backend, pidfd, PROBE_COMMAND_CLEANUP_TIMEOUT)
+    {
+        failures.push(error.to_string());
+    }
+    finish_owned_cleanup(failures)
+}
+
+fn combine_cleanup_results(first: Result<()>, second: Result<()>) -> Result<()> {
+    let failures = [first, second]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| error.to_string())
+        .collect();
+    finish_owned_cleanup(failures)
+}
+
+fn output_limit_error() -> DeployError {
+    DeployError::Probe(format!(
+        "probe command output exceeded the {} byte per-stream limit",
+        MAX_PROBE_COMMAND_STREAM_BYTES
+    ))
 }
 
 fn terminate_unpinned_owned_child(child: &mut std::process::Child) -> Result<()> {
@@ -1203,5 +1424,85 @@ mod parent_death_tests {
         };
         assert!(arm_parent_death(&ops, 41).is_err());
         assert_eq!(&*ops.events.borrow(), &["arm"]);
+    }
+}
+
+#[cfg(test)]
+mod real_command_tests {
+    use super::*;
+
+    fn shell_command(script: &str, current_dir: &Path) -> ProbeCommand {
+        ProbeCommand {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![OsString::from("-c"), OsString::from(script)],
+            current_dir: current_dir.to_path_buf(),
+            environment: BTreeMap::new(),
+            stdin: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn real_command_drains_verbose_stdout_and_stderr_while_process_runs() {
+        let fixture = tempfile::tempdir().unwrap();
+        let command = shell_command(
+            "head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2",
+            fixture.path(),
+        );
+
+        let output = RealProbeBackend::default()
+            .run_command(&command, Duration::from_secs(2))
+            .expect("pipe-capacity-sized output must not deadlock the probe");
+
+        assert_eq!(output.stdout.len(), 262_144);
+        assert_eq!(output.stderr.len(), 262_144);
+    }
+
+    #[test]
+    fn real_command_rejects_output_beyond_the_bounded_capture() {
+        let fixture = tempfile::tempdir().unwrap();
+        let command = shell_command("head -c 1048577 /dev/zero", fixture.path());
+
+        let error = RealProbeBackend::default()
+            .run_command(&command, Duration::from_secs(2))
+            .expect_err("unbounded probe output must be rejected");
+
+        assert!(error.to_string().contains("per-stream limit"), "{error}");
+    }
+
+    #[test]
+    fn real_command_kills_descendants_that_keep_output_pipes_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        let command = shell_command(
+            "sleep 5 & descendant=$!; printf '%s\\n' \"$descendant\"",
+            fixture.path(),
+        );
+        let started = Instant::now();
+
+        let output = RealProbeBackend::default()
+            .run_command(&command, Duration::from_secs(1))
+            .expect("an inherited pipe must not outlive the bounded probe");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe waited for the descendant-held pipe to close"
+        );
+        let descendant: libc::pid_t = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal zero only tests whether this child pid exists.
+            let result = unsafe { libc::kill(descendant, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "probe descendant {descendant} survived cleanup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
