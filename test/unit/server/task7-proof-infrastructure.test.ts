@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -103,6 +104,89 @@ if (process.argv[2] === 'install' && process.argv[3] === 'chromium') {
   chmodSync(cli, 0o755)
 }
 
+function sandboxDefinitionSha256() {
+  const files = [
+    'docker/sandbox/Dockerfile',
+    'docker/sandbox/entrypoint.sh',
+    'docker/sandbox/ensure-playwright-cache.sh',
+  ]
+  const hashes = files.map((file) => createHash('sha256')
+    .update(readFileSync(path.join(repository, file)))
+    .digest('hex'))
+  const lock = JSON.parse(readFileSync(path.join(repository, 'package-lock.json'), 'utf8'))
+  const playwrightVersion = lock.packages?.['node_modules/playwright']?.version
+  if (!playwrightVersion) throw new Error('package-lock.json does not resolve playwright')
+  return createHash('sha256')
+    .update(`${[...hashes, `playwright=${playwrightVersion}`].join('\n')}\n`)
+    .digest('hex')
+}
+
+function writeConcurrentFakeDocker(binRoot: string) {
+  const fakeDocker = path.join(binRoot, 'docker')
+  writeFileSync(
+    fakeDocker,
+    `#!/usr/bin/env bash
+set -euo pipefail
+
+state="\${FAKE_DOCKER_STATE:?}"
+case "\${1:-}:\${2:-}" in
+  image:inspect)
+    printf '%s\\n' "\${FAKE_DOCKER_DEFINITION_SHA256:?}"
+    ;;
+  network:inspect)
+    if [ -d "\${state}/network" ]; then
+      exit 0
+    fi
+    marker="\${state}/network-inspect-\${BASHPID}"
+    : > "\${marker}"
+    expected="\${FAKE_DOCKER_INSPECT_BARRIER:-1}"
+    for _attempt in $(seq 1 500); do
+      count="$(find "\${state}" -maxdepth 1 -name 'network-inspect-*' | wc -l)"
+      if [ "\${count}" -ge "\${expected}" ]; then
+        break
+      fi
+      sleep 0.01
+    done
+    if [ -d "\${state}/network" ]; then
+      exit 0
+    fi
+    : > "\${state}/network-missing-\${BASHPID}"
+    for _attempt in $(seq 1 500); do
+      count="$(find "\${state}" -maxdepth 1 -name 'network-missing-*' | wc -l)"
+      if [ "\${count}" -ge "\${expected}" ]; then
+        exit 1
+      fi
+      sleep 0.01
+    done
+    echo "fake docker inspect barrier timed out" >&2
+    exit 70
+    ;;
+  network:create)
+    if [ "\${FAKE_DOCKER_NETWORK_CREATE_ERROR:-}" = "permission" ]; then
+      echo "Error response from daemon: permission denied creating network" >&2
+      exit 42
+    fi
+    if mkdir "\${state}/network" 2>/dev/null; then
+      printf '%s\\n' freshell-sandbox
+      exit 0
+    fi
+    echo "Error response from daemon: network freshell-sandbox already exists" >&2
+    exit 1
+    ;;
+  run:*)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected fake docker invocation: %q' "$@" >&2
+    printf '\\n' >&2
+    exit 64
+    ;;
+esac
+`,
+  )
+  chmodSync(fakeDocker, 0o755)
+}
+
 function callWithinTryBlock(
   sourceFile: ts.SourceFile,
   predicate: (call: ts.CallExpression) => boolean,
@@ -197,6 +281,53 @@ describe('Task 7 proof infrastructure', () => {
     expect(groupProvision).toBeGreaterThan(-1)
     expect(existingUidLookup).toBeGreaterThan(groupProvision)
     expect(dockerfile).toContain('usermod -g "${GID}" sandbox;')
+  })
+
+  it('lets concurrent sandbox invocations share network creation', async () => {
+    const root = temporaryRoot('freshell-sandbox-network-race-')
+    const binRoot = path.join(root, 'bin')
+    const state = path.join(root, 'state')
+    mkdirSync(binRoot)
+    mkdirSync(state)
+    writeConcurrentFakeDocker(binRoot)
+    const environment = {
+      ...process.env,
+      PATH: `${binRoot}:${process.env.PATH}`,
+      FAKE_DOCKER_STATE: state,
+      FAKE_DOCKER_DEFINITION_SHA256: sandboxDefinitionSha256(),
+      FAKE_DOCKER_INSPECT_BARRIER: '2',
+    }
+    const wrapper = path.join(repository, 'scripts/sandbox-test.sh')
+
+    const results = await Promise.allSettled([
+      execFileAsync(wrapper, ['true'], { env: environment }),
+      execFileAsync(wrapper, ['true'], { env: environment }),
+    ])
+
+    expect(results.map(({ status }) => status)).toEqual(['fulfilled', 'fulfilled'])
+  })
+
+  it('preserves a network creation failure when the network remains absent', async () => {
+    const root = temporaryRoot('freshell-sandbox-network-error-')
+    const binRoot = path.join(root, 'bin')
+    const state = path.join(root, 'state')
+    mkdirSync(binRoot)
+    mkdirSync(state)
+    writeConcurrentFakeDocker(binRoot)
+    const environment = {
+      ...process.env,
+      PATH: `${binRoot}:${process.env.PATH}`,
+      FAKE_DOCKER_STATE: state,
+      FAKE_DOCKER_DEFINITION_SHA256: sandboxDefinitionSha256(),
+      FAKE_DOCKER_NETWORK_CREATE_ERROR: 'permission',
+    }
+    const wrapper = path.join(repository, 'scripts/sandbox-test.sh')
+
+    await expect(execFileAsync(wrapper, ['true'], { env: environment }))
+      .rejects.toMatchObject({
+        code: 42,
+        stderr: expect.stringContaining('permission denied creating network'),
+      })
   })
 
   it('keeps ordinary fake-Codex argv logging portable', async () => {

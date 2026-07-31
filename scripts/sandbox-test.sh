@@ -80,7 +80,21 @@ fi
 # intent explicit and doesn't depend on the daemon's default-network state.
 NETWORK_NAME="freshell-sandbox"
 if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-  docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+  NETWORK_CREATE_STATUS=0
+  NETWORK_CREATE_OUTPUT="$(
+    docker network create --driver bridge "${NETWORK_NAME}" 2>&1
+  )" || NETWORK_CREATE_STATUS=$?
+  if [ "${NETWORK_CREATE_STATUS}" -ne 0 ]; then
+    # A concurrent wrapper may have created the network after our inspect.
+    # Accept that race only when Docker confirms the desired end state;
+    # otherwise preserve the original create failure and diagnostics.
+    if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+      if [ -n "${NETWORK_CREATE_OUTPUT}" ]; then
+        echo "${NETWORK_CREATE_OUTPUT}" >&2
+      fi
+      exit "${NETWORK_CREATE_STATUS}"
+    fi
+  fi
 fi
 
 DOCKER_ARGS=(
