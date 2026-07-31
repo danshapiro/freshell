@@ -1186,11 +1186,12 @@ async fn main() -> ExitCode {
             // derivation (USERPROFILE on Windows; HOME else passwd-entry
             // home on POSIX).
             home_dir: resolve_wire_home_dir(),
-            // Node's hard 15 s by-id runner timeout, applied as the route's
-            // outer deadline on the whole blocking resolver (see
-            // `resolve.rs` for the abandonment semantics).
-            resolve_deadline: resolve::RESOLVE_OUTER_DEADLINE,
-            // Admission cap on concurrent blocking resolver tasks — see
+            // Node's hard 15 s by-id worker timeout, applied to EACH
+            // blocking fallback dispatch (permit wait + fallback) — never
+            // the in-memory resolver around it (see `resolve.rs` for the
+            // abandonment semantics).
+            resolve_deadline: resolve::RESOLVE_FALLBACK_DEADLINE,
+            // Admission cap on concurrent blocking fallback tasks — see
             // `RESOLVE_MAX_CONCURRENCY` for why abandoned (uncancellable)
             // blocking tasks must be bounded in COUNT, not just latency.
             resolve_permits: Arc::new(tokio::sync::Semaphore::new(
