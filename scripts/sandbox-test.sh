@@ -18,25 +18,18 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
-PLAYWRIGHT_VERSION="$(
-  node -e '
-    const lock = require(process.argv[1])
-    const version = lock.packages?.["node_modules/playwright"]?.version
-    if (!version) throw new Error("package-lock.json does not resolve playwright")
-    process.stdout.write(version)
-  ' "${REPO_ROOT}/package-lock.json"
-)"
+# shellcheck source=scripts/sandbox-image-definition.sh
+source "${REPO_ROOT}/scripts/sandbox-image-definition.sh"
+
+SANDBOX_UID="$(id -u)"
+SANDBOX_GID="$(id -g)"
+PLAYWRIGHT_VERSION="$(sandbox_playwright_version "${REPO_ROOT}")"
 DEFINITION_SHA256="$(
-  {
-    sha256sum \
-      "${REPO_ROOT}/docker/sandbox/Dockerfile" \
-      "${REPO_ROOT}/docker/sandbox/entrypoint.sh" \
-      "${REPO_ROOT}/docker/sandbox/ensure-playwright-cache.sh"
-    printf 'playwright=%s\n' "${PLAYWRIGHT_VERSION}"
-  } \
-  | awk '{print $1}' \
-  | sha256sum \
-  | awk '{print $1}'
+  sandbox_image_definition_sha256 \
+    "${REPO_ROOT}" \
+    "${PLAYWRIGHT_VERSION}" \
+    "${SANDBOX_UID}" \
+    "${SANDBOX_GID}"
 )"
 
 MOUNT_CORPUS=0

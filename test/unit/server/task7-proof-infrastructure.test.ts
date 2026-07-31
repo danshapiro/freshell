@@ -104,7 +104,7 @@ if (process.argv[2] === 'install' && process.argv[3] === 'chromium') {
   chmodSync(cli, 0o755)
 }
 
-function sandboxDefinitionSha256() {
+function sandboxDefinitionSha256(uid = process.getuid!(), gid = process.getgid!()) {
   const files = [
     'docker/sandbox/Dockerfile',
     'docker/sandbox/entrypoint.sh',
@@ -117,7 +117,12 @@ function sandboxDefinitionSha256() {
   const playwrightVersion = lock.packages?.['node_modules/playwright']?.version
   if (!playwrightVersion) throw new Error('package-lock.json does not resolve playwright')
   return createHash('sha256')
-    .update(`${[...hashes, `playwright=${playwrightVersion}`].join('\n')}\n`)
+    .update(`${[
+      ...hashes,
+      `playwright=${playwrightVersion}`,
+      `uid=${uid}`,
+      `gid=${gid}`,
+    ].join('\n')}\n`)
     .digest('hex')
 }
 
@@ -132,6 +137,9 @@ state="\${FAKE_DOCKER_STATE:?}"
 case "\${1:-}:\${2:-}" in
   image:inspect)
     printf '%s\\n' "\${FAKE_DOCKER_DEFINITION_SHA256:?}"
+    ;;
+  build:*)
+    printf '%s\\n' "$*" > "\${FAKE_DOCKER_BUILD_LOG:?}"
     ;;
   network:inspect)
     if [ -d "\${state}/network" ]; then
@@ -258,12 +266,17 @@ describe('Task 7 proof infrastructure', () => {
     )
     const build = readFileSync(path.join(repository, 'scripts/sandbox-build.sh'), 'utf8')
     const run = readFileSync(path.join(repository, 'scripts/sandbox-test.sh'), 'utf8')
+    const definition = readFileSync(
+      path.join(repository, 'scripts/sandbox-image-definition.sh'),
+      'utf8',
+    )
     expect(dockerfile).toContain('ARG PLAYWRIGHT_VERSION')
     expect(dockerfile).toContain('"playwright@${PLAYWRIGHT_VERSION}" install-deps chromium')
-    expect(build).toContain('lock.packages?.["node_modules/playwright"]?.version')
+    expect(definition).toContain('lock.packages?.["node_modules/playwright"]?.version')
     expect(build).toContain('--build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}"')
-    expect(run).toContain('lock.packages?.["node_modules/playwright"]?.version')
-    expect(run).toContain("printf 'playwright=%s\\n' \"${PLAYWRIGHT_VERSION}\"")
+    expect(build).toContain('sandbox_playwright_version "${REPO_ROOT}"')
+    expect(run).toContain('sandbox_playwright_version "${REPO_ROOT}"')
+    expect(definition).toContain("printf 'playwright=%s\\nuid=%s\\ngid=%s\\n'")
   })
 
   it('maps an existing sandbox UID onto a provisioned primary GID', () => {
@@ -281,6 +294,71 @@ describe('Task 7 proof infrastructure', () => {
     expect(groupProvision).toBeGreaterThan(-1)
     expect(existingUidLookup).toBeGreaterThan(groupProvision)
     expect(dockerfile).toContain('usermod -g "${GID}" sandbox;')
+  })
+
+  it('invalidates the shared sandbox image fingerprint when its baked user identity changes', async () => {
+    const build = readFileSync(path.join(repository, 'scripts/sandbox-build.sh'), 'utf8')
+    const run = readFileSync(path.join(repository, 'scripts/sandbox-test.sh'), 'utf8')
+    const helper = path.join(repository, 'scripts/sandbox-image-definition.sh')
+    const lock = JSON.parse(readFileSync(path.join(repository, 'package-lock.json'), 'utf8'))
+    const playwrightVersion = lock.packages?.['node_modules/playwright']?.version
+    if (!playwrightVersion) throw new Error('package-lock.json does not resolve playwright')
+    const fingerprint = async (uid: number, gid: number) => {
+      const { stdout } = await execFileAsync('bash', [
+        '-c',
+        'source "$1"; sandbox_image_definition_sha256 "$2" "$3" "$4" "$5"',
+        'sandbox-image-definition-test',
+        helper,
+        repository,
+        playwrightVersion,
+        String(uid),
+        String(gid),
+      ])
+      return stdout.trim()
+    }
+
+    const identity1000 = await fingerprint(1000, 1000)
+    expect(identity1000).toBe(sandboxDefinitionSha256(1000, 1000))
+    await expect(fingerprint(1001, 1000)).resolves.not.toBe(identity1000)
+    await expect(fingerprint(1000, 1001)).resolves.not.toBe(identity1000)
+    for (const wrapper of [build, run]) {
+      expect(wrapper).toContain('source "${REPO_ROOT}/scripts/sandbox-image-definition.sh"')
+      expect(wrapper).toContain('sandbox_image_definition_sha256')
+      expect(wrapper).toContain('"${SANDBOX_UID}"')
+      expect(wrapper).toContain('"${SANDBOX_GID}"')
+    }
+  })
+
+  it('rebuilds a sandbox image cached for a different user identity', async () => {
+    const root = temporaryRoot('freshell-sandbox-identity-cache-')
+    const binRoot = path.join(root, 'bin')
+    const state = path.join(root, 'state')
+    const buildLog = path.join(root, 'build.log')
+    mkdirSync(binRoot)
+    mkdirSync(state)
+    writeConcurrentFakeDocker(binRoot)
+    const uid = process.getuid!()
+    const gid = process.getgid!()
+    const environment = {
+      ...process.env,
+      PATH: `${binRoot}:${process.env.PATH}`,
+      FAKE_DOCKER_STATE: state,
+      FAKE_DOCKER_DEFINITION_SHA256: sandboxDefinitionSha256(uid + 1, gid),
+      FAKE_DOCKER_BUILD_LOG: buildLog,
+    }
+
+    await execFileAsync(
+      path.join(repository, 'scripts/sandbox-test.sh'),
+      ['true'],
+      { env: environment },
+    )
+
+    const buildInvocation = readFileSync(buildLog, 'utf8')
+    expect(buildInvocation).toContain(`--build-arg UID=${uid}`)
+    expect(buildInvocation).toContain(`--build-arg GID=${gid}`)
+    expect(buildInvocation).toContain(
+      `--build-arg FRESHELL_SANDBOX_DEFINITION_SHA256=${sandboxDefinitionSha256(uid, gid)}`,
+    )
   })
 
   it('lets concurrent sandbox invocations share network creation', async () => {
