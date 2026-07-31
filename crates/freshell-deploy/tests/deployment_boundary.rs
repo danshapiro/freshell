@@ -238,10 +238,7 @@ fn production_binary_routes_strict_controller_commands() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert_eq!(
-        String::from_utf8(status.stdout).unwrap(),
-        "fresh\n"
-    );
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "fresh\n");
 
     let malformed = Command::new(binary)
         .args([

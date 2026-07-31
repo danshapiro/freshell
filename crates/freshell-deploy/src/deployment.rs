@@ -280,8 +280,7 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
     match command.mode {
         UpdateMode::ClientOnly => {
             let prior = prior.as_ref().expect("one-sided assembly has a prior");
-            let descriptor = prior_descriptor
-                .expect("one-sided assembly has descriptor result")?;
+            let descriptor = prior_descriptor.expect("one-sided assembly has descriptor result")?;
             let client = command
                 .client_dir
                 .as_deref()
@@ -304,8 +303,7 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
         }
         UpdateMode::Server => {
             let prior = prior.as_ref().expect("one-sided assembly has a prior");
-            let descriptor = prior_descriptor
-                .expect("one-sided assembly has descriptor result")?;
+            let descriptor = prior_descriptor.expect("one-sided assembly has descriptor result")?;
             stage.copy_generation_tree(&prior, Path::new("client"), Path::new("client"))?;
             let sources = command
                 .server
