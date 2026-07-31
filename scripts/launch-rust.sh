@@ -141,32 +141,71 @@ if (( CLIENT_ONLY == 1 )); then
   resolve_stored_controller
 fi
 
+CURRENT_UID="$(id -u)"
+
+validate_trusted_ancestor_chain() {
+  local ancestor="$1"
+  local ancestor_uid
+  local ancestor_mode
+
+  while :; do
+    ancestor_uid="$(stat -c '%u' -- "$ancestor")"
+    ancestor_mode="$(stat -c '%a' -- "$ancestor")"
+    if (( (8#$ancestor_mode & 00022) != 0 )); then
+      if (( (8#$ancestor_mode & 01000) == 0 )) ||
+        [[ "$ancestor_uid" != 0 && "$ancestor_uid" != "$CURRENT_UID" ]]; then
+        die "FRESHELL_DEPLOY_BUILD_PARENT ancestor $ancestor is writable by other users without trusted sticky ownership"
+      fi
+    fi
+
+    [[ "$ancestor" == "/" ]] && break
+    ancestor="$(dirname -- "$ancestor")"
+  done
+}
+
+validate_build_parent() {
+  [[ -d "$BUILD_PARENT" && ! -L "$BUILD_PARENT" ]] ||
+    die "FRESHELL_DEPLOY_BUILD_PARENT must be a real directory"
+  BUILD_PARENT="$(readlink -f "$BUILD_PARENT")"
+  [[ "$BUILD_PARENT" != "/" ]] ||
+    die "FRESHELL_DEPLOY_BUILD_PARENT must not be the filesystem root"
+  case "$BUILD_PARENT/" in
+    "$REPO_ROOT/"*)
+      die "FRESHELL_DEPLOY_BUILD_PARENT must be outside the checkout and immutable store"
+      ;;
+  esac
+
+  local build_parent_uid
+  local build_parent_mode
+  build_parent_uid="$(stat -c '%u' -- "$BUILD_PARENT")"
+  build_parent_mode="$(stat -c '%a' -- "$BUILD_PARENT")"
+  if [[ "$build_parent_uid" != "$CURRENT_UID" ]]; then
+    die "FRESHELL_DEPLOY_BUILD_PARENT must be owned by the current user"
+  fi
+  if (( (8#$build_parent_mode & 00022) != 0 && (8#$build_parent_mode & 01000) == 0 )); then
+    die "FRESHELL_DEPLOY_BUILD_PARENT must not be writable by other users unless sticky"
+  fi
+
+  validate_trusted_ancestor_chain "$(dirname -- "$BUILD_PARENT")"
+}
+
 BUILD_PARENT="${FRESHELL_DEPLOY_BUILD_PARENT:-${TMPDIR:-/tmp}/freshell-deploy-builds-${UID}}"
 [[ "$BUILD_PARENT" == /* ]] || die "FRESHELL_DEPLOY_BUILD_PARENT must be absolute"
-if [[ ! -e "$BUILD_PARENT" ]]; then
+if [[ -e "$BUILD_PARENT" ]]; then
+  validate_build_parent
+else
+  EXISTING_BUILD_ANCESTOR="$BUILD_PARENT"
+  while [[ ! -e "$EXISTING_BUILD_ANCESTOR" ]]; do
+    EXISTING_BUILD_ANCESTOR="$(dirname -- "$EXISTING_BUILD_ANCESTOR")"
+  done
+  EXISTING_BUILD_ANCESTOR="$(readlink -f "$EXISTING_BUILD_ANCESTOR")"
+  validate_trusted_ancestor_chain "$EXISTING_BUILD_ANCESTOR"
+
   (
     umask 077
     mkdir -p "$BUILD_PARENT"
   )
-fi
-[[ -d "$BUILD_PARENT" && ! -L "$BUILD_PARENT" ]] ||
-  die "FRESHELL_DEPLOY_BUILD_PARENT must be a real directory"
-BUILD_PARENT="$(readlink -f "$BUILD_PARENT")"
-[[ "$BUILD_PARENT" != "/" ]] ||
-  die "FRESHELL_DEPLOY_BUILD_PARENT must not be the filesystem root"
-case "$BUILD_PARENT/" in
-  "$REPO_ROOT/"*)
-    die "FRESHELL_DEPLOY_BUILD_PARENT must be outside the checkout and immutable store"
-    ;;
-esac
-BUILD_PARENT_UID="$(stat -c '%u' "$BUILD_PARENT")"
-BUILD_PARENT_MODE="$(stat -c '%a' "$BUILD_PARENT")"
-CURRENT_UID="$(id -u)"
-if [[ "$BUILD_PARENT_UID" != "$CURRENT_UID" ]]; then
-  die "FRESHELL_DEPLOY_BUILD_PARENT must be owned by the current user"
-fi
-if (( (8#$BUILD_PARENT_MODE & 00022) != 0 && (8#$BUILD_PARENT_MODE & 01000) == 0 )); then
-  die "FRESHELL_DEPLOY_BUILD_PARENT must not be writable by other users unless sticky"
+  validate_build_parent
 fi
 BUILD_DIR="$(mktemp -d "$BUILD_PARENT/launch-$PORT.XXXXXXXX")"
 chmod 700 "$BUILD_DIR"
