@@ -46,11 +46,17 @@
 //!   `MAX_RESUME_CANDIDATES` (8) × `FALLBACK_BUDGET_PER_REQUEST` (2 per
 //!   provider) fallback calls + one index scan per token. Keep any new
 //!   closure invocation inside that block. The whole blocking task is
-//!   additionally bounded by [`RESOLVE_OUTER_DEADLINE`] (Node's hard 15 s
-//!   by-id runner timeout): on elapse the task is ABANDONED (blocking tasks
-//!   cannot be cancelled — recorded deviation from Node's
-//!   `worker.terminate()`) and the request answers a degraded 200 reporting
-//!   every enabled provider unsearchable.
+//!   additionally bounded THREE ways: (1) [`RESOLVE_OUTER_DEADLINE`] (Node's
+//!   hard 15 s by-id runner timeout) bounds the request — permit wait AND
+//!   resolver — and on elapse the task is ABANDONED (blocking tasks cannot
+//!   be killed — recorded deviation from Node's `worker.terminate()`) with a
+//!   degraded 200 reporting every enabled provider unsearchable; (2) a
+//!   [`RESOLVE_MAX_CONCURRENCY`]-permit semaphore whose permit MOVES INTO
+//!   the blocking task caps how many (abandoned or live) resolver tasks can
+//!   exist at once — a permit-starved request degrades with the same
+//!   timeout shape instead of queueing; (3) a cooperative cancel flag,
+//!   checked before every fallback invocation, stops an abandoned resolver
+//!   at its next fallback boundary.
 //! - RECORDED DEVIATION: a `JoinError` (the resolver PANICKED) answers an
 //!   explicit 500 `{"error":"Resolve failed"}`. Node has no defined behavior
 //!   here — a top-level resolver throw becomes an unhandled rejection in the
@@ -125,6 +131,22 @@ const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 /// this request and a blocking-pool worker alive indefinitely.
 pub const RESOLVE_OUTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(15_000);
 
+/// Admission cap on CONCURRENT blocking resolver tasks. Node needs no such
+/// cap — its by-id runner `worker.terminate()`s a stalled worker thread at
+/// the 15 s timeout, so stalled work never accumulates. A Rust blocking task
+/// cannot be killed: on deadline elapse it is ABANDONED and keeps its
+/// blocking-pool thread until the underlying FS/SQLite op returns. Without
+/// admission control, repeated authenticated requests against a stalled
+/// provider store would accumulate abandoned tasks without bound and exhaust
+/// Tokio's blocking pool (default max 512 threads), starving UNRELATED
+/// server work (every other `spawn_blocking` user). The permit is MOVED INTO
+/// the blocking task, so an abandoned task keeps holding it until its
+/// underlying op returns — stalled-task accumulation is therefore capped at
+/// this count, and the worst case degrades ONLY the resolve route. 8 permits
+/// comfortably exceed any realistic resolve concurrency (one interactive
+/// dialog per user) while staying a small fraction of the pool.
+pub const RESOLVE_MAX_CONCURRENCY: usize = 8;
+
 /// opencode `ses_*` by-id fallback: `Ok(Some(hit))` = the lookup resolved the
 /// id, `Ok(None)` = miss, `Err(ProviderFailure)` = the provider store could
 /// not be searched (recorded as a provider error, result degrades — never a
@@ -157,6 +179,11 @@ pub struct ResolveState {
     /// [`RESOLVE_OUTER_DEADLINE`] (Node's 15 s by-id runner timeout);
     /// injectable so tests exercise the timeout path without waiting 15 s.
     pub resolve_deadline: std::time::Duration,
+    /// Admission semaphore bounding concurrent blocking resolver tasks (see
+    /// [`RESOLVE_MAX_CONCURRENCY`]). Production wires a fresh semaphore with
+    /// that many permits; injectable so tests exercise saturation without
+    /// spawning eight stalled resolvers.
+    pub resolve_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
@@ -417,18 +444,64 @@ async fn resolve_session(
     // there continues to `finish()`). Pure, bounded string parsing.
     let timeout_hint = freshell_sessions::resume_input::parse_resume_input(&input).hint;
 
-    let opencode = state.opencode_session_by_id.clone();
-    let claude = state.locate_claude_transcript.clone();
+    // Cooperative-cancellation flag for the blocking resolver: a blocking
+    // task cannot be killed, but the fallback WRAPPERS below check this flag
+    // before every provider invocation, so an ABANDONED resolver stops doing
+    // provider work at the next fallback boundary instead of running every
+    // remaining candidate to completion. (Index matching between boundaries
+    // is bounded in-memory work; the expensive, stall-prone operations are
+    // exactly the fallback FS/SQLite calls this gates.)
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opencode: Option<OpencodeByIdLookup> = state.opencode_session_by_id.clone().map(|inner| {
+        let cancel = Arc::clone(&cancel);
+        Arc::new(move |id: &str| {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                // Result is discarded (the flag is only ever set on the
+                // abandonment path below) — the Err merely stops the
+                // provider call; it can never reach the wire.
+                return Err(ProviderFailure {
+                    code: None,
+                    message: "resolve cancelled after deadline".to_string(),
+                });
+            }
+            inner(id)
+        }) as OpencodeByIdLookup
+    });
+    let claude: Option<ClaudeLocator> = state.locate_claude_transcript.clone().map(|inner| {
+        let cancel = Arc::clone(&cancel);
+        Arc::new(move |id: &str| {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ProviderFailure {
+                    code: None,
+                    message: "resolve cancelled after deadline".to_string(),
+                });
+            }
+            inner(id)
+        }) as ClaudeLocator
+    });
     // Outer deadline = Node's hard by-id runner timeout
     // (`opencode-by-id-runner.ts` DEFAULT_TIMEOUT_MS): Node terminates the
     // stalled worker and the rejection surfaces as a providerError on a
     // degraded 200. SQLite's 500 ms busy timeout only bounds LOCK waits — a
     // filesystem or SQLite operation stalled outside lock handling would
-    // otherwise hold this request and a blocking-pool worker indefinitely,
-    // and repeated authenticated requests could exhaust the blocking pool.
-    let joined = tokio::time::timeout(
-        state.resolve_deadline,
+    // otherwise hold this request and a blocking-pool worker indefinitely.
+    //
+    // The deadline bounds BOTH the permit wait and the resolver itself:
+    // admission (`resolve_permits`, see [`RESOLVE_MAX_CONCURRENCY`]) caps
+    // how many blocking resolver tasks can exist at once, and the permit is
+    // MOVED INTO the blocking closure so an abandoned task keeps holding it
+    // until its underlying op returns. A request that cannot get a permit
+    // within the deadline therefore degrades with the SAME timeout-shaped
+    // response instead of queueing unboundedly — no (N+1)th blocking task is
+    // ever spawned past the cap.
+    let permits = Arc::clone(&state.resolve_permits);
+    let joined = tokio::time::timeout(state.resolve_deadline, async move {
+        let permit = permits
+            .acquire_owned()
+            .await
+            .expect("resolve semaphore is never closed");
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let deps = ResolveDeps {
                 // as_deref (Option<Vec<T>> -> Option<&[T]>): as_ref().map(|s| s.as_slice())
                 // trips clippy's warn-by-default `option_as_ref_deref` under -D warnings.
@@ -438,25 +511,29 @@ async fn resolve_session(
                 opencode_session_by_id: opencode.as_deref(),
             };
             resolve_resume_input(&input, &deps)
-        }),
-    )
+        })
+        .await
+    })
     .await;
 
-    // Deadline elapsed. RECORDED DEVIATION from Node's cancellation: a
-    // blocking task cannot be cancelled, so dropping the JoinHandle ABANDONS
-    // it (fire-and-forget — it runs to completion on the blocking pool and
-    // its result is discarded); Node instead `worker.terminate()`s the
-    // stalled worker thread. The deadline still frees this request and its
-    // connection, which is what bounds per-request latency and mitigates
-    // pool exhaustion. Response shape mirrors Node's by-id-runner timeout
-    // contract: 200 + `degraded` + message-only providerErrors (never a 5xx,
-    // never a healthy-looking "not found"). Attribution differs by
-    // construction: Node's timeout wraps ONE provider's worker; this outer
-    // deadline abandons the WHOLE resolver — index matching and fallbacks
-    // alike — so NO enabled provider finished searching and every one is
-    // reported unsearchable (the hardened contract forbids presenting an
-    // unsearchable state as ready-empty).
+    // Deadline elapsed — EITHER no permit became available (admission cap
+    // saturated by earlier abandoned resolvers) or the resolver itself
+    // stalled. RECORDED DEVIATION from Node's cancellation: a blocking task
+    // cannot be killed, so dropping the JoinHandle ABANDONS it (it keeps its
+    // permit and blocking-pool thread until its underlying op returns); Node
+    // instead `worker.terminate()`s the stalled worker thread. Setting the
+    // cancel flag makes the abandoned resolver stop at its next fallback
+    // boundary, and the permit cap bounds how many abandoned tasks can ever
+    // coexist ([`RESOLVE_MAX_CONCURRENCY`]). Response shape mirrors Node's
+    // by-id-runner timeout contract: 200 + `degraded` + message-only
+    // providerErrors (never a 5xx, never a healthy-looking "not found").
+    // Attribution differs by construction: Node's timeout wraps ONE
+    // provider's worker; this outer deadline abandons the WHOLE resolver —
+    // index matching and fallbacks alike — so NO enabled provider finished
+    // searching and every one is reported unsearchable (the hardened
+    // contract forbids presenting an unsearchable state as ready-empty).
     let Ok(joined) = joined else {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             deadline_ms = state.resolve_deadline.as_millis() as u64,
             "resolve timed out; abandoning the blocking resolver task"
@@ -726,6 +803,7 @@ mod tests {
             locate_claude_transcript: None,
             home_dir: Some(Arc::new("/home/tester".to_string())),
             resolve_deadline: super::RESOLVE_OUTER_DEADLINE,
+            resolve_permits: Arc::new(tokio::sync::Semaphore::new(super::RESOLVE_MAX_CONCURRENCY)),
         }
     }
 
@@ -1425,6 +1503,189 @@ mod tests {
                 "unsearchedProviders": [],
                 "homeDir": "/home/tester"
             })
+        );
+    }
+
+    /// Blocks until `release` flips true (or a 5 s safety valve elapses so a
+    /// broken test can never hang the suite), then answers a clean miss.
+    fn stalled_until(
+        release: &std::sync::atomic::AtomicBool,
+    ) -> Result<
+        Option<freshell_sessions::resume_resolve::OpencodeByIdHit>,
+        freshell_sessions::resume_resolve::ProviderFailure,
+    > {
+        let start = std::time::Instant::now();
+        while !release.load(std::sync::atomic::Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(None)
+    }
+
+    #[tokio::test]
+    async fn saturated_permits_degrade_the_next_request_without_spawning_another_resolver() {
+        // Admission-control proof: an ABANDONED resolver keeps its permit
+        // until its underlying op returns, and a request that cannot get a
+        // permit within the deadline degrades WITHOUT spawning an (N+1)th
+        // blocking task. With permits = 1: request A stalls (holding the
+        // permit past its own deadline), request B must answer the SAME
+        // degraded timeout shape while the injected resolver body was
+        // invoked exactly ONCE — the invocation count staying at 1 IS the
+        // proof that no second blocking resolver ran.
+        let dir = temp_dir("permits");
+        let index = fixture_index(Vec::new()).await;
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut st = state(&dir, Some(index));
+        st.resolve_deadline = std::time::Duration::from_millis(100);
+        st.resolve_permits = Arc::clone(&permits);
+        st.opencode_session_by_id = Some({
+            let counter = Arc::clone(&counter);
+            let release = Arc::clone(&release);
+            Arc::new(move |_id: &str| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stalled_until(&release)
+            })
+        });
+
+        let body = serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" });
+        let (status_a, body_a) = post(st.clone(), body.clone(), true).await;
+        assert_eq!(status_a, StatusCode::OK);
+        assert_eq!(body_a["status"], "degraded", "request A: {body_a}");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "request A's resolver must have been invoked once"
+        );
+
+        // The abandoned task still holds the ONLY permit. Request B must
+        // degrade at ITS deadline without the resolver body ever running.
+        let started = std::time::Instant::now();
+        let (status_b, body_b) = post(st.clone(), body, true).await;
+        assert_eq!(status_b, StatusCode::OK);
+        assert_eq!(body_b["status"], "degraded", "request B: {body_b}");
+        assert_eq!(
+            body_b["providerErrors"][0]["message"], "resolve timed out after 100ms",
+            "permit starvation must answer the SAME timeout-shaped degradation: {body_b}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "request B must degrade promptly, not queue behind the stalled permit"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "request B must NOT have spawned an (N+1)th blocking resolver"
+        );
+
+        // Cleanup: release the stalled op; the abandoned task finishes and
+        // returns its permit — proving the permit's lifetime tracked the
+        // UNDERLYING op, not the abandoned request.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while permits.available_permits() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned resolver must return its permit once its op completes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_exact_ses_tokens_invoke_the_opencode_fallback_twice_when_not_abandoned() {
+        // CONTROL for the cancellation test below: this two-token input
+        // drives TWO opencode fallback invocations (budget is 2 per
+        // provider) when nothing is cancelled — so the cancelled variant's
+        // count of ONE proves the cancel flag (not the budget or the input
+        // shape) is what stopped the second call.
+        let dir = temp_dir("cancel-control");
+        let index = fixture_index(Vec::new()).await;
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut st = state(&dir, Some(index));
+        st.opencode_session_by_id = Some({
+            let counter = Arc::clone(&counter);
+            Arc::new(move |_id: &str| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            })
+        });
+        let (status, body) = post(
+            st,
+            serde_json::json!({
+                "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa ses_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready", "control response: {body}");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the two-token input must consume both opencode fallback calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_resolver_observes_the_cancel_flag_at_the_next_fallback_boundary() {
+        // Cooperative cancellation proof: after the outer deadline abandons
+        // the blocking task, the resolver must STOP at the next fallback
+        // boundary instead of running to completion. Same two-token input as
+        // the control above (which proves TWO invocations happen when not
+        // cancelled): the first invocation stalls past the deadline; once it
+        // returns, the second must be SKIPPED because the cancel flag is
+        // set. Completion is observed via the permit returning — no sleeps
+        // guessing at task lifetime.
+        let dir = temp_dir("cancel");
+        let index = fixture_index(Vec::new()).await;
+        let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let returned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut st = state(&dir, Some(index));
+        st.resolve_deadline = std::time::Duration::from_millis(50);
+        st.opencode_session_by_id = Some({
+            let invoked = Arc::clone(&invoked);
+            let returned = Arc::clone(&returned);
+            Arc::new(move |_id: &str| {
+                invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Stall well past the 50 ms deadline, then answer a miss —
+                // the resolver would proceed to the second token's fallback.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                returned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            })
+        });
+        let (status, body) = post(
+            st,
+            serde_json::json!({
+                "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa ses_bbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded", "response: {body}");
+
+        // Wait for the FIRST stalled call to RETURN inside the abandoned
+        // task; a non-cancelling resolver then invokes the second token's
+        // fallback synchronously (microseconds later — the 300 ms grace is
+        // three orders of magnitude of margin), so a count still at 1 after
+        // the grace proves the cancel flag was observed, not slow scheduling.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while returned.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the abandoned resolver's first call must eventually return"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            invoked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cancelled resolver must SKIP the second fallback invocation"
         );
     }
 }
