@@ -1118,30 +1118,34 @@ async fn main() -> ExitCode {
             // `session-indexer.ts:1159-1161`).
             session_metadata: session_metadata_store.clone(),
             // opencode `ses_*` exact-id fallback: the SAME data home the
-            // OpencodeSource uses. KNOWN DIVERGENCE (see resolve.rs module
-            // doc): still the retired parent-walk (Task 4 replaces it with
-            // the direct row query) and read errors are still mapped to an
-            // `Ok(None)` miss instead of `Err(ProviderFailure)` — the full
-            // health channel is wired in Task 6.
+            // OpencodeSource uses, answered by the hardened direct by-id row
+            // query (`opencode_session_row_by_id`, Node's
+            // `opencode-by-id-query.ts`) — archived + child sessions
+            // included, full row (title/lastActivityAt) returned. KNOWN
+            // DIVERGENCE (see resolve.rs module doc): read errors are still
+            // mapped to an `Ok(None)` miss instead of `Err(ProviderFailure)`
+            // — the full health channel is wired in Task 6.
             opencode_session_by_id: Some(std::sync::Arc::new(
                 |session_id: &str| -> Result<
                     Option<freshell_sessions::resume_resolve::OpencodeByIdHit>,
                     freshell_sessions::resume_resolve::ProviderFailure,
                 > {
+                    use freshell_sessions::resume_resolve::OpencodeByIdHit;
                     let data_home = freshell_sessions::parse::default_opencode_data_home();
-                    Ok(freshell_sessions::parse::opencode_session_directory_by_id(
+                    match freshell_sessions::parse::opencode_session_row_by_id(
                         &data_home, session_id,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|hit| {
-                        freshell_sessions::resume_resolve::OpencodeByIdHit {
-                            session_id: session_id.to_string(),
-                            cwd: hit.directory,
-                            title: None,
-                            last_activity_at: None,
-                        }
-                    }))
+                    ) {
+                        Ok(row) => Ok(row.map(|r| OpencodeByIdHit {
+                            session_id: r.session_id,
+                            cwd: r.cwd,
+                            title: r.title,
+                            last_activity_at: r.last_activity_at,
+                        })),
+                        // TASK-6 upgrades this to Err(ProviderFailure{..})
+                        // once the wire carries providerErrors; until then a
+                        // read failure stays a miss.
+                        Err(_) => Ok(None),
+                    }
                 },
             )),
             // claude transcript exact-id fallback: the SAME ordered-roots scan

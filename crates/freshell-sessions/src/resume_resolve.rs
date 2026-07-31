@@ -20,17 +20,14 @@
 //!   `provider_errors` are computed but DROPPED by `resolve.rs`, and there is
 //!   no `unsearchedProviders`/`homeDir` field or scan-failure/warming
 //!   readiness merge yet.
-//! - opencode by-id fallback WIRING (plan Task 4): the closure `main.rs`
-//!   supplies ports the RETIRED parent-walk
-//!   (`parse::opencode_session_directory_by_id`), not the hardened direct
-//!   row query Node's fallback now uses
-//!   (`server/coding-cli/providers/opencode-by-id-query.ts`). Consequences:
-//!   orphaned/cyclic child rows are a Rust MISS where Node HITs; a
-//!   legacy-schema DB (no `parent_id` column) is a Rust universal HIT for
-//!   any full-shape `ses_*` id where Node hits only REAL rows; the wired
-//!   hits omit the `title`/`lastActivityAt` Node's row query emits (the
-//!   [`OpencodeByIdHit`] type below already carries them); and the closure
-//!   maps read errors to `Ok(None)` misses instead of `Err(ProviderFailure)`.
+//! - opencode by-id fallback ERROR mapping (plan Task 6): the closure
+//!   `main.rs` supplies runs the hardened direct row query
+//!   (`parse::opencode_session_row_by_id`, Node's
+//!   `server/coding-cli/providers/opencode-by-id-query.ts` — archived +
+//!   child sessions included, full row with `title`/`lastActivityAt`
+//!   returned), but still maps read errors to `Ok(None)` misses instead of
+//!   `Err(ProviderFailure)` — `degraded` stays unreachable in production
+//!   until Task 6 rewires it.
 //! - claude fallback WIRING (plan Task 6): the wired `locate_transcript`
 //!   (`freshell-freshagent`) probes `<projects>/<project>/<subdir>/<id>.jsonl`
 //!   and never Node's `<projects>/<project>/<parent>/subagents/<id>.jsonl`

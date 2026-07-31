@@ -424,133 +424,122 @@ pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, 
     }
 }
 
-/// A resume-resolve by-id fallback HIT: Node's `resolveOpencodeSessionRoots`
-/// walk resolved the requested id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpencodeSessionDirectory {
-    /// The requested row's OWN `directory` column — the SPAWN cwd opencode
-    /// resumes in (`resolve-session.ts:77-84`: NOT the project root) — kept
-    /// only when TRUTHY (`opencode.ts:265-267, 281`). `None` for an empty or
-    /// NULL `directory` and for EVERY legacy-schema hit (Node's early return
-    /// never reads the row). `None` ⇒ the wire match OMITS `cwd`.
-    pub directory: Option<String>,
+/// SHORT busy timeout (`opencode-by-id-query.ts:12`): a locked DB must fail
+/// FAST — the failure surfaces as provider-unavailable, never "not found".
+const OPENCODE_BYID_BUSY_TIMEOUT_MS: u64 = 500;
+
+/// Code-PRESERVING error for the by-id query (the plain `OpencodeReadError`
+/// stays for its other consumers). Node's thrown sqlite errors carry a
+/// `.code` like `SQLITE_CANTOPEN` at the QUERY layer — but Node's production
+/// worker boundary then STRIPS it (`opencode-by-id.worker.ts:41-42`
+/// serializes only `{name, message}`; `opencode-by-id-runner.ts:103-106`
+/// rebuilds the Error without `.code`), so the code never reaches the wire.
+/// We keep the code HERE for structured logging and precise messages; the
+/// production closure (Task 6 Step 3b) deliberately maps it to
+/// `ProviderFailure { code: None, .. }` — wire parity is message-only for
+/// opencode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpencodeByIdError {
+    pub code: Option<String>,
+    pub message: String,
 }
 
-/// One row of the walk: `(directory, parent_id)` for an id, `None` = no row.
-type SessionRow = (Option<String>, Option<String>);
-
-fn fetch_session_row(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Option<SessionRow>, OpencodeReadError> {
-    match conn.query_row(
-        "SELECT directory, parent_id FROM session WHERE id = ?1",
-        rusqlite::params![session_id],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        },
-    ) {
-        Ok(row) => Ok(Some(row)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(OpencodeReadError(e.to_string())),
+/// Map a rusqlite error to the Node-style `SQLITE_*` code name via
+/// `rusqlite::Error::sqlite_error_code()` (available in the pinned 0.31.0).
+fn by_id_err(e: rusqlite::Error) -> OpencodeByIdError {
+    use rusqlite::ffi::ErrorCode as C;
+    let code = e.sqlite_error_code().and_then(|c| match c {
+        C::CannotOpen => Some("SQLITE_CANTOPEN"),
+        C::DatabaseBusy => Some("SQLITE_BUSY"),
+        C::DatabaseLocked => Some("SQLITE_LOCKED"),
+        C::NotADatabase => Some("SQLITE_NOTADB"),
+        C::PermissionDenied => Some("SQLITE_PERM"),
+        C::ReadOnly => Some("SQLITE_READONLY"),
+        _ => None,
+    });
+    OpencodeByIdError {
+        code: code.map(str::to_string),
+        message: e.to_string(),
     }
 }
 
-/// Resume-resolve by-id lookup — a bug-for-bug port of Node's
-/// `OpencodeProvider.resolveOpencodeSessionRoots`
-/// (`server/coding-cli/providers/opencode.ts:239-323`). NOTE the Node
-/// consumer has since moved on: the RETIRED pre-#586 resolve consumed this
-/// walk directly; hardened Node resolves opencode ids via
-/// `resolve-session.ts` → `resolve-fallbacks.ts` → the by-id worker
-/// (`providers/opencode-by-id-query.ts`, a DIRECT row query). This walk
-/// remains the Rust resolve fallback's interim lookup — a recorded
-/// divergence, see `resume_resolve.rs`. This is deliberately NOT the attach-arm
-/// existence probe: Node walks the `parent_id` chain, and every quirk of
-/// that walk is wire-observable, so all are replicated:
-///
-/// - LEGACY schema (`session` lacks `parent_id`, detected with the same
-///   `PRAGMA table_info(session)` probe the listing uses): return a HIT with
-///   `directory: None` for ANY requested id — Node returns early
-///   (`opencode.ts:246-250`) with NO row query and NO existence check, so
-///   even nonexistent ids hit and existing directories are never read.
-/// - MODERN schema: fetch the requested row (missing row ⇒ `Ok(None)`);
-///   keep its OWN `directory` only if non-empty (truthy filter,
-///   `opencode.ts:265-267, 281`); then walk `parent_id` with a `seen` set —
-///   a missing parent row (`opencode.ts:292-295`) or a cycle
-///   (`opencode.ts:287-290`) marks the requested id unresolved ⇒ `Ok(None)`
-///   even though the row exists; reaching a root (`parent_id` NULL) ⇒ HIT.
-///
-/// Same read-only open and short busy timeout as [`session_exists_by_id`].
-/// `Err` for ANY read failure — the resolve endpoint treats `Err` as a miss
-/// (empty matches), never a 5xx (Node likewise degrades: 3 retries then all
-/// ids unresolved, `opencode.ts:239-322`).
-pub fn opencode_session_directory_by_id(
+/// The hardened exact-id row (`OpencodeSessionRow` subset the by-id query
+/// selects). `last_activity_at` floored to integer ms (REAL columns possible).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpencodeByIdRow {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub created_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
+    pub project_path: Option<String>,
+}
+
+/// Hardened (#586) exact-id lookup — 1:1 port of
+/// `runOpencodeSessionByIdQuery` (`opencode-by-id-query.ts`). Deliberately
+/// includes ARCHIVED and CHILD sessions: an exact id pasted by the user must
+/// resolve even when the listing hides it. Errors PROPAGATE (a missing or
+/// unreadable DB file is `Err`, matching Node's throwing `DatabaseSync`
+/// open — provider unavailable ≠ not found).
+pub fn opencode_session_row_by_id(
     data_home: &Path,
     session_id: &str,
-) -> Result<Option<OpencodeSessionDirectory>, OpencodeReadError> {
+) -> Result<Option<OpencodeByIdRow>, OpencodeByIdError> {
     let db_path = data_home.join("opencode.db");
-    if !db_path.exists() {
-        return Ok(None);
-    }
     let conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    .map_err(by_id_err)?;
     conn.busy_timeout(std::time::Duration::from_millis(
-        EXISTENCE_BY_ID_BUSY_TIMEOUT_MS,
+        OPENCODE_BYID_BUSY_TIMEOUT_MS,
     ))
-    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    .map_err(by_id_err)?;
 
-    // PRAGMA table_info(session) -> hasParentId (same detection as the
-    // listing's `run_opencode_query_inner`).
-    let has_parent_id = {
+    let table_names: std::collections::HashSet<String> = {
         let mut stmt = conn
-            .prepare("PRAGMA table_info(session)")
-            .map_err(|e| OpencodeReadError(e.to_string()))?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| OpencodeReadError(e.to_string()))?;
-        let mut found = false;
-        for name in names {
-            if name.map_err(|e| OpencodeReadError(e.to_string()))? == "parent_id" {
-                found = true;
-            }
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .map_err(by_id_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(by_id_err)?;
+        let mut set = std::collections::HashSet::new();
+        for r in rows {
+            set.insert(r.map_err(by_id_err)?);
         }
-        found
+        set
     };
-    if !has_parent_id {
-        // Node's legacy early return (`opencode.ts:246-250`): every requested
-        // id resolves as its own root — no row query, no existence check, no
-        // directory read. Bug-for-bug: nonexistent ids HIT, `cwd` omitted.
-        return Ok(Some(OpencodeSessionDirectory { directory: None }));
-    }
-
-    let Some((directory, first_parent)) = fetch_session_row(&conn, session_id)? else {
+    if !table_names.contains("session") {
         return Ok(None);
-    };
-    // Truthy filter (`opencode.ts:265-267, 281`): empty string ⇒ no cwd.
-    let directory = directory.filter(|d| !d.is_empty());
-
-    // Parent walk (`opencode.ts:283-303`): a missing parent or a cycle marks
-    // the REQUESTED id unresolved (`resolve-session.ts:66`) ⇒ miss, even
-    // though its own row exists and its directory was already collected.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(session_id.to_string());
-    let mut parent = first_parent;
-    while let Some(current) = parent {
-        if !seen.insert(current.clone()) {
-            return Ok(None); // cycle guard (`opencode.ts:287-290`)
-        }
-        match fetch_session_row(&conn, &current)? {
-            None => return Ok(None), // missing parent (`opencode.ts:292-295`)
-            Some((_, next_parent)) => parent = next_parent,
-        }
     }
-    Ok(Some(OpencodeSessionDirectory { directory }))
+    let has_project = table_names.contains("project");
+    let project_select = if has_project { "p.worktree" } else { "NULL" };
+    let project_join = if has_project {
+        "LEFT JOIN project p ON p.id = s.project_id"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT s.id, s.directory, s.title, s.time_created, s.time_updated, \
+         {project_select} FROM session s {project_join} WHERE s.id = ?1 LIMIT 1"
+    );
+    match conn.query_row(&sql, rusqlite::params![session_id], |row| {
+        Ok(OpencodeByIdRow {
+            session_id: match row.get::<_, SqlValue>(0)? {
+                SqlValue::Text(s) => s,
+                other => to_opt_string(&other).unwrap_or_default(),
+            },
+            cwd: to_opt_string(&row.get::<_, SqlValue>(1)?),
+            title: to_opt_string(&row.get::<_, SqlValue>(2)?),
+            created_at: to_opt_i64(&row.get::<_, SqlValue>(3)?),
+            last_activity_at: to_opt_i64(&row.get::<_, SqlValue>(4)?),
+            project_path: to_opt_string(&row.get::<_, SqlValue>(5)?),
+        })
+    }) {
+        Ok(row) => Ok(Some(row)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(by_id_err(e)),
+    }
 }
 
 /// `defaultOpencodeDataHome` — `$XDG_DATA_HOME/opencode` -> win `LOCALAPPDATA/opencode`
