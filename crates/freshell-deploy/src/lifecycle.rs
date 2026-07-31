@@ -471,12 +471,9 @@ fn recover_launch(
 
     match existing_receipt {
         None => spawn_lifecycle_helper(&record, auth_token)?,
-        Some(LaunchAttemptReceipt::DefinitelyNotStarted { .. }) => {
-            // A terminal attempt is never reused. Publish a fresh operation
-            // before allowing another helper to execute.
-            record = LifecycleLaunchRecord::new(store, None)?;
-            write_record(store, &lifecycle_path(store), &record)?;
-            spawn_lifecycle_helper(&record, auth_token)?;
+        Some(LaunchAttemptReceipt::DefinitelyNotStarted { claim }) => {
+            complete_stopped_launch(store, &mut record, &claim)?;
+            return Ok(());
         }
         Some(LaunchAttemptReceipt::Owned { claim }) => {
             if !claim_matches_record(&claim, &record) {
@@ -486,10 +483,15 @@ fn recover_launch(
             }
             let procfs = LinuxProcfs::default();
             if !procfs.executor_birth_is_alive(&claim.executor)? {
+                if read_ready(&record.ready_file)?.is_some() {
+                    return Err(DeployError::Activation(
+                        "exited lifecycle launch has ready evidence and cannot be classified as definitely not started"
+                            .to_string(),
+                    ));
+                }
                 claim_store.mark_definitely_not_started(&claim)?;
-                record = LifecycleLaunchRecord::new(store, None)?;
-                write_record(store, &lifecycle_path(store), &record)?;
-                spawn_lifecycle_helper(&record, auth_token)?;
+                complete_stopped_launch(store, &mut record, &claim)?;
+                return Ok(());
             }
         }
     }
@@ -519,10 +521,11 @@ fn recover_launch(
                     ExpectedProcessObservation::PortFree => {}
                 }
             }
-            Some(LaunchAttemptReceipt::DefinitelyNotStarted { .. }) => {
+            Some(LaunchAttemptReceipt::DefinitelyNotStarted { claim }) => {
+                complete_stopped_launch(store, &mut record, &claim)?;
                 return Err(DeployError::Activation(
                     "lifecycle launch attempt ended without starting a server".to_string(),
-                ))
+                ));
             }
             None => {
                 if LinuxProcfs::default().port_has_listener(record.port)? {
@@ -539,6 +542,52 @@ fn recover_launch(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn complete_stopped_launch(
+    store: &Store,
+    record: &mut LifecycleLaunchRecord,
+    claim: &LaunchClaim,
+) -> Result<()> {
+    if !claim_matches_record(claim, record) {
+        return Err(DeployError::Activation(
+            "terminal lifecycle claim does not match its durable record".to_string(),
+        ));
+    }
+    let procfs = LinuxProcfs::default();
+    if procfs.port_has_listener(record.port)? {
+        return Err(DeployError::Activation(
+            "terminal lifecycle launch still has a listener".to_string(),
+        ));
+    }
+    if procfs.executor_birth_is_alive(&claim.executor)? {
+        return Err(DeployError::Activation(
+            "terminal lifecycle launch executor is still alive".to_string(),
+        ));
+    }
+    if read_ready(&record.ready_file)?.is_some() {
+        return Err(DeployError::Activation(
+            "definitely-not-started lifecycle launch has contradictory ready evidence".to_string(),
+        ));
+    }
+    if store.selected_generation_id()?.as_deref() != Some(record.generation_id.as_str()) {
+        return Err(DeployError::Activation(
+            "terminal lifecycle launch no longer matches the selected generation".to_string(),
+        ));
+    }
+    let live = store.read_live()?.ok_or_else(|| {
+        DeployError::Activation("authoritative live receipt is missing".to_string())
+    })?;
+    if live.selected_generation_id != record.generation_id
+        || live.running_server_generation_id.is_some()
+        || live.process_identity.is_some()
+    {
+        return Err(DeployError::Activation(
+            "terminal lifecycle launch is not authoritatively stopped".to_string(),
+        ));
+    }
+    record.complete = true;
+    write_record(store, &lifecycle_path(store), record)
 }
 
 fn complete_launch(
@@ -1052,6 +1101,37 @@ mod tests {
         }
     }
 
+    fn launch_claim(
+        record: &LifecycleLaunchRecord,
+        executor: crate::journal::LaunchExecutorIdentity,
+    ) -> LaunchClaim {
+        LaunchClaim {
+            schema_version: "1".to_string(),
+            claim_id: Uuid::new_v4().to_string(),
+            transaction_id: record.operation_id.clone(),
+            nonce: record.nonce.clone(),
+            attempt_id: "current-0".to_string(),
+            receipt_file: record.claim_file.clone(),
+            lane: LaunchLane::TargetRollForward,
+            generation_id: record.generation_id.clone(),
+            port: record.port,
+            executor,
+        }
+    }
+
+    fn write_stopped_live(store: &Store, record: &LifecycleLaunchRecord) {
+        store
+            .lock()
+            .unwrap()
+            .write_live(&LiveReceipt::new(
+                record.generation_id.clone(),
+                None,
+                false,
+                None,
+            ))
+            .unwrap();
+    }
+
     fn captured_legacy_store() -> (tempfile::TempDir, Store, ProcessIdentity) {
         let fixture = tempfile::tempdir().unwrap();
         let checkout = fixture.path().join("checkout");
@@ -1207,6 +1287,99 @@ mod tests {
             !environment.contains_key(OsStr::new("FRESHELL_BIND_HOST")),
             "an absent operator override must leave bind selection to the server"
         );
+    }
+
+    #[test]
+    fn definitely_not_started_launch_reconciles_to_the_exact_stopped_selection() {
+        let (_fixture, store, record) = managed_store();
+        write_stopped_live(&store, &record);
+        let claim = launch_claim(
+            &record,
+            crate::journal::LaunchExecutorIdentity {
+                pid: u32::MAX,
+                kernel_boot_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".to_string(),
+                start_time_ticks: "90071992547409931234".to_string(),
+                executable: record.server_executable.clone(),
+                cwd: record.generation_root.display().to_string(),
+                effective_uid: unsafe { libc::geteuid() },
+            },
+        );
+        let claim_store = LaunchAttemptReceiptStore::new(&record.claim_file).unwrap();
+        claim_store.claim(&claim).unwrap();
+        claim_store.mark_definitely_not_started(&claim).unwrap();
+
+        let locked = store.lock().unwrap();
+        recover_launch(
+            &store,
+            &locked,
+            "lifecycle-concurrency-test",
+            record.clone(),
+        )
+        .unwrap();
+
+        let terminal = read_record(&store, &lifecycle_path(&store))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal.operation_id, record.operation_id,
+            "recovery must not mint another attempt for the persistently bad generation"
+        );
+        assert!(terminal.complete);
+        assert_eq!(
+            store.selected_generation_id().unwrap().as_deref(),
+            Some(record.generation_id.as_str())
+        );
+        let stopped = store.read_live().unwrap().unwrap();
+        assert_eq!(stopped.selected_generation_id, record.generation_id);
+        assert!(stopped.running_server_generation_id.is_none());
+        assert!(stopped.process_identity.is_none());
+    }
+
+    #[test]
+    fn terminal_receipt_never_abandons_its_still_living_exact_executor() {
+        let (_fixture, store, record) = managed_store();
+        write_stopped_live(&store, &record);
+        let mut executor = Command::new("sleep")
+            .arg("30")
+            .current_dir(&record.generation_root)
+            .spawn()
+            .unwrap();
+        let executor_identity = LinuxProcfs::default()
+            .launch_executor_identity(
+                executor.id(),
+                record.server_executable.clone(),
+                &record.generation_root,
+            )
+            .unwrap();
+        let claim = launch_claim(&record, executor_identity);
+        let claim_store = LaunchAttemptReceiptStore::new(&record.claim_file).unwrap();
+        claim_store.claim(&claim).unwrap();
+        claim_store.mark_definitely_not_started(&claim).unwrap();
+
+        let locked = store.lock().unwrap();
+        let error = recover_launch(
+            &store,
+            &locked,
+            "lifecycle-concurrency-test",
+            record.clone(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("terminal lifecycle launch executor is still alive"));
+        assert!(
+            executor.try_wait().unwrap().is_none(),
+            "reconciliation must neither abandon nor signal an executor whose exit is unproven"
+        );
+        let still_pending = read_record(&store, &lifecycle_path(&store))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_pending.operation_id, record.operation_id);
+        assert!(!still_pending.complete);
+
+        executor.kill().unwrap();
+        executor.wait().unwrap();
     }
 
     #[test]
