@@ -9,23 +9,27 @@
 //! `freshell-sessions/src/resume_resolve.rs`; tracked in
 //! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
 //! `sessionResolve` capability flag is held `false` (`main.rs`) until this
-//! list is empty:
-//! - response surface (plan Tasks 3, 5, 6): no `degraded` status,
-//!   `providerErrors`, `unsearchedProviders`, or `homeDir`, and no
-//!   scan-failure/warming-default merge — the fallbacks wired in `main.rs`
-//!   map read errors to a MISS, never a provider error.
+//! list is empty. The resolve CORE is hardened (degraded status, provider
+//! errors, budgeted shape-gated fallbacks, sessionType overlay+default);
+//! what remains is this route's wire surface and the `main.rs` wiring:
+//! - wire surface (plan Tasks 5, 6): this route still serializes the legacy
+//!   `{status, matches, hint}` shape (`LegacyWire` below) — the core's
+//!   `provider_errors` are computed but DROPPED here, and there is no
+//!   `unsearchedProviders`/`homeDir` field or scan-failure/warming-default
+//!   merge yet. The fallbacks wired in `main.rs` also still map read errors
+//!   to an `Ok(None)` MISS, never an `Err(ProviderFailure)`, so `degraded`
+//!   is unreachable in production until Task 6 rewires them.
 //! - opencode by-id fallback runs the RETIRED parent-walk
 //!   (`resolveOpencodeSessionRoots` port), not Node's hardened direct row
-//!   query (`providers/opencode-by-id-query.ts`): orphaned/cyclic child
-//!   rows miss where Node hits, a legacy-schema DB universally hits any
-//!   full-shape `ses_*` id where Node hits only real rows, and hits omit
-//!   Node's `title`/`lastActivityAt`.
-//! - fallback hits hardcode `sessionType` (`"claude"`/`"opencode"`) instead
-//!   of consulting the session-metadata overlay (Node's `sessionTypeFor`).
+//!   query (`providers/opencode-by-id-query.ts`) — plan Task 4: orphaned/
+//!   cyclic child rows miss where Node hits, a legacy-schema DB universally
+//!   hits any full-shape `ses_*` id where Node hits only real rows, and the
+//!   wired hits omit Node's `title`/`lastActivityAt` (the core's
+//!   `OpencodeByIdHit` already carries them).
 //! - the claude fallback's `locate_transcript` never probes Node's
 //!   `<project>/<parent>/subagents/<id>.jsonl` layout (subagent child
-//!   transcripts miss); its cwd read IS bounded to Node's 64 KiB
-//!   (`transcript_cwd_bounded`).
+//!   transcripts miss) — the checked locator is plan Task 6; its cwd read IS
+//!   bounded to Node's 64 KiB (`transcript_cwd_bounded`).
 //!
 //! Behavior contract:
 //! - auth: same `x-auth-token` / `freshell-auth` cookie check as every other
@@ -74,10 +78,9 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
-use freshell_sessions::parse::OpencodeSessionDirectory;
 use freshell_sessions::resume_resolve::{
-    resolve_resume_input, ClaudeTranscriptHit, ResolveDeps, ResumeResolveResponse,
-    ResumeResolveStatus,
+    resolve_resume_input, ClaudeTranscriptHit, OpencodeByIdHit, ProviderFailure, ResolveDeps,
+    ResumeResolveOutcome, ResumeResolveStatus,
 };
 
 use crate::boot::{is_authed, unauthorized};
@@ -87,15 +90,18 @@ use crate::settings_store::SettingsStore;
 /// zod `.max(20000)` on `input` (`shared/resume-resolve-contract.ts`).
 const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 
-/// opencode `ses_*` by-id fallback: `Some(hit)` = Node's by-id parent-walk
-/// resolved the id (`hit.directory` is the row's own truthy `directory` —
-/// the spawn cwd — and `None` for empty/NULL directories and legacy-schema
-/// hits), `None` = walk miss (no row, orphaned chain, cycle) OR unreadable
-/// DB (read errors are a miss here — the endpoint never 5xxes).
-pub type OpencodeDirLookup = Arc<dyn Fn(&str) -> Option<OpencodeSessionDirectory> + Send + Sync>;
+/// opencode `ses_*` by-id fallback: `Ok(Some(hit))` = the lookup resolved the
+/// id, `Ok(None)` = miss, `Err(ProviderFailure)` = the provider store could
+/// not be searched (recorded as a provider error, result degrades — never a
+/// 5xx). The wiring in `main.rs` still maps read errors to `Ok(None)` until
+/// Task 6 (see the module doc's divergence list).
+pub type OpencodeByIdLookup =
+    Arc<dyn Fn(&str) -> Result<Option<OpencodeByIdHit>, ProviderFailure> + Send + Sync>;
 
-/// claude transcript exact-id fallback: lowercased id + original cwd.
-pub type ClaudeLocator = Arc<dyn Fn(&str) -> Option<ClaudeTranscriptHit> + Send + Sync>;
+/// claude transcript exact-id fallback: lowercased id + original cwd, same
+/// `Result` contract as [`OpencodeByIdLookup`].
+pub type ClaudeLocator =
+    Arc<dyn Fn(&str) -> Result<Option<ClaudeTranscriptHit>, ProviderFailure> + Send + Sync>;
 
 /// Shared state for the resolve surface.
 #[derive(Clone)]
@@ -107,7 +113,7 @@ pub struct ResolveState {
     pub settings: SettingsStore,
     pub session_index: Option<Arc<SessionIndex>>,
     pub session_metadata: SessionMetadataStore,
-    pub opencode_dir_by_id: Option<OpencodeDirLookup>,
+    pub opencode_session_by_id: Option<OpencodeByIdLookup>,
     pub locate_claude_transcript: Option<ClaudeLocator>,
 }
 
@@ -301,7 +307,7 @@ async fn resolve_session(
         HashMap::new()
     };
 
-    let opencode = state.opencode_dir_by_id.clone();
+    let opencode = state.opencode_session_by_id.clone();
     let claude = state.locate_claude_transcript.clone();
     let joined = tokio::task::spawn_blocking(move || {
         let deps = ResolveDeps {
@@ -309,8 +315,8 @@ async fn resolve_session(
             // trips clippy's warn-by-default `option_as_ref_deref` under -D warnings.
             sessions: snapshot.as_deref(),
             session_types: &session_types,
-            opencode_dir_by_id: opencode.as_deref(),
             locate_claude_transcript: claude.as_deref(),
+            opencode_session_by_id: opencode.as_deref(),
         };
         resolve_resume_input(&input, &deps)
     })
@@ -319,12 +325,28 @@ async fn resolve_session(
     // JoinError = the resolve task panicked. Express would 500 here; this
     // port answers a benign ready-empty (Global Constraint: never 5xx) and
     // the panic is already on stderr for diagnosis.
-    let response = joined.unwrap_or(ResumeResolveResponse {
+    let outcome = joined.unwrap_or(ResumeResolveOutcome {
         status: ResumeResolveStatus::Ready,
         matches: Vec::new(),
         hint: None,
+        provider_errors: Vec::new(),
     });
-    Json(response).into_response()
+
+    // TASK-6: replaced by the full hardened wire response — until then this
+    // route keeps today's `{status, matches, hint}` shape and DROPS the
+    // core's provider_errors (see the module doc's divergence list).
+    #[derive(serde::Serialize)]
+    struct LegacyWire {
+        status: freshell_sessions::resume_resolve::ResumeResolveStatus,
+        matches: Vec<freshell_sessions::resume_resolve::ResumeResolveMatch>,
+        hint: Option<freshell_sessions::resume_input::ResumeHint>,
+    }
+    Json(LegacyWire {
+        status: outcome.status,
+        matches: outcome.matches,
+        hint: outcome.hint,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -409,7 +431,7 @@ mod tests {
             settings: crate::settings_store::SettingsStore::load(Some(dir), vec!["claude".into()]),
             session_index: index,
             session_metadata: crate::session_metadata::SessionMetadataStore::new(dir),
-            opencode_dir_by_id: None,
+            opencode_session_by_id: None,
             locate_claude_transcript: None,
         }
     }
@@ -694,10 +716,13 @@ mod tests {
         let index = fixture_index(vec![claude_fixture()]).await;
         let unknown = "ses_child000000000000000000000";
         let mut st = state(&dir, Some(index));
-        st.opencode_dir_by_id = Some(Arc::new(|_id: &str| {
-            Some(freshell_sessions::parse::OpencodeSessionDirectory {
-                directory: Some("/repo/beta".to_string()),
-            })
+        st.opencode_session_by_id = Some(Arc::new(|id: &str| {
+            Ok(Some(freshell_sessions::resume_resolve::OpencodeByIdHit {
+                session_id: id.to_string(),
+                cwd: Some("/repo/beta".to_string()),
+                title: None,
+                last_activity_at: None,
+            }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": unknown }), true).await;
         assert_eq!(status, StatusCode::OK);
@@ -720,10 +745,12 @@ mod tests {
         let unknown = "aaaaaaaa-1111-4222-8333-444444444444";
         let mut st = state(&dir, Some(index));
         st.locate_claude_transcript = Some(Arc::new(move |id: &str| {
-            Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
-                session_id: id.to_ascii_lowercase(),
-                cwd: Some("/repo/gamma".to_string()),
-            })
+            Ok(Some(
+                freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    session_id: id.to_ascii_lowercase(),
+                    cwd: Some("/repo/gamma".to_string()),
+                },
+            ))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": unknown }), true).await;
         assert_eq!(status, StatusCode::OK);

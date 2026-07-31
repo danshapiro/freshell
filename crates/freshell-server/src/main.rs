@@ -1118,14 +1118,32 @@ async fn main() -> ExitCode {
             // `session-indexer.ts:1159-1161`).
             session_metadata: session_metadata_store.clone(),
             // opencode `ses_*` exact-id fallback: the SAME data home the
-            // OpencodeSource uses. Read errors (`Err`) are a resolve miss,
-            // never a 5xx — the endpoint's never-5xx contract.
-            opencode_dir_by_id: Some(std::sync::Arc::new(|session_id: &str| {
-                let data_home = freshell_sessions::parse::default_opencode_data_home();
-                freshell_sessions::parse::opencode_session_directory_by_id(&data_home, session_id)
+            // OpencodeSource uses. KNOWN DIVERGENCE (see resolve.rs module
+            // doc): still the retired parent-walk (Task 4 replaces it with
+            // the direct row query) and read errors are still mapped to an
+            // `Ok(None)` miss instead of `Err(ProviderFailure)` — the full
+            // health channel is wired in Task 6.
+            opencode_session_by_id: Some(std::sync::Arc::new(
+                |session_id: &str| -> Result<
+                    Option<freshell_sessions::resume_resolve::OpencodeByIdHit>,
+                    freshell_sessions::resume_resolve::ProviderFailure,
+                > {
+                    let data_home = freshell_sessions::parse::default_opencode_data_home();
+                    Ok(freshell_sessions::parse::opencode_session_directory_by_id(
+                        &data_home, session_id,
+                    )
                     .ok()
                     .flatten()
-            })),
+                    .map(|hit| {
+                        freshell_sessions::resume_resolve::OpencodeByIdHit {
+                            session_id: session_id.to_string(),
+                            cwd: hit.directory,
+                            title: None,
+                            last_activity_at: None,
+                        }
+                    }))
+                },
+            )),
             // claude transcript exact-id fallback: the SAME ordered-roots scan
             // the attach arm and IndexExistenceProbe trust
             // (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), paired with
@@ -1134,15 +1152,25 @@ async fn main() -> ExitCode {
             // scan a multi-GB transcript). Node's locator lowercases the id
             // before scanning and returns the lowercased id — mirrored here.
             // KNOWN DIVERGENCE (see resolve.rs module doc): this locator
-            // never probes Node's `<parent>/subagents/<id>.jsonl` layout.
-            locate_claude_transcript: Some(std::sync::Arc::new(|session_id: &str| {
-                let lowered = session_id.to_ascii_lowercase();
-                let path = freshell_freshagent::locate_transcript(&lowered)?;
-                Some(freshell_sessions::resume_resolve::ClaudeTranscriptHit {
-                    session_id: lowered,
-                    cwd: freshell_freshagent::transcript_cwd_bounded(&path),
-                })
-            })),
+            // never probes Node's `<parent>/subagents/<id>.jsonl` layout and
+            // still swallows read errors as `Ok(None)` misses — the checked
+            // locator + `Err(ProviderFailure)` reporting is wired in Task 6.
+            locate_claude_transcript: Some(std::sync::Arc::new(
+                |session_id: &str| -> Result<
+                    Option<freshell_sessions::resume_resolve::ClaudeTranscriptHit>,
+                    freshell_sessions::resume_resolve::ProviderFailure,
+                > {
+                    let lowered = session_id.to_ascii_lowercase();
+                    Ok(
+                        freshell_freshagent::locate_transcript(&lowered).map(|path| {
+                            freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                                session_id: lowered.clone(),
+                                cwd: freshell_freshagent::transcript_cwd_bounded(&path),
+                            }
+                        }),
+                    )
+                },
+            )),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
