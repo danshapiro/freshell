@@ -6,10 +6,11 @@
 //! merges router-level fields (scan failures, unsearchedProviders, homeDir)
 //! and serializes.
 //!
-//! KNOWN DIVERGENCES / NOT YET PORTED — this list is the in-code record a
-//! follow-up implementer relies on (also tracked in
+//! DIVERGENCE LEDGER — this is the in-code record a follow-up implementer
+//! relies on (history in
 //! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
-//! `sessionResolve` capability flag is held `false` until it is empty. The
+//! `sessionResolve` capability flag is declared `true`
+//! (`crates/freshell-server/src/main.rs`, `build_platform_payload`). The
 //! CORE below is at parity with the hardened Node core (matching order, case
 //! rules, subagent gating, sessionType overlay+default, provider-error
 //! channel, shape gates, budgets). The wire surface
@@ -17,10 +18,12 @@
 //! degraded fire-and-forget refresh) and the failure-REPORTING production
 //! fallbacks (checked claude locator `locate_transcript_checked`,
 //! error-propagating opencode by-id query) landed in plan Task 6
-//! (`resolve.rs` + `main.rs`); what remains:
-//!
-//! - the `sessionResolve` capability flag itself is still held `false` and
-//!   the e2e resolve matrix has not yet run against the route (plan Task 7).
+//! (`resolve.rs` + `main.rs`), and the resume-button e2e matrix ran green
+//! against the route (plan Task 7). No known unported divergences remain
+//! beyond the RECORDED DEVIATIONS documented in the HTTP layer's module doc
+//! (`resolve.rs`): an explicit 500 on a resolver panic (Node has no defined
+//! behavior there), and `homeDir` omitted when the server has no resolvable
+//! home (HOME/USERPROFILE unset).
 //!
 //! Wire parity notes:
 //! - Field ORDER in `ResumeResolveMatch` matches the Node object literals —
