@@ -277,7 +277,7 @@ if [[ "$BOOTSTRAP_STATE" == "capture-required" ]]; then
     --node-modules "$RUNTIME_ROOT/node_modules" \
     --node-executable "$NODE_EXECUTABLE" \
     --node-version "$NODE_VERSION"
-elif [[ "$BOOTSTRAP_STATE" != "captured-legacy" && "$BOOTSTRAP_STATE" != "managed" ]]; then
+elif [[ "$BOOTSTRAP_STATE" != "fresh" && "$BOOTSTRAP_STATE" != "captured-legacy" && "$BOOTSTRAP_STATE" != "managed" ]]; then
   echo "launch-rust: controller returned unknown bootstrap state $BOOTSTRAP_STATE" >&2
   exit 1
 fi

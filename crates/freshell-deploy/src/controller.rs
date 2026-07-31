@@ -17,6 +17,7 @@ use crate::store::{Generation, LockedStore, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapStatus {
+    Fresh,
     CaptureRequired,
     CapturedLegacy,
     Managed,
@@ -25,6 +26,7 @@ pub enum BootstrapStatus {
 impl fmt::Display for BootstrapStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Fresh => "fresh",
             Self::CaptureRequired => "capture-required",
             Self::CapturedLegacy => "captured-legacy",
             Self::Managed => "managed",
@@ -37,7 +39,11 @@ pub fn inspect_bootstrap_status(store: &Store) -> Result<BootstrapStatus> {
     let live = store.read_live()?;
     let legacy = store.read_legacy_capture()?;
     match (selected, live, legacy) {
-        (None, None, None) => Ok(BootstrapStatus::CaptureRequired),
+        (None, None, None) => Ok(BootstrapStatus::Fresh),
+        (Some(selected), None, None) => {
+            GenerationDescriptor::read(&store.verify_generation(&selected)?)?;
+            Ok(BootstrapStatus::Fresh)
+        }
         (Some(selected), Some(live), legacy) if live.selected_generation_id == selected => {
             let generation = store.verify_generation(&selected)?;
             match GenerationDescriptor::read(&generation) {
@@ -101,10 +107,37 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let store = Store::open(&command.checkout, command.port)?;
     let auth_token = load_auth_token(&command.checkout)?;
     recover_unfinished(&store, &auth_token)?;
-    let prior_id = store.selected_generation_id()?.ok_or_else(|| {
+    let prior_id = store.selected_generation_id()?;
+    let live = store.read_live()?;
+    let legacy = store.read_legacy_capture()?;
+    let fresh = live.is_none() && legacy.is_none();
+    if fresh && command.mode != crate::journal::UpdateMode::Full {
+        return Err(DeployError::Activation(
+            "a fresh deployment requires a combined client/server generation".to_string(),
+        ));
+    }
+    let target = assemble_generation(&store, &command)?;
+    if fresh {
+        let locked = store.lock()?;
+        if store.selected_generation_id()? != prior_id || store.read_live()?.is_some() {
+            return Err(DeployError::Activation(
+                "fresh deployment state changed after private assembly".to_string(),
+            ));
+        }
+        locked.select_generation(&target.id)?;
+        locked.write_live(&crate::receipts::LiveReceipt::new(
+            target.id.clone(),
+            None,
+            false,
+            None,
+        ))?;
+        drop(locked);
+        crate::lifecycle::execute_start_current(&command.checkout, command.port, false)?;
+        return Ok(());
+    }
+    let prior_id = prior_id.ok_or_else(|| {
         DeployError::Activation("deployment requires a selected prior generation".to_string())
     })?;
-    let target = assemble_generation(&store, &command)?;
     if target.id == prior_id {
         if command.mode.changes_server() {
             crate::lifecycle::execute_start_current(&command.checkout, command.port, true)?;

@@ -249,21 +249,29 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
             "assembly command does not match the opened deployment store".to_string(),
         ));
     }
-    let selected_id = store.selected_generation_id()?.ok_or_else(|| {
-        DeployError::InvalidReceipt(
-            "a selected prior generation is required before assembly".to_string(),
-        )
-    })?;
-    let prior = store.verify_generation(&selected_id)?;
-    let prior_descriptor = GenerationDescriptor::read(&prior);
-    if command.mode != UpdateMode::Full && prior_descriptor.is_err() {
+    let selected_id = store.selected_generation_id()?;
+    let prior = selected_id
+        .as_deref()
+        .map(|id| store.verify_generation(id))
+        .transpose()?;
+    let prior_descriptor = prior.as_ref().map(GenerationDescriptor::read);
+    if command.mode != UpdateMode::Full
+        && prior_descriptor
+            .as_ref()
+            .is_some_and(std::result::Result::is_err)
+    {
         return Err(DeployError::Activation(
             "one-sided updates are unavailable until combined bootstrap completes".to_string(),
         ));
     }
+    if prior.is_none() && command.mode != UpdateMode::Full {
+        return Err(DeployError::Activation(
+            "a fresh deployment requires a combined client/server generation".to_string(),
+        ));
+    }
 
     let locked = store.lock()?;
-    if store.selected_generation_id()?.as_deref() != Some(selected_id.as_str()) {
+    if store.selected_generation_id()? != selected_id {
         return Err(DeployError::Activation(
             "selected generation changed before private assembly".to_string(),
         ));
@@ -271,7 +279,9 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
     let mut stage = locked.begin_generation()?;
     match command.mode {
         UpdateMode::ClientOnly => {
-            let descriptor = prior_descriptor?;
+            let prior = prior.as_ref().expect("one-sided assembly has a prior");
+            let descriptor = prior_descriptor
+                .expect("one-sided assembly has descriptor result")?;
             let client = command
                 .client_dir
                 .as_deref()
@@ -293,7 +303,9 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
             stage.write_bytes(Path::new(DESCRIPTOR_FILE), &descriptor.to_json()?, 0o644)?;
         }
         UpdateMode::Server => {
-            let descriptor = prior_descriptor?;
+            let prior = prior.as_ref().expect("one-sided assembly has a prior");
+            let descriptor = prior_descriptor
+                .expect("one-sided assembly has descriptor result")?;
             stage.copy_generation_tree(&prior, Path::new("client"), Path::new("client"))?;
             let sources = command
                 .server
@@ -317,7 +329,11 @@ pub fn assemble_generation(store: &Store, command: &DeployCommand) -> Result<Gen
                 .as_deref()
                 .expect("parsed full command has client");
             let provenance = ClientAssetProvenance::from_candidate(client)?;
-            copy_candidate_client(&mut stage, client, &prior)?;
+            if let Some(prior) = prior.as_ref() {
+                copy_candidate_client(&mut stage, client, prior)?;
+            } else {
+                stage.copy_tree(client, Path::new("client"))?;
+            }
             stage.write_bytes(
                 Path::new(CLIENT_ASSET_PROVENANCE_FILE),
                 &provenance.to_json()?,

@@ -672,6 +672,23 @@ describe('canonical launch-rust deployment wrapper', () => {
       .toContain('full')
   })
 
+  it('starts a combined deployment on a genuinely unused port without legacy capture', () => {
+    const result = run(['--port', '43128', '--restart'])
+    expect(result.status, result.stderr).toBe(0)
+    const recorded = events()
+    expect(
+      recorded.some(
+        (event) => event.command === 'controller' && event.args[0] === 'capture',
+      ),
+    ).toBe(false)
+    expect(state('43128')).toMatchObject({
+      runningServerGenerationId: expect.any(String),
+      legacy: false,
+      stopCount: 0,
+      startCount: 1,
+    })
+  })
+
   it.each(['client_rejects_server', 'server_rejects_client'])(
     'rejects %s incompatibility before selected/running identities change',
     (direction) => {
@@ -946,6 +963,72 @@ describe('real deployment controller boundary', () => {
       const controller = path.join(cargoTarget, 'release/freshell-deploy')
       const extensions = realpathSync(path.join(repository, 'extensions'))
       const captureFixture = path.join(fixtures, 'real-capture-parent.sh')
+      let freshPort = await unusedPort()
+      while (freshPort === 3002 || freshPort === port) freshPort = await unusedPort()
+      const freshCommon = ['--checkout', realCheckout, '--port', String(freshPort)]
+      expect(
+        (await checkedAsync(controller, ['bootstrap-status', ...freshCommon], {
+          cwd: realCheckout,
+          env: realEnvironment,
+        })).stdout.trim(),
+      ).toBe('fresh')
+      await checkedAsync(controller, [
+        'deploy',
+        ...freshCommon,
+        '--mode',
+        'full',
+        '--client-dir',
+        candidateClient,
+        '--server-executable',
+        server,
+        '--controller-executable',
+        controller,
+        '--extensions-dir',
+        extensions,
+        '--dist-server-dir',
+        distServer,
+        '--mcp-entry-relative',
+        'mcp/server.js',
+        '--claude-sidecar-dir',
+        sidecar,
+        '--claude-sidecar-entry-relative',
+        'index.mjs',
+        '--package-json',
+        path.join(runtime, 'package.json'),
+        '--package-lock',
+        path.join(runtime, 'package-lock.json'),
+        '--node-modules',
+        nodeModules,
+        '--node-executable',
+        node,
+        '--node-version',
+        process.version,
+      ], {
+        cwd: realCheckout,
+        env: realEnvironment,
+        timeout: 300_000,
+      })
+      await waitForHttp(freshPort, 'up')
+      const freshLive = JSON.parse(readFileSync(
+        path.join(
+          realCheckout,
+          '.freshell-deploy/ports',
+          String(freshPort),
+          'live.json',
+        ),
+        'utf8',
+      ))
+      rememberProcess(knownProcesses, freshLive.processIdentity)
+      expect(freshLive).toMatchObject({
+        selectedGenerationId: freshLive.runningServerGenerationId,
+        legacy: false,
+      })
+      await checkedAsync(controller, ['stop-current', ...freshCommon], {
+        cwd: realCheckout,
+        env: realEnvironment,
+      })
+      await waitForHttp(freshPort, 'down')
+
       await checkedAsync(captureFixture, [], {
         cwd: realCheckout,
         env: {

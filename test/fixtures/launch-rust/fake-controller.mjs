@@ -94,7 +94,7 @@ if (args[0] === 'capture') {
 
 if (args[0] === 'bootstrap-status') {
   if (!existsSync(stateFile)) {
-    process.stdout.write('capture-required\n')
+    process.stdout.write('fresh\n')
   } else if (state().legacy) {
     process.stdout.write('capture-required\n')
   } else {
@@ -104,8 +104,16 @@ if (args[0] === 'bootstrap-status') {
 }
 
 if (args[0] === 'deploy') {
-  const before = state()
   const mode = value('--mode')
+  const before = existsSync(stateFile)
+    ? state()
+    : {
+        selectedGenerationId: null,
+        runningServerGenerationId: null,
+        legacy: false,
+        stopCount: 0,
+        startCount: 0,
+      }
   if (before.legacy && mode !== 'full') {
     process.stderr.write('one-sided modes are unavailable before bootstrap\n')
     process.exit(1)
@@ -128,8 +136,10 @@ if (args[0] === 'deploy') {
     const candidate = value('--client-dir')
     copyFileSync(path.join(candidate, 'index.html'), path.join(client, 'index.html'))
     copyFileSync(path.join(candidate, 'assets', 'candidate.js'), path.join(client, 'assets', 'candidate.js'))
-    const priorAsset = path.join(generations, before.selectedGenerationId, 'client', 'assets', 'prior.js')
-    if (existsSync(priorAsset)) copyFileSync(priorAsset, path.join(client, 'assets', 'prior.js'))
+    if (before.selectedGenerationId) {
+      const priorAsset = path.join(generations, before.selectedGenerationId, 'client', 'assets', 'prior.js')
+      if (existsSync(priorAsset)) copyFileSync(priorAsset, path.join(client, 'assets', 'prior.js'))
+    }
   }
   const candidate = {
     ...before,
@@ -137,7 +147,10 @@ if (args[0] === 'deploy') {
     runningServerGenerationId: mode === 'client-only' ? before.runningServerGenerationId : id,
     legacy: mode === 'client-only' ? before.legacy : false,
   }
-  if (mode !== 'client-only') candidate.stopCount += 1
+  if (mode !== 'client-only') {
+    candidate.stopCount += before.runningServerGenerationId ? 1 : 0
+    candidate.startCount += 1
+  }
   const failpoint = process.env.FRESHELL_FIXTURE_FAILPOINT
   const afterCommit = new Set(['after_activation_receipt', 'after_activation_confirmed'])
   if (failpoint && !afterCommit.has(failpoint)) {

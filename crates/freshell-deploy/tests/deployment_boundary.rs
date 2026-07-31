@@ -240,7 +240,7 @@ fn production_binary_routes_strict_controller_commands() {
     assert!(status.status.success());
     assert_eq!(
         String::from_utf8(status.stdout).unwrap(),
-        "capture-required\n"
+        "fresh\n"
     );
 
     let malformed = Command::new(binary)
@@ -425,7 +425,10 @@ fn assembly_fixture() -> AssemblyFixture {
 #[test]
 fn bootstrap_status_requires_complete_receipts_and_recognizes_managed_state() {
     let fixture = assembly_fixture();
-    assert!(inspect_bootstrap_status(&fixture.store).is_err());
+    assert_eq!(
+        inspect_bootstrap_status(&fixture.store).unwrap(),
+        BootstrapStatus::Fresh
+    );
     let locked = fixture.store.lock().unwrap();
     locked
         .write_live(&LiveReceipt::new(
@@ -439,6 +442,32 @@ fn bootstrap_status_requires_complete_receipts_and_recognizes_managed_state() {
     assert_eq!(
         inspect_bootstrap_status(&fixture.store).unwrap(),
         BootstrapStatus::Managed
+    );
+}
+
+#[test]
+fn an_unused_port_store_is_fresh_and_accepts_a_combined_generation() {
+    let fixture = assembly_fixture();
+    fs::remove_file(fixture.store.paths().current_pointer()).unwrap();
+    assert_eq!(
+        inspect_bootstrap_status(&fixture.store).unwrap(),
+        BootstrapStatus::Fresh
+    );
+
+    let client = fixture.sources.join("fresh-client");
+    write(client.join("index.html"), b"fresh\n");
+    write(client.join("assets/fresh.js"), b"fresh asset\n");
+    write(client.join("deployment-compatibility.json"), b"{}\n");
+    let target = assemble_generation(
+        &fixture.store,
+        &full_command(&fixture, &client, "fresh-server"),
+    )
+    .unwrap();
+
+    assert!(target.path.join("client/assets/fresh.js").is_file());
+    assert!(
+        !target.path.join("client/assets/prior.js").exists(),
+        "a fresh store has no predecessor assets to retain"
     );
 }
 
