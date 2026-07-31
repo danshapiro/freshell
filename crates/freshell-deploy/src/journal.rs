@@ -464,7 +464,7 @@ impl TransactionRecord {
             ));
         }
         for process in &self.relaunch_attempts {
-            if self.mode == UpdateMode::ClientOnly || self.phase == TransactionPhase::Activated {
+            if self.mode == UpdateMode::ClientOnly {
                 return Err(DeployError::Journal(
                     "relaunch evidence is invalid for this transaction phase".to_string(),
                 ));
@@ -509,8 +509,7 @@ impl TransactionRecord {
                 && !match attempt.lane {
                     LaunchLane::TargetGated => self.phase == TransactionPhase::StartTargetIntent,
                     LaunchLane::PriorRollback => {
-                        self.mode.changes_server()
-                            && self.phase <= TransactionPhase::ActivationAuthorized
+                        self.mode.changes_server() && self.phase <= TransactionPhase::Activated
                     }
                     LaunchLane::TargetRollForward => {
                         self.mode.changes_server()
@@ -526,7 +525,7 @@ impl TransactionRecord {
                 && match attempt.lane {
                     LaunchLane::TargetGated => false,
                     LaunchLane::PriorRollback => {
-                        self.phase > TransactionPhase::ActivationAuthorized
+                        self.phase > TransactionPhase::Activated
                             && self.phase != TransactionPhase::RollbackComplete
                     }
                     LaunchLane::TargetRollForward => {

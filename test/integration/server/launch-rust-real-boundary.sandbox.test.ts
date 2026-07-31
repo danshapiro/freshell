@@ -1620,6 +1620,7 @@ describe('real deployment controller boundary', () => {
           phase: 'switch_current_intent',
           selected: 'prior',
           activated: false,
+          rollForward: false,
           live: false,
           finalized: false,
           interruptPriorRelaunch: true,
@@ -1630,6 +1631,7 @@ describe('real deployment controller boundary', () => {
           phase: 'switch_current_intent',
           selected: 'target',
           activated: false,
+          rollForward: false,
           live: false,
           finalized: false,
           interruptPriorRelaunch: false,
@@ -1640,6 +1642,7 @@ describe('real deployment controller boundary', () => {
           phase: 'activation_authorized',
           selected: 'target',
           activated: true,
+          rollForward: false,
           live: false,
           finalized: false,
           interruptPriorRelaunch: false,
@@ -1650,6 +1653,7 @@ describe('real deployment controller boundary', () => {
           phase: 'activation_confirmed',
           selected: 'target',
           activated: true,
+          rollForward: true,
           live: true,
           finalized: false,
           interruptPriorRelaunch: false,
@@ -1660,6 +1664,7 @@ describe('real deployment controller boundary', () => {
           phase: 'activation_confirmed',
           selected: 'target',
           activated: true,
+          rollForward: true,
           live: true,
           finalized: true,
           interruptPriorRelaunch: false,
@@ -1791,31 +1796,19 @@ describe('real deployment controller boundary', () => {
         rememberProcess(knownProcesses, recoveredLive.processIdentity)
 
         if (boundary.activated) {
-          if (boundary.stopCandidateAfterReceipt) {
-            expect(recoveredLive.processIdentity, boundary.name)
-              .not.toEqual(interrupted.candidate.process)
-            expect(isRecordedProcessRunning(interrupted.candidate.process), boundary.name)
-              .toBe(false)
-            expect(
-              recovered.launchAttempts.map((attempt: any) => attempt.lane),
-              boundary.name,
-            ).toEqual(['target_gated', 'target_roll_forward'])
-            expect(
-              recovered.launchAttempts.at(-1).state.processIdentity,
-              boundary.name,
-            ).toEqual(recoveredLive.processIdentity)
-          } else {
-            expect(recoveredLive.processIdentity, boundary.name)
-              .toEqual(interrupted.candidate.process)
-            expect(recovered.launchAttempts, boundary.name)
-              .toEqual(interrupted.launchAttempts)
-          }
           expect(readFileSync(interrupted.controls.activatedFile, 'utf8'), boundary.name)
             .toBe(activationReceiptBytes)
           expect(
             JSON.parse(readFileSync(interrupted.controls.activatedFile, 'utf8')),
             boundary.name,
           ).toEqual(interrupted.candidate.ready)
+        }
+
+        if (boundary.rollForward) {
+          expect(recoveredLive.processIdentity, boundary.name)
+            .toEqual(interrupted.candidate.process)
+          expect(recovered.launchAttempts, boundary.name)
+            .toEqual(interrupted.launchAttempts)
           expect(
             recovered.launchAttempts.map((attempt: any) => attempt.lane),
             boundary.name,
@@ -1830,6 +1823,20 @@ describe('real deployment controller boundary', () => {
             .toBe(interrupted.priorGenerationId)
           expect(recoveredLive.runningServerGenerationId, boundary.name)
             .toBe(interrupted.priorGenerationId)
+          if (boundary.stopCandidateAfterReceipt) {
+            expect(recoveredLive.processIdentity, boundary.name)
+              .not.toEqual(interrupted.candidate.process)
+            expect(isRecordedProcessRunning(interrupted.candidate.process), boundary.name)
+              .toBe(false)
+            expect(
+              recovered.launchAttempts.map((attempt: any) => attempt.lane),
+              boundary.name,
+            ).toEqual(['target_gated', 'prior_rollback'])
+            expect(
+              recovered.launchAttempts.at(-1).state.processIdentity,
+              boundary.name,
+            ).toEqual(recoveredLive.processIdentity)
+          }
           await checkedAsync(controller, fullDeployArgs(interruptedClient), {
             cwd: realCheckout,
             env: realEnvironment,
@@ -1861,7 +1868,7 @@ describe('real deployment controller boundary', () => {
           ).text(),
           boundary.name,
         ).toContain(boundary.name)
-        if (boundary.activated) {
+        if (boundary.rollForward) {
           expect(existsSync(recovered.controls.activatedFile)).toBe(true)
           expect(path.basename(readlinkSync(path.join(portRoot, 'current')))).toBe(
             recovered.targetGenerationId,

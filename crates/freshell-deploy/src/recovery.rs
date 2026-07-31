@@ -45,25 +45,10 @@ where
         return Ok(RecoveryOutcome::Activated);
     }
     if record.phase == TransactionPhase::Activated {
-        require_selected(driver, &record.target_generation_id)?;
-        let state = driver.observe_port(&record)?;
-        validate_port_state(&record, &state)?;
-        match state {
-            PortState::Target {
-                candidate,
-                service: ServiceState::Ordinary,
-            } => {
-                driver.verify_running(&candidate.process)?;
-                driver.verify_ordinary(&candidate.process)?;
-            }
-            PortState::Free => verify_owned_predecessors_exited(driver, &record)?,
-            _ => {
-                return Err(DeployError::Recovery(
-                    "durably activated target has unsafe pointer or process drift".to_string(),
-                ))
-            }
+        if !verify_exact_ordinary_target(driver, &record)? {
+            rollback(journal, driver, &record)?;
+            return Ok(RecoveryOutcome::RolledBack);
         }
-        require_selected(driver, &record.target_generation_id)?;
         let confirmed = record.advanced(TransactionPhase::ActivationConfirmed)?;
         journal.save(&confirmed)?;
         roll_forward_confirmed(journal, driver, &confirmed)?;
@@ -79,8 +64,7 @@ where
                         "activation receipt exists without durable candidate evidence".to_string(),
                     )
                 })?;
-                confirm_durable_activation(journal, driver, &record, candidate, &receipt)?;
-                return Ok(RecoveryOutcome::Activated);
+                return confirm_durable_activation(journal, driver, &record, candidate, &receipt);
             }
             ActivationReceiptObservation::Absent => {
                 let candidate = record.candidate.as_ref().ok_or_else(|| {
@@ -126,10 +110,9 @@ where
                                 ActivationReceiptObservation::Present(receipt),
                                 ActivationReceiptObservation::Absent,
                             ) => {
-                                confirm_durable_activation(
+                                return confirm_durable_activation(
                                     journal, driver, &record, candidate, &receipt,
-                                )?;
-                                return Ok(RecoveryOutcome::Activated);
+                                );
                             }
                             (
                                 ActivationReceiptObservation::Absent,
@@ -192,19 +175,56 @@ fn confirm_durable_activation<J, D>(
     record: &TransactionRecord,
     candidate: &crate::probe::CandidateEvidence,
     receipt: &crate::probe::DeploymentReadyReceipt,
-) -> Result<()>
+) -> Result<RecoveryOutcome>
 where
     J: TransactionJournal,
     D: ActivationDriver,
 {
     require_matching_receipt(record, candidate, receipt)?;
-    require_selected(driver, &record.target_generation_id)?;
+    if !verify_exact_ordinary_target(driver, record)? {
+        rollback(journal, driver, record)?;
+        return Ok(RecoveryOutcome::RolledBack);
+    }
     let activated = record.advanced(TransactionPhase::Activated)?;
     journal.save(&activated)?;
-    require_selected(driver, &record.target_generation_id)?;
+    if !verify_exact_ordinary_target(driver, &activated)? {
+        rollback(journal, driver, &activated)?;
+        return Ok(RecoveryOutcome::RolledBack);
+    }
     let confirmed = activated.advanced(TransactionPhase::ActivationConfirmed)?;
     journal.save(&confirmed)?;
-    roll_forward_confirmed(journal, driver, &confirmed)
+    roll_forward_confirmed(journal, driver, &confirmed)?;
+    Ok(RecoveryOutcome::Activated)
+}
+
+fn verify_exact_ordinary_target<D: ActivationDriver>(
+    driver: &mut D,
+    record: &TransactionRecord,
+) -> Result<bool> {
+    let selected = driver.selected_generation()?;
+    if selected == record.prior_generation_id {
+        return Ok(false);
+    }
+    if selected != record.target_generation_id {
+        return Err(DeployError::Recovery(format!(
+            "current pointer changed to {selected}; expected the prior or target generation during pre-confirmation recovery"
+        )));
+    }
+    for _ in 0..2 {
+        let state = driver.observe_port(record)?;
+        validate_port_state(record, &state)?;
+        let process = match state {
+            PortState::Target {
+                candidate,
+                service: ServiceState::Ordinary,
+            } => candidate.process,
+            _ => return Ok(false),
+        };
+        driver.verify_running(&process)?;
+        driver.verify_ordinary(&process)?;
+        require_selected(driver, &record.target_generation_id)?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn reconcile_pending_launch<J, D>(

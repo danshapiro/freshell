@@ -1481,7 +1481,7 @@ fn precommit_recovery_covers_each_stop_start_and_pointer_crash_window() {
 }
 
 #[test]
-fn exact_durable_activation_receipt_commits_even_after_candidate_exit() {
+fn exact_activation_receipt_does_not_commit_an_exited_candidate() {
     let mut record = prepared_record(UpdateMode::Server, 3514);
     record.phase = TransactionPhase::ActivationAuthorized;
     record.candidate = Some(candidate(TARGET_ID, 5102, 3514));
@@ -1496,29 +1496,29 @@ fn exact_durable_activation_receipt_commits_even_after_candidate_exit() {
 
     let result = ActivationController::new(&mut journal, &mut driver).recover();
 
-    assert_eq!(result.unwrap(), RecoveryOutcome::Activated);
+    assert_eq!(result.unwrap(), RecoveryOutcome::RolledBack);
     assert_eq!(
         journal.record.as_ref().unwrap().phase,
-        TransactionPhase::ActivationConfirmed
+        TransactionPhase::RollbackComplete
     );
     assert!(journal.record.as_ref().unwrap().finalized);
-    assert_eq!(driver.selected, TARGET_ID);
+    assert_eq!(driver.selected, PRIOR_ID);
     assert!(
         driver
             .events
             .iter()
-            .any(|event| matches!(event, Event::StartOrdinary(_))),
-        "a committed target whose original process exited must relaunch the exact target generation"
+            .any(|event| matches!(event, Event::StartOrdinary(root) if root == &generation_root(3514, PRIOR_ID).display().to_string())),
+        "an exited target before confirmation must relaunch the prior generation"
     );
-    assert_eq!(driver.live.selected_generation_id, TARGET_ID);
+    assert_eq!(driver.live.selected_generation_id, PRIOR_ID);
     assert_eq!(
         driver.live.running_server_generation_id.as_deref(),
-        Some(TARGET_ID)
+        Some(PRIOR_ID)
     );
 }
 
 #[test]
-fn durable_activated_authority_ignores_receipt_loss_but_rejects_gated_drift() {
+fn activated_recovery_requires_a_live_ordinary_target_before_confirmation() {
     #[derive(Clone, Copy)]
     enum BrokenEvidence {
         Absent,
@@ -1527,6 +1527,7 @@ fn durable_activated_authority_ignores_receipt_loss_but_rejects_gated_drift() {
         Mismatched,
         Gated,
         Vanished,
+        VanishedAfterPointerRestore,
     }
     for broken in [
         BrokenEvidence::Absent,
@@ -1535,6 +1536,7 @@ fn durable_activated_authority_ignores_receipt_loss_but_rejects_gated_drift() {
         BrokenEvidence::Mismatched,
         BrokenEvidence::Gated,
         BrokenEvidence::Vanished,
+        BrokenEvidence::VanishedAfterPointerRestore,
     ] {
         let mut record = prepared_record(UpdateMode::Server, 3541);
         record.phase = TransactionPhase::Activated;
@@ -1567,15 +1569,25 @@ fn durable_activated_authority_ignores_receipt_loss_but_rejects_gated_drift() {
             BrokenEvidence::Vanished => {
                 driver.state = PortState::Free;
             }
+            BrokenEvidence::VanishedAfterPointerRestore => {
+                driver.state = PortState::Free;
+                driver.selected = PRIOR_ID.to_string();
+            }
         }
 
         let result = ActivationController::new(&mut journal, &mut driver).recover();
-        if matches!(broken, BrokenEvidence::Gated) {
-            assert!(result.is_err());
+        if matches!(
+            broken,
+            BrokenEvidence::Gated
+                | BrokenEvidence::Vanished
+                | BrokenEvidence::VanishedAfterPointerRestore
+        ) {
+            assert_eq!(result.unwrap(), RecoveryOutcome::RolledBack);
             assert_eq!(
                 journal.record.as_ref().unwrap().phase,
-                TransactionPhase::Activated
+                TransactionPhase::RollbackComplete
             );
+            assert_eq!(driver.selected, PRIOR_ID);
         } else {
             assert_eq!(result.unwrap(), RecoveryOutcome::Activated);
             assert_eq!(
