@@ -22,6 +22,7 @@ import { createHash } from 'node:crypto'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { stopOwnedChildBeforeIdentity } from '../../helpers/owned-child-process.js'
+import { waitForHttp as waitForHttpWithDeadline } from '../../e2e-browser/helpers/wait-for-http.js'
 
 function isStrictlyBeneath(root: string, candidate: string) {
   const relative = path.relative(path.resolve(root), path.resolve(candidate))
@@ -253,18 +254,8 @@ async function unusedPort() {
   return address.port
 }
 
-async function waitForHttp(port: number, expected: 'up' | 'down', timeout = 20_000) {
-  const deadline = Date.now() + timeout
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`)
-      if (expected === 'up' && response.status === 200) return
-    } catch {
-      if (expected === 'down') return
-    }
-    await new Promise((resolve) => setTimeout(resolve, 40))
-  }
-  throw new Error(`port ${port} did not become ${expected}`)
+function waitForHttp(port: number, expected: 'up' | 'down', timeout = 20_000) {
+  return waitForHttpWithDeadline(port, expected, timeout, { pollInterval: 40 })
 }
 
 function sha256(file: string) {
