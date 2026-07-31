@@ -884,15 +884,78 @@ impl GenerationStage {
 impl Drop for GenerationStage {
     fn drop(&mut self) {
         if !self.published && self.path.starts_with(self.store.paths.generations_dir()) {
-            let safely_removed = self
-                .manifest
-                .as_ref()
-                .is_some_and(|manifest| remove_manifested_tree(&self.path, manifest).is_ok());
+            let safely_removed = match self.manifest.as_ref() {
+                Some(manifest) => remove_manifested_tree(&self.path, manifest).is_ok(),
+                None => {
+                    remove_unsealed_stage(self.store.paths.generations_dir(), &self.path).is_ok()
+                }
+            };
             if safely_removed {
                 let _ = sync_directory(self.store.paths.generations_dir());
             }
         }
     }
+}
+
+fn remove_unsealed_stage(generations: &Path, root: &Path) -> Result<()> {
+    if root.parent() != Some(generations) {
+        return Err(DeployError::UnsafeStorePath(root.to_path_buf()));
+    }
+    let stage_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(".stage-"))
+        .ok_or_else(|| DeployError::UnsafeStorePath(root.to_path_buf()))?;
+    Uuid::parse_str(stage_name).map_err(|_| DeployError::UnsafeStorePath(root.to_path_buf()))?;
+    let initial = fs::symlink_metadata(root)?;
+    if initial.file_type().is_symlink()
+        || !initial.is_dir()
+        || initial.uid() != unsafe { libc::geteuid() }
+        || initial.mode() & 0o7777 != 0o700
+    {
+        return Err(DeployError::UnsafeStorePath(root.to_path_buf()));
+    }
+    let entries = crate::manifest::snapshot_tree_entries(root)?;
+    let revalidated = fs::symlink_metadata(root)?;
+    if revalidated.file_type().is_symlink()
+        || !revalidated.is_dir()
+        || revalidated.dev() != initial.dev()
+        || revalidated.ino() != initial.ino()
+        || revalidated.uid() != initial.uid()
+        || revalidated.mode() & 0o7777 != 0o700
+        || crate::manifest::snapshot_tree_entries(root)? != entries
+    {
+        return Err(DeployError::UnsafeStorePath(root.to_path_buf()));
+    }
+
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    for entry in entries {
+        let path = root.join(entry.path);
+        match entry.kind {
+            crate::manifest::EntryKind::Directory => directories.push(path),
+            crate::manifest::EntryKind::File | crate::manifest::EntryKind::Symlink => {
+                files.push(path)
+            }
+        }
+    }
+    directories.sort_by_key(|path| path.components().count());
+    for path in &directories {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(DeployError::UnsafeStorePath(path.clone()));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    for path in files {
+        fs::remove_file(path)?;
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        fs::remove_dir(path)?;
+    }
+    fs::remove_dir(root)?;
+    Ok(())
 }
 
 fn copy_directory_contents(source: &Path, destination: &Path, relative_base: &Path) -> Result<()> {

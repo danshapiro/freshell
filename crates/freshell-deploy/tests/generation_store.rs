@@ -752,6 +752,24 @@ fn abandoned_stage_cleanup_also_refuses_any_unmanifested_path() {
 }
 
 #[test]
+fn unsealed_controller_owned_stage_is_removed_on_drop() {
+    let fixture = checkout();
+    let store = store(fixture.path(), 3332);
+    let mut stage = begin_generation(&store).unwrap();
+    stage
+        .write_bytes(Path::new("partial/nested"), b"partial assembly", 0o644)
+        .unwrap();
+    let stage_path = stage.path().to_path_buf();
+
+    drop(stage);
+
+    assert!(
+        !stage_path.exists(),
+        "a failed pre-seal assembly must not leak its private staging closure"
+    );
+}
+
+#[test]
 fn abandoned_stage_cleanup_never_follows_a_replaced_stage_root_symlink() {
     let fixture = checkout();
     let store = store(fixture.path(), 3327);
