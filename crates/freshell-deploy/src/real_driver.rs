@@ -87,6 +87,19 @@ impl<'store, 'lock> RealActivationDriver<'store, 'lock> {
         })
     }
 
+    pub(crate) fn preflight_fresh_target(&mut self, root: &Path, id: &str) -> Result<()> {
+        if self.store.selected_generation_id()?.is_some()
+            || self.store.read_live()?.is_some()
+            || self.store.read_legacy_capture()?.is_some()
+            || self.procfs.port_has_listener(self.store.paths().port())?
+        {
+            return Err(DeployError::Activation(
+                "fresh deployment state changed before target preflight".to_string(),
+            ));
+        }
+        self.probe_generation(root, id)
+    }
+
     fn probe_generation(&mut self, root: &Path, id: &str) -> Result<()> {
         let generation = self.store.verify_generation(id)?;
         if generation.path != root {

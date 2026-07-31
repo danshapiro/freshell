@@ -141,11 +141,16 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let target = assemble_generation(&store, &command)?;
     if fresh {
         let locked = store.lock()?;
-        if store.selected_generation_id()? != prior_id || store.read_live()?.is_some() {
+        if store.selected_generation_id()? != prior_id
+            || store.read_live()?.is_some()
+            || store.read_legacy_capture()?.is_some()
+        {
             return Err(DeployError::Activation(
                 "fresh deployment state changed after private assembly".to_string(),
             ));
         }
+        RealActivationDriver::new(&store, &locked, auth_token.clone())?
+            .preflight_fresh_target(&target.path, &target.id)?;
         locked.select_generation(&target.id)?;
         locked.write_live(&crate::receipts::LiveReceipt::new(
             target.id.clone(),

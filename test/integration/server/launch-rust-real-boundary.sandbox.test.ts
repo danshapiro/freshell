@@ -969,16 +969,28 @@ describe('real deployment controller boundary', () => {
       const controller = path.join(cargoTarget, 'release/freshell-deploy')
       const extensions = realpathSync(path.join(repository, 'extensions'))
       const captureFixture = path.join(fixtures, 'real-capture-parent.sh')
+      const brokenSidecar = path.join(root, 'broken-sidecar')
+      cpSync(sidecar, brokenSidecar, { recursive: true })
+      writeFileSync(
+        path.join(brokenSidecar, 'index.mjs'),
+        "await import('./missing-sidecar-dependency.mjs')\n",
+      )
+      const brokenDistServer = path.join(root, 'broken-dist-server')
+      cpSync(distServer, brokenDistServer, { recursive: true })
+      writeFileSync(
+        path.join(brokenDistServer, 'mcp/server.js'),
+        "await import('./missing-mcp-dependency.mjs')\n",
+      )
       let freshPort = await unusedPort()
       while (freshPort === 3002 || freshPort === port) freshPort = await unusedPort()
       const freshCommon = ['--checkout', realCheckout, '--port', String(freshPort)]
-      expect(
-        (await checkedAsync(controller, ['bootstrap-status', ...freshCommon], {
-          cwd: realCheckout,
-          env: realEnvironment,
-        })).stdout.trim(),
-      ).toBe('fresh')
-      await checkedAsync(controller, [
+      const freshDeployArgs = ({
+        sidecarDir = sidecar,
+        distServerDir = distServer,
+      }: {
+        sidecarDir?: string
+        distServerDir?: string
+      } = {}) => [
         'deploy',
         ...freshCommon,
         '--mode',
@@ -992,11 +1004,11 @@ describe('real deployment controller boundary', () => {
         '--extensions-dir',
         extensions,
         '--dist-server-dir',
-        distServer,
+        distServerDir,
         '--mcp-entry-relative',
         'mcp/server.js',
         '--claude-sidecar-dir',
-        sidecar,
+        sidecarDir,
         '--claude-sidecar-entry-relative',
         'index.mjs',
         '--package-json',
@@ -1009,7 +1021,46 @@ describe('real deployment controller boundary', () => {
         node,
         '--node-version',
         process.version,
-      ], {
+      ]
+      const freshPortRoot = path.join(
+        realCheckout,
+        '.freshell-deploy/ports',
+        String(freshPort),
+      )
+      const expectFreshState = async () => {
+        expect(existsSync(path.join(freshPortRoot, 'current'))).toBe(false)
+        expect(existsSync(path.join(freshPortRoot, 'live.json'))).toBe(false)
+        await waitForPortFree(freshPort)
+        expect(
+          (await checkedAsync(controller, ['bootstrap-status', ...freshCommon], {
+            cwd: realCheckout,
+            env: realEnvironment,
+          })).stdout.trim(),
+        ).toBe('fresh')
+      }
+      expect(
+        (await checkedAsync(controller, ['bootstrap-status', ...freshCommon], {
+          cwd: realCheckout,
+          env: realEnvironment,
+        })).stdout.trim(),
+      ).toBe('fresh')
+      await expect(
+        checkedAsync(controller, freshDeployArgs({ sidecarDir: brokenSidecar }), {
+          cwd: realCheckout,
+          env: realEnvironment,
+          timeout: 300_000,
+        }),
+      ).rejects.toThrow(/probe command failed/i)
+      await expectFreshState()
+      await expect(
+        checkedAsync(controller, freshDeployArgs({ distServerDir: brokenDistServer }), {
+          cwd: realCheckout,
+          env: realEnvironment,
+          timeout: 300_000,
+        }),
+      ).rejects.toThrow(/probe command failed/i)
+      await expectFreshState()
+      await checkedAsync(controller, freshDeployArgs(), {
         cwd: realCheckout,
         env: realEnvironment,
         timeout: 300_000,
