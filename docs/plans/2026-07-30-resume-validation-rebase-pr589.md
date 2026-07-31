@@ -578,7 +578,7 @@ fn fresh_create(request_id: &str, mode: &str) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn server_allocated_fresh_claude_id_is_never_gated() {
     let (url, registry, _ledger, _state) =
-        spawn_server_with_probe(AlwaysAbsentProbe, false).await;
+        spawn_server_with_probe(Arc::new(AlwaysAbsentProbe), false).await;
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
     send_json(&mut ws, &fresh_create("req-prealloc-claude", "claude")).await;
@@ -601,7 +601,7 @@ async fn server_allocated_fresh_claude_id_is_never_gated() {
 #[tokio::test(flavor = "multi_thread")]
 async fn server_allocated_fresh_amplifier_id_is_never_gated() {
     let (url, registry, _ledger, _state) =
-        spawn_server_with_probe(AlwaysAbsentProbe, false).await;
+        spawn_server_with_probe(Arc::new(AlwaysAbsentProbe), false).await;
     let _amp_home = common::isolate_amplifier_home();
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
@@ -621,10 +621,14 @@ async fn server_allocated_fresh_amplifier_id_is_never_gated() {
 }
 ```
 
-If `spawn_server_with_probe`'s parameter is a concrete `StubProbe` type rather
-than `impl SessionExistenceProbe`, generalize the parameter to
-`impl SessionExistenceProbe + Send + Sync + 'static` (matching how the probe is
-stored in `WsState.session_existence`) — a test-harness-only change in this file.
+`spawn_server_with_probe`'s probe parameter is `Arc<dyn SessionExistenceProbe>`
+(resume_validation_gate.rs:96-102) — all six existing call sites pass an `Arc`,
+which is why the snippet wraps the probe in `Arc::new(...)` (unsized coercion
+`Arc<AlwaysAbsentProbe> → Arc<dyn SessionExistenceProbe>` happens at the call
+site; `Arc` is already imported in this file for those existing calls). Do NOT
+change the harness signature — that would break the six existing callers. If
+the signature has drifted from `Arc<dyn ...>`, match whatever the existing
+call sites in the file do verbatim.
 
 - [ ] **Step 3: Run the new tests**
 
