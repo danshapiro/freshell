@@ -19,13 +19,11 @@
 //!   merge yet. The fallbacks wired in `main.rs` also still map read errors
 //!   to an `Ok(None)` MISS, never an `Err(ProviderFailure)`, so `degraded`
 //!   is unreachable in production until Task 6 rewires them.
-//! - opencode by-id fallback runs the RETIRED parent-walk
-//!   (`resolveOpencodeSessionRoots` port), not Node's hardened direct row
-//!   query (`providers/opencode-by-id-query.ts`) — plan Task 4: orphaned/
-//!   cyclic child rows miss where Node hits, a legacy-schema DB universally
-//!   hits any full-shape `ses_*` id where Node hits only real rows, and the
-//!   wired hits omit Node's `title`/`lastActivityAt` (the core's
-//!   `OpencodeByIdHit` already carries them).
+//! - the opencode by-id fallback now runs Node's hardened direct row query
+//!   (`opencode_session_row_by_id`, `providers/opencode-by-id-query.ts` —
+//!   archived + child rows hit, `title`/`lastActivityAt` returned), but its
+//!   read errors are still mapped to an `Ok(None)` miss (see above) — the
+//!   `Err(ProviderFailure)` rewire is plan Task 6.
 //! - the claude fallback's `locate_transcript` never probes Node's
 //!   `<project>/<parent>/subagents/<id>.jsonl` layout (subagent child
 //!   transcripts miss) — the checked locator is plan Task 6; its cwd read IS
@@ -720,8 +718,8 @@ mod tests {
             Ok(Some(freshell_sessions::resume_resolve::OpencodeByIdHit {
                 session_id: id.to_string(),
                 cwd: Some("/repo/beta".to_string()),
-                title: None,
-                last_activity_at: None,
+                title: Some("beta".to_string()),
+                last_activity_at: Some(1234),
             }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": unknown }), true).await;
@@ -733,6 +731,8 @@ mod tests {
                 "sessionId": unknown,
                 "cwd": "/repo/beta",
                 "sessionType": "opencode",
+                "title": "beta",
+                "lastActivityAt": 1234,
                 "matchKind": "exact"
             }])
         );
