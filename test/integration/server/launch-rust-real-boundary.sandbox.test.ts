@@ -1255,7 +1255,13 @@ describe('real deployment controller boundary', () => {
         ),
       ).toBe(true)
       expect(await (await fetch(`http://127.0.0.1:${port}/`)).text()).toContain(clientMarker)
-      assertExactManagedGeneration(portRoot, restoredLegacy, port, node, false)
+      assertExactManagedGeneration(
+        portRoot,
+        emergencyRestartedLegacy,
+        port,
+        node,
+        false,
+      )
       expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
 
       await checkedAsync(
