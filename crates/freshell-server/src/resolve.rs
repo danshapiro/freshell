@@ -45,7 +45,12 @@
 //!   the async runtime, and per-request work is bounded by
 //!   `MAX_RESUME_CANDIDATES` (8) × `FALLBACK_BUDGET_PER_REQUEST` (2 per
 //!   provider) fallback calls + one index scan per token. Keep any new
-//!   closure invocation inside that block.
+//!   closure invocation inside that block. The whole blocking task is
+//!   additionally bounded by [`RESOLVE_OUTER_DEADLINE`] (Node's hard 15 s
+//!   by-id runner timeout): on elapse the task is ABANDONED (blocking tasks
+//!   cannot be cancelled — recorded deviation from Node's
+//!   `worker.terminate()`) and the request answers a degraded 200 reporting
+//!   every enabled provider unsearchable.
 //! - RECORDED DEVIATION: a `JoinError` (the resolver PANICKED) answers an
 //!   explicit 500 `{"error":"Resolve failed"}`. Node has no defined behavior
 //!   here — a top-level resolver throw becomes an unhandled rejection in the
@@ -113,6 +118,13 @@ use crate::settings_store::SettingsStore;
 /// zod `.max(20000)` on `input` (`shared/resume-resolve-contract.ts`).
 const RESOLVE_INPUT_MAX_UTF16: usize = 20000;
 
+/// Outer deadline on the blocking resolver, mirroring Node's hard by-id
+/// runner timeout (`opencode-by-id-runner.ts` `DEFAULT_TIMEOUT_MS = 15_000`;
+/// the listing runner uses the same value). Without it, a filesystem or
+/// SQLite operation stalled OUTSIDE SQLite's 500 ms busy handling would hold
+/// this request and a blocking-pool worker alive indefinitely.
+pub const RESOLVE_OUTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(15_000);
+
 /// opencode `ses_*` by-id fallback: `Ok(Some(hit))` = the lookup resolved the
 /// id, `Ok(None)` = miss, `Err(ProviderFailure)` = the provider store could
 /// not be searched (recorded as a provider error, result degrades — never a
@@ -141,6 +153,10 @@ pub struct ResolveState {
     /// — lets the client prefill a CONCRETE cwd instead of the `~` sentinel.
     /// `None` (no resolvable home) omits `homeDir` from the wire.
     pub home_dir: Option<Arc<String>>,
+    /// Outer deadline for the blocking resolver task. Production wires
+    /// [`RESOLVE_OUTER_DEADLINE`] (Node's 15 s by-id runner timeout);
+    /// injectable so tests exercise the timeout path without waiting 15 s.
+    pub resolve_deadline: std::time::Duration,
 }
 
 /// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
@@ -389,20 +405,91 @@ async fn resolve_session(
         HashMap::new()
     };
 
+    // Computed BEFORE the resolver so the deadline-elapsed response below can
+    // report it too (it depends only on the enabled set, read above).
+    let unsearched_providers: Vec<String> = KNOWN_RESUME_PROVIDERS
+        .iter()
+        .filter(|name| !enabled.contains(**name))
+        .map(|name| (*name).to_string())
+        .collect();
+    // Parsed OUTSIDE the blocking task so a timed-out response still carries
+    // the hint (Node's per-runner timeout path carries it too — resolution
+    // there continues to `finish()`). Pure, bounded string parsing.
+    let timeout_hint = freshell_sessions::resume_input::parse_resume_input(&input).hint;
+
     let opencode = state.opencode_session_by_id.clone();
     let claude = state.locate_claude_transcript.clone();
-    let joined = tokio::task::spawn_blocking(move || {
-        let deps = ResolveDeps {
-            // as_deref (Option<Vec<T>> -> Option<&[T]>): as_ref().map(|s| s.as_slice())
-            // trips clippy's warn-by-default `option_as_ref_deref` under -D warnings.
-            sessions: snapshot.as_deref(),
-            session_types: &session_types,
-            locate_claude_transcript: claude.as_deref(),
-            opencode_session_by_id: opencode.as_deref(),
-        };
-        resolve_resume_input(&input, &deps)
-    })
+    // Outer deadline = Node's hard by-id runner timeout
+    // (`opencode-by-id-runner.ts` DEFAULT_TIMEOUT_MS): Node terminates the
+    // stalled worker and the rejection surfaces as a providerError on a
+    // degraded 200. SQLite's 500 ms busy timeout only bounds LOCK waits — a
+    // filesystem or SQLite operation stalled outside lock handling would
+    // otherwise hold this request and a blocking-pool worker indefinitely,
+    // and repeated authenticated requests could exhaust the blocking pool.
+    let joined = tokio::time::timeout(
+        state.resolve_deadline,
+        tokio::task::spawn_blocking(move || {
+            let deps = ResolveDeps {
+                // as_deref (Option<Vec<T>> -> Option<&[T]>): as_ref().map(|s| s.as_slice())
+                // trips clippy's warn-by-default `option_as_ref_deref` under -D warnings.
+                sessions: snapshot.as_deref(),
+                session_types: &session_types,
+                locate_claude_transcript: claude.as_deref(),
+                opencode_session_by_id: opencode.as_deref(),
+            };
+            resolve_resume_input(&input, &deps)
+        }),
+    )
     .await;
+
+    // Deadline elapsed. RECORDED DEVIATION from Node's cancellation: a
+    // blocking task cannot be cancelled, so dropping the JoinHandle ABANDONS
+    // it (fire-and-forget — it runs to completion on the blocking pool and
+    // its result is discarded); Node instead `worker.terminate()`s the
+    // stalled worker thread. The deadline still frees this request and its
+    // connection, which is what bounds per-request latency and mitigates
+    // pool exhaustion. Response shape mirrors Node's by-id-runner timeout
+    // contract: 200 + `degraded` + message-only providerErrors (never a 5xx,
+    // never a healthy-looking "not found"). Attribution differs by
+    // construction: Node's timeout wraps ONE provider's worker; this outer
+    // deadline abandons the WHOLE resolver — index matching and fallbacks
+    // alike — so NO enabled provider finished searching and every one is
+    // reported unsearchable (the hardened contract forbids presenting an
+    // unsearchable state as ready-empty).
+    let Ok(joined) = joined else {
+        tracing::warn!(
+            deadline_ms = state.resolve_deadline.as_millis() as u64,
+            "resolve timed out; abandoning the blocking resolver task"
+        );
+        let message = format!(
+            "resolve timed out after {}ms",
+            state.resolve_deadline.as_millis()
+        );
+        let provider_errors: Vec<ResumeResolveProviderError> = KNOWN_RESUME_PROVIDERS
+            .iter()
+            .filter(|name| enabled.contains(**name))
+            .map(|name| ResumeResolveProviderError {
+                provider: (*name).to_string(),
+                code: None,
+                message: Some(message.clone()),
+            })
+            .collect();
+        // Same fire-and-forget refresh every degraded response schedules
+        // (`sessions-router.ts:293-305` parity): a stalled index source may
+        // be the culprit, and a client Retry should get a chance to converge.
+        if let Some(index) = state.session_index.as_ref() {
+            index.request_refresh();
+        }
+        return Json(ResolveWireResponse {
+            status: ResumeResolveStatus::Degraded,
+            matches: Vec::new(),
+            hint: timeout_hint,
+            provider_errors,
+            unsearched_providers,
+            home_dir: state.home_dir.as_ref().map(|h| h.as_str().to_string()),
+        })
+        .into_response();
+    };
 
     // JoinError = the resolve task PANICKED. RECORDED DEVIATION (module
     // doc): Node has no defined behavior here (unhandled rejection, no
@@ -638,6 +725,7 @@ mod tests {
             opencode_session_by_id: None,
             locate_claude_transcript: None,
             home_dir: Some(Arc::new("/home/tester".to_string())),
+            resolve_deadline: super::RESOLVE_OUTER_DEADLINE,
         }
     }
 
@@ -1286,5 +1374,57 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, serde_json::json!({ "error": "Resolve failed" }));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_resolver_answers_degraded_at_the_outer_deadline_never_hangs() {
+        // Node bounds every by-id worker with a hard 15 s timeout
+        // (`opencode-by-id-runner.ts` DEFAULT_TIMEOUT_MS); the rejection is
+        // caught per-fallback and surfaces as a providerError on a degraded
+        // 200. Without an outer deadline on the Rust blocking task, a
+        // filesystem/SQLite op stalled outside SQLite's 500 ms busy handling
+        // would hold this request (and a blocking-pool worker) forever. The
+        // deadline is injected small so the test never waits 15 s; the
+        // stalled closure keeps sleeping well past it. Timeliness proof:
+        // without the deadline the sleeping closure returns Ok(None) (a
+        // clean miss) and the response would be `ready` — asserting
+        // `degraded` + the timeout providerErrors proves the deadline path
+        // answered, not the stalled resolver.
+        let dir = temp_dir("stall");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let mut st = state(&dir, Some(index));
+        st.resolve_deadline = std::time::Duration::from_millis(50);
+        st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Ok(None)
+        }));
+        let (status, body) = post(
+            st,
+            serde_json::json!({ "input": "ses_aaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "degraded",
+                "matches": [],
+                // The hint still rides along (Node's timed-out fallback path
+                // carries it too — resolution there finishes via `finish()`).
+                "hint": { "provider": "opencode", "source": "id-shape" },
+                // NO enabled provider finished searching before the deadline
+                // — report every one unsearchable (never a healthy-looking
+                // "not found"), message-only like Node's worker-timeout entry.
+                "providerErrors": [
+                    { "provider": "claude", "message": "resolve timed out after 50ms" },
+                    { "provider": "codex", "message": "resolve timed out after 50ms" },
+                    { "provider": "opencode", "message": "resolve timed out after 50ms" },
+                    { "provider": "amplifier", "message": "resolve timed out after 50ms" }
+                ],
+                "unsearchedProviders": [],
+                "homeDir": "/home/tester"
+            })
+        );
     }
 }

@@ -433,10 +433,24 @@ async fn session_directory(
 /// launch that set `FRESHELL_HOME` to a temp dir (while leaving `HOME` as
 /// the real user home) made claude/codex sessions invisible -- they were
 /// looked up under `<FRESHELL_HOME>/.claude` / `.codex`, which don't exist.
+///
+/// Windows/Tauri parity: Node derives these via `os.homedir()`, which reads
+/// `USERPROFILE` on Windows -- and production Tauri deliberately inherits the
+/// desktop environment WITHOUT setting `HOME` (`freshell-tauri/src/lib.rs`,
+/// `home: None`). Reading only `HOME` left `session_index: None` on native
+/// Windows (route permanently `warming`, exact-id fallbacks never invoked),
+/// while the `homeDir` wire field (`main.rs`) already recognized
+/// `USERPROFILE`. Resolution is HOME-then-USERPROFILE (identical on Unix,
+/// where HOME is always set).
 pub(crate) fn provider_home() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .map(PathBuf::from)
 }
 
@@ -1306,13 +1320,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_home_none_when_home_unset() {
+    fn provider_home_none_when_home_and_userprofile_unset() {
         let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
         let saved_freshell_home = std::env::var("FRESHELL_HOME").ok();
         let saved_home = std::env::var("HOME").ok();
+        let saved_userprofile = std::env::var("USERPROFILE").ok();
 
         std::env::set_var("FRESHELL_HOME", "/tmp/freshell-isolated-config-root-2");
         std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
 
         assert_eq!(provider_home(), None);
 
@@ -1323,6 +1339,66 @@ mod tests {
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    // Native Windows/Tauri parity (`os.homedir()` reads `USERPROFILE` on
+    // Windows; Node's index and the Rust `homeDir` wire field both resolve
+    // it): production Tauri inherits the desktop environment WITHOUT setting
+    // `HOME` (`freshell-tauri/src/lib.rs`, `home: None`), so a
+    // USERPROFILE-only environment must still build a real session index
+    // instead of `session_index: None` (permanent `warming`).
+    #[test]
+    fn provider_home_falls_back_to_userprofile_when_home_unset() {
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_userprofile = std::env::var("USERPROFILE").ok();
+
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "/Users/win-fixture");
+
+        assert_eq!(
+            provider_home(),
+            Some(PathBuf::from("/Users/win-fixture")),
+            "provider_home() must fall back to USERPROFILE when HOME is unset (Node os.homedir() parity)"
+        );
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    #[test]
+    fn provider_home_prefers_home_over_userprofile() {
+        let _guard = PROVIDER_HOME_ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        let saved_userprofile = std::env::var("USERPROFILE").ok();
+
+        std::env::set_var("HOME", "/home/real-user-fixture");
+        std::env::set_var("USERPROFILE", "/Users/win-fixture");
+
+        assert_eq!(
+            provider_home(),
+            Some(PathBuf::from("/home/real-user-fixture")),
+            "HOME must win when both HOME and USERPROFILE are set"
+        );
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
         }
     }
 

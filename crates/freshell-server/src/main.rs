@@ -1236,6 +1236,10 @@ async fn main() -> ExitCode {
             home_dir: std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(|h| Arc::new(h.to_string_lossy().into_owned())),
+            // Node's hard 15 s by-id runner timeout, applied as the route's
+            // outer deadline on the whole blocking resolver (see
+            // `resolve.rs` for the abandonment semantics).
+            resolve_deadline: resolve::RESOLVE_OUTER_DEADLINE,
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
