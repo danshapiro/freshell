@@ -325,7 +325,7 @@ These Cargo tests exercise deterministic adapters and never signal or stop a hos
 
 **Files:**
 - Refactor: `scripts/launch-rust.sh`
-- Create: `test/integration/server/launch-rust-deployment.sandbox.test.ts`
+- Create: `test/integration/server/launch-rust-real-boundary.sandbox.test.ts`
 - Create: `config/vitest/vitest.deploy-sandbox.config.ts`
 - Modify: `config/vitest/vitest.server.config.ts`
 - Create fixture commands beneath `test/fixtures/launch-rust/`
@@ -357,14 +357,14 @@ Modify the ordinary server Vitest config to explicitly exclude `**/*.sandbox.tes
 - [ ] **Step 4: Run exhaustive sandbox mode/failpoint tests**
 
 ```bash
-scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 npm run test:vitest -- run test/integration/server/launch-rust-deployment.sandbox.test.ts --config config/vitest/vitest.deploy-sandbox.config.ts --maxWorkers=1 --no-file-parallelism"
+scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 npm run test:vitest -- run test/integration/server/launch-rust-real-boundary.sandbox.test.ts --config config/vitest/vitest.deploy-sandbox.config.ts --maxWorkers=1 --no-file-parallelism"
 bash -n scripts/launch-rust.sh
 ```
 
 - [ ] **Step 5: Refactor and commit**
 
 ```bash
-git add scripts/launch-rust.sh config/vitest/vitest.deploy-sandbox.config.ts config/vitest/vitest.server.config.ts test/integration/server/launch-rust-deployment.sandbox.test.ts test/fixtures/launch-rust
+git add scripts/launch-rust.sh config/vitest/vitest.deploy-sandbox.config.ts config/vitest/vitest.server.config.ts test/integration/server/launch-rust-real-boundary.sandbox.test.ts test/fixtures/launch-rust
 git commit -m "feat(deploy): add compatibility-checked update modes"
 ```
 
@@ -374,7 +374,8 @@ git commit -m "feat(deploy): add compatibility-checked update modes"
 - Create: `test/integration/server/launch-rust-real-boundary.sandbox.test.ts`
 - Create: `test/e2e-browser/deployment-compatibility.spec.ts`
 - Create: `test/e2e-browser/playwright.deploy-sandbox.config.ts`
-- Add: tiny native failure-candidate fixture crate under `test/fixtures/launch-rust/failing-candidate/`
+- Modify: `crates/freshell-server/src/main.rs` with the sandbox-only
+  `FRESHELL_TEST_EXIT_AFTER_DEPLOY_AUTHORIZATION=1` pre-commit failure seam
 - Modify: `AGENTS.md`
 - Modify only if verification exposes a defect: files from Tasks 1–6.
 
