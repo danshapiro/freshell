@@ -1746,10 +1746,11 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
 /// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
 /// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
-/// `featureFlags.sessionResolve` is held `false` until the hardened resolve
-/// response surface (degraded/providerErrors/homeDir, warming default) is
-/// ported — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
-/// Tasks 3, 5, 6 (SYNC-06).
+/// `featureFlags.sessionResolve` is the unconditional literal both servers
+/// declare now that the hardened resolve response surface
+/// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
+/// landed — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
+/// Tasks 2-6 (SYNC-06).
 fn build_platform_payload(
     available_clis: serde_json::Value,
     env: &dyn freshell_platform::Env,
@@ -1759,9 +1760,7 @@ fn build_platform_payload(
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        // sessionResolve: held false until the hardened resolve port lands
-        // (see the hardened plan, Tasks 3/5/6).
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env), "sessionResolve": false },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env), "sessionResolve": true },
     })
 }
 
@@ -2407,14 +2406,15 @@ mod tests {
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
         // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
-        // Rust payload. `sessionResolve` is held FALSE here until the hardened
-        // resolve response surface is ported (SYNC-06; hardened plan Tasks
-        // 3/5/6).
+        // Rust payload. `sessionResolve` is TRUE again: the hardened resolve
+        // response surface (degraded/providerErrors/unsearchedProviders/
+        // homeDir, warming default) landed via the hardened plan Tasks 2-6
+        // (SYNC-06), so the flag is now genuinely earned.
         let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": false })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
         );
     }
 
@@ -2424,7 +2424,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), &env);
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": false })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
         );
     }
 
