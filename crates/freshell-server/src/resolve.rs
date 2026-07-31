@@ -423,6 +423,75 @@ fn bounded_fallback<T: Send + 'static>(
     })
 }
 
+/// Node's override-key lookup for ONE indexed session
+/// (`buildProjectGroups`, `session-indexer.ts:1173-1186`): the composite
+/// `"{provider}:{sessionId}"` key first, then the bare session id; only when
+/// NEITHER hits and the session is a claude transcript whose file basename
+/// differs from its parsed session id (a pre-sessionId-parsing-era override)
+/// do the legacy keys apply — composite `"claude:{basename}"`, then the bare
+/// basename. First PRESENT entry wins, exactly like Node's `||` chain: an
+/// earlier key that maps to an (even empty) object stops the fallthrough.
+fn lookup_session_override<'a>(
+    overrides: &'a Map<String, Value>,
+    session: &IndexedSession,
+) -> Option<&'a Map<String, Value>> {
+    let direct = overrides
+        .get(&session.key())
+        .or_else(|| overrides.get(&session.session_id))
+        .filter(|v| !v.is_null());
+    if let Some(ov) = direct {
+        return ov.as_object();
+    }
+    if session.provider != "claude" {
+        return None;
+    }
+    // `path.basename(sourceFile, '.jsonl')` (`session-indexer.ts:1176`).
+    let basename = session.source_file.as_deref()?.file_name()?.to_str()?;
+    let legacy_id = basename.strip_suffix(".jsonl").unwrap_or(basename);
+    if legacy_id.is_empty() || legacy_id == session.session_id {
+        return None;
+    }
+    overrides
+        .get(&format!("claude:{legacy_id}"))
+        .or_else(|| overrides.get(legacy_id))
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_object)
+}
+
+/// Node's `applyOverride` (`session-indexer.ts:204-220`) restricted to the
+/// fields the resolve wire shape can observe: `deleted` hides the session
+/// entirely (`None`), a non-empty `titleOverride` replaces its title
+/// (Node's `!!ov?.titleOverride` — an empty string is falsy, never applied).
+/// The other fields Node merges (`summaryOverride`, `createdAtOverride`,
+/// `archived`) never reach a resolve match — matches carry only
+/// title/cwd/lastActivityAt/sessionType/firstUserMessage — so they are not
+/// projected here. Node's provider-generated-title suppression
+/// (`titleSource === 'provider-generated'` vs an override sourced
+/// `dir`/`first-message`) is not portable: the Rust index does not track a
+/// parsed `titleSource` (the sidebar overlay,
+/// `session_directory.rs::apply_session_overrides`, shares this recorded
+/// divergence).
+fn project_session_through_overrides(
+    session: &IndexedSession,
+    overrides: &Map<String, Value>,
+) -> Option<IndexedSession> {
+    let Some(ov) = lookup_session_override(overrides, session) else {
+        return Some(session.clone());
+    };
+    if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let mut projected = session.clone();
+    if let Some(title) = ov
+        .get("titleOverride")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        projected.title = Some(title.to_string());
+    }
+    Some(projected)
+}
+
 /// `POST /api/sessions/resolve`. Body taken as raw bytes (never an
 /// axum-flavored rejection): an ABSENT or UNPARSEABLE body becomes `{}` —
 /// the same value Express's `req.body ?? {}` hands zod for an absent body —
@@ -477,16 +546,18 @@ async fn resolve_session(
         None => (None, Vec::new()),
     };
 
-    // Deleted-override filter: Node's resolve reads the POST-filter project
-    // groups (`session-indexer.ts:209,1155-1156`) and the Rust sidebar
-    // applies the same overlay (`session_directory.rs`
-    // `apply_session_overrides`) — the resolve read model must agree with
-    // both. Composite key `"{provider}:{session_id}"` ONLY: Node's extra
-    // bare-id/legacy-claude override keys are a pre-existing accepted
-    // divergence (the Rust sidebar does not consult them either). The
-    // exact-id FALLBACKS below intentionally BYPASS this filter — Node's
-    // fallbacks read sqlite/the filesystem directly and never consult
-    // overrides — bug-for-bug.
+    // Override projection: Node's resolve reads the POST-override project
+    // groups (`resolve-session.ts:85` via `session-indexer.ts:1173-1187`,
+    // `applyOverride` at `session-indexer.ts:204-220`), so the Rust read
+    // model must project the snapshot through the SAME overlay before any
+    // matching: `deleted` hides the session, `titleOverride` replaces its
+    // title, and the override is looked up under EVERY key shape Node
+    // recognizes (composite `provider:sessionId`, bare session id, and the
+    // legacy claude transcript-basename keys) — see
+    // `lookup_session_override` / `project_session_through_overrides`. The
+    // exact-id FALLBACKS below intentionally BYPASS this projection —
+    // Node's fallbacks read sqlite/the filesystem directly and never
+    // consult overrides — bug-for-bug.
     // Read the enabled set BEFORE dispatching the core resolve, and FILTER
     // the snapshot with it: Node's index EXCLUDES disabled providers at scan
     // time (`session-indexer.ts:1454-1467`), so its resolution never sees
@@ -508,13 +579,7 @@ async fn resolve_session(
         sessions
             .iter()
             .filter(|session| enabled.contains(&session.provider))
-            .filter(|session| {
-                overrides
-                    .get(&session.key())
-                    .and_then(Value::as_object)
-                    .is_none_or(|ov| !ov.get("deleted").and_then(Value::as_bool).unwrap_or(false))
-            })
-            .cloned()
+            .filter_map(|session| project_session_through_overrides(session, &overrides))
             .collect()
     });
 
@@ -1176,6 +1241,106 @@ mod tests {
         st.settings
             .patch_session_override(
                 &format!("claude:{CLAUDE_ID}"),
+                &[("deleted", Some(serde_json::json!(true)))],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    /// The pre-parsing-era transcript basename for the legacy-override tests:
+    /// differs from `CLAUDE_ID`, so Node's legacy branch
+    /// (`session-indexer.ts:1175-1186`) fires for it.
+    const LEGACY_BASENAME: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// `claude_fixture()` whose transcript file basename differs from its
+    /// parsed session id — the shape that makes Node consult the legacy
+    /// `claude:{basename}` / bare-`{basename}` override keys.
+    fn claude_fixture_with_legacy_source() -> IndexedSession {
+        IndexedSession {
+            source_file: Some(std::path::PathBuf::from(format!(
+                "/home/tester/.claude/projects/-repo-alpha/{LEGACY_BASENAME}.jsonl"
+            ))),
+            ..claude_fixture()
+        }
+    }
+
+    #[tokio::test]
+    async fn title_override_projects_onto_resolve_matches() {
+        // Node's resolve reads the POST-override projection
+        // (`resolve-session.ts:85` via `session-indexer.ts:1187,204-220`):
+        // a user rename (`titleOverride`) must be visible on the resolve
+        // wire, not the stale parsed title.
+        let dir = temp_dir("titleov");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{CLAUDE_ID}"),
+                &[
+                    ("titleOverride", Some(serde_json::json!("Renamed by user"))),
+                    ("titleSource", Some(serde_json::json!("user"))),
+                ],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"][0]["sessionId"], CLAUDE_ID);
+        assert_eq!(body["matches"][0]["title"], "Renamed by user");
+    }
+
+    #[tokio::test]
+    async fn bare_session_id_deleted_override_hides_prefix_matches() {
+        // Node's override lookup falls back to the BARE session-id key
+        // (`session-indexer.ts:1174`); a session deleted under it must not
+        // resurface as a prefix match on the Rust side.
+        let dir = temp_dir("baredel");
+        let index = fixture_index(vec![claude_fixture()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(CLAUDE_ID, &[("deleted", Some(serde_json::json!(true)))])
+            .await;
+        let prefix = &CLAUDE_ID[..12];
+        let (status, body) = post(st, serde_json::json!({ "input": prefix }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_composite_basename_deleted_override_hides_the_session() {
+        // Node's legacy branch (`session-indexer.ts:1175-1186`): when neither
+        // the composite nor bare current-id key hits and the claude
+        // transcript's file basename differs from its session id, the
+        // `claude:{basename}` key applies.
+        let dir = temp_dir("legacycomp");
+        let index = fixture_index(vec![claude_fixture_with_legacy_source()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                &format!("claude:{LEGACY_BASENAME}"),
+                &[("deleted", Some(serde_json::json!(true)))],
+            )
+            .await;
+        let (status, body) = post(st, serde_json::json!({ "input": CLAUDE_ID }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["matches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn legacy_claude_bare_basename_deleted_override_hides_the_session() {
+        // The deepest rung of Node's lookup chain
+        // (`session-indexer.ts:1179`): the bare transcript-basename key.
+        let dir = temp_dir("legacybare");
+        let index = fixture_index(vec![claude_fixture_with_legacy_source()]).await;
+        let st = state(&dir, Some(index));
+        st.settings
+            .patch_session_override(
+                LEGACY_BASENAME,
                 &[("deleted", Some(serde_json::json!(true)))],
             )
             .await;
