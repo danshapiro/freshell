@@ -141,26 +141,19 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let target = assemble_generation(&store, &command)?;
     if fresh {
         let locked = store.lock()?;
-        if store.selected_generation_id()? != prior_id
-            || store.read_live()?.is_some()
-            || store.read_legacy_capture()?.is_some()
-        {
-            return Err(DeployError::Activation(
-                "fresh deployment state changed after private assembly".to_string(),
-            ));
-        }
-        RealActivationDriver::new(&store, &locked, auth_token.clone())?
-            .preflight_fresh_target(&target.path, &target.id)?;
-        locked.select_generation(&target.id)?;
-        locked.write_live(&crate::receipts::LiveReceipt::new(
-            target.id.clone(),
-            None,
-            false,
-            None,
-        ))?;
-        drop(locked);
-        crate::lifecycle::execute_start_current(&command.checkout, command.port, false)?;
-        return Ok(());
+        return publish_and_start_fresh_locked(
+            &store,
+            &locked,
+            &target,
+            prior_id.as_deref(),
+            |store, locked, target| {
+                RealActivationDriver::new(store, locked, auth_token.clone())?
+                    .preflight_fresh_target(&target.path, &target.id)
+            },
+            |store, locked| {
+                crate::lifecycle::start_current_locked(store, locked, &auth_token, false)
+            },
+        );
     }
     let prior_id = prior_id.ok_or_else(|| {
         DeployError::Activation("deployment requires a selected prior generation".to_string())
@@ -217,6 +210,37 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let mut controller = ActivationController::new(&mut journal, &mut driver);
     controller.begin(request)?;
     controller.run().map(|_| ())
+}
+
+fn publish_and_start_fresh_locked<Preflight, Start>(
+    store: &Store,
+    locked: &LockedStore<'_>,
+    target: &Generation,
+    prior_id: Option<&str>,
+    preflight: Preflight,
+    start: Start,
+) -> Result<()>
+where
+    Preflight: FnOnce(&Store, &LockedStore<'_>, &Generation) -> Result<()>,
+    Start: FnOnce(&Store, &LockedStore<'_>) -> Result<()>,
+{
+    if store.selected_generation_id()?.as_deref() != prior_id
+        || store.read_live()?.is_some()
+        || store.read_legacy_capture()?.is_some()
+    {
+        return Err(DeployError::Activation(
+            "fresh deployment state changed after private assembly".to_string(),
+        ));
+    }
+    preflight(store, locked, target)?;
+    locked.select_generation(&target.id)?;
+    locked.write_live(&crate::receipts::LiveReceipt::new(
+        target.id.clone(),
+        None,
+        false,
+        None,
+    ))?;
+    start(store, locked)
 }
 
 fn recover_unfinished(store: &Store, auth_token: &str) -> Result<()> {
@@ -329,4 +353,66 @@ pub(crate) fn load_auth_token(checkout: &Path) -> Result<String> {
     Err(DeployError::Activation(
         "AUTH_TOKEN is required by the deployment controller".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn fresh_publication_and_start_are_atomic_against_stop_current() {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkout = fixture.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        fs::write(checkout.join(".git"), "gitdir: /tmp/fixture.git\n").unwrap();
+        let source = fixture.path().join("generation");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("artifact"), "fresh\n").unwrap();
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = crate::DeployPort::new(listener.local_addr().unwrap().port()).unwrap();
+        drop(listener);
+        let store = Store::open(&checkout, port).unwrap();
+        let locked = store.lock().unwrap();
+        let target = locked.import_tree(&source).unwrap();
+        drop(locked);
+
+        let (start_entered_tx, start_entered_rx) = mpsc::channel();
+        let (finish_start_tx, finish_start_rx) = mpsc::channel();
+        let deploy_checkout = checkout.clone();
+        let target_id = target.id.clone();
+        let deploy = thread::spawn(move || {
+            let store = Store::open(&deploy_checkout, port).unwrap();
+            let target = store.verify_generation(&target_id).unwrap();
+            let locked = store.lock().unwrap();
+            publish_and_start_fresh_locked(
+                &store,
+                &locked,
+                &target,
+                None,
+                |_store, _locked, _target| Ok(()),
+                |_store, _locked| {
+                    start_entered_tx.send(()).unwrap();
+                    finish_start_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        start_entered_rx.recv().unwrap();
+
+        assert!(matches!(
+            crate::lifecycle::execute_stop_current(&checkout, port),
+            Err(DeployError::LockBusy(_))
+        ));
+
+        finish_start_tx.send(()).unwrap();
+        deploy.join().unwrap().unwrap();
+        let live = store.read_live().unwrap().unwrap();
+        assert_eq!(live.selected_generation_id, target.id);
+        assert!(live.process_identity.is_none());
+    }
 }

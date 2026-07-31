@@ -224,7 +224,7 @@ pub(crate) fn execute_start_current(
     let auth_token = crate::controller::load_auth_token(checkout)?;
     let locked = store.lock()?;
     crate::controller::recover_unfinished_locked(&store, &locked, &auth_token)?;
-    recover_or_start(&store, &locked, &auth_token, restart)
+    start_current_locked(&store, &locked, &auth_token, restart)
 }
 
 pub(crate) fn execute_stop_current(checkout: &Path, port: DeployPort) -> Result<()> {
@@ -298,7 +298,7 @@ where
     recover(&store, &locked, &auth_token, record)
 }
 
-fn recover_or_start(
+pub(crate) fn start_current_locked(
     store: &Store,
     locked: &LockedStore<'_>,
     auth_token: &str,
