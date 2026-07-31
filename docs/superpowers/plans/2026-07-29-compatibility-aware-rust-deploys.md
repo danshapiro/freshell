@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Work only in `.worktrees/deploy-compatibility-rollback` on branch `feat/deploy-compatibility-rollback`.
-- Base all behavior on verified-green `origin/main` commit `2641ada382472586ce1aa7664331d384853e867d`; the branch's merge base and the final verification commands below are pinned to that exact commit.
+- The implementation began on verified-green `origin/main` commit `2641ada382472586ce1aa7664331d384853e867d` and was later revalidated and rebased onto `179c0d45eb4ae8c459dba37e0d0f7d22f2023bd0`; final verification is pinned to that integration base.
 - Preserve deliberate independent advancement: client and server versions do not need to be equal, share a release number, or come from the same commit.
 - A client-only update proceeds only when the candidate client accepts the running server version and the running server accepts the candidate client.
 - A server-only update proceeds only when the candidate server and the selected client accept each other.
@@ -426,7 +426,7 @@ cargo test --workspace
 scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 cargo test -p freshell-deploy --test legacy_capture actual_proc_capture -- --ignored --test-threads=1"
 scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 CARGO_BUILD_JOBS=2 npm run test:vitest -- run test/integration/server/launch-rust-real-boundary.sandbox.test.ts --config config/vitest/vitest.deploy-sandbox.config.ts --maxWorkers=1 --no-file-parallelism"
 scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 CARGO_BUILD_JOBS=2 npx playwright test test/e2e-browser/deployment-compatibility.spec.ts --config test/e2e-browser/playwright.deploy-sandbox.config.ts --workers=1"
-git diff --check 2641ada382472586ce1aa7664331d384853e867d...HEAD
+git diff --check 179c0d45eb4ae8c459dba37e0d0f7d22f2023bd0...HEAD
 git status --short
 ```
 
