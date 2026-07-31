@@ -232,7 +232,7 @@ cargo test -p freshell-server extensions
 - [ ] **Step 4: Refactor and commit**
 
 ```bash
-git add crates/freshell-platform/src/mcp_inject.rs crates/freshell-server/src/extensions.rs
+git add crates/freshell-platform/src/mcp_inject.rs crates/freshell-platform/src/mcp_inject_tests.rs crates/freshell-server/src/extensions.rs
 git commit -m "feat(deploy): bind immutable runtime paths"
 ```
 
