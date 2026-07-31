@@ -150,6 +150,20 @@ pub trait SessionSource: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Per-sweep health probe for a direct-listed source, consulted on EVERY
+    /// sweep — including when [`Self::direct_change_token`] is UNCHANGED.
+    /// Node parity: `refreshDirectProvider()` runs on every full scan and
+    /// records/clears `scanFailures` per attempt (`session-indexer.ts:1457`,
+    /// `:1070-1082`), so its failure evidence is never older than one scan.
+    /// The mtime change-token gates only the expensive re-QUERY (the session
+    /// DATA cache) — it must never gate the HEALTH signal, because a database
+    /// can become locked or unreadable (e.g. `chmod`) without either mtime
+    /// moving. `Err` records a scan failure (cached sessions preserved); `Ok`
+    /// clears it. Default `Ok` for file-based sources (never called).
+    fn direct_health_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Provider identity for scan-failure reporting (`getScanFailures` parity).
     /// `None` (default) = this source does not participate in failure tracking.
     fn provider_name(&self) -> Option<&'static str> {
@@ -165,22 +179,31 @@ pub trait SessionSource: Send + Sync {
     }
 }
 
-/// Shared root-listing probe for the file-backed sources' `discover_checked`
-/// overrides: a MISSING root (`NotFound`/`NotADirectory`) is a genuine empty
-/// (an absent provider — matches Node's ENOENT tolerance), while any other
-/// listing failure (EACCES/EIO/...) PROPAGATES so the sweep records it as a
-/// scan failure instead of silently serving an empty listing. `pub(crate)`
-/// so `amplifier.rs`'s source can reuse it.
-pub(crate) fn ensure_root_listable(root: &Path) -> Result<(), std::io::Error> {
+/// Open a provider ROOT directory for the SINGLE-PASS checked traversals
+/// below: a MISSING root (`NotFound`/`NotADirectory`) is a genuine empty
+/// (an absent provider — matches Node's ENOENT tolerance, `Ok(None)`), while
+/// any other open failure (EACCES/EIO/...) PROPAGATES so the sweep records
+/// it as a scan failure instead of silently serving an empty listing.
+///
+/// This replaces the earlier disposable `read_dir` PREFLIGHT
+/// (`ensure_root_listable`) that was followed by a second, error-swallowing
+/// `read_dir` for the actual traversal — a TOCTOU window where a failure
+/// between the two calls (or a per-entry iterator error during the second)
+/// came back as `Ok(empty)`, CLEARING the provider's scan failure and
+/// pruning its cached sessions from a sweep that never actually listed
+/// anything. The traversals now consume THIS handle directly (one
+/// `read_dir`, no window) and propagate per-entry iterator errors with `?`.
+/// `pub(crate)` so `amplifier.rs`'s source can reuse it.
+pub(crate) fn open_root_dir(root: &Path) -> Result<Option<std::fs::ReadDir>, std::io::Error> {
     match std::fs::read_dir(root) {
-        Ok(_) => Ok(()),
+        Ok(entries) => Ok(Some(entries)),
         Err(e)
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            Ok(())
+            Ok(None)
         }
         Err(e) => Err(e),
     }
@@ -216,7 +239,7 @@ impl ClaudeSource {
 
 impl SessionSource for ClaudeSource {
     fn discover(&self) -> Vec<FileStat> {
-        discover_claude_home(&self.claude_home)
+        discover_claude_home(&self.claude_home).unwrap_or_default()
     }
 
     fn provider_name(&self) -> Option<&'static str> {
@@ -225,10 +248,12 @@ impl SessionSource for ClaudeSource {
 
     /// Root-listing failure propagation: an unlistable `<claude_home>/projects`
     /// (EACCES/EIO — not a merely-absent one) is a scan failure, never a
-    /// silent empty listing. Per-project/nested errors stay tolerant.
+    /// silent empty listing. SINGLE-PASS: the same `read_dir` handle that
+    /// fails here is the one the traversal consumes (no disposable preflight,
+    /// no TOCTOU window), and root iterator-entry errors propagate too.
+    /// Per-project/nested errors stay tolerant.
     fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
-        ensure_root_listable(&self.claude_home.join("projects"))?;
-        Ok(self.discover())
+        discover_claude_home(&self.claude_home)
     }
 
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
@@ -248,17 +273,23 @@ impl SessionSource for ClaudeSource {
 /// Stat (not parse) every `<claude_home>/projects/*/…*.jsonl` file, in the
 /// same discovery order `scan_claude_home` used to walk them (sorted
 /// directory entries — determinism; readdir order is filesystem-dependent).
-fn discover_claude_home(claude_home: &Path) -> Vec<FileStat> {
+///
+/// SINGLE-PASS root traversal: the ONE `read_dir` opened by [`open_root_dir`]
+/// is the one iterated, and per-entry iterator errors propagate (`?`) — a
+/// root that fails to open OR fails mid-iteration is an `Err` (recorded as a
+/// scan failure by the sweep), never a silent `Ok(empty)`. A MISSING root is
+/// a genuine empty. Per-project/nested errors stay tolerant (Node parity).
+fn discover_claude_home(claude_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
     let projects_dir = claude_home.join("projects");
-    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
-        return Vec::new();
+    let Some(project_entries) = open_root_dir(&projects_dir)? else {
+        return Ok(Vec::new());
     };
 
     let mut stats = Vec::new();
-    let mut project_dirs: Vec<PathBuf> = project_entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .collect();
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
+    for entry in project_entries {
+        project_dirs.push(entry?.path());
+    }
     project_dirs.sort(); // determinism (readdir order is filesystem-dependent)
 
     for project_dir in project_dirs {
@@ -296,7 +327,7 @@ fn discover_claude_home(claude_home: &Path) -> Vec<FileStat> {
             }
         }
     }
-    stats
+    Ok(stats)
 }
 
 /// `fs::metadata` a single file into a [`FileStat`]. `None` on any stat
@@ -403,9 +434,7 @@ impl CodexSource {
 
 impl SessionSource for CodexSource {
     fn discover(&self) -> Vec<FileStat> {
-        let mut stats = Vec::new();
-        walk_jsonl_recursive(&self.codex_home.join("sessions"), &mut stats);
-        stats
+        discover_codex_sessions(&self.codex_home).unwrap_or_default()
     }
 
     fn provider_name(&self) -> Option<&'static str> {
@@ -414,10 +443,12 @@ impl SessionSource for CodexSource {
 
     /// Root-listing failure propagation: an unlistable `<codex_home>/sessions`
     /// (EACCES/EIO — not a merely-absent one) is a scan failure, never a
-    /// silent empty listing. Nested-directory errors stay tolerant.
+    /// silent empty listing. SINGLE-PASS: the same `read_dir` handle that
+    /// fails here is the one the traversal consumes (no disposable preflight,
+    /// no TOCTOU window), and root iterator-entry errors propagate too.
+    /// Nested-directory errors stay tolerant.
     fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
-        ensure_root_listable(&self.codex_home.join("sessions"))?;
-        Ok(self.discover())
+        discover_codex_sessions(&self.codex_home)
     }
 
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
@@ -425,11 +456,43 @@ impl SessionSource for CodexSource {
     }
 }
 
+/// Stat every `.jsonl` under `<codex_home>/sessions`, recursively.
+///
+/// SINGLE-PASS root traversal: the ONE `read_dir` opened by [`open_root_dir`]
+/// is the one iterated, and per-entry iterator errors propagate (`?`) — a
+/// root that fails to open OR fails mid-iteration is an `Err` (recorded as a
+/// scan failure by the sweep), never a silent `Ok(empty)`. A MISSING root is
+/// a genuine empty. NESTED directories stay tolerant via
+/// [`walk_jsonl_recursive`] (Node parity: `walkJsonlFiles`).
+fn discover_codex_sessions(codex_home: &Path) -> Result<Vec<FileStat>, std::io::Error> {
+    let root = codex_home.join("sessions");
+    let Some(entries) = open_root_dir(&root)? else {
+        return Ok(Vec::new());
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        paths.push(entry?.path());
+    }
+    paths.sort(); // determinism (readdir order is filesystem-dependent)
+    let mut stats = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            walk_jsonl_recursive(&path, &mut stats);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            if let Some(stat) = stat_file(&path) {
+                stats.push(stat);
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Recursively stat every `.jsonl` under `dir`, sorted (per directory level)
 /// for determinism — readdir order is filesystem-dependent. Mirrors
 /// `walkJsonlFiles` (`providers/codex.ts:423-436`): unbounded recursion,
 /// corruption-tolerant (an unreadable directory yields fewer entries, never
-/// panics).
+/// panics). NESTED levels only — the root level is
+/// [`discover_codex_sessions`]'s single-pass checked traversal.
 fn walk_jsonl_recursive(dir: &Path, out: &mut Vec<FileStat>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -569,6 +632,15 @@ impl SessionSource for OpencodeSource {
             .map(opencode_session_to_indexed)
             .collect())
     }
+
+    /// Per-sweep health probe (see the trait doc): the db must still be
+    /// OPENABLE and its schema page READABLE through the exact open path
+    /// `direct_list` uses -- a locked/`chmod`ed/corrupted db fails here even
+    /// when its mtime (the change token) never moved. A MISSING db stays
+    /// healthy-absent, matching `list_sessions`'s `MissingDb` tolerance.
+    fn direct_health_check(&self) -> Result<(), String> {
+        self.provider.health_check().map_err(|e| e.to_string())
+    }
 }
 
 fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSession {
@@ -687,16 +759,23 @@ pub struct SessionIndex {
     /// background refresh needs to update the save-debounce bookkeeping
     /// without borrowing `&SessionIndex`.
     persist_state: Arc<StdMutex<PersistState>>,
-    /// Providers whose most recent listing attempt FAILED (`getScanFailures`
-    /// parity — see [`Self::scan_failures`]). Updated by every sweep
-    /// (`refresh_snapshot`); `Arc`-wrapped for the same detached-refresh
-    /// reason `snapshot` is.
-    scan_failures: Arc<StdMutex<HashSet<String>>>,
 }
 
+/// One published sweep GENERATION: the snapshot items AND the scan-failure
+/// set that same sweep produced, behind ONE lock. Publishing them as a unit
+/// (and reading them through [`SessionIndex::snapshot_with_failures`]) is
+/// what makes a coherent read possible — a consumer can never pair a
+/// failed-scan empty snapshot with a subsequently cleared failure set (a
+/// healthy-looking `ready + matches: []` lie), nor a recovered snapshot
+/// with stale failures. The lock is only ever held for field reads/writes,
+/// never across a sweep or an await point.
 struct CachedSnapshot {
     items: Arc<Vec<IndexedSession>>,
     fetched_at: Instant,
+    /// Providers whose listing attempt FAILED during the sweep that
+    /// published THIS generation (`getScanFailures` parity — see
+    /// [`SessionIndex::scan_failures`]).
+    scan_failures: HashSet<String>,
 }
 
 /// Bookkeeping for the persistent parse-cache's opportunistic-save gating
@@ -758,12 +837,19 @@ impl SessionIndex {
             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
             persist_path,
             persist_state: Arc::new(StdMutex::new(PersistState::default())),
-            scan_failures: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
     /// Providers whose MOST RECENT listing attempt failed (unsearchable, not
     /// empty) — `codingCliIndexer.getScanFailures()` parity. Sorted, deduped.
+    /// Read from the published [`CachedSnapshot`] generation (one short
+    /// lock); a cold index (nothing published) has no failures yet.
+    ///
+    /// COHERENCE NOTE: this standalone accessor is a point-in-time read of
+    /// the CURRENT generation. A consumer that needs the snapshot AND its
+    /// failures to come from the SAME generation (the resolve route) must
+    /// use [`Self::snapshot_with_failures`] instead of pairing `snapshot()`
+    /// with a later `scan_failures()` call.
     ///
     /// NODE PARITY NOTE: Node behaves exactly like `refresh_snapshot` here —
     /// a throwing `listSessionFiles()` also yields an empty file list and
@@ -774,9 +860,11 @@ impl SessionIndex {
     /// healthy `ready + matches: []`. Both direct-listed (opencode) and
     /// file-backed (claude/codex/amplifier) outages are therefore recorded.
     pub fn scan_failures(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.scan_failures.lock().unwrap().iter().cloned().collect();
-        names.sort();
-        names
+        let guard = self.snapshot.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|c| sorted_names(&c.scan_failures))
+            .unwrap_or_default()
     }
 
     /// Fire-and-forget refresh (`requestRefresh` parity): gives a degraded
@@ -801,8 +889,18 @@ impl SessionIndex {
     /// serve. Either way, the actual rebuild is incremental (see
     /// [`refresh_snapshot`]), not a full re-parse of unchanged files.
     pub async fn snapshot(&self) -> Arc<Vec<IndexedSession>> {
-        if let Some(items) = self.fresh_cached() {
-            return items;
+        self.snapshot_with_failures().await.0
+    }
+
+    /// [`Self::snapshot`] plus the scan failures of the SAME published
+    /// generation, read under ONE lock acquisition — the coherent read model
+    /// for consumers (the resolve route) that must never pair a failed-scan
+    /// snapshot with a cleared failure set, or a recovered snapshot with
+    /// stale failures. Same stale-while-revalidate semantics as
+    /// [`Self::snapshot`].
+    pub async fn snapshot_with_failures(&self) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        if let Some(pair) = self.cached_pair(true) {
+            return pair;
         }
         // Stale or absent. Try to become this round's sweeper WITHOUT
         // blocking -- `try_lock_owned` never waits, so a caller that
@@ -810,7 +908,7 @@ impl SessionIndex {
         // in-flight sweep.
         match Arc::clone(&self.refresh_lock).try_lock_owned() {
             Ok(guard) => {
-                if let Some(stale) = self.any_cached() {
+                if let Some(stale) = self.cached_pair(false) {
                     // Someone must read fresh data eventually, but not THIS
                     // caller, and not by blocking anyone else either.
                     self.spawn_background_refresh(guard);
@@ -821,7 +919,7 @@ impl SessionIndex {
             }
             Err(_) => {
                 // Another caller is already sweeping this round.
-                if let Some(stale) = self.any_cached() {
+                if let Some(stale) = self.cached_pair(false) {
                     return stale;
                 }
                 // Truly cold AND racing another cold-start caller: wait for
@@ -829,8 +927,8 @@ impl SessionIndex {
                 // B-T5's "N concurrent misses -> 1 sweep" guarantee for the
                 // cold-cache case).
                 let _guard = self.refresh_lock.lock().await;
-                self.fresh_cached()
-                    .or_else(|| self.any_cached())
+                self.cached_pair(true)
+                    .or_else(|| self.cached_pair(false))
                     .unwrap_or_default()
             }
         }
@@ -856,18 +954,27 @@ impl SessionIndex {
     /// The cached snapshot, if present and within the TTL window. A brief,
     /// non-async lock: never held across an await point.
     fn fresh_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {
-        let guard = self.snapshot.lock().unwrap();
-        match guard.as_ref() {
-            Some(c) if c.fetched_at.elapsed() < self.ttl => Some(Arc::clone(&c.items)),
-            _ => None,
-        }
+        self.cached_pair(true).map(|(items, _)| items)
     }
 
     /// The cached snapshot, if present, regardless of TTL freshness -- the
     /// stale-while-revalidate read: "is there ANYTHING to serve right now."
     fn any_cached(&self) -> Option<Arc<Vec<IndexedSession>>> {
+        self.cached_pair(false).map(|(items, _)| items)
+    }
+
+    /// The cached `(snapshot, scan_failures)` pair of the SAME published
+    /// generation, read under ONE lock acquisition (never held across an
+    /// await point). `require_fresh` applies the TTL window; `false` is the
+    /// stale-while-revalidate read.
+    fn cached_pair(&self, require_fresh: bool) -> Option<(Arc<Vec<IndexedSession>>, Vec<String>)> {
         let guard = self.snapshot.lock().unwrap();
-        guard.as_ref().map(|c| Arc::clone(&c.items))
+        match guard.as_ref() {
+            Some(c) if !require_fresh || c.fetched_at.elapsed() < self.ttl => {
+                Some((Arc::clone(&c.items), sorted_names(&c.scan_failures)))
+            }
+            _ => None,
+        }
     }
 
     /// Cold-start path: run the sweep and wait for it (there is nothing else
@@ -877,19 +984,18 @@ impl SessionIndex {
     async fn run_refresh_inline(
         &self,
         guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Arc<Vec<IndexedSession>> {
-        let items = Self::perform_refresh(
+    ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+        let pair = Self::perform_refresh(
             self.sources.clone(),
             Arc::clone(&self.file_cache),
             Arc::clone(&self.direct_cache),
             Arc::clone(&self.snapshot),
             self.persist_path.clone(),
             Arc::clone(&self.persist_state),
-            Arc::clone(&self.scan_failures),
         )
         .await;
         drop(guard);
-        items
+        pair
     }
 
     /// Warm-cache path: run the sweep DETACHED, so the caller that triggered
@@ -904,7 +1010,6 @@ impl SessionIndex {
         let snapshot = Arc::clone(&self.snapshot);
         let persist_path = self.persist_path.clone();
         let persist_state = Arc::clone(&self.persist_state);
-        let scan_failures = Arc::clone(&self.scan_failures);
         tokio::spawn(async move {
             let _ = Self::perform_refresh(
                 sources,
@@ -913,7 +1018,6 @@ impl SessionIndex {
                 snapshot,
                 persist_path,
                 persist_state,
-                scan_failures,
             )
             .await;
             drop(guard);
@@ -933,26 +1037,31 @@ impl SessionIndex {
         snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
         persist_path: Option<PathBuf>,
         persist_state: Arc<StdMutex<PersistState>>,
-        scan_failures: Arc<StdMutex<HashSet<String>>>,
-    ) -> Arc<Vec<IndexedSession>> {
+    ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
         let sweep_result = tokio::task::spawn_blocking({
             let file_cache = Arc::clone(&file_cache);
             let direct_cache = Arc::clone(&direct_cache);
-            let scan_failures = Arc::clone(&scan_failures);
+            let snapshot = Arc::clone(&snapshot);
             move || {
                 let mut cache = file_cache.lock().unwrap();
                 let mut direct = direct_cache.lock().unwrap();
-                // Clone the failure set in a SHORT lock and mutate the LOCAL
-                // copy during the sweep — `scan_failures()` is a sync
-                // accessor called from async route handlers right after a
-                // stale-while-revalidate `snapshot()`, so holding this mutex
-                // across a multi-second sweep would block a runtime thread
-                // exactly when degraded responses are being served. The
-                // updated set is swapped back in at publish time below,
-                // alongside the snapshot publish. Lost updates are
-                // impossible: `refresh_lock` guarantees at most one sweep
-                // at a time.
-                let mut failures = scan_failures.lock().unwrap().clone();
+                // Seed the failure set from the last PUBLISHED generation in
+                // a SHORT lock and mutate the LOCAL copy during the sweep —
+                // `scan_failures()`/`cached_pair()` are sync accessors
+                // called from async route handlers right after a
+                // stale-while-revalidate `snapshot()`, so holding the
+                // snapshot mutex across a multi-second sweep would block a
+                // runtime thread exactly when degraded responses are being
+                // served. The updated set is published below IN THE SAME
+                // lock write as the new snapshot (one atomic generation).
+                // Lost updates are impossible: `refresh_lock` guarantees at
+                // most one sweep at a time.
+                let mut failures = snapshot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.scan_failures.clone())
+                    .unwrap_or_default();
                 let (items, changed) =
                     refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures);
                 (items, changed, failures)
@@ -969,9 +1078,10 @@ impl SessionIndex {
                 // `unwrap_or_default()` behavior) would silently overwrite a
                 // good, previously-published snapshot with an empty one
                 // marked FRESH. Preserve whatever's already published
-                // instead, mirroring `refresh_snapshot`'s own
-                // `direct_list`-error handling a few lines above
-                // (preserve-cached + log) rather than dropping data.
+                // instead (items AND failures — the whole generation),
+                // mirroring `refresh_snapshot`'s own `direct_list`-error
+                // handling a few lines above (preserve-cached + log) rather
+                // than dropping data.
                 eprintln!(
                     "session-directory: refresh sweep panicked (preserving cached \
                      snapshot): {join_err}"
@@ -980,28 +1090,28 @@ impl SessionIndex {
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .map(|c| Arc::clone(&c.items))
+                    .map(|c| (Arc::clone(&c.items), sorted_names(&c.scan_failures)))
                     .unwrap_or_default();
             }
         };
         let items = Arc::new(items);
+        let failure_names = sorted_names(&failures);
         {
+            // ONE lock write publishes the snapshot AND its scan failures as
+            // a single generation — a reader (`cached_pair`) can never
+            // observe a failed-scan snapshot paired with a cleared failure
+            // set, nor a recovered snapshot paired with stale failures.
             let mut guard = snapshot.lock().unwrap();
             *guard = Some(CachedSnapshot {
                 items: Arc::clone(&items),
                 fetched_at: Instant::now(),
+                scan_failures: failures,
             });
         } // guard dropped here — never held across an .await.
-          // Publish the sweep's failure bookkeeping in its own SHORT lock,
-          // alongside the snapshot publish (see the sweep closure above for
-          // why the mutex is not held during the sweep itself). The panic
-          // (JoinError) path above deliberately leaves the shared set
-          // untouched, mirroring its preserve-the-published-snapshot stance.
-        *scan_failures.lock().unwrap() = failures;
-        // Opportunistic persistence: gated (threshold/debounce) and, when
-        // warranted, saved via a DETACHED task -- never awaited here, so
-        // neither an HTTP request handler NOR this refresh itself is
-        // delayed by a disk write.
+          // Opportunistic persistence: gated (threshold/debounce) and, when
+          // warranted, saved via a DETACHED task -- never awaited here, so
+          // neither an HTTP request handler NOR this refresh itself is
+          // delayed by a disk write.
         if let Some((path, cache_snapshot)) = take_pending_save_from_parts(
             &persist_path,
             &persist_state,
@@ -1024,7 +1134,7 @@ impl SessionIndex {
                 }
             });
         }
-        items
+        (items, failure_names)
     }
 
     /// Populate the cache once, eagerly. Call from `main.rs` via
@@ -1077,6 +1187,15 @@ fn take_pending_save_from_parts(
     Some((path, cache_snapshot))
 }
 
+/// Sorted, deduped provider names from a scan-failure set — the wire shape
+/// [`SessionIndex::scan_failures`]/[`SessionIndex::snapshot_with_failures`]
+/// expose (`getScanFailures` parity: stable order for assertions/dedupe).
+fn sorted_names(failures: &HashSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = failures.iter().cloned().collect();
+    names.sort();
+    names
+}
+
 /// One cached direct-listed source's last successful listing, keyed by
 /// source index in [`SessionIndex::direct_cache`]. Mirrors [`FileEntry`]'s
 /// role for file-based sources, but keyed by change-token instead of
@@ -1126,7 +1245,33 @@ fn refresh_snapshot(
     for (idx, source) in sources.iter().enumerate() {
         if let Some(token) = source.direct_change_token() {
             let unchanged = direct_cache.get(&idx).is_some_and(|e| e.token == token);
-            if !unchanged {
+            if unchanged {
+                // HEALTH evidence must be refreshed EVERY sweep (Node parity:
+                // `refreshDirectProvider()` runs on every full scan and
+                // records/clears `scanFailures` per attempt,
+                // `session-indexer.ts:1457`, `:1070-1082`). The unchanged
+                // mtime token gates only the expensive re-QUERY of session
+                // DATA -- a database can become locked or unreadable (e.g.
+                // `chmod`) without either watched mtime moving, so reporting
+                // `ready` from the stale cache here would violate the "never
+                // present unsearchable as healthy" contract.
+                match source.direct_health_check() {
+                    Ok(()) => {
+                        if let Some(name) = source.provider_name() {
+                            scan_failures.remove(name);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(name) = source.provider_name() {
+                            scan_failures.insert(name.to_string());
+                        }
+                        eprintln!(
+                            "session-directory: direct-listed source #{idx} health check \
+                             failed (preserving cached sessions): {err}"
+                        );
+                    }
+                }
+            } else {
                 match source.direct_list() {
                     Ok(items) => {
                         if let Some(name) = source.provider_name() {
@@ -2175,6 +2320,7 @@ mod tests {
         let snapshot = Arc::new(StdMutex::new(Some(CachedSnapshot {
             items: Arc::clone(&good_snapshot),
             fetched_at: Instant::now(),
+            scan_failures: HashSet::new(),
         })));
         let file_cache = Arc::new(StdMutex::new(HashMap::new()));
         let direct_cache = Arc::new(StdMutex::new(HashMap::new()));
@@ -2182,14 +2328,13 @@ mod tests {
 
         let panicking_source: Arc<dyn SessionSource> = Arc::new(PanicSource);
 
-        let result = SessionIndex::perform_refresh(
+        let (result, result_failures) = SessionIndex::perform_refresh(
             vec![panicking_source],
             Arc::clone(&file_cache),
             Arc::clone(&direct_cache),
             Arc::clone(&snapshot),
             None,
             Arc::clone(&persist_state),
-            Arc::new(StdMutex::new(HashSet::new())),
         )
         .await;
 
@@ -2198,6 +2343,10 @@ mod tests {
             1,
             "a panicked blocking sweep must return the last-known-good snapshot, \
              not an empty one"
+        );
+        assert!(
+            result_failures.is_empty(),
+            "the preserved generation's failure set rides along unchanged"
         );
 
         let published = snapshot.lock().unwrap();
@@ -3238,7 +3387,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_direct_list_records_a_scan_failure_and_recovery_clears_it() {
-        // A direct-listed source whose direct_list() can be toggled to Err.
+        // A direct-listed source with a CONSTANT change token whose
+        // direct_list()/direct_health_check() can be toggled to Err. The
+        // constant token is load-bearing (review fix): a previous version of
+        // this test used an artificial always-changing token, which forced a
+        // re-query every sweep and thereby MASKED the production defect that
+        // health evidence was only refreshed when the mtime token moved
+        // (a locked/chmod'd db changes neither mtime).
         struct FlakySource(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl SessionSource for FlakySource {
             fn discover(&self) -> Vec<FileStat> {
@@ -3250,17 +3405,22 @@ mod tests {
             fn provider_name(&self) -> Option<&'static str> {
                 Some("opencode")
             }
-            // A CHANGING token each call, so every sweep re-queries.
+            // CONSTANT token: the underlying mtimes never move in this test.
             fn direct_change_token(&self) -> Option<i64> {
-                use std::sync::atomic::{AtomicI64, Ordering};
-                static N: AtomicI64 = AtomicI64::new(0);
-                Some(N.fetch_add(1, Ordering::SeqCst))
+                Some(42)
             }
             fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
                 if self.0.load(std::sync::atomic::Ordering::SeqCst) {
                     Err("unable to open database file".to_string())
                 } else {
                     Ok(Vec::new())
+                }
+            }
+            fn direct_health_check(&self) -> Result<(), String> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("unable to open database file".to_string())
+                } else {
+                    Ok(())
                 }
             }
         }
@@ -3270,14 +3430,16 @@ mod tests {
             std::time::Duration::ZERO, // every snapshot() sweeps
             None,
         );
-        // COLD cache: the first snapshot() sweeps INLINE, so this assert is
-        // deterministic.
+        // Phase 1 — COLD cache, broken source: the first snapshot() sweeps
+        // INLINE (deterministic assert). No DirectEntry is cached yet, so
+        // this exercises the direct_list() error path.
         let _ = index.snapshot().await;
         assert_eq!(index.scan_failures(), vec!["opencode".to_string()]);
+        // Phase 2 — recovery: a failed listing never cached a token, so the
+        // next sweep re-queries and clears the failure. WARM-but-stale cache:
+        // snapshot() refreshes DETACHED (stale-while-revalidate) — observe by
+        // POLLING via the module's existing `wait_until` helper.
         broken.store(false, std::sync::atomic::Ordering::SeqCst);
-        // WARM-but-stale cache: snapshot() returns stale data immediately and
-        // refreshes DETACHED (stale-while-revalidate) — recovery must be observed
-        // by POLLING. Reuse the module's existing `wait_until` test helper.
         let _ = index.snapshot().await;
         assert!(
             wait_until(std::time::Duration::from_secs(2), || index
@@ -3286,6 +3448,84 @@ mod tests {
             .await,
             "scan failure must clear once the source recovers"
         );
+        // Phase 3 — the review-fix case: a DirectEntry is now cached under
+        // token 42 and the token NEVER changes again, yet the source becomes
+        // unhealthy. The per-sweep health probe alone must re-record the
+        // failure — a sweep must never report `ready` from stale evidence.
+        broken.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || index.scan_failures()
+                == vec!["opencode".to_string()])
+            .await,
+            "a newly-failing source with an UNCHANGED change token must still \
+             record a scan failure (health is re-evidenced every sweep)"
+        );
+    }
+
+    /// Finding-1 coverage through the REAL `OpencodeSource` (no injected
+    /// token, no test double): a seeded sqlite db that becomes unreadable
+    /// via `chmod 000` — which moves NEITHER `opencode.db` nor
+    /// `opencode.db-wal` mtime, so the change token is provably unchanged —
+    /// must record a scan failure while preserving the cached sessions, and
+    /// clear it again once the db is readable (mtime STILL unchanged, so
+    /// recovery also flows through the health probe, not a re-query).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_db_unreadable_with_unchanged_mtime_records_a_scan_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-health",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        let db = data_home.join("opencode.db");
+        let source = OpencodeSource::new(data_home.clone());
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(source) as _],
+            Duration::ZERO,
+            None,
+        );
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1, "sanity: the readable db lists one session");
+        assert!(index.scan_failures().is_empty());
+
+        let mtime_before = std::fs::metadata(&db).unwrap().modified().unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().modified().unwrap(),
+            mtime_before,
+            "chmod must not move the db mtime — the change token is unchanged"
+        );
+        if std::fs::File::open(&db).is_ok() {
+            // Permission bits are not enforced for this euid (e.g. root in a
+            // CI container) — the probe cannot fail. Restore and bail rather
+            // than assert something the environment cannot produce.
+            eprintln!("skipping unreadable-db assertions: euid can read a 0o000 file");
+            std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::remove_dir_all(&data_home).ok();
+            return;
+        }
+
+        let _ = index.snapshot().await; // stale-while-revalidate: sweep is detached
+        assert!(
+            wait_until(Duration::from_secs(2), || index.scan_failures()
+                == vec!["opencode".to_string()])
+            .await,
+            "an unreadable db with an unchanged mtime must record a scan failure"
+        );
+        assert_eq!(
+            index.snapshot().await.len(),
+            1,
+            "cached sessions are preserved through the outage (data cache intact)"
+        );
+
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(Duration::from_secs(2), || index.scan_failures().is_empty()).await,
+            "the failure must clear once the db is readable again (mtime still unchanged)"
+        );
+        std::fs::remove_dir_all(&data_home).ok();
     }
 
     #[tokio::test]
@@ -3333,6 +3573,152 @@ mod tests {
                 .is_empty())
             .await,
             "file-backed scan failure must clear once the root is listable again"
+        );
+    }
+
+    /// Finding-2 coverage through the REAL `ClaudeSource` (no injected
+    /// `discover_checked` double): a seeded home whose `projects/` root
+    /// becomes unlistable (`chmod 000`) must record a scan failure — the
+    /// single-pass checked traversal propagates the root `read_dir` error
+    /// from the SAME handle the sweep consumes (no disposable preflight, no
+    /// TOCTOU window in which a failure could come back as `Ok(empty)` and
+    /// clear the outage) — and recovery must clear it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_claude_source_unlistable_projects_root_records_a_scan_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = unique_temp_dir("claude-unlistable");
+        let project = home.join("projects").join("proj-a");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = synthetic_session_id(1);
+        write_session_file(
+            &project,
+            "s.jsonl",
+            &sid,
+            "/repo/a",
+            "2024-01-01T00:00:00Z",
+            "hello",
+        );
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(home.clone())) as _],
+            Duration::ZERO,
+            None,
+        );
+        assert_eq!(
+            index.snapshot().await.len(),
+            1,
+            "sanity: one session listed"
+        );
+        assert!(index.scan_failures().is_empty());
+
+        let projects = home.join("projects");
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&projects).is_ok() {
+            eprintln!("skipping unlistable-root assertions: euid can list a 0o000 dir");
+            std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+
+        let _ = index.snapshot().await; // stale-while-revalidate: sweep is detached
+        assert!(
+            wait_until(Duration::from_secs(2), || index.scan_failures()
+                == vec!["claude".to_string()])
+            .await,
+            "an unlistable projects root must record a scan failure for the REAL source"
+        );
+
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(Duration::from_secs(2), || index.scan_failures().is_empty()).await,
+            "the failure must clear once the root is listable again"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                index.peek().map(|s| s.len()) == Some(1)
+            })
+            .await,
+            "the session must be re-discovered after recovery"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Finding-2 coverage for the REAL `CodexSource` and `AmplifierSource`
+    /// checked traversals, at the lowest real layer (`discover_checked`
+    /// itself): an unlistable root is `Err` (never a silent `Ok(empty)`),
+    /// a listable one enumerates, and a MISSING root is a genuine empty.
+    #[cfg(unix)]
+    #[test]
+    fn real_codex_and_amplifier_unlistable_roots_propagate_from_discover_checked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Codex: <codex_home>/sessions/<y>/<m>/<d>/*.jsonl
+        let codex_home = unique_temp_dir("codex-unlistable");
+        let day = codex_home
+            .join("sessions")
+            .join("2024")
+            .join("01")
+            .join("01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-x.jsonl"), b"").unwrap();
+        let codex = CodexSource::new(codex_home.clone());
+        assert_eq!(
+            codex.discover_checked().expect("listable root").len(),
+            1,
+            "sanity: one rollout discovered"
+        );
+        let codex_root = codex_home.join("sessions");
+        std::fs::set_permissions(&codex_root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = std::fs::read_dir(&codex_root).is_err();
+        if enforced {
+            assert!(
+                codex.discover_checked().is_err(),
+                "an unlistable codex sessions root must be Err, never Ok(empty)"
+            );
+        } else {
+            eprintln!("skipping unlistable-root assertions: euid can list a 0o000 dir");
+        }
+        std::fs::set_permissions(&codex_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&codex_home).ok();
+
+        // Amplifier: <amplifier_home>/projects/<proj>/sessions/<id>/metadata.json
+        let amp_home = unique_temp_dir("amplifier-unlistable");
+        let session_dir = amp_home
+            .join("projects")
+            .join("-repo-a")
+            .join("sessions")
+            .join("sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("metadata.json"), b"{}").unwrap();
+        let amp = crate::amplifier::AmplifierSource::new(amp_home.clone());
+        assert_eq!(
+            amp.discover_checked().expect("listable root").len(),
+            1,
+            "sanity: one metadata.json discovered"
+        );
+        let amp_root = amp_home.join("projects");
+        std::fs::set_permissions(&amp_root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if enforced {
+            assert!(
+                amp.discover_checked().is_err(),
+                "an unlistable amplifier projects root must be Err, never Ok(empty)"
+            );
+        }
+        std::fs::set_permissions(&amp_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&amp_home).ok();
+
+        // MISSING roots stay a genuine empty (absent provider), for both.
+        let ghost = unique_temp_dir("ghost-home");
+        assert_eq!(
+            CodexSource::new(ghost.clone()).discover_checked().unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            crate::amplifier::AmplifierSource::new(ghost)
+                .discover_checked()
+                .unwrap(),
+            Vec::new()
         );
     }
 
@@ -3412,6 +3798,76 @@ mod tests {
         assert!(
             failures.is_empty(),
             "no failure recorded yet — the sweep hasn't published anything"
+        );
+    }
+
+    /// Finding-3 pin: the snapshot and its scan failures are ONE atomic
+    /// generation. A source that strictly alternates between a failing sweep
+    /// (empty listing + failure recorded) and a healthy sweep (one session +
+    /// failure cleared) can only ever be observed in one of those two
+    /// coherent states through the combined accessor — never a failed-scan
+    /// empty snapshot paired with a cleared failure set (a healthy-looking
+    /// `ready + matches: []` lie), and never a recovered snapshot paired
+    /// with stale failures. Structural with the single-lock publish; the
+    /// old split-lock model had a window between the two publishes where
+    /// both incoherent mixes were observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_and_scan_failures_publish_as_one_atomic_generation() {
+        struct AlternatingSource {
+            item: IndexedSession,
+            sweeps: Arc<AtomicUsize>,
+        }
+        impl SessionSource for AlternatingSource {
+            fn discover(&self) -> Vec<FileStat> {
+                Vec::new()
+            }
+            fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+                if self.sweeps.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                    Ok(vec![FileStat {
+                        path: PathBuf::from("/fake/alternating.jsonl"),
+                        mtime_ms: 0,
+                        size: 0,
+                    }])
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "denied",
+                    ))
+                }
+            }
+            fn parse(&self, _p: &Path) -> Option<IndexedSession> {
+                Some(self.item.clone())
+            }
+            fn provider_name(&self) -> Option<&'static str> {
+                Some("claude")
+            }
+        }
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(AlternatingSource {
+                item: mk("s1", "claude", 1),
+                sweeps: Arc::new(AtomicUsize::new(0)),
+            }) as _],
+            Duration::ZERO, // every snapshot() is stale -> continuous sweeps
+            None,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut seen_healthy, mut seen_failed) = (false, false);
+        while std::time::Instant::now() < deadline && !(seen_healthy && seen_failed) {
+            let (items, failures) = index.snapshot_with_failures().await;
+            match (items.len(), failures.as_slice()) {
+                (1, []) => seen_healthy = true,
+                (0, [name]) if name == "claude" => seen_failed = true,
+                (len, _) => panic!(
+                    "incoherent generation observed: a failed-scan snapshot must never \
+                     pair with a cleared failure set (items={len}, failures={failures:?})"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            seen_healthy && seen_failed,
+            "both generations must be observed for the pin to be meaningful \
+             (healthy={seen_healthy}, failed={seen_failed})"
         );
     }
 }

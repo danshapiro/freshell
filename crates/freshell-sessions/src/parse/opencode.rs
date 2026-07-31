@@ -281,6 +281,25 @@ impl OpencodeProvider {
     /// row-mapping skips rows without a cwd, and a query failure surfaces as `Err`
     /// (re-throw / preserve-cached semantics). `now_ms` is the injected clock the
     /// reference reads from `Date.now()`.
+    /// Cheap per-sweep health probe: is the database still OPENABLE and its
+    /// schema page READABLE through the exact open path [`Self::list_sessions`]
+    /// uses? A missing db is healthy-absent (matching `list_sessions`'s
+    /// `MissingDb` tolerance); a locked, `chmod`ed, or corrupted db errors.
+    /// One `sqlite_master` count (a single page read) — never a full listing.
+    pub fn health_check(&self) -> Result<(), OpencodeReadError> {
+        let db_path = self.database_path();
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| OpencodeReadError(e.to_string()))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|e| OpencodeReadError(e.to_string()))
+    }
+
     pub fn list_sessions(&self, now_ms: i64) -> Result<OpencodeListing, OpencodeReadError> {
         let db_path = self.database_path();
         let mut degrade = Vec::new();
