@@ -223,9 +223,10 @@ CARGO_TARGET_DIR_VALUE="$BUILD_DIR/cargo-target"
 
 build_client() {
   echo "Typechecking and building the client in private staging..."
-  npm run typecheck:client -- \
+  npm run typecheck:client:app -- \
     --incremental false \
     --tsBuildInfoFile "$BUILD_DIR/tsconfig.client.tsbuildinfo"
+  npm run typecheck:deployment-compatibility
   FRESHELL_CLIENT_OUT_DIR="$CLIENT_DIR" npm run build:client
 }
 

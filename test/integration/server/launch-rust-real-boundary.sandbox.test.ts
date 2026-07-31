@@ -557,9 +557,16 @@ describe('canonical launch-rust deployment wrapper', () => {
     expect(recorded.filter((event) => event.command === 'cargo')).toEqual([])
     expect(recorded.filter((event) => event.command === 'npm').map((event) => event.args.slice(0, 2)))
       .toEqual([
-        ['run', 'typecheck:client'],
+        ['run', 'typecheck:client:app'],
+        ['run', 'typecheck:deployment-compatibility'],
         ['run', 'build:client'],
       ])
+    const appTypecheck = recorded.find(
+      (event) => event.command === 'npm' && event.args[1] === 'typecheck:client:app',
+    )
+    const buildInfoIndex = appTypecheck?.args.indexOf('--tsBuildInfoFile') ?? -1
+    expect(buildInfoIndex).toBeGreaterThan(0)
+    expect(isStrictlyBeneath('/tmp', appTypecheck?.args[buildInfoIndex + 1] ?? '')).toBe(true)
     expect(isStrictlyBeneath(
       '/tmp',
       recorded.find(
@@ -662,7 +669,8 @@ describe('canonical launch-rust deployment wrapper', () => {
     expect(result.status, result.stderr).toBe(0)
     const npm = events().filter((event) => event.command === 'npm').map((event) => event.args.slice(0, 2))
     expect(npm).toEqual([
-      ['run', 'typecheck:client'],
+      ['run', 'typecheck:client:app'],
+      ['run', 'typecheck:deployment-compatibility'],
       ['run', 'build:client'],
       ['run', 'typecheck:server'],
       ['run', 'build:server'],
