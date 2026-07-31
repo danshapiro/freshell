@@ -59,13 +59,18 @@
 //!   whose permit MOVES INTO the fallback task caps how many (abandoned or
 //!   live) fallback tasks can exist at once — a permit-starved dispatch
 //!   degrades with the same timeout-shaped provider error instead of
-//!   queueing; (3) a cooperative cancel flag, checked before every fallback
-//!   invocation, makes one timed-out dispatch skip every later fallback in
-//!   the SAME request (each skip records the same timeout-shaped provider
-//!   error — that provider was not searched), so a single request abandons
-//!   at most ONE stalled task. ERRATA: commit bb357a598 applied the
+//!   queueing; (3) the per-provider budget (`FALLBACK_BUDGET_PER_REQUEST`
+//!   = 2) caps how many dispatches — and therefore abandoned tasks — one
+//!   request can produce. Each dispatch is bounded INDEPENDENTLY: a
+//!   timeout blames only the provider whose dispatch elapsed, and later
+//!   candidates/providers are still attempted with their own bounds
+//!   (Node records the rejection per provider and keeps iterating,
+//!   `resolve-session.ts:133-156`). ERRATA: commit bb357a598 applied the
 //!   deadline + admission around the WHOLE resolver as an interim
-//!   approximation; corrected to this fallback-only scoping.
+//!   approximation; corrected to fallback-only scoping. ERRATA: commit
+//!   ffa4aac1a shared one cooperative cancel flag across both providers,
+//!   so one timeout skipped every later fallback and fabricated timeouts
+//!   for providers never dispatched; corrected to per-dispatch scoping.
 //! - RECORDED DEVIATION: a `JoinError` (the resolver PANICKED) answers an
 //!   explicit 500 `{"error":"Resolve failed"}`. Node has no defined behavior
 //!   here — a top-level resolver throw becomes an unhandled rejection in the
@@ -176,7 +181,7 @@ pub type ClaudeLocator =
 /// The generic exact-id fallback closure shape shared by
 /// [`OpencodeByIdLookup`] (`T = OpencodeByIdHit`) and [`ClaudeLocator`]
 /// (`T = ClaudeTranscriptHit`); [`bounded_fallback`] wraps one in the
-/// permit + deadline + cooperative-cancel dispatch.
+/// permit + per-dispatch-deadline dispatch.
 type FallbackFn<T> = Arc<dyn Fn(&str) -> Result<Option<T>, ProviderFailure> + Send + Sync>;
 
 /// Shared state for the resolve surface.
@@ -345,17 +350,26 @@ fn validate_resolve_body(body: &Value) -> Result<String, Value> {
 /// `deadline` (permit wait + fallback, Node's hard 15 s worker timeout) and
 /// admitted by `permits` ([`RESOLVE_MAX_CONCURRENCY`]).
 ///
+/// The deadline is scoped to THIS dispatch alone — a timeout here never
+/// affects later fallback invocations in the same request. Node bounds
+/// each by-id worker individually, records the rejection for that ONE
+/// provider, and continues through later candidates/providers
+/// (`resolve-session.ts:133-156`); this port does the same, so a stalled
+/// opencode store can never fabricate a claude timeout (or vice versa).
+/// ERRATA: commit ffa4aac1a shared one cooperative cancel flag across
+/// both providers' dispatches, so one timeout skipped every later
+/// fallback and blamed providers that were never dispatched; corrected
+/// to this per-dispatch scoping.
+///
 /// RECORDED DEVIATION from Node's cancellation: a blocking task cannot be
 /// killed, so on deadline elapse the task is ABANDONED (Node instead
 /// `worker.terminate()`s the stalled thread) — the permit MOVES INTO the
 /// task, so an abandoned task keeps holding it until its underlying op
-/// returns, capping stalled-task accumulation at the permit count. The
-/// elapse also sets `cancel`, so every LATER fallback invocation in the
-/// same request is skipped (recording the same timeout-shaped failure —
-/// that provider was NOT searched, and reporting it healthy would present
-/// an unsearchable state as "not found"); one request abandons at most one
-/// stalled task. A panicking fallback is resumed on the caller thread so
-/// the resolver task's JoinError still answers the explicit 500.
+/// returns, capping stalled-task accumulation at the permit count; within
+/// one request the per-provider budget (`FALLBACK_BUDGET_PER_REQUEST` = 2)
+/// caps abandonment at budget × wired providers. A panicking fallback is
+/// resumed on the caller thread so the resolver task's JoinError still
+/// answers the explicit 500.
 ///
 /// Called from the resolver's blocking thread: `handle.block_on` re-enters
 /// the runtime for the permit + timeout machinery (never from an async
@@ -365,17 +379,10 @@ fn bounded_fallback<T: Send + 'static>(
     handle: tokio::runtime::Handle,
     permits: Arc<tokio::sync::Semaphore>,
     deadline: std::time::Duration,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> FallbackFn<T> {
     Arc::new(move |id: &str| {
         // Node's worker-timeout rejection shape: message-only providerError.
         let message = format!("resolve timed out after {}ms", deadline.as_millis());
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(ProviderFailure {
-                code: None,
-                message,
-            });
-        }
         let id = id.to_string();
         let inner = Arc::clone(&inner);
         let permits = Arc::clone(&permits);
@@ -407,9 +414,10 @@ fn bounded_fallback<T: Send + 'static>(
             Err(_elapsed) => {
                 // Deadline elapsed — EITHER no permit became available
                 // (admission cap saturated by earlier abandoned fallbacks)
-                // or the fallback itself stalled. Abandon it, skip later
-                // fallbacks in this request, and blame ONLY this provider.
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                // or the fallback itself stalled. Abandon it and blame ONLY
+                // this provider; later dispatches in the same request run
+                // with their own bounds (Node continues through later
+                // candidates/providers, `resolve-session.ts:133-156`).
                 tracing::warn!(
                     deadline_ms = deadline.as_millis() as u64,
                     "resolve fallback timed out; abandoning its blocking task"
@@ -602,15 +610,13 @@ async fn resolve_session(
         HashMap::new()
     };
 
-    // Cooperative-cancellation flag for the FALLBACK phase: a blocking task
-    // cannot be killed, but the bounded dispatch below checks this flag
-    // before every provider invocation, so once ONE fallback dispatch times
-    // out (its task abandoned, holding a permit) every LATER fallback in
-    // the same request is skipped — a single request abandons at most one
-    // stalled task. (Index matching between boundaries is bounded in-memory
-    // work; the expensive, stall-prone operations are exactly the fallback
-    // FS/SQLite calls this gates.)
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Each fallback dispatch below is bounded INDEPENDENTLY (own deadline,
+    // own permit): a timeout in one provider's dispatch never skips — or
+    // fabricates a timeout for — later dispatches, matching Node's
+    // per-worker containment (`resolve-session.ts:133-156` records the
+    // rejection for that provider and continues). Abandoned-task
+    // accumulation is capped by the per-provider budget within a request
+    // and by the admission semaphore across requests.
     // Captured HERE (async context) so the blocking resolver thread can
     // dispatch each fallback back onto the runtime via `Handle::block_on`.
     let handle = tokio::runtime::Handle::current();
@@ -620,7 +626,6 @@ async fn resolve_session(
             handle.clone(),
             Arc::clone(&state.resolve_permits),
             state.resolve_deadline,
-            Arc::clone(&cancel),
         )
     });
     let claude: Option<ClaudeLocator> = state.locate_claude_transcript.clone().map(|inner| {
@@ -629,7 +634,6 @@ async fn resolve_session(
             handle.clone(),
             Arc::clone(&state.resolve_permits),
             state.resolve_deadline,
-            Arc::clone(&cancel),
         )
     });
     // The resolver task itself runs WITHOUT a permit and WITHOUT a deadline
@@ -1734,6 +1738,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_opencode_timeout_never_skips_or_blames_a_healthy_claude_fallback() {
+        // Cross-provider containment (Node parity): Node bounds each by-id
+        // worker INDIVIDUALLY (`opencode-by-id-runner.ts` DEFAULT_TIMEOUT_MS),
+        // records the rejection for THAT provider, and CONTINUES through
+        // later candidates/providers (`resolve-session.ts:133-156` — the
+        // catch records per-provider and the entry loop keeps going). Input
+        // = an opencode `ses_` id followed by a claude UUID: the opencode
+        // dispatch stalls past its own deadline, but the claude lookup is
+        // healthy and MUST still run — returning its match — while ONLY
+        // opencode is blamed for the timeout.
+        let dir = temp_dir("cross-provider");
+        let index = fixture_index(Vec::new()).await;
+        let mut st = state(&dir, Some(index));
+        st.resolve_deadline = std::time::Duration::from_millis(50);
+        st.opencode_session_by_id = Some(Arc::new(|_id: &str| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            Ok(None)
+        }));
+        st.locate_claude_transcript = Some(Arc::new(|id: &str| {
+            Ok(Some(
+                freshell_sessions::resume_resolve::ClaudeTranscriptHit {
+                    session_id: id.to_ascii_lowercase(),
+                    cwd: Some("/home/tester/project".to_string()),
+                },
+            ))
+        }));
+        let (status, body) = post(
+            st,
+            serde_json::json!({
+                "input": format!("ses_aaaaaaaaaaaaaaaaaaaaaaaaaa {CLAUDE_ID}")
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "degraded", "response: {body}");
+        assert_eq!(
+            body["matches"],
+            serde_json::json!([{
+                "provider": "claude",
+                "sessionId": CLAUDE_ID,
+                "cwd": "/home/tester/project",
+                "sessionType": "claude",
+                "matchKind": "exact"
+            }]),
+            "the healthy claude fallback match must be returned: {body}"
+        );
+        assert_eq!(
+            body["providerErrors"],
+            serde_json::json!([
+                { "provider": "opencode", "message": "resolve timed out after 50ms" }
+            ]),
+            "only the provider whose dispatch timed out may be blamed: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_exact_index_hit_succeeds_while_the_permit_pool_is_saturated() {
         // CORRECTED SCOPING (Node parity): admission + deadline bound ONLY
         // the blocking provider-fallback dispatch. Node's cheap paths —
@@ -1951,11 +2012,11 @@ mod tests {
 
     #[tokio::test]
     async fn two_exact_ses_tokens_invoke_the_opencode_fallback_twice_when_not_abandoned() {
-        // CONTROL for the cancellation test below: this two-token input
-        // drives TWO opencode fallback invocations (budget is 2 per
-        // provider) when nothing is cancelled — so the cancelled variant's
-        // count of ONE proves the cancel flag (not the budget or the input
-        // shape) is what stopped the second call.
+        // CONTROL for the per-dispatch containment test below: this
+        // two-token input drives TWO opencode fallback invocations (budget
+        // is 2 per provider) when nothing stalls — so the stalled variant's
+        // count of TWO proves the budget/input shape allows both calls and
+        // continuation after a timeout is real, not an artifact.
         let dir = temp_dir("cancel-control");
         let index = fixture_index(Vec::new()).await;
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1985,30 +2046,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timed_out_fallback_sets_the_cancel_flag_skipping_later_fallbacks() {
-        // Cooperative cancellation proof, scoped to the FALLBACK phase:
-        // after one fallback dispatch times out (its blocking task is
-        // abandoned holding a permit), the request must SKIP every later
-        // fallback invocation instead of stacking more abandoned tasks.
-        // Same two-token input as the control above (which proves TWO
-        // invocations happen when nothing times out): the first invocation
-        // stalls past the deadline; once it returns, the second must be
-        // SKIPPED because the cancel flag is set.
-        let dir = temp_dir("cancel");
+    async fn a_timed_out_fallback_never_skips_the_next_candidates_dispatch() {
+        // Per-dispatch containment (Node parity): after the first
+        // candidate's dispatch times out (its blocking task abandoned,
+        // holding a permit), the SECOND candidate's fallback must still be
+        // dispatched with its OWN deadline — Node records the rejection for
+        // that provider and continues through later candidates/providers
+        // (`resolve-session.ts:133-156`). ERRATA: ffa4aac1a's shared cancel
+        // flag skipped it (and fabricated timeouts for providers never
+        // dispatched). Abandonment stays bounded WITHOUT the flag: the
+        // per-provider budget (2) caps the dispatches one request can
+        // produce. Same two-token input as the control above (which proves
+        // exactly TWO invocations happen when nothing stalls), so a count
+        // of 2 here proves continuation — while first-error-wins dedupe
+        // keeps ONE opencode error on the wire.
+        let dir = temp_dir("per-dispatch");
         let index = fixture_index(Vec::new()).await;
         let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let returned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut st = state(&dir, Some(index));
         st.resolve_deadline = std::time::Duration::from_millis(50);
         st.opencode_session_by_id = Some({
             let invoked = Arc::clone(&invoked);
-            let returned = Arc::clone(&returned);
             Arc::new(move |_id: &str| {
                 invoked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Stall well past the 50 ms deadline, then answer a miss —
-                // the resolver would proceed to the second token's fallback.
+                // Stall well past the 50 ms deadline, then answer a miss.
                 std::thread::sleep(std::time::Duration::from_millis(250));
-                returned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(None)
             })
         });
@@ -2022,25 +2084,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "degraded", "response: {body}");
-
-        // Wait for the FIRST stalled call to RETURN inside the abandoned
-        // task; a non-cancelling resolver then invokes the second token's
-        // fallback synchronously (microseconds later — the 300 ms grace is
-        // three orders of magnitude of margin), so a count still at 1 after
-        // the grace proves the cancel flag was observed, not slow scheduling.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while returned.load(std::sync::atomic::Ordering::SeqCst) < 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the abandoned resolver's first call must eventually return"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            body["providerErrors"],
+            serde_json::json!([
+                { "provider": "opencode", "message": "resolve timed out after 50ms" }
+            ]),
+            "first error per provider wins — two timeouts, ONE entry: {body}"
+        );
         assert_eq!(
             invoked.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the cancelled resolver must SKIP the second fallback invocation"
+            2,
+            "the second candidate's dispatch must still run with its own deadline"
         );
     }
 }
