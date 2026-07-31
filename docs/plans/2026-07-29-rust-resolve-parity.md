@@ -1,5 +1,29 @@
 # SYNC-06: Rust Server Resume-Resolve Parity Implementation Plan
 
+> ## ⚠️ ARCHIVED / SUPERSEDED — DO NOT EXECUTE ⚠️
+>
+> **This plan is superseded by
+> [`docs/plans/2026-07-30-rust-resolve-parity-hardened.md`](2026-07-30-rust-resolve-parity-hardened.md).**
+> It is retained only as a historical record of the first (pre-#586) pass.
+>
+> - It implements the **RETIRED pre-#586 resolve contract**, including the
+>   retired OpenCode parent-chain resolver (`resolveOpencodeSessionRoots`
+>   parent-walk) that main's hardened Node implementation replaced with a
+>   direct by-id row query — while claiming full parity it does not deliver.
+> - Its "Parity reference — Node behavior being ported" section (lines ~62-72)
+>   describes the **obsolete pre-#586 Node behavior**, not the hardened
+>   contract (`degraded` status, `providerErrors`, `unsearchedProviders`,
+>   `homeDir` are all absent).
+> - Its expected test counts (line ~3103, "32 passed; 14 passed") are **stale**
+>   and do not match the current tree.
+> - Its own final checklist step confirms this plan targeted the retired
+>   implementation; the completion checklist's SYNC-06 `PARTIAL / REOPENED
+>   (2026-07-30)` entry records the reopening.
+>
+> **DO NOT EXECUTE.** Re-executing this plan would reintroduce defects already
+> resolved by the hardened plan, and its indexed-Codex E2E gate could still
+> pass while doing so. Execute the hardened plan instead.
+
 > **For agentic workers:** This plan is executed task-by-task by the
 > workflow's execute stage: a fresh implementer per task, with a spec +
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax

@@ -2,8 +2,10 @@
 
 ## Goal
 
-Close checklist item **SYNC-06** in
-`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:803`: implement
+Deliver the Rust-server half of checklist item **SYNC-06** in
+`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:803` (the item itself
+stays unchecked until its `PW-TAURI-WIN` native-Windows validation, out of scope here,
+also lands — see Requirement 8): implement
 `POST /api/sessions/resolve` in the **Rust server** (`crates/freshell-server`) with full
 behavior parity to the Node implementation, and declare the `sessionResolve` feature flag
 from the Rust server so the shared client shows the pinned sidebar Resume button on
@@ -85,11 +87,17 @@ Rust endpoint's JSON must be wire-compatible with what the client already consum
 7. **Feature flag.** Declare `sessionResolve` in the Rust server's feature-flags payload
    (its equivalent of `detectFeatureFlags()`), so the shared client renders the Resume
    button. Do not gate it on anything else.
-8. **Checklist update.** Mark SYNC-06 done in
-   `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` with evidence,
-   following the file's existing entry conventions. The `PW-TAURI-WIN` (native Windows
-   WebView2) half of the validation remains explicitly out of scope, as prior entries
-   do — note it.
+8. **Checklist update.** Record the SYNC-06 parity evidence in
+   `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md` as a `PARTIAL`
+   bullet following the file's existing entry conventions (the SYNC-05/SAFE-11
+   precedent), and KEEP the SYNC-06 checkbox UNCHECKED (`- [ ]`): the `PW-TAURI-WIN`
+   (native Windows WebView2) half of its named validation is explicitly out of scope
+   for this work, so the item cannot be marked done — the bullet must name what is
+   green and list `PW-TAURI-WIN` as `MISSING`. (This matches the implementation plan,
+   `docs/plans/2026-07-30-rust-resolve-parity-hardened.md` Task 7 Step 4, and the
+   checklist's current state. An earlier revision of this requirement said "Mark
+   SYNC-06 done", contradicting the out-of-scope declaration above — corrected
+   2026-07-31.)
 
 ## Verification
 

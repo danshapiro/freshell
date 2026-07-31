@@ -1916,13 +1916,17 @@ Unit tests for `errno_code` in `main.rs`'s (or the module's) `#[cfg(test)]` modu
 State fields:
 
 ```rust
-// Node sends os.homedir() (`sessions-router.ts:306-314`) — the USER's home.
-// Do NOT reuse resolve_home(): it prefers FRESHELL_HOME, a config/storage
-// root that can differ from the real home, and the dialog would prefill a
-// cwd-less resume into the wrong directory.
-home_dir: std::env::var_os("HOME")
-    .or_else(|| std::env::var_os("USERPROFILE"))
-    .map(|h| Arc::new(h.to_string_lossy().into_owned())),
+// Node sends os.homedir() (`sessions-router.ts:306-314`) — the USER's home,
+// USERPROFILE-backed on native Windows where Tauri deliberately leaves HOME
+// unset. Resolve it via the SAME `session_directory::provider_home()` helper
+// the session index sources use: HOME then USERPROFILE, an EMPTY var treated
+// as unset (a raw `var_os("HOME").or_else(USERPROFILE)` chain would accept
+// an empty HOME verbatim and never reach USERPROFILE). Landed as the
+// `resolve_wire_home_dir()` helper in `main.rs`. Do NOT reuse
+// resolve_home(): it prefers FRESHELL_HOME, a config/storage root that can
+// differ from the real home, and the dialog would prefill a cwd-less resume
+// into the wrong directory.
+home_dir: resolve_wire_home_dir(),
 opencode_session_by_id: Some({
     std::sync::Arc::new(|session_id: &str| {
         let data_home = freshell_sessions::parse::default_opencode_data_home();
@@ -1959,16 +1963,17 @@ locate_claude_transcript: Some({
         let lowered = session_id.to_ascii_lowercase();
         // Node-parity root (`server/claude-home.ts:4-7` +
         // `providers/claude.ts:524-535`): CLAUDE_HOME (non-empty) else
-        // $HOME/.claude, joined with "projects" — the SAME root the Rust
-        // session index uses (`session_directory::claude_home`). Note
-        // CLAUDE_HOME alone suffices even when HOME is unset (Node's
+        // `<home>/.claude`, joined with "projects", where `<home>` resolves
+        // HOME then USERPROFILE with an EMPTY var treated as unset
+        // (`session_directory::provider_home()` — the SAME root the Rust
+        // session index uses). Node's `os.homedir()` is USERPROFILE-backed
+        // on native Windows, where Tauri deliberately leaves HOME unset; a
+        // HOME-only fallback would silently miss every transcript there.
+        // Note CLAUDE_HOME alone suffices even when no home resolves (Node's
         // getClaudeHome() honors it directly); no root ⇒ Ok(None), a miss.
         let claude_home = match std::env::var("CLAUDE_HOME").ok().filter(|v| !v.is_empty()) {
             Some(v) => Some(std::path::PathBuf::from(v)),
-            None => std::env::var("HOME")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|h| std::path::PathBuf::from(h).join(".claude")),
+            None => session_directory::provider_home().map(|h| h.join(".claude")),
         };
         let roots: Vec<std::path::PathBuf> = match claude_home {
             Some(h) => vec![h.join("projects")],
@@ -1994,6 +1999,21 @@ locate_claude_transcript: Some({
     }) as crate::resolve::ClaudeLocator
 }),
 ```
+
+> **POST-EXECUTION NOTE (2026-07-31):** the wiring above landed with the closure
+> bodies extracted to named helpers in `crates/freshell-server/src/main.rs` —
+> `resolve_wire_home_dir()` (the `homeDir` field) and
+> `resolve_claude_exact_id_fallback()` (the `locate_claude_transcript` body) —
+> both resolving the home through `session_directory::provider_home()`
+> (HOME then USERPROFILE, empty treated as unset). An earlier revision of this
+> plan instructed a `CLAUDE_HOME` → `HOME`-only fallback here, which could not
+> achieve native-Windows parity (Tauri leaves HOME unset; Node's `os.homedir()`
+> is USERPROFILE-backed there).
+
+Home-resolution verifiers for this wiring (landed, in `main.rs`'s test module and `session_directory.rs`'s test module):
+- `claude_exact_id_fallback_finds_transcript_in_a_userprofile_only_environment` (`crates/freshell-server/src/main.rs`) — the USERPROFILE-only exact-id fallback test: HOME and CLAUDE_HOME unset, USERPROFILE pointing at a temp home containing `.claude/projects/<project>/<id>.jsonl`; the fallback ITSELF (not just `provider_home()`) must return the transcript hit with the lowercased id and its cwd.
+- `wire_home_dir_treats_empty_home_as_unset_falling_back_to_userprofile` (`crates/freshell-server/src/main.rs`) — an EMPTY `HOME` must fall through to `USERPROFILE` for the `homeDir` wire field.
+- `provider_home_falls_back_to_userprofile_when_home_unset`, `provider_home_prefers_home_over_userprofile`, `provider_home_none_when_home_and_userprofile_unset` (`crates/freshell-server/src/session_directory.rs`) — the shared helper's precedence and empty-as-unset semantics.
 
 - [ ] **Step 4: Async-hygiene verification (context §5 — verify, don't assume)**
 
