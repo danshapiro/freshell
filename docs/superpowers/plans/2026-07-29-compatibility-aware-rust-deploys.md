@@ -272,6 +272,7 @@ Do not treat the legacy PID file alone as ownership. Resolve the requested liste
 ```bash
 cargo test -p freshell-deploy --test generation_store
 cargo test -p freshell-deploy --test legacy_capture
+scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 cargo test -p freshell-deploy --test legacy_capture actual_proc_capture -- --ignored --test-threads=1"
 git add .gitignore crates/freshell-deploy Cargo.lock
 git commit -m "feat(deploy): capture immutable working generations"
 ```
@@ -422,6 +423,8 @@ Explain in plain language: different versions are normal; the selected client an
 npm run lint
 FRESHELL_TEST_SUMMARY='compatibility-aware independent client/server deploy final verification' npm run check
 cargo test --workspace
+scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 cargo test -p freshell-deploy --test legacy_capture actual_proc_capture -- --ignored --test-threads=1"
+scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 CARGO_BUILD_JOBS=2 npm run test:vitest -- run test/integration/server/launch-rust-real-boundary.sandbox.test.ts --config config/vitest/vitest.deploy-sandbox.config.ts --maxWorkers=1 --no-file-parallelism"
 scripts/sandbox-test.sh "FRESHELL_DESTRUCTIVE_SANDBOX=1 CARGO_BUILD_JOBS=2 npx playwright test test/e2e-browser/deployment-compatibility.spec.ts --config test/e2e-browser/playwright.deploy-sandbox.config.ts --workers=1"
 git diff --check origin/main...
 git status --short
@@ -432,7 +435,7 @@ Expected: PASS with only documented skips and a clean worktree after commits.
 - [ ] **Step 6: Commit docs and any focused verification fixes**
 
 ```bash
-git add AGENTS.md
+git add AGENTS.md docs/superpowers/plans/2026-07-29-compatibility-aware-rust-deploys.md
 git commit -m "docs: explain compatibility-checked Rust deploys"
 ```
 
