@@ -94,6 +94,19 @@ impl SessionSource for AmplifierSource {
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
         parse_amplifier_file(path)
     }
+
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("amplifier")
+    }
+
+    /// Root-listing failure propagation: an unlistable
+    /// `<amplifier_home>/projects` (EACCES/EIO — not a merely-absent one) is
+    /// a scan failure, never a silent empty listing. Nested-directory errors
+    /// stay tolerant.
+    fn discover_checked(&self) -> Result<Vec<FileStat>, std::io::Error> {
+        crate::directory_index::ensure_root_listable(&self.amplifier_home.join("projects"))?;
+        Ok(self.discover())
+    }
 }
 
 /// Recursively find every `metadata.json` under `dir` (never

@@ -200,7 +200,7 @@ fn terminal_inventory_and_settings_parse_from_transcript() {
             ));
             assert_eq!(
                 s.settings.coding_cli.enabled_providers,
-                vec!["claude", "codex", "opencode"]
+                vec!["claude", "codex", "opencode", "amplifier"]
             );
         }
         other => panic!("expected SettingsUpdated, got {other:?}"),

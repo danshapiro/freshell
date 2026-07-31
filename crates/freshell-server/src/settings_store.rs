@@ -181,7 +181,12 @@ impl SettingsStore {
         let mut migrated_legacy = false;
         {
             const LEGACY: [&str; 2] = ["claude", "codex"];
-            const DEFAULTS: [&str; 3] = ["claude", "codex", "opencode"];
+            // Node's four-provider `DEFAULT_ENABLED_CLI_PROVIDERS`
+            // (`shared/coding-cli-defaults.ts:3`) — a persisted legacy list
+            // must gain `amplifier` here exactly as it does on Node
+            // (`server/settings-migrate.ts:35-46`), or the provider stays
+            // unsearched and its indexed sessions filtered out.
+            const DEFAULTS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
             let enabled_norm =
                 normalize_trimmed_string_list(&settings.coding_cli.enabled_providers);
             let legacy_match = enabled_norm.len() == LEGACY.len()
@@ -278,6 +283,16 @@ impl SettingsStore {
     /// A clone of the live settings tree.
     pub async fn get(&self) -> ServerSettings {
         self.inner.read().await.clone()
+    }
+
+    /// The enabled coding-CLI provider names (`settings.codingCli.enabledProviders`)
+    /// — the resolve route's unsearched-provider computation reads this. Async
+    /// because the settings tree is behind a tokio RwLock (same as `get()`).
+    // TODO(rust-resolve-parity Task 6): the resolve route's wire upgrade
+    // consumes this (`unsearchedProviders`); until then only tests call it.
+    #[allow(dead_code)]
+    pub async fn coding_cli_enabled_providers(&self) -> Vec<String> {
+        self.inner.read().await.coding_cli.enabled_providers.clone()
     }
 
     /// GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
@@ -1982,6 +1997,80 @@ mod tests {
         assert_eq!(
             s.coding_cli.enabled_providers,
             vec!["claude", "codex", "opencode"]
+        );
+        assert_eq!(s.coding_cli.known_providers, Some(discovered));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 5 (resolve parity): `coding_cli_enabled_providers()` reads the
+    /// persisted `settings.codingCli.enabledProviders` list as-is (the resolve
+    /// route's unsearched-provider computation consumes it,
+    /// `server/sessions-router.ts:255-316`).
+    #[tokio::test]
+    async fn coding_cli_enabled_providers_returns_persisted_list() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","opencode"]}}}"#,
+        )
+        .unwrap();
+        let store = store_at(&dir);
+        assert_eq!(
+            store.coding_cli_enabled_providers().await,
+            vec!["claude".to_string(), "opencode".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 5 (resolve parity): a FRESH home's default enabled-provider list
+    /// must be Node's authoritative four-provider
+    /// `DEFAULT_ENABLED_CLI_PROVIDERS` (`shared/coding-cli-defaults.ts:3`) —
+    /// including `amplifier`. Pins the live parity defect where the Rust
+    /// default omitted `amplifier`, leaving that provider unsearched and its
+    /// indexed sessions filtered out.
+    #[tokio::test]
+    async fn coding_cli_enabled_providers_defaults_match_node_default_set() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir); // no config file — pure defaults
+        assert_eq!(
+            store.coding_cli_enabled_providers().await,
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "opencode".to_string(),
+                "amplifier".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 5 (resolve parity): the legacy-default migration mirrors Node's
+    /// FOUR-provider `DEFAULT_ENABLED_CLI_PROVIDERS`
+    /// (`server/settings-migrate.ts:35-46`) — a persisted legacy
+    /// `["claude","codex"]` gains `amplifier` under exactly the same
+    /// availability gating it already gains `opencode` (only when
+    /// discovered).
+    #[tokio::test]
+    async fn legacy_default_enabled_providers_migration_includes_amplifier() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"settings":{"codingCli":{"enabledProviders":["claude","codex"],"providers":{},"mcpServer":true}}}"#,
+        )
+        .unwrap();
+        let discovered: Vec<String> =
+            ["claude", "codex", "gemini", "kimi", "opencode", "amplifier"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let store = SettingsStore::load(Some(&dir), discovered.clone());
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "opencode", "amplifier"]
         );
         assert_eq!(s.coding_cli.known_providers, Some(discovered));
         std::fs::remove_dir_all(&dir).ok();

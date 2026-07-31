@@ -36,10 +36,14 @@ pub fn default_server_settings() -> ServerSettings {
             title_prompt: None,
         },
         coding_cli: SettingsCodingCli {
+            // Node's `DEFAULT_ENABLED_CLI_PROVIDERS`
+            // (`shared/coding-cli-defaults.ts:3`) — four providers,
+            // including `amplifier`.
             enabled_providers: vec![
                 "claude".to_string(),
                 "codex".to_string(),
                 "opencode".to_string(),
+                "amplifier".to_string(),
             ],
             mcp_server: true,
             providers: json!({ "claude": { "permissionMode": "default" }, "codex": {} }),
