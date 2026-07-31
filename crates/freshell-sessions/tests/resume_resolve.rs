@@ -170,8 +170,10 @@ fn ambiguous_prefix_returns_all_matches_most_recent_first_capped() {
         .collect();
     let out = resolve("417e8345", Some(&many), None, None);
     assert_eq!(out.matches.len(), RESOLVE_MATCH_CAP);
-    assert_eq!(out.matches[0].last_activity_at, Some(24)); // most recent first
-    assert!(out.matches[RESOLVE_MATCH_CAP - 1].last_activity_at >= Some(5));
+    // Most recent first; 25 sessions with activity 24..0 capped at 20 make
+    // the tail EXACTLY 5.
+    assert_eq!(out.matches[0].last_activity_at, Some(24));
+    assert_eq!(out.matches[RESOLVE_MATCH_CAP - 1].last_activity_at, Some(5));
 }
 
 // Node #8: `tries candidates in priority order until one resolves`

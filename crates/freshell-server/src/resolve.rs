@@ -5,16 +5,18 @@
 //! exclusion, candidate work budget, full-id shape gates + per-request
 //! fallback budget).
 //!
-//! KNOWN DIVERGENCES — NOT yet ported (full detail in the core's module doc,
-//! `freshell-sessions/src/resume_resolve.rs`; tracked in
+//! DIVERGENCE LEDGER (full detail in the core's module doc,
+//! `freshell-sessions/src/resume_resolve.rs`; history in
 //! `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`). The
-//! `sessionResolve` capability flag is held `false` (`main.rs`) until this
-//! list is empty. The wire surface, the failure-reporting production
-//! fallbacks (checked claude locator, propagating opencode by-id query), and
-//! the scan-failure/unsearched-provider route merge all landed in plan
-//! Task 6; what remains:
-//! - the `sessionResolve` capability flag itself is still held `false` and
-//!   the e2e resolve matrix has not yet run against this route (plan Task 7).
+//! `sessionResolve` capability flag is declared `true` (`main.rs`,
+//! `build_platform_payload`): the wire surface, the failure-reporting
+//! production fallbacks (checked claude locator, propagating opencode by-id
+//! query), and the scan-failure/unsearched-provider route merge all landed
+//! in plan Task 6, and the resume-button e2e matrix ran green against this
+//! route (plan Task 7). No known unported divergences remain beyond the
+//! RECORDED DEVIATIONS documented below (explicit 500 on a resolver panic
+//! instead of Node's undefined behavior; `homeDir` omitted when the server
+//! has no resolvable home).
 //!
 //! Behavior contract:
 //! - wire shape (`ResumeResolveResponseSchema`, `sessions-router.ts:306-314`):
