@@ -6,7 +6,8 @@
 > for tracking.
 
 **Goal:** Rebase the already-built, twice-reviewed branch `feat/resume-validation`
-(27 commits atop `39010cb57`) onto current main (`2641ada38`, which merged PR #589
+(28 commits atop `39010cb57`, tip `8b0f08162` — the count includes the docs-only
+plan commit) onto current main (`2641ada38`, which merged PR #589
 "graceful-restore-resume-s1"), resolving the one semantic conflict by carrying
 `resume_id_from_wire` through main's new `LaunchPrep` struct (locked Option A),
 restoring the gate-before-plan invariant against #589's off-permit codex planning,
@@ -18,7 +19,7 @@ struct: `launch_intent` / `resume_session_id` / `claude_fresh_prealloc`) and mov
 codex restore-class launch planning BEFORE the spawn-gate permit. The branch's gate
 commit `1ed94741d` computes those same values inline plus a boolean
 `resume_id_from_wire` — hence one conflicted file (`crates/freshell-ws/src/terminal.rs`,
-one hunk). The work is: (1) replay the 27 branch commits, resolving the conflict by
+one hunk). The work is: (1) replay the 28 branch commits, resolving the conflict by
 extending `LaunchPrep`/`derive_launch_prep` with a 4th field `resume_id_from_wire`
 (set in exactly one place — the wire-derivation `else` arm), (2) first-ever direct
 unit tests on `derive_launch_prep` pinning the new field's origin semantics,
@@ -43,6 +44,8 @@ untouched by this rebase.
 - Broad JS/Vitest runs go through the shared coordinator gate (`npm run check` / `npm run test:unit` with `FRESHELL_TEST_SUMMARY="<why>"` set; check `npm run test:status` first; never kill a foreign gate holder; never raw `npx vitest` for broad runs). Expected to be UNNEEDED here: the rebase must not touch client files (Task 7 verifies and gates this).
 - `cargo test --workspace` is LONG — always run with a generous timeout (≥ 1800 s), never a 30 s default.
 - Host-gated `#[ignore]` e2e tests mutate process env — run them alone: `-- --ignored --test-threads=1`.
+- Several Rust e2e tests exec node fixtures that need repo `node_modules` (`tsx` for three MCP tests in the workspace suite; `ws` for the codex fake app-server used by the ignored gate tests). Missing `node_modules` produces FALSE failures (e.g. `PTY_SPAWN_FAILED: codex app-server exited before listening`). Before any test step: `test -d node_modules || npm ci` (build tooling only — no coordinator gate needed).
+- The `restore_storm` pins are LOAD-SENSITIVE on this host (validated: 0–2/5 fail with 62–70 s timeouts at 32-core load ~28; 5/5 in ~2 s at load ~11, identical commit). Before attributing a storm-pin failure to your changes: check `uptime`, re-run when load is low, and if still failing run the same pins on pristine main `2641ada38` back-to-back (e.g. in a detached temp clone) for a same-conditions baseline.
 - Known pre-existing unrelated failure on main: `test/e2e/terminal-font-settings.test.tsx` — if it ever shows up in a JS run, note it and move on; do not chase. (It is not run by `npm run test:unit`.)
 - Respect other agents' concurrent activity: Task 1 verifies the worktree is clean and no rebase is in progress before starting; if it is dirty or mid-rebase, HALT and report instead of clobbering.
 - Locked resolution direction (Option A): `resume_id_from_wire` is derived in `derive_launch_prep` as a `LaunchPrep` field. Do NOT re-compute it after extraction (divergence risk); do NOT infer it from surrounding context (fragile).
@@ -62,6 +65,7 @@ untouched by this rebase.
 - `resume_id_from_wire` semantics (branch `HEAD:terminal.rs:1637,1692,1811`): `true` iff the wire-derivation `else` arm ran — i.e. `mode != "shell"` AND neither `should_preallocate_fresh_claude` nor `should_preallocate_fresh_amplifier`. TRAP: `claude_fresh_prealloc` alone is NOT a "server-allocated" signal — the amplifier prealloc arm mints a server id with `claude_fresh_prealloc == false`. The field must be `false` for BOTH prealloc arms.
 - The claude P0.4 restore ladder runs only when the `else` arm ran (claude prealloc requires `restore != Some(true)`, the ladder requires `restore == Some(true)`), so ladder-resolved ids are always `resume_id_from_wire == true` — the flag's value is unaffected by main hoisting the ladder out of the derivation.
 - Main ordering (`origin/main:crates/freshell-ws/src/create_gate.rs`): `prepare_launch` (derive + codex `LaunchClass::Restore` plan) `:80` → permit `acquire_unbounded` `:129` → `handle_create(create, Some(prepared), …)` (7 args) `:224`. The branch's gate tests to reconcile against: `crates/freshell-ws/tests/resume_validation_gate.rs` (incl. `#[ignore]`d `managed_default_stale_codex_id_is_gated_before_planning:751`), `auto_resume_respawn.rs`, `rest_resume_*` unit tests in `terminal_tabs.rs`; main's pins: `crates/freshell-ws/tests/restore_storm.rs` (5 tests) and `restore_plan_queue_cap.rs` (1 test).
+- Validated end-to-end in sandbox rebases (load-bearing pass, evidence in `.worktrees/.the-usual-logs/resume-validation/`): the rebase stops exactly ONCE, at `1ed94741d` (commit 13/28; git auto-places the branch's gate block after the D7 guard — Step 4's "verify" arm is the real path); `LaunchIntent` is `Copy` (cli_launch.rs:85), so `*launch_intent` compiles; exactly ONE `PreparedLaunch` literal exists (the `prepare_launch` return the plan itself modifies); Task 2 + Task 5 code snippets compiled verbatim with clippy `-D warnings` clean. Every main line number cited above was re-verified exact at `2641ada38`.
 
 ---
 
@@ -72,7 +76,7 @@ untouched by this rebase.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a verified-clean worktree on `feat/resume-validation`, a backup ref, and recorded baseline facts (`N_COMMITS=27`, pre-rebase HEAD sha, pre-rebase client-file list) that Tasks 2 and 7 compare against.
+- Produces: a verified-clean worktree on `feat/resume-validation`, a backup ref, and recorded baseline facts (`N_COMMITS=28`, pre-rebase HEAD sha, pre-rebase client-file list) that Tasks 2 and 7 compare against.
 
 - [ ] **Step 1: Verify worktree state and branch**
 
@@ -107,19 +111,26 @@ final report.
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/resume-validation
-git rev-parse HEAD                                   # record: PRE_REBASE_HEAD (expect 318e9c295…)
-git rev-list --count 39010cb57..HEAD                 # record: N_COMMITS (expect 27)
+git rev-parse HEAD                                   # record: PRE_REBASE_HEAD (expect 8b0f08162…)
+git rev-list --count 39010cb57..HEAD                 # record: N_COMMITS (expect 28)
 git diff --name-only 39010cb57..HEAD -- src/ test/ shared/ | sort   # record: PRE_CLIENT_FILES
 git branch backup/resume-validation-pre-589-rebase HEAD
 git rev-parse backup/resume-validation-pre-589-rebase  # expect: same sha as PRE_REBASE_HEAD
 ```
+
+Re-pin rule: baselines are pinned at EXECUTION time, not planning time. If HEAD is
+not `8b0f08162`, inspect the extra commits (`git log --stat 318e9c295..HEAD`): if
+every extra commit is docs-only (e.g. more `docs/plans/` additions), record the
+ACTUAL sha and count and use the actual `N_COMMITS` wherever this plan says 28;
+if any extra commit touches code, HALT and report — the plan's conflict analysis
+was validated against `8b0f08162`.
 
 Expected `PRE_CLIENT_FILES` (the branch's own client footprint — the rebase must not grow it):
 
 ```
 shared/ws-protocol.ts
 src/components/TerminalView.tsx
-test/unit/components/TerminalView.lifecycle.test.tsx
+test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
 - [ ] **Step 4: Baseline sanity build**
@@ -287,10 +298,11 @@ cd /home/dan/code/freshell/.worktrees/resume-validation
 grep -n '<<<<<<<\|=======\|>>>>>>>' crates/freshell-ws/src/terminal.rs   # expect: no output
 cargo check -p freshell-ws                                              # expect: exit 0
 git add crates/freshell-ws/src/terminal.rs
-git rebase --continue
+GIT_EDITOR=true git rebase --continue
 ```
 
-Keep the original commit message. Expected: the rebase proceeds.
+Keep the original commit message (`GIT_EDITOR=true` makes the continue
+non-interactive while keeping it). Expected: the rebase proceeds.
 
 - [ ] **Step 6: Handle any later stops with these fixed rules**
 
@@ -312,8 +324,8 @@ branch-only additions. After each resolution: the same `grep` for markers +
 cd /home/dan/code/freshell/.worktrees/resume-validation
 git status --porcelain                       # expect: empty (rebase finished)
 git merge-base HEAD 2641ada382472586ce1aa7664331d384853e867d   # expect: 2641ada38247…
-git rev-list --count 2641ada38..HEAD         # expect: 27 (or 27 minus recorded skips)
-git grep -n resume_id_from_wire -- crates/   # expect: exactly the derive decl+set, struct field, destructure, gate predicate — all in terminal.rs
+git rev-list --count 2641ada38..HEAD         # expect: 28 (Task 1's N_COMMITS, minus recorded skips)
+git grep -n resume_id_from_wire -- crates/   # expect: exactly SIX sites, all terminal.rs — struct field, derive decl, else-arm set, return literal, destructure, gate predicate
 git diff --name-only 39010cb57..backup/resume-validation-pre-589-rebase -- src/ test/ shared/ | sort > /tmp/pre_client.txt
 git diff --name-only 2641ada38..HEAD -- src/ test/ shared/ | sort > /tmp/post_client.txt
 diff /tmp/pre_client.txt /tmp/post_client.txt && echo CLIENT-FOOTPRINT-UNCHANGED
@@ -325,6 +337,7 @@ Expected: all as annotated; `CLIENT-FOOTPRINT-UNCHANGED` prints.
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/resume-validation
+test -d node_modules || npm ci   # three tests exec node fixtures needing tsx/ws (see Global Constraints)
 cargo check --workspace
 cargo test -p freshell-ws --test resume_validation_gate
 cargo test -p freshell-ws --test auto_resume_respawn
@@ -337,7 +350,8 @@ cargo test -p freshell-platform --lib resume_gate
 
 Run with timeout ≥ 1200 s each where needed. Expected: ALL PASS. (The `#[ignore]`d
 `managed_default_stale_codex_id_is_gated_before_planning` is deliberately NOT run
-here — it is Task 5's red test.) If a storm pin fails, first inspect whether the
+here — the ignored pair is exercised in Task 5, whose RED is the new case-7b ORDER
+pin, and in Task 7.) If a storm pin fails, first inspect whether the
 gate fired inside the storm harness (it must not: the harness's default
 `WsState.session_existence` probe answers Unknown → fail-open); report findings
 honestly rather than papering over.
@@ -508,7 +522,7 @@ git commit -m "test(ws): first direct unit tests for derive_launch_prep — pin 
 - Modify: `crates/freshell-ws/tests/resume_validation_gate.rs` (append probe + 2 tests)
 
 **Interfaces:**
-- Consumes: the file's own harness — `spawn_server_with_probe(probe, fresh_agent_enabled)`, `common::isolate_amplifier_home()`, `common::connect_and_capture_inventory`, `send_json`, `next_created_or_error`, `notice_of`, `restore_create_with_session_ref(request_id, mode, session_id)`, the `SessionExistenceProbe` trait (methods incl. `exists_for_gate`) and `SessionExistence::Absent`, plus `StubProbe` (`:28-60`) as the impl template.
+- Consumes: the file's own harness — `spawn_server_with_probe(probe, fresh_agent_enabled)`, `common::isolate_amplifier_home()`, `common::connect_and_capture_inventory`, `send_json`, `next_created_or_error`, `notice_of`, `restore_create_with_session_ref(request_id, mode, session_id)`, the `SessionExistenceProbe` trait (required methods: `exists` and `ever_observed` — `exists_for_gate` is the wrapper in `resume_validation.rs` that the gate calls, not a trait method) and `SessionExistence::Absent`, plus `StubProbe` (`:28-60`) as the impl template.
 - Produces: tests `server_allocated_fresh_claude_id_is_never_gated` and `server_allocated_fresh_amplifier_id_is_never_gated`; probe type `AlwaysAbsentProbe`.
 
 - [ ] **Step 1: Add an always-Absent probe**
@@ -516,8 +530,8 @@ git commit -m "test(ws): first direct unit tests for derive_launch_prep — pin 
 `StubProbe` defaults unmatched keys to `Unknown` (fail-open), which would make this
 test pass for the WRONG reason. Add, next to `StubProbe`, a probe that answers
 `Absent` for EVERY query — copy `StubProbe`'s `impl SessionExistenceProbe` block
-shape exactly (same method names/signatures, at minimum `exists_for_gate`; if the
-trait has more required methods, answer `SessionExistence::Absent` from each):
+shape exactly (the trait's required methods are `exists` and `ever_observed`;
+validated against the file's `StubProbe`/`GateOrderProbe` impls):
 
 ```rust
 /// Answers Absent for EVERY (provider, id) query — including ids minted
@@ -527,8 +541,11 @@ trait has more required methods, answer `SessionExistence::Absent` from each):
 struct AlwaysAbsentProbe;
 
 impl SessionExistenceProbe for AlwaysAbsentProbe {
-    fn exists_for_gate(&self, _provider: &str, _session_id: &str) -> SessionExistence {
+    fn exists(&self, _provider: &str, _session_id: &str) -> SessionExistence {
         SessionExistence::Absent
+    }
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        false
     }
 }
 ```
@@ -647,6 +664,7 @@ Expected: all non-ignored tests in the target pass before committing.
 
 **Files:**
 - Modify: `crates/freshell-ws/src/terminal.rs` (new `ResumeGateCarry` struct + `gate_wire_resume` helper; `PreparedLaunch` gains a field; `prepare_launch` gains the pre-plan gate; `handle_create`'s gate site becomes carry-aware)
+- Modify: `crates/freshell-ws/tests/resume_validation_gate.rs` (append the case-7b ORDER pin — the red test for this task)
 
 **Interfaces:**
 - Consumes: `PreparedLaunch { prep, codex_launch }` and `prepare_launch` (main `terminal.rs:1584-1647`), the `handle_create` top destructure (`:1665-1672`), the gate block from Task 2, `LaunchPrep.resume_id_from_wire`.
@@ -663,20 +681,194 @@ branch's `handle_create` position (post-ladder, post-D7 — which also keeps
 ladder-resolved claude ids gated, and keeps the off-permit gate from ever seeing a
 pre-ladder non-canonical claude id). The codex-scoped off-permit gate never runs on
 reconnect paths — `prepare_launch` is a spawn-door (restore-create) caller only.
+Two validated notes to keep in mind: (a) the door-2 respawn seam (main
+`terminal.rs:~2962`) also plans codex permit-free, OUTSIDE `prepare_launch` — it is
+covered by the branch's separate door-2 respawn gate, not by this task; (b) on the
+unfixed rebased tree a gate-fired codex create silently ADOPTS the stale-planned
+sidecar (`terminal.rs:~2323` `guard.take()`) — the "no stale `PreparedCodexLaunch`
+can ever exist" property only holds AFTER this task's fix.
 
-- [ ] **Step 1: RED — run the ignored ordering pin, expect FAIL**
+- [ ] **Step 1: RED — add the case-7b ORDER pin and run it, expect FAIL**
+
+VALIDATED FINDING (do not re-litigate): the existing `#[ignore]`d case-7 test
+(`managed_default_stale_codex_id_is_gated_before_planning`) PASSES on the rebased
+tree even though the gate-before-plan violation is REAL (proven by instrumentation:
+the stale id flows through `prepare_launch`'s off-permit planning). Case 7 is BLIND
+to the ordering post-#589: the TUI argv derives from post-gate spawn-time state
+(`cli_launch.rs:479-488`) and the stale-planned sidecar is silently adopted at the
+plan site (`terminal.rs:~2323` `guard.take()`). Case 7 therefore stays as a
+both-sides behavioral pin — it is NOT this task's red. The red is the new case-7b
+ORDER pin below, which was validated red→green in a sandbox (deterministic 2/2 both
+sides, ~0.25 s, load-insensitive).
+
+Append to the END of `crates/freshell-ws/tests/resume_validation_gate.rs`
+(immediately after case 7). Test-only — no fixture or production edits (the
+`FAKE_CODEX_APP_SERVER_ARG_LOG` knob already exists in `fake-app-server.mjs`, which
+writes it synchronously at startup, before it listens):
+
+```rust
+// ── gate-vs-plan ORDER probe (case 7b) ──────────────────────────────────────
+
+/// [`StubProbe`] + a gate-before-plan ORDER latch: on the FIRST `exists`
+/// consult for the watched `(provider, session_id)`, records whether
+/// managed-launch planning had ALREADY spawned the codex app-server sidecar
+/// (the fixture's `FAKE_CODEX_APP_SERVER_ARG_LOG` file exists on disk).
+///
+/// Determinism: the fixture writes the arg-log SYNCHRONOUSLY at process
+/// startup, before it ever listens, and `plan_codex_managed_launch` awaits
+/// the sidecar listening — so by the time any plan completes the marker
+/// exists. Both orderings under test are sequential awaits on the same task
+/// (plan-then-gate pre-fix, gate-then-plan post-fix), so the latch value is
+/// not load-sensitive.
+struct GateOrderProbe {
+    provider: String,
+    session_id: String,
+    answer: SessionExistence,
+    planning_marker: std::path::PathBuf,
+    planning_started_before_gate: std::sync::Mutex<Option<bool>>,
+}
+
+impl SessionExistenceProbe for GateOrderProbe {
+    fn exists(&self, provider: &str, session_id: &str) -> SessionExistence {
+        if provider == self.provider && session_id == self.session_id {
+            let mut latch = self.planning_started_before_gate.lock().unwrap();
+            if latch.is_none() {
+                *latch = Some(self.planning_marker.exists());
+            }
+            return self.answer;
+        }
+        SessionExistence::Unknown
+    }
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        false
+    }
+}
+
+/// Case 7b — the ORDER behind case 7's pin, made directly observable: the
+/// disk-existence gate must consult the probe for a stale WIRE codex resume
+/// id BEFORE managed-launch planning spawns any app-server sidecar
+/// (gate-before-plan). Post-#589, restore-class codex planning runs
+/// OFF-permit in `prepare_launch`; without an off-permit gate the stale id
+/// undergoes sidecar planning FIRST and the gate only fires afterwards.
+/// Case 7 is blind to that ordering (the stale-planned sidecar is silently
+/// adopted and the TUI argv derives from post-gate state) — this pin is not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
+async fn managed_default_stale_codex_id_probe_consulted_before_any_planning() {
+    // Managed leg: the flag stays UNSET (default ON), mirroring case 7.
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+
+    let stale_id = "3f9d2c81-6a4e-4b7f-9c0d-5e8a1b2c3d4f"; // definitively absent
+    let capture_path = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-argv-{}.json",
+        std::process::id()
+    ));
+    // The committed fake-app-server fixture writes this file synchronously at
+    // startup (before `new WebSocketServer`) when the env var is set — it
+    // exists on disk ⟺ sidecar planning has begun.
+    let planning_marker = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-planned-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture_path);
+    let _ = std::fs::remove_file(&planning_marker);
+    let dispatcher = write_codex_dispatcher();
+    std::env::set_var("CODEX_CMD", &dispatcher);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture_path);
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &planning_marker);
+    let codex_home = std::env::temp_dir().join(format!(
+        "freshell-resume-gate-order-codex-home-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    std::env::set_var("CODEX_HOME", &codex_home);
+
+    let probe = Arc::new(GateOrderProbe {
+        provider: "codex".into(),
+        session_id: stale_id.into(),
+        answer: SessionExistence::Absent,
+        planning_marker: planning_marker.clone(),
+        planning_started_before_gate: std::sync::Mutex::new(None),
+    });
+    let (url, registry, _ledger, _state) =
+        spawn_managed_codex_server_with_probe(probe.clone(), true).await;
+
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    send_json(
+        &mut ws,
+        &restore_create_with_legacy_resume_id("req-gate-7b", "codex", stale_id),
+    )
+    .await;
+
+    // Preconditions (case 7's own pins): the gate fired as a fresh spawn with
+    // the operator notice…
+    let created = next_created_or_error(&mut ws, "req-gate-7b").await;
+    assert_eq!(
+        created["type"], "terminal.created",
+        "the gate-fired create must SUCCEED as a fresh spawn, got {created}"
+    );
+    let notice = notice_of(&created).expect("gate must set the stale-resume notice");
+    assert!(
+        notice.contains(stale_id),
+        "notice names the stale id: {notice}"
+    );
+
+    // …and the fresh spawn still went managed — planning DID run (this guards
+    // the ordering latch against a vacuous pass where nothing was planned).
+    let argv = wait_for_captured_argv(&capture_path);
+    assert_eq!(
+        argv[0], "--remote",
+        "fresh spawn must still plan managed launch"
+    );
+    assert!(
+        planning_marker.exists(),
+        "the codex app-server sidecar must have spawned (planning happened)"
+    );
+
+    let planning_before_gate = *probe.planning_started_before_gate.lock().unwrap();
+
+    // Cleanup BEFORE the ordering assertion so a RED run still tears down.
+    registry.kill_all();
+    std::env::remove_var("CODEX_CMD");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+    std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
+    std::env::remove_var("CODEX_HOME");
+    let _ = std::fs::remove_file(&capture_path);
+    let _ = std::fs::remove_file(&planning_marker);
+
+    // THE pin: gate-before-plan. `Some(true)` means the app-server sidecar
+    // was already up when the gate first consulted the probe for the stale
+    // id — i.e. the stale WIRE resume id underwent off-permit
+    // `plan_codex_managed_launch` BEFORE the disk-existence gate could drop
+    // it, and the create then silently inherited the stale-planned sidecar.
+    let planning_before_gate = planning_before_gate
+        .expect("the disk-existence gate must consult the probe for the stale codex id");
+    assert!(
+        !planning_before_gate,
+        "GATE-BEFORE-PLAN VIOLATED: managed-launch planning spawned a codex app-server \
+         sidecar BEFORE the disk-existence gate consulted the probe for stale id \
+         {stale_id} — the stale wire resume id underwent off-permit \
+         plan_codex_managed_launch ahead of the gate"
+    );
+}
+```
+
+Then run (prereq: repo `node_modules` present — `test -d node_modules || npm ci`;
+without it the test fails with `PTY_SPAWN_FAILED: codex app-server exited before
+listening`, a FALSE red):
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/resume-validation
 cargo test -p freshell-ws --test resume_validation_gate \
-  managed_default_stale_codex_id_is_gated_before_planning -- --ignored --test-threads=1
+  managed_default_stale_codex_id_probe_consulted_before_any_planning \
+  -- --ignored --test-threads=1 --exact
 ```
 
-Expected: FAIL — post-rebase, `prepare_launch` plans the codex sidecar for the
-stale id before the `handle_create` gate can drop it. Record the failure output.
-If it PASSES here, STOP and investigate how the create under test reaches planning
-(it may bypass `prepare_launch`); do not proceed on an unverified premise — report
-what you find.
+Expected: FAIL with panic text beginning `GATE-BEFORE-PLAN VIOLATED: managed-launch
+planning spawned a codex app-server sidecar BEFORE the disk-existence gate consulted
+the probe for stale id 3f9d2c81-…`. Any OTHER failure (missing notice, no `--remote`
+argv, `PTY_SPAWN_FAILED`, the latch `.expect()`) is NOT the red — STOP and
+investigate; do not proceed on an unverified premise. Record the failure output.
 
 - [ ] **Step 2: Add `ResumeGateCarry` and factor the gate body into `gate_wire_resume`**
 
@@ -895,14 +1087,20 @@ cargo clippy -p freshell-ws --all-targets -- -D warnings
 Expected: exit 0 both. If any other code constructs `PreparedLaunch` literally
 (the compiler will say so), add `resume_gate: None` there.
 
-- [ ] **Step 6: GREEN — the ignored ordering pin now passes**
+- [ ] **Step 6: GREEN — the case-7b ORDER pin now passes**
 
 ```bash
+cd /home/dan/code/freshell/.worktrees/resume-validation
 cargo test -p freshell-ws --test resume_validation_gate \
-  managed_default_stale_codex_id_is_gated_before_planning -- --ignored --test-threads=1
+  managed_default_stale_codex_id_probe_consulted_before_any_planning \
+  -- --ignored --test-threads=1 --exact
+cargo test -p freshell-ws --test resume_validation_gate -- --ignored --test-threads=1
+cargo clippy -p freshell-ws --tests -- -D warnings
 ```
 
-Expected: PASS.
+Expected: first command `ok. 1 passed`; second `2 passed` (case 7 stays a passing
+behavioral pin on both sides — it is NOT a red and must not be presented as one);
+clippy clean. Expected runtimes ~0.2–0.5 s per test (load-insensitive by design).
 
 - [ ] **Step 7: Re-run every interaction surface**
 
@@ -924,7 +1122,7 @@ adds a no-op consult) and Task 4's `server_allocated_*` pins.
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/resume-validation
-git add crates/freshell-ws/src/terminal.rs
+git add crates/freshell-ws/src/terminal.rs crates/freshell-ws/tests/resume_validation_gate.rs
 git commit -m "fix(ws): run the codex wire-resume gate off-permit before planning — reconcile resume-validation gate-before-plan with #589"
 ```
 
@@ -1066,7 +1264,7 @@ git log --format='%an <%ae>' 2641ada38..HEAD | sort -u          # expect exactly
 git status --porcelain                                          # expect empty
 ```
 
-Expected: 27 replayed commits (minus any recorded empty-skips) + 2–4 reconciliation
+Expected: 28 replayed commits (Task 1's N_COMMITS, minus any recorded empty-skips) + 2–4 reconciliation
 commits (Tasks 3, 4, 5, optional 6), every message Conventional-Commits-shaped, no
 stray WIP/fixup commits, clean tree. Confirm the backup ref still exists
 (`git rev-parse backup/resume-validation-pre-589-rebase`). **Do NOT push, do NOT
@@ -1078,7 +1276,7 @@ from Task 1.
 
 ## Self-review record
 
-- **Spec coverage:** Required work 1 (rebase + Option A + consistent later resolutions) → Tasks 1–2. Required work 2 (TDD unit test on `derive_launch_prep` for wire-vs-server-allocated + gate-level never-gated assertion) → Tasks 3–4 (with mutation-proof steps making the "prove" honest, since the field lands during the rebase). Required work 3 (re-run branch gate tests, auto_resume, rest_resume_, managed-path characterization, #589 storm pins) → Task 2 Step 8, Task 5 Steps 1/6/7, Task 7. Required work 4 (fmt/clippy/workspace tests/client-if-touched, known font-settings caveat) → Task 7. Required work 5 (clean history, reconciliation commit messages, docs only-if-false) → Tasks 5–7. The explicit ordering interaction (gate → plan-off-permit → permit → spawn, or documented alternative) → Task 5, which implements the blessed ordering for codex and documents in code why non-codex modes gate on-permit (no off-permit plan step exists for them; ladder-resolved claude ids must be validated post-ladder).
+- **Spec coverage:** Required work 1 (rebase + Option A + consistent later resolutions) → Tasks 1–2. Required work 2 (TDD unit test on `derive_launch_prep` for wire-vs-server-allocated + gate-level never-gated assertion) → Tasks 3–4 (with mutation-proof steps making the "prove" honest, since the field lands during the rebase). Required work 3 (re-run branch gate tests, auto_resume, rest_resume_, managed-path characterization, #589 storm pins) → Task 2 Step 8, Task 5 Steps 1/6/7, Task 7. Required work 4 (fmt/clippy/workspace tests/client-if-touched, known font-settings caveat) → Task 7. Required work 5 (clean history, reconciliation commit messages, docs only-if-false) → Tasks 5–7. The explicit ordering interaction (gate → plan-off-permit → permit → spawn, or documented alternative) → Task 5, which implements the blessed ordering for codex and documents in code why non-codex modes gate on-permit (no off-permit plan step exists for them; ladder-resolved claude ids must be validated post-ladder). Task 5's TDD structure was re-based on validated evidence: the original red (case 7) passes pre-fix because its argv detection is blind post-#589, so the red is the new case-7b ORDER pin — sandbox-verified deterministic RED (pre-fix) → GREEN (post-fix) with the exact code inlined in Step 1.
 - **No silent deferrals:** No stubs or fakes stand in for required behavior; the only test doubles are the pre-existing harness probes (`StubProbe`, plus the new `AlwaysAbsentProbe`), and the real-probe production path is exercised by the branch's existing `freshell-server` existence tests which run in Task 7's workspace sweep. No requirement was moved to "known limitations". **UNRESOLVED COVERAGE GAPS: none.**
 - **Placeholder scan:** every code step carries complete code; the two places where a repo detail could not be pinned read-only (TerminalCreate serde defaults; the exact `SessionExistenceProbe` method list) carry a deterministic in-repo fallback (copy the named proven builder/impl at an exact file:line), not a TBD.
 - **Type consistency:** `LaunchPrep.resume_id_from_wire: bool` (Tasks 2/3/5), `ResumeGateCarry { notice, stale_session_id }` + `gate_wire_resume(state, mode, &mut Option<String>, &mut LaunchIntent, &mut bool)` (Task 5 both call sites), `PreparedLaunch.resume_gate: Option<ResumeGateCarry>` (Task 5 Steps 3–4), test names in Task 4 Step 2 match Step 3/4 run filters — all cross-checked.
