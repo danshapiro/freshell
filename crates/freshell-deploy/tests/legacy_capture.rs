@@ -31,6 +31,7 @@ struct RuntimeFixture {
     sources: LegacyRuntimeSources,
     old_executable: PathBuf,
     replaced_path: PathBuf,
+    controller_executable: PathBuf,
 }
 
 fn runtime_fixture(root: &Path) -> RuntimeFixture {
@@ -115,6 +116,9 @@ fn runtime_fixture(root: &Path) -> RuntimeFixture {
     let node_executable = artifacts.join("node");
     fs::write(&node_executable, "#!/bin/sh\n").unwrap();
     fs::set_permissions(&node_executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let controller_executable = artifacts.join("freshell-deploy");
+    fs::write(&controller_executable, b"fixture recovery controller").unwrap();
+    fs::set_permissions(&controller_executable, fs::Permissions::from_mode(0o755)).unwrap();
 
     RuntimeFixture {
         sources: LegacyRuntimeSources {
@@ -130,6 +134,7 @@ fn runtime_fixture(root: &Path) -> RuntimeFixture {
         },
         old_executable,
         replaced_path,
+        controller_executable,
     }
 }
 
@@ -545,7 +550,80 @@ fn request(runtime: &RuntimeFixture) -> LegacyCaptureRequest {
             executable: runtime.sources.package_json.parent().unwrap().join("node"),
             version: "v22.18.0".to_string(),
         },
+        controller_executable: runtime.controller_executable.clone(),
     }
+}
+
+#[test]
+fn failed_capture_does_not_wedge_retry_with_a_different_recovery_controller() {
+    let fixture = checkout();
+    let runtime = runtime_fixture(fixture.path());
+    let store = Store::open(fixture.path(), DeployPort::new(PORT).unwrap()).unwrap();
+    let first_controller = fixture.path().join("first-controller");
+    let retry_controller = fixture.path().join("retry-controller");
+    fs::write(&first_controller, "first controller").unwrap();
+    fs::write(&retry_controller, "retry controller").unwrap();
+    fs::set_permissions(&first_controller, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&retry_controller, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut first_request = request(&runtime);
+    first_request.controller_executable = first_controller;
+    assert!(matches!(
+        capture_legacy(
+            &store,
+            &first_request,
+            &FakeProcessInspector::stable(&runtime.old_executable),
+            &FakeScratchProbe {
+                fail: true,
+                requests: Mutex::new(Vec::new()),
+            },
+        ),
+        Err(DeployError::LegacyCapture(message)) if message.contains("scratch validation failed")
+    ));
+    assert!(
+        !store.paths().legacy_controller().exists(),
+        "a capture that fails validation must not claim the recovery-controller slot"
+    );
+
+    fs::write(
+        store.paths().legacy_controller(),
+        fs::read(&first_request.controller_executable).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        store.paths().legacy_controller(),
+        fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+
+    let mut retry_request = request(&runtime);
+    retry_request.controller_executable = retry_controller;
+    capture_legacy(
+        &store,
+        &retry_request,
+        &FakeProcessInspector::stable(&runtime.old_executable),
+        &FakeScratchProbe::passing(),
+    )
+    .expect("a corrected retry may use the controller that actually completed capture");
+    assert_eq!(
+        fs::read(store.paths().legacy_controller()).unwrap(),
+        b"retry controller"
+    );
+
+    assert!(matches!(
+        capture_legacy(
+            &store,
+            &first_request,
+            &FakeProcessInspector::stable(&runtime.old_executable),
+            &FakeScratchProbe::passing(),
+        ),
+        Err(DeployError::InvalidReceipt(message)) if message.contains("controller is immutable")
+    ));
+    assert_eq!(
+        fs::read(store.paths().legacy_controller()).unwrap(),
+        b"retry controller",
+        "a completed capture makes its recovery controller authoritative"
+    );
 }
 
 #[test]

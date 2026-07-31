@@ -49,6 +49,7 @@ pub struct LegacyCaptureRequest {
     pub port: DeployPort,
     pub runtime: LegacyRuntimeSources,
     pub node: NodePrerequisite,
+    pub controller_executable: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +343,7 @@ pub fn capture_legacy<Inspector: ProcessInspector, Probe: ScratchProbe>(
         }
     }
 
+    locked.install_legacy_controller(&request.controller_executable)?;
     let generation = locked.publish_or_reuse(stage)?;
     if prefix.legacy.is_none() {
         locked.write_legacy_capture(&receipt)?;

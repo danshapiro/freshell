@@ -213,7 +213,7 @@ impl Store {
         Ok(Some(receipt))
     }
 
-    pub(crate) fn install_legacy_controller(&self, source: &Path) -> Result<()> {
+    fn install_legacy_controller_locked(&self, source: &Path) -> Result<()> {
         let canonical_source = fs::canonicalize(source)?;
         let source_metadata = fs::symlink_metadata(&canonical_source)?;
         if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
@@ -221,6 +221,7 @@ impl Store {
         }
         let bytes = fs::read(&canonical_source)?;
         let destination = self.paths.legacy_controller();
+        let completed_capture = self.read_legacy_capture()?.is_some();
         match fs::symlink_metadata(destination) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink()
@@ -233,15 +234,24 @@ impl Store {
                 let installed = crate::process_identity::FileIdentity::from_path(destination)?;
                 let source = crate::manifest::sha256_bytes(&bytes);
                 if installed.sha256 != source {
+                    if !completed_capture {
+                        return atomic_write(destination, &bytes, 0o500);
+                    }
                     return Err(DeployError::InvalidReceipt(
                         "captured legacy recovery controller is immutable and differs from the executing controller"
                             .to_string(),
                     ));
                 }
-                return Ok(());
+                return sync_directory(self.paths.port_root());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        if completed_capture {
+            return Err(DeployError::InvalidReceipt(
+                "captured legacy recovery controller is missing after capture completed"
+                    .to_string(),
+            ));
         }
         atomic_write_new(destination, &bytes, 0o500)
     }
@@ -525,6 +535,10 @@ impl LockedStore<'_> {
 
     pub fn write_legacy_capture(&self, receipt: &LegacyCaptureReceipt) -> Result<()> {
         self.store.write_legacy_capture_locked(receipt)
+    }
+
+    pub(crate) fn install_legacy_controller(&self, source: &Path) -> Result<()> {
+        self.store.install_legacy_controller_locked(source)
     }
 
     pub fn remove_generation(&self, id: &str) -> Result<()> {
