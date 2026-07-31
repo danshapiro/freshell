@@ -51,6 +51,11 @@ const MATRIX_SPECS = [
   // kinds. See term13-scrollback-boundary.spec.ts.
   /term13-scrollback-boundary\.spec\.ts$/,
   /ws-ping-pong-matrix\.spec\.ts$/,
+  // SYNC-06 -- resume-by-id parity: the pinned sidebar Resume button and the
+  // paste-then-Enter resume path against BOTH servers (POST /api/sessions/resolve
+  // + sessionResolve flag now exist on the Rust server too, with the hardened
+  // response surface -- degraded/providerErrors/unsearchedProviders/homeDir).
+  /resume-button\.spec\.ts$/,
   // SESSION-01 narrowed-MISSING closure -- sidebar-click resume (Codex leg
   // runs on both kinds; the Amplifier leg self-skips on legacy via an
   // explicit `test.skip` KNOWN DIVERGENCE call). See sidebar-click-resume.spec.ts.
