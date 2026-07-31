@@ -238,10 +238,20 @@ pub(crate) fn execute_stop_current(checkout: &Path, port: DeployPort) -> Result<
     let selected = store
         .selected_generation_id()?
         .ok_or_else(|| DeployError::Activation("current generation is missing".to_string()))?;
-    // A stored controller exists only in a managed generation. Reading the
-    // descriptor also prevents a descriptor-less legacy receipt from being
-    // converted into an unverifiable stopped state.
-    GenerationDescriptor::read(&store.verify_generation(&selected)?)?;
+    let generation = store.verify_generation(&selected)?;
+    let captured_legacy = match GenerationDescriptor::read(&generation) {
+        Ok(_) => None,
+        Err(descriptor_error) => {
+            let legacy = store.read_legacy_capture()?.ok_or(descriptor_error)?;
+            if legacy.generation_id != selected {
+                return Err(DeployError::InvalidReceipt(
+                    "descriptor-less current generation is not the captured legacy recovery generation"
+                        .to_string(),
+                ));
+            }
+            Some(legacy)
+        }
+    };
     let live = store.read_live()?.ok_or_else(|| {
         DeployError::Activation("authoritative live receipt is missing".to_string())
     })?;
@@ -249,6 +259,9 @@ pub(crate) fn execute_stop_current(checkout: &Path, port: DeployPort) -> Result<
         return Err(DeployError::Activation(
             "live receipt disagrees with current generation".to_string(),
         ));
+    }
+    if let Some(legacy) = &captured_legacy {
+        crate::controller::require_exact_captured_legacy(&selected, &live, legacy)?;
     }
     let Some(expected) = live.process_identity.as_ref() else {
         return Ok(());
@@ -952,6 +965,8 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     use super::*;
+    use crate::controller::{inspect_bootstrap_status, BootstrapStatus};
+    use crate::legacy::{LegacyCaptureReceipt, NonSecretLaunchMetadata, RuntimeBindings};
     use crate::process_identity::ListenerIdentity;
 
     fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) {
@@ -1048,6 +1063,156 @@ mod tests {
             effective_uid: unsafe { libc::geteuid() },
             runtime: record.runtime.clone(),
         }
+    }
+
+    fn captured_legacy_store() -> (tempfile::TempDir, Store, ProcessIdentity) {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkout = fixture.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        write(checkout.join(".git"), "gitdir: /tmp/fixture.git\n");
+
+        let node = fixture.path().join("node");
+        executable(&node, "echo v22.0.0");
+        let source = fixture.path().join("legacy-generation");
+        executable(source.join("server/freshell-server"), "exit 0");
+        write(source.join("client/index.html"), "legacy fixture\n");
+        write(source.join("extensions/fixture.json"), "{}\n");
+        write(source.join("dist/server/mcp/server.js"), "export {}\n");
+        write(source.join("claude-sidecar/index.mjs"), "process.exit(0)\n");
+        write(source.join("package.json"), "{}\n");
+        write(source.join("package-lock.json"), "{}\n");
+        write(
+            source.join("node_modules/fixture/package.json"),
+            "{\"name\":\"fixture\"}\n",
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = DeployPort::new(listener.local_addr().unwrap().port()).unwrap();
+        drop(listener);
+        let store = Store::open(&checkout, port).unwrap();
+        let locked = store.lock().unwrap();
+        let generation = locked.import_tree(&source).unwrap();
+        locked.select_generation(&generation.id).unwrap();
+
+        let mut executable =
+            FileIdentity::from_path(&generation.path.join("server/freshell-server")).unwrap();
+        executable.mode |= 0o200;
+        let process = ProcessIdentity {
+            pid: u32::MAX - 1,
+            kernel_boot_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            start_time_ticks: "90071992547409931234".to_string(),
+            executable,
+            listener: ListenerIdentity {
+                port,
+                socket_inode: "991122".to_string(),
+                owner_pid: u32::MAX - 1,
+                network_namespace: "net:[4026533111]".to_string(),
+            },
+            cwd: checkout.display().to_string(),
+            argv0: "freshell-server".to_string(),
+            argument_count: 1,
+            effective_uid: unsafe { libc::geteuid() },
+            runtime: RuntimeProvenance {
+                client_dir: source.join("client").display().to_string(),
+                extensions_dir: source.join("extensions").display().to_string(),
+                dist_server_dir: source.join("dist/server").display().to_string(),
+                mcp_entry: source
+                    .join("dist/server/mcp/server.js")
+                    .display()
+                    .to_string(),
+                claude_sidecar_entry: source
+                    .join("claude-sidecar/index.mjs")
+                    .display()
+                    .to_string(),
+                node_executable: node.display().to_string(),
+                package_json: source.join("package.json").display().to_string(),
+                package_lock: source.join("package-lock.json").display().to_string(),
+                production_node_modules: source.join("node_modules").display().to_string(),
+            },
+        };
+        let legacy = LegacyCaptureReceipt {
+            schema_version: "1".to_string(),
+            generation_id: generation.id.clone(),
+            legacy: true,
+            process: process.clone(),
+            runtime: RuntimeBindings {
+                server_executable: "server/freshell-server".to_string(),
+                client_dir: "client".to_string(),
+                extensions_dir: "extensions".to_string(),
+                dist_server_dir: "dist/server".to_string(),
+                mcp_entry: "dist/server/mcp/server.js".to_string(),
+                claude_sidecar_entry: "claude-sidecar/index.mjs".to_string(),
+                package_json: "package.json".to_string(),
+                package_lock: "package-lock.json".to_string(),
+                production_node_modules: "node_modules".to_string(),
+            },
+            node: NodePrerequisite {
+                executable: node,
+                version: "v22.0.0".to_string(),
+            },
+            launch: NonSecretLaunchMetadata {
+                cwd: process.cwd.clone(),
+                argv0: process.argv0.clone(),
+                argument_count: process.argument_count,
+            },
+        };
+        locked.write_legacy_capture(&legacy).unwrap();
+        locked
+            .write_live(&LiveReceipt::new(
+                generation.id.clone(),
+                Some(generation.id),
+                true,
+                Some(process.clone()),
+            ))
+            .unwrap();
+        drop(locked);
+        (fixture, store, process)
+    }
+
+    #[test]
+    fn stop_current_accepts_the_receipt_proven_captured_legacy_selection() {
+        let (_fixture, store, captured_process) = captured_legacy_store();
+
+        execute_stop_current(store.paths().checkout(), store.paths().port()).unwrap();
+
+        let stopped = store.read_live().unwrap().unwrap();
+        assert_eq!(
+            stopped.selected_generation_id,
+            store.selected_generation_id().unwrap().unwrap()
+        );
+        assert_eq!(
+            stopped.running_server_generation_id, None,
+            "a stopped receipt must not claim the captured process is still running"
+        );
+        assert_eq!(stopped.process_identity, None);
+        assert!(!stopped.legacy);
+        assert_eq!(
+            inspect_bootstrap_status(&store).unwrap(),
+            BootstrapStatus::CapturedLegacy,
+            "the launcher must keep selecting the immutable legacy controller after stop"
+        );
+        assert_eq!(
+            store.read_legacy_capture().unwrap().unwrap().process,
+            captured_process,
+            "stop must not rewrite the capture evidence"
+        );
+    }
+
+    #[test]
+    fn stop_current_rejects_a_descriptorless_selection_without_capture_evidence() {
+        let (_fixture, store, _captured_process) = captured_legacy_store();
+        let live_before = fs::read(store.paths().live_receipt()).unwrap();
+        fs::remove_file(store.paths().legacy_receipt()).unwrap();
+
+        assert!(
+            execute_stop_current(store.paths().checkout(), store.paths().port()).is_err(),
+            "descriptor-less selection must fail closed without immutable capture evidence"
+        );
+        assert_eq!(
+            fs::read(store.paths().live_receipt()).unwrap(),
+            live_before,
+            "a rejected stop must not rewrite authoritative process evidence"
+        );
     }
 
     #[test]

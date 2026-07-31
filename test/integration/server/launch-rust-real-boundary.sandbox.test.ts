@@ -1316,6 +1316,49 @@ describe('real deployment controller boundary', () => {
       expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
 
       await checkedAsync(
+        path.join(realCheckout, 'scripts/launch-rust.sh'),
+        ['--port', String(port), '--stop'],
+        { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
+      )
+      await waitForHttp(port, 'down')
+      const stoppedLegacy = JSON.parse(readFileSync(liveFile, 'utf8'))
+      expect(stoppedLegacy).toEqual({
+        schemaVersion: '1',
+        selectedGenerationId: capturedLegacy.selectedGenerationId,
+        runningServerGenerationId: null,
+        legacy: false,
+      })
+      expect(
+        (await checkedAsync(legacyController, ['bootstrap-status', ...common], {
+          cwd: realCheckout,
+          env: realEnvironment,
+        })).stdout.trim(),
+      ).toBe('captured-legacy')
+      expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
+
+      await checkedAsync(
+        path.join(realCheckout, 'scripts/launch-rust.sh'),
+        ['--port', String(port), '--skip-build'],
+        { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },
+      )
+      await waitForHttp(port, 'up')
+      const startedAfterLegacyStop = JSON.parse(readFileSync(liveFile, 'utf8'))
+      rememberProcess(knownProcesses, startedAfterLegacyStop.processIdentity)
+      expect(startedAfterLegacyStop.selectedGenerationId).toBe(
+        capturedLegacy.selectedGenerationId,
+      )
+      expect(startedAfterLegacyStop.runningServerGenerationId).toBe(
+        capturedLegacy.selectedGenerationId,
+      )
+      expect(startedAfterLegacyStop.processIdentity.pid).not.toBe(
+        emergencyRestartedLegacy.processIdentity.pid,
+      )
+      expect(startedAfterLegacyStop.processIdentity.executable.sha256).toBe(
+        capturedLegacyExecutableDigest,
+      )
+      expect(isRecordedProcessRunning(unrelatedSentinelIdentity)).toBe(true)
+
+      await checkedAsync(
         controller,
         fullDeployArgs(candidateClient),
         { cwd: realCheckout, env: realEnvironment, timeout: 300_000 },

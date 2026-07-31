@@ -279,21 +279,30 @@ fn generation_runtime(
     }
 }
 
-fn require_exact_captured_legacy(
+pub(crate) fn require_exact_captured_legacy(
     selected: &str,
     live: &crate::receipts::LiveReceipt,
     legacy: &LegacyCaptureReceipt,
 ) -> Result<()> {
-    if legacy.generation_id != selected
-        || live.running_server_generation_id.as_deref() != Some(selected)
-        || live.process_identity.is_none()
-        || (live.legacy && live.process_identity.as_ref() != Some(&legacy.process))
-    {
+    if legacy.generation_id != selected {
         return Err(DeployError::InvalidReceipt(
             "captured legacy receipts disagree".to_string(),
         ));
     }
-    Ok(())
+    match (
+        live.running_server_generation_id.as_deref(),
+        live.process_identity.as_ref(),
+    ) {
+        (Some(running), Some(process))
+            if running == selected && (!live.legacy || process == &legacy.process) =>
+        {
+            Ok(())
+        }
+        (None, None) if !live.legacy => Ok(()),
+        _ => Err(DeployError::InvalidReceipt(
+            "captured legacy receipts disagree".to_string(),
+        )),
+    }
 }
 
 pub(crate) fn load_auth_token(checkout: &Path) -> Result<String> {
