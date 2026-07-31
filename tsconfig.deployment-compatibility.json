@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "checkJs": true,
+    "incremental": false,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "scripts/deployment-compatibility.mjs"
+  ]
+}

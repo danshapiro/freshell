@@ -27,6 +27,7 @@ interface CorpusCase {
 const root = fileURLToPath(new URL('../../..', import.meta.url))
 const execFileAsync = promisify(execFile)
 const helperPath = join(root, 'scripts/deployment-compatibility.mjs')
+const typecheckConfigPath = join(root, 'tsconfig.deployment-compatibility.json')
 const corpus = (await readFile(
   new URL('../../fixtures/deployment-compatibility/cases.jsonl', import.meta.url),
   'utf8',
@@ -200,5 +201,57 @@ describe('deployment compatibility CLI', () => {
       '{"phase":"prepared","generationId":"abc"}\n',
     )
     expect(await readdir(directory)).toEqual(['event.jsonl'])
+  })
+})
+
+describe('deployment compatibility JavaScript typecheck', () => {
+  it('checks the helper without enabling checks for unrelated JavaScript', async () => {
+    const { stdout: listedFiles } = await execFileAsync(
+      join(root, 'node_modules/.bin/tsc'),
+      ['--project', typecheckConfigPath, '--listFilesOnly', '--pretty', 'false'],
+    )
+    const checkedProjectJavaScript = listedFiles
+      .trim()
+      .split('\n')
+      .filter(
+        (path) =>
+          path.startsWith(root) &&
+          !path.includes('/node_modules/') &&
+          /\.(?:c|m)?js$/.test(path),
+      )
+    expect(checkedProjectJavaScript).toEqual([helperPath])
+
+    const directory = await mkdtemp(join(tmpdir(), 'freshell-compat-typecheck-'))
+    const shadowHelperPath = join(directory, 'deployment-compatibility.mjs')
+    const shadowConfigPath = join(directory, 'tsconfig.json')
+    const helperSource = await readFile(helperPath, 'utf8')
+
+    await writeFile(
+      shadowHelperPath,
+      `${helperSource}\nconst intentionalTypeError = 'not a number'\nintentionalTypeError.toFixed(2)\n`,
+    )
+    await writeFile(
+      shadowConfigPath,
+      JSON.stringify({
+        extends: typecheckConfigPath,
+        compilerOptions: {
+          incremental: false,
+          typeRoots: [join(root, 'node_modules/@types')],
+        },
+        files: [shadowHelperPath],
+        include: [],
+      }),
+    )
+
+    await expect(
+      execFileAsync(join(root, 'node_modules/.bin/tsc'), [
+        '--project',
+        shadowConfigPath,
+        '--pretty',
+        'false',
+      ]),
+    ).rejects.toMatchObject({
+      stdout: expect.stringContaining("Property 'toFixed' does not exist"),
+    })
   })
 })
