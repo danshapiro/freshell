@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -253,6 +254,34 @@ fn production_binary_routes_strict_controller_commands() {
         .output()
         .unwrap();
     assert_eq!(malformed.status.code(), Some(2));
+}
+
+#[test]
+fn empty_store_with_a_real_listener_requires_capture() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = fixture.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join(".git"), "gitdir: /tmp/fixture.git\n").unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_freshell-deploy"))
+        .args([
+            "bootstrap-status",
+            "--checkout",
+            checkout.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(status.status.success(), "{:?}", status.stderr);
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        "capture-required\n"
+    );
+    drop(listener);
 }
 
 #[test]

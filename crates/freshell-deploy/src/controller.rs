@@ -67,6 +67,17 @@ pub fn inspect_bootstrap_status(store: &Store) -> Result<BootstrapStatus> {
     }
 }
 
+fn inspect_operational_bootstrap_status(store: &Store) -> Result<BootstrapStatus> {
+    let status = inspect_bootstrap_status(store)?;
+    if status == BootstrapStatus::Fresh
+        && crate::process_identity::LinuxProcfs::default()
+            .port_has_listener(store.paths().port())?
+    {
+        return Ok(BootstrapStatus::CaptureRequired);
+    }
+    Ok(status)
+}
+
 pub fn execute_controller(command: ControllerCommand) -> Result<String> {
     match command {
         ControllerCommand::BootstrapStatus { checkout, port } => {
@@ -76,7 +87,7 @@ pub fn execute_controller(command: ControllerCommand) -> Result<String> {
                 let auth_token = load_auth_token(&checkout)?;
                 recover_unfinished(&store, &auth_token)?;
             }
-            Ok(inspect_bootstrap_status(&store)?.to_string())
+            Ok(inspect_operational_bootstrap_status(&store)?.to_string())
         }
         ControllerCommand::Deploy(command) => {
             execute_deploy(*command)?;
@@ -114,6 +125,14 @@ fn execute_deploy(command: DeployCommand) -> Result<()> {
     let live = store.read_live()?;
     let legacy = store.read_legacy_capture()?;
     let fresh = live.is_none() && legacy.is_none();
+    if fresh
+        && crate::process_identity::LinuxProcfs::default()
+            .port_has_listener(store.paths().port())?
+    {
+        return Err(DeployError::Activation(
+            "fresh deployment port is occupied; legacy capture is required".to_string(),
+        ));
+    }
     if fresh && command.mode != crate::journal::UpdateMode::Full {
         return Err(DeployError::Activation(
             "a fresh deployment requires a combined client/server generation".to_string(),
