@@ -1,5 +1,42 @@
 # Rust Resolve-Session Parity with the Hardened (#586) Resume Contract — Implementation Plan
 
+> ## ⚠️ EXECUTED / COMPLETION RECORD — DO NOT EXECUTE ⚠️
+>
+> **This plan was FULLY IMPLEMENTED on branch `feat/rust-resolve-parity`**
+> (all seven tasks, committed; the run's evidence is recorded in the SYNC-06
+> `PARTIAL (2026-07-30, hardened-contract follow-up, commit 22022a848)`
+> bullet of `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`).
+> The text below is preserved as a HISTORICAL RECORD of the executed
+> workflow — it is NOT an executable task sequence against HEAD:
+>
+> - **Pre-implementation assertions in the body describe the state BEFORE
+>   execution, not HEAD.** Statements like "API X does not exist yet",
+>   "Expected: compile FAILURE", and the Task 1 Step 4 drift findings were
+>   true at planning time; every listed API/behavior has since LANDED, and
+>   the RED-gate "expected failure" runs succeeded during execution and are
+>   no longer reproducible at HEAD (the suites now compile and pass).
+> - **The step checkboxes (`- [ ]`) are preserved in their historical
+>   unchecked working form** — the executing workflow tracked per-task
+>   completion externally (fresh implementer per task, spec + quality review
+>   after each). They do NOT indicate pending work: every step of every task
+>   was executed and committed.
+> - **The branch's git history was subsequently REWORDED in place** (two
+>   commit messages corrected; commit `97ab164a0` remapped the checklist
+>   SHAs). `origin/feat/rust-resolve-parity` still holds the divergent
+>   pre-reword history, so Task 7's plain
+>   `git push -u origin feat/rust-resolve-parity` no longer applies:
+>   publishing requires the user's deliberate `git push --force-with-lease`
+>   (safety tag `pre-reword-backup` preserves the pre-reword tip). Pre-reword
+>   SHAs cited in the body (e.g. `c38422a0`) are superseded — see the
+>   in-place annotations.
+> - A few passages were corrected by post-review fix commits (home-resolution
+>   parity via `provider_home()`; resolve admission rescoped to the fallback
+>   dispatch) — the `POST-EXECUTION NOTE` blocks in the body mark where the
+>   landed implementation diverged from the original planned text.
+>
+> **DO NOT EXECUTE.** Re-running these steps against HEAD would fail on
+> already-landed APIs and unmet "expected failure" gates.
+
 > **For agentic workers:** This plan is executed task-by-task by the
 > workflow's execute stage: a fresh implementer per task, with a spec +
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
@@ -77,6 +114,18 @@ Expected: ALL PASS (these are main's hardened tests, untouched by the branch).
 - [ ] **Step 4: Confirm the drift findings (read, don't fix — fixes are Tasks 2–6)**
 
 Verify each of these against the code; they are the delta worklist:
+
+> **POST-EXECUTION NOTE (2026-07-31):** the five drift findings below were the
+> PRE-EXECUTION baseline, preserved verbatim. All five have since LANDED
+> (Tasks 2–6): the TS test is fixture-driven again, the Rust parser carries
+> the known-family regex + `MAX_RESUME_CANDIDATES = 8`, the resolve core is
+> the hardened per-token port (`Degraded`, `providerErrors`, case rules,
+> subagent exclusion, budgeted shape-gated fallbacks), the opencode lookup is
+> the direct by-id row query, and the wire response carries
+> `providerErrors`/`unsearchedProviders`/`homeDir`. Checking these items
+> against HEAD shows the OPPOSITE of what each asserts — that is the proof of
+> completion, not a plan/code mismatch.
+
 1. `test/unit/shared/resume-input-parser.test.ts` does NOT read `test/fixtures/resume-input/parser-cases.json` (the rebase kept main's inline version) — the anti-drift keystone is broken on the TS side even though both suites are green.
 2. `crates/freshell-sessions/src/resume_input.rs` still has the generic `[a-z]{2,10}_[0-9A-Za-z]{8,40}` prefixed-id regex and NO candidate cap; the hardened TS parser (`shared/resume-input-parser.ts:29,37`) has the known-family regex and `MAX_RESUME_CANDIDATES = 8`.
 3. `crates/freshell-sessions/src/resume_resolve.rs` has status `Ready|Warming` only (no `Degraded`), no `providerErrors`, lowercases ALL tokens (ses_ ids must be case-SENSITIVE), does not exclude subagents from prefix discovery, runs the index pass for ALL tokens before ANY fallback (hardened order is per-token exact → fallback → prefix), has no fallback shape gates or per-request budget, and maps fallback read errors to a silent miss (the incident class).
@@ -602,6 +651,11 @@ ALSO keep the Rust-only additions given verbatim above that have no Node twin (`
 
 Run: `cargo test -p freshell-sessions --test resume_resolve`
 Expected: compile errors (`OpencodeByIdHit`, `ProviderFailure`, `ResumeResolveOutcome`, `Degraded` unknown).
+
+> **POST-EXECUTION NOTE (2026-07-31):** historical RED gate — the compile
+> failure occurred as expected during execution, and Step 3's implementation
+> then landed (commit `5a3332be3`). It is NOT reproducible at HEAD: the named
+> APIs all exist now, and this suite compiles and passes.
 
 - [ ] **Step 3: Rewrite `crates/freshell-sessions/src/resume_resolve.rs`**
 
@@ -1699,6 +1753,11 @@ For the five commented tests (`a_provider_scan_failure_reports_degraded_with_the
 
 Run: `cargo test -p freshell-server` — expected FAIL/compile-error (new state fields, wire fields missing).
 
+> **POST-EXECUTION NOTE (2026-07-31):** historical RED gate — the failure
+> occurred as expected during execution, and Steps 2–3's implementation then
+> landed (commit `1480e2a71`). It is NOT reproducible at HEAD: the state and
+> wire fields all exist now, and `cargo test -p freshell-server` passes.
+
 - [ ] **Step 2: Implement the wire + route merge in `resolve.rs`**
 
 - Extend `ResolveState`:
@@ -2099,6 +2158,13 @@ Expected: all 3 tests × both projects (legacy-chromium AND rust-chromium) pass,
 
 In `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`, append a NEW `PARTIAL` bullet under the SYNC-06 item, directly after the existing `PARTIAL (2026-07-30, commit c38422a0)` bullet, following that bullet's exact style:
 
+> **POST-EXECUTION NOTE (2026-07-31):** the `c38422a0` reference above is a
+> PRE-REWORD SHA that no longer exists in this branch's history (the branch
+> was reworded in place; commit `97ab164a0` remapped the checklist's SHAs).
+> The bullet it points at now reads `PARTIAL / REOPENED (2026-07-30)` with no
+> commit reference, and the new bullet this step appends landed in the
+> checklist citing the reworded implementation commit `22022a848`.
+
 ```markdown
   - PARTIAL (2026-07-30, hardened-contract follow-up, commit `<HEAD short sha>`): rebased onto `f903e8a6` (#586) and closed the hardening delta. Contract: `status` gains `degraded`; `providerErrors`/`unsearchedProviders`/`homeDir` on the wire (`crates/freshell-server/src/resolve.rs`). Ranking: per-token exact→fallback→prefix, ses_ case-SENSITIVE, subagents excluded from prefix discovery, sessionType provider-default. Parser: known-family prefix regex + MAX_RESUME_CANDIDATES=8, pinned by the EXTENDED shared fixture `test/fixtures/resume-input/parser-cases.json` (<N> cases; TS test restored to fixture-driven form) green on BOTH parsers. Provider health: broken opencode store → degraded + providerErrors on the wire (never silent not-found), scan-failure channel + disabled→unsearched, degraded fire-and-forget refresh; hardened by-id row query (archived+child, errors propagate). Async hygiene: all fallback IO inside spawn_blocking, work bounded by cap-8×budget-2. `cargo test --workspace`: <N> passed, 0 failed; fmt+clippy clean. E2E: `resume-button.spec.ts` green on BOTH projects, 2 runs each (<N>/<N> per run). MISSING: the `PW-TAURI-WIN` (native Windows WebView2) half remains out of scope, per the SYNC-05/SAFE-11 PARTIAL convention.
 ```
@@ -2118,6 +2184,16 @@ git push -u origin feat/rust-resolve-parity
 ```
 
 Expected: push succeeds (the branch was local-only; this creates the remote branch). Do NOT open a pull request — that requires explicit user approval.
+
+> **POST-EXECUTION NOTE (2026-07-31):** OVERTAKEN BY EVENTS — the push above
+> DID run during execution (creating `origin/feat/rust-resolve-parity`), but
+> the local history was subsequently REWORDED in place (two commit messages
+> corrected), so origin now holds divergent PRE-REWORD history. Re-running the
+> plain `git push -u origin feat/rust-resolve-parity` would fail
+> non-fast-forward. Publishing the corrected history requires the USER's
+> deliberate `git push --force-with-lease origin feat/rust-resolve-parity`
+> (safety tag `pre-reword-backup` preserves the pre-reword tip). Do not push
+> without explicit user direction.
 
 ---
 
