@@ -14,6 +14,7 @@ use freshell_deployment::{assert_mutually_compatible, parse_declaration, Declara
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::bounded_http::{get as bounded_http_get, HttpLimits};
 use crate::error::{DeployError, Result};
 use crate::legacy::{NodePrerequisite, RuntimeBindings};
 use crate::manifest::ManifestEntry;
@@ -952,20 +953,21 @@ impl ProbeBackend for RealProbeBackend {
         path: &str,
         auth_token: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
-            .map_err(|error| DeployError::Probe(format!("probe HTTP connect failed: {error}")))?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        let auth = auth_token
-            .map(|token| format!("x-auth-token: {token}\r\n"))
-            .unwrap_or_default();
-        stream.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n")
-                .as_bytes(),
-        )?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        parse_http_ok(&response)
+        let response = bounded_http_get(
+            address,
+            &address.to_string(),
+            path,
+            auth_token,
+            HttpLimits::default(),
+        )
+        .map_err(|error| DeployError::Probe(format!("probe HTTP request failed: {error}")))?;
+        if response.status != 200 {
+            return Err(DeployError::Probe(format!(
+                "probe HTTP request did not return 200: {}",
+                response.status
+            )));
+        }
+        Ok(response.body)
     }
 
     fn terminate_reap(
@@ -1347,22 +1349,6 @@ fn finish_owned_cleanup(failures: Vec<String>) -> Result<()> {
             failures.join("; ")
         )))
     }
-}
-
-fn parse_http_ok(response: &[u8]) -> Result<Vec<u8>> {
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| DeployError::Probe("probe HTTP response is malformed".to_string()))?;
-    let headers = std::str::from_utf8(&response[..split])
-        .map_err(|_| DeployError::Probe("probe HTTP headers are not UTF-8".to_string()))?;
-    if !headers.starts_with("HTTP/1.1 200 ") && !headers.starts_with("HTTP/1.0 200 ") {
-        return Err(DeployError::Probe(format!(
-            "probe HTTP request did not return 200: {}",
-            headers.lines().next().unwrap_or("missing status")
-        )));
-    }
-    Ok(response[split + 4..].to_vec())
 }
 
 #[cfg(test)]

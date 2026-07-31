@@ -1,6 +1,7 @@
 //! Immutable Freshell deployment generations and legacy bootstrap capture.
 
 mod activation;
+mod bounded_http;
 mod cli;
 mod controller;
 mod controller_command;

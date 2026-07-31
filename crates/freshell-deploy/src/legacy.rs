@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::bounded_http::{get as bounded_http_get, HttpLimits};
 use crate::durable::sync_directory;
 use crate::error::{DeployError, Result};
 use crate::manifest::{sha256_file, snapshot_tree_entries, ManifestEntry};
@@ -2094,37 +2095,21 @@ fn expected_extension_names(directory: &Path) -> Result<BTreeSet<String>> {
 }
 
 fn scratch_get(port: DeployPort, path: &str, auth_token: Option<&str>) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port.get())).map_err(|error| {
-        DeployError::LegacyCapture(format!("scratch HTTP connection failed: {error}"))
-    })?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n")?;
-    if let Some(auth_token) = auth_token {
-        write!(stream, "x-auth-token: {auth_token}\r\n")?;
-    }
-    stream.write_all(b"Connection: close\r\n\r\n")?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| {
-            DeployError::LegacyCapture("scratch HTTP response has no header boundary".to_string())
-        })?;
-    let headers = std::str::from_utf8(&response[..header_end]).map_err(|error| {
-        DeployError::LegacyCapture(format!("scratch HTTP headers are not UTF-8: {error}"))
-    })?;
-    if !headers
-        .lines()
-        .next()
-        .is_some_and(|line| line.starts_with("HTTP/1.1 200"))
-    {
+    let response = bounded_http_get(
+        SocketAddr::from(([127, 0, 0, 1], port.get())),
+        "localhost",
+        path,
+        auth_token,
+        HttpLimits::default(),
+    )
+    .map_err(|error| DeployError::LegacyCapture(format!("scratch HTTP request failed: {error}")))?;
+    if response.status != 200 {
         return Err(DeployError::LegacyCapture(format!(
-            "scratch HTTP check for {path} failed: {}",
-            truncate(headers, 1024)
+            "scratch HTTP check for {path} returned {}",
+            response.status
         )));
     }
-    Ok(response[header_end + 4..].to_vec())
+    Ok(response.body)
 }
 
 fn parse_listening_address(log: &str) -> Option<SocketAddr> {

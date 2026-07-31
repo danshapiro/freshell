@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use crate::activation::{
     read_cancellation_receipt, ActivationDriver, ActivationReceiptObservation,
     CancellationReceiptObservation, LaunchAttemptObservation, LaunchSpec, PortState, ServiceState,
 };
+use crate::bounded_http::{get as bounded_http_get, HttpLimits, HttpResponse};
 use crate::deployment::{required_predecessor_client_assets, GenerationDescriptor};
 use crate::error::{DeployError, Result};
 use crate::journal::{
@@ -827,46 +828,20 @@ fn read_ready_receipt(path: &Path) -> Result<Option<DeploymentReadyReceipt>> {
     Ok(Some(receipt))
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
 fn http_get(
     port: crate::paths::DeployPort,
     path: &str,
     auth_token: Option<&str>,
 ) -> Result<HttpResponse> {
     let address = SocketAddr::from(([127, 0, 0, 1], port.get()));
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
-        .map_err(|error| DeployError::Activation(format!("HTTP connect failed: {error}")))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let auth = auth_token
-        .map(|token| format!("x-auth-token: {token}\r\n"))
-        .unwrap_or_default();
-    stream.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n")
-            .as_bytes(),
-    )?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| DeployError::Activation("HTTP response is malformed".to_string()))?;
-    let headers = std::str::from_utf8(&response[..split])
-        .map_err(|_| DeployError::Activation("HTTP response headers are not UTF-8".to_string()))?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| DeployError::Activation("HTTP status is malformed".to_string()))?;
-    Ok(HttpResponse {
-        status,
-        body: response[split + 4..].to_vec(),
-    })
+    bounded_http_get(
+        address,
+        &format!("127.0.0.1:{port}"),
+        path,
+        auth_token,
+        HttpLimits::default(),
+    )
+    .map_err(|error| DeployError::Activation(format!("HTTP request failed: {error}")))
 }
 
 fn remove_probe_directory(path: &Path) -> Result<()> {

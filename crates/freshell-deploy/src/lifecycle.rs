@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bounded_http::{get as bounded_http_get, HttpLimits};
 use crate::deployment::GenerationDescriptor;
 use crate::durable::atomic_write;
 use crate::error::{DeployError, Result};
@@ -841,27 +842,15 @@ fn verify_node_prerequisite(node: &NodePrerequisite, generation_root: &Path) -> 
 
 fn http_get(port: DeployPort, path: &str) -> Result<u16> {
     let address = SocketAddr::from(([127, 0, 0, 1], port.get()));
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
-        .map_err(|error| DeployError::Activation(format!("HTTP connect failed: {error}")))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| DeployError::Activation("HTTP response is malformed".to_string()))?;
-    let headers = std::str::from_utf8(&response[..header_end])
-        .map_err(|_| DeployError::Activation("HTTP response headers are not UTF-8".to_string()))?;
-    headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse().ok())
-        .ok_or_else(|| DeployError::Activation("HTTP status is malformed".to_string()))
+    bounded_http_get(
+        address,
+        &format!("127.0.0.1:{port}"),
+        path,
+        None,
+        HttpLimits::default(),
+    )
+    .map(|response| response.status)
+    .map_err(|error| DeployError::Activation(format!("HTTP request failed: {error}")))
 }
 
 fn read_ready(path: &Path) -> Result<Option<DeploymentReadyReceipt>> {
