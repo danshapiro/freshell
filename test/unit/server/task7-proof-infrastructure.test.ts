@@ -182,6 +182,23 @@ describe('Task 7 proof infrastructure', () => {
     expect(run).toContain("printf 'playwright=%s\\n' \"${PLAYWRIGHT_VERSION}\"")
   })
 
+  it('maps an existing sandbox UID onto a provisioned primary GID', () => {
+    const dockerfile = readFileSync(
+      path.join(repository, 'docker/sandbox/Dockerfile'),
+      'utf8',
+    )
+    const groupProvision = dockerfile.indexOf(
+      '(getent group "${GID}" >/dev/null 2>&1 || groupadd -g "${GID}" sandbox)',
+    )
+    const existingUidLookup = dockerfile.indexOf(
+      'if getent passwd "${UID}" >/dev/null 2>&1; then',
+    )
+
+    expect(groupProvision).toBeGreaterThan(-1)
+    expect(existingUidLookup).toBeGreaterThan(groupProvision)
+    expect(dockerfile).toContain('usermod -g "${GID}" sandbox;')
+  })
+
   it('keeps ordinary fake-Codex argv logging portable', async () => {
     const invocation = await fakeCodexInvocation({
       FAKE_CODEX_PROC_ROOT: '/definitely-not-a-real-proc-root',

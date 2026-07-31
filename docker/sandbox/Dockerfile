@@ -53,16 +53,18 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # user Linux/WSL default, and this operator's UID too) — useradd would fail
 # with "UID already in use" in that common case. So: if the requested UID is
 # already taken, rename that existing user to "sandbox" instead of creating a
-# duplicate; only fall back to a fresh useradd when the UID is free.
+# duplicate; only fall back to a fresh useradd when the UID is free. Provision
+# the requested group first so either path can map sandbox's primary GID to it.
 ARG UID=1000
 ARG GID=1000
-RUN if getent passwd "${UID}" >/dev/null 2>&1; then \
+RUN (getent group "${GID}" >/dev/null 2>&1 || groupadd -g "${GID}" sandbox) \
+    && if getent passwd "${UID}" >/dev/null 2>&1; then \
       EXISTING_NAME="$(getent passwd "${UID}" | cut -d: -f1)"; \
       if [ "${EXISTING_NAME}" != "sandbox" ]; then \
-        usermod -l sandbox -g "${GID}" -d /home/sandbox -m "${EXISTING_NAME}"; \
+        usermod -l sandbox -d /home/sandbox -m "${EXISTING_NAME}"; \
       fi; \
+      usermod -g "${GID}" sandbox; \
     else \
-      (getent group "${GID}" >/dev/null 2>&1 || groupadd -g "${GID}" sandbox); \
       useradd -m -u "${UID}" -g "${GID}" -s /bin/bash sandbox; \
     fi \
     && chown -R "${UID}:${GID}" /usr/local/cargo /usr/local/rustup
