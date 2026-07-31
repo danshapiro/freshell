@@ -209,6 +209,20 @@
       "input": "claude -rf ed2afda6-a340-443e-ba60-024a1b3554b4",
       "candidates": [{ "token": "ed2afda6-a340-443e-ba60-024a1b3554b4", "kind": "uuid" }],
       "hint": { "provider": "claude", "source": "word" }
+    },
+    {
+      "name": "known thread_ id family",
+      "input": "thread_abc123456",
+      "candidates": [{ "token": "thread_abc123456", "kind": "prefixed-id" }],
+      "hint": null
+    },
+    {
+      "name": "known task_ id family with a long 46-char suffix",
+      "input": "task_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3",
+      "candidates": [
+        { "token": "task_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3", "kind": "prefixed-id" }
+      ],
+      "hint": null
     }
   ]
 }
