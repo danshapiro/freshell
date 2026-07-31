@@ -367,7 +367,7 @@ No new commit — the rebase itself rewrote history. Record the post-rebase HEAD
 - Modify: `crates/freshell-ws/src/terminal.rs` (one 3-line test-module hook, next to the existing `#[cfg(test)] #[path = "terminal_create_ordering_tests.rs"]` hook at `terminal.rs:71-73`)
 
 **Interfaces:**
-- Consumes: `derive_launch_prep(&TerminalCreate, &str) -> LaunchPrep` and `LaunchPrep { launch_intent, resume_session_id, claude_fresh_prealloc, resume_id_from_wire }` from Task 2; `TerminalCreate` (deserializable, `#[serde(rename_all = "camelCase")]`, fields `requestId`, `mode`, `restore`, `resumeSessionId`, `sessionRef{provider,sessionId}`); `LaunchIntent::{Start, Resume}`.
+- Consumes: `derive_launch_prep(&TerminalCreate, &str) -> LaunchPrep` and `LaunchPrep { launch_intent, resume_session_id, claude_fresh_prealloc, resume_id_from_wire }` from Task 2; `TerminalCreate` (deserializable, `#[serde(rename_all = "camelCase")]`, fields `requestId`, `mode`, `shell` (REQUIRED — `Shell`, no serde default, per `crates/freshell-protocol/src/client_messages.rs:205`; every payload below carries `"shell": "system"`, the same value the proven builder at `resume_validation_gate.rs:407` uses), `restore`, `resumeSessionId`, `sessionRef{provider,sessionId}`); `LaunchIntent::{Start, Resume}`.
 - Produces: test module `terminal_launch_prep_tests` — Task 4's mutation-proof step reruns it by name.
 
 - [ ] **Step 1: Register the sibling test file**
@@ -402,6 +402,7 @@ fn wire_session_ref_restore_is_from_wire() {
     let create = create_from_json(serde_json::json!({
         "requestId": "r-wire-ref",
         "mode": "codex",
+        "shell": "system",
         "restore": true,
         "sessionRef": { "provider": "codex", "sessionId": "stale-codex-id" }
     }));
@@ -417,6 +418,7 @@ fn wire_legacy_resume_session_id_is_from_wire() {
     let create = create_from_json(serde_json::json!({
         "requestId": "r-wire-legacy",
         "mode": "amplifier",
+        "shell": "system",
         "restore": true,
         "resumeSessionId": "stale-amp-id"
     }));
@@ -429,7 +431,8 @@ fn wire_legacy_resume_session_id_is_from_wire() {
 fn claude_fresh_prealloc_is_server_allocated_not_wire() {
     let create = create_from_json(serde_json::json!({
         "requestId": "r-claude-fresh",
-        "mode": "claude"
+        "mode": "claude",
+        "shell": "system"
     }));
     let prep = derive_launch_prep(&create, "claude");
     assert!(prep.claude_fresh_prealloc);
@@ -448,7 +451,8 @@ fn amplifier_fresh_prealloc_is_server_allocated_not_wire() {
     // claude_fresh_prealloc stays false — the flag must still be false.
     let create = create_from_json(serde_json::json!({
         "requestId": "r-amp-fresh",
-        "mode": "amplifier"
+        "mode": "amplifier",
+        "shell": "system"
     }));
     let prep = derive_launch_prep(&create, "amplifier");
     assert!(!prep.claude_fresh_prealloc);
@@ -465,7 +469,8 @@ fn amplifier_fresh_prealloc_is_server_allocated_not_wire() {
 fn shell_mode_is_never_from_wire() {
     let create = create_from_json(serde_json::json!({
         "requestId": "r-shell",
-        "mode": "shell"
+        "mode": "shell",
+        "shell": "system"
     }));
     let prep = derive_launch_prep(&create, "shell");
     assert!(!prep.resume_id_from_wire);
@@ -473,10 +478,13 @@ fn shell_mode_is_never_from_wire() {
 }
 ```
 
-If `serde_json::from_value` panics on a missing required field (e.g. `shell`),
-copy the exact payload shape emitted by the proven builder
-`restore_create_with_session_ref` at
-`crates/freshell-ws/tests/resume_validation_gate.rs:407` (minus the outer
+Every payload above already carries `"shell": "system"` because
+`TerminalCreate.shell` is a REQUIRED field with no serde default
+(`crates/freshell-protocol/src/client_messages.rs:205`) — the same value the
+proven builder `restore_create_with_session_ref` emits at
+`crates/freshell-ws/tests/resume_validation_gate.rs:407`. Residual fallback
+only: if `serde_json::from_value` still panics on some OTHER missing required
+field, copy the exact payload shape emitted by that builder (minus the outer
 `"type": "terminal.create"` envelope if `TerminalCreate` is the payload struct)
 and add the missing fields to every JSON literal above. Adjust `use super::*;`
 imports if `uuid`/`serde_json` need explicit paths — mirror the imports of the
@@ -523,35 +531,50 @@ git commit -m "test(ws): first direct unit tests for derive_launch_prep — pin 
 
 **Interfaces:**
 - Consumes: the file's own harness — `spawn_server_with_probe(probe, fresh_agent_enabled)`, `common::isolate_amplifier_home()`, `common::connect_and_capture_inventory`, `send_json`, `next_created_or_error`, `notice_of`, `restore_create_with_session_ref(request_id, mode, session_id)`, the `SessionExistenceProbe` trait (required methods: `exists` and `ever_observed` — `exists_for_gate` is the wrapper in `resume_validation.rs` that the gate calls, not a trait method) and `SessionExistence::Absent`, plus `StubProbe` (`:28-60`) as the impl template.
-- Produces: tests `server_allocated_fresh_claude_id_is_never_gated` and `server_allocated_fresh_amplifier_id_is_never_gated`; probe type `AlwaysAbsentProbe`.
+- Produces: tests `server_allocated_fresh_claude_id_is_never_gated` and `server_allocated_fresh_amplifier_id_is_never_gated`; probe type `AbsentButObservedProbe`.
 
-- [ ] **Step 1: Add an always-Absent probe**
+- [ ] **Step 1: Add an absent-but-previously-observed probe**
 
 `StubProbe` defaults unmatched keys to `Unknown` (fail-open), which would make this
-test pass for the WRONG reason. Add, next to `StubProbe`, a probe that answers
-`Absent` for EVERY query — copy `StubProbe`'s `impl SessionExistenceProbe` block
-shape exactly (the trait's required methods are `exists` and `ever_observed`;
-validated against the file's `StubProbe`/`GateOrderProbe` impls):
+test pass for the WRONG reason. Equally important: the probe MUST answer
+`ever_observed → true`, not `false`. With `ever_observed → false`, a wrongly
+consulted gate on a claude id evaluates `evaluate_resume_gate("claude", Absent,
+false)`, which is the claude ZERO-TURN CARVE-OUT → `Proceed`
+(`crates/freshell-platform/src/resume_gate.rs:100-104`, pinned by
+`claude_zero_turn_carve_out_proceeds`) — no notice, so the claude test would pass
+vacuously and Step 4's mutation could never go red. With `Absent` +
+`ever_observed → true` the outcome is `SpawnFresh`
+(`crates/freshell-platform/src/resume_gate.rs:119`), which fires the notice for
+BOTH claude and amplifier. Add, next to `StubProbe`, a probe with exactly these
+answers — copy `StubProbe`'s `impl SessionExistenceProbe` block shape exactly
+(the trait's required methods are `exists` and `ever_observed`; validated
+against the file's `StubProbe` impl):
 
 ```rust
-/// Answers Absent for EVERY (provider, id) query — including ids minted
-/// server-side that the test cannot know in advance. If the gate ever
-/// consults the probe for a server-allocated id, it will fire and the
-/// assertions below will catch it.
-struct AlwaysAbsentProbe;
+/// Answers Absent-but-previously-observed for EVERY (provider, id) query —
+/// including ids minted server-side that the test cannot know in advance.
+/// `ever_observed → true` is load-bearing: it defeats the claude zero-turn
+/// carve-out (Absent + never-observed → Proceed, resume_gate.rs:100-104),
+/// so ANY gate consult on a server-allocated id — claude included —
+/// evaluates to SpawnFresh (resume_gate.rs:119), fires the notice, and
+/// fails the assertions below.
+struct AbsentButObservedProbe;
 
-impl SessionExistenceProbe for AlwaysAbsentProbe {
+impl SessionExistenceProbe for AbsentButObservedProbe {
     fn exists(&self, _provider: &str, _session_id: &str) -> SessionExistence {
         SessionExistence::Absent
     }
     fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
-        false
+        true
     }
 }
 ```
 
 (Adjust method list/signatures to match `StubProbe`'s impl verbatim — that impl is
-the source of truth in this file.)
+the source of truth in this file — but keep the ANSWERS above: `Absent` and
+`true`. The trait's `ever_observed_on_disk` has a default that delegates to
+`ever_observed` (`crates/freshell-ws/src/existence.rs:57-59`), so no third
+method is needed.)
 
 - [ ] **Step 2: Write the two failing/proving tests**
 
@@ -573,12 +596,14 @@ fn fresh_create(request_id: &str, mode: &str) -> serde_json::Value {
 
 /// A fresh claude create mints a SERVER-allocated session id (prealloc).
 /// That id is by definition absent on disk — and must NEVER be gated:
-/// no notice, plain successful create. Probe answers Absent for everything,
-/// so any gate consult on the minted id would fire and fail this test.
+/// no notice, plain successful create. Probe answers Absent-but-observed
+/// for everything, so any gate consult on the minted id evaluates to
+/// SpawnFresh (the claude zero-turn carve-out does NOT apply), fires the
+/// notice, and fails this test.
 #[tokio::test(flavor = "multi_thread")]
 async fn server_allocated_fresh_claude_id_is_never_gated() {
     let (url, registry, _ledger, _state) =
-        spawn_server_with_probe(Arc::new(AlwaysAbsentProbe), false).await;
+        spawn_server_with_probe(Arc::new(AbsentButObservedProbe), false).await;
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
     send_json(&mut ws, &fresh_create("req-prealloc-claude", "claude")).await;
@@ -601,7 +626,7 @@ async fn server_allocated_fresh_claude_id_is_never_gated() {
 #[tokio::test(flavor = "multi_thread")]
 async fn server_allocated_fresh_amplifier_id_is_never_gated() {
     let (url, registry, _ledger, _state) =
-        spawn_server_with_probe(Arc::new(AlwaysAbsentProbe), false).await;
+        spawn_server_with_probe(Arc::new(AbsentButObservedProbe), false).await;
     let _amp_home = common::isolate_amplifier_home();
 
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
@@ -624,7 +649,7 @@ async fn server_allocated_fresh_amplifier_id_is_never_gated() {
 `spawn_server_with_probe`'s probe parameter is `Arc<dyn SessionExistenceProbe>`
 (resume_validation_gate.rs:96-102) — all six existing call sites pass an `Arc`,
 which is why the snippet wraps the probe in `Arc::new(...)` (unsized coercion
-`Arc<AlwaysAbsentProbe> → Arc<dyn SessionExistenceProbe>` happens at the call
+`Arc<AbsentButObservedProbe> → Arc<dyn SessionExistenceProbe>` happens at the call
 site; `Arc` is already imported in this file for those existing calls). Do NOT
 change the harness signature — that would break the six existing callers. If
 the signature has drifted from `Arc<dyn ...>`, match whatever the existing
@@ -648,7 +673,14 @@ prealloc arm of `derive_launch_prep`), run:
 cargo test -p freshell-ws --test resume_validation_gate server_allocated_fresh_claude_id_is_never_gated
 ```
 
-Expected: FAILS (gate fires on the minted id, notice appears). Revert the one-line
+Expected: FAILS — the mutated flag makes the gate consult the probe for the
+minted claude id; the probe answers `Absent` + `ever_observed → true`, so the
+claude zero-turn carve-out (`Absent` + never-observed → `Proceed`,
+`resume_gate.rs:100-104`) does NOT apply and the outcome is `SpawnFresh`
+(`resume_gate.rs:119`): the gate fires, the notice appears, and the
+`notice_of(&frame).is_none()` assertion trips. (This is exactly why Step 1's
+probe answers `ever_observed → true` — with `false`, the carve-out would
+swallow the mutation and this step could never go red.) Revert the one-line
 mutation, rerun, expected: PASS.
 
 - [ ] **Step 5: Run the whole gate suite, then commit**
@@ -1281,6 +1313,6 @@ from Task 1.
 ## Self-review record
 
 - **Spec coverage:** Required work 1 (rebase + Option A + consistent later resolutions) → Tasks 1–2. Required work 2 (TDD unit test on `derive_launch_prep` for wire-vs-server-allocated + gate-level never-gated assertion) → Tasks 3–4 (with mutation-proof steps making the "prove" honest, since the field lands during the rebase). Required work 3 (re-run branch gate tests, auto_resume, rest_resume_, managed-path characterization, #589 storm pins) → Task 2 Step 8, Task 5 Steps 1/6/7, Task 7. Required work 4 (fmt/clippy/workspace tests/client-if-touched, known font-settings caveat) → Task 7. Required work 5 (clean history, reconciliation commit messages, docs only-if-false) → Tasks 5–7. The explicit ordering interaction (gate → plan-off-permit → permit → spawn, or documented alternative) → Task 5, which implements the blessed ordering for codex and documents in code why non-codex modes gate on-permit (no off-permit plan step exists for them; ladder-resolved claude ids must be validated post-ladder). Task 5's TDD structure was re-based on validated evidence: the original red (case 7) passes pre-fix because its argv detection is blind post-#589, so the red is the new case-7b ORDER pin — sandbox-verified deterministic RED (pre-fix) → GREEN (post-fix) with the exact code inlined in Step 1.
-- **No silent deferrals:** No stubs or fakes stand in for required behavior; the only test doubles are the pre-existing harness probes (`StubProbe`, plus the new `AlwaysAbsentProbe`), and the real-probe production path is exercised by the branch's existing `freshell-server` existence tests which run in Task 7's workspace sweep. No requirement was moved to "known limitations". **UNRESOLVED COVERAGE GAPS: none.**
-- **Placeholder scan:** every code step carries complete code; the two places where a repo detail could not be pinned read-only (TerminalCreate serde defaults; the exact `SessionExistenceProbe` method list) carry a deterministic in-repo fallback (copy the named proven builder/impl at an exact file:line), not a TBD.
+- **No silent deferrals:** No stubs or fakes stand in for required behavior; the only test doubles are the pre-existing harness probes (`StubProbe`, plus the new `AbsentButObservedProbe`), and the real-probe production path is exercised by the branch's existing `freshell-server` existence tests which run in Task 7's workspace sweep. No requirement was moved to "known limitations". **UNRESOLVED COVERAGE GAPS: none.**
+- **Placeholder scan:** every code step carries complete code; the one place where a repo detail could drift (the exact `SessionExistenceProbe` method list) carries a deterministic in-repo fallback (copy the named proven impl at an exact file:line), not a TBD. `TerminalCreate`'s required `shell` field WAS pinned read-only (`crates/freshell-protocol/src/client_messages.rs:205`, no serde default) and every Task 3 payload carries `"shell": "system"`.
 - **Type consistency:** `LaunchPrep.resume_id_from_wire: bool` (Tasks 2/3/5), `ResumeGateCarry { notice, stale_session_id }` + `gate_wire_resume(state, mode, &mut Option<String>, &mut LaunchIntent, &mut bool)` (Task 5 both call sites), `PreparedLaunch.resume_gate: Option<ResumeGateCarry>` (Task 5 Steps 3–4), test names in Task 4 Step 2 match Step 3/4 run filters — all cross-checked.
