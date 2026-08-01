@@ -1009,7 +1009,12 @@ These tests are written AFTER the Task 2 implementation, so they should pass imm
 
 Both must be disabled because these tests drive the foreign completion with a DIFFERENT turn id (`turn-c` / `turn-child`) than the bound thread's in-flight one (`turn-1` / `turn-parent` from the preceding `turn/started`): with only the thread guard removed, the turn-id guard would still drop the foreign completion and mask the red (the tests would stay green for the wrong reason). Then run:
 
-`cargo test -p freshell-ws foreign_thread_proxy_completion_does_not_ring turn_events_forward_thread_turn_and_nested_status`
+```bash
+cargo test -p freshell-ws foreign_thread_proxy_completion_does_not_ring
+cargo test -p freshell-ws turn_events_forward_thread_turn_and_nested_status
+```
+
+(Two separate invocations — `cargo test` accepts only ONE positional test-name filter; passing a second positional errors with `unexpected argument` before anything compiles or runs.)
 
 Expected: both FAIL (the foreign completion rings). Restore the guards (`git checkout -- crates/freshell-activity/src/codex.rs` restores the committed version if you edited in place).
 
@@ -1201,6 +1206,7 @@ git commit -m "feat(server): carry threadId/turnId/status on codex turn registry
 - Modify: `server/coding-cli/codex-activity-tracker.ts` (`CodexTerminalActivity` type `:32-49`; `onTurnStarted`/`onTurnCompleted` `:238-263`; `transitionAfterTurnClear` `:372+`; `transitionPendingAfterTurnClear` `:412+`; new `claimTurnKeyIfIdle` next to `recordCompletionIfIdle` `:442+`)
 - Test: `test/unit/server/coding-cli/codex-activity-tracker.test.ts`
 - Test: `test/unit/server/coding-cli/codex-activity-wiring.test.ts` (fixture update)
+- Test: `test/unit/server/coding-cli/turn-completion-snapshots.test.ts` (fixture update only — pinned snapshot; deliberate, documented protocol decision; assertions unchanged)
 
 **Interfaces:**
 - Consumes (from Task 4): `CodexTurnStartedEvent`/`CodexTurnCompletedEvent` with `threadId`, `turnId?`, `status?`.
@@ -1386,10 +1392,12 @@ Also update the PRE-EXISTING app-server-lane tracker tests to the new event shap
 
 (No `turnId` needed — it stays absent, and absent turn ids fall through the dedupe guard by design.) Without this update, Step 4's thread guard (`state.sessionId !== input.threadId`, i.e. `'session-1' !== undefined`) silently drops these events and three tests fail (`promotes busy from app-server turn started and clears from turn completed`, `does not double-emit when app-server completion is followed by BEL and JSONL completion`, `clears a pending submit from app-server completion even when turn started was missed`); and because Task 4 made `threadId: string` required on both event types, the bare calls are also TypeScript errors that would fail Task 7's `npm run check`.
 
+Finally, update the pinned snapshot suite `test/unit/server/coding-cli/turn-completion-snapshots.test.ts` — its `CodexActivityTracker` block contains the ONLY other bare `{ terminalId, at }` turn-event call sites in the repo: six calls, four at `:65-68` (all `term-1`, bound via `tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', ... })` at `:64`) and two at `:71-72` (`term-2`, bound `sessionId: 'session-2'` at `:70`). Add `threadId: 'session-1'` to the four `term-1` calls and `threadId: 'session-2'` to the two `term-2` calls; change nothing else in the file. This file's header pins its ASSERTIONS ("must never change without an explicit protocol decision") — this edit IS that explicit protocol decision, so record it in place: add a comment above the updated calls citing this plan (kata codex-turn-thread-scope: app-server turn events now carry the bound thread's required `threadId`; only the event-construction INPUTS change to the new required shape). The pinned OUTPUTS are untouched and must still pass byte-identical: because each event now carries the `threadId` matching its terminal's bound session (and no `turnId`, which falls through the dedupe guard), Task 5's thread guard passes them through exactly as before — the three-completion `toEqual`, the `completionSeq` sequence `[1, 2, 1]`, and the pinned JSON string all remain valid. If any pinned assertion fails after this fixture update, STOP: that is an implementation bug in Task 5 — never re-pin the snapshot. Without this fixture update, Task 4's required `threadId: string` makes the six bare calls TypeScript errors (failing Task 7 Step 4's `npm run check`), and at runtime the thread guard would silently drop the events (the snapshot's 3 expected completions become 0).
+
 - [ ] **Step 3: Run to verify RED**
 
-Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts --run`
-Expected: the new `describe` block FAILS (foreign completion currently flips to idle and records; interrupted currently records; stale turn id currently completes). The wiring test AND the updated `turn.complete emission (server-authoritative)` tests still PASS (the tracker ignores the extra fields today) — their red would arrive with the Step 4 filter if the fixtures were wrong, so they pin the contract both ways.
+Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts test/unit/server/coding-cli/turn-completion-snapshots.test.ts --run`
+Expected: the new `describe` block FAILS (foreign completion currently flips to idle and records; interrupted currently records; stale turn id currently completes). The wiring test, the updated `turn.complete emission (server-authoritative)` tests, AND the updated snapshot suite still PASS (the tracker ignores the extra fields today) — their red would arrive with the Step 4 filter if the fixtures were wrong, so they pin the contract both ways.
 
 - [ ] **Step 4: Implement the tracker guards**
 
@@ -1497,7 +1505,7 @@ Expected: PASS (all new tests + all pre-existing tracker tests — the `turn.com
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/codex-activity-tracker.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts
+git add server/coding-cli/codex-activity-tracker.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts test/unit/server/coding-cli/turn-completion-snapshots.test.ts
 git commit -m "fix(server): thread-scope and status-guard codex app-server turn events"
 ```
 
@@ -1650,6 +1658,7 @@ Run:
 npm run test:vitest -- --config config/vitest/vitest.server.config.ts \
   test/unit/server/coding-cli/codex-activity-tracker.test.ts \
   test/unit/server/coding-cli/codex-activity-wiring.test.ts \
+  test/unit/server/coding-cli/turn-completion-snapshots.test.ts \
   test/unit/server/terminal-registry.codex-sidecar.test.ts \
   test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts \
   test/server/codex-activity-exact-subset.test.ts \
