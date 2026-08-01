@@ -45,6 +45,13 @@ export type CodexTerminalActivity = CodexActivityRecord & {
   lastSeenSessionLastActivityAt?: number
   lastObservedAt: number
   lastEmittedTurnKey?: number
+  /**
+   * kata codex-turn-thread-scope: the bound thread's in-flight app-server
+   * turn id (set on turn/started). A turn/completed carrying a DIFFERENT
+   * turn id is a stale echo of an already-closed turn -- no-op by
+   * construction. Absent ids fall back to phase semantics.
+   */
+  currentTurnId?: string
   parserState: TurnCompleteSignalParserState
 }
 
@@ -238,8 +245,16 @@ export class CodexActivityTracker extends EventEmitter {
   onTurnStarted(input: CodexTurnStartedEvent): void {
     const state = this.states.get(input.terminalId)
     if (!state) return
+    // Thread scope guard (kata codex-turn-thread-scope, spike scenario D):
+    // the shared app-server connection relays turn events for EVERY thread
+    // (sub-agents, review threads, forks). Only the bound thread's turns
+    // drive this terminal. A codex terminal enters the tracker only at bind
+    // time, so the unbound window is inherently silent (parity with the
+    // Rust tracker's unbound => ignore).
+    if (state.sessionId === undefined || state.sessionId !== input.threadId) return
 
     const previous = this.toRecord(state)
+    state.currentTurnId = input.turnId
     state.lastSeenTaskStartedAt = maxDefined(state.lastSeenTaskStartedAt, input.at)
     this.promoteBusy(state, input.at, input.at)
     this.commitState(state, previous)
@@ -248,13 +263,26 @@ export class CodexActivityTracker extends EventEmitter {
   onTurnCompleted(input: CodexTurnCompletedEvent): void {
     const state = this.states.get(input.terminalId)
     if (!state) return
+    // Guard order mirrors the Rust tracker (crates/freshell-activity/src/
+    // codex.rs::note_proxy_turn_completed): thread scope -> inProgress ->
+    // stale turn id -> status.
+    if (state.sessionId === undefined || state.sessionId !== input.threadId) return
+    // turn/completed fires for ALL statuses; inProgress is not a turn end.
+    if (input.status === 'inProgress') return
+    if (input.turnId !== undefined && state.currentTurnId !== undefined && input.turnId !== state.currentTurnId) {
+      return
+    }
+    // Status guard: only 'completed' (or absent -- older protocol forms)
+    // records a bell-worthy completion; interrupted/failed clear silently
+    // (shared/ws-protocol.ts terminal.idle: never after crash/interrupt).
+    const record = input.status === undefined || input.status === 'completed'
 
     const previous = this.toRecord(state)
     state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
     if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
-      this.transitionPendingAfterTurnClear(state, input.at)
+      this.transitionPendingAfterTurnClear(state, input.at, record)
     } else if (state.acceptedStartAt !== undefined) {
-      this.transitionAfterTurnClear(state, input.at)
+      this.transitionAfterTurnClear(state, input.at, record)
     } else if (state.latentAcceptedStartAt !== undefined) {
       this.transitionAfterLatentTurnClear(state, input.at)
     }
@@ -369,7 +397,7 @@ export class CodexActivityTracker extends EventEmitter {
     state.lastObservedAt = at
   }
 
-  private transitionAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+  private transitionAfterTurnClear(state: CodexTerminalActivity, at: number, record = true): void {
     const turnKey = state.acceptedStartAt
     const hasQueuedSubmit = this.hasQueuedSubmit(state)
     state.lastClearedAt = at
@@ -390,7 +418,11 @@ export class CodexActivityTracker extends EventEmitter {
       state.queuedSubmitAt = undefined
       state.pendingUntil = undefined
     }
-    this.recordCompletionIfIdle(state, turnKey, at)
+    if (record) {
+      this.recordCompletionIfIdle(state, turnKey, at)
+    } else {
+      this.claimTurnKeyIfIdle(state, turnKey)
+    }
   }
 
   private transitionAfterLatentTurnClear(state: CodexTerminalActivity, at: number): void {
@@ -409,7 +441,7 @@ export class CodexActivityTracker extends EventEmitter {
     state.lastObservedAt = at
   }
 
-  private transitionPendingAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+  private transitionPendingAfterTurnClear(state: CodexTerminalActivity, at: number, record = true): void {
     const turnKey = state.pendingSubmitAt
     state.latentAcceptedStartAt = undefined
     state.lastClearedAt = at
@@ -428,7 +460,11 @@ export class CodexActivityTracker extends EventEmitter {
       state.pendingUntil = undefined
       state.queuedSubmitAt = undefined
     }
-    this.recordCompletionIfIdle(state, turnKey, at)
+    if (record) {
+      this.recordCompletionIfIdle(state, turnKey, at)
+    } else {
+      this.claimTurnKeyIfIdle(state, turnKey)
+    }
   }
 
   /**
@@ -449,6 +485,20 @@ export class CodexActivityTracker extends EventEmitter {
       ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       at,
     }))
+  }
+
+  /**
+   * Abort-shaped clears (turn_aborted / status interrupted|failed): claim
+   * the turn key exactly like recordCompletionIfIdle does, but WITHOUT
+   * recording, so a later echo of the same physical turn (BEL, JSONL
+   * reconcile, app-server duplicate -- all share this key space) cannot
+   * mint a completion. shared/ws-protocol.ts terminal.idle: "Never emitted
+   * after crash/interrupt/exit".
+   */
+  private claimTurnKeyIfIdle(state: CodexTerminalActivity, turnKey: number | undefined): void {
+    if (turnKey === undefined) return
+    if (state.phase !== 'idle') return
+    state.lastEmittedTurnKey = turnKey
   }
 
   private flushCompletions(): void {

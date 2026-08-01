@@ -46,14 +46,20 @@ describe('wireCodexActivityTracker', () => {
       sessionId: 'session-1',
       reason: 'association',
     })
-    registry.emit('codex.turn.started', { terminalId: 'term-1', at: 1_100 })
+    registry.emit('codex.turn.started', { terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
 
     expect(tracker.getActivity('term-1')).toMatchObject({
       phase: 'busy',
       acceptedStartAt: 1_100,
     })
 
-    registry.emit('codex.turn.completed', { terminalId: 'term-1', at: 1_200 })
+    registry.emit('codex.turn.completed', {
+      terminalId: 'term-1',
+      threadId: 'session-1',
+      turnId: 'turn-1',
+      status: 'completed',
+      at: 1_200,
+    })
 
     expect(tracker.getActivity('term-1')).toMatchObject({
       phase: 'idle',

@@ -60,16 +60,19 @@ describe('CodexActivityTracker turn-completion snapshot', () => {
     const completions: CodexTurnCompleteEvent[] = []
     tracker.on('turn.complete', (e: CodexTurnCompleteEvent) => completions.push(e))
 
+    // kata codex-turn-thread-scope: app-server turn events now carry the bound
+    // thread's required `threadId`; only the event-construction INPUTS change
+    // to the new required shape. The pinned assertions below are untouched.
     // term-1: two app-server-delimited turns.
     tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', at: 1000 })
-    tracker.onTurnStarted({ terminalId: 'term-1', at: 1100 })
-    tracker.onTurnCompleted({ terminalId: 'term-1', at: 1200 })
-    tracker.onTurnStarted({ terminalId: 'term-1', at: 2100 })
-    tracker.onTurnCompleted({ terminalId: 'term-1', at: 2200 })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', at: 1100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 1200 })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', at: 2100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 2200 })
     // term-2: one turn.
     tracker.bindTerminal({ terminalId: 'term-2', sessionId: 'session-2', reason: 'association', at: 1000 })
-    tracker.onTurnStarted({ terminalId: 'term-2', at: 3100 })
-    tracker.onTurnCompleted({ terminalId: 'term-2', at: 3200 })
+    tracker.onTurnStarted({ terminalId: 'term-2', threadId: 'session-2', at: 3100 })
+    tracker.onTurnCompleted({ terminalId: 'term-2', threadId: 'session-2', at: 3200 })
 
     expect(completions).toEqual([
       { terminalId: 'term-1', sessionId: 'session-1', at: 1200, completionSeq: 1 },

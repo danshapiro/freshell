@@ -1023,7 +1023,7 @@ describe('CodexActivityTracker', () => {
       const events = collectCompletions(tracker)
       tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
 
-      tracker.onTurnStarted({ terminalId: 'term-1', at: 1_100 })
+      tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', at: 1_100 })
 
       expect(tracker.getActivity('term-1')).toMatchObject({
         phase: 'busy',
@@ -1032,7 +1032,7 @@ describe('CodexActivityTracker', () => {
       })
       expect(tracker.isPromptBlocked('term-1')).toBe(true)
 
-      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+      tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 1_200 })
 
       expect(tracker.getActivity('term-1')).toMatchObject({
         phase: 'idle',
@@ -1048,8 +1048,8 @@ describe('CodexActivityTracker', () => {
       const events = collectCompletions(tracker)
       tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
 
-      tracker.onTurnStarted({ terminalId: 'term-1', at: 1_100 })
-      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+      tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', at: 1_100 })
+      tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 1_200 })
       tracker.noteOutput({ terminalId: 'term-1', data: '\x07', at: 1_250 })
       tracker.reconcileProjects(createProjects(createSession('session-1', {
         latestTaskStartedAt: 1_100,
@@ -1066,7 +1066,7 @@ describe('CodexActivityTracker', () => {
       tracker.bindTerminal({ terminalId: 'term-1', sessionId: 'session-1', reason: 'association', session: createSession('session-1'), at: 1_000 })
       tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
 
-      tracker.onTurnCompleted({ terminalId: 'term-1', at: 1_200 })
+      tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 1_200 })
 
       expect(tracker.getActivity('term-1')).toMatchObject({
         phase: 'idle',
@@ -1140,5 +1140,146 @@ describe('CodexActivityTracker', () => {
 
       expect(events).toEqual([{ terminalId: 'term-1', sessionId: 'session-1', at: 1_500, completionSeq: 1 }])
     })
+  })
+})
+
+describe('thread-scoped app-server turn events (kata codex-turn-thread-scope)', () => {
+  it('ignores a sub-agent thread completion mid-parent-turn (spike scenario D)', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'thread-parent',
+      reason: 'association',
+      session: createSession('thread-parent'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'thread-parent', turnId: 'turn-parent', at: 1_100 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+
+    // Sub-agent child thread completes while the parent turn is running.
+    tracker.onTurnCompleted({
+      terminalId: 'term-1',
+      threadId: 'thread-child',
+      turnId: 'turn-child',
+      status: 'completed',
+      at: 1_200,
+    })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+    expect(completions).toEqual([])
+
+    // The parent's real completion still rings exactly once.
+    tracker.onTurnCompleted({
+      terminalId: 'term-1',
+      threadId: 'thread-parent',
+      turnId: 'turn-parent',
+      status: 'completed',
+      at: 1_300,
+    })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([{ terminalId: 'term-1', sessionId: 'thread-parent', at: 1_300, completionSeq: 1 }])
+  })
+
+  it('ignores a foreign thread turn start', () => {
+    const tracker = new CodexActivityTracker()
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'thread-parent',
+      reason: 'association',
+      session: createSession('thread-parent'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'thread-child', turnId: 'turn-c', at: 1_100 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+  })
+
+  it('interrupted status clears busy without recording a completion', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'interrupted', at: 1_200 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([])
+  })
+
+  it('failed status clears busy without recording a completion', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'failed', at: 1_200 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([])
+  })
+
+  it('inProgress status is a strict no-op', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'inProgress', at: 1_200 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+    expect(completions).toEqual([])
+  })
+
+  it('absent status still records a completion (older protocol forms)', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_200 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toHaveLength(1)
+  })
+
+  it('ignores a stale completion for a previous turn id', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', at: 1_100 })
+    // Late echo for an OLDER turn while turn-2 runs: no-op by construction.
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'completed', at: 1_150 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+    expect(completions).toEqual([])
+    // turn-2's real completion still rings.
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', status: 'completed', at: 1_300 })
+    expect(completions).toHaveLength(1)
   })
 })
