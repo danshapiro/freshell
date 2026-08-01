@@ -1283,3 +1283,64 @@ describe('thread-scoped app-server turn events (kata codex-turn-thread-scope)', 
     expect(completions).toHaveLength(1)
   })
 })
+
+describe('reconcile turn_aborted de-chime (kata codex-turn-thread-scope)', () => {
+  it('turn_aborted clears busy without recording a completion', () => {
+    // SEMANTIC CHANGE: shared/ws-protocol.ts terminal.idle is "never emitted
+    // after crash/interrupt/exit" -- an Esc-interrupt (turn_aborted in the
+    // rollout JSONL) must return the pane to idle silently.
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })),
+      1_200,
+    )
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_150,
+        latestTurnAbortedAt: 1_180,
+      })),
+      1_300,
+    )
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([])
+  })
+
+  it('a task_complete at or after an abort still records a completion', () => {
+    // Tie-break: abort suppresses the chime only when STRICTLY newest.
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })),
+      1_200,
+    )
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_150,
+        latestTaskCompletedAt: 1_180,
+        latestTurnAbortedAt: 1_180,
+      })),
+      1_300,
+    )
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toHaveLength(1)
+  })
+})

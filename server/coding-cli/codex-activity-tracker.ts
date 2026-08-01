@@ -303,6 +303,14 @@ export class CodexActivityTracker extends EventEmitter {
       const nextCompletedAt = session.codexTaskEvents?.latestTaskCompletedAt
       const nextTurnAbortedAt = session.codexTaskEvents?.latestTurnAbortedAt
       const clearedAt = maxDefined(nextCompletedAt, nextTurnAbortedAt)
+      // The newest terminating event decides the clear's shape: an abort
+      // (Esc-interrupt / turn_aborted) still ends the turn but must not ring
+      // (shared/ws-protocol.ts terminal.idle: "never emitted after
+      // crash/interrupt/exit"). Ties go to task_complete: a real completion
+      // at the same instant still rings. Mirror of the Rust tracker's
+      // clear_is_abort (crates/freshell-activity/src/codex.rs).
+      const clearIsAbort = nextTurnAbortedAt !== undefined
+        && (nextCompletedAt === undefined || nextTurnAbortedAt > nextCompletedAt)
       state.lastSeenSessionLastActivityAt = maxDefined(state.lastSeenSessionLastActivityAt, session.lastActivityAt)
 
       if (nextStartedAt !== undefined) {
@@ -358,7 +366,7 @@ export class CodexActivityTracker extends EventEmitter {
         && state.pendingSubmitAt !== undefined
         && clearedAt >= state.pendingSubmitAt
       ) {
-        this.transitionPendingAfterTurnClear(state, at)
+        this.transitionPendingAfterTurnClear(state, at, !clearIsAbort)
       }
 
       if (
@@ -367,7 +375,7 @@ export class CodexActivityTracker extends EventEmitter {
         && clearedAt >= state.acceptedStartAt
         && (state.phase === 'busy' || state.phase === 'unknown')
       ) {
-        this.transitionAfterTurnClear(state, at)
+        this.transitionAfterTurnClear(state, at, !clearIsAbort)
       }
 
       this.commitState(state, previous)
