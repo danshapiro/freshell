@@ -46,7 +46,7 @@ use freshell_activity::TrackerEffect;
 use freshell_protocol::{
     AgentProvider, AmplifierActivityRecord, AmplifierActivityUpdated, ClaudeActivityRecord,
     ClaudeActivityUpdated, CodexActivityRecord, CodexActivityUpdated, ServerMessage, TerminalIdle,
-    TerminalTurnComplete, TurnCompletionSnapshot,
+    TerminalIdleReason, TerminalTurnComplete, TurnCompletionSnapshot,
 };
 use freshell_terminal::ActivityEvent;
 
@@ -721,33 +721,65 @@ impl ActivityHub {
                 };
                 self.emit(frames);
             }
-            ActivityEvent::Exit { terminal_id, .. } => {
+            ActivityEvent::Exit {
+                terminal_id,
+                at,
+                spontaneous,
+            } => {
                 let frames = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
-                    let Some(mode) = inner.modes.remove(&terminal_id) else {
-                        return;
-                    };
-                    inner.idle.note_exit(&terminal_id);
-                    inner.lanes.remove(&terminal_id);
-                    inner.lane_retries.remove(&terminal_id);
-                    inner.codex_lanes.remove(&terminal_id);
-                    match mode.as_str() {
-                        "claude" => {
-                            let effects = inner.claude.note_exit(&terminal_id);
-                            claude_frames(&mut inner.idle, effects)
-                        }
-                        "codex" => {
-                            let effects = inner.codex.note_exit(&terminal_id);
-                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
-                            frames
-                        }
-                        "amplifier" => {
-                            let effects = inner.amplifier.note_exit(&terminal_id);
-                            let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
-                            frames
-                        }
-                        _ => Vec::new(),
+                    // Read engagement BEFORE any teardown: `idle.note_exit` deletes the
+                    // per-terminal gate state and `modes.remove` would early-return.
+                    // Task 7 extends this read with
+                    // `|| inner.codex.has_pending_approvals(&terminal_id)` (a pane
+                    // blocked on an approval whose process dies must ring even after
+                    // its 2s boundary already rang).
+                    let ring_death_bell = spontaneous && inner.idle.is_engaged(&terminal_id);
+                    let mut frames = Vec::new();
+                    if ring_death_bell {
+                        // Spontaneous death while engaged: same frame, same reason —
+                        // no wire change. reason MUST be Grace: the client zod enum
+                        // (shared/ws-protocol.ts:210-215) and the Rust enum
+                        // (freshell-protocol server_messages.rs:397-402) allow ONLY
+                        // grace|queue-empty — a novel reason is silently dropped by
+                        // the Node schema and unrepresentable here. `at` is the fresh
+                        // exit timestamp (client dedupe is per-terminal monotonic
+                        // `at`). Immediate (no grace): a dead process emits nothing
+                        // further, so nothing could ever cancel it. Exactly once per
+                        // terminal: the modes.remove below guarantees the teardown
+                        // runs once, and a later shutdown sweep of a retained exited
+                        // row arrives with spontaneous=false.
+                        frames.push(ServerMessage::TerminalIdle(TerminalIdle {
+                            terminal_id: terminal_id.clone(),
+                            at,
+                            reason: TerminalIdleReason::Grace,
+                        }));
                     }
+                    if let Some(mode) = inner.modes.remove(&terminal_id) {
+                        inner.idle.note_exit(&terminal_id);
+                        inner.lanes.remove(&terminal_id);
+                        inner.lane_retries.remove(&terminal_id);
+                        inner.codex_lanes.remove(&terminal_id);
+                        let tracker_frames = match mode.as_str() {
+                            "claude" => {
+                                let effects = inner.claude.note_exit(&terminal_id);
+                                claude_frames(&mut inner.idle, effects)
+                            }
+                            "codex" => {
+                                let effects = inner.codex.note_exit(&terminal_id);
+                                let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                                frames
+                            }
+                            "amplifier" => {
+                                let effects = inner.amplifier.note_exit(&terminal_id);
+                                let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
+                                frames
+                            }
+                            _ => Vec::new(),
+                        };
+                        frames.extend(tracker_frames);
+                    }
+                    frames
                 };
                 self.emit(frames);
             }
@@ -1603,6 +1635,291 @@ mod tests {
         assert_eq!(removed["remove"][0], "t1");
         let (records, _) = hub.codex_list();
         assert!(records.is_empty());
+    }
+
+    /// Decision 3 death bell: a spontaneous exit (the process died on its
+    /// own) while ENGAGED (confirmed busy) rings exactly one terminal.idle.
+    /// This test doubles as the audit-A17 ordering pin: if the hub read
+    /// engagement AFTER `idle.note_exit` (which deletes the per-terminal
+    /// state), the read would always be false and no frame would arrive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spontaneous_exit_while_busy_rings_terminal_idle_once() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-1".into()),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Drive to CONFIRMED busy via the proxy turn lane.
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        // The process dies mid-turn.
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("terminal.idle death bell for a spontaneous exit while busy");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one terminal.idle for the death, never a duplicate"
+        );
+    }
+
+    /// Decision 3: a freshell-initiated kill (api / idle reaper / shutdown —
+    /// spontaneous=false) stays silent even mid-turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn freshell_initiated_kill_while_busy_stays_silent() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-1".into()),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: false,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a requested exit must never ring the death bell"
+        );
+    }
+
+    /// Decision 3: exit while idle (no engagement) is silent — a human
+    /// closing an idle pane is not an attention event.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spontaneous_exit_while_idle_stays_silent() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a spontaneous exit while idle must stay silent"
+        );
+    }
+
+    /// Decision 3 (audit A8): queue evidence does NOT suppress the death
+    /// bell — a dead process never runs its queued submit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_submit_does_not_suppress_the_death_bell() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-1".into()),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        // A submit queued while busy (would auto-run at the turn clear —
+        // but the process dies first, so it never will).
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("queue evidence must not suppress the death bell");
+        assert_eq!(idle["terminalId"], "t1");
+    }
+
+    /// Decision 3, claude tracker: same death bell for a claude-mode
+    /// terminal driven busy via the claude input lane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_spontaneous_exit_while_busy_rings() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "claude.activity.updated", 2_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("terminal.idle death bell for a claude spontaneous exit while busy");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one terminal.idle for the death"
+        );
+    }
+
+    /// Audit A6 red test: `/quit` typed into an IDLE codex pane. The Enter
+    /// that executes the slash command is indistinguishable from a prompt
+    /// submit in the input lane, so the tracker goes Idle→Pending — and the
+    /// pty then exits. Input-only pending must NOT count as engagement:
+    /// ringing here would bell the canonical human quit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slash_command_quit_from_an_idle_pane_does_not_ring() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // The lone-CR "/quit" Enter: the input lane promotes Idle→Pending.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 2_000, |v| {
+            v["upsert"][0]["phase"] == "pending"
+        })
+        .await
+        .expect("pending upsert");
+
+        // The process exits on its own — exactly what /quit looks like.
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a human /quit from an idle pane must never ring the death bell"
+        );
     }
 
     /// Gemini/Kimi terminals stay status-inert (TERM-16): no activity frames.

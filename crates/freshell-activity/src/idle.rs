@@ -143,6 +143,20 @@ impl IdleGate {
         self.states.remove(terminal_id);
     }
 
+    /// Engagement for the DEATH BELL (decision 3): true only for a CONFIRMED
+    /// busy phase or an armed grace window. The codex input-only Pending
+    /// submit gate is excluded — the Enter that executes a human /quit//exit
+    /// is indistinguishable from a prompt submit in the input lane
+    /// (signal.rs:36-38), so ringing on pending would bell the canonical
+    /// human quit. Read by the hub's exit arm BEFORE `note_exit` drops the
+    /// state: a spontaneous process death while engaged rings the bell.
+    pub fn is_engaged(&self, terminal_id: &str) -> bool {
+        self.states
+            .get(terminal_id)
+            .map(|s| (s.busy && !s.pending) || s.deadline.is_some())
+            .unwrap_or(false)
+    }
+
     /// Emit every window whose deadline has lapsed (once each). A terminal
     /// that re-entered busy never emits (defensive second gate).
     pub fn expire(&mut self, at: i64) -> Vec<IdleEmission> {
@@ -398,6 +412,33 @@ mod tests {
             gate.expire(200 + IDLE_GRACE_MS)[0].reason,
             TerminalIdleReason::Grace
         );
+    }
+
+    #[test]
+    fn is_engaged_reflects_confirmed_busy_and_armed_deadlines_but_never_input_pending() {
+        let mut gate = IdleGate::with_grace_ms(2_000);
+        assert!(!gate.is_engaged("t1"), "unknown terminal is not engaged");
+        gate.note_phase("t1", IdleGatePhase::Pending);
+        assert!(
+            !gate.is_engaged("t1"),
+            "input-only pending is NOT death-bell engagement: the Enter that \
+             executes /quit looks like a prompt submit (signal.rs:36-38) and \
+             must not ring when the pty then exits (decision 3, audit A6)"
+        );
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        assert!(gate.is_engaged("t1"), "confirmed busy is engaged");
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        assert!(
+            !gate.is_engaged("t1"),
+            "idle with no pending window is not engaged"
+        );
+        gate.note_turn_boundary("t1", 10_000); // arms deadline
+        assert!(
+            gate.is_engaged("t1"),
+            "an armed grace window is engaged (a pending bell must survive death)"
+        );
+        gate.expire(20_000);
+        assert!(!gate.is_engaged("t1"), "after emission nothing is engaged");
     }
 
     #[test]
