@@ -292,6 +292,7 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
     let mut latest_task_started_at: Option<i64> = None;
     let mut latest_task_completed_at: Option<i64> = None;
     let mut latest_turn_aborted_at: Option<i64> = None;
+    let mut latest_turn_aborted_reason: Option<String> = None;
 
     for line in &lines {
         let obj: Value = match serde_json::from_str(line) {
@@ -447,7 +448,22 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
                     latest_task_completed_at = max_timestamp(latest_task_completed_at, timestamp_ms)
                 }
                 Some("turn_aborted") => {
-                    latest_turn_aborted_at = max_timestamp(latest_turn_aborted_at, timestamp_ms)
+                    // Newest-wins PAIRING: the reason always corresponds to
+                    // the winning `latest_turn_aborted_at`, and is None when
+                    // that abort carried no reason (legacy lines).
+                    let beats = match (latest_turn_aborted_at, timestamp_ms) {
+                        (_, None) => false,
+                        (None, Some(_)) => true,
+                        (Some(seen), Some(at)) => at > seen,
+                    };
+                    if beats {
+                        latest_turn_aborted_at = timestamp_ms;
+                        latest_turn_aborted_reason = obj
+                            .get("payload")
+                            .and_then(|p| p.get("reason"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
                 }
                 _ => {}
             }
@@ -474,6 +490,7 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
             latest_task_started_at,
             latest_task_completed_at,
             latest_turn_aborted_at,
+            latest_turn_aborted_reason,
         })
     } else {
         None

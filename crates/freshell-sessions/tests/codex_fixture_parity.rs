@@ -40,10 +40,42 @@ fn task_events_stream_matches_reference() {
             latest_task_started_at: Some(1_772_323_205_000),
             latest_task_completed_at: Some(1_772_323_204_000),
             latest_turn_aborted_at: Some(1_772_323_206_000),
+            latest_turn_aborted_reason: Some("Sanitized abort".to_string()),
         }),
         ..Default::default()
     };
     assert_eq!(meta, expected);
+}
+
+#[test]
+fn turn_aborted_reason_pairs_with_the_newest_abort() {
+    // Newest-wins PAIRING: the emitted reason belongs to the winning
+    // `latest_turn_aborted_at`; a reason-less legacy line yields None.
+    let reasoned = concat!(
+        r#"{"timestamp":"2026-03-01T00:00:01.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"a","reason":"replaced"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-03-01T00:00:02.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"b","reason":"interrupted"}}"#,
+    );
+    let events = parse_codex_session_content(reasoned)
+        .codex_task_events
+        .expect("task events present");
+    assert_eq!(events.latest_turn_aborted_at, Some(1_772_323_202_000));
+    assert_eq!(
+        events.latest_turn_aborted_reason,
+        Some("interrupted".to_string())
+    );
+
+    // A NEWER reason-less abort must not inherit the older abort's reason.
+    let legacy_newest = concat!(
+        r#"{"timestamp":"2026-03-01T00:00:01.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"a","reason":"interrupted"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-03-01T00:00:02.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"b"}}"#,
+    );
+    let events = parse_codex_session_content(legacy_newest)
+        .codex_task_events
+        .expect("task events present");
+    assert_eq!(events.latest_turn_aborted_at, Some(1_772_323_202_000));
+    assert_eq!(events.latest_turn_aborted_reason, None);
 }
 
 #[test]

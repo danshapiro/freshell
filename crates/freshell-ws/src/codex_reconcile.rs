@@ -125,14 +125,23 @@ pub(crate) fn fold_task_events(lines: &[String]) -> CodexTaskEvents {
             continue;
         }
         let ts = value.get("timestamp").and_then(parse_timestamp_ms);
-        let slot = match value
-            .get("payload")
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str())
-        {
+        let payload = value.get("payload");
+        let slot = match payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) {
             Some("task_started") => &mut events.latest_task_started_at,
             Some("task_complete") => &mut events.latest_task_completed_at,
-            Some("turn_aborted") => &mut events.latest_turn_aborted_at,
+            Some("turn_aborted") => {
+                // Newest-wins PAIRING: the reason always corresponds to the
+                // winning `latest_turn_aborted_at`, and is None when that
+                // abort carried no reason (legacy lines).
+                if timestamp_beats(events.latest_turn_aborted_at, ts) {
+                    events.latest_turn_aborted_at = ts;
+                    events.latest_turn_aborted_reason = payload
+                        .and_then(|p| p.get("reason"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                continue;
+            }
             _ => continue,
         };
         *slot = match (*slot, ts) {
@@ -142,6 +151,17 @@ pub(crate) fn fold_task_events(lines: &[String]) -> CodexTaskEvents {
         };
     }
     events
+}
+
+/// True when `candidate` becomes the new max over `current` (the fold's
+/// max-assign idiom, expressed as a predicate so paired fields can move
+/// together). A timestamp-less candidate never wins; ties keep the current.
+fn timestamp_beats(current: Option<i64>, candidate: Option<i64>) -> bool {
+    match (current, candidate) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(current), Some(candidate)) => candidate > current,
+    }
 }
 
 /// Resume-time rollout locator: find the rollout owned by `session_id` under
@@ -240,6 +260,41 @@ mod tests {
         ];
         let events = fold_task_events(&lines);
         assert_eq!(events.latest_turn_aborted_at, Some(1_753_430_400_000));
+        assert_eq!(
+            events.latest_turn_aborted_reason, None,
+            "a reason-less legacy line yields None"
+        );
+    }
+
+    #[test]
+    fn fold_pairs_the_abort_reason_with_the_newest_abort_timestamp() {
+        // Newest-wins pairing: the reason belongs to the WINNING abort, even
+        // when an older reasoned abort arrives later in the batch.
+        let lines = vec![
+            r#"{"timestamp":"2026-07-25T08:00:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"x","reason":"interrupted"}}"#
+                .to_string(),
+            r#"{"timestamp":"2026-07-25T07:00:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"w","reason":"replaced"}}"#
+                .to_string(),
+        ];
+        let events = fold_task_events(&lines);
+        assert_eq!(
+            events.latest_turn_aborted_reason,
+            Some("interrupted".to_string())
+        );
+    }
+
+    #[test]
+    fn fold_newer_reasonless_abort_clears_a_stale_reason() {
+        // The pairing invariant also holds in reverse: a NEWER reason-less
+        // abort must not inherit the older abort's reason.
+        let lines = vec![
+            r#"{"timestamp":"2026-07-25T07:00:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"w","reason":"interrupted"}}"#
+                .to_string(),
+            r#"{"timestamp":"2026-07-25T08:00:00.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"x"}}"#
+                .to_string(),
+        ];
+        let events = fold_task_events(&lines);
+        assert_eq!(events.latest_turn_aborted_reason, None);
     }
 
     #[test]

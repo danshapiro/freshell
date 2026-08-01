@@ -88,6 +88,9 @@ pub struct CodexTaskEvents {
     pub latest_task_started_at: Option<i64>,
     pub latest_task_completed_at: Option<i64>,
     pub latest_turn_aborted_at: Option<i64>,
+    /// Reason string paired with `latest_turn_aborted_at` (e.g. "interrupted").
+    /// None on legacy rollout lines that carry no reason.
+    pub latest_turn_aborted_reason: Option<String>,
 }
 
 impl CodexTaskEvents {
@@ -342,10 +345,12 @@ impl CodexActivityTracker {
             events.latest_turn_aborted_at,
         );
         // The newest terminating event decides the clear's shape: an abort
-        // (Esc-interrupt / `turn_aborted`) still ends the turn but must not
-        // ring (shared/ws-protocol.ts:199-208 -- terminal.idle is "never
-        // emitted after crash/interrupt/exit"). Ties go to task_complete: a
-        // real completion at the same instant still rings.
+        // (Esc-interrupt / `turn_aborted`) still ends the turn, but only a
+        // HUMAN-attributed abort (reason `interrupted`/`replaced`, or a
+        // reason-less legacy line) stays silent -- the human is present.
+        // Any OTHER present reason is codex stopping on its own, which DOES
+        // record (rings terminal.idle). Ties go to task_complete: a real
+        // completion at the same instant still rings.
         let clear_is_abort = match (
             events.latest_task_completed_at,
             events.latest_turn_aborted_at,
@@ -354,6 +359,8 @@ impl CodexActivityTracker {
             (None, Some(_)) => true,
             _ => false,
         };
+        let record =
+            !clear_is_abort || !abort_reason_is_human(events.latest_turn_aborted_reason.as_deref());
 
         // Promote on a NEW unresolved start.
         if let Some(started_at) = events.latest_task_started_at {
@@ -405,7 +412,7 @@ impl CodexActivityTracker {
                         at,
                         &mut self.ledger,
                         &mut completions,
-                        !clear_is_abort,
+                        record,
                     );
                     // CE1: swallow the PTY BEL echo of this reconciled turn end
                     // (armed regardless of whether the fold arrived as one
@@ -424,7 +431,7 @@ impl CodexActivityTracker {
                         at,
                         &mut self.ledger,
                         &mut completions,
-                        !clear_is_abort,
+                        record,
                     );
                     state.swallow_next_bel = true;
                     // S5.a: and the proxy echo of the same physical turn.
@@ -833,6 +840,13 @@ fn has_pending_output_liveness(state: &TerminalActivity, at: i64) -> bool {
     }
 }
 
+/// Human-attributed abort reasons stay silent. A MISSING reason is treated
+/// as human/uncertain (legacy rollouts omit it; the real-world corpus shows
+/// 'interrupted' is the only observed value; uncertainty never rings).
+fn abort_reason_is_human(reason: Option<&str>) -> bool {
+    matches!(reason, None | Some("interrupted") | Some("replaced"))
+}
+
 fn has_queued_submit(state: &TerminalActivity) -> bool {
     match state.queued_submit_at {
         Some(queued) => state
@@ -1206,6 +1220,14 @@ mod tests {
             ..Default::default()
         }
     }
+    fn aborted(at: i64, reason: Option<&str>) -> CodexTaskEvents {
+        CodexTaskEvents {
+            latest_task_started_at: Some(at - 1_000),
+            latest_task_completed_at: None,
+            latest_turn_aborted_at: Some(at),
+            latest_turn_aborted_reason: reason.map(str::to_string),
+        }
+    }
 
     #[test]
     fn reconcile_seeds_busy_for_an_unresolved_rollout() {
@@ -1226,6 +1248,7 @@ mod tests {
             latest_task_started_at: Some(100),
             latest_task_completed_at: Some(150),
             latest_turn_aborted_at: None,
+            latest_turn_aborted_reason: None,
         };
         let effects = tracker.reconcile_rollout("t1", &events, 200);
         assert!(effects.is_empty());
@@ -1255,6 +1278,10 @@ mod tests {
         // as "never emitted after crash/interrupt/exit" -- an Esc-interrupt
         // (`turn_aborted`) must return the pane to idle WITHOUT recording a
         // bell-worthy completion.
+        // REFINED (attention-bell plan, Task 3): this fixture carries NO
+        // abort reason, which stays silent (uncertainty never rings). Aborts
+        // with a non-human reason DO record -- see the `reconcile_abort_*`
+        // tests below.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.reconcile_rollout("t1", &started(100), 200);
@@ -1268,6 +1295,47 @@ mod tests {
             completions(&effects).is_empty(),
             "turn_aborted must not ring the bell"
         );
+    }
+
+    /// Human-requested abort (Esc) — silent, unchanged behavior.
+    #[test]
+    fn reconcile_abort_with_interrupted_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, Some("interrupted")), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// 'replaced' = human submitted new input — silent.
+    #[test]
+    fn reconcile_abort_with_replaced_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, Some("replaced")), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// Missing reason = legacy rollout line / uncertainty — no heuristic bells.
+    #[test]
+    fn reconcile_abort_without_reason_clears_without_completing() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects = tracker.reconcile_rollout("t1", &aborted(5_000, None), 5_000);
+        assert_eq!(completions(&effects).len(), 0);
+    }
+
+    /// Any OTHER present reason is not human-attributed — it records (rings).
+    #[test]
+    fn reconcile_abort_with_unknown_reason_records_a_completion() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("sess-1"), 1_000);
+        tracker.reconcile_rollout("t1", &started(2_000), 2_000);
+        let effects =
+            tracker.reconcile_rollout("t1", &aborted(5_000, Some("token_budget_exceeded")), 5_000);
+        assert_eq!(completions(&effects).len(), 1);
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub struct CodexTaskEventSnapshot {
     pub latest_task_started_at: Option<i64>,
     pub latest_task_completed_at: Option<i64>,
     pub latest_turn_aborted_at: Option<i64>,
+    /// Reason string paired with `latest_turn_aborted_at` (e.g. "interrupted").
+    /// None on legacy rollout lines that carry no reason. Node mirror:
+    /// `latestTurnAbortedReason` (Task 10 of the attention-bell plan).
+    pub latest_turn_aborted_reason: Option<String>,
 }
 
 impl CodexTaskEventSnapshot {
