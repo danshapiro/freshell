@@ -195,6 +195,7 @@ mod tests {
     use freshell_codex::remote_proxy_side_effects::{
         CandidateSource, CandidateThread, RemoteProxyCandidate,
     };
+    use freshell_terminal::ActivityEvent;
     use std::sync::Arc as StdArc;
 
     /// WsState test-construction, copied from `codex_association.rs`'s
@@ -309,6 +310,185 @@ mod tests {
             cwd: Some("/tmp/x".to_string()),
             event,
         }
+    }
+
+    /// kata codex-turn-thread-scope: a hub-bearing state for observing turn
+    /// routing (test_state() deliberately sets `activity: None`), plus the
+    /// hub's broadcast receiver.
+    fn test_state_with_hub() -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let mut state = test_state();
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        state.activity = Some(crate::activity::ActivityHub::new(StdArc::new(tx), None));
+        (state, rx)
+    }
+
+    /// A TurnEventParams whose status sits NESTED at `params.turn.status`
+    /// exactly like the real app-server's small-frame form -- proves the
+    /// router reads it via `freshell_codex::turn_status`, not a naive
+    /// `params.get("status")`.
+    fn turn_params(
+        thread_id: &str,
+        turn_id: &str,
+        nested_status: Option<&str>,
+    ) -> freshell_codex::remote_proxy::TurnEventParams {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "threadId".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        params.insert(
+            "turnId".to_string(),
+            serde_json::Value::String(turn_id.to_string()),
+        );
+        if let Some(status) = nested_status {
+            params.insert("turn".to_string(), serde_json::json!({ "status": status }));
+        }
+        freshell_codex::remote_proxy::TurnEventParams {
+            thread_id: thread_id.to_string(),
+            turn_id: Some(turn_id.to_string()),
+            params,
+        }
+    }
+
+    /// Local copy of the activity.rs test harness's frame matcher (that one
+    /// is `#[cfg(test)]`-private to its module).
+    async fn next_frame_matching(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        wanted: &str,
+        timeout_ms: u64,
+        pred: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value = serde_json::from_str(&frame).ok()?;
+                    if value["type"] == wanted && pred(&value) {
+                        return Some(value);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_events_forward_thread_turn_and_nested_status_to_the_hub() {
+        let (state, mut rx) = test_state_with_hub();
+        let hub = state.activity.clone().expect("hub");
+        // Track + bind the terminal the way a resume-create does.
+        (hub.registry_observer())(ActivityEvent::Created {
+            terminal_id: "term-t".into(),
+            mode: "codex".into(),
+            resume_session_id: Some("thread-parent".into()),
+            at: 1,
+        });
+
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-t",
+                RemoteProxyEvent::TurnStarted(turn_params("thread-parent", "turn-1", None)),
+            ),
+        )
+        .await;
+
+        // Foreign sub-agent completion: must not ring. The bounded no-ring
+        // check sits BETWEEN the foreign and bound completions -- without it,
+        // a regressed thread guard would ring HERE and the trailing
+        // "exactly one" tail could still pass (the bound completion would
+        // then hit the Idle arm and no-op, leaving one frame total).
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-t",
+                RemoteProxyEvent::TurnCompleted(turn_params(
+                    "thread-child",
+                    "turn-c",
+                    Some("completed"),
+                )),
+            ),
+        )
+        .await;
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "term-t"
+            }),
+        )
+        .await;
+        assert!(
+            premature.is_err(),
+            "a foreign thread completion must not ring"
+        );
+
+        // NESTED-status pin: an `inProgress` completion for the BOUND thread
+        // and the in-flight turn id must not ring. THIS event is what proves
+        // the router extracts `params.turn.status` via
+        // `freshell_codex::turn_status`: a router that forgets the extraction
+        // (or reads a naive flat `params.get("status")`) forwards `None`,
+        // which records a completion (design decision #3: absent status
+        // records) and rings here. The tracker's `inProgress` guard returns
+        // before touching state, so the pane stays Busy for the real
+        // completion below.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-t",
+                RemoteProxyEvent::TurnCompleted(turn_params(
+                    "thread-parent",
+                    "turn-1",
+                    Some("inProgress"),
+                )),
+            ),
+        )
+        .await;
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "term-t"
+            }),
+        )
+        .await;
+        assert!(
+            premature.is_err(),
+            "a nested inProgress status must be extracted and must not ring"
+        );
+
+        // Bound thread's real completion with NESTED turn.status: rings once.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-t",
+                RemoteProxyEvent::TurnCompleted(turn_params(
+                    "thread-parent",
+                    "turn-1",
+                    Some("completed"),
+                )),
+            ),
+        )
+        .await;
+
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "term-t"
+        })
+        .await
+        .expect("bound thread's completion rings");
+        assert_eq!(complete["sessionId"], "thread-parent");
+
+        // Exactly one -- the foreign and inProgress completions produced nothing.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "term-t"
+            }),
+        )
+        .await;
+        assert!(second.is_err(), "exactly one turn.complete expected");
     }
 
     #[tokio::test]

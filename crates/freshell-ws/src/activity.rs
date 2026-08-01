@@ -2912,4 +2912,64 @@ mod tests {
         .expect("resume-busy seeding via the locator-attached lane");
         assert_eq!(busy["upsert"][0]["sessionId"], "sess-1");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn foreign_thread_proxy_completion_does_not_ring() {
+        // Regression pin for spike scenario D at the hub seam: a sub-agent
+        // child thread's turn/completed mid-parent-turn must not emit
+        // terminal.turn.complete (and therefore can never arm the IdleGate).
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-parent".into()),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t"
+        })
+        .await
+        .expect("initial upsert");
+
+        hub.note_codex_proxy_turn("t", "thread-parent", Some("turn-parent"), None, false);
+        // Sub-agent child thread completes while the parent turn runs.
+        hub.note_codex_proxy_turn(
+            "t",
+            "thread-child",
+            Some("turn-child"),
+            Some("completed"),
+            true,
+        );
+
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "t"
+            }),
+        )
+        .await;
+        assert!(
+            premature.is_err(),
+            "a sub-agent thread completion must not ring"
+        );
+
+        // The parent's real completion still rings.
+        hub.note_codex_proxy_turn(
+            "t",
+            "thread-parent",
+            Some("turn-parent"),
+            Some("completed"),
+            true,
+        );
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "t"
+        })
+        .await
+        .expect("parent turn complete");
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["sessionId"], "thread-parent");
+    }
 }
