@@ -671,6 +671,13 @@ impl CodexActivityTracker {
                 return Vec::new();
             }
         }
+        // Node parity (codex-activity-tracker.ts onTurnCompleted): once the
+        // stale-id guard passes, this completion IS the in-flight turn's
+        // terminal event -- retire the id unconditionally, even when the
+        // effect below is swallowed or lands in the Idle arm. A surviving id
+        // could wrongly drop a later real completion whose turn/started was
+        // missed (proxy reconnect / fork windows).
+        state.current_proxy_turn_id = None;
         if state.swallow_next_proxy_complete {
             state.swallow_next_proxy_complete = false;
             return Vec::new();
@@ -678,9 +685,9 @@ impl CodexActivityTracker {
         // Task 7: an accepted terminal-status completion retires the turn's
         // approval pause state ONCE, BEFORE the phase match -- a turn that
         // completes during an approval pause routes through the Idle arm
-        // (the request itself demoted the phase), so arm-local clears would
-        // never run there and a late resolve of the stale approval would
-        // flip the pane Busy again.
+        // (the request itself demoted the phase, and the Idle arm never
+        // records or resumes), so a late resolve of the stale approval must
+        // not flip the pane Busy again.
         state.pending_approvals.clear();
         state.resume_busy_after_approval = false;
         // Attention-bell policy: completed AND failed are non-human stopping causes
@@ -702,7 +709,6 @@ impl CodexActivityTracker {
                 );
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
-                state.current_proxy_turn_id = None;
             }
             CodexPhase::Busy | CodexPhase::Unknown => {
                 let turn_key = state.last_proxy_started_at.or(state.pending_submit_at);
@@ -721,9 +727,30 @@ impl CodexActivityTracker {
                 }
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
-                state.current_proxy_turn_id = None;
             }
-            CodexPhase::Idle => {}
+            CodexPhase::Idle => {
+                // Mid-pause turn end / stale echo (silent claim): an approval
+                // pause demoted the phase, so the pause's turn/completed lands
+                // here -- no completion, no boundary (the approval bell
+                // already covers this attention event). But the anchors this
+                // turn planted (accepted via the mid-pause reconcile fold,
+                // pending via a pause keystroke) would otherwise survive and
+                // let the codex TUI's turn-complete BEL -- or the rollout's
+                // clear echo -- re-mint the same physical turn as a spurious
+                // TurnComplete (a second terminal.idle for one episode).
+                // Claim the turn key exactly like the Busy arm, retire the
+                // anchors, and arm both cross-lane swallows. Clearing
+                // accepted_start_at is safe for reconcile_rollout: its clear
+                // guard requires Busy|Unknown and `.map(..).unwrap_or(false)`
+                // on the anchor, and its promotion guard falls back to the
+                // is_new edge-trigger.
+                let turn_key = state.last_proxy_started_at.or(state.pending_submit_at);
+                state.accepted_start_at = None;
+                state.pending_submit_at = None;
+                claim_turn_key_if_idle(state, turn_key.or(Some(at)));
+                state.swallow_next_bel = true;
+                state.swallow_next_reconcile_clear = true;
+            }
         }
         self.effects_after_transition(terminal_id, previous, completions)
     }
@@ -747,7 +774,10 @@ impl CodexActivityTracker {
                 return Vec::new();
             }
         }
-        state.pending_approvals.insert(request_id.to_string());
+        // Hardening: only a NEWLY inserted request id arms the gate. A
+        // duplicate request frame (proxy retry / reconnect replay) for an id
+        // already pending must not re-arm -- one boundary per approval pause.
+        let newly_inserted = state.pending_approvals.insert(request_id.to_string());
         let previous = state.to_record();
         if matches!(
             state.phase,
@@ -759,10 +789,12 @@ impl CodexActivityTracker {
         state.updated_at = at;
         let next = state.to_record();
         let mut effects = changed(Some(&previous), next);
-        effects.push(TrackerEffect::AttentionBoundary {
-            terminal_id: terminal_id.to_string(),
-            at,
-        });
+        if newly_inserted {
+            effects.push(TrackerEffect::AttentionBoundary {
+                terminal_id: terminal_id.to_string(),
+                at,
+            });
+        }
         effects
     }
 
@@ -2256,6 +2288,104 @@ mod tests {
         // A late response to the stale approval must not flip the pane busy.
         let effects = tracker.note_approval_resolved("t1", "41", 6_000);
         assert!(effects.is_empty());
+    }
+
+    /// A turn that ends WHILE the approval pause holds the phase at Idle must
+    /// end silently (the approval bell already covers the attention event) --
+    /// AND its surviving anchors must not let the codex TUI's turn-complete
+    /// BEL echo re-mint the same physical turn as a spurious TurnComplete
+    /// (which would ring a second terminal.idle for one episode).
+    #[test]
+    fn mid_pause_turn_end_silences_the_bel_echo_and_clears_anchors() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        // The turn's own task_started folds mid-pause (audit A9 branch): the
+        // accepted anchor lands without flipping Busy.
+        tracker.reconcile_rollout("t1", &started(3_500), 3_500);
+        // The turn completes while the approval is still pending: the Idle
+        // arm claims silently -- no completion.
+        let done = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            5_000,
+        );
+        assert!(
+            completions(&done).is_empty(),
+            "a mid-pause turn end must not record a completion"
+        );
+        // The TUI's turn-complete BEL echo of that same physical turn.
+        let echo = tracker.note_output("t1", "\u{7}", 5_100);
+        assert!(
+            completions(&echo).is_empty(),
+            "the BEL echo of a mid-pause turn end must not re-mint the turn"
+        );
+        let state = tracker.states.get("t1").expect("state");
+        assert_eq!(state.accepted_start_at, None, "accepted anchor retired");
+        assert_eq!(state.pending_submit_at, None, "pending anchor retired");
+    }
+
+    /// Node parity: the in-flight proxy turn id is retired unconditionally
+    /// once the stale-id guard passes -- including swallowed echoes and the
+    /// Idle arm. A surviving id could wrongly drop a later real completion
+    /// whose turn/started was missed (proxy reconnect / fork windows).
+    #[test]
+    fn swallowed_and_idle_arm_proxy_echoes_retire_the_in_flight_turn_id() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        // The rollout lane ends the turn (fold the start, then its clear).
+        tracker.reconcile_rollout("t1", &started(2_500), 2_600);
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(2_500),
+            latest_task_completed_at: Some(3_000),
+            latest_turn_aborted_at: None,
+            latest_turn_aborted_reason: None,
+        };
+        tracker.reconcile_rollout("t1", &events, 3_100);
+        // First proxy echo of the same physical turn: swallowed one-shot.
+        let first = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_200,
+        );
+        assert!(completions(&first).is_empty(), "swallowed echo is silent");
+        // Second echo lands in the Idle arm: still silent.
+        let second = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_300,
+        );
+        assert!(completions(&second).is_empty(), "idle-arm echo is silent");
+        // The id of the closed turn must not survive either path.
+        assert_eq!(tracker.current_proxy_turn_id_for("t1"), None);
+    }
+
+    /// Hardening: a duplicate request frame for an id ALREADY pending must
+    /// not push a second AttentionBoundary (re-arming the gate would re-ring
+    /// the same approval pause).
+    #[test]
+    fn duplicate_approval_request_does_not_rearm_the_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let first = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })));
+        let dup = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_500);
+        assert!(
+            !dup.iter()
+                .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })),
+            "a duplicate approval request frame must not re-arm the gate"
+        );
     }
 
     /// Audit A9: the FIRST rollout fold of the turn's own task_started passes

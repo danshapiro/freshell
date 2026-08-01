@@ -3712,6 +3712,91 @@ mod tests {
         .expect("resolve restores busy after the deferred promotion");
     }
 
+    /// One bell per episode: an approval pause rings once; the turn then
+    /// completes MID-PAUSE (the approval is never resolved) and the codex
+    /// TUI's turn-complete BEL echoes on the PTY. Neither the mid-pause
+    /// turn/completed (Idle-arm silent claim) nor the BEL echo (armed
+    /// swallow) may mint a second terminal.idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_pause_turn_end_and_bel_echo_ring_exactly_once_per_episode() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout lane attached; proxy lane drives the confirmed busy.
+        let (_guard, rollout) = codex_rollout_fixture(&[]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        hub.note_codex_proxy_turn("t1", "sess-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        hub.note_codex_approval("t1", Some("sess-1"), "41", true);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("pause upsert");
+
+        // The turn's own task_started folds MID-PAUSE (audit A9): the
+        // accepted anchor lands without flipping busy.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_started", now_ms())).expect("write");
+        }
+        assert!(
+            next_frame_matching(&mut rx, "codex.activity.updated", 1_000, |v| {
+                v["upsert"][0]["phase"] == "busy"
+            })
+            .await
+            .is_none(),
+            "the mid-pause fold must not flip the pane busy"
+        );
+
+        // The ONE bell of the episode: the armed approval boundary.
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("the approval bell rings once");
+        assert_eq!(idle["terminalId"], "t1");
+
+        // The turn ends while the approval is still pending, then the TUI's
+        // turn-complete BEL echoes on the PTY.
+        hub.note_codex_proxy_turn("t1", "sess-1", Some("turn-1"), Some("completed"), true);
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+                .await
+                .is_none(),
+            "exactly ONE terminal.idle for the whole episode -- the mid-pause \
+             turn end and its BEL echo must not re-ring"
+        );
+    }
+
     /// Decision 3 / audit A10: a pane blocked on an approval whose process
     /// dies spontaneously rings — even AFTER the armed deadline already rang
     /// (pending_approvals counts as death-bell engagement).
