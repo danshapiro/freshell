@@ -20,6 +20,7 @@
 - Keep the IdleGate 2s grace untouched: `IDLE_GRACE_MS = 2_000` (`crates/freshell-activity/src/idle.rs:30`) and `TERMINAL_IDLE_GRACE_MS = 2_000` (`server/coding-cli/truly-idle-emitter.ts:1`) stay exactly as they are.
 - No client changes: `terminal.idle` remains the only bell/green edge.
 - Vitest ONLY via the coordinator: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts <paths> --run`. Raw `npx vitest` is forbidden (AGENTS.md). Broad runs (`npm run check`) go through the shared coordinator gate — wait for the gate, never kill foreign holders.
+- Worktree prerequisite (ledger A14): the worktree must have its own `node_modules` (`npm ci` — already performed during plan validation). The `freshell-ws`/`freshell-codex` Rust integration binaries spawn the server, which resolves the worktree-local `tsx`; without the install ~20 integration binaries fail with `Unable to resolve MCP dependency "tsx"`. Baseline at HEAD was verified green after install: 53/53 Rust test binaries (800 tests), 136/136 targeted vitest tests.
 - Rust targeted tests: `cargo test -p <crate>`.
 - Commit author email must be the verified `3732858+danshapiro@users.noreply.github.com`.
 - `.kata.toml`: this plan does not modify it; if any step somehow does, commit it.
@@ -28,11 +29,19 @@
 ## Design decisions locked by this plan
 
 1. **Guards live in the trackers** (`crates/freshell-activity/src/codex.rs`, `server/coding-cli/codex-activity-tracker.ts`), not in the routers — the trackers are pure, synchronous, and densely unit-tested; the routers/wiring stay dumb pass-throughs that merely stop discarding the payload.
-2. **Unbound window = ignore.** Before a terminal has a bound codex thread id (`session_id`/`sessionId` is `None`/state absent), proxy/app-server turn events are ignored entirely (no phase change, no completion). Rationale: on the managed path, candidate adoption binds identity from `thread/started` BEFORE the first `turn/started` arrives, so the window is effectively empty; when it isn't, the pending-submit and BEL lanes still cover UX, and the rollout lane reconciles after bind. This is the "simplest correct behavior" the spec asks to choose and document.
+2. **Unbound window = ignore.** Before a terminal has a bound codex thread id (`session_id`/`sessionId` is `None`/state absent), proxy/app-server turn events are ignored entirely (no phase change, no completion). Rationale (validated — load-bearing ledger A3): on the Rust managed path the proxy's identity gate HOLDS client `turn/start`/`thread/fork` frames until candidate adoption has bound the pane (`crates/freshell-codex/src/remote_proxy.rs:601-613`; release after adoption in `crates/freshell-ws/src/codex_proxy_route.rs:127-146`), so the unbound window is structurally empty there. On Node the fresh-create path binds only via rollout proof, which is skipped until the first turn completes (`server/terminal-registry.ts:2669-2672`, bind at `:2904`) — the ENTIRE first fresh turn runs pre-bind and the tracker has no state for it (state is created on bind), so "ignore" is byte-identical to today's behavior. The justification is therefore STATUS-QUO PARITY on Node, not fallback-lane coverage: the first fresh Node turn is dark today and stays dark (pre-existing, out of scope); the rollout lane reconciles from bind onward. This is the "simplest correct behavior" the spec asks to choose and document.
 3. **Status guard:** only `Some("completed")` — or an ABSENT status (older protocol forms; avoids panes hanging busy) — records a bell-worthy completion. `interrupted`/`failed` clear the busy phase without recording. `inProgress` is a strict no-op (not a turn end at all).
 4. **Turn-id dedupe:** the tracker remembers the in-flight proxy turn id (set on `turn/started`). A completion carrying a DIFFERENT turn id (both present) is a stale echo of an already-closed turn — a no-op by construction. When either id is absent, fall through to existing behavior. The existing cross-lane swallow flags (`swallow_next_bel`, `swallow_next_proxy_complete`, `swallow_next_reconcile_clear`) are KEPT unchanged — they dedupe across the disjoint clock domains (PTY BEL / rollout / proxy) that turn ids cannot reach. The five pinned swallow tests must stay green.
 5. **Abort-shaped clears claim the turn key.** When a clear does not record a completion (abort/interrupt/failed), it still writes `last_emitted_turn_key`/`lastEmittedTurnKey` so a later echo of the same physical turn cannot mint a completion.
-6. **Tie-break:** when `latest_task_completed_at == latest_turn_aborted_at`, the clear counts as a real completion (a genuine `task_complete` at the same instant still rings). Abort wins only when strictly newer.
+6. **Tie-break:** when `latest_task_completed_at == latest_turn_aborted_at`, the clear counts as a real completion (a genuine `task_complete` at the same instant still rings). Abort wins only when strictly newer. (Validated — ledger A8: rollout terminal events are one-per-turn and `task_complete` is never co-written for an interrupted turn, so ties are theoretical; the rule direction is safe.)
+7. **Rebind clears in-flight proxy-turn state (Rust only).** Fork/resume rebinds arrive from the async disk fork-watch lane with NO ordering guarantee vs proxy turn events (`crates/freshell-ws/src/codex_proxy_route.rs:88-91` explicitly defers fork rebinds to it). `bind_session` and `track_terminal`'s rebind branch must clear `current_proxy_turn_id` AND `last_proxy_started_at` whenever the bound id changes (ledger A9, falsified without this) — otherwise the child thread's first `turn/completed` is misclassified as a stale echo (stuck busy until reconcile) or collides on `last_emitted_turn_key`. Node needs nothing: `bindTerminal` builds a fresh state literal on rebind (`server/coding-cli/codex-activity-tracker.ts:139-152`). A candidate-SET thread match (accepting any owned/forked thread) was considered to close the fork window and rejected: sub-agent threads ARE forks (spike D rollout: `forked_from_id` = parent thread), so set-matching would reintroduce the exact bug this plan fixes. Residual fork-window drops (child turn events landing pre-rebind are ignored by the thread guard) are covered by the rollout-reconcile lane after rebind.
+
+### Residual risks (validated and accepted — see load-bearing ledger)
+
+- **Hard kill / crash can leave a turn with NO `turn_aborted`** in the rollout (openai/codex#12843): pre-existing gap, unchanged by this plan; the busy-deadman force-read lane self-heals. Out of scope.
+- **Id casing:** codex emits lowercase thread ids and every managed bind source takes the id verbatim from the wire or rollout `payload.id` (4/4 spike rollouts: filename UUID == `payload.id` == wire threadId). A hand-supplied UPPERCASE resume id would bind but never match the strict-equality guard — accepted; no normalization added.
+- **Detached review threads** (separate thread, no parent turn) exist in the codex protocol but are not delivered by the 0.146 TUI (`/review` is hardcoded inline, running on the parent thread). If a future codex version flips that default, strict thread-equality would leave review work invisible — revisit on codex upgrades.
+- **`turn/completed` status is a required field with vocabulary exactly `completed|interrupted|failed|inProgress`** at codex 0.146 (`thread_data.rs:246`); the absent-status fallback in decision #3 exists only for older/other protocol forms.
 
 ## File Structure
 
@@ -249,7 +258,7 @@ git commit -m "fix(activity): rollout turn_aborted clears codex phase without re
 This is the core fix (spec items A, B, C-proxy, D). The tracker signature change and the hub/router plumbing MUST land in one commit or the workspace will not compile.
 
 **Files:**
-- Modify: `crates/freshell-activity/src/codex.rs` (`TerminalActivity` ~`:109-163`, `track_terminal` initializer ~`:225-247`, `note_proxy_turn_started` ~`:523-541`, `note_proxy_turn_completed` ~`:546-579`, tests ~`:1393-1531`)
+- Modify: `crates/freshell-activity/src/codex.rs` (`TerminalActivity` ~`:109-163`, `track_terminal` initializer + rebind branch ~`:225-247`, `bind_session` ~`:278-289`, `note_proxy_turn_started` ~`:523-541`, `note_proxy_turn_completed` ~`:546-579`, tests ~`:1393-1531`)
 - Modify: `crates/freshell-ws/src/activity.rs` (`HubEvent::CodexProxyTurn` ~`:136-140`, `note_codex_proxy_turn` ~`:269-276`, dispatch arm ~`:509-525`, test `proxy_turn_events_reach_the_codex_tracker_and_emit_turn_complete` ~`:2499-2571`)
 - Modify: `crates/freshell-ws/src/codex_proxy_route.rs` (turn arms ~`:57-66`)
 
@@ -325,6 +334,33 @@ Append to the `mod tests` block in `crates/freshell-activity/src/codex.rs`:
             .note_proxy_turn_completed("t", "thread-x", Some("turn-1"), Some("completed"), 2_000)
             .is_empty());
         assert_eq!(tracker.list()[0].phase, CodexPhase::Idle);
+    }
+
+    #[test]
+    fn rebind_clears_stale_in_flight_proxy_turn_state() {
+        // Design decision #7 (load-bearing ledger A9, falsified without this):
+        // fork/resume rebinds arrive from the async disk fork-watch lane with
+        // NO ordering guarantee vs proxy turn events. The child thread's first
+        // turn/started can land BEFORE the rebind (the thread guard rightly
+        // drops it); if the parent's stale current_proxy_turn_id survived the
+        // rebind, the child's first turn/completed would be misclassified as
+        // a stale echo -- stuck busy until reconcile.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t", Some("thread-a"), 0);
+        tracker.note_proxy_turn_started("t", "thread-a", Some("turn-a1"), 1_000);
+        // Child turn starts pre-rebind: dropped by the thread guard.
+        tracker.note_proxy_turn_started("t", "thread-b", Some("turn-b1"), 1_200);
+        // Disk fork-watch lane rebinds the pane to the child thread.
+        tracker.bind_session("t", "thread-b");
+        let effects = tracker.note_proxy_turn_completed(
+            "t",
+            "thread-b",
+            Some("turn-b1"),
+            Some("completed"),
+            2_000,
+        );
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
     }
 
     // ---- Status guard ----
@@ -464,9 +500,9 @@ and initialize it in `track_terminal`'s struct literal (next to `last_proxy_star
     /// connection relays turn events for EVERY thread on it (sub-agent,
     /// review, fork threads -- spike scenario D). Only the bound thread's
     /// turns may drive this terminal; before a thread binds we stay
-    /// conservative and ignore the proxy lane entirely (candidate adoption
-    /// binds identity before the first turn on the managed path; the
-    /// pending/BEL lanes still cover the unbound window).
+    /// conservative and ignore the proxy lane entirely (the Rust identity
+    /// gate holds turn/start until adoption binds, so the window is
+    /// structurally empty on the managed path -- design decision #2).
     pub fn note_proxy_turn_started(
         &mut self,
         terminal_id: &str,
@@ -582,6 +618,21 @@ and initialize it in `track_terminal`'s struct literal (next to `last_proxy_star
 ```
 
 (Note: this replaces Task 1 Step 3f's temporary `true` with the status-derived `record`.)
+
+4d. Clear the in-flight proxy-turn state on rebind (design decision #7 — ledger A9). In `bind_session` (~`:278-289`), after the same-id no-op check, alongside the `state.session_id = Some(...)` assignment, add:
+
+```rust
+        // Design decision #7 (kata codex-turn-thread-scope): a rebind moves
+        // the pane to a DIFFERENT thread (fork/resume, delivered by the async
+        // disk fork-watch lane -- codex_proxy_route.rs:88-91). The old
+        // thread's in-flight turn id and start anchor must not survive, or
+        // the new thread's first turn/completed is misclassified as a stale
+        // echo / collides on last_emitted_turn_key.
+        state.current_proxy_turn_id = None;
+        state.last_proxy_started_at = None;
+```
+
+and add the same two lines in `track_terminal`'s rebind branch (~`:232-241`), next to its `existing.session_id = Some(...)` assignment (guarded by the same "id actually changed" condition that branch already establishes).
 
 - [ ] **Step 5: Run freshell-activity, expect the crate green but the workspace still red**
 
@@ -1562,7 +1613,7 @@ git commit -m "fix(server): reconcile turn_aborted clears codex phase without re
 No new behavior — prove the whole change set against the repo's targeted and integration suites, honoring AGENTS.md test coordination.
 
 **Files:**
-- Possibly modify (only if a pinned suite requires a deliberate semantic update): `test/server/ws-codex-turn-complete.test.ts`, `test/server/codex-activity-exact-subset.test.ts`, `test/unit/port/oracle/t2-codex-equivalence-rust.test.ts`
+- Possibly modify (only if a pinned suite requires a deliberate semantic update): `test/server/ws-codex-turn-complete.test.ts`, `test/server/codex-activity-exact-subset.test.ts`
 
 **Interfaces:**
 - Consumes: everything above. Produces: a green verification record in the commit message.
@@ -1588,13 +1639,12 @@ npm run test:vitest -- --config config/vitest/vitest.server.config.ts \
   test/unit/server/terminal-registry.codex-sidecar.test.ts \
   test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts \
   test/server/codex-activity-exact-subset.test.ts \
-  test/server/ws-codex-turn-complete.test.ts \
-  test/unit/port/oracle/t2-codex-equivalence-rust.test.ts --run
+  test/server/ws-codex-turn-complete.test.ts --run
 ```
 
 Expected: PASS. Failure protocol (be honest, never paper over):
 - `ws-codex-turn-complete.test.ts` / `codex-activity-exact-subset.test.ts` drive real registry + wiring: if a fixture emits app-server turn events without a matching bound `threadId`, that is the OLD contract — update the fixture to bind a session and carry the matching `threadId` (deliberate, with a comment citing this plan), never weaken the guard.
-- `t2-codex-equivalence-rust.test.ts` compares Node/Rust tracker behavior: both sides changed symmetrically in this plan, so a mismatch means one side's guard order diverged — fix the CODE to match the guard order documented in Task 5 Step 4b, do not fork the test.
+- `t2-codex-equivalence-rust.test.ts` is deliberately NOT in this command (load-bearing ledger A12/A14): it is silently DESELECTED under `vitest.server.config.ts` (that config's include excludes `test/unit/port/**`), and under its own `config/vitest/vitest.oracle.config.ts` it is `describe.skip` unless `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS` is set — which drives a real live codex call, off-limits for this plan. Validation proved the oracle harness is a pure WS client on the fresh-agent lane (`port/oracle/harness/t2-live-codex.ts:628-716`) that never touches the terminal-activity surfaces this plan changes, so skipping it forfeits no coverage. Do NOT add it back expecting it to run.
 
 - [ ] **Step 4: Broad repo check (coordinated)**
 
@@ -1619,7 +1669,7 @@ git commit -m "test: align codex turn integration fixtures with thread-scoped se
 | B. Thread-scope proxy lane in tracker; bound-thread guard; documented unbound-window behavior | Task 2 Steps 1+4 (`unbound_terminal_ignores_proxy_turn_events`, thread-guard tests); decision §"Design decisions" #2 |
 | C. Status-guard completions (proxy lane) — interrupted/failed clear w/o completion | Task 2 (status tests + `record` flag) |
 | C. Rollout lane: `turn_aborted` clears w/o completion; pinned test rewritten deliberately; matches ws-protocol.ts:200-203 | Task 1 (Rust), Task 6 (Node) |
-| D. turn_id matching makes duplicate/stale completions no-ops; swallow flags kept for BEL/reconcile echoes; BEL-only unmanaged path not regressed | Task 2 (`stale_completion_...`, `current_proxy_turn_id`; swallow tests kept green with `turn_id = None`), Task 5 (`currentTurnId`) |
+| D. turn_id matching makes duplicate/stale completions no-ops; swallow flags kept for BEL/reconcile echoes; BEL-only unmanaged path not regressed | Task 2 (`stale_completion_...`, `current_proxy_turn_id`; swallow tests kept green with `turn_id = None`; rebind reset per decision #7, Step 4d + `rebind_clears_stale_in_flight_proxy_turn_state`), Task 5 (`currentTurnId`; Node rebind is naturally safe — fresh state literal) |
 | E. IdleGate 2s grace untouched | Global Constraints (no idle.rs / truly-idle-emitter.ts edits anywhere in the plan) |
 | F. Node parity: registry event carries threadId/turnId/status; tracker filters by bound session id; status guard; `extractTurnCompletedStatus` path consumed via `codexTurnStatus`; reconcile abort de-chime; ws-protocol doc comments verified unchanged | Tasks 4, 5, 6 |
 | G. No client changes; no wire shape changes | Global Constraints; Task 7 Step 4 contract freeze |
