@@ -22,10 +22,12 @@
 //!   QUEUED turn: it records queue evidence and never arms mid-turn;
 //! * subagent/tool completions inside a running turn never reach this gate
 //!   (the trackers only report REAL turn boundaries);
-//! * spontaneous death (exit removal while `is_engaged`) triggers an
-//!   immediate bell emission here, but the exit-death bell itself is emitted
-//!   by the HUB directly; `is_engaged` deliberately excludes the input-only
-//!   Pending state (queued submit gate blocks terminal.idle while input flows).
+//! * spontaneous death (exit removal while `is_engaged`): the gate itself
+//!   never emits for a removed terminal. The hub reads `is_engaged` BEFORE
+//!   removal and emits the exit-death bell directly. `is_engaged` deliberately
+//!   excludes the input-only Pending state because a human `/quit`/`/exit`
+//!   Enter from an idle pane is indistinguishable from a prompt submit
+//!   (ringing there would bell the canonical human quit).
 //!
 //! Zero-polling: pure deadlines + `next_deadline()`; the hub arms a single
 //! one-shot timer. No pending windows ⇒ no timers.
