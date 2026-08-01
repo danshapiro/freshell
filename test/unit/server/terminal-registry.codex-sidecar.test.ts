@@ -2772,7 +2772,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexRecoveryBlockedError).toBe(teardownError))
     await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
     expect(planCreate).toHaveBeenCalledTimes(1)
-    expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0 })
+    // spontaneous: false = Task-11 exit discriminator, indicates requested close (recovery-final-close path)
+    expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0, spontaneous: false })
   })
 
   it('keeps unpublished candidate teardown failure retryable for final close', async () => {
@@ -3103,7 +3104,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         expect(registry.get(term.terminalId)?.codexRecoveryBlockedError?.message).toContain('failed 3 consecutive times')
       })
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
-      expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0 })
+      // spontaneous: false = Task-11 exit discriminator, indicates requested close (recovery-final-close path)
+      expect(exited).toHaveBeenCalledWith({ terminalId: term.terminalId, exitCode: 0, spontaneous: false })
 
       await new Promise((resolve) => setTimeout(resolve, 25))
       expect(planCreate).toHaveBeenCalledTimes(3)
