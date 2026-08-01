@@ -272,13 +272,14 @@ export class CodexActivityTracker extends EventEmitter {
     if (input.turnId !== undefined && state.currentTurnId !== undefined && input.turnId !== state.currentTurnId) {
       return
     }
-    // Status guard: only 'completed' (or absent -- older protocol forms)
-    // records a bell-worthy completion; interrupted/failed clear silently
-    // (shared/ws-protocol.ts terminal.idle: never after crash/interrupt).
-    const record = input.status === undefined || input.status === 'completed'
+    // Attention-bell policy: completed AND failed record (ring); interrupted is
+    // the human-requested silent clear. Mirrors Rust codex.rs record predicate.
+    const record = input.status === undefined || input.status === 'completed' || input.status === 'failed'
 
     const previous = this.toRecord(state)
-    state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    if (input.status === undefined || input.status === 'completed') {
+      state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    }
     if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
       this.transitionPendingAfterTurnClear(state, input.at, record)
     } else if (state.acceptedStartAt !== undefined) {

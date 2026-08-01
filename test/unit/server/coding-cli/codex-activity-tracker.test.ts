@@ -1211,7 +1211,7 @@ describe('thread-scoped app-server turn events (kata codex-turn-thread-scope)', 
     expect(completions).toEqual([])
   })
 
-  it('failed status clears busy without recording a completion', () => {
+  it('records a completion when the bound thread turn fails', () => {
     const tracker = new CodexActivityTracker()
     const completions: unknown[] = []
     tracker.on('turn.complete', (event) => completions.push(event))
@@ -1225,7 +1225,70 @@ describe('thread-scoped app-server turn events (kata codex-turn-thread-scope)', 
     tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
     tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'failed', at: 1_200 })
     expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
-    expect(completions).toEqual([])
+    expect(completions).toHaveLength(1)
+  })
+
+  it('failed with a queued submit behaves exactly like completed with a queued submit', () => {
+    const tracker1 = new CodexActivityTracker()
+    const completions1: unknown[] = []
+    tracker1.on('turn.complete', (event) => completions1.push(event))
+    tracker1.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker1.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker1.noteInput({ terminalId: 'term-1', data: '\r', at: 1_150 })
+    tracker1.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'completed', at: 1_200 })
+
+    const tracker2 = new CodexActivityTracker()
+    const completions2: unknown[] = []
+    tracker2.on('turn.complete', (event) => completions2.push(event))
+    tracker2.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker2.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker2.noteInput({ terminalId: 'term-1', data: '\r', at: 1_150 })
+    tracker2.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'failed', at: 1_200 })
+
+    expect(completions1).toEqual(completions2)
+  })
+
+  it('does not advance lastSeenTaskCompletedAt on interrupted or failed turns', () => {
+    const tracker = new CodexActivityTracker()
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+
+    // First, a completed turn sets the timestamp
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'completed', at: 1_200 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ lastSeenTaskCompletedAt: 1_200 })
+
+    // An interrupted turn should NOT advance the timestamp
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', at: 1_300 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', status: 'interrupted', at: 1_400 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ lastSeenTaskCompletedAt: 1_200 })
+
+    // A failed turn should NOT advance the timestamp
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-3', at: 1_500 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-3', status: 'failed', at: 1_600 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ lastSeenTaskCompletedAt: 1_200 })
+
+    // Another completed turn SHOULD advance the timestamp
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-4', at: 1_700 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-4', status: 'completed', at: 1_800 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ lastSeenTaskCompletedAt: 1_800 })
   })
 
   it('inProgress status is a strict no-op', () => {
