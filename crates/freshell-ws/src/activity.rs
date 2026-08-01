@@ -2364,9 +2364,16 @@ mod tests {
     }
 
     /// SEMANTIC CHANGE (attention-bell plan 2026-08-01): failed turns now ring.
-    /// With the predicate flipped to include "failed", a failed proxy turn
-    /// completion records a completion and arms the gate, emitting exactly one
-    /// terminal.idle via the grace window.
+    /// PROXY-lane queued-then-failed -- the hub-level mirror of the tracker
+    /// test `failed_with_queued_submit_behaves_exactly_like_completed_with_queued_submit`
+    /// (freshell-activity codex.rs): a submit queued while turn 1 is busy
+    /// auto-submits as turn 2 when turn 1 FAILS; turn 2's start lands inside
+    /// turn 1's grace window and cancels the pending emission (the queued
+    /// submit suppresses the immediate ring), so only the final drain rings:
+    /// exactly ONE terminal.idle with reason 'grace' (the proxy lane never
+    /// re-arms busy->pending, so no queue evidence accrues). BOTH completions
+    /// are 'failed': with the old record predicate (failed = silent claim) no
+    /// completion is ever minted and NO terminal.idle arrives at all.
     #[tokio::test(flavor = "multi_thread")]
     async fn codex_failed_turn_rings_and_queued_failed_drains_to_a_single_idle() {
         let (hub, mut rx) = hub();
@@ -2375,72 +2382,76 @@ mod tests {
             ActivityEvent::Created {
                 terminal_id: "t1".into(),
                 mode: "codex".into(),
-                resume_session_id: None,
+                resume_session_id: Some("thread-1".into()),
                 at: now_ms(),
             },
         );
-        // Turn 1 submitted -> Pending.
+        // Initial idle upsert (session bound at create).
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Turn 1 starts on the proxy lane -> Busy.
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("turn-1 busy upsert");
+
+        // Queue a submit while busy (goes into the tracker's submit queue).
         observer_send(
             &hub,
             ActivityEvent::Input {
                 terminal_id: "t1".into(),
-                data: "\r".into(),
+                data: "do the next thing\r".into(),
                 at: now_ms(),
             },
         );
-        // Streaming output is publicly INERT for codex (refreshes
-        // last_observed_at only; no phase promotion, no effects).
-        observer_send(
-            &hub,
-            ActivityEvent::Output {
-                terminal_id: "t1".into(),
-                data: "working on it...".into(),
-                at: now_ms(),
-            },
-        );
-        // Queued submit while Pending (goes into the tracker's submit queue;
-        // publicly silent).
-        observer_send(
-            &hub,
-            ActivityEvent::Input {
-                terminal_id: "t1".into(),
-                data: "\r".into(),
-                at: now_ms(),
-            },
-        );
-        // BEL #1: turn clear consumes the queued submit -> stays Pending;
-        // pending->pending is suppressed, so NO public Changed and NO
-        // completion (no queue evidence can reach the gate).
-        observer_send(
-            &hub,
-            ActivityEvent::Output {
-                terminal_id: "t1".into(),
-                data: "\u{07}".into(),
-                at: now_ms(),
-            },
-        );
-        // BEL #2: queue empty -> Idle + completion -> the gate arms.
-        // (With failed now recording, this mirrors the completed behavior exactly.)
-        observer_send(
-            &hub,
-            ActivityEvent::Output {
-                terminal_id: "t1".into(),
-                data: "\u{07}".into(),
-                at: now_ms(),
-            },
-        );
+
+        // Turn 1 FAILS. The flipped predicate records a completion and arms
+        // the grace window (the old predicate claimed silently: nothing in
+        // this test would ever ring).
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), Some("failed"), true);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("turn-1 failed clear upsert");
+
+        // Distinct-ms guard: proxy turn keys are last_proxy_started_at
+        // stamped with now_ms() on the hub task; a same-millisecond second
+        // start would collide with the per-turn dedupe
+        // (last_emitted_turn_key) and swallow turn 2's completion.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // The queued message auto-submits as turn 2 INSIDE turn 1's grace
+        // window: the busy re-entry cancels the pending emission -- the
+        // queued submit suppresses turn 1's immediate ring.
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-2"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("turn-2 busy upsert");
+
+        // Turn 2 also FAILS -> the queue has drained: one completion, the
+        // gate re-arms, and the lapsed grace window emits exactly one idle.
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-2"), Some("failed"), true);
         let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
             .await
-            .expect("terminal.idle after the codex queue drains");
+            .expect("terminal.idle after the queued-failed sequence drains");
         assert_eq!(
             idle["reason"], "grace",
-            "codex failed queue evidence works exactly like completed queue evidence"
+            "no busy->pending re-arm on the proxy lane => no queue evidence => grace"
         );
         assert!(
             next_frame_of_type(&mut rx, "terminal.idle", 1_000)
                 .await
                 .is_none(),
-            "exactly one emission for the codex drain"
+            "turn-1's suppressed window must not produce a second idle"
         );
     }
 
