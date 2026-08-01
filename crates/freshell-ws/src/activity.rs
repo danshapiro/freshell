@@ -1592,6 +1592,7 @@ mod tests {
             ActivityEvent::Exit {
                 terminal_id: "t1".into(),
                 at: now_ms(),
+                spontaneous: false,
             },
         );
         let removed = next_frame_matching(&mut rx, "codex.activity.updated", 2_000, |v| {
@@ -2161,6 +2162,7 @@ mod tests {
             ActivityEvent::Exit {
                 terminal_id: "t1".into(),
                 at: now_ms(),
+                spontaneous: false,
             },
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2977,6 +2979,7 @@ mod tests {
             ActivityEvent::Exit {
                 terminal_id: "t1".into(),
                 at: crate::terminal::now_ms(),
+                spontaneous: false,
             },
         );
         next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
@@ -3010,6 +3013,7 @@ mod tests {
             ActivityEvent::Exit {
                 terminal_id: "t1".into(),
                 at: now,
+                spontaneous: false,
             },
         );
         next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {

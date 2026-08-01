@@ -407,6 +407,10 @@ pub enum ActivityEvent {
     Exit {
         terminal_id: String,
         at: i64,
+        /// true = the process died on its own (finish_pty_exit); false = a
+        /// freshell-initiated kill (api / idle reaper / shutdown). Human-requested
+        /// closes must never ring the attention bell.
+        spontaneous: bool,
     },
 }
 
@@ -1507,6 +1511,7 @@ impl TerminalRegistry {
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),
+            spontaneous: false,
         });
         true
     }
@@ -1625,6 +1630,7 @@ impl TerminalRegistry {
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),
+            spontaneous: true,
         });
         true
     }
@@ -4342,6 +4348,46 @@ mod tests {
                 ActivityEvent::Exit { terminal_id, .. } if terminal_id == "T-nat"
             )),
             "natural exit must fire the Exit tap"
+        );
+    }
+
+    #[test]
+    fn kill_emits_a_non_spontaneous_exit_event() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+        reg.insert_headless("T-kill", "S-kill");
+        assert!(reg.kill("T-kill"));
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Exit { terminal_id, spontaneous, .. }
+                    if terminal_id == "T-kill" && !spontaneous
+            )),
+            "a freshell-initiated kill must emit Exit with spontaneous == false"
+        );
+    }
+
+    #[test]
+    fn natural_pty_exit_emits_a_spontaneous_exit_event() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+        reg.insert_headless("T-spont", "S-spont");
+        assert!(reg.finish_pty_exit("T-spont", 0));
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Exit { terminal_id, spontaneous, .. }
+                    if terminal_id == "T-spont" && *spontaneous
+            )),
+            "a natural PTY exit must emit Exit with spontaneous == true"
         );
     }
 
