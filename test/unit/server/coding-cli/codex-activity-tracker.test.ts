@@ -1559,3 +1559,248 @@ describe('reconcile turn_aborted de-chime (kata codex-turn-thread-scope)', () =>
     expect(completions).toHaveLength(1)
   })
 })
+
+describe('approval pause semantics (Task 12, Node mirror of Rust Task 7)', () => {
+  type Collected = {
+    changes: Array<{ upsert: Array<{ phase: string }>; remove: string[] } & Record<string, unknown>>
+    boundaries: Array<{ terminalId: string; at: number }>
+    completions: unknown[]
+  }
+
+  function collect(tracker: CodexActivityTracker): Collected {
+    const collected: Collected = { changes: [], boundaries: [], completions: [] }
+    tracker.on('changed', (change) => collected.changes.push(change))
+    tracker.on('attention.boundary', (event) => collected.boundaries.push(event))
+    tracker.on('turn.complete', (event) => collected.completions.push(event))
+    return collected
+  }
+
+  function busyUpserts(collected: Collected): unknown[] {
+    return collected.changes.flatMap((change) => change.upsert.filter((record) => record.phase === 'busy'))
+  }
+
+  function bindBusy(tracker: CodexActivityTracker, reason: 'start' | 'resume' = 'start'): void {
+    tracker.bindTerminal({
+      terminalId: 't1',
+      sessionId: 'thread-1',
+      reason,
+      session: createSession('thread-1'),
+      at: 1_000,
+    })
+    tracker.onTurnStarted({ terminalId: 't1', threadId: 'thread-1', turnId: 'turn-1', at: 2_000 })
+  }
+
+  it('pauses busy to idle and arms an attention boundary without a turn completion', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    expect(collected.changes).toHaveLength(1)
+    expect(collected.changes[0]!.upsert).toEqual([expect.objectContaining({ phase: 'idle' })])
+    expect(collected.boundaries).toEqual([{ terminalId: 't1', at: 3_000 }])
+    expect(collected.completions).toEqual([])
+  })
+
+  it('returns to busy when the approval resolves', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 4_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'busy' })
+  })
+
+  it('stays idle on resolve when the approval arrived while already idle', () => {
+    const tracker = new CodexActivityTracker()
+    tracker.bindTerminal({
+      terminalId: 't1',
+      sessionId: 'thread-1',
+      reason: 'start',
+      session: createSession('thread-1'),
+      at: 1_000,
+    })
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 4_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    expect(busyUpserts(collected)).toEqual([])
+  })
+
+  it('ignores a foreign-thread approval request (sub-agent approvals must not ring the parent pane)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'subagent-thread', requestId: '41', at: 3_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'busy' })
+    expect(collected.changes).toEqual([])
+    expect(collected.boundaries).toEqual([])
+  })
+
+  it('accepts an approval request without a threadId (the proxy is per-terminal)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', requestId: '41', at: 3_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    expect(collected.boundaries).toEqual([{ terminalId: 't1', at: 3_000 }])
+  })
+
+  it('does not let a queued submit block the approval boundary (still blocked on a human)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.noteInput({ terminalId: 't1', data: 'queued message\r', at: 2_500 })
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+
+    expect(collected.boundaries).toEqual([{ terminalId: 't1', at: 3_000 }])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+  })
+
+  it('clears pending approvals at turn completion so a late resolve is a no-op', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    tracker.onTurnCompleted({
+      terminalId: 't1',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'completed',
+      at: 5_000,
+    })
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    const collected = collect(tracker)
+
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 6_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    expect(collected.changes).toEqual([])
+  })
+
+  it('reconcile task_started landing mid-pause folds anchors without flipping busy (audit A9)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker, 'resume')
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.reconcileProjects(
+      createProjects(createSession('thread-1', { latestTaskStartedAt: 3_500 })),
+      3_500,
+    )
+
+    expect(busyUpserts(collected)).toEqual([])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle', acceptedStartAt: 3_500 })
+
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 4_000 })
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'busy' })
+  })
+
+  it('a resume re-announce mid-pause does not promote idle to busy (audit A9)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.bindTerminal({
+      terminalId: 't1',
+      sessionId: 'thread-1',
+      reason: 'resume',
+      session: createSession('thread-1', { latestTaskStartedAt: 2_000 }),
+      at: 3_500,
+    })
+
+    expect(busyUpserts(collected)).toEqual([])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 4_000 })
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'busy' })
+  })
+
+  it('resolve normalizes pending-submit input state planted by a mid-pause Enter (audit A9 hazard 2)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    tracker.noteInput({ terminalId: 't1', data: '\r', at: 3_500 }) // answering the approval prompt
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 4_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'busy' })
+    expect(tracker.getActivity('t1')?.pendingSubmitAt).toBeUndefined()
+    expect(tracker.getActivity('t1')?.pendingUntil).toBeUndefined()
+    expect(tracker.getActivity('t1')?.pendingFreshnessAt).toBeUndefined()
+
+    const collected = collect(tracker)
+    tracker.onTurnCompleted({
+      terminalId: 't1',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'completed',
+      at: 6_000,
+    })
+
+    expect(collected.completions).toHaveLength(1)
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    const pendingUpserts = collected.changes.flatMap((change) =>
+      change.upsert.filter((record) => record.phase === 'pending'))
+    expect(pendingUpserts).toEqual([])
+  })
+
+  it('rebinding to a different thread drops the pause state', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+
+    tracker.bindTerminal({
+      terminalId: 't1',
+      sessionId: 'thread-2',
+      reason: 'resume',
+      session: createSession('thread-2'),
+      at: 4_000,
+    })
+    const collected = collect(tracker)
+
+    tracker.onApprovalResolved({ terminalId: 't1', requestId: '41', at: 5_000 })
+
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+    expect(collected.changes).toEqual([])
+  })
+
+  it('a removal with a non-empty pending-approval set carries approvalPendingRemovals (decision 3)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.noteExit({ terminalId: 't1', at: 5_000, spontaneous: true })
+
+    expect(collected.changes).toEqual([{
+      upsert: [],
+      remove: ['t1'],
+      spontaneousExitRemovals: ['t1'],
+      approvalPendingRemovals: ['t1'],
+    }])
+  })
+
+  it('a removal without pending approvals omits approvalPendingRemovals', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    const collected = collect(tracker)
+
+    tracker.noteExit({ terminalId: 't1', at: 5_000, spontaneous: true })
+
+    expect(collected.changes).toEqual([{
+      upsert: [],
+      remove: ['t1'],
+      spontaneousExitRemovals: ['t1'],
+    }])
+  })
+})

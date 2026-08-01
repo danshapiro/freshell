@@ -8,6 +8,8 @@ import {
 } from '../../shared/turn-complete-signal.js'
 import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 import type {
+  CodexApprovalRequestedEvent,
+  CodexApprovalResolvedEvent,
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
   SessionBindingReason,
@@ -52,6 +54,16 @@ export type CodexTerminalActivity = CodexActivityRecord & {
    * construction. Absent ids fall back to phase semantics.
    */
   currentTurnId?: string
+  /**
+   * Outstanding server->client approval request ids (managed proxy lane,
+   * Task 12 / Rust codex.rs pending_approvals).
+   */
+  pendingApprovals: Set<string>
+  /**
+   * True when the approval pause demoted a working phase; the resolve
+   * restores 'busy'. False when the approval arrived while already idle.
+   */
+  resumeBusyAfterApproval: boolean
   parserState: TurnCompleteSignalParserState
 }
 
@@ -67,6 +79,13 @@ export type CodexActivityChange = {
   remove: string[]
   /** Subset of `remove` caused by a spontaneous PTY death (death-bell input). */
   spontaneousExitRemovals?: string[]
+  /**
+   * Subset of `remove` whose pending-approval set was non-empty at removal
+   * time (read BEFORE deletion). A pane blocked on an approval whose process
+   * dies spontaneously counts as engaged for the death bell (decision 3 --
+   * Node mirror of Rust has_pending_approvals).
+   */
+  approvalPendingRemovals?: string[]
 }
 
 function maxDefined(...values: Array<number | undefined>): number | undefined {
@@ -164,6 +183,11 @@ export class CodexActivityTracker extends EventEmitter {
       lastSeenTurnAbortedAt: input.session?.codexTaskEvents?.latestTurnAbortedAt,
       lastSeenSessionLastActivityAt: input.session?.lastActivityAt,
       lastClearedAt: latestClearAt(input.session),
+      // A rebind moves the pane to a different thread: the old thread's
+      // approval pause state must not survive (fresh state ⇒ inherently
+      // cleared -- Task 12 mirror of Rust bind_session).
+      pendingApprovals: new Set(),
+      resumeBusyAfterApproval: false,
       parserState: createTurnCompleteSignalParserState(),
     }
 
@@ -281,6 +305,13 @@ export class CodexActivityTracker extends EventEmitter {
     if (input.turnId !== undefined && state.currentTurnId !== undefined && input.turnId !== state.currentTurnId) {
       return
     }
+    // Task 12: an accepted terminal-status completion retires the turn's
+    // approval pause state ONCE, BEFORE the phase transitions -- a turn that
+    // completes during an approval pause routes through the idle path (the
+    // request itself demoted the phase), so a late resolve of the stale
+    // approval must not flip the pane busy again.
+    state.pendingApprovals.clear()
+    state.resumeBusyAfterApproval = false
     // Attention-bell policy: completed AND failed record (ring); interrupted is
     // the human-requested silent clear. Mirrors Rust codex.rs record predicate.
     const record = input.status === undefined || input.status === 'completed' || input.status === 'failed'
@@ -299,6 +330,58 @@ export class CodexActivityTracker extends EventEmitter {
     }
     this.commitState(state, previous)
     this.flushCompletions()
+  }
+
+  /**
+   * Approval-request pause (managed proxy lane, Task 12 -- Node mirror of
+   * Rust note_approval_requested). Thread-scoped like turn events; requests
+   * without a threadId are accepted (the proxy is per-terminal). The public
+   * phase maps to the EXISTING not-busy value -- no new wire phase. Queued
+   * input never suppresses approval bells: still blocked on a human.
+   */
+  onApprovalRequested(input: CodexApprovalRequestedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+    if (input.threadId !== undefined && state.sessionId !== undefined && input.threadId !== state.sessionId) {
+      return
+    }
+    state.pendingApprovals.add(input.requestId)
+    const previous = this.toRecord(state)
+    if (state.phase === 'busy' || state.phase === 'pending' || state.phase === 'unknown') {
+      state.resumeBusyAfterApproval = true
+      state.phase = 'idle'
+    }
+    state.updatedAt = input.at
+    this.commitState(state, previous)
+    // Arms the truly-idle gate WITHOUT minting a turn completion or a
+    // terminal.turn.complete frame -- an approval pause is not a turn end.
+    // Emitted AFTER the 'changed' demotion so the gate sees not-busy first.
+    this.emit('attention.boundary', { terminalId: input.terminalId, at: input.at })
+  }
+
+  /**
+   * The approval response passed back through the proxy: the turn resumes.
+   * Cancels a pending bell within the grace (gate sees busy); un-greens the
+   * pane. Stale/unknown request ids are no-ops.
+   */
+  onApprovalResolved(input: CodexApprovalResolvedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+    if (!state.pendingApprovals.delete(input.requestId)) return
+    if (state.pendingApprovals.size > 0 || !state.resumeBusyAfterApproval) return
+    state.resumeBusyAfterApproval = false
+    const previous = this.toRecord(state)
+    state.phase = 'busy'
+    state.updatedAt = input.at
+    state.lastObservedAt = input.at
+    // Audit A9 hazard 2: a mid-pause Enter (the human answering the approval
+    // prompt in the TUI) planted PTY pending-submit state -- normalize it so
+    // the next turn clear is not misread as a queued re-arm of the pause
+    // keystroke (which would suppress a legitimate later bell).
+    state.pendingSubmitAt = undefined
+    state.pendingFreshnessAt = undefined
+    state.pendingUntil = undefined
+    this.commitState(state, previous)
   }
 
   reconcileProjects(projects: ProjectGroup[], at: number): void {
@@ -342,7 +425,17 @@ export class CodexActivityTracker extends EventEmitter {
             || (state.bindingReason === 'resume' && state.phase === 'idle')
           )
         ) {
-          this.promoteBusy(state, nextStartedAt, at)
+          if (state.pendingApprovals.size === 0) {
+            this.promoteBusy(state, nextStartedAt, at)
+          } else {
+            // Lane-interference guard (decision 8 / audit A9): the turn's own
+            // task_started folding in MID-PAUSE would flip the phase busy,
+            // feed the gate, and silently cancel the armed approval bell.
+            // Fold the anchor as usual but defer the busy promotion to the
+            // approval resolve.
+            state.acceptedStartAt = nextStartedAt
+            state.resumeBusyAfterApproval = true
+          }
         } else if (
           isNewStart
           && state.bindingReason === 'association'
@@ -561,10 +654,20 @@ export class CodexActivityTracker extends EventEmitter {
 
     if (input.reason === 'resume') {
       if (state.phase === 'idle') {
-        state.phase = 'busy'
-        state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
-        state.latentAcceptedStartAt = undefined
-        state.updatedAt = input.at
+        if (state.pendingApprovals.size > 0) {
+          // Lane-interference guard (decision 8 / audit A9): a resume
+          // re-announce landing during a pending approval must not promote
+          // idle -> busy (it would silently cancel the armed approval bell).
+          // Fold the anchor; the resolve restores busy.
+          state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
+          state.latentAcceptedStartAt = undefined
+          state.resumeBusyAfterApproval = true
+        } else {
+          state.phase = 'busy'
+          state.acceptedStartAt = maxDefined(state.acceptedStartAt, startedAt)
+          state.latentAcceptedStartAt = undefined
+          state.updatedAt = input.at
+        }
       } else if (state.phase === 'pending') {
         state.latentAcceptedStartAt = maxDefined(state.latentAcceptedStartAt, startedAt)
       } else {
@@ -655,11 +758,15 @@ export class CodexActivityTracker extends EventEmitter {
   private removeState(terminalId: string, opts?: { spontaneousExit?: boolean }): void {
     const existing = this.states.get(terminalId)
     if (!existing) return
+    // Death-bell engagement (decision 3): read BEFORE deleting the state -- a
+    // pane blocked on an approval when it dies must still ring.
+    const approvalPending = existing.pendingApprovals.size > 0
     this.states.delete(terminalId)
     this.emit('changed', {
       upsert: [],
       remove: [terminalId],
       ...(opts?.spontaneousExit ? { spontaneousExitRemovals: [terminalId] } : {}),
+      ...(approvalPending ? { approvalPendingRemovals: [terminalId] } : {}),
     } satisfies CodexActivityChange)
   }
 

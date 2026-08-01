@@ -48,6 +48,31 @@ export type CodexTurnStartedEvent = {
   at: number
 }
 
+/**
+ * A sniffed server->client approval request (codex remote proxy, Task 12):
+ * the app-server is blocked on a human until it resolves. Emitted on the
+ * registry as 'codex.approval.requested'.
+ */
+export type CodexApprovalRequestedEvent = {
+  terminalId: string
+  /** See CodexTurnStartedEvent.threadId -- may be a foreign thread or absent. */
+  threadId?: string
+  /** Canonicalized JSON-RPC request id (string form). */
+  requestId: string
+  at: number
+}
+
+/**
+ * The approval resolved: a client response, an upstream serverRequest/resolved
+ * notification, or a proxy-teardown drain. Emitted on the registry as
+ * 'codex.approval.resolved'.
+ */
+export type CodexApprovalResolvedEvent = {
+  terminalId: string
+  requestId: string
+  at: number
+}
+
 export type CodexTurnCompletedEvent = {
   terminalId: string
   /** See CodexTurnStartedEvent.threadId -- may be a foreign thread. */

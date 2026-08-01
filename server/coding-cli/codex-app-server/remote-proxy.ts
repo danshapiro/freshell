@@ -37,6 +37,20 @@ export type CodexRemoteProxyRepairTrigger =
   | { kind: 'proxy_close' | 'proxy_error' | 'candidate_capture_timeout'; error?: Error; scope?: 'fork_handoff' }
   | { kind: 'fs_changed'; watchId: string; changedPaths: string[] }
 
+/**
+ * One sniffed server→client approval REQUEST (a frame carrying BOTH `id` and
+ * `method`, with the method in `CODEX_APPROVAL_REQUEST_METHODS`) — the codex
+ * app-server is blocked on a human until it resolves. The frame itself is
+ * relayed verbatim regardless.
+ */
+export type CodexApprovalRequestEvent = {
+  /** Canonicalized request id (string form of the JSON-RPC id). */
+  requestId: string
+  method: string
+  /** Best-effort params.threadId — undefined for oversized/opaque frames. */
+  threadId?: string
+}
+
 type JsonRpcId = string | number
 
 type ProxyFrame = {
@@ -79,6 +93,13 @@ type ProxyConnection = {
   upstream: WebSocket
   pendingMethods: Map<JsonRpcId, string>
   pendingForkRequests: Map<JsonRpcId, { parentThreadId?: string }>
+  /**
+   * Outstanding server→client approval request ids (decision 5). Resolved by
+   * a client response ({id, result} OR {id, error}), an upstream
+   * `serverRequest/resolved` notification, or drained with resolutions on
+   * connection teardown (decision 5b).
+   */
+  pendingServerApprovals: Set<JsonRpcId>
 }
 
 type CodexRemoteProxyOptions = {
@@ -109,6 +130,43 @@ const STATEFUL_NOTIFICATION_METHODS = new Set([
   'thread/status/changed',
 ])
 
+/**
+ * Server→client JSON-RPC REQUEST methods that block on a human. Sourced from
+ * the codex 0.129.0 schema inventory
+ * (test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94) and
+ * verified EXACT against the codex `ServerRequest` enum at both 0.129.0 and
+ * the deployed 0.146.0. Mirrors the Rust proxy's APPROVAL_REQUEST_METHODS
+ * (crates/freshell-codex/src/remote_proxy.rs).
+ */
+export const CODEX_APPROVAL_REQUEST_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+  'item/tool/requestUserInput',
+  'mcpServer/elicitation/request',
+  'applyPatchApproval',
+  'execCommandApproval',
+])
+
+/**
+ * Machine-serviced server→client requests — never human-attention.
+ * (`attestation/generate` and `currentTime/read` are new at 0.146.0.)
+ * Anything outside BOTH lists is debug-logged to catch future drift
+ * (decision 6) — no bell, just logging.
+ */
+const AUTOMATED_SERVER_REQUEST_METHODS = new Set([
+  'item/tool/call',
+  'account/chatgptAuthTokens/refresh',
+  'attestation/generate',
+  'currentTime/read',
+])
+
+/**
+ * Legacy approval methods carry `params.conversationId` instead of
+ * `params.threadId` (codex-rs v1.rs:126-158).
+ */
+const LEGACY_APPROVAL_REQUEST_METHODS = new Set(['applyPatchApproval', 'execCommandApproval'])
+
 export class CodexRemoteProxy {
   private readonly upstreamWsUrl: string
   private readonly portAllocator: () => Promise<LoopbackServerEndpoint>
@@ -126,6 +184,8 @@ export class CodexRemoteProxy {
   private readonly candidateHandlers = new Set<(candidate: CodexRemoteProxyCandidate) => void>()
   private readonly turnStartedHandlers = new Set<(event: CodexTurnEvent) => void>()
   private readonly turnCompletedHandlers = new Set<(event: CodexTurnEvent) => void>()
+  private readonly approvalRequestedHandlers = new Set<(event: CodexApprovalRequestEvent) => void>()
+  private readonly approvalResolvedHandlers = new Set<(event: { requestId: string }) => void>()
   private readonly repairTriggerHandlers = new Set<(event: CodexRemoteProxyRepairTrigger) => void>()
   private readonly lifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
@@ -193,6 +253,7 @@ export class CodexRemoteProxy {
     }
     for (const connection of [...this.connections]) {
       connection.pendingForkRequests.clear()
+      this.drainPendingServerApprovals(connection)
       connection.client.close()
       connection.upstream.close()
     }
@@ -270,6 +331,16 @@ export class CodexRemoteProxy {
     return () => this.turnCompletedHandlers.delete(handler)
   }
 
+  onApprovalRequested(handler: (event: CodexApprovalRequestEvent) => void): () => void {
+    this.approvalRequestedHandlers.add(handler)
+    return () => this.approvalRequestedHandlers.delete(handler)
+  }
+
+  onApprovalResolved(handler: (event: { requestId: string }) => void): () => void {
+    this.approvalResolvedHandlers.add(handler)
+    return () => this.approvalResolvedHandlers.delete(handler)
+  }
+
   onRepairTrigger(handler: (event: CodexRemoteProxyRepairTrigger) => void): () => void {
     this.repairTriggerHandlers.add(handler)
     return () => this.repairTriggerHandlers.delete(handler)
@@ -300,6 +371,7 @@ export class CodexRemoteProxy {
       upstream,
       pendingMethods: new Map(),
       pendingForkRequests: new Map(),
+      pendingServerApprovals: new Set(),
     }
     this.connections.add(connection)
     if (this.requireCandidatePersistence) {
@@ -324,6 +396,7 @@ export class CodexRemoteProxy {
     const closeBoth = () => {
       this.connections.delete(connection)
       connection.pendingForkRequests.clear()
+      this.drainPendingServerApprovals(connection)
       client.close()
       upstream.close()
     }
@@ -469,6 +542,13 @@ export class CodexRemoteProxy {
 
     const id = envelope.id
     if (id !== undefined) {
+      if (typeof envelope.method === 'string') {
+        // id + method => a server->client REQUEST (our own responses never
+        // reach this path). Never consult pendingMethods for these -- the
+        // server's id space is not ours.
+        this.handleUpstreamServerRequest(connection, frame, id, envelope.method)
+        return
+      }
       const method = connection.pendingMethods.get(id)
       const forkRequest = connection.pendingForkRequests.get(id)
       if (method !== undefined) {
@@ -502,12 +582,101 @@ export class CodexRemoteProxy {
       }, 'Codex remote proxy forwarding upstream notification')
     }
 
+    if (method === 'serverRequest/resolved') {
+      // Decision 5c: the app-server resolved its own request. Resolve the
+      // pending approval; relay the notification verbatim regardless.
+      this.handleServerRequestResolvedNotification(frame)
+      sendFrameIfOpen(connection.client, frame)
+      return
+    }
+
     if (typeof method === 'string' && STATEFUL_NOTIFICATION_METHODS.has(method)) {
       this.handleStatefulUpstreamNotification(connection, frame, method)
       return
     }
 
     sendFrameIfOpen(connection.client, frame)
+  }
+
+  /**
+   * A server->client JSON-RPC REQUEST (upstream frame carrying BOTH id and
+   * method). Approval-set methods are sniffed (decision 5) and recorded so a
+   * matching client response resolves them; methods in NEITHER the approval
+   * set nor the automated set are debug-logged to surface drift (decision 6).
+   * Every server request relays verbatim -- the proxy observes, never consumes.
+   */
+  private handleUpstreamServerRequest(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    id: JsonRpcId,
+    method: string,
+  ): void {
+    if (CODEX_APPROVAL_REQUEST_METHODS.has(method)) {
+      connection.pendingServerApprovals.add(id)
+      const threadId = extractApprovalThreadId(frame, method)
+      this.emitApprovalRequested({
+        requestId: String(id),
+        method,
+        ...(threadId !== undefined ? { threadId } : {}),
+      })
+    } else if (!AUTOMATED_SERVER_REQUEST_METHODS.has(method)) {
+      // Decision 6: the method set is version-fluid -- surface drift.
+      log.debug({ method }, 'unrecognized codex server->client request method (not treated as an approval)')
+    }
+    sendFrameIfOpen(connection.client, frame)
+  }
+
+  /**
+   * Matches an upstream `serverRequest/resolved` notification's
+   * `params.requestId` against every connection's pending approval set (the
+   * request went out on this proxy's single upstream) and emits an approval
+   * resolution when it was pending. Best-effort: oversized/opaque frames
+   * resolve nothing (the teardown drain, decision 5b, remains the backstop).
+   */
+  private handleServerRequestResolvedNotification(frame: ProxyFrame): void {
+    if (frame.byteLength > MAX_FULL_PARSE_BYTES) return
+    const parsed = parseJsonFrame(frame)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+    const params = (parsed as Record<string, unknown>).params
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return
+    const value = (params as Record<string, unknown>).requestId
+    // The wire may carry the id as a string ("41") or a number (41); a pending
+    // numeric id must resolve either way.
+    const candidates: JsonRpcId[] = []
+    let requestId: string
+    if (typeof value === 'string') {
+      candidates.push(value)
+      const numeric = Number(value)
+      if (Number.isInteger(numeric) && String(numeric) === value) candidates.push(numeric)
+      requestId = value
+    } else if (typeof value === 'number') {
+      candidates.push(value)
+      requestId = String(value)
+    } else {
+      return
+    }
+    let resolved = false
+    for (const connection of this.connections) {
+      for (const candidate of candidates) {
+        if (connection.pendingServerApprovals.delete(candidate)) resolved = true
+      }
+    }
+    if (resolved) {
+      this.emitApprovalResolved(requestId)
+    }
+  }
+
+  /**
+   * Decision 5b: teardown/restart drains ALL pending approvals. A restarted
+   * app-server's per-process id counter starts at 0 again, so stale pending
+   * ids would collide with the next incarnation's fresh requests -- resolve
+   * them now rather than letting a tracker stay paused forever.
+   */
+  private drainPendingServerApprovals(connection: ProxyConnection): void {
+    for (const id of connection.pendingServerApprovals) {
+      this.emitApprovalResolved(String(id))
+    }
+    connection.pendingServerApprovals.clear()
   }
 
   private maybeEmitThreadStartResponseCandidate(parsed: unknown): void {
@@ -835,6 +1004,15 @@ export class CodexRemoteProxy {
   ): void {
     if (request.id !== undefined && typeof request.method === 'string') {
       connection.pendingMethods.set(request.id, request.method)
+    } else if (request.id !== undefined && request.method === undefined) {
+      // A response frame: {id, result} OR {id, error} -- BOTH resolve a
+      // pending server approval (decision 5a; codex handles errors via
+      // process_error). The method-absence check is MANDATORY (decision 5d):
+      // a client REQUEST whose id numerically collides with a pending server
+      // approval must not resolve it.
+      if (connection.pendingServerApprovals.delete(request.id)) {
+        this.emitApprovalResolved(String(request.id))
+      }
     }
     sendFrameIfOpen(connection.upstream, frame)
   }
@@ -1137,6 +1315,18 @@ export class CodexRemoteProxy {
     }
   }
 
+  private emitApprovalRequested(event: CodexApprovalRequestEvent): void {
+    for (const handler of this.approvalRequestedHandlers) {
+      handler(event)
+    }
+  }
+
+  private emitApprovalResolved(requestId: string): void {
+    for (const handler of this.approvalResolvedHandlers) {
+      handler({ requestId })
+    }
+  }
+
   private emitThreadLifecycle(event: CodexThreadLifecycleEvent): void {
     for (const handler of this.lifecycleHandlers) {
       handler(event)
@@ -1210,6 +1400,22 @@ function extractThreadForkParentThreadId(frame: ProxyFrame): string | undefined 
   const threadId = findJsonObjectMember(raw, params.valueStart, 'threadId')
   if (!threadId || raw[threadId.valueStart] !== BYTE_QUOTE) return undefined
   return decodeJsonString(raw, threadId.valueStart, threadId.valueEnd)
+}
+
+/**
+ * Best-effort thread pointer for a sniffed approval request: v2 methods carry
+ * `params.threadId`; legacy methods carry `params.conversationId` (decision 7,
+ * codex-rs v1.rs:126-158). Oversized/opaque frames yield undefined.
+ */
+function extractApprovalThreadId(frame: ProxyFrame, method: string): string | undefined {
+  if (frame.byteLength > MAX_FULL_PARSE_BYTES) return undefined
+  const parsed = parseJsonFrame(frame)
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const params = (parsed as Record<string, unknown>).params
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return undefined
+  const key = LEGACY_APPROVAL_REQUEST_METHODS.has(method) ? 'conversationId' : 'threadId'
+  const value = (params as Record<string, unknown>)[key]
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function clientEnvelopeFailureMessage(reason: string): string {

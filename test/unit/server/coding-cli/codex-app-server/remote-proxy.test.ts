@@ -2063,3 +2063,187 @@ describe('CodexRemoteProxy', () => {
     }))
   })
 })
+
+describe('CodexRemoteProxy approval sniffing (decision 5/6/7)', () => {
+  const approvalRequestFrame = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 41,
+    method: 'item/commandExecution/requestApproval',
+    params: { threadId: 'thread-1', command: 'rm -rf /tmp/x' },
+  })
+
+  async function startApprovalHarness(upstreamFrames: string[]): Promise<{
+    upstream: UpstreamHandle
+    proxy: CodexRemoteProxy
+    tui: WebSocket
+    requested: unknown[]
+    resolved: unknown[]
+    relayed: Promise<Array<{ raw: Buffer; isBinary: boolean }>>
+  }> {
+    const upstream = await startUpstream((socket, message) => {
+      if ((message as { method?: string }).method === 'initialize') {
+        for (const frame of upstreamFrames) socket.send(frame)
+      }
+    })
+    const proxy = await startProxy(upstream.wsUrl, { requireCandidatePersistence: false })
+    const requested: unknown[] = []
+    const resolved: unknown[] = []
+    proxy.onApprovalRequested((event) => requested.push(event))
+    proxy.onApprovalResolved((event) => resolved.push(event))
+    const tui = await connect(proxy.wsUrl)
+    const relayed = collectRawFrames(tui, upstreamFrames.length)
+    tui.send(JSON.stringify({ id: 1, method: 'initialize', params: {} }))
+    return { upstream, proxy, tui, requested, resolved, relayed }
+  }
+
+  async function upstreamMessageCount(upstream: UpstreamHandle): Promise<number> {
+    return upstream.messages.length
+  }
+
+  async function waitForUpstreamMessage(upstream: UpstreamHandle, predicate: (message: any) => boolean, ms = 500): Promise<any> {
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+      const found = upstream.messages.find((message) => predicate(message))
+      if (found !== undefined) return found
+      await delay(5)
+    }
+    throw new Error(`Timed out waiting ${ms}ms for upstream message.`)
+  }
+
+  // 1. approval request frame emits approval requested and relays verbatim
+  it('emits approval requested for a sniffed approval request and relays the frame verbatim', async () => {
+    const { requested, relayed } = await startApprovalHarness([approvalRequestFrame])
+    const frames = await relayed
+    expect(frames[0]!.raw.toString()).toBe(approvalRequestFrame)
+    expect(requested).toEqual([{
+      requestId: '41',
+      method: 'item/commandExecution/requestApproval',
+      threadId: 'thread-1',
+    }])
+  })
+
+  // 2. non-approval server request is relayed without events
+  it('relays a machine-serviced server request (item/tool/call) without any approval event', async () => {
+    const frame = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 41,
+      method: 'item/tool/call',
+      params: { threadId: 'thread-1' },
+    })
+    const { requested, resolved, relayed } = await startApprovalHarness([frame])
+    const frames = await relayed
+    expect(frames[0]!.raw.toString()).toBe(frame)
+    expect(requested).toEqual([])
+    expect(resolved).toEqual([])
+  })
+
+  // 3. approval response emits approval resolved and forwards upstream
+  it('resolves a pending approval on the client {id, result} response and forwards it upstream', async () => {
+    const { upstream, tui, resolved, relayed } = await startApprovalHarness([approvalRequestFrame])
+    await relayed
+    tui.send(JSON.stringify({ jsonrpc: '2.0', id: 41, result: { decision: 'approved' } }))
+    await waitForUpstreamMessage(upstream, (message) => message?.id === 41 && message?.result !== undefined)
+    expect(resolved).toEqual([{ requestId: '41' }])
+  })
+
+  // 4. client response with unknown id emits nothing
+  it('emits nothing for a client response whose id matches no pending approval', async () => {
+    const { upstream, tui, resolved, relayed } = await startApprovalHarness([approvalRequestFrame])
+    await relayed
+    tui.send(JSON.stringify({ jsonrpc: '2.0', id: 999, result: {} }))
+    await waitForUpstreamMessage(upstream, (message) => message?.id === 999)
+    expect(resolved).toEqual([])
+  })
+
+  // 5. approval request without threadId yields undefined
+  it('emits threadId undefined when the approval request params lack a threadId', async () => {
+    const frame = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 41,
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'rm -rf /tmp/x' },
+    })
+    const { requested, relayed } = await startApprovalHarness([frame])
+    await relayed
+    expect(requested).toEqual([{
+      requestId: '41',
+      method: 'item/commandExecution/requestApproval',
+      threadId: undefined,
+    }])
+  })
+
+  // 6. legacy approval reads conversationId (decision 7 / audit A3)
+  it('populates threadId from params.conversationId for legacy execCommandApproval', async () => {
+    const frame = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 42,
+      method: 'execCommandApproval',
+      params: { conversationId: 'thread-1', command: 'ls' },
+    })
+    const { requested, relayed } = await startApprovalHarness([frame])
+    await relayed
+    expect(requested).toEqual([{
+      requestId: '42',
+      method: 'execCommandApproval',
+      threadId: 'thread-1',
+    }])
+  })
+
+  // 7. error response also resolves (decision 5a / audit A5)
+  it('resolves a pending approval on the client {id, error} response too', async () => {
+    const { upstream, tui, resolved, relayed } = await startApprovalHarness([approvalRequestFrame])
+    await relayed
+    tui.send(JSON.stringify({ jsonrpc: '2.0', id: 41, error: { code: -1, message: 'denied' } }))
+    await waitForUpstreamMessage(upstream, (message) => message?.id === 41 && message?.error !== undefined)
+    expect(resolved).toEqual([{ requestId: '41' }])
+  })
+
+  // 8. client frame with id AND method never resolves (decision 5d)
+  it('never resolves on a client REQUEST whose id collides with a pending approval', async () => {
+    const { upstream, tui, resolved, relayed } = await startApprovalHarness([approvalRequestFrame])
+    await relayed
+    tui.send(JSON.stringify({ jsonrpc: '2.0', id: 41, method: 'thread/start', params: {} }))
+    await waitForUpstreamMessage(upstream, (message) => message?.id === 41 && message?.method === 'thread/start')
+    expect(resolved).toEqual([])
+  })
+
+  // 9. serverRequest/resolved notification resolves (decision 5c)
+  it('resolves a pending approval on an upstream serverRequest/resolved notification and relays it', async () => {
+    const notification = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'serverRequest/resolved',
+      params: { threadId: 'thread-1', requestId: '41' },
+    })
+    const { resolved, relayed } = await startApprovalHarness([approvalRequestFrame, notification])
+    const frames = await relayed
+    expect(frames[1]!.raw.toString()).toBe(notification)
+    expect(resolved).toEqual([{ requestId: '41' }])
+  })
+
+  // 10. upstream teardown drains pending approvals (decision 5b)
+  it('drains every pending approval with a resolution when the upstream connection tears down', async () => {
+    const { upstream, resolved, relayed } = await startApprovalHarness([approvalRequestFrame])
+    await relayed
+    for (const socket of upstream.sockets) socket.close()
+    const deadline = Date.now() + 1_000
+    while (resolved.length === 0 && Date.now() < deadline) {
+      await delay(5)
+    }
+    expect(resolved).toEqual([{ requestId: '41' }])
+  })
+
+  // 11. unknown server->client request method is logged, not belled (decision 6)
+  it('relays an unrecognized server request method without emitting an approval event', async () => {
+    const frame = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 43,
+      method: 'some/future/method',
+      params: {},
+    })
+    const { requested, resolved, relayed } = await startApprovalHarness([frame])
+    const frames = await relayed
+    expect(frames[0]!.raw.toString()).toBe(frame)
+    expect(requested).toEqual([])
+    expect(resolved).toEqual([])
+  })
+})

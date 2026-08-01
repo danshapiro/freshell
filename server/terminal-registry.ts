@@ -25,6 +25,8 @@ import type { LoopbackServerEndpoint } from './local-port.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
+  CodexApprovalRequestedEvent,
+  CodexApprovalResolvedEvent,
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
   SessionBindingReason,
@@ -607,6 +609,8 @@ export type TerminalRecord = {
     | 'onCandidate'
     | 'onTurnStarted'
     | 'onTurnCompleted'
+    | 'onApprovalRequested'
+    | 'onApprovalResolved'
     | 'onRepairTrigger'
     | 'onFsChanged'
     | 'watchPath'
@@ -1970,6 +1974,27 @@ export class TerminalRegistry extends EventEmitter {
       })
     })
     if (turnCompletedUnsubscribe) unsubscribers.push(turnCompletedUnsubscribe)
+
+    const approvalRequestedUnsubscribe = sidecar.onApprovalRequested?.((event) => {
+      if (!isCurrentSidecar()) return
+      this.emit('codex.approval.requested', {
+        terminalId: record.terminalId,
+        ...(event.threadId !== undefined ? { threadId: event.threadId } : {}),
+        requestId: event.requestId,
+        at: Date.now(),
+      } satisfies CodexApprovalRequestedEvent)
+    })
+    if (approvalRequestedUnsubscribe) unsubscribers.push(approvalRequestedUnsubscribe)
+
+    const approvalResolvedUnsubscribe = sidecar.onApprovalResolved?.((event) => {
+      if (!isCurrentSidecar()) return
+      this.emit('codex.approval.resolved', {
+        terminalId: record.terminalId,
+        requestId: event.requestId,
+        at: Date.now(),
+      } satisfies CodexApprovalResolvedEvent)
+    })
+    if (approvalResolvedUnsubscribe) unsubscribers.push(approvalResolvedUnsubscribe)
 
     const repairUnsubscribe = sidecar.onRepairTrigger?.((event) => {
       if (!isCurrentSidecar()) return

@@ -4,6 +4,8 @@ import {
 } from './codex-activity-tracker.js'
 import type { ProjectGroup } from './types.js'
 import type {
+  CodexApprovalRequestedEvent,
+  CodexApprovalResolvedEvent,
   CodexTurnCompletedEvent,
   CodexTurnStartedEvent,
   TerminalInputRawEvent,
@@ -79,6 +81,14 @@ export function wireCodexActivityTracker(input: {
     tracker.onTurnCompleted(event)
   }
 
+  const onApprovalRequested = (event: CodexApprovalRequestedEvent) => {
+    tracker.onApprovalRequested(event)
+  }
+
+  const onApprovalResolved = (event: CodexApprovalResolvedEvent) => {
+    tracker.onApprovalResolved(event)
+  }
+
   const onExit = (event: { terminalId: string; spontaneous?: boolean }) => {
     tracker.noteExit({ terminalId: event.terminalId, at: now(), spontaneous: event.spontaneous === true })
   }
@@ -89,6 +99,8 @@ export function wireCodexActivityTracker(input: {
   registry.on('terminal.output.raw', onOutput)
   registry.on('codex.turn.started', onTurnStarted)
   registry.on('codex.turn.completed', onTurnCompleted)
+  registry.on('codex.approval.requested', onApprovalRequested)
+  registry.on('codex.approval.resolved', onApprovalResolved)
   registry.on('terminal.exit', onExit)
 
   const stopIndexerUpdates = codingCliIndexer.onUpdate((projects) => {
@@ -109,6 +121,8 @@ export function wireCodexActivityTracker(input: {
       registry.off('terminal.output.raw', onOutput)
       registry.off('codex.turn.started', onTurnStarted)
       registry.off('codex.turn.completed', onTurnCompleted)
+      registry.off('codex.approval.requested', onApprovalRequested)
+      registry.off('codex.approval.resolved', onApprovalResolved)
       registry.off('terminal.exit', onExit)
       stopIndexerUpdates()
       clearIntervalFn(sweepTimer)

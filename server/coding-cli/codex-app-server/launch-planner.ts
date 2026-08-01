@@ -9,6 +9,7 @@ import type {
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
 import {
   CodexRemoteProxy,
+  type CodexApprovalRequestEvent,
   type CodexRemoteProxyCandidate,
   type CodexRemoteProxyRepairTrigger,
 } from './remote-proxy.js'
@@ -34,6 +35,8 @@ export type CodexLaunchSidecar = {
   onCandidate?(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void
   onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
   onTurnCompleted?(handler: (event: CodexTurnEvent) => void): () => void
+  onApprovalRequested?(handler: (event: CodexApprovalRequestEvent) => void): () => void
+  onApprovalResolved?(handler: (event: { requestId: string }) => void): () => void
   onRepairTrigger?(handler: (event: CodexRemoteProxyRepairTrigger) => void): () => void
   onFsChanged?(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void
   onThreadLifecycle?(handler: (event: CodexThreadLifecycleEvent) => void): () => void
@@ -80,6 +83,8 @@ type CodexLaunchProxy = Pick<
   | 'onCandidate'
   | 'onTurnStarted'
   | 'onTurnCompleted'
+  | 'onApprovalRequested'
+  | 'onApprovalResolved'
   | 'onRepairTrigger'
   | 'onThreadLifecycle'
   | 'onLifecycleLoss'
@@ -246,6 +251,8 @@ export class CodexLaunchPlanner {
       onCandidate: (handler) => getProxy()?.onCandidate(handler) ?? (() => undefined),
       onTurnStarted: (handler) => getProxy()?.onTurnStarted(handler) ?? (() => undefined),
       onTurnCompleted: (handler) => getProxy()?.onTurnCompleted(handler) ?? (() => undefined),
+      onApprovalRequested: (handler) => getProxy()?.onApprovalRequested(handler) ?? (() => undefined),
+      onApprovalResolved: (handler) => getProxy()?.onApprovalResolved(handler) ?? (() => undefined),
       onRepairTrigger: (handler) => getProxy()?.onRepairTrigger(handler) ?? (() => undefined),
       onFsChanged: (handler) => runtime.onFsChanged(handler),
       onThreadLifecycle: (handler) => getProxy()?.onThreadLifecycle(handler) ?? (() => undefined),

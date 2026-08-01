@@ -1,7 +1,9 @@
+import { EventEmitter } from 'events'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   TERMINAL_IDLE_GRACE_MS,
   TrulyIdleEmitter,
+  wireTrulyIdleEmitter,
   type TrulyIdleEvent,
 } from '../../../../server/coding-cli/truly-idle-emitter.js'
 
@@ -264,6 +266,90 @@ describe('TrulyIdleEmitter', () => {
     emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
     emitter.noteTurnComplete({ terminalId: 't1', at: Date.now() })
     emitter.dispose()
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+  })
+})
+
+describe('approval pause bell (Task 12)', () => {
+  let emitter: TrulyIdleEmitter
+  let events: TrulyIdleEvent[]
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-23T12:00:00Z'))
+    emitter = new TrulyIdleEmitter()
+    events = []
+    emitter.on('idle', (event: TrulyIdleEvent) => events.push(event))
+  })
+
+  afterEach(() => {
+    emitter.dispose()
+    vi.useRealTimers()
+  })
+
+  it('an attention.boundary bridged through the wiring arms the grace window and rings once', () => {
+    const tracker = new EventEmitter()
+    const wiring = wireTrulyIdleEmitter({ tracker, emitter })
+    tracker.emit('changed', { upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    // Approval pause: the tracker demotes to idle, then arms the boundary.
+    tracker.emit('changed', { upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    tracker.emit('attention.boundary', { terminalId: 't1', at: Date.now() })
+
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS)
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ terminalId: 't1', reason: 'grace' })
+    wiring.dispose()
+  })
+
+  it('a busy upsert within the grace (the resolve path) cancels the approval bell', () => {
+    const tracker = new EventEmitter()
+    const wiring = wireTrulyIdleEmitter({ tracker, emitter })
+    tracker.emit('changed', { upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    tracker.emit('changed', { upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    tracker.emit('attention.boundary', { terminalId: 't1', at: Date.now() })
+
+    vi.advanceTimersByTime(500)
+    tracker.emit('changed', { upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+    wiring.dispose()
+  })
+
+  it('dispose detaches the attention.boundary bridge', () => {
+    const tracker = new EventEmitter()
+    const wiring = wireTrulyIdleEmitter({ tracker, emitter })
+    wiring.dispose()
+    expect(tracker.listenerCount('attention.boundary')).toBe(0)
+    tracker.emit('attention.boundary', { terminalId: 't1', at: Date.now() })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+  })
+
+  it('a spontaneous removal carrying approvalPendingRemovals rings even when not busy and no timer is armed', () => {
+    // The approval bell already rang (busy=false, grace spent) -- the pane was
+    // still blocked on a human when its process died.
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    emitter.noteActivityChanged({
+      upsert: [],
+      remove: ['t1'],
+      spontaneousExitRemovals: ['t1'],
+      approvalPendingRemovals: ['t1'],
+    })
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ terminalId: 't1', reason: 'grace' })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(1)
+  })
+
+  it('a REQUESTED close of an approval-blocked pane stays silent (no spontaneous exit)', () => {
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    emitter.noteActivityChanged({
+      upsert: [],
+      remove: ['t1'],
+      approvalPendingRemovals: ['t1'],
+    })
     vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
     expect(events).toHaveLength(0)
   })

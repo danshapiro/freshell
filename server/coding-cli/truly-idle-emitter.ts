@@ -32,6 +32,13 @@ export type TrulyIdleActivityChange = {
    * the death bell immediately when the terminal was engaged.
    */
   spontaneousExitRemovals?: string[]
+  /**
+   * Subset of `remove` whose pending-approval set was non-empty at removal
+   * time (codex approval pauses — Node mirror of Rust has_pending_approvals).
+   * A pane blocked on an approval whose process dies spontaneously rings even
+   * after its 2s boundary already rang (busy=false, no armed timer).
+   */
+  approvalPendingRemovals?: string[]
 }
 
 type TerminalIdleState = {
@@ -110,17 +117,19 @@ export class TrulyIdleEmitter extends EventEmitter {
       state.pending = nextPending
     }
     const spontaneous = new Set(change.spontaneousExitRemovals ?? [])
+    const approvalPending = new Set(change.approvalPendingRemovals ?? [])
     for (const terminalId of change.remove ?? []) {
       const state = this.states.get(terminalId)
       if (!state) continue
       // Engagement for the death bell (decision 3): CONFIRMED busy or an armed
       // grace window. phase 'pending' is input-only (the Enter that executes a
-      // human /quit looks like a prompt submit) and NEVER counts. Task 12 ORs
-      // in approval waits via change.approvalPendingRemovals.
+      // human /quit looks like a prompt submit) and NEVER counts. Approval
+      // waits (change.approvalPendingRemovals) OR in below: a pane blocked on
+      // an approval is engaged even after its boundary already rang.
       const engaged = (state.busy && !state.pending) || state.graceTimer !== undefined
       this.cancelGrace(state)
       this.states.delete(terminalId)
-      if (spontaneous.has(terminalId) && engaged) {
+      if (spontaneous.has(terminalId) && (engaged || approvalPending.has(terminalId))) {
         // Spontaneous process death while working: ring immediately — a dead
         // process emits nothing further, and a queued prompt will never run.
         // Requested closes (tab close / terminal.close / shutdown) never ring.
@@ -210,12 +219,20 @@ export function wireTrulyIdleEmitter(input: {
   const onTurnComplete = (event: { terminalId: string; at: number }) => {
     emitter.noteTurnComplete(event)
   }
+  const onAttentionBoundary = (event: { terminalId: string; at: number }) => {
+    // Approval-pause boundary (codex only; a no-op stream for the other
+    // trackers): arms the same grace window — no terminal.turn.complete
+    // frame is involved.
+    emitter.noteTurnComplete(event)
+  }
   tracker.on('changed', onChanged)
   tracker.on('turn.complete', onTurnComplete)
+  tracker.on('attention.boundary', onAttentionBoundary)
   return {
     dispose(): void {
       tracker.off('changed', onChanged)
       tracker.off('turn.complete', onTurnComplete)
+      tracker.off('attention.boundary', onAttentionBoundary)
       emitter.dispose()
     },
   }

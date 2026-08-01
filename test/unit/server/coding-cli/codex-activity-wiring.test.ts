@@ -83,10 +83,48 @@ describe('wireCodexActivityTracker', () => {
 
     expect(registry.listenerCount('codex.turn.started')).toBe(1)
     expect(registry.listenerCount('codex.turn.completed')).toBe(1)
+    expect(registry.listenerCount('codex.approval.requested')).toBe(1)
+    expect(registry.listenerCount('codex.approval.resolved')).toBe(1)
 
     dispose()
 
     expect(registry.listenerCount('codex.turn.started')).toBe(0)
     expect(registry.listenerCount('codex.turn.completed')).toBe(0)
+    expect(registry.listenerCount('codex.approval.requested')).toBe(0)
+    expect(registry.listenerCount('codex.approval.resolved')).toBe(0)
+  })
+
+  it('feeds approval registry events into the tracker (Task 12)', () => {
+    const registry = new FakeRegistry()
+    const indexer = new FakeCodingCliIndexer()
+    const { tracker, dispose } = wireCodexActivityTracker({
+      registry: registry as any,
+      codingCliIndexer: indexer,
+      now: () => 1_000,
+      setIntervalFn: (() => 0) as any,
+      clearIntervalFn: vi.fn() as any,
+    })
+
+    registry.emit('terminal.session.bound', {
+      terminalId: 'term-1',
+      provider: 'codex',
+      sessionId: 'session-1',
+      reason: 'start',
+    })
+    registry.emit('codex.turn.started', { terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+
+    registry.emit('codex.approval.requested', {
+      terminalId: 'term-1',
+      threadId: 'session-1',
+      requestId: '41',
+      at: 1_200,
+    })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+
+    registry.emit('codex.approval.resolved', { terminalId: 'term-1', requestId: '41', at: 1_300 })
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'busy' })
+
+    dispose()
   })
 })
