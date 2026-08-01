@@ -21,7 +21,7 @@ function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean })
   // `busy` is already the authoritative per-pane busy aggregate (busyPaneIds);
   // do NOT AND it with the last-writer-wins tab.status, which a sibling pane's
   // 'exited' can clobber and wrongly suppress blue.
-  return <Circle className={cn('h-2 w-2', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
+  return <Circle className={cn('h-2 w-2 shrink-0', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
 /** Max pane-type icons shown per tab; panes beyond this fold into the '+N' badge. */
@@ -126,7 +126,7 @@ export default function TabItem({
     )
 
     return (
-      <span className="flex items-center gap-0.5">
+      <span className="flex shrink-0 items-center gap-0.5">
         {groups.map((group) => (
           <span key={group.key} className="flex items-center gap-0.5">
             {group.info && repoIconKeys.has(group.key) && (
@@ -158,7 +158,7 @@ export default function TabItem({
   const tabContent = (
     <div
       className={cn(
-        'group relative flex items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
+        'group relative flex w-full min-w-0 items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
@@ -201,7 +201,7 @@ export default function TabItem({
       {isRenaming ? (
         <input
           ref={inputRef}
-          className="bg-transparent outline-none w-32 text-sm"
+          className="bg-transparent outline-none flex-1 min-w-0 text-sm"
           value={renameValue}
           onChange={(e) => onRenameChange(e.target.value)}
           onBlur={onRenameBlur}
@@ -209,14 +209,14 @@ export default function TabItem({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <span className="whitespace-nowrap truncate text-sm max-w-[5rem]">
+        <span className="flex-1 min-w-0 whitespace-nowrap truncate text-sm">
           {tab.title}
         </span>
       )}
 
       <button
         className={cn(
-          'ml-0.5 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded transition-opacity',
+          'ml-0.5 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex shrink-0 items-center justify-center rounded transition-opacity',
           isActive
             ? 'opacity-60 hover:opacity-100'
             : 'opacity-0 group-hover:opacity-60 hover:!opacity-100'

@@ -121,7 +121,15 @@ function SortableTab({
   )
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      // Uniform tab width: 180px when space allows, shrinking equally
+      // (never below 100px) before the strip starts scrolling.
+      className="w-[180px] min-w-[100px] shrink"
+    >
       <TabItem
         tab={tabWithDisplayTitle}
         isActive={isActive}
@@ -585,6 +593,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         <DragOverlay>
           {activeTab ? (
             <div
+              className="w-[180px]"
               style={{
                 opacity: 0.9,
                 transform: 'scale(1.02)',

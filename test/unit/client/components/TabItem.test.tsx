@@ -336,14 +336,18 @@ describe('TabItem', () => {
     expect(onDoubleClick).toHaveBeenCalled()
   })
 
-  it('uses the same title width class for active and inactive tabs', () => {
+  it('uses the same flexible title width classes for active and inactive tabs', () => {
     const { rerender } = render(<TabItem {...defaultProps} isActive={false} />)
     let title = screen.getByText('Test Tab')
-    expect(title.className).toContain('max-w-[5rem]')
+    expect(title.className).toContain('flex-1')
+    expect(title.className).toContain('min-w-0')
+    expect(title.className).toContain('truncate')
 
     rerender(<TabItem {...defaultProps} isActive={true} />)
     title = screen.getByText('Test Tab')
-    expect(title.className).toContain('max-w-[5rem]')
+    expect(title.className).toContain('flex-1')
+    expect(title.className).toContain('min-w-0')
+    expect(title.className).toContain('truncate')
   })
 
   it('does not vertically offset inactive tabs', () => {
