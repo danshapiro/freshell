@@ -197,12 +197,24 @@ export const TerminalTurnCompleteSchema = z.object({
 })
 
 /**
- * Truly-idle edge for terminal-mode CLI panes (claude/codex/opencode/amplifier).
- * Emitted once per busy -> truly-idle transition, after a grace window with no
- * new session-file activity AND no detectable queued user prompt. Never emitted
- * after crash/interrupt/exit; subagent completions inside a running turn never
- * produce it. This is the ONLY edge the client rings/shades on for terminal CLI
- * panes ('terminal.turn.complete' stays informational for them).
+ * Attention edge for terminal-mode CLI panes (claude/codex/opencode/amplifier):
+ * "the agent stopped making progress and you don't already know". Emitted once
+ * per attention transition. Rings for: completed turns (after a grace window
+ * with no new activity and no detectable queued prompt), FAILED turns,
+ * non-human rollout abort reasons (forward-compatible policy — no live codex
+ * <= 0.147 emits one), spontaneous process death while ENGAGED (confirmed
+ * turn, armed grace window, or pending approval; immediate — no grace), and
+ * approval-request pauses (managed codex only; unmanaged/PTY-only codex has
+ * no approval signal). NEVER emitted after a HUMAN-REQUESTED stop:
+ * Esc/interrupt (turn.status 'interrupted', abort reason
+ * 'interrupted'/'replaced'), slash-command quits from an idle pane
+ * (input-only pending state never counts as death-bell engagement), tab
+ * close, terminal.close, or server shutdown (including graceful-shutdown
+ * SIGTERMs). Subagent completions inside a running turn never produce it.
+ * Queued input suppresses completion bells (work continues) but NOT death
+ * bells (a dead process never runs the queue) and NOT approval bells (still
+ * blocked on the human). This is the ONLY edge the client rings/shades on
+ * for terminal CLI panes ('terminal.turn.complete' stays informational).
  *
  * Pinned wire contract shared with the Rust server port - do not change
  * unilaterally: { terminalId, at (server epoch ms), reason: 'grace' | 'queue-empty' }.

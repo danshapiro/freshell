@@ -3,7 +3,10 @@
 //! Pinned wire contract: `{ terminalId, at (server epoch ms), reason:
 //! 'grace' | 'queue-empty' }`, emitted ONCE per busy→truly-idle transition.
 //!
-//! Semantics:
+//! Semantics (terminal.idle is never emitted after a HUMAN-REQUESTED stop;
+//! it IS emitted for failed turns, non-human abort reasons (forward-compatible
+//! — none emitted at codex <= 0.147), spontaneous death while engaged, and
+//! approval pauses; see shared/ws-protocol.ts terminal.idle doc):
 //! * a turn boundary (the provider's positive turn end) ARMS a grace window
 //!   (default [`IDLE_GRACE_MS`] = 2000ms);
 //! * new activity within the window EXTENDS it (amplifier: any events.jsonl
@@ -18,10 +21,35 @@
 //! * a turn boundary while the tracker still reports busy/pending is a
 //!   QUEUED turn: it records queue evidence and never arms mid-turn;
 //! * subagent/tool completions inside a running turn never reach this gate
-//!   (the trackers only report REAL turn boundaries).
+//!   (the trackers only report REAL turn boundaries);
+//! * spontaneous death (exit removal while `is_engaged`) triggers an
+//!   immediate bell emission here, but the exit-death bell itself is emitted
+//!   by the HUB directly; `is_engaged` deliberately excludes the input-only
+//!   Pending state (queued submit gate blocks terminal.idle while input flows).
 //!
 //! Zero-polling: pure deadlines + `next_deadline()`; the hub arms a single
 //! one-shot timer. No pending windows ⇒ no timers.
+//!
+//! # Accepted Residuals
+//!
+//! The following edge cases are accepted design trade-offs (not deferrals):
+//! 1. Mid-turn `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and
+//!    the TUI's ~2s shutdown budget can exit before the abort evidence lands
+//!    — may ring on a human force-quit of a visibly-working pane. No in-band
+//!    discriminator exists; accepted.
+//! 2. Out-of-band `kill -9`/SIGTERM of the CLI by the user: observationally
+//!    identical to a crash — rings; accepted.
+//! 3. Claude/amplifier Enter-executed quits (`/exit`): input-driven Busy is
+//!    those trackers' ONLY turn evidence, so it stays death-bell engagement;
+//!    same residual family as (1); accepted.
+//! 4. Node 120s busy-deadman swallow (audit A17): a recovery window longer
+//!    than `BUSY_DEADMAN_MS` demotes busy→unknown and `unknown` never arms the
+//!    death bell — a MISSED bell (never a false ring); accepted.
+//! 5. A SENT approval request auto-resolved server-side slower than ~2s rings
+//!    once (decision 5); accepted.
+//! 6. Node opencode death bells: deliberately excluded (noisy busy proxy) —
+//!    follow-up. Rust opencode: no hub tracker exists — N/A.
+//! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
 
 use std::collections::HashMap;
 

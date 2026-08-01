@@ -1084,10 +1084,12 @@ fn record_completion_if_idle(
 /// Abort-shaped clears (`turn_aborted` in the rollout lane; status
 /// `interrupted`/`failed` on the proxy lane, Task 2): claim the turn key
 /// exactly like `record_completion_if_idle` does, but WITHOUT recording a
-/// ledger completion -- the pane returns to idle silently
-/// (shared/ws-protocol.ts:199-208: `terminal.idle` is never emitted after
-/// crash/interrupt/exit) and a later echo of the same physical turn cannot
-/// mint a completion.
+/// ledger completion -- the pane returns to idle silently (terminal.idle is
+/// never emitted after a HUMAN-REQUESTED stop; it IS emitted for failed turns,
+/// non-human abort reasons (forward-compatible — none emitted at codex <=
+/// 0.147), spontaneous death while engaged, and approval pauses;
+/// shared/ws-protocol.ts terminal.idle doc) and a later echo of the same
+/// physical turn cannot mint a completion.
 fn claim_turn_key_if_idle(state: &mut TerminalActivity, turn_key: Option<i64>) {
     let Some(turn_key) = turn_key else { return };
     if state.phase != CodexPhase::Idle {
@@ -1387,8 +1389,11 @@ mod tests {
     fn reconcile_turn_aborted_clears_without_completing() {
         // SEMANTIC CHANGE (kata: codex-turn-thread-scope). This test replaces
         // `reconcile_turn_aborted_also_clears_and_completes`, which pinned the
-        // old buggy behavior. shared/ws-protocol.ts:199-208 pins terminal.idle
-        // as "never emitted after crash/interrupt/exit" -- an Esc-interrupt
+        // old buggy behavior. terminal.idle is never emitted after a
+        // HUMAN-REQUESTED stop; it IS emitted for failed turns, non-human
+        // abort reasons (forward-compatible — none emitted at codex <= 0.147),
+        // spontaneous death while engaged, and approval pauses
+        // (shared/ws-protocol.ts terminal.idle doc) -- an Esc-interrupt
         // (`turn_aborted`) must return the pane to idle WITHOUT recording a
         // bell-worthy completion.
         // REFINED (attention-bell plan, Task 3): this fixture carries NO
