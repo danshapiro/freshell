@@ -952,7 +952,12 @@ Append to `mod tests` in `crates/freshell-ws/src/codex_proxy_route.rs` (after `t
             ),
         )
         .await;
-        // Foreign sub-agent completion: must not ring.
+
+        // Foreign sub-agent completion: must not ring. The bounded no-ring
+        // check sits BETWEEN the foreign and bound completions -- without it,
+        // a regressed thread guard would ring HERE and the trailing
+        // "exactly one" tail could still pass (the bound completion would
+        // then hit the Idle arm and no-op, leaving one frame total).
         route_proxy_event(
             &state,
             tagged(
@@ -965,7 +970,52 @@ Append to `mod tests` in `crates/freshell-ws/src/codex_proxy_route.rs` (after `t
             ),
         )
         .await;
-        // Bound thread's completion with NESTED turn.status: rings once.
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "term-t"
+            }),
+        )
+        .await;
+        assert!(
+            premature.is_err(),
+            "a foreign thread completion must not ring"
+        );
+
+        // NESTED-status pin: an `inProgress` completion for the BOUND thread
+        // and the in-flight turn id must not ring. THIS event is what proves
+        // the router extracts `params.turn.status` via
+        // `freshell_codex::turn_status`: a router that forgets the extraction
+        // (or reads a naive flat `params.get("status")`) forwards `None`,
+        // which records a completion (design decision #3: absent status
+        // records) and rings here. The tracker's `inProgress` guard returns
+        // before touching state, so the pane stays Busy for the real
+        // completion below.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-t",
+                RemoteProxyEvent::TurnCompleted(turn_params(
+                    "thread-parent",
+                    "turn-1",
+                    Some("inProgress"),
+                )),
+            ),
+        )
+        .await;
+        let premature = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+                v["terminalId"] == "term-t"
+            }),
+        )
+        .await;
+        assert!(
+            premature.is_err(),
+            "a nested inProgress status must be extracted and must not ring"
+        );
+
+        // Bound thread's real completion with NESTED turn.status: rings once.
         route_proxy_event(
             &state,
             tagged(
@@ -986,7 +1036,7 @@ Append to `mod tests` in `crates/freshell-ws/src/codex_proxy_route.rs` (after `t
         .expect("bound thread's completion rings");
         assert_eq!(complete["sessionId"], "thread-parent");
 
-        // Exactly one -- the foreign completion produced nothing.
+        // Exactly one -- the foreign and inProgress completions produced nothing.
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
@@ -1016,7 +1066,27 @@ cargo test -p freshell-ws turn_events_forward_thread_turn_and_nested_status
 
 (Two separate invocations — `cargo test` accepts only ONE positional test-name filter; passing a second positional errors with `unexpected argument` before anything compiles or runs.)
 
-Expected: both FAIL (the foreign completion rings). Restore the guards (`git checkout -- crates/freshell-activity/src/codex.rs` restores the committed version if you edited in place).
+Expected: both FAIL — each at its mid-test bounded no-ring check, because the unguarded foreign completion rings (the hub test at "a sub-agent thread completion must not ring", the router test at "a foreign thread completion must not ring"). Restore the guards (`git checkout -- crates/freshell-activity/src/codex.rs` restores the committed version if you edited in place).
+
+Then run a SECOND directed mutation to prove the router test pins the NESTED `turn.status` extraction (the router-seam property no other test covers — the hub tests inject status directly into `note_codex_proxy_turn`, bypassing the router). With `codex.rs` restored, in `crates/freshell-ws/src/codex_proxy_route.rs`'s `RemoteProxyEvent::TurnCompleted` arm temporarily replace the Task 2 Step 7 line
+
+```rust
+                let status = freshell_codex::turn_status(&params.params);
+```
+
+with
+
+```rust
+                let status: Option<String> = None;
+```
+
+and run:
+
+```bash
+cargo test -p freshell-ws turn_events_forward_thread_turn_and_nested_status
+```
+
+Expected: FAIL at "a nested inProgress status must be extracted and must not ring" — the mutated router forwards `None`, absent status records (design decision #3), and the bound-thread `inProgress` completion rings prematurely. Restore with `git checkout -- crates/freshell-ws/src/codex_proxy_route.rs`.
 
 - [ ] **Step 4: Run green**
 
