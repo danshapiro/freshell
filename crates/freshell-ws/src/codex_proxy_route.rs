@@ -93,6 +93,11 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
             // S5.a + D-GATE-SOFT: log only (includes CandidateCaptureTimeout).
             tracing::warn!(terminal_id = %terminal_id, ?trigger, "codex_proxy_repair_trigger");
         }
+        RemoteProxyEvent::ApprovalRequested(_) | RemoteProxyEvent::ApprovalResolved { .. } => {
+            // Task 6 (proxy approval sniffing) emits these; Task 7 routes them
+            // into the activity hub's attention tracking. Observe-only until then.
+            tracing::debug!(terminal_id = %terminal_id, "codex_proxy_approval_event");
+        }
     }
 }
 

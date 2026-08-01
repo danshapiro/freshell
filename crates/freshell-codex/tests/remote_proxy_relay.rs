@@ -761,7 +761,405 @@ async fn a_slow_tui_consumer_does_not_lose_messages_from_upstream() {
     proxy.close().await;
 }
 
-// ── 10. close() tears down active connections and stops accepting new ones ─────────
+// ── 10. approval-request sniffing (decisions 5/6/7) ─────────────────────────────────
+
+/// Polls briefly and asserts NO proxy event arrives — used to prove non-approval
+/// frames and unknown-id responses stay event-silent.
+async fn assert_no_event(rx: &mut mpsc::UnboundedReceiver<RemoteProxyEvent>) {
+    let res = timeout(Duration::from_millis(300), rx.recv()).await;
+    assert!(res.is_err(), "expected no proxy event, got {res:?}");
+}
+
+#[tokio::test]
+async fn approval_request_frame_emits_approval_requested_and_relays_verbatim() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "item/commandExecution/requestApproval",
+        "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+    })
+    .to_string();
+    conn.send_text(frame.clone());
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::ApprovalRequested(params) => {
+            assert_eq!(params.request_id, "41");
+            assert_eq!(params.method, "item/commandExecution/requestApproval");
+            assert_eq!(params.thread_id.as_deref(), Some("thread-1"));
+        }
+        other => panic!("expected ApprovalRequested, got {other:?}"),
+    }
+
+    let relayed = recv_text(&mut tui).await;
+    assert_eq!(
+        relayed, frame,
+        "the approval request must relay to the client byte-identical"
+    );
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn non_approval_server_request_is_relayed_without_events() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "item/tool/call",
+        "params": {"threadId": "thread-1"},
+    })
+    .to_string();
+    conn.send_text(frame.clone());
+
+    let relayed = recv_text(&mut tui).await;
+    assert_eq!(
+        relayed, frame,
+        "automated server request must relay verbatim"
+    );
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn approval_response_emits_approval_resolved_and_forwards_upstream() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+    let _ = recv_events(&mut events, 1).await; // ApprovalRequested
+    let _ = recv_text(&mut tui).await; // the relayed approval request
+
+    let response =
+        json!({"jsonrpc": "2.0", "id": 41, "result": {"decision": "approved"}}).to_string();
+    tui.send(Message::Text(response.clone())).await.unwrap();
+
+    let received_events = recv_events(&mut events, 1).await;
+    assert_eq!(
+        received_events[0],
+        RemoteProxyEvent::ApprovalResolved {
+            request_id: "41".to_string()
+        }
+    );
+
+    let forwarded = conn.recv_text().await;
+    assert_eq!(
+        forwarded, response,
+        "the approval response must forward upstream unchanged"
+    );
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn client_response_with_unknown_id_emits_nothing() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    let response = json!({"id": 999, "result": {}}).to_string();
+    tui.send(Message::Text(response.clone())).await.unwrap();
+
+    let forwarded = conn.recv_text().await;
+    assert_eq!(forwarded, response);
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn approval_request_without_thread_id_yields_none() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::ApprovalRequested(params) => {
+            assert_eq!(params.request_id, "41");
+            assert_eq!(params.thread_id, None);
+        }
+        other => panic!("expected ApprovalRequested, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn legacy_approval_reads_conversation_id() {
+    // Decision 7 / audit A3: legacy methods carry params.conversationId, not
+    // params.threadId (codex-rs v1.rs:126-158).
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let _tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "execCommandApproval",
+            "params": {"conversationId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::ApprovalRequested(params) => {
+            assert_eq!(params.request_id, "42");
+            assert_eq!(params.method, "execCommandApproval");
+            assert_eq!(params.thread_id.as_deref(), Some("thread-1"));
+        }
+        other => panic!("expected ApprovalRequested, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn error_response_also_resolves() {
+    // Decision 5a / audit A5: a client {id, error} response resolves identically to
+    // {id, result} — codex handles errors via process_error.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+    let _ = recv_events(&mut events, 1).await; // ApprovalRequested
+    let _ = recv_text(&mut tui).await; // the relayed approval request
+
+    let response =
+        json!({"jsonrpc": "2.0", "id": 41, "error": {"code": -1, "message": "denied"}}).to_string();
+    tui.send(Message::Text(response.clone())).await.unwrap();
+
+    let received_events = recv_events(&mut events, 1).await;
+    assert_eq!(
+        received_events[0],
+        RemoteProxyEvent::ApprovalResolved {
+            request_id: "41".to_string()
+        }
+    );
+
+    let forwarded = conn.recv_text().await;
+    assert_eq!(forwarded, response);
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn client_frame_with_id_and_method_never_resolves() {
+    // Decision 5d: response matching REQUIRES method-absence — a client REQUEST whose
+    // id numerically collides with a pending server approval must not resolve it.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let mut conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+    let _ = recv_events(&mut events, 1).await; // ApprovalRequested
+    let _ = recv_text(&mut tui).await; // the relayed approval request
+
+    let colliding_request =
+        json!({"jsonrpc": "2.0", "id": 41, "method": "thread/start", "params": {}}).to_string();
+    tui.send(Message::Text(colliding_request.clone()))
+        .await
+        .unwrap();
+
+    let forwarded = conn.recv_text().await;
+    assert_eq!(
+        forwarded, colliding_request,
+        "the colliding client REQUEST must forward upstream unchanged"
+    );
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn server_request_resolved_notification_resolves() {
+    // Decision 5c: the upstream `serverRequest/resolved` notification (fields
+    // {thread_id, request_id} under camelCase serde rename — codex
+    // v2/notification.rs:53-56 @0.146.0) resolves the pending approval.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+    let _ = recv_events(&mut events, 1).await; // ApprovalRequested
+    let _ = recv_text(&mut tui).await; // the relayed approval request
+
+    let notification = json!({
+        "method": "serverRequest/resolved",
+        "params": {"threadId": "thread-1", "requestId": "41"},
+    })
+    .to_string();
+    conn.send_text(notification.clone());
+
+    let received_events = recv_events(&mut events, 1).await;
+    assert_eq!(
+        received_events[0],
+        RemoteProxyEvent::ApprovalResolved {
+            request_id: "41".to_string()
+        }
+    );
+
+    let relayed = recv_text(&mut tui).await;
+    assert_eq!(
+        relayed, notification,
+        "the resolved notification must relay to the client verbatim"
+    );
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn upstream_reconnect_clears_pending_approvals() {
+    // Decision 5b: upstream teardown drains ALL pending approvals — the restarted
+    // app-server's per-process id counter starts at 0 again and stale ids would collide.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    conn.send_text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "command": "rm -rf /tmp/x"},
+        })
+        .to_string(),
+    );
+    let _ = recv_events(&mut events, 1).await; // ApprovalRequested
+    let _ = recv_text(&mut tui).await; // the relayed approval request
+
+    drop(conn); // upstream goes away (the harness's disconnect simulation)
+
+    let received_events = recv_events(&mut events, 2).await;
+    assert!(
+        received_events.iter().any(|e| matches!(
+            e,
+            RemoteProxyEvent::ApprovalResolved { request_id } if request_id == "41"
+        )),
+        "expected the drained pending approval to resolve, got {received_events:?}"
+    );
+
+    proxy.close().await;
+}
+
+#[tokio::test]
+async fn unknown_server_request_method_is_logged_not_belled() {
+    // Decision 6: an unrecognized server->client request method is debug-logged and
+    // relayed — never treated as an approval.
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+    let conn = upstream.accept().await;
+
+    let frame = json!({"jsonrpc": "2.0", "id": 43, "method": "some/future/method", "params": {}})
+        .to_string();
+    conn.send_text(frame.clone());
+
+    let relayed = recv_text(&mut tui).await;
+    assert_eq!(relayed, frame, "unknown server request must relay verbatim");
+    assert_no_event(&mut events).await;
+
+    proxy.close().await;
+}
+
+// ── 11. close() tears down active connections and stops accepting new ones ─────────
 
 #[tokio::test]
 async fn close_tears_down_active_connections_and_stops_accepting_new_ones() {

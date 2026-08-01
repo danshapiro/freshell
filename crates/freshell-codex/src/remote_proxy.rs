@@ -80,6 +80,36 @@ const STATEFUL_NOTIFICATION_METHODS: &[&str] = &[
     "thread/status/changed",
 ];
 
+/// Server→client JSON-RPC REQUEST methods that block on a human. Sourced
+/// from the codex 0.129.0 schema inventory
+/// (test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94)
+/// and verified EXACT against the codex `ServerRequest` enum at both
+/// 0.129.0 and the deployed 0.146.0.
+const APPROVAL_REQUEST_METHODS: &[&str] = &[
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "applyPatchApproval",
+    "execCommandApproval",
+];
+
+/// Machine-serviced server→client requests — never human-attention.
+/// (`attestation/generate` and `currentTime/read` are new at 0.146.0.)
+/// Anything outside BOTH lists is debug-logged to catch future drift
+/// (decision 6) — no bell, just logging.
+const AUTOMATED_SERVER_REQUEST_METHODS: &[&str] = &[
+    "item/tool/call",
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate",
+    "currentTime/read",
+];
+
+/// Legacy approval methods carry `params.conversationId` instead of
+/// `params.threadId` (codex-rs v1.rs:126-158).
+const LEGACY_APPROVAL_REQUEST_METHODS: &[&str] = &["applyPatchApproval", "execCommandApproval"];
+
 /// `MAX_COMPLETED_TURN_KEYS` (`remote-proxy.ts:95`).
 const MAX_COMPLETED_TURN_KEYS: usize = 256;
 
@@ -161,6 +191,18 @@ pub struct TurnEventParams {
     pub params: Map<String, Value>,
 }
 
+/// One sniffed server→client approval REQUEST (a frame carrying BOTH `id` and `method`,
+/// with the method in [`APPROVAL_REQUEST_METHODS`]) — the codex app-server is blocked on
+/// a human until it resolves. Task 7 routes this into the hub's attention tracking.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalRequestParams {
+    /// Canonicalized request id (string form of the JSON-RPC id).
+    pub request_id: String,
+    pub method: String,
+    /// Best-effort params.threadId — None for oversized/opaque frames.
+    pub thread_id: Option<String>,
+}
+
 /// The lifecycle-LOSS subset of thread lifecycle notifications (`CodexThreadLifecycleLossEvent`,
 /// `client.ts`, consumed at `remote-proxy.ts:669,677-681,745,751-756`): `thread/closed`
 /// always; `thread/status/changed` only for the two loss-worthy statuses.
@@ -204,6 +246,15 @@ pub enum RemoteProxyEvent {
     TurnStarted(TurnEventParams),
     TurnCompleted(TurnEventParams),
     RepairTrigger(RemoteProxyRepairTrigger),
+    /// A server→client approval request was sniffed (decision 5) — the app-server is
+    /// blocked on a human. The frame itself is relayed verbatim regardless.
+    ApprovalRequested(ApprovalRequestParams),
+    /// A previously-sniffed approval resolved: a client `{id, result}` OR `{id, error}`
+    /// response (decision 5a), an upstream `serverRequest/resolved` notification
+    /// (decision 5c), or connection teardown draining the pending set (decision 5b).
+    ApprovalResolved {
+        request_id: String,
+    },
 }
 
 // ── the proxy handle ─────────────────────────────────────────────────────────────────
@@ -575,6 +626,10 @@ struct ConnState {
     pending_to_upstream: VecDeque<OutFrame>,
     pending_methods: HashMap<RequestId, String>,
     pending_fork_requests: HashMap<RequestId, Option<String>>,
+    /// Sniffed server→client approval requests still awaiting a resolution (decision 5).
+    /// Keyed on the SERVER's id space (never consulted for our own client requests);
+    /// drained with `ApprovalResolved` emissions on connection teardown (decision 5b).
+    pending_server_approvals: HashSet<RequestId>,
 }
 
 impl ConnState {
@@ -585,6 +640,7 @@ impl ConnState {
             pending_to_upstream: VecDeque::new(),
             pending_methods: HashMap::new(),
             pending_fork_requests: HashMap::new(),
+            pending_server_approvals: HashSet::new(),
         }
     }
 }
@@ -770,7 +826,14 @@ async fn run_hub(
                         None,
                     );
                 }
-                for (_, conn) in hub.connections.drain() {
+                let drained: Vec<ConnState> = hub.connections.drain().map(|(_, c)| c).collect();
+                for conn in drained {
+                    // Decision 5b: shutdown is a teardown too — drain pending approvals.
+                    for req_id in conn.pending_server_approvals {
+                        hub.emit(RemoteProxyEvent::ApprovalResolved {
+                            request_id: request_id_to_string(&req_id),
+                        });
+                    }
                     if let Some(tx) = conn.client_tx {
                         let _ = tx.send(WriterMsg::Close);
                     }
@@ -792,6 +855,15 @@ impl Hub {
 
     fn close_connection(&mut self, conn_id: u64) {
         if let Some(conn) = self.connections.remove(&conn_id) {
+            // Decision 5b: teardown/restart drains ALL pending approvals. A restarted
+            // app-server's per-process id counter starts at 0 again, so stale pending
+            // ids would collide with the next incarnation's fresh requests — resolve
+            // them now rather than letting a tracker stay paused forever.
+            for req_id in conn.pending_server_approvals {
+                self.emit(RemoteProxyEvent::ApprovalResolved {
+                    request_id: request_id_to_string(&req_id),
+                });
+            }
             if let Some(tx) = conn.client_tx {
                 let _ = tx.send(WriterMsg::Close);
             }
@@ -1022,10 +1094,30 @@ impl Hub {
         id: Option<JsonRpcEnvelopeId>,
         method: Option<String>,
     ) {
-        if let (Some(id), Some(method)) = (id.as_ref().and_then(envelope_id_to_request_id), method)
-        {
-            if let Some(conn) = self.connections.get_mut(&conn_id) {
-                conn.pending_methods.insert(id, method);
+        if let Some(req_id) = id.as_ref().and_then(envelope_id_to_request_id) {
+            match method {
+                Some(method) => {
+                    if let Some(conn) = self.connections.get_mut(&conn_id) {
+                        conn.pending_methods.insert(req_id, method);
+                    }
+                }
+                None => {
+                    // A response frame: {id, result} OR {id, error} — BOTH resolve a
+                    // pending server approval (decision 5a; codex handles errors via
+                    // process_error). The `method`-absence check is MANDATORY
+                    // (decision 5d): a client REQUEST whose id numerically collides
+                    // with a pending server approval must not resolve it, so this arm
+                    // only ever sees genuine responses.
+                    let resolved = self
+                        .connections
+                        .get_mut(&conn_id)
+                        .is_some_and(|conn| conn.pending_server_approvals.remove(&req_id));
+                    if resolved {
+                        self.emit(RemoteProxyEvent::ApprovalResolved {
+                            request_id: request_id_to_string(&req_id),
+                        });
+                    }
+                }
             }
         }
         self.send_to_upstream(conn_id, data, binary);
@@ -1097,6 +1189,49 @@ impl Hub {
         };
 
         if let Some(id) = envelope.id.clone() {
+            if let Some(method) = envelope.method.as_deref() {
+                // id + method ⇒ a server→client REQUEST (our own responses never
+                // reach this path). Never consult pending_methods for these — the
+                // server's id space is not ours.
+                if APPROVAL_REQUEST_METHODS.contains(&method) {
+                    if let Some(req_id) = envelope_id_to_request_id(&id) {
+                        // v2 methods carry params.threadId; legacy methods carry
+                        // params.conversationId (decision 7, codex-rs v1.rs:126-158).
+                        let thread_pointer = if LEGACY_APPROVAL_REQUEST_METHODS.contains(&method) {
+                            "/params/conversationId"
+                        } else {
+                            "/params/threadId"
+                        };
+                        let thread_id = (data.len() <= MAX_FULL_PARSE_BYTES)
+                            .then(|| serde_json::from_slice::<Value>(&data).ok())
+                            .flatten()
+                            .and_then(|v| {
+                                v.pointer(thread_pointer)
+                                    .and_then(|t| t.as_str())
+                                    .map(str::to_string)
+                            });
+                        if let Some(conn) = self.connections.get_mut(&conn_id) {
+                            conn.pending_server_approvals.insert(req_id);
+                        }
+                        self.emit(RemoteProxyEvent::ApprovalRequested(ApprovalRequestParams {
+                            request_id: envelope_id_to_string(&id),
+                            method: method.to_string(),
+                            thread_id,
+                        }));
+                    }
+                } else if !AUTOMATED_SERVER_REQUEST_METHODS.contains(&method) {
+                    // Decision 6: the method set is version-fluid — surface drift.
+                    tracing::debug!(
+                        method,
+                        "unrecognized codex server->client request method (not treated as an approval)"
+                    );
+                }
+                // The proxy observes, never consumes: every server→client request
+                // relays verbatim, approval or not.
+                self.send_to_client(conn_id, data, binary);
+                return;
+            }
+
             let req_id = envelope_id_to_request_id(&id);
             let (method, fork_request) = match self.connections.get_mut(&conn_id) {
                 Some(conn) => {
@@ -1130,12 +1265,65 @@ impl Hub {
         }
 
         if let Some(method) = envelope.method.as_deref() {
+            if method == "serverRequest/resolved" {
+                // Decision 5c: the app-server resolved its own request (fields
+                // {thread_id, request_id} under camelCase serde rename — codex
+                // v2/notification.rs:53-56 @0.146.0). Resolve the pending approval;
+                // relay the notification verbatim regardless.
+                self.handle_server_request_resolved_notification(&data);
+                self.send_to_client(conn_id, data, binary);
+                return;
+            }
             if STATEFUL_NOTIFICATION_METHODS.contains(&method) {
                 self.handle_stateful_upstream_notification(conn_id, data, binary, method);
                 return;
             }
         }
         self.send_to_client(conn_id, data, binary);
+    }
+
+    /// Matches an upstream `serverRequest/resolved` notification's `params.requestId`
+    /// against every connection's pending approval set (the request went out on this
+    /// proxy's single upstream) and emits [`RemoteProxyEvent::ApprovalResolved`] when it
+    /// was pending. Best-effort: oversized/opaque frames resolve nothing (the teardown
+    /// drain, decision 5b, remains the backstop).
+    fn handle_server_request_resolved_notification(&mut self, data: &[u8]) {
+        if data.len() > MAX_FULL_PARSE_BYTES {
+            return;
+        }
+        let Ok(parsed) = serde_json::from_slice::<Value>(data) else {
+            return;
+        };
+        let Some(request_id_value) = parsed.pointer("/params/requestId") else {
+            return;
+        };
+        // The wire may carry the id as a string ("41") or a number (41); a pending
+        // RequestId::Int(41) must resolve either way.
+        let (candidates, request_id) = match request_id_value {
+            Value::String(s) => {
+                let mut candidates = vec![RequestId::Str(s.clone())];
+                if let Ok(n) = s.parse::<i64>() {
+                    candidates.push(RequestId::Int(n));
+                }
+                (candidates, s.clone())
+            }
+            Value::Number(n) => match n.as_i64() {
+                Some(n) => (vec![RequestId::Int(n)], n.to_string()),
+                None => return,
+            },
+            _ => return,
+        };
+        let mut resolved = false;
+        for conn in self.connections.values_mut() {
+            for candidate in &candidates {
+                if conn.pending_server_approvals.remove(candidate) {
+                    resolved = true;
+                }
+            }
+        }
+        if resolved {
+            self.emit(RemoteProxyEvent::ApprovalResolved { request_id });
+        }
     }
 
     fn handle_thread_start_response(
@@ -1541,6 +1729,31 @@ fn envelope_id_to_request_id(id: &JsonRpcEnvelopeId) -> Option<RequestId> {
                 None
             }
         }
+    }
+}
+
+/// Canonicalizes a JSON-RPC id for the [`ApprovalRequestParams::request_id`] payload:
+/// string ids verbatim, numeric ids via their canonical integer formatting (matching
+/// [`envelope_id_to_json`]'s integer-literal preference).
+fn envelope_id_to_string(id: &JsonRpcEnvelopeId) -> String {
+    match id {
+        JsonRpcEnvelopeId::Str(s) => s.clone(),
+        JsonRpcEnvelopeId::Num(n) => {
+            if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                (*n as i64).to_string()
+            } else {
+                n.to_string()
+            }
+        }
+    }
+}
+
+/// The [`RequestId`] counterpart of [`envelope_id_to_string`] — used where only the
+/// bridged pending-set key is at hand (response matching, teardown drains).
+fn request_id_to_string(id: &RequestId) -> String {
+    match id {
+        RequestId::Int(n) => n.to_string(),
+        RequestId::Str(s) => s.clone(),
     }
 }
 
