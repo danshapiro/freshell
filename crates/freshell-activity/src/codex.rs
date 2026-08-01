@@ -312,6 +312,19 @@ impl CodexActivityTracker {
             events.latest_task_completed_at,
             events.latest_turn_aborted_at,
         );
+        // The newest terminating event decides the clear's shape: an abort
+        // (Esc-interrupt / `turn_aborted`) still ends the turn but must not
+        // ring (shared/ws-protocol.ts:199-208 -- terminal.idle is "never
+        // emitted after crash/interrupt/exit"). Ties go to task_complete: a
+        // real completion at the same instant still rings.
+        let clear_is_abort = match (
+            events.latest_task_completed_at,
+            events.latest_turn_aborted_at,
+        ) {
+            (Some(completed), Some(aborted)) => aborted > completed,
+            (None, Some(_)) => true,
+            _ => false,
+        };
 
         // Promote on a NEW unresolved start.
         if let Some(started_at) = events.latest_task_started_at {
@@ -363,6 +376,7 @@ impl CodexActivityTracker {
                         at,
                         &mut self.ledger,
                         &mut completions,
+                        !clear_is_abort,
                     );
                     // CE1: swallow the PTY BEL echo of this reconciled turn end
                     // (armed regardless of whether the fold arrived as one
@@ -376,7 +390,13 @@ impl CodexActivityTracker {
                         .map(|accepted| cleared_at >= accepted)
                         .unwrap_or(false)
                 {
-                    transition_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                    transition_after_turn_clear(
+                        state,
+                        at,
+                        &mut self.ledger,
+                        &mut completions,
+                        !clear_is_abort,
+                    );
                     state.swallow_next_bel = true;
                     // S5.a: and the proxy echo of the same physical turn.
                     state.swallow_next_proxy_complete = true;
@@ -555,7 +575,13 @@ impl CodexActivityTracker {
         let mut completions: Vec<(Option<String>, i64, i64)> = Vec::new();
         match state.phase {
             CodexPhase::Pending => {
-                transition_pending_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                transition_pending_after_turn_clear(
+                    state,
+                    at,
+                    &mut self.ledger,
+                    &mut completions,
+                    true,
+                );
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
             }
@@ -741,13 +767,13 @@ fn consume_turn_complete_signal(
 ) -> bool {
     if state.phase == CodexPhase::Pending {
         if state.pending_submit_at.is_some() {
-            transition_pending_after_turn_clear(state, at, ledger, completions);
+            transition_pending_after_turn_clear(state, at, ledger, completions, true);
             return true;
         }
         return false;
     }
     if state.accepted_start_at.is_some() {
-        transition_after_turn_clear(state, at, ledger, completions);
+        transition_after_turn_clear(state, at, ledger, completions, true);
         return true;
     }
     false
@@ -758,6 +784,7 @@ fn transition_pending_after_turn_clear(
     at: i64,
     ledger: &mut TurnCompletionLedger,
     completions: &mut Vec<(Option<String>, i64, i64)>,
+    record: bool,
 ) {
     let turn_key = state.pending_submit_at;
     let queued = has_queued_submit(state);
@@ -780,7 +807,11 @@ fn transition_pending_after_turn_clear(
         state.pending_until = None;
         state.queued_submit_at = None;
     }
-    record_completion_if_idle(state, turn_key, at, ledger, completions);
+    if record {
+        record_completion_if_idle(state, turn_key, at, ledger, completions);
+    } else {
+        claim_turn_key_if_idle(state, turn_key);
+    }
 }
 
 fn transition_after_turn_clear(
@@ -788,6 +819,7 @@ fn transition_after_turn_clear(
     at: i64,
     ledger: &mut TurnCompletionLedger,
     completions: &mut Vec<(Option<String>, i64, i64)>,
+    record: bool,
 ) {
     let turn_key = state.accepted_start_at;
     let queued = has_queued_submit(state);
@@ -807,7 +839,11 @@ fn transition_after_turn_clear(
         state.queued_submit_at = None;
         state.pending_until = None;
     }
-    record_completion_if_idle(state, turn_key, at, ledger, completions);
+    if record {
+        record_completion_if_idle(state, turn_key, at, ledger, completions);
+    } else {
+        claim_turn_key_if_idle(state, turn_key);
+    }
 }
 
 /// `recordCompletionIfIdle`: record only when a real turn-end transition
@@ -830,6 +866,21 @@ fn record_completion_if_idle(
     state.last_emitted_turn_key = Some(turn_key);
     let seq = ledger.record_turn_completion(&state.terminal_id, at);
     completions.push((state.session_id.clone(), at, seq));
+}
+
+/// Abort-shaped clears (`turn_aborted` in the rollout lane; status
+/// `interrupted`/`failed` on the proxy lane, Task 2): claim the turn key
+/// exactly like `record_completion_if_idle` does, but WITHOUT recording a
+/// ledger completion -- the pane returns to idle silently
+/// (shared/ws-protocol.ts:199-208: `terminal.idle` is never emitted after
+/// crash/interrupt/exit) and a later echo of the same physical turn cannot
+/// mint a completion.
+fn claim_turn_key_if_idle(state: &mut TerminalActivity, turn_key: Option<i64>) {
+    let Some(turn_key) = turn_key else { return };
+    if state.phase != CodexPhase::Idle {
+        return;
+    }
+    state.last_emitted_turn_key = Some(turn_key);
 }
 
 #[cfg(test)]
@@ -1111,11 +1162,38 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_turn_aborted_also_clears_and_completes() {
+    fn reconcile_turn_aborted_clears_without_completing() {
+        // SEMANTIC CHANGE (kata: codex-turn-thread-scope). This test replaces
+        // `reconcile_turn_aborted_also_clears_and_completes`, which pinned the
+        // old buggy behavior. shared/ws-protocol.ts:199-208 pins terminal.idle
+        // as "never emitted after crash/interrupt/exit" -- an Esc-interrupt
+        // (`turn_aborted`) must return the pane to idle WITHOUT recording a
+        // bell-worthy completion.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", None, 0);
         tracker.reconcile_rollout("t1", &started(100), 200);
         let events = CodexTaskEvents {
+            latest_turn_aborted_at: Some(300),
+            ..Default::default()
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 400);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert!(
+            completions(&effects).is_empty(),
+            "turn_aborted must not ring the bell"
+        );
+    }
+
+    #[test]
+    fn reconcile_task_complete_at_or_after_an_abort_still_completes() {
+        // Tie-break rule: abort suppresses the chime only when it is STRICTLY
+        // the newest terminating event. A real task_complete at the same
+        // instant (or newer) still rings.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let events = CodexTaskEvents {
+            latest_task_completed_at: Some(300),
             latest_turn_aborted_at: Some(300),
             ..Default::default()
         };
