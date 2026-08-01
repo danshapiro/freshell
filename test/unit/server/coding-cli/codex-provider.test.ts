@@ -178,6 +178,90 @@ describe('codex-provider', () => {
     })
   })
 
+  it('captures the turn_aborted reason paired with the abort timestamp', () => {
+    const meta = parseCodexSessionContent([
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-abort-reason', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'review_ended' },
+      }),
+    ].join('\n'))
+
+    expect(meta.codexTaskEvents).toEqual({
+      latestTurnAbortedAt: Date.parse('2026-03-01T00:00:06.000Z'),
+      latestTurnAbortedReason: 'review_ended',
+    })
+  })
+
+  it('leaves latestTurnAbortedReason absent for legacy turn_aborted lines without a reason', () => {
+    const meta = parseCodexSessionContent([
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-abort-legacy', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-1' },
+      }),
+    ].join('\n'))
+
+    expect(meta.codexTaskEvents).toEqual({
+      latestTurnAbortedAt: Date.parse('2026-03-01T00:00:06.000Z'),
+    })
+  })
+
+  it('pairs the reason with the newest abort: a newer reason-less abort clears a stale reason', () => {
+    const sessionMeta = JSON.stringify({
+      timestamp: '2026-03-01T00:00:00.000Z',
+      type: 'session_meta',
+      payload: { id: 'session-abort-newest', cwd: '/project/codex' },
+    })
+
+    // Older abort carries a reason; the newer reason-less abort wins the pairing.
+    const staleReasonCleared = parseCodexSessionContent([
+      sessionMeta,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-1', reason: 'review_ended' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:08.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-2' },
+      }),
+    ].join('\n'))
+    expect(staleReasonCleared.codexTaskEvents).toEqual({
+      latestTurnAbortedAt: Date.parse('2026-03-01T00:00:08.000Z'),
+    })
+
+    // And the reverse: a newer abort's reason replaces the older pairing.
+    const newestReasonWins = parseCodexSessionContent([
+      sessionMeta,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-1' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:08.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-2', reason: 'review_ended' },
+      }),
+    ].join('\n'))
+    expect(newestReasonWins.codexTaskEvents).toEqual({
+      latestTurnAbortedAt: Date.parse('2026-03-01T00:00:08.000Z'),
+      latestTurnAbortedReason: 'review_ended',
+    })
+  })
+
   it('drops head-only unresolved starts from truncated Codex snippets while preserving clear signals', () => {
     expect(sanitizeCodexTaskEventsForTruncatedSnippet({
       latestTaskStartedAt: 100,
@@ -187,9 +271,11 @@ describe('codex-provider', () => {
       latestTaskStartedAt: 100,
       latestTaskCompletedAt: 90,
       latestTurnAbortedAt: 110,
+      latestTurnAbortedReason: 'review_ended',
     })).toEqual({
       latestTaskCompletedAt: 90,
       latestTurnAbortedAt: 110,
+      latestTurnAbortedReason: 'review_ended',
     })
   })
 

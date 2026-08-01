@@ -1381,6 +1381,10 @@ describe('reconcile turn_aborted de-chime (kata codex-turn-thread-scope)', () =>
     // SEMANTIC CHANGE: shared/ws-protocol.ts terminal.idle is "never emitted
     // after crash/interrupt/exit" -- an Esc-interrupt (turn_aborted in the
     // rollout JSONL) must return the pane to idle silently.
+    //
+    // REFINEMENT (abortReasonIsHuman): this snapshot carries no
+    // latestTurnAbortedReason (legacy line / uncertainty), which stays
+    // SILENT; only a present, non-human reason rings (see tests below).
     const tracker = new CodexActivityTracker()
     const completions: unknown[] = []
     tracker.on('turn.complete', (event) => completions.push(event))
@@ -1429,6 +1433,95 @@ describe('reconcile turn_aborted de-chime (kata codex-turn-thread-scope)', () =>
         latestTaskStartedAt: 1_150,
         latestTaskCompletedAt: 1_180,
         latestTurnAbortedAt: 1_180,
+      })),
+      1_300,
+    )
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toHaveLength(1)
+  })
+
+  // Locked decision 2 (mirrors Rust abort_reason_is_human): reason
+  // 'interrupted' or 'replaced' -> human-requested, silent; reason MISSING ->
+  // legacy/uncertainty, silent; any OTHER present reason -> not
+  // human-attributed, records a completion (rings). Forward-compatible: no
+  // live codex writes a ring-worthy reason today.
+  it('an abort with reason "interrupted" clears busy silently', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })),
+      1_200,
+    )
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_150,
+        latestTurnAbortedAt: 1_180,
+        latestTurnAbortedReason: 'interrupted',
+      })),
+      1_300,
+    )
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([])
+  })
+
+  it('an abort with reason "replaced" clears busy silently', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })),
+      1_200,
+    )
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_150,
+        latestTurnAbortedAt: 1_180,
+        latestTurnAbortedReason: 'replaced',
+      })),
+      1_300,
+    )
+    expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'idle' })
+    expect(completions).toEqual([])
+  })
+
+  it('an abort with an unknown (non-human) reason records a completion', () => {
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 })),
+      1_200,
+    )
+    tracker.reconcileProjects(
+      createProjects(createSession('session-1', {
+        latestTaskStartedAt: 1_150,
+        latestTurnAbortedAt: 1_180,
+        latestTurnAbortedReason: 'review_ended',
       })),
       1_300,
     )

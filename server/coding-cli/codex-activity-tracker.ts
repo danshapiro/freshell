@@ -83,6 +83,13 @@ function latestClearAt(session?: CodingCliSession): number | undefined {
   )
 }
 
+// Mirrors Rust abort_reason_is_human: missing reason = legacy/uncertainty ->
+// silent; 'interrupted'/'replaced' = human-requested -> silent; anything else
+// is not human-attributed and records (rings).
+function abortReasonIsHuman(reason: string | undefined): boolean {
+  return reason === undefined || reason === 'interrupted' || reason === 'replaced'
+}
+
 function isUnresolvedSession(session?: CodingCliSession): boolean {
   const startedAt = session?.codexTaskEvents?.latestTaskStartedAt
   if (startedAt === undefined) return false
@@ -313,6 +320,10 @@ export class CodexActivityTracker extends EventEmitter {
       // clear_is_abort (crates/freshell-activity/src/codex.rs).
       const clearIsAbort = nextTurnAbortedAt !== undefined
         && (nextCompletedAt === undefined || nextTurnAbortedAt > nextCompletedAt)
+      // Abort-shaped clears stay silent only when human-attributed (or the
+      // legacy reason-less form); a present non-human reason records (rings).
+      const nextTurnAbortedReason = session.codexTaskEvents?.latestTurnAbortedReason
+      const record = !clearIsAbort || !abortReasonIsHuman(nextTurnAbortedReason)
       state.lastSeenSessionLastActivityAt = maxDefined(state.lastSeenSessionLastActivityAt, session.lastActivityAt)
 
       if (nextStartedAt !== undefined) {
@@ -368,7 +379,7 @@ export class CodexActivityTracker extends EventEmitter {
         && state.pendingSubmitAt !== undefined
         && clearedAt >= state.pendingSubmitAt
       ) {
-        this.transitionPendingAfterTurnClear(state, at, !clearIsAbort)
+        this.transitionPendingAfterTurnClear(state, at, record)
       }
 
       if (
@@ -377,7 +388,7 @@ export class CodexActivityTracker extends EventEmitter {
         && clearedAt >= state.acceptedStartAt
         && (state.phase === 'busy' || state.phase === 'unknown')
       ) {
-        this.transitionAfterTurnClear(state, at, !clearIsAbort)
+        this.transitionAfterTurnClear(state, at, record)
       }
 
       this.commitState(state, previous)

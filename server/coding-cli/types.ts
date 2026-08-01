@@ -118,6 +118,12 @@ export interface CodexTaskEventSnapshot {
   latestTaskStartedAt?: number
   latestTaskCompletedAt?: number
   latestTurnAbortedAt?: number
+  /**
+   * The `reason` on the newest turn_aborted line, paired newest-wins with
+   * `latestTurnAbortedAt` (a newer reason-less abort clears a stale reason).
+   * Mirrors Rust `latest_turn_aborted_reason`. Absent on legacy lines.
+   */
+  latestTurnAbortedReason?: string
 }
 
 export interface ErrorPayload {

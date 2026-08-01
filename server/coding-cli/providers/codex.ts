@@ -271,6 +271,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   let latestTaskStartedAt: number | undefined
   let latestTaskCompletedAt: number | undefined
   let latestTurnAbortedAt: number | undefined
+  let latestTurnAbortedReason: string | undefined
 
   for (const line of lines) {
     let obj: any
@@ -360,7 +361,14 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
           latestTaskCompletedAt = maxTimestamp(latestTaskCompletedAt, timestampMs)
           break
         case 'turn_aborted':
-          latestTurnAbortedAt = maxTimestamp(latestTurnAbortedAt, timestampMs)
+          // Pair the reason with the winning timestamp (newest-wins): a newer
+          // reason-less abort clears a stale reason. Mirrors the Rust
+          // latest_turn_aborted_reason pairing.
+          if (timestampMs !== undefined && (latestTurnAbortedAt === undefined || timestampMs > latestTurnAbortedAt)) {
+            latestTurnAbortedAt = timestampMs
+            latestTurnAbortedReason =
+              typeof obj?.payload?.reason === 'string' ? obj.payload.reason : undefined
+          }
           break
         default:
           break
@@ -380,6 +388,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
             ...(latestTaskStartedAt !== undefined ? { latestTaskStartedAt } : {}),
             ...(latestTaskCompletedAt !== undefined ? { latestTaskCompletedAt } : {}),
             ...(latestTurnAbortedAt !== undefined ? { latestTurnAbortedAt } : {}),
+            ...(latestTurnAbortedReason !== undefined ? { latestTurnAbortedReason } : {}),
           } satisfies CodexTaskEventSnapshot,
         }
       : {}),
@@ -417,7 +426,13 @@ export function sanitizeCodexTaskEventsForTruncatedSnippet(
       ? { latestTaskCompletedAt: preserveTailStart ? tailCompletedAt : snapshot.latestTaskCompletedAt }
       : {}),
     ...((preserveTailStart ? tailTurnAbortedAt : snapshot.latestTurnAbortedAt) !== undefined
-      ? { latestTurnAbortedAt: preserveTailStart ? tailTurnAbortedAt : snapshot.latestTurnAbortedAt }
+      ? {
+          latestTurnAbortedAt: preserveTailStart ? tailTurnAbortedAt : snapshot.latestTurnAbortedAt,
+          // Keep the reason paired with whichever abort timestamp won.
+          ...((preserveTailStart ? tailSnapshot?.latestTurnAbortedReason : snapshot.latestTurnAbortedReason) !== undefined
+            ? { latestTurnAbortedReason: preserveTailStart ? tailSnapshot?.latestTurnAbortedReason : snapshot.latestTurnAbortedReason }
+            : {}),
+        }
       : {}),
   }
 
