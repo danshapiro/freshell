@@ -890,11 +890,29 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       registry.on('codex.turn.completed', (event) => turnEvents.push({ type: 'completed', event }))
 
       sidecar.emitTurnStarted({ threadId: 'thread-durable', turnId: 'turn-1', params: {} })
-      sidecar.emitTurnCompleted({ threadId: 'thread-durable', turnId: 'turn-1', params: {} })
+      sidecar.emitTurnCompleted({
+        threadId: 'thread-durable',
+        turnId: 'turn-1',
+        // Nested like the real app-server's small-frame form -- pins that the
+        // registry reads params.turn?.status ?? params.status.
+        params: { turn: { status: 'completed' } },
+      })
 
       expect(turnEvents).toEqual([
-        { type: 'started', event: { terminalId: term.terminalId, at: 4_200 } },
-        { type: 'completed', event: { terminalId: term.terminalId, at: 4_200 } },
+        {
+          type: 'started',
+          event: { terminalId: term.terminalId, threadId: 'thread-durable', turnId: 'turn-1', at: 4_200 },
+        },
+        {
+          type: 'completed',
+          event: {
+            terminalId: term.terminalId,
+            threadId: 'thread-durable',
+            turnId: 'turn-1',
+            status: 'completed',
+            at: 4_200,
+          },
+        },
       ])
       expect(record.codexDurability).toMatchObject({
         state: 'durable',

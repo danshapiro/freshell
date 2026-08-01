@@ -1275,6 +1275,21 @@ export function buildSpawnSpec(
   return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
 }
 
+/**
+ * `params.turn?.status ?? params.status` -- the codex turn/completed status.
+ * Mirror of `freshell_codex::protocol::turn_status` and adapter.ts:922-923;
+ * handles both the small-frame nested form and the large-frame flattened form.
+ */
+function codexTurnStatus(params: Record<string, unknown>): string | undefined {
+  const turn = params.turn
+  if (turn && typeof turn === 'object') {
+    const nested = (turn as Record<string, unknown>).status
+    if (typeof nested === 'string') return nested
+  }
+  const status = params.status
+  return typeof status === 'string' ? status : undefined
+}
+
 export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
   private bindingAuthority = new SessionBindingAuthority()
@@ -1921,6 +1936,8 @@ export class TerminalRegistry extends EventEmitter {
       if (!isCurrentSidecar()) return
       this.emit('codex.turn.started', {
         terminalId: record.terminalId,
+        threadId: event.threadId,
+        ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
         at: Date.now(),
       } satisfies CodexTurnStartedEvent)
       void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
@@ -1931,8 +1948,12 @@ export class TerminalRegistry extends EventEmitter {
 
     const turnCompletedUnsubscribe = sidecar.onTurnCompleted?.((event) => {
       if (!isCurrentSidecar()) return
+      const status = codexTurnStatus(event.params)
       this.emit('codex.turn.completed', {
         terminalId: record.terminalId,
+        threadId: event.threadId,
+        ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
+        ...(status !== undefined ? { status } : {}),
         at: Date.now(),
       } satisfies CodexTurnCompletedEvent)
       void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {

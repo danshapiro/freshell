@@ -37,10 +37,27 @@ export type TerminalSessionUnboundEvent = {
 
 export type CodexTurnStartedEvent = {
   terminalId: string
+  /**
+   * The codex thread that emitted `turn/started` -- NOT necessarily the
+   * terminal's bound thread: sub-agent, review, and fork threads share the
+   * app-server connection (kata codex-turn-thread-scope, spike scenario D).
+   * Consumers MUST scope by the terminal's bound session id.
+   */
+  threadId: string
+  turnId?: string
   at: number
 }
 
 export type CodexTurnCompletedEvent = {
   terminalId: string
+  /** See CodexTurnStartedEvent.threadId -- may be a foreign thread. */
+  threadId: string
+  turnId?: string
+  /**
+   * Raw turn status: 'completed' | 'interrupted' | 'failed' | 'inProgress'
+   * (absent on older protocol forms). Only 'completed' is a positive,
+   * bell-worthy completion -- see shared/ws-protocol.ts terminal.idle.
+   */
+  status?: string
   at: number
 }
