@@ -1113,7 +1113,7 @@ pub fn note_approval_resolved(
 ```
 
 Adapt the `to_record`/`has_public_change` usage to the file's existing effect-emission idiom (see `note_proxy_turn_started` `:571-599` for the canonical pattern).
-4. Clear approval state at turn end and rebind: in both accepted arms of `note_proxy_turn_completed` (same spots as Task 2's clear) add `state.pending_approvals.clear(); state.resume_busy_after_approval = false;`; likewise in the rebind branches (`track_terminal` `:247` area, `bind_session` `:306` area).
+4. Clear approval state at turn end and rebind: in `note_proxy_turn_completed`, add `state.pending_approvals.clear(); state.resume_busy_after_approval = false;` ONCE on the accepted completion path (same acceptance/terminal-status gating as Task 2's clear) but placed BEFORE the phase match — NOT inside individual match arms. Placement rationale: a turn that completes during an approval pause routes through the `CodexPhase::Idle => {}` arm (the approval request itself demoted the phase to Idle), so arm-local clears in the Pending and Busy|Unknown arms would never run there and the `turn_completion_clears_pending_approvals` test above could not pass — the stale approval's later resolve would find `resume_busy_after_approval == true`, flip the pane Busy, and emit a `Changed` effect. Clearing before the match covers every accepted arm, including Idle. Likewise clear both fields in the rebind branches (`track_terminal` `:247` area, `bind_session` `:306` area).
 5. Match-arm fallout: add `TrackerEffect::AttentionBoundary { .. } => {}` arms wherever the compiler demands (claude/amplifier frame mappers, ledger, etc.).
 6. Accessor:
 
