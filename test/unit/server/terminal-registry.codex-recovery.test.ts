@@ -240,6 +240,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -324,6 +325,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -446,6 +448,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -570,6 +573,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -763,6 +767,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -976,6 +981,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -1091,6 +1097,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -1470,6 +1477,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -1512,6 +1520,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 
@@ -1661,6 +1670,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 0,
       recoverableForRestore: true,
+      spontaneous: true,
     })
     expect(planCreate).not.toHaveBeenCalled()
   })
@@ -1930,7 +1940,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     pty.onExit.mock.calls[0][0]({ exitCode: 2, signal: 0 })
 
     expect(record.status).toBe('exited')
-    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 2 })
+    expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 2, spontaneous: true })
   })
 
   it('does not start durable recovery for an explicit user close', async () => {
@@ -1984,6 +1994,7 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
       terminalId: record.terminalId,
       exitCode: 9,
       recoverableForRestore: true,
+      spontaneous: true,
     })
   })
 })

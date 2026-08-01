@@ -2034,7 +2034,7 @@ describe('TerminalRegistry', () => {
 
       expect(registry.get(record.terminalId)?.status).toBe('exited')
       expect(exited).toHaveBeenCalledTimes(1)
-      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 7 })
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 7, spontaneous: true })
     })
 
     it('explicit kill emits one terminal.exit', () => {
@@ -2046,7 +2046,8 @@ describe('TerminalRegistry', () => {
       registry.kill(record.terminalId)
 
       expect(exited).toHaveBeenCalledTimes(1)
-      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+      // spontaneous: false = Task-11 exit discriminator, indicates requested close (explicit kill)
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0, spontaneous: false })
     })
 
     it('marks idle detached auto-kill exits as recoverable for restore', async () => {
@@ -2064,10 +2065,12 @@ describe('TerminalRegistry', () => {
 
       await registry.enforceIdleKillsForTest()
 
+      // spontaneous: false = Task-11 exit discriminator, indicates requested close (idle auto-kill)
       expect(exited).toHaveBeenCalledWith({
         terminalId: record.terminalId,
         exitCode: 0,
         recoverableForRestore: true,
+        spontaneous: false,
       })
     })
 
@@ -2095,6 +2098,7 @@ describe('TerminalRegistry', () => {
           terminalId: durableExit.terminalId,
           exitCode: 0,
           recoverableForRestore: true,
+          spontaneous: true,
         })
       })
     })
@@ -2126,16 +2130,20 @@ describe('TerminalRegistry', () => {
       expect(exited).toHaveBeenCalledWith({
         terminalId: nonDurableExit.terminalId,
         exitCode: 7,
+        spontaneous: true,
       })
       await vi.waitFor(() => {
         expect(exited).toHaveBeenCalledWith({
           terminalId: attachedDurableExit.terminalId,
           exitCode: 0,
+          spontaneous: true,
         })
       })
+      // spontaneous: false = Task-11 exit discriminator, indicates requested close (explicit kill)
       expect(exited).toHaveBeenCalledWith({
         terminalId: explicitKill.terminalId,
         exitCode: 0,
+        spontaneous: false,
       })
       expect(exited.mock.calls.some(([payload]) => payload?.recoverableForRestore === true)).toBe(false)
     })
