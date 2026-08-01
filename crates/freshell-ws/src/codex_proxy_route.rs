@@ -54,14 +54,31 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
         RemoteProxyEvent::Candidate(candidate) => {
             route_candidate(state, &terminal_id, cwd.as_deref(), candidate).await;
         }
-        RemoteProxyEvent::TurnStarted(_) => {
+        RemoteProxyEvent::TurnStarted(params) => {
             if let Some(hub) = &state.activity {
-                hub.note_codex_proxy_turn(&terminal_id, false);
+                hub.note_codex_proxy_turn(
+                    &terminal_id,
+                    &params.thread_id,
+                    params.turn_id.as_deref(),
+                    None,
+                    false,
+                );
             }
         }
-        RemoteProxyEvent::TurnCompleted(_) => {
+        RemoteProxyEvent::TurnCompleted(params) => {
             if let Some(hub) = &state.activity {
-                hub.note_codex_proxy_turn(&terminal_id, true);
+                // `status` lives inside params -- nested `params.turn.status`
+                // on the small-frame path, flat `params.status` on the
+                // oversized byte-scan path. `turn_status` handles both
+                // (protocol.rs:316-333).
+                let status = freshell_codex::turn_status(&params.params);
+                hub.note_codex_proxy_turn(
+                    &terminal_id,
+                    &params.thread_id,
+                    params.turn_id.as_deref(),
+                    status.as_deref(),
+                    true,
+                );
             }
         }
         RemoteProxyEvent::ThreadStarted(_) | RemoteProxyEvent::ThreadLifecycle(_) => {

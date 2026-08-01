@@ -133,9 +133,15 @@ enum HubEvent {
     CodexFsChange {
         terminal_id: String,
     },
-    /// S5.a: a proxy TurnStarted/TurnCompleted for a managed codex terminal.
+    /// S5.a + kata codex-turn-thread-scope: a proxy TurnStarted/TurnCompleted
+    /// for a managed codex terminal, carrying the EMITTING thread's identity
+    /// (which may be a sub-agent/review/fork thread, not the bound one) and,
+    /// for completions, the raw turn status. The tracker owns the guards.
     CodexProxyTurn {
         terminal_id: String,
+        thread_id: String,
+        turn_id: Option<String>,
+        status: Option<String>,
         completed: bool,
     },
 }
@@ -266,11 +272,24 @@ impl ActivityHub {
         });
     }
 
-    /// S5.a: proxy (managed-launch) turn lane — channel-deferred like
+    /// S5.a: proxy (managed-launch) turn lane -- channel-deferred like
     /// `bind_codex_session` so all frame emission stays on the hub task.
-    pub fn note_codex_proxy_turn(&self, terminal_id: &str, completed: bool) {
+    /// `status` is only meaningful for completions (`turn/completed` carries
+    /// 'completed' | 'interrupted' | 'failed' | 'inProgress'); pass `None`
+    /// for starts.
+    pub fn note_codex_proxy_turn(
+        &self,
+        terminal_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        status: Option<&str>,
+        completed: bool,
+    ) {
         let _ = self.tx.send(HubEvent::CodexProxyTurn {
             terminal_id: terminal_id.to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.map(str::to_string),
+            status: status.map(str::to_string),
             completed,
         });
     }
@@ -508,15 +527,29 @@ impl ActivityHub {
             }
             HubEvent::CodexProxyTurn {
                 terminal_id,
+                thread_id,
+                turn_id,
+                status,
                 completed,
             } => {
                 let at = now_ms();
                 let frames = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     let effects = if completed {
-                        inner.codex.note_proxy_turn_completed(&terminal_id, at)
+                        inner.codex.note_proxy_turn_completed(
+                            &terminal_id,
+                            &thread_id,
+                            turn_id.as_deref(),
+                            status.as_deref(),
+                            at,
+                        )
                     } else {
-                        inner.codex.note_proxy_turn_started(&terminal_id, at)
+                        inner.codex.note_proxy_turn_started(
+                            &terminal_id,
+                            &thread_id,
+                            turn_id.as_deref(),
+                            at,
+                        )
                     };
                     let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
                     frames
@@ -2504,11 +2537,14 @@ mod tests {
             ActivityEvent::Created {
                 terminal_id: "t".into(),
                 mode: "codex".into(),
-                resume_session_id: None,
+                // kata codex-turn-thread-scope: the proxy lane is thread-
+                // scoped, so this test binds the thread at create (the
+                // resume path); unbound terminals now ignore proxy turns.
+                resume_session_id: Some("thread-1".into()),
                 at: crate::terminal::now_ms(),
             },
         );
-        // Initial idle upsert (no sessionId -- the G3 gap state).
+        // Initial idle upsert (session bound at create).
         next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
             v["upsert"][0]["terminalId"] == "t"
         })
@@ -2516,9 +2552,9 @@ mod tests {
         .expect("initial idle upsert");
 
         // Exercise: proxy turn lane.
-        hub.note_codex_proxy_turn("t", false); // started
-        hub.note_codex_proxy_turn("t", true); // completed
-        hub.note_codex_proxy_turn("t", true); // duplicate echo — must not double
+        hub.note_codex_proxy_turn("t", "thread-1", Some("turn-1"), None, false); // started
+        hub.note_codex_proxy_turn("t", "thread-1", Some("turn-1"), Some("completed"), true); // completed
+        hub.note_codex_proxy_turn("t", "thread-1", Some("turn-1"), Some("completed"), true); // duplicate echo — must not double
 
         // Assert: busy→idle transition via activity update.
         let busy = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
