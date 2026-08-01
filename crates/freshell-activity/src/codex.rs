@@ -609,8 +609,7 @@ impl CodexActivityTracker {
     /// 3. turn-id -- a completion for a different turn than the in-flight
     ///    one is a stale echo, no-op by construction;
     /// 4. directed proxy swallow (cross-lane dedupe, unchanged);
-    /// 5. status -- only `completed` (or absent: older protocols) records a
-    ///    bell-worthy completion; `interrupted`/`failed` clear silently.
+    /// 5. status -- `completed | failed | absent` record a bell-worthy completion; `interrupted` clears silently.
     pub fn note_proxy_turn_completed(
         &mut self,
         terminal_id: &str,
@@ -638,7 +637,12 @@ impl CodexActivityTracker {
             state.swallow_next_proxy_complete = false;
             return Vec::new();
         }
-        let record = matches!(status, None | Some("completed"));
+        // Attention-bell policy: completed AND failed are non-human stopping causes
+        // and record a completion (=> gate arms => terminal.idle). `interrupted`
+        // (and only it) is human-requested and stays a silent claim. If a queued
+        // submit exists the shared transition machinery re-arms instead of ringing —
+        // the queued message auto-submits and work continues.
+        let record = matches!(status, None | Some("completed") | Some("failed"));
         let previous = state.to_record();
         let mut completions: Vec<(Option<String>, i64, i64)> = Vec::new();
         match state.phase {
@@ -1810,15 +1814,43 @@ mod tests {
         assert!(completions(&effects).is_empty());
     }
 
+    /// SEMANTIC CHANGE (attention-bell plan 2026-08-01): a failed turn is a
+    /// non-human stopping cause — it records a completion so the IdleGate rings.
+    /// Failed takes EXACTLY the completed path, so queue suppression + grace
+    /// apply naturally. (Previously pinned as clears-without-completion.)
     #[test]
-    fn failed_status_clears_busy_without_completion() {
+    fn failed_status_records_a_completion() {
+        // Mirror the setup of `absent_status_still_completes_for_the_bound_thread`
+        // (codex.rs:1843): track, bind thread, proxy turn started, then complete.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t", Some("sess"), 0);
         tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
         let effects =
-            tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("failed"), 2_000);
+            tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some("failed"), 5_000);
         assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
-        assert!(completions(&effects).is_empty());
+        assert_eq!(
+            completions(&effects).len(),
+            1,
+            "failed must mint a completion"
+        );
+    }
+
+    /// Failed must be indistinguishable from completed in effect shape — that is
+    /// what makes queued-submit suppression and the 2s grace apply for free.
+    #[test]
+    fn failed_with_queued_submit_behaves_exactly_like_completed_with_queued_submit() {
+        let run = |status: &str| {
+            let mut tracker = CodexActivityTracker::new();
+            tracker.track_terminal("t", Some("sess"), 0);
+            tracker.note_proxy_turn_started("t", "sess", Some("turn-1"), 1_000);
+            // Queue a submit while busy (mirror the input used by
+            // `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`, codex.rs:1039).
+            tracker.note_input("t", "do the next thing\r", 3_000);
+            let effects =
+                tracker.note_proxy_turn_completed("t", "sess", Some("turn-1"), Some(status), 5_000);
+            (phases(&effects), completions(&effects).len())
+        };
+        assert_eq!(run("failed"), run("completed"));
     }
 
     #[test]

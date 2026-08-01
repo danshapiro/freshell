@@ -2363,6 +2363,157 @@ mod tests {
         );
     }
 
+    /// SEMANTIC CHANGE (attention-bell plan 2026-08-01): failed turns now ring.
+    /// With the predicate flipped to include "failed", a failed proxy turn
+    /// completion records a completion and arms the gate, emitting exactly one
+    /// terminal.idle via the grace window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_failed_turn_rings_and_queued_failed_drains_to_a_single_idle() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        // Turn 1 submitted -> Pending.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // Streaming output is publicly INERT for codex (refreshes
+        // last_observed_at only; no phase promotion, no effects).
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "working on it...".into(),
+                at: now_ms(),
+            },
+        );
+        // Queued submit while Pending (goes into the tracker's submit queue;
+        // publicly silent).
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // BEL #1: turn clear consumes the queued submit -> stays Pending;
+        // pending->pending is suppressed, so NO public Changed and NO
+        // completion (no queue evidence can reach the gate).
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        // BEL #2: queue empty -> Idle + completion -> the gate arms.
+        // (With failed now recording, this mirrors the completed behavior exactly.)
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the codex queue drains");
+        assert_eq!(
+            idle["reason"], "grace",
+            "codex failed queue evidence works exactly like completed queue evidence"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one emission for the codex drain"
+        );
+    }
+
+    /// Plain failed turn (no queue): failed status now records a completion
+    /// and the gate arms, emitting exactly one terminal.idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_failed_turn_emits_terminal_idle() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-1".into()),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        // Initial idle upsert (session bound at create).
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Exercise: proxy turn lane with failed status.
+        hub.note_codex_proxy_turn("t", "thread-1", Some("turn-1"), None, false); // started
+        hub.note_codex_proxy_turn("t", "thread-1", Some("turn-1"), Some("failed"), true); // failed
+
+        // Assert: busy→idle transition via activity update.
+        let busy = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t" && r["phase"] == "busy")
+                })
+                .unwrap_or(false)
+        })
+        .await
+        .expect("busy upsert");
+        assert_eq!(busy["upsert"][0]["terminalId"], "t");
+
+        // Assert: at least one codex.activity.updated showing idle phase (from failed).
+        let idle_upsert = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t" && r["phase"] == "idle")
+                })
+                .unwrap_or(false)
+        })
+        .await
+        .expect("idle upsert");
+        assert_eq!(idle_upsert["upsert"][0]["terminalId"], "t");
+
+        // Assert: exactly ONE terminal.idle frame (failed now records a completion).
+        let _idle = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("terminal.idle on failed turn");
+
+        // Assert: no second terminal.idle frame.
+        let no_second = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_frame_of_type(&mut rx, "terminal.idle", 3_000),
+        )
+        .await;
+        assert!(
+            no_second.is_err(),
+            "must emit exactly one terminal.idle, not a duplicate"
+        );
+    }
+
     /// INTERACTION (idle-gate x codex-status-completeness): with the rollout
     /// lane attached, CodexPhase::Busy is reachable, so the busy->pending
     /// re-arm at a reconciled turn clear DOES accrue queue evidence -- the
