@@ -944,6 +944,36 @@ describe('CodexActivityTracker', () => {
     expect(tracker.getActivity('term-1')).toBeUndefined()
   })
 
+  it('marks a spontaneous exit removal so the death bell can ring, while unbind stays flag-less', () => {
+    const tracker = new CodexActivityTracker()
+    const changes: Array<{ upsert: unknown[]; remove: string[]; spontaneousExitRemovals?: string[] }> = []
+    tracker.on('changed', (change) => changes.push(change))
+
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    tracker.noteExit({ terminalId: 'term-1', at: 1_100, spontaneous: true })
+    expect(changes.at(-1)).toEqual({
+      upsert: [],
+      remove: ['term-1'],
+      spontaneousExitRemovals: ['term-1'],
+    })
+
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-2',
+      reason: 'association',
+      session: createSession('session-2'),
+      at: 1_200,
+    })
+    tracker.unbindTerminal({ terminalId: 'term-1', at: 1_300 })
+    expect(changes.at(-1)).toEqual({ upsert: [], remove: ['term-1'] })
+  })
+
   it('expires stale pending back to idle after the fresh-snapshot grace and stale busy to unknown', () => {
     const tracker = new CodexActivityTracker()
 

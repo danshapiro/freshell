@@ -31,6 +31,8 @@ export type ClaudeTurnCompleteEvent = {
 export type ClaudeActivityChange = {
   upsert: ClaudeActivityRecord[]
   remove: string[]
+  /** Subset of `remove` caused by a spontaneous PTY death (death-bell input). */
+  spontaneousExitRemovals?: string[]
 }
 
 type TrackerLogger = {
@@ -166,8 +168,8 @@ export class ClaudeActivityTracker extends EventEmitter {
     }
   }
 
-  noteExit(input: { terminalId: string }): void {
-    this.removeState(input.terminalId)
+  noteExit(input: { terminalId: string; spontaneous?: boolean }): void {
+    this.removeState(input.terminalId, { spontaneousExit: input.spontaneous === true })
   }
 
   expire(at: number): void {
@@ -197,9 +199,13 @@ export class ClaudeActivityTracker extends EventEmitter {
     this.emit('changed', { upsert: [next], remove: [] } satisfies ClaudeActivityChange)
   }
 
-  private removeState(terminalId: string): void {
+  private removeState(terminalId: string, opts?: { spontaneousExit?: boolean }): void {
     if (!this.states.delete(terminalId)) return
-    this.emit('changed', { upsert: [], remove: [terminalId] } satisfies ClaudeActivityChange)
+    this.emit('changed', {
+      upsert: [],
+      remove: [terminalId],
+      ...(opts?.spontaneousExit ? { spontaneousExitRemovals: [terminalId] } : {}),
+    } satisfies ClaudeActivityChange)
   }
 
   private toRecord(state: ClaudeTerminalActivity): ClaudeActivityRecord {

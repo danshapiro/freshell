@@ -1537,6 +1537,37 @@ describe('shutdownGracefully', () => {
     }
   })
 
+  it('emits every shutdown exit with spontaneous: false (server shutdown is a requested stop)', async () => {
+    // Audit A7: shutdownGracefully SIGTERMs ptys directly WITHOUT setting
+    // status='exited', so its exits flow through finishTerminalPtyExit. They
+    // must never look spontaneous — no death bell may ring on server shutdown.
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+    try {
+      registry.create({ mode: 'shell' })
+      registry.create({ mode: 'shell' })
+      const exits: Array<{ terminalId: string; spontaneous?: boolean }> = []
+      registry.on('terminal.exit', (event: { terminalId: string; spontaneous?: boolean }) => {
+        exits.push(event)
+      })
+
+      for (const pty of mockPtyProcess.instances) {
+        pty.kill.mockImplementation(() => {
+          setTimeout(() => pty._emitExit(0), 10)
+        })
+      }
+
+      await registry.shutdownGracefully(5000)
+
+      expect(exits).toHaveLength(2)
+      for (const exit of exits) {
+        expect(exit.spontaneous).toBe(false)
+      }
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
+  })
+
   it('should skip signal argument on Windows', async () => {
     const originalPlatform = process.platform
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
@@ -1554,6 +1585,44 @@ describe('shutdownGracefully', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
     }
+  })
+})
+
+describe('internal terminal.exit spontaneous discriminator', () => {
+  let registry: TerminalRegistry
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useRealTimers()
+    mockPtyProcess.instances = []
+    registry = new TerminalRegistry(createTestSettings())
+  })
+
+  it('marks an unrequested pty death spontaneous: true', () => {
+    registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+    const exits: Array<{ terminalId: string; spontaneous?: boolean }> = []
+    registry.on('terminal.exit', (event: { terminalId: string; spontaneous?: boolean }) => {
+      exits.push(event)
+    })
+
+    pty._emitExit(1)
+
+    expect(exits).toHaveLength(1)
+    expect(exits[0].spontaneous).toBe(true)
+  })
+
+  it('marks a kill() (requested close) exit spontaneous: false', () => {
+    const term = registry.create({ mode: 'shell' })
+    const exits: Array<{ terminalId: string; spontaneous?: boolean }> = []
+    registry.on('terminal.exit', (event: { terminalId: string; spontaneous?: boolean }) => {
+      exits.push(event)
+    })
+
+    registry.kill(term.terminalId)
+
+    expect(exits).toHaveLength(1)
+    expect(exits[0].spontaneous).toBe(false)
   })
 })
 

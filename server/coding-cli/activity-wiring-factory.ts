@@ -37,7 +37,7 @@ export type PtyActivityTracker = {
   bindSession(input: { terminalId: string; sessionId: string; at: number }): void
   noteInput(input: { terminalId: string; data: string; at: number }): void
   noteOutput(input: { terminalId: string; data: string; at: number }): void
-  noteExit(input: { terminalId: string }): void
+  noteExit(input: { terminalId: string; spontaneous?: boolean }): void
   expire(at: number): void
 }
 
@@ -85,9 +85,9 @@ export function wirePtyActivityTracker<T extends PtyActivityTracker>(input: {
   const onOutput = (event: TerminalOutputRawEvent) => {
     tracker.noteOutput({ terminalId: event.terminalId, data: event.data, at: event.at })
   }
-  const onExit = (event: { terminalId?: string }) => {
+  const onExit = (event: { terminalId?: string; spontaneous?: boolean }) => {
     if (!event.terminalId) return
-    tracker.noteExit({ terminalId: event.terminalId })
+    tracker.noteExit({ terminalId: event.terminalId, spontaneous: event.spontaneous === true })
   }
 
   registry.on('terminal.created', onCreated)

@@ -26,6 +26,12 @@ export type TrulyIdleActivityUpsert = {
 export type TrulyIdleActivityChange = {
   upsert?: TrulyIdleActivityUpsert[]
   remove?: string[]
+  /**
+   * Subset of `remove` caused by a spontaneous process death (PTY exit that no
+   * requested close — kill/kill_all/shutdown/unbind — asked for). These ring
+   * the death bell immediately when the terminal was engaged.
+   */
+  spontaneousExitRemovals?: string[]
 }
 
 type TerminalIdleState = {
@@ -57,7 +63,11 @@ function isBusyPhase(phase: string): boolean {
  * - A codex busy→pending re-arm (queued submit consumed at turn clear) counts
  *   as queue evidence; codex emits its completion only when the queue drained.
  * - Deadman/signal-loss idle flips arrive WITHOUT a turn boundary and never
- *   arm; PTY exit / crash removals cancel any armed timer and never emit.
+ *   arm; requested-close removals (tab close / terminal.close / shutdown /
+ *   unbind) cancel any armed timer and never emit. A SPONTANEOUS exit removal
+ *   (change.spontaneousExitRemovals) while engaged — confirmed busy, or an
+ *   armed grace window — rings immediately: a dead process emits nothing
+ *   further, so the pending bell must not be lost.
  * - OpenCode's genuine turn end arrives as activityRemove followed by
  *   turnComplete: the removal clears state, the boundary then arms grace-only.
  *
@@ -99,13 +109,23 @@ export class TrulyIdleEmitter extends EventEmitter {
       state.busy = nextBusy
       state.pending = nextPending
     }
+    const spontaneous = new Set(change.spontaneousExitRemovals ?? [])
     for (const terminalId of change.remove ?? []) {
       const state = this.states.get(terminalId)
       if (!state) continue
-      // Exit/crash (or an opencode idle removal): never emit from here — only
-      // a subsequent turn boundary may re-arm.
+      // Engagement for the death bell (decision 3): CONFIRMED busy or an armed
+      // grace window. phase 'pending' is input-only (the Enter that executes a
+      // human /quit looks like a prompt submit) and NEVER counts. Task 12 ORs
+      // in approval waits via change.approvalPendingRemovals.
+      const engaged = (state.busy && !state.pending) || state.graceTimer !== undefined
       this.cancelGrace(state)
       this.states.delete(terminalId)
+      if (spontaneous.has(terminalId) && engaged) {
+        // Spontaneous process death while working: ring immediately — a dead
+        // process emits nothing further, and a queued prompt will never run.
+        // Requested closes (tab close / terminal.close / shutdown) never ring.
+        this.emit('idle', { terminalId, at: this.now(), reason: 'grace' } satisfies TrulyIdleEvent)
+      }
     }
   }
 

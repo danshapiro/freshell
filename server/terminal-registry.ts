@@ -1505,6 +1505,12 @@ export class TerminalRegistry extends EventEmitter {
     record: TerminalRecord,
     event: { exitCode: number; signal?: number },
   ): void {
+    // Requested closes (kill()/kill_all, shutdownGracefully's direct SIGTERMs)
+    // mark codexRecoveryFinalClose BEFORE exit dispatch — capture it at ENTRY,
+    // before markCodexRecoveryFinalClose below marks EVERY finishing record
+    // and would erase the signal (audit A7: a blanket `true` would ring death
+    // bells on server shutdown).
+    const requestedClose = record.codexRecoveryFinalClose === true
     this.clearCodexPendingCleanExitFinalizer(record)
     this.markCodexRecoveryFinalClose(record)
     this.clearCodexInputGate(record)
@@ -1527,6 +1533,9 @@ export class TerminalRegistry extends EventEmitter {
     this.emit('terminal.exit', {
       terminalId: record.terminalId,
       exitCode: event.exitCode,
+      // Internal payload only (NOT the client wire frame above): true when no
+      // requested close asked for this exit — the death-bell discriminator.
+      spontaneous: !requestedClose,
       ...(recoverableForRestore ? { recoverableForRestore: true } : {}),
     })
     this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
@@ -4091,6 +4100,8 @@ export class TerminalRegistry extends EventEmitter {
     this.emit('terminal.exit', {
       terminalId,
       exitCode: term.exitCode,
+      // kill() is always a requested close — never a death bell.
+      spontaneous: false,
       ...(options.recoverableForRestore ? { recoverableForRestore: true } : {}),
     })
     this.forgetCodexDurabilityStoreRecord(term, 'user_final_close')

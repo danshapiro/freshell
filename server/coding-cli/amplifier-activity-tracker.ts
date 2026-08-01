@@ -43,6 +43,8 @@ export type AmplifierTurnCompleteEvent = {
 export type AmplifierActivityChange = {
   upsert: AmplifierActivityRecord[]
   remove: string[]
+  /** Subset of `remove` caused by a spontaneous PTY death (death-bell input). */
+  spontaneousExitRemovals?: string[]
 }
 
 /**
@@ -340,9 +342,9 @@ export class AmplifierActivityTracker extends EventEmitter {
     this.emit('turn.complete', completion)
   }
 
-  noteExit(input: { terminalId: string }): void {
+  noteExit(input: { terminalId: string; spontaneous?: boolean }): void {
     // PTY exit is the authoritative end — unconditional (plan §6).
-    this.removeState(input.terminalId)
+    this.removeState(input.terminalId, { spontaneousExit: input.spontaneous === true })
   }
 
   expire(at: number): void {
@@ -384,12 +386,16 @@ export class AmplifierActivityTracker extends EventEmitter {
     this.emit('changed', { upsert: [next], remove: [] } satisfies AmplifierActivityChange)
   }
 
-  private removeState(terminalId: string): void {
+  private removeState(terminalId: string, opts?: { spontaneousExit?: boolean }): void {
     const state = this.states.get(terminalId)
     if (!state) return
     this.clearSubmitGrace(state)
     this.states.delete(terminalId)
-    this.emit('changed', { upsert: [], remove: [terminalId] } satisfies AmplifierActivityChange)
+    this.emit('changed', {
+      upsert: [],
+      remove: [terminalId],
+      ...(opts?.spontaneousExit ? { spontaneousExitRemovals: [terminalId] } : {}),
+    } satisfies AmplifierActivityChange)
   }
 
   private toRecord(state: AmplifierTerminalActivity): AmplifierActivityRecord {

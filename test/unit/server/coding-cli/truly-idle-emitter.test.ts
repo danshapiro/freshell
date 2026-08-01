@@ -107,14 +107,77 @@ describe('TrulyIdleEmitter', () => {
     expect(events[0].reason).toBe('grace')
   })
 
-  it('never emits after a crash/exit (activity remove), even with a grace timer armed', () => {
+  it('never emits after a REQUESTED close (activity remove without spontaneousExitRemovals), even with a grace timer armed', () => {
+    // Scoped to requested removals (tab close / terminal.close / shutdown):
+    // spontaneous exits while engaged now ring immediately (see below).
     emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
     emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
     emitter.noteTurnComplete({ terminalId: 't1', at: Date.now() })
-    // PTY exit lands inside the grace window.
+    // Requested close lands inside the grace window.
     emitter.noteActivityChanged({ upsert: [], remove: ['t1'] })
     vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
     expect(events).toHaveLength(0)
+  })
+
+  it('emits terminal.idle immediately when a busy terminal is removed by a spontaneous exit', () => {
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toEqual({ terminalId: 't1', at: Date.now(), reason: 'grace' })
+    // Immediate edge — no timer left pending, nothing further.
+    expect(vi.getTimerCount()).toBe(0)
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(1)
+  })
+
+  it('stays silent when a busy terminal is removed by a requested close', () => {
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'] })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+  })
+
+  it('stays silent when an idle terminal exits spontaneously', () => {
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+  })
+
+  it('stays silent when an input-pending terminal exits spontaneously (slash-command quit)', () => {
+    // decision 3 / audit A6: /quit typed into an idle pane arrives as phase
+    // 'pending' (the executing Enter looks like a prompt submit) — input-only
+    // pending is never engagement.
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'pending' }], remove: [] })
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(0)
+  })
+
+  it('rings when a spontaneous exit lands during an armed grace window', () => {
+    // busy → turn complete (arms grace) → spontaneous removal before expiry:
+    // the pending bell survives death.
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })
+    emitter.noteTurnComplete({ terminalId: 't1', at: Date.now() })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS - 500)
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ terminalId: 't1', reason: 'grace' })
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS * 3)
+    expect(events).toHaveLength(1)
+  })
+
+  it('queue evidence does not suppress the death bell', () => {
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
+    // Turn boundary while busy = queued turn evidence.
+    emitter.noteTurnComplete({ terminalId: 't1', at: Date.now() })
+    emitter.noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ terminalId: 't1', reason: 'grace' })
   })
 
   it('never emits on a deadman/signal-loss idle flip (phase idle without a turn boundary)', () => {

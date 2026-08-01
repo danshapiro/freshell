@@ -109,6 +109,18 @@ describe('ClaudeActivityTracker', () => {
     expect(changes.at(-1)).toEqual({ upsert: [], remove: ['t1'] })
   })
 
+  it('marks a spontaneous exit removal so the death bell can ring', () => {
+    const { tracker, changes } = setup()
+    tracker.trackTerminal({ terminalId: 't1', at: 1000 })
+    tracker.noteExit({ terminalId: 't1', spontaneous: true })
+    expect(tracker.getActivity('t1')).toBeUndefined()
+    expect(changes.at(-1)).toEqual({
+      upsert: [],
+      remove: ['t1'],
+      spontaneousExitRemovals: ['t1'],
+    })
+  })
+
   it('list() reflects current records', () => {
     const { tracker } = setup()
     tracker.trackTerminal({ terminalId: 't1', at: 1000 })

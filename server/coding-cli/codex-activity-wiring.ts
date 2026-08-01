@@ -79,8 +79,8 @@ export function wireCodexActivityTracker(input: {
     tracker.onTurnCompleted(event)
   }
 
-  const onExit = (event: { terminalId: string }) => {
-    tracker.noteExit({ terminalId: event.terminalId, at: now() })
+  const onExit = (event: { terminalId: string; spontaneous?: boolean }) => {
+    tracker.noteExit({ terminalId: event.terminalId, at: now(), spontaneous: event.spontaneous === true })
   }
 
   registry.on('terminal.session.bound', onBound)

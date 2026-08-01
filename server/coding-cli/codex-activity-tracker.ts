@@ -65,6 +65,8 @@ export type CodexTurnCompleteEvent = {
 export type CodexActivityChange = {
   upsert: CodexActivityRecord[]
   remove: string[]
+  /** Subset of `remove` caused by a spontaneous PTY death (death-bell input). */
+  spontaneousExitRemovals?: string[]
 }
 
 function maxDefined(...values: Array<number | undefined>): number | undefined {
@@ -180,9 +182,9 @@ export class CodexActivityTracker extends EventEmitter {
     this.removeState(input.terminalId)
   }
 
-  noteExit(input: { terminalId: string; at: number }): void {
+  noteExit(input: { terminalId: string; at: number; spontaneous?: boolean }): void {
     void input.at
-    this.removeState(input.terminalId)
+    this.removeState(input.terminalId, { spontaneousExit: input.spontaneous === true })
   }
 
   noteInput(input: { terminalId: string; data: string; at: number }): void {
@@ -650,11 +652,15 @@ export class CodexActivityTracker extends EventEmitter {
     this.emit('changed', { upsert: [next], remove: [] } satisfies CodexActivityChange)
   }
 
-  private removeState(terminalId: string): void {
+  private removeState(terminalId: string, opts?: { spontaneousExit?: boolean }): void {
     const existing = this.states.get(terminalId)
     if (!existing) return
     this.states.delete(terminalId)
-    this.emit('changed', { upsert: [], remove: [terminalId] } satisfies CodexActivityChange)
+    this.emit('changed', {
+      upsert: [],
+      remove: [terminalId],
+      ...(opts?.spontaneousExit ? { spontaneousExitRemovals: [terminalId] } : {}),
+    } satisfies CodexActivityChange)
   }
 
   private toRecord(state: CodexTerminalActivity): CodexActivityRecord {
