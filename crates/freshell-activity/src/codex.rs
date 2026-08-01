@@ -141,7 +141,8 @@ struct TerminalActivity {
     /// TurnStarted -- the proxy lane's turn key for Busy/Unknown clears.
     last_proxy_started_at: Option<i64>,
     /// Proxy lane (kata codex-turn-thread-scope): the turn id of the bound
-    /// thread's in-flight proxy turn, set on TurnStarted. A TurnCompleted
+    /// thread's in-flight proxy turn, set on TurnStarted, cleared on rebind
+    /// AND at every accepted terminal-status completion. A TurnCompleted
     /// carrying a DIFFERENT turn id is a stale echo of an already-closed
     /// turn and is a no-op by construction. `None` falls back to phase
     /// semantics (older protocols omit turnId).
@@ -225,6 +226,13 @@ impl CodexActivityTracker {
 
     pub fn list_latest_completions(&self) -> Vec<freshell_protocol::TurnCompletionSnapshot> {
         self.ledger.list_latest_completions()
+    }
+
+    #[cfg(test)]
+    fn current_proxy_turn_id_for(&self, terminal_id: &str) -> Option<String> {
+        self.states
+            .get(terminal_id)
+            .and_then(|s| s.current_proxy_turn_id.clone())
     }
 
     /// Track a codex terminal from create time (deviation 1 above —
@@ -656,6 +664,7 @@ impl CodexActivityTracker {
                 );
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
+                state.current_proxy_turn_id = None;
             }
             CodexPhase::Busy | CodexPhase::Unknown => {
                 let turn_key = state.last_proxy_started_at.or(state.pending_submit_at);
@@ -674,6 +683,7 @@ impl CodexActivityTracker {
                 }
                 state.swallow_next_bel = true;
                 state.swallow_next_reconcile_clear = true;
+                state.current_proxy_turn_id = None;
             }
             CodexPhase::Idle => {}
         }
@@ -1932,5 +1942,35 @@ mod tests {
         let effects =
             tracker.note_proxy_turn_completed("t", "sess", None, Some("completed"), 2_000);
         assert_eq!(completions(&effects), vec![1]);
+    }
+
+    /// Deferred minor from the thread-scope plan: the in-flight proxy turn id
+    /// must not survive the turn it belongs to. A NEW turn id arriving after a
+    /// completed one must not be rejected by the stale-turn-id guard.
+    #[test]
+    fn accepted_completion_clears_the_in_flight_proxy_turn_id() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            3_000,
+        );
+        // The in-flight proxy turn id must be cleared after the accepted completion.
+        assert_eq!(tracker.current_proxy_turn_id_for("t1"), None);
+        // With the id cleared, a follow-up turn with a new id starts cleanly and
+        // its completion is NOT swallowed by the turn-id-mismatch guard.
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-2"), 4_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-2"),
+            Some("completed"),
+            6_000,
+        );
+        assert_eq!(completions(&effects).len(), 1);
     }
 }
