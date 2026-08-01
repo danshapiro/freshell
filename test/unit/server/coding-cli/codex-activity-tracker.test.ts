@@ -1687,6 +1687,82 @@ describe('approval pause semantics (Task 12, Node mirror of Rust Task 7)', () =>
     expect(collected.changes).toEqual([])
   })
 
+  // The next three tests attach the completion collector BEFORE
+  // onTurnCompleted (the test above attaches it after, which masked the
+  // mid-pause double-ring): a completion arriving while the approval pause
+  // holds the phase at idle must be a SILENT claim -- the approval bell
+  // already covers this attention event, and the surviving anchors must not
+  // let a later PTY BEL echo re-mint the same physical turn.
+  it('a turn completing mid-pause records nothing (status completed)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.onTurnCompleted({
+      terminalId: 't1',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'completed',
+      at: 5_000,
+    })
+
+    expect(collected.completions).toEqual([])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+  })
+
+  it('a turn completing mid-pause records nothing (status failed)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.onTurnCompleted({
+      terminalId: 't1',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'failed',
+      at: 5_000,
+    })
+
+    expect(collected.completions).toEqual([])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+  })
+
+  it('a BEL echo after a mid-pause turn end mints nothing (anchors are claimed)', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    const collected = collect(tracker)
+
+    tracker.onTurnCompleted({
+      terminalId: 't1',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      status: 'completed',
+      at: 5_000,
+    })
+    expect(tracker.getActivity('t1')?.acceptedStartAt).toBeUndefined()
+    expect(tracker.getActivity('t1')?.pendingSubmitAt).toBeUndefined()
+
+    // The codex TUI's turn-complete BEL echo of that same physical turn.
+    tracker.noteOutput({ terminalId: 't1', data: '\u0007', at: 5_100 })
+
+    expect(collected.completions).toEqual([])
+    expect(tracker.getActivity('t1')).toMatchObject({ phase: 'idle' })
+  })
+
+  it('a duplicate approval request frame does not re-arm the boundary', () => {
+    const tracker = new CodexActivityTracker()
+    bindBusy(tracker)
+    const collected = collect(tracker)
+
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_000 })
+    tracker.onApprovalRequested({ terminalId: 't1', threadId: 'thread-1', requestId: '41', at: 3_500 })
+
+    expect(collected.boundaries).toEqual([{ terminalId: 't1', at: 3_000 }])
+  })
+
   it('reconcile task_started landing mid-pause folds anchors without flipping busy (audit A9)', () => {
     const tracker = new CodexActivityTracker()
     bindBusy(tracker, 'resume')

@@ -323,7 +323,24 @@ export class CodexActivityTracker extends EventEmitter {
     }
     if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
       this.transitionPendingAfterTurnClear(state, input.at, record)
-    } else if (state.acceptedStartAt !== undefined) {
+    } else if (state.phase === 'idle') {
+      // Mid-pause turn end / stale echo (mirror of the Rust Idle arm,
+      // crates/freshell-activity/src/codex.rs note_proxy_turn_completed):
+      // an approval pause demoted the phase, so the pause's turn/completed
+      // lands here -- no completion, no event (the approval bell already
+      // covers this attention event). But the anchors this turn planted
+      // (acceptedStartAt via onTurnStarted's promoteBusy or a mid-pause
+      // reconcile fold; pendingSubmitAt via a pause keystroke; a latent
+      // anchor on association bindings) would otherwise survive and let a
+      // later PTY BEL echo re-mint the same physical turn via
+      // consumeTurnCompleteSignal. Claim the turn key with the same
+      // derivation the busy/pending paths use and retire the anchors.
+      const turnKey = state.acceptedStartAt ?? state.pendingSubmitAt
+      state.acceptedStartAt = undefined
+      state.pendingSubmitAt = undefined
+      state.latentAcceptedStartAt = undefined
+      this.claimTurnKeyIfIdle(state, turnKey)
+    } else if ((state.phase === 'busy' || state.phase === 'unknown') && state.acceptedStartAt !== undefined) {
       this.transitionAfterTurnClear(state, input.at, record)
     } else if (state.latentAcceptedStartAt !== undefined) {
       this.transitionAfterLatentTurnClear(state, input.at)
@@ -345,6 +362,11 @@ export class CodexActivityTracker extends EventEmitter {
     if (input.threadId !== undefined && state.sessionId !== undefined && input.threadId !== state.sessionId) {
       return
     }
+    // Hardening (mirror of Rust note_approval_requested): only a NEWLY
+    // inserted request id arms the gate. A duplicate request frame (proxy
+    // retry / reconnect replay) for an id already pending must not re-arm --
+    // one boundary per approval pause.
+    const newlyInserted = !state.pendingApprovals.has(input.requestId)
     state.pendingApprovals.add(input.requestId)
     const previous = this.toRecord(state)
     if (state.phase === 'busy' || state.phase === 'pending' || state.phase === 'unknown') {
@@ -356,7 +378,9 @@ export class CodexActivityTracker extends EventEmitter {
     // Arms the truly-idle gate WITHOUT minting a turn completion or a
     // terminal.turn.complete frame -- an approval pause is not a turn end.
     // Emitted AFTER the 'changed' demotion so the gate sees not-busy first.
-    this.emit('attention.boundary', { terminalId: input.terminalId, at: input.at })
+    if (newlyInserted) {
+      this.emit('attention.boundary', { terminalId: input.terminalId, at: input.at })
+    }
   }
 
   /**
