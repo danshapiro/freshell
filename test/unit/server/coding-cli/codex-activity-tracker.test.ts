@@ -1345,6 +1345,35 @@ describe('thread-scoped app-server turn events (kata codex-turn-thread-scope)', 
     tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', status: 'completed', at: 1_300 })
     expect(completions).toHaveLength(1)
   })
+
+  it('clears the in-flight turn id at accepted completion so the next turn is not swallowed', () => {
+    // start turn-1, complete it (status 'completed'); start turn-2, complete
+    // turn-2 — assert the second completion records (not rejected as stale).
+    const tracker = new CodexActivityTracker()
+    const completions: unknown[] = []
+    tracker.on('turn.complete', (event) => completions.push(event))
+    tracker.bindTerminal({
+      terminalId: 'term-1',
+      sessionId: 'session-1',
+      reason: 'association',
+      session: createSession('session-1'),
+      at: 1_000,
+    })
+    // start turn-1 and complete it
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-1', status: 'completed', at: 1_200 })
+    expect(completions).toHaveLength(1)
+    // currentTurnId should have been cleared after turn-1 completed
+    expect(tracker.getActivity('term-1')?.currentTurnId).toBeUndefined()
+    // start turn-2 and complete it
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', at: 1_300 })
+    expect(tracker.getActivity('term-1')?.currentTurnId).toBe('turn-2')
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', turnId: 'turn-2', status: 'completed', at: 1_400 })
+    // second completion should have recorded
+    expect(completions).toHaveLength(2)
+    // and currentTurnId should have been cleared again
+    expect(tracker.getActivity('term-1')?.currentTurnId).toBeUndefined()
+  })
 })
 
 describe('reconcile turn_aborted de-chime (kata codex-turn-thread-scope)', () => {

@@ -276,6 +276,7 @@ export class CodexActivityTracker extends EventEmitter {
     // the human-requested silent clear. Mirrors Rust codex.rs record predicate.
     const record = input.status === undefined || input.status === 'completed' || input.status === 'failed'
 
+    state.currentTurnId = undefined
     const previous = this.toRecord(state)
     if (input.status === undefined || input.status === 'completed') {
       state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
