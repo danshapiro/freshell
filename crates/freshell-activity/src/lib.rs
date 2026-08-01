@@ -49,4 +49,8 @@ pub enum TrackerEffect<R> {
     },
     /// Amplifier only: force-read the events tail (missed-signal failsafe).
     ForceRead { terminal_id: String, at: i64 },
+    /// Arms the truly-idle gate WITHOUT minting a turn completion or a
+    /// terminal.turn.complete frame. Used for attention causes that are not
+    /// turn ends (approval-request pauses).
+    AttentionBoundary { terminal_id: String, at: i64 },
 }

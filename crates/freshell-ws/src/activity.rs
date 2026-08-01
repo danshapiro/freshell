@@ -144,6 +144,16 @@ enum HubEvent {
         status: Option<String>,
         completed: bool,
     },
+    /// Task 7: a sniffed server→client approval request (`requested: true`)
+    /// or its resolution (`requested: false`) for a managed codex terminal.
+    /// Requests may carry the emitting thread's id (the tracker's thread
+    /// guard drops sub-agent approvals); resolves never do.
+    CodexApproval {
+        terminal_id: String,
+        thread_id: Option<String>,
+        request_id: String,
+        requested: bool,
+    },
 }
 
 struct AmplifierLane {
@@ -291,6 +301,26 @@ impl ActivityHub {
             turn_id: turn_id.map(str::to_string),
             status: status.map(str::to_string),
             completed,
+        });
+    }
+
+    /// Task 7: proxy (managed-launch) approval lane -- channel-deferred like
+    /// `note_codex_proxy_turn` so all frame emission stays on the hub task.
+    /// `requested: true` is a sniffed server→client approval request;
+    /// `false` is its resolution. `thread_id` is best-effort and only
+    /// present on requests.
+    pub fn note_codex_approval(
+        &self,
+        terminal_id: &str,
+        thread_id: Option<&str>,
+        request_id: &str,
+        requested: bool,
+    ) {
+        let _ = self.tx.send(HubEvent::CodexApproval {
+            terminal_id: terminal_id.to_string(),
+            thread_id: thread_id.map(str::to_string),
+            request_id: request_id.to_string(),
+            requested,
         });
     }
 
@@ -556,6 +586,32 @@ impl ActivityHub {
                 };
                 self.emit(frames);
             }
+            HubEvent::CodexApproval {
+                terminal_id,
+                thread_id,
+                request_id,
+                requested,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = if requested {
+                        inner.codex.note_approval_requested(
+                            &terminal_id,
+                            thread_id.as_deref(),
+                            &request_id,
+                            at,
+                        )
+                    } else {
+                        inner
+                            .codex
+                            .note_approval_resolved(&terminal_id, &request_id, at)
+                    };
+                    let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                    frames
+                };
+                self.emit(frames);
+            }
         }
     }
 
@@ -730,11 +786,12 @@ impl ActivityHub {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     // Read engagement BEFORE any teardown: `idle.note_exit` deletes the
                     // per-terminal gate state and `modes.remove` would early-return.
-                    // Task 7 extends this read with
-                    // `|| inner.codex.has_pending_approvals(&terminal_id)` (a pane
-                    // blocked on an approval whose process dies must ring even after
-                    // its 2s boundary already rang).
-                    let ring_death_bell = spontaneous && inner.idle.is_engaged(&terminal_id);
+                    // Task 7: a pane blocked on an approval whose process dies must
+                    // ring even after its 2s boundary already rang, so pending
+                    // approvals count as engagement too.
+                    let ring_death_bell = spontaneous
+                        && (inner.idle.is_engaged(&terminal_id)
+                            || inner.codex.has_pending_approvals(&terminal_id));
                     let mut frames = Vec::new();
                     if ring_death_bell {
                         // Spontaneous death while engaged: same frame, same reason —
@@ -1217,6 +1274,8 @@ fn claude_frames(
                 ));
             }
             TrackerEffect::ForceRead { .. } => {}
+            // Codex-only (approval pauses); never emitted by the claude tracker.
+            TrackerEffect::AttentionBoundary { .. } => {}
         }
     }
     frames
@@ -1268,6 +1327,12 @@ fn codex_frames(
                 ));
             }
             TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
+            TrackerEffect::AttentionBoundary { terminal_id, at } => {
+                // Arm the gate WITHOUT a terminal.turn.complete frame — an approval
+                // pause is not a turn end. Effect order guarantees the Idle phase
+                // Changed was processed first, so the boundary arms.
+                idle.note_turn_boundary(&terminal_id, at);
+            }
         }
     }
     (frames, force_reads)
@@ -1318,6 +1383,8 @@ fn amplifier_frames(
                 ));
             }
             TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
+            // Codex-only (approval pauses); never emitted by the amplifier tracker.
+            TrackerEffect::AttentionBoundary { .. } => {}
         }
     }
     (frames, force_reads)
@@ -3454,5 +3521,225 @@ mod tests {
         .expect("parent turn complete");
         assert_eq!(complete["provider"], "codex");
         assert_eq!(complete["sessionId"], "thread-parent");
+    }
+
+    // ---- Approval pauses (attention bell, Task 7) ----
+
+    /// Shared setup: a codex terminal bound to thread-1, driven to CONFIRMED
+    /// busy via the proxy turn lane.
+    async fn busy_codex_terminal(
+        hub: &ActivityHub,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+    ) {
+        observer_send(
+            hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("thread-1".into()),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+        hub.note_codex_proxy_turn("t1", "thread-1", Some("turn-1"), None, false);
+        next_frame_matching(rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+    }
+
+    /// An approval request pauses the turn: the pane flips to the EXISTING
+    /// not-busy phase, the gate arms, and exactly ONE terminal.idle rings
+    /// after the 2s grace — never a second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_request_rings_once_after_grace() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+
+        hub.note_codex_approval("t1", Some("thread-1"), "41", true);
+        let paused = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("approval pause maps to the existing not-busy phase");
+        assert_eq!(paused["upsert"][0]["terminalId"], "t1");
+
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle for the approval pause");
+        assert_eq!(idle["terminalId"], "t1");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one terminal.idle per approval pause"
+        );
+    }
+
+    /// A SENT request answered quickly stays silent: the resolve restores
+    /// Busy within the grace, cancelling the pending bell.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_answered_within_grace_stays_silent() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+
+        hub.note_codex_approval("t1", Some("thread-1"), "41", true);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("pause upsert");
+        // Answered immediately (resolves carry no threadId on the wire).
+        hub.note_codex_approval("t1", None, "41", false);
+        let resumed = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("resolve restores busy");
+        assert_eq!(resumed["upsert"][0]["terminalId"], "t1");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+                .await
+                .is_none(),
+            "an approval answered within the grace must stay silent"
+        );
+    }
+
+    /// Queued input does NOT suppress approval bells — the pane is still
+    /// blocked on the human.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_input_does_not_suppress_the_approval_bell() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+
+        // Submit-shaped input while Busy: queued behind the running turn.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "queued message\r".into(),
+                at: now_ms(),
+            },
+        );
+        hub.note_codex_approval("t1", Some("thread-1"), "41", true);
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("queued input must not suppress the approval bell");
+        assert_eq!(idle["terminalId"], "t1");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "still exactly one terminal.idle"
+        );
+    }
+
+    /// Audit A9: a rollout reconcile whose newest event is the turn's own
+    /// task_started lands MID-PAUSE — it must not flip the pane Busy (which
+    /// would cancel the armed approval bell at the gate).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_tick_during_a_pending_approval_does_not_cancel_the_armed_bell() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout lane attached with no unresolved turn yet.
+        let (_guard, rollout) = codex_rollout_fixture(&[]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        // Proxy lane drives the confirmed busy.
+        hub.note_codex_proxy_turn("t1", "sess-1", Some("turn-1"), None, false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy upsert");
+
+        hub.note_codex_approval("t1", Some("sess-1"), "41", true);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("pause upsert");
+
+        // BEFORE the 2s grace elapses: the turn's own task_started reaches
+        // the rollout fold via inotify.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_started", now_ms())).expect("write");
+        }
+        // No Busy-phase upsert may be emitted mid-pause.
+        assert!(
+            next_frame_matching(&mut rx, "codex.activity.updated", 1_000, |v| {
+                v["upsert"][0]["phase"] == "busy"
+            })
+            .await
+            .is_none(),
+            "a mid-pause reconcile promotion must not flip the pane busy"
+        );
+        // The armed approval bell still rings after the grace.
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("the reconcile tick must not cancel the armed approval bell");
+        assert_eq!(idle["terminalId"], "t1");
+
+        // The resolve restores Busy (deferred promotion).
+        hub.note_codex_approval("t1", None, "41", false);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("resolve restores busy after the deferred promotion");
+    }
+
+    /// Decision 3 / audit A10: a pane blocked on an approval whose process
+    /// dies spontaneously rings — even AFTER the armed deadline already rang
+    /// (pending_approvals counts as death-bell engagement).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spontaneous_exit_during_a_pending_approval_rings() {
+        let (hub, mut rx) = hub();
+        busy_codex_terminal(&hub, &mut rx).await;
+
+        hub.note_codex_approval("t1", Some("thread-1"), "41", true);
+        // Let the grace elapse: the approval bell rings (deadline now spent,
+        // phase not busy).
+        let first = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("approval bell");
+        assert_eq!(first["terminalId"], "t1");
+
+        // The process dies while still blocked on the approval.
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let second = next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+            .await
+            .expect("death bell: pending approvals count as engagement");
+        assert_eq!(second["terminalId"], "t1");
     }
 }

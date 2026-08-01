@@ -93,10 +93,22 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
             // S5.a + D-GATE-SOFT: log only (includes CandidateCaptureTimeout).
             tracing::warn!(terminal_id = %terminal_id, ?trigger, "codex_proxy_repair_trigger");
         }
-        RemoteProxyEvent::ApprovalRequested(_) | RemoteProxyEvent::ApprovalResolved { .. } => {
-            // Task 6 (proxy approval sniffing) emits these; Task 7 routes them
-            // into the activity hub's attention tracking. Observe-only until then.
-            tracing::debug!(terminal_id = %terminal_id, "codex_proxy_approval_event");
+        RemoteProxyEvent::ApprovalRequested(params) => {
+            // Task 7: the app-server is blocked on a human -- the hub's
+            // attention tracking pauses the pane and arms the idle gate.
+            if let Some(hub) = &state.activity {
+                hub.note_codex_approval(
+                    &terminal_id,
+                    params.thread_id.as_deref(),
+                    &params.request_id,
+                    true,
+                );
+            }
+        }
+        RemoteProxyEvent::ApprovalResolved { request_id } => {
+            if let Some(hub) = &state.activity {
+                hub.note_codex_approval(&terminal_id, None, &request_id, false);
+            }
         }
     }
 }

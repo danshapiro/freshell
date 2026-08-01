@@ -150,6 +150,11 @@ struct TerminalActivity {
     /// turn and is a no-op by construction. `None` falls back to phase
     /// semantics (older protocols omit turnId).
     current_proxy_turn_id: Option<String>,
+    /// Outstanding server→client approval request ids (managed proxy lane).
+    pending_approvals: std::collections::HashSet<String>,
+    /// True when the approval pause demoted a working phase; the resolve
+    /// restores Busy. False when the approval arrived while already idle.
+    resume_busy_after_approval: bool,
     last_observed_at: i64,
     last_emitted_turn_key: Option<i64>,
     parser_state: ParserState,
@@ -257,6 +262,9 @@ impl CodexActivityTracker {
                     // survive (see bind_session).
                     existing.current_proxy_turn_id = None;
                     existing.last_proxy_started_at = None;
+                    // Task 7: nor may the old thread's approval pause state.
+                    existing.pending_approvals.clear();
+                    existing.resume_busy_after_approval = false;
                     let next = existing.to_record();
                     return changed(Some(&previous), next);
                 }
@@ -281,6 +289,8 @@ impl CodexActivityTracker {
             swallow_next_reconcile_clear: false,
             last_proxy_started_at: None,
             current_proxy_turn_id: None,
+            pending_approvals: std::collections::HashSet::new(),
+            resume_busy_after_approval: false,
             last_observed_at: at,
             last_emitted_turn_key: None,
             parser_state: ParserState::new(),
@@ -316,6 +326,9 @@ impl CodexActivityTracker {
         // echo / collides on last_emitted_turn_key.
         state.current_proxy_turn_id = None;
         state.last_proxy_started_at = None;
+        // Task 7: nor may the old thread's approval pause state.
+        state.pending_approvals.clear();
+        state.resume_busy_after_approval = false;
         let next = state.to_record();
         changed(Some(&previous), next)
     }
@@ -380,12 +393,22 @@ impl CodexActivityTracker {
                     .map(|cleared| started_at > cleared)
                     .unwrap_or(true)
             {
-                state.phase = CodexPhase::Busy;
-                state.force_read_logged = false;
-                state.next_force_read_at = None;
-                state.accepted_start_at = Some(started_at);
-                state.updated_at = at;
-                state.last_observed_at = at;
+                if state.pending_approvals.is_empty() {
+                    state.phase = CodexPhase::Busy;
+                    state.force_read_logged = false;
+                    state.next_force_read_at = None;
+                    state.accepted_start_at = Some(started_at);
+                    state.updated_at = at;
+                    state.last_observed_at = at;
+                } else {
+                    // Lane-interference guard (decision 8 / audit A9): the
+                    // turn's own task_started folding in MID-PAUSE would flip
+                    // the phase Busy, feed the gate, and silently cancel the
+                    // armed approval bell. Fold the anchors as usual but
+                    // defer the Busy promotion to the approval resolve.
+                    state.accepted_start_at = Some(started_at);
+                    state.resume_busy_after_approval = true;
+                }
             }
         }
 
@@ -652,6 +675,14 @@ impl CodexActivityTracker {
             state.swallow_next_proxy_complete = false;
             return Vec::new();
         }
+        // Task 7: an accepted terminal-status completion retires the turn's
+        // approval pause state ONCE, BEFORE the phase match -- a turn that
+        // completes during an approval pause routes through the Idle arm
+        // (the request itself demoted the phase), so arm-local clears would
+        // never run there and a late resolve of the stale approval would
+        // flip the pane Busy again.
+        state.pending_approvals.clear();
+        state.resume_busy_after_approval = false;
         // Attention-bell policy: completed AND failed are non-human stopping causes
         // and record a completion (=> gate arms => terminal.idle). `interrupted`
         // (and only it) is human-requested and stays a silent claim. If a queued
@@ -695,6 +726,88 @@ impl CodexActivityTracker {
             CodexPhase::Idle => {}
         }
         self.effects_after_transition(terminal_id, previous, completions)
+    }
+
+    /// Approval-request pause (managed lane). Thread-scoped like turn events;
+    /// requests without a threadId are accepted (the proxy is per-terminal).
+    /// Public phase maps to the EXISTING not-busy value — no new wire phase.
+    /// Queued input never suppresses approval bells: still blocked on a human.
+    pub fn note_approval_requested(
+        &mut self,
+        terminal_id: &str,
+        thread_id: Option<&str>,
+        request_id: &str,
+        at: i64,
+    ) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if let (Some(thread), Some(bound)) = (thread_id, state.session_id.as_deref()) {
+            if thread != bound {
+                return Vec::new();
+            }
+        }
+        state.pending_approvals.insert(request_id.to_string());
+        let previous = state.to_record();
+        if matches!(
+            state.phase,
+            CodexPhase::Busy | CodexPhase::Pending | CodexPhase::Unknown
+        ) {
+            state.resume_busy_after_approval = true;
+            state.phase = CodexPhase::Idle;
+        }
+        state.updated_at = at;
+        let next = state.to_record();
+        let mut effects = changed(Some(&previous), next);
+        effects.push(TrackerEffect::AttentionBoundary {
+            terminal_id: terminal_id.to_string(),
+            at,
+        });
+        effects
+    }
+
+    /// The approval response passed back through the proxy: the turn resumes.
+    /// Cancels a pending bell within the grace (gate sees Busy); un-greens the
+    /// pane. Stale/unknown request ids are no-ops.
+    pub fn note_approval_resolved(
+        &mut self,
+        terminal_id: &str,
+        request_id: &str,
+        at: i64,
+    ) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if !state.pending_approvals.remove(request_id) {
+            return Vec::new();
+        }
+        if !state.pending_approvals.is_empty() || !state.resume_busy_after_approval {
+            return Vec::new();
+        }
+        state.resume_busy_after_approval = false;
+        let previous = state.to_record();
+        state.phase = CodexPhase::Busy;
+        state.updated_at = at;
+        state.last_observed_at = at;
+        // Audit A9 hazard 2: a mid-pause Enter (the human answering the
+        // approval prompt in the TUI) planted PTY pending-submit state --
+        // normalize it so the NEXT turn clear is not misread as a queued
+        // re-arm of the pause keystroke.
+        state.pending_submit_at = None;
+        state.pending_freshness_at = None;
+        state.pending_until = None;
+        let next = state.to_record();
+        changed(Some(&previous), next)
+    }
+
+    /// Death-bell engagement extension (decision 3): a pane blocked on an
+    /// approval whose process dies spontaneously must ring. Read by the hub's
+    /// Exit arm alongside IdleGate::is_engaged, BEFORE any teardown.
+    pub fn has_pending_approvals(&self, terminal_id: &str) -> bool {
+        self.states
+            .get(terminal_id)
+            .map(|s| !s.pending_approvals.is_empty())
+            .unwrap_or(false)
     }
 
     /// Shared effect-assembly tail (extracted, S5.a): convert a transition's
@@ -2040,5 +2153,170 @@ mod tests {
             6_000,
         );
         assert_eq!(completions(&effects).len(), 1);
+    }
+
+    // ---- Approval pauses (attention bell, Task 7) ----
+
+    /// Approval pause: internal waiting state, public phase flips to the
+    /// EXISTING not-busy value, and the gate boundary arms (no completion).
+    #[test]
+    fn approval_request_pauses_busy_to_idle_and_arms_a_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(
+            completions(&effects).len(),
+            0,
+            "an approval pause is not a turn end"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, TrackerEffect::AttentionBoundary { at: 3_000, .. })),
+            "the gate boundary must arm"
+        );
+    }
+
+    #[test]
+    fn approval_resolved_returns_to_busy() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Busy], "the turn resumes");
+    }
+
+    #[test]
+    fn approval_resolved_with_no_prior_busy_stays_idle() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000); // pane was idle
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(
+            phases(&effects),
+            Vec::<CodexPhase>::new(),
+            "nothing to resume"
+        );
+    }
+
+    #[test]
+    fn foreign_thread_approval_request_is_ignored() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", Some("subagent-thread"), "41", 3_000);
+        assert!(
+            effects.is_empty(),
+            "a sub-agent approval must not ring the parent pane"
+        );
+    }
+
+    #[test]
+    fn approval_request_without_thread_id_is_accepted() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        let effects = tracker.note_approval_requested("t1", None, "41", 3_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+    }
+
+    #[test]
+    fn queued_submit_does_not_block_the_approval_boundary() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_input("t1", "queued message\r", 2_500); // still blocked on the human
+        let effects = tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, TrackerEffect::AttentionBoundary { .. })));
+    }
+
+    #[test]
+    fn turn_completion_clears_pending_approvals() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            5_000,
+        );
+        // A late response to the stale approval must not flip the pane busy.
+        let effects = tracker.note_approval_resolved("t1", "41", 6_000);
+        assert!(effects.is_empty());
+    }
+
+    /// Audit A9: the FIRST rollout fold of the turn's own task_started passes
+    /// the reconcile edge-trigger (codex.rs:352-368) — landing mid-pause it
+    /// would flip phase Busy, feed the gate, and silently cancel the armed
+    /// approval bell. Mid-pause promotions must fold anchors but defer the
+    /// phase flip to the resolve.
+    #[test]
+    fn reconcile_task_started_during_pending_approval_does_not_flip_busy() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        // Reuse Task 3's `started(at)` CodexTaskEvents helper.
+        let effects = tracker.reconcile_rollout("t1", &started(3_500), 3_500);
+        assert_eq!(
+            phases(&effects),
+            Vec::<CodexPhase>::new(),
+            "no Busy upsert mid-pause"
+        );
+        // The deferred promotion resumes at resolve.
+        let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+        assert_eq!(phases(&effects), vec![CodexPhase::Busy]);
+    }
+
+    /// Audit A9 hazard 2: a mid-pause Enter (the human answering the approval
+    /// in the TUI) plants PTY pending-submit state; resolve must normalize it
+    /// so the NEXT turn clear is not misclassified as a queued re-arm (which
+    /// would suppress a legitimate later bell).
+    #[test]
+    fn approval_resolve_normalizes_pending_submit_input_state() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        tracker.note_input("t1", "\r", 3_500); // answering the approval prompt
+        tracker.note_approval_resolved("t1", "41", 4_000);
+        let effects = tracker.note_proxy_turn_completed(
+            "t1",
+            "thread-1",
+            Some("turn-1"),
+            Some("completed"),
+            6_000,
+        );
+        assert_eq!(
+            phases(&effects),
+            vec![CodexPhase::Idle],
+            "no Pending re-arm from the pause keystroke"
+        );
+        assert_eq!(
+            completions(&effects).len(),
+            1,
+            "the completion bell must not be swallowed"
+        );
+    }
+
+    /// Decision 3 / audit A10: a pane blocked on an approval counts as engaged
+    /// for the death bell.
+    #[test]
+    fn has_pending_approvals_tracks_the_pending_set() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 1_000);
+        assert!(!tracker.has_pending_approvals("t1"));
+        tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+        assert!(tracker.has_pending_approvals("t1"));
+        tracker.note_approval_resolved("t1", "41", 4_000);
+        assert!(!tracker.has_pending_approvals("t1"));
     }
 }
