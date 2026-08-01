@@ -5,9 +5,9 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Ring the `terminal.idle` bell for every non-human-requested stop of a codex terminal pane — failed turns, unknown-reason aborts, spontaneous process death while working, and approval-request pauses — while keeping human-requested stops (Esc/interrupt, tab close, `terminal.close`, shutdown) silent, with zero wire-shape changes.
+**Goal:** Ring the `terminal.idle` bell for every non-human-requested stop of a codex terminal pane — failed turns, spontaneous process death while engaged, and approval-request pauses, plus forward-compatible policy plumbing for non-human `turn_aborted` reasons (NO live producer emits a ring-worthy abort reason at codex 0.129.0–0.147.0-alpha; today's real failures surface as `turn/completed status='failed'`, covered by Tasks 1/8) — while keeping human-requested stops (Esc/interrupt, `/quit`/`/exit`, tab close, `terminal.close`, server shutdown) silent, with zero wire-shape changes. Deployed codex is pinned at **0.146.0** (`codex --version`; the fixture inventory is 0.129.0 — both were source-audited by the load-bearing-assumption audit).
 
-**Architecture:** All new causes are internal representations inside the existing server-side tracker/gate machinery (`crates/freshell-activity` + `crates/freshell-ws` on Rust; `server/coding-cli/*` on Node). Every cause emits the SAME `terminal.idle` frame and maps to the SAME not-busy public phase. The codex app-server proxy gains server→client request sniffing (approvals); the rollout parser gains `turn_aborted.reason` plumbing; the registry exit event gains a spontaneous-vs-requested discriminator.
+**Architecture:** All new causes are internal representations inside the existing server-side tracker/gate machinery (`crates/freshell-activity` + `crates/freshell-ws` on Rust; `server/coding-cli/*` on Node). Every cause emits the SAME `terminal.idle` frame and maps to the SAME not-busy public phase. The codex app-server proxy gains server→client request sniffing (approvals); the rollout parser gains `turn_aborted.reason` plumbing (forward-compatible policy — see decision 2); the registry exit event gains a spontaneous-vs-requested discriminator.
 
 **Tech Stack:** Rust (freshell-activity, freshell-ws, freshell-codex, freshell-terminal, freshell-sessions crates), TypeScript Node server (server/coding-cli, server/terminal-registry.ts, shared/ws-protocol.ts), cargo test, vitest.
 
@@ -16,7 +16,8 @@
 - Base branch: this worktree (`/home/dan/code/freshell/.worktrees/codex-attention-bell`, branch `feat/codex-attention-bell`) is branched FROM `fix/codex-turn-thread-scope` (head 911fa4cdc). Do NOT rebase onto or branch from `origin/main`.
 - ZERO wire-shape changes: the `terminal.idle` frame stays exactly `{ terminalId, at, reason: 'grace' | 'queue-empty' }`. All new causes reuse `reason: 'grace'`. The contract freeze (`npm run test:port`, `port/contract/*.json`) must stay green with NO regenerated contract files.
 - The bell (`terminal.idle`) is the ONLY client bell/attention trigger; the not-busy icon is the only indication. NO new user-facing signals, NO new public phase enum values.
-- Never emit `terminal.idle` for a HUMAN-REQUESTED stop: Esc/interrupt (`turn.status='interrupted'`, abort reason `interrupted`/`replaced`), tab close / `terminal.close` API / server shutdown kills.
+- Never emit `terminal.idle` for a HUMAN-REQUESTED stop: Esc/interrupt (`turn.status='interrupted'`, abort reason `interrupted`/`replaced`), slash-command quits (`/quit`/`/exit` from an idle pane — the executing Enter looks like a prompt submit to the input lane; see decision 3), tab close / `terminal.close` API / server shutdown kills (including `shutdownGracefully()`'s direct SIGTERMs — Task 11).
+- Baseline repair first: the branch base ships a red `cargo test` gate (freshell-ws `tests/auto_resume_e2e.rs`) — Task 0 fixes it before ANY feature work. `npm install` inside the worktree is allowed during execution (node_modules is missing).
 - Busy-deadman/unknown (120s silence) stays silent — uncertainty is not a stop signal; no heuristic bells.
 - Strict Red-Green-Refactor TDD: write the failing test, see it fail, implement minimally, see it pass, commit.
 - Test coordination (AGENTS.md): run vitest ONLY via `npm run test:vitest -- <paths>` (never raw `npx vitest`). `test:unit` covers `test/unit`, `test:integration` covers `test/server`.
@@ -28,14 +29,15 @@
 ## Locked design decisions (read before any task)
 
 1. **`turn/completed status='failed'` rings** by flipping the record predicate — failed takes EXACTLY the same code path as completed, so queued-submit suppression and the 2s IdleGate grace apply naturally. `interrupted` stays a silent clear.
-2. **`turn_aborted` reason policy:** reason `interrupted` or `replaced` → silent (human-requested). Reason MISSING → silent (legacy rollout lines carry no reason; the 400-rollout corpus shows `interrupted` is the only real value; an absent reason is uncertainty, and per constraint above uncertainty is not a stop signal). Any OTHER present reason string → ring.
-3. **Spontaneous exit while engaged rings immediately** (no grace — a dead process produces no more events; nothing can cancel). "Engaged" = the IdleGate's per-terminal `busy` flag OR an armed grace deadline (a completion bell that was pending when the process died still rings). Queue evidence does NOT suppress death bells. Freshell-initiated kills (`kill`/`kill_all`, by `api`/`idle`/`shutdown`) are silent. Exit while idle is silent. Rust covers claude/codex/amplifier uniformly via the shared hub Exit arm + gate (opencode has no Rust tracker — N/A). Node covers codex/claude/amplifier via the shared `TrulyIdleEmitter`; Node opencode is a documented follow-up (its "record exists ⇔ busy" signal is a noisy busy proxy and would produce heuristic bells).
-4. **Auto-resume interaction:** we still ring on spontaneous death even when auto-resume will respawn the process — the respawned codex does not re-run the interrupted turn, so attention IS needed. (Node's codex durable-recovery path that swallows the pty exit entirely — `finishTerminalPtyExit` never runs — emits no exit event, hence no bell; that is correct and stays.)
-5. **Approval-request pause:** managed (`--remote`) codex only. The proxy sniffs server→client JSON-RPC REQUESTS (frames with BOTH `id` and `method`) whose method is in the approval set below; the response passing back through the proxy (client→server frame with that `id`, no `method`) resolves it. Internal waiting state maps to the EXISTING not-busy public phase; the same IdleGate boundary arms the bell (2s grace suppresses auto-answered approvals, e.g. `auto_review`). Queued input does NOT suppress approval bells. Unmanaged/PTY-only codex has no approval signal — acceptable, documented.
-6. **Approval method set** (from `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94`, codex 0.129.0 inventory; `item/tool/call` and `account/chatgptAuthTokens/refresh` are automated, NOT human-attention):
+2. **`turn_aborted` reason policy:** reason `interrupted` or `replaced` → silent (human-requested). Reason MISSING → silent (legacy rollout lines carry no reason; an absent reason is uncertainty, and per constraint above uncertainty is not a stop signal). Any OTHER present reason string → ring. **Corrected rationale (audit A11/A12):** this is FORWARD-COMPATIBLE POLICY, not a live bell cause — at codex 0.129.0–0.147.0-alpha the `TurnAbortReason` enum is exactly `{interrupted, replaced, review_ended, budget_limited}` and only `interrupted`/`replaced` have construction sites (codex-rs protocol.rs:4207-4214 @0.146.0); a 5,114-file rollout corpus (2,527 `turn_aborted` lines) is 100% `"interrupted"`. NO ring-worthy abort writes a reasoned `turn_aborted` line today; today's real non-human failures surface as `turn/completed status='failed'` / rollout `turn_complete{error}` — covered by Tasks 1/8. Known false negative (accepted): codex's guardian automation aborts write `"interrupted"` and stay silent.
+3. **Spontaneous exit while engaged rings immediately** (no grace — a dead process produces no more events; nothing can cancel). **"Engaged" for the death bell (corrected by audit A6/A10):** busy from a CONFIRMED turn (codex: accepted proxy turn started / accepted rollout `task_started`) OR an armed grace deadline (a completion bell that was pending when the process died still rings) OR a NON-EMPTY pending-approval set (a pane blocked on an approval whose process dies must ring — it is not busy, and its 2s boundary may already have rung; Tasks 5/7/11/12). **Input-only pending state NEVER counts as engagement:** the canonical human quit — `/quit`/`/exit` typed into an IDLE pane — is read by the input lane as a prompt submit (the CR: Rust `signal.rs:36-38` `is_submit_input` → `codex.rs:443-490` `note_input` → Pending; Node `codex-activity-tracker.ts:181-209` `noteInput`), drives the gate busy, and the pty exits <2s later; ringing there would bell the canonical human quit and violate the hard silence constraint. Queue evidence does NOT suppress death bells. Freshell-initiated kills (`kill`/`kill_all`, by `api`/`idle`/`shutdown` — including `shutdownGracefully()`'s direct SIGTERMs, which flow through the normal pty-exit finalizer; Task 11) are silent. Exit while idle is silent. Rust covers claude/codex/amplifier uniformly via the shared hub Exit arm + gate (opencode has no Rust tracker — N/A). Node covers codex/claude/amplifier via the shared `TrulyIdleEmitter`; Node opencode is a documented follow-up (its "record exists ⇔ busy" signal is a noisy busy proxy and would produce heuristic bells). **Accepted residuals (documented in Task 13):** mid-turn `/quit`/Ctrl+D (codex sends NO `Op::Interrupt` on Ctrl+D; the TUI's ~2s shutdown budget may skip the abort write) and out-of-band `kill -9` by the user may still ring — no in-band discriminator exists; claude/amplifier Enter-executed quits are the same family (input-driven Busy is those trackers' ONLY turn evidence, so it stays engagement); Node's 120s busy-deadman can demote busy→unknown during long recovery windows and swallow the bell (missed bell, never a false ring).
+4. **Auto-resume interaction (rationale corrected by audit A15):** successful durable recovery swallows the pty exit entirely — `finishTerminalPtyExit` never runs, no internal exit event is emitted, hence no bell — and the resumed backend turn may CONTINUE where it left off: codex `thread/resume` re-attaches to a still-running backend thread via `resume_running_thread` (codex-rs thread_processor.rs:3426/:3528 @0.146.0 — "rejoin semantics"); freshell's clean-exit recovery gate recovers precisely when the backend turn is `inProgress` (`terminal-registry.ts:3362`). The death bell therefore fires only when recovery FAILS or is ABANDONED and the exit event is actually emitted — which is exactly when attention is needed. (When the app-server itself died, resume is a pure history restore, the interrupted turn is dead, and the bell is equally justified.)
+5. **Approval-request pause:** managed (`--remote`) codex only. The proxy sniffs server→client JSON-RPC REQUESTS (frames with BOTH `id` and `method`) whose method is in the approval set below; a resolution clears it. Internal waiting state maps to the EXISTING not-busy public phase; the same IdleGate boundary arms the bell (2s grace suppresses a SENT request answered quickly). Queued input does NOT suppress approval bells. Unmanaged/PTY-only codex has no approval signal — acceptable, documented. **Resolution signals (audit A4/A5 — ALL of these must resolve, with tests, Tasks 6/12):** (a) a client `{id, result}` response frame; (b) a client `{id, error}` response frame — errors resolve identically (codex handles them via `process_error`, message_processor.rs:756-758 @0.146.0); (c) the server-side notification **`serverRequest/resolved`** with params `{threadId, requestId}` (common.rs:1701, v2/notification.rs:53-56 @0.146.0) — codex 0.146.0 can resolve a SENT request server-side with NO client response frame (`auto_resolution_ms` on `item/tool/requestUserInput`; turn cancel via `cancel_requests_for_thread`); (d) sidecar/upstream restart or reconnect clears ALL pending approvals (emitting resolutions) — the app-server's request-id allocator is a per-process monotonic `AtomicI64` starting at 0 (outgoing_message.rs:283 @0.146.0), so stale ids from a previous incarnation would collide. Response matching REQUIRES `method` ABSENT on the frame — an id alone is not enough (client requests always carry `method`; server and client request ids are independent integer spaces both starting near 0). Note: policy-auto-approvals (allowlisted commands; `auto_review`, served by a server-side subagent — v2/shared.rs:224-247 @0.146.0) never emit wire frames at all and cannot ring by construction; a SENT request auto-resolved slower than ~2s rings once (accepted residual, low severity).
+6. **Approval method set** (from `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94`, codex 0.129.0 inventory; verified EXACT against the codex `ServerRequest` enum at BOTH 0.129.0 and the deployed 0.146.0 — audit A2):
    `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `applyPatchApproval`, `execCommandApproval`.
-7. **Approval thread scoping:** approval request params have no documented shape in this repo (spike logs contain zero approval frames). Sniff by method name with opaque params; best-effort extract `params.threadId` when the frame is small enough to fully parse (`<= MAX_FULL_PARSE_BYTES`); when present and the tracker has a bound thread that differs → ignore (sub-agent approval must not ring the parent pane); when absent → accept (the proxy is per-terminal).
-8. **Gate arming for approvals uses a NEW internal tracker effect** (`AttentionBoundary` / Node tracker event `attention.boundary`) that arms the IdleGate WITHOUT emitting a `terminal.turn.complete` frame (an approval pause is not a turn end).
+   Machine-serviced server→client requests are deliberately EXCLUDED: `item/tool/call`, `account/chatgptAuthTokens/refresh` (both tags), plus `attestation/generate` and `currentTime/read` (new at 0.146.0 — both machine-serviced, correctly excluded). The set is version-fluid: both proxies DEBUG-LOG any unrecognized server→client request method (no bell, just logging — catches future drift; Tasks 6/12).
+7. **Approval thread scoping (corrected by audit A3):** the five v2 methods carry `params.threadId`; the two LEGACY methods (`applyPatchApproval`, `execCommandApproval`) carry `params.conversationId` instead (codex-rs v1.rs:126-158 — reading only `threadId` would misread every legacy approval as thread-less). Sniff by method name with opaque params; best-effort extract `params.threadId` OR, for the legacy methods, `params.conversationId`, when the frame is small enough to fully parse (`<= MAX_FULL_PARSE_BYTES`); when present and the tracker has a bound thread that differs → ignore (BEST-EFFORT heuristic: codex gives no guarantee about how child-thread approvals present on the wire, so mismatch⇒sub-agent is a safe-direction bet, not a verified fact); when absent → accept (the proxy is per-terminal).
+8. **Gate arming for approvals uses a NEW internal tracker effect** (`AttentionBoundary` / Node tracker event `attention.boundary`) that arms the IdleGate WITHOUT emitting a `terminal.turn.complete` frame (an approval pause is not a turn end). **Lane interference guard (audit A9):** while `pending_approvals` is non-empty, OTHER lanes' busy promotions — the rollout reconcile's first fold of the turn's own `task_started` (codex.rs:352-368 passes the edge-trigger and would call `idle.note_phase(Busy)`, clearing the armed deadline and silently cancelling the bell), and Node's `reconcileProjects`/`refreshExistingBinding` promotions — must fold their anchors as usual but set the resume-busy flag (`resume_busy_after_approval` / `resumeBusyAfterApproval`) INSTEAD of flipping the public phase or feeding Busy to the gate (both servers, Tasks 7/12). Approval resolve restores Busy and normalizes any pending-submit input state planted during the pause.
 9. **Deferred minors:** (a) clear the in-flight proxy turn id at accepted completion on BOTH servers; (b) Node `lastSeenTaskCompletedAt` only advances for genuine completed status (`undefined` or `'completed'`) — failed/interrupted turns do not bump it (the field name means "task COMPLETED").
 
 ## File structure (what each touched file is responsible for)
@@ -43,7 +45,7 @@
 | File | Responsibility in this plan |
 |---|---|
 | `crates/freshell-activity/src/codex.rs` | Codex tracker state machine: record predicate, abort-reason policy, approval state, turn-id clear |
-| `crates/freshell-activity/src/idle.rs` | IdleGate: new `is_engaged` read accessor |
+| `crates/freshell-activity/src/idle.rs` | IdleGate: new `is_engaged` read accessor (confirmed busy or armed deadline; input-only pending excluded) |
 | `crates/freshell-activity/src/ledger.rs` (or wherever `TrackerEffect` lives) | New `TrackerEffect::AttentionBoundary` variant |
 | `crates/freshell-ws/src/activity.rs` | Hub: exit-bell emission, approval HubEvent routing, effect→gate mapping |
 | `crates/freshell-ws/src/codex_reconcile.rs` | Rollout fold: capture `turn_aborted.reason` |
@@ -61,6 +63,54 @@
 | `shared/ws-protocol.ts` | Doc-comment-only update of `terminal.idle` semantics (schema untouched) |
 
 Run all commands from the worktree root `/home/dan/code/freshell/.worktrees/codex-attention-bell` unless stated otherwise.
+
+---
+
+### Task 0: Baseline repair — inherited `cargo test` regression + worktree npm install (audit A20)
+
+**Files:**
+- Possibly modify: base-branch production code under `crates/freshell-ws/src/` (`activity.rs`, `codex_proxy_route.rs`) and/or `crates/freshell-activity/src/codex.rs` — OR, only with evidence of an intentional behavior change, `crates/freshell-ws/tests/auto_resume_e2e.rs`
+- No plan-feature code in this task.
+
+**Interfaces:**
+- Consumes: the inherited branch head (911fa4cdc + the plan-doc commit). The audit (V8 report) established: `cargo test -p freshell-activity -p freshell-ws` FAILS (exit 101) — `crates/freshell-ws/tests/auto_resume_e2e.rs` tests `reconcile_after_replacement_attaches_to_the_new_terminal` and `crashing_agent_is_resumed_twice_then_settles_exited` both time out at `tests/common/mod.rs:959` ("timed out waiting for a terminal.created frame"); deterministic (2/2 reruns); the SAME test binary passes on main (c7badcbef); the test files are byte-identical between merge-base 35fbf1357 and 911fa4cdc ⇒ the regression lives in the base-branch production changes (941ad584e..911fa4cdc: `freshell-ws/src/activity.rs` +116, `freshell-ws/src/codex_proxy_route.rs` +205, `freshell-activity/src/codex.rs` +426).
+- Produces: ALL five gates green before Task 1 begins. Every later task assumes a green baseline.
+
+- [ ] **Step 1: Reproduce**
+
+Run: `cargo test -p freshell-ws --test auto_resume_e2e`
+Expected: both tests FAIL with the terminal.created timeout. If they pass, record the environment difference and re-run twice before proceeding (the audit observed determinism).
+
+- [ ] **Step 2: Diagnose the regression**
+
+Diff the base-branch production changes: `git diff 35fbf1357..911fa4cdc -- crates/freshell-ws/src/activity.rs crates/freshell-ws/src/codex_proxy_route.rs crates/freshell-activity/src/codex.rs`. Bisect within the five branch commits (941ad584e, e039320b8, f740b1722, d2341c999, 911fa4cdc) if the diff read is not conclusive: `git bisect start 911fa4cdc 35fbf1357` running the two tests as the predicate.
+
+- [ ] **Step 3: Fix**
+
+Fix the production regression so the tests pass unmodified. ONLY if the diff proves the base branch intentionally changed the behavior these e2e tests pin (decide from the commit messages + code evidence, not convenience) may the tests be updated instead — cite the intentional change in the test doc comment.
+
+- [ ] **Step 4: Worktree npm install**
+
+Run: `npm install` (from the worktree root — allowed during execution). Do NOT rely on the parent repo's `/home/dan/code/freshell/node_modules`: running `npm run` against it silently resolves main-branch dependency versions and yields misleading signal.
+
+- [ ] **Step 5: Verify ALL five gates green**
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p freshell-activity -p freshell-ws
+npm run test:vitest -- test/unit/server/coding-cli
+npm run test:port
+```
+
+Expected: all PASS. Do not start Task 1 until they do.
+
+- [ ] **Step 6: Commit separately**
+
+```bash
+git add -A ':!docs/plans'
+git commit -m "fix(ws): repair auto_resume_e2e regression inherited from the base branch"
+```
 
 ---
 
@@ -241,6 +291,8 @@ git commit -m "fix(activity): clear the in-flight codex proxy turn id at accepte
 - Consumes: `CodexTaskEvents { latest_task_started_at, latest_task_completed_at, latest_turn_aborted_at: Option<i64> }`; `reconcile_rollout(&mut self, terminal_id: &str, events: &CodexTaskEvents, at: i64) -> Vec<CodexEffect>` (`codex.rs:320-429`).
 - Produces: `CodexTaskEvents` and the freshell-sessions snapshot gain `pub latest_turn_aborted_reason: Option<String>` (the reason paired with the winning `latest_turn_aborted_at`). Policy helper `fn abort_reason_is_human(reason: Option<&str>) -> bool` in `codex.rs`. Task 10 mirrors the same field/policy names on Node (`latestTurnAbortedReason`, `abortReasonIsHuman`).
 
+**Rationale (corrected by audit A12 — read before implementing):** this task is forward-compatible policy plumbing, NOT a live bell cause. At codex 0.129.0–0.147.0-alpha, `TurnAbortReason` = `{interrupted, replaced, review_ended, budget_limited}`; only `interrupted`/`replaced` have construction sites, and a 5,114-file rollout corpus (2,527 `turn_aborted` lines) is 100% `"interrupted"` — NO ring-worthy abort writes a reasoned `turn_aborted` line today. Today's real failures surface as `turn/completed status='failed'` (Tasks 1/8). Keep the tasks and tests exactly as specified: they pin the default-ring policy for reasons a future codex may emit.
+
 - [ ] **Step 1: Write failing tracker tests (policy)**
 
 In `crates/freshell-activity/src/codex.rs` tests, next to `reconcile_turn_aborted_clears_without_completing` (`:1237`) — which stays valid for reason-less aborts but should be renamed/documented — add. Use the local `CodexTaskEvents` construction idiom (helpers `started(at)`/`completed(at)` at `:1183`/`:1189`; extend or inline with the new field):
@@ -383,7 +435,7 @@ git commit -m "feat(activity): ring on non-human turn_aborted reasons via end-to
 
 **Interfaces:**
 - Consumes: `ActivityEvent::Exit { terminal_id: String, at: i64 }`; `kill_internal(&self, terminal_id, by: &'static str)` (`:1444`); `finish_pty_exit(&self, terminal_id, exit_code)` (`:1567`).
-- Produces: `ActivityEvent::Exit { terminal_id: String, at: i64, spontaneous: bool }` — `false` from `kill_internal` (freshell-initiated: api/idle/shutdown), `true` from `finish_pty_exit` (spontaneous PTY/process death). Task 5 consumes `spontaneous`.
+- Produces: `ActivityEvent::Exit { terminal_id: String, at: i64, spontaneous: bool }` — `false` from `kill_internal` (freshell-initiated: api/idle/shutdown), `true` from `finish_pty_exit` (spontaneous PTY/process death). Task 5 consumes `spontaneous` and MUST read gate engagement BEFORE any hub state teardown (`modes.remove` / `idle.note_exit` both destroy the evidence — audit A17; the ordering is spelled out and test-pinned in Task 5 Step 5).
 
 - [ ] **Step 1: Write the failing registry tests**
 
@@ -440,7 +492,7 @@ git commit -m "feat(terminal): carry a spontaneous-vs-requested discriminator on
 
 **Interfaces:**
 - Consumes: `ActivityEvent::Exit { terminal_id, at, spontaneous }` (Task 4); `IdleGate` internals `TerminalIdleState { busy, pending, saw_queue_evidence, deadline }` (`idle.rs:49-60`); frame shape `ServerMessage::TerminalIdle(TerminalIdle { terminal_id, at, reason })` as built at `activity.rs:1039-1045`.
-- Produces: `IdleGate::is_engaged(&self, terminal_id: &str) -> bool` (busy OR armed deadline). Hub emits exactly one `terminal.idle` (reason `Grace`) for a spontaneous exit while engaged, for all three hub trackers.
+- Produces: `IdleGate::is_engaged(&self, terminal_id: &str) -> bool` — CONFIRMED busy (`busy && !pending`) OR an armed deadline. The codex input-only submit gate (`pending`, set by `note_phase(Pending)`) is deliberately NOT engagement: the Enter that executes a human `/quit`/`/exit` from an idle pane is indistinguishable from a prompt submit in the input lane (decision 3, audit A6). Hub emits exactly one `terminal.idle` (reason `Grace`) for a spontaneous exit while engaged, for all three hub trackers. Task 7 extends the hub's engagement read with `codex.has_pending_approvals(..)` once approval state exists.
 
 - [ ] **Step 1: Write the failing IdleGate accessor test**
 
@@ -448,11 +500,18 @@ In `idle.rs` `mod tests`:
 
 ```rust
 #[test]
-fn is_engaged_reflects_busy_and_armed_deadlines() {
+fn is_engaged_reflects_confirmed_busy_and_armed_deadlines_but_never_input_pending() {
     let mut gate = IdleGate::with_grace_ms(2_000);
     assert!(!gate.is_engaged("t1"), "unknown terminal is not engaged");
+    gate.note_phase("t1", IdleGatePhase::Pending);
+    assert!(
+        !gate.is_engaged("t1"),
+        "input-only pending is NOT death-bell engagement: the Enter that \
+         executes /quit looks like a prompt submit (signal.rs:36-38) and \
+         must not ring when the pty then exits (decision 3, audit A6)"
+    );
     gate.note_phase("t1", IdleGatePhase::Busy);
-    assert!(gate.is_engaged("t1"), "busy is engaged");
+    assert!(gate.is_engaged("t1"), "confirmed busy is engaged");
     gate.note_phase("t1", IdleGatePhase::Idle);
     assert!(!gate.is_engaged("t1"), "idle with no pending window is not engaged");
     gate.note_turn_boundary("t1", 10_000); // arms deadline
@@ -467,13 +526,17 @@ fn is_engaged_reflects_busy_and_armed_deadlines() {
 Run: `cargo test -p freshell-activity is_engaged` → COMPILE ERROR. Then add to `impl IdleGate` next to `note_exit` (`idle.rs:142-144`):
 
 ```rust
-/// True while the tracker reports busy-or-pending OR a grace window is
-/// armed. Read by the hub's exit arm BEFORE `note_exit` drops the state:
-/// a spontaneous process death while engaged rings the attention bell.
+/// Engagement for the DEATH BELL (decision 3): true only for a CONFIRMED
+/// busy phase or an armed grace window. The codex input-only Pending
+/// submit gate is excluded — the Enter that executes a human /quit//exit
+/// is indistinguishable from a prompt submit in the input lane
+/// (signal.rs:36-38), so ringing on pending would bell the canonical
+/// human quit. Read by the hub's exit arm BEFORE `note_exit` drops the
+/// state: a spontaneous process death while engaged rings the bell.
 pub fn is_engaged(&self, terminal_id: &str) -> bool {
     self.states
         .get(terminal_id)
-        .map(|s| s.busy || s.deadline.is_some())
+        .map(|s| (s.busy && !s.pending) || s.deadline.is_some())
         .unwrap_or(false)
 }
 ```
@@ -500,9 +563,18 @@ In `activity.rs` `mod tests` (use `hub()` `:1331`, `observer_send` `:1337`, `nex
 // 5. claude_spontaneous_exit_while_busy_rings — same as (1) with a claude-mode
 //    terminal driven Busy via the claude lane (mirror
 //    claude_submit_bel_turn_complete_and_terminal_idle_flow :1450 setup).
+// 6. slash_command_quit_from_an_idle_pane_does_not_ring  (audit A6 red test)
+//    Track t1 (codex) and leave it Idle; feed a lone-CR PTY input ("\r") the
+//    way existing hub tests drive the input lane (locate a test that sends
+//    ActivityEvent::Input / the hub's input entry and mirror it) — the input
+//    lane promotes Idle→Pending (codex.rs:443-490) and the gate goes
+//    busy+pending; then observer_send(Exit { spontaneous: true, at });
+//    assert NO terminal.idle (bounded negative wait). This is exactly what
+//    `/quit`/`/exit` typed into an idle pane looks like to the tracker: the
+//    slash-command Enter is indistinguishable from a prompt submit.
 ```
 
-Write all five as real tests with the file's local harness idioms.
+Write all six as real tests with the file's local harness idioms. Test 1 doubles as the audit-A17 ordering pin: if the implementation reads `is_engaged` AFTER `idle.note_exit` (which deletes the per-terminal state), the read is always false and test 1 fails.
 
 - [ ] **Step 4: Red**
 
@@ -511,52 +583,62 @@ Expected: FAIL — no frame emitted (exit is currently silent).
 
 - [ ] **Step 5: Implement the hub exit-bell**
 
-Rewrite the Exit arm (`activity.rs:724-753`) — bind `at` and `spontaneous`, read engagement BEFORE any state is dropped (`note_exit` at `:730` and each tracker's `note_exit` both destroy the evidence):
+Rewrite the Exit arm (`activity.rs:724-753`) — bind `at` and `spontaneous`. ORDERING IS LOAD-BEARING (audits A17/A8): the engagement read AND the bell decision happen FIRST, before the `modes.remove` early-return and before `idle.note_exit` — both destroy the evidence.
 
 ```rust
 ActivityEvent::Exit { terminal_id, at, spontaneous } => {
     let frames = {
         let mut inner = self.inner.lock().expect("activity hub lock");
-        let Some(mode) = inner.modes.remove(&terminal_id) else {
-            return;
-        };
-        // Read BEFORE note_exit drops gate state. Engaged = busy/pending
-        // OR an armed grace window (a pending completion bell must still
-        // ring if the process dies during the grace).
+        // Read engagement BEFORE any teardown: `idle.note_exit` deletes the
+        // per-terminal gate state and `modes.remove` would early-return.
+        // Task 7 extends this read with
+        // `|| inner.codex.has_pending_approvals(&terminal_id)` (a pane
+        // blocked on an approval whose process dies must ring even after
+        // its 2s boundary already rang).
         let ring_death_bell = spontaneous && inner.idle.is_engaged(&terminal_id);
-        inner.idle.note_exit(&terminal_id);
-        inner.lanes.remove(&terminal_id);
-        inner.lane_retries.remove(&terminal_id);
-        inner.codex_lanes.remove(&terminal_id);
-        let mut frames = match mode.as_str() {
-            "claude" => {
-                let effects = inner.claude.note_exit(&terminal_id);
-                claude_frames(&mut inner.idle, effects)
-            }
-            "codex" => {
-                let effects = inner.codex.note_exit(&terminal_id);
-                let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
-                frames
-            }
-            "amplifier" => {
-                let effects = inner.amplifier.note_exit(&terminal_id);
-                let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
-                frames
-            }
-            _ => Vec::new(),
-        };
+        let mut frames = Vec::new();
         if ring_death_bell {
-            // Spontaneous death while working: same frame, same reason —
-            // no wire change. Immediate (no grace): a dead process emits
-            // nothing further, so nothing could ever cancel it. Exactly
-            // once per terminal: modes.remove above guarantees the arm
-            // runs once (a later shutdown sweep of a retained exited row
-            // arrives with spontaneous=false AND finds no mode).
+            // Spontaneous death while engaged: same frame, same reason —
+            // no wire change. reason MUST be Grace: the client zod enum
+            // (shared/ws-protocol.ts:210-215) and the Rust enum
+            // (freshell-protocol server_messages.rs:397-402) allow ONLY
+            // grace|queue-empty — a novel reason is silently dropped by
+            // the Node schema and unrepresentable here. `at` is the fresh
+            // exit timestamp (client dedupe is per-terminal monotonic
+            // `at`). Immediate (no grace): a dead process emits nothing
+            // further, so nothing could ever cancel it. Exactly once per
+            // terminal: the modes.remove below guarantees the teardown
+            // runs once, and a later shutdown sweep of a retained exited
+            // row arrives with spontaneous=false.
             frames.push(ServerMessage::TerminalIdle(TerminalIdle {
                 terminal_id: terminal_id.clone(),
                 at,
                 reason: TerminalIdleReason::Grace,
             }));
+        }
+        if let Some(mode) = inner.modes.remove(&terminal_id) {
+            inner.idle.note_exit(&terminal_id);
+            inner.lanes.remove(&terminal_id);
+            inner.lane_retries.remove(&terminal_id);
+            inner.codex_lanes.remove(&terminal_id);
+            let tracker_frames = match mode.as_str() {
+                "claude" => {
+                    let effects = inner.claude.note_exit(&terminal_id);
+                    claude_frames(&mut inner.idle, effects)
+                }
+                "codex" => {
+                    let effects = inner.codex.note_exit(&terminal_id);
+                    let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                    frames
+                }
+                "amplifier" => {
+                    let effects = inner.amplifier.note_exit(&terminal_id);
+                    let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
+                    frames
+                }
+                _ => Vec::new(),
+            };
+            frames.extend(tracker_frames);
         }
         frames
     };
@@ -620,6 +702,34 @@ Locate the existing `mod tests` in `remote_proxy.rs` (the branch added upstream-
 //    response to OUR own pending client request; untouched behavior).
 // 5. approval_request_without_thread_id_yields_none
 //    Frame like (1) but params lacks threadId — thread_id == None.
+// 6. legacy_approval_reads_conversation_id  (decision 7 / audit A3)
+//    Upstream frame {"id":42,"method":"execCommandApproval",
+//    "params":{"conversationId":"thread-1","command":"..."}} →
+//    ApprovalRequested { thread_id: Some("thread-1"), .. } (legacy methods
+//    carry params.conversationId, codex-rs v1.rs:126-158).
+// 7. error_response_also_resolves  (decision 5a / audit A5)
+//    After (1), CLIENT frame {"id":41,"error":{"code":-1,"message":"denied"}}
+//    → ApprovalResolved { request_id: "41" } AND forwarded upstream.
+// 8. client_frame_with_id_and_method_never_resolves  (decision 5d)
+//    After (1), CLIENT frame {"id":41,"method":"thread/start","params":{}}
+//    (a REQUEST whose id happens to collide) → NO ApprovalResolved; the
+//    frame forwards upstream unchanged.
+// 9. server_request_resolved_notification_resolves  (decision 5c)
+//    After (1), UPSTREAM notification (no id)
+//    {"method":"serverRequest/resolved","params":{"threadId":"thread-1","requestId":"41"}}
+//    → ApprovalResolved { request_id: "41" } AND the notification relays to
+//    the client verbatim. (Verify the exact wire field casing against the
+//    cached codex source v2/notification.rs:53-56 @0.146.0 — the struct is
+//    {thread_id, request_id} under camelCase serde rename.)
+// 10. upstream_reconnect_clears_pending_approvals  (decision 5b)
+//    After (1), tear down / re-dial the upstream connection the way the
+//    harness simulates disconnects → ApprovalResolved { request_id: "41" }
+//    is emitted for every drained pending id (the app-server id counter is
+//    per-process and restarts at 0 — stale ids would collide).
+// 11. unknown_server_request_method_is_logged_not_belled  (decision 6)
+//    Upstream frame {"id":43,"method":"some/future/method","params":{}} →
+//    no ApprovalRequested, bytes relayed verbatim (assert relay; the debug
+//    log itself needs no assertion — keep it a tracing::debug!).
 ```
 
 - [ ] **Step 2: Red**
@@ -634,9 +744,9 @@ Expected: COMPILE ERROR (no variants) — red.
 ```rust
 /// Server→client JSON-RPC REQUEST methods that block on a human. Sourced
 /// from the codex 0.129.0 schema inventory
-/// (test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94);
-/// `item/tool/call` and `account/chatgptAuthTokens/refresh` are automated
-/// and deliberately excluded.
+/// (test/fixtures/coding-cli/codex-app-server/schema-inventory.ts:84-94)
+/// and verified EXACT against the codex `ServerRequest` enum at both
+/// 0.129.0 and the deployed 0.146.0.
 const APPROVAL_REQUEST_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -646,6 +756,21 @@ const APPROVAL_REQUEST_METHODS: &[&str] = &[
     "applyPatchApproval",
     "execCommandApproval",
 ];
+
+/// Machine-serviced server→client requests — never human-attention.
+/// (`attestation/generate` and `currentTime/read` are new at 0.146.0.)
+/// Anything outside BOTH lists is debug-logged to catch future drift
+/// (decision 6) — no bell, just logging.
+const AUTOMATED_SERVER_REQUEST_METHODS: &[&str] = &[
+    "item/tool/call",
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate",
+    "currentTime/read",
+];
+
+/// Legacy approval methods carry `params.conversationId` instead of
+/// `params.threadId` (codex-rs v1.rs:126-158).
+const LEGACY_APPROVAL_REQUEST_METHODS: &[&str] = &["applyPatchApproval", "execCommandApproval"];
 ```
 
 2. Per-connection state: alongside `pending_methods` / `pending_fork_requests` add `pending_server_approvals: HashSet<RequestId>` (use the same `RequestId` type `pending_methods` keys on; add a small `fn envelope_id_to_string(id: &JsonRpcEnvelopeId) -> String` for the event payload — string ids verbatim, numeric ids via their canonical integer formatting).
@@ -659,10 +784,17 @@ if let Some(method) = envelope.method.as_deref() {
     // server's id space is not ours.
     if APPROVAL_REQUEST_METHODS.contains(&method) {
         if let Some(req_id) = envelope_id_to_request_id(&id) {
+            // v2 methods carry params.threadId; legacy methods carry
+            // params.conversationId (decision 7, codex-rs v1.rs:126-158).
+            let thread_pointer = if LEGACY_APPROVAL_REQUEST_METHODS.contains(&method) {
+                "/params/conversationId"
+            } else {
+                "/params/threadId"
+            };
             let thread_id = (data.len() <= MAX_FULL_PARSE_BYTES)
                 .then(|| serde_json::from_slice::<serde_json::Value>(&data).ok())
                 .flatten()
-                .and_then(|v| v.pointer("/params/threadId").and_then(|t| t.as_str()).map(str::to_string));
+                .and_then(|v| v.pointer(thread_pointer).and_then(|t| t.as_str()).map(str::to_string));
             if let Some(conn) = self.connections.get_mut(&conn_id) {
                 conn.pending_server_approvals.insert(req_id);
             }
@@ -672,6 +804,9 @@ if let Some(method) = envelope.method.as_deref() {
                 thread_id,
             }));
         }
+    } else if !AUTOMATED_SERVER_REQUEST_METHODS.contains(&method) {
+        // Decision 6: the method set is version-fluid — surface drift.
+        tracing::debug!(method, "unrecognized codex server->client request method (not treated as an approval)");
     }
     self.send_to_client(conn_id, data, binary);
     return;
@@ -680,10 +815,13 @@ if let Some(method) = envelope.method.as_deref() {
 
 (Reuse the existing `envelope_id_to_request_id` helper visible at `:1017`; keep relay-verbatim semantics for ALL server requests, approval or not.)
 
-4. In `forward_client_frame` (`:1017-1032`), when `id` is Some and `method` is None (a response):
+4. In `forward_client_frame` (`:1017-1032`), when `id` is Some and `method` is None (a response — the `method.is_none()` check is MANDATORY, decision 5d: a client REQUEST whose id numerically collides with a pending server approval must not resolve it):
 
 ```rust
 if method.is_none() {
+    // A response frame: {id, result} OR {id, error} — BOTH resolve
+    // (decision 5a; codex handles errors via process_error). No need to
+    // inspect the payload beyond id+method-absence.
     if let Some(req_id) = id.as_ref().and_then(envelope_id_to_request_id) {
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             if conn.pending_server_approvals.remove(&req_id) {
@@ -699,6 +837,10 @@ if method.is_none() {
 Restructure to fit the existing `if let (Some(id), Some(method))` shape without double-borrowing; forward the frame upstream unchanged in all cases.
 
 5. Add the two variants + struct to `RemoteProxyEvent` (`:199-207`).
+
+6. **Server-side resolution (decision 5c):** in the upstream NOTIFICATION path (frames with `method` and NO `id` — the same branch that handles `STATEFUL_NOTIFICATION_METHODS`), when `envelope.method.as_deref() == Some("serverRequest/resolved")` and `data.len() <= MAX_FULL_PARSE_BYTES`, parse `params.requestId` (verify the exact wire casing against the cached codex source `v2/notification.rs:53-56` @0.146.0 — struct fields `{thread_id, request_id}` under camelCase serde rename), remove it from `pending_server_approvals` (search ALL connections' pending sets — the request went out on this proxy's single upstream), and emit `ApprovalResolved` when it was pending. Relay the notification to the client verbatim regardless.
+
+7. **Restart hygiene (decision 5b):** wherever the proxy tears down or re-dials the upstream connection (mirror how `pending_methods`/`pending_fork_requests` are handled on connection teardown — locate with `grep -n "pending_methods" crates/freshell-codex/src/remote_proxy.rs`), drain `pending_server_approvals` and emit `ApprovalResolved` for EVERY drained id, so trackers never stay paused across an incarnation whose fresh id counter (per-process `AtomicI64` from 0) would collide with stale ids.
 
 - [ ] **Step 4: Run**
 
@@ -718,8 +860,8 @@ git commit -m "feat(codex): sniff app-server approval requests and match their r
 
 **Files:**
 - Modify: `crates/freshell-activity/src/ledger.rs` (or the file defining `TrackerEffect` — locate with `grep -rn "enum TrackerEffect" crates/freshell-activity/src/`): new variant
-- Modify: `crates/freshell-activity/src/codex.rs` (new state fields + `note_approval_requested`/`note_approval_resolved`; clears in completion/rebind paths)
-- Modify: `crates/freshell-ws/src/activity.rs` (`codex_frames` `:1195-1242`; `claude_frames` `:1146-1191`; `amplifier_frames` `:1246-1292`; new `HubEvent::CodexApproval` + public entry; hub tests)
+- Modify: `crates/freshell-activity/src/codex.rs` (new state fields + `note_approval_requested`/`note_approval_resolved` + `has_pending_approvals`; clears in completion/rebind paths; reconcile promotion guard at `:352-368`)
+- Modify: `crates/freshell-ws/src/activity.rs` (`codex_frames` `:1195-1242`; `claude_frames` `:1146-1191`; `amplifier_frames` `:1246-1292`; new `HubEvent::CodexApproval` + public entry; Exit-arm engagement extension from Task 5; hub tests)
 - Modify: `crates/freshell-ws/src/codex_proxy_route.rs` (`route_proxy_event` `:46-95`)
 
 **Interfaces:**
@@ -736,6 +878,10 @@ AttentionBoundary { terminal_id: String, at: i64 },
 // CodexActivityTracker:
 pub fn note_approval_requested(&mut self, terminal_id: &str, thread_id: Option<&str>, request_id: &str, at: i64) -> Vec<CodexEffect>;
 pub fn note_approval_resolved(&mut self, terminal_id: &str, request_id: &str, at: i64) -> Vec<CodexEffect>;
+/// Death-bell engagement extension (decision 3): a pane blocked on an
+/// approval whose process dies spontaneously must ring. Read by the hub's
+/// Exit arm alongside IdleGate::is_engaged, BEFORE any teardown.
+pub fn has_pending_approvals(&self, terminal_id: &str) -> bool;
 
 // ActivityHub:
 pub fn note_codex_approval(&self, terminal_id: &str, thread_id: Option<&str>, request_id: &str, requested: bool);
@@ -817,6 +963,56 @@ fn turn_completion_clears_pending_approvals() {
     // A late response to the stale approval must not flip the pane busy.
     let effects = tracker.note_approval_resolved("t1", "41", 6_000);
     assert!(effects.is_empty());
+}
+
+/// Audit A9: the FIRST rollout fold of the turn's own task_started passes
+/// the reconcile edge-trigger (codex.rs:352-368) — landing mid-pause it
+/// would flip phase Busy, feed the gate, and silently cancel the armed
+/// approval bell. Mid-pause promotions must fold anchors but defer the
+/// phase flip to the resolve.
+#[test]
+fn reconcile_task_started_during_pending_approval_does_not_flip_busy() {
+    let mut tracker = CodexActivityTracker::new();
+    tracker.track_terminal("t1", Some("thread-1"), 1_000);
+    tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+    tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+    // Reuse Task 3's `started(at)` CodexTaskEvents helper (codex.rs:1183).
+    let effects = tracker.reconcile_rollout("t1", &started(3_500), 3_500);
+    assert_eq!(phases(&effects), Vec::<CodexPhase>::new(), "no Busy upsert mid-pause");
+    // The deferred promotion resumes at resolve.
+    let effects = tracker.note_approval_resolved("t1", "41", 4_000);
+    assert_eq!(phases(&effects), vec![CodexPhase::Busy]);
+}
+
+/// Audit A9 hazard 2: a mid-pause Enter (the human answering the approval
+/// in the TUI) plants PTY pending-submit state; resolve must normalize it
+/// so the NEXT turn clear is not misclassified as a queued re-arm (which
+/// would suppress a legitimate later bell).
+#[test]
+fn approval_resolve_normalizes_pending_submit_input_state() {
+    let mut tracker = CodexActivityTracker::new();
+    tracker.track_terminal("t1", Some("thread-1"), 1_000);
+    tracker.note_proxy_turn_started("t1", "thread-1", Some("turn-1"), 2_000);
+    tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+    tracker.note_input("t1", "\r", 3_500); // answering the approval prompt
+    tracker.note_approval_resolved("t1", "41", 4_000);
+    let effects =
+        tracker.note_proxy_turn_completed("t1", "thread-1", Some("turn-1"), Some("completed"), 6_000);
+    assert_eq!(phases(&effects), vec![CodexPhase::Idle], "no Pending re-arm from the pause keystroke");
+    assert_eq!(completions(&effects).len(), 1, "the completion bell must not be swallowed");
+}
+
+/// Decision 3 / audit A10: a pane blocked on an approval counts as engaged
+/// for the death bell.
+#[test]
+fn has_pending_approvals_tracks_the_pending_set() {
+    let mut tracker = CodexActivityTracker::new();
+    tracker.track_terminal("t1", Some("thread-1"), 1_000);
+    assert!(!tracker.has_pending_approvals("t1"));
+    tracker.note_approval_requested("t1", Some("thread-1"), "41", 3_000);
+    assert!(tracker.has_pending_approvals("t1"));
+    tracker.note_approval_resolved("t1", "41", 4_000);
+    assert!(!tracker.has_pending_approvals("t1"));
 }
 ```
 
@@ -919,6 +1115,19 @@ pub fn note_approval_resolved(
 Adapt the `to_record`/`has_public_change` usage to the file's existing effect-emission idiom (see `note_proxy_turn_started` `:571-599` for the canonical pattern).
 4. Clear approval state at turn end and rebind: in both accepted arms of `note_proxy_turn_completed` (same spots as Task 2's clear) add `state.pending_approvals.clear(); state.resume_busy_after_approval = false;`; likewise in the rebind branches (`track_terminal` `:247` area, `bind_session` `:306` area).
 5. Match-arm fallout: add `TrackerEffect::AttentionBoundary { .. } => {}` arms wherever the compiler demands (claude/amplifier frame mappers, ledger, etc.).
+6. Accessor:
+
+```rust
+pub fn has_pending_approvals(&self, terminal_id: &str) -> bool {
+    self.states
+        .get(terminal_id)
+        .map(|s| !s.pending_approvals.is_empty())
+        .unwrap_or(false)
+}
+```
+
+7. **Reconcile promotion guard (decision 8 / audit A9):** in `reconcile_rollout`'s promotion branch (`codex.rs:352-368` — the arm that sets `state.phase = CodexPhase::Busy` at `:368`), when `!state.pending_approvals.is_empty()`: still fold the anchors exactly as the branch does today (`last_seen_task_started_at`, `accepted_start_at`) but set `state.resume_busy_after_approval = true` INSTEAD of assigning the phase (and emit no Busy `Changed` upsert). The resolve path already restores Busy via the flag.
+8. **Resolve normalization (audit A9 hazard 2):** in `note_approval_resolved`, when the pending set empties, also clear the PTY pending-submit state a mid-pause Enter may have planted (`pending_submit_at` and the disarmed-swallow flags set at `codex.rs:480-489` — mirror how the rebind path resets them) so the next turn clear is not misread as a queued re-arm.
 
 Run: `cargo test -p freshell-activity approval` → PASS.
 
@@ -936,6 +1145,19 @@ Hub tests in `activity.rs` `mod tests` (grace is 2s in production — mirror how
 //    assert NO terminal.idle within a bounded wait, and the activity frame is Busy again.
 // 3. queued_input_does_not_suppress_the_approval_bell
 //    Busy + submit-shaped input first, then approval request; still one terminal.idle.
+// 4. reconcile_tick_during_a_pending_approval_does_not_cancel_the_armed_bell  (audit A9)
+//    Busy via proxy lane; approval requested (deadline armed); BEFORE the 2s
+//    grace elapses, drive a rollout reconcile whose newest event is the
+//    turn's task_started (mirror how existing tests feed rollout fixtures /
+//    CodexFsChange); assert the terminal.idle STILL arrives after the grace
+//    AND no Busy-phase codex.activity.updated frame was emitted mid-pause;
+//    then resolve → the activity frame shows Busy again.
+// 5. spontaneous_exit_during_a_pending_approval_rings  (decision 3 / audit A10)
+//    Busy via proxy lane; approval requested; let the 2s grace elapse and the
+//    approval bell ring (deadline now spent, phase not busy); then
+//    observer_send(Exit { spontaneous: true, at }); assert a SECOND
+//    terminal.idle arrives — pending_approvals counts as death-bell
+//    engagement even after the armed deadline has already rung.
 ```
 
 Implementation:
@@ -1122,6 +1344,8 @@ git commit -m "fix(server): clear the in-flight codex turn id at accepted comple
 - Consumes: rollout payload `{"type":"turn_aborted","turn_id":"...","reason":"interrupted"}` (reason may be absent on legacy lines).
 - Produces: `CodexTaskEventSnapshot.latestTurnAbortedReason?: string` (paired newest-wins with `latestTurnAbortedAt`); tracker helper `abortReasonIsHuman(reason: string | undefined): boolean` mirroring Rust (`undefined | 'interrupted' | 'replaced'` → true).
 
+**Rationale (corrected by audit A12):** as in Task 3, this is forward-compatible policy plumbing — no live codex (0.129.0–0.147.0-alpha) writes a ring-worthy `turn_aborted` reason (a 5,114-file corpus is 100% `"interrupted"`); today's real failures ring via `status='failed'` (Tasks 1/8). Keep the tests as specified.
+
 - [ ] **Step 1: Write failing tests (parser + tracker policy)**
 
 Parser: a rollout line with `reason` populates `latestTurnAbortedReason`; a legacy line leaves it `undefined`; newest abort wins the pairing.
@@ -1178,7 +1402,7 @@ git commit -m "feat(server): ring on non-human codex turn_aborted reasons (Node 
 ### Task 11: Node — spontaneous-exit bell (codex/claude/amplifier)
 
 **Files:**
-- Modify: `server/terminal-registry.ts` (internal emits at `:1527-1531` and `:4091-4095` — NOT the client `safeSend` wire frames at `:1520`/`:4084`)
+- Modify: `server/terminal-registry.ts` (`finishTerminalPtyExit` `:1504-1535`; internal emits at `:1527-1531` and `:4091-4095` — NOT the client `safeSend` wire frames at `:1520`/`:4084`)
 - Modify: `server/coding-cli/codex-activity-wiring.ts:82-92` and the claude/amplifier equivalents (locate: `grep -rn "registry.on('terminal.exit'" server/coding-cli/`)
 - Modify: `server/coding-cli/codex-activity-tracker.ts` (`noteExit` `:176-179`, `removeState` `:640-645`), `claude-activity-tracker.ts` (`noteExit` `:169`, `removeState` `:200`), `amplifier-activity-tracker.ts` (`noteExit` `:343`, `removeState` `:387`)
 - Modify: `server/coding-cli/truly-idle-emitter.ts` (remove loop `:102-109`; change type; doc `:57-58`)
@@ -1186,7 +1410,7 @@ git commit -m "feat(server): ring on non-human codex turn_aborted reasons (Node 
 
 **Interfaces:**
 - Consumes: registry internal event `'terminal.exit'` payload; `TrulyIdleActivityChange` ('changed' event payload `{ upsert, remove }`).
-- Produces: internal `'terminal.exit'` payload gains `spontaneous: boolean` (`finishTerminalPtyExit` → `true`; `kill` → `false`). Tracker `noteExit(input: { terminalId: string; at: number; spontaneous?: boolean })`; `removeState(terminalId, opts?: { spontaneousExit?: boolean })`; `'changed'` payload gains optional `spontaneousExitRemovals?: string[]`. Emitter emits `{ terminalId, at: now(), reason: 'grace' }` immediately for a spontaneous removal while engaged (`state.busy || state.graceTimer !== undefined`). `unbindTerminal` never passes the flag (requested).
+- Produces: internal `'terminal.exit'` payload gains `spontaneous: boolean` — `finishTerminalPtyExit` computes it as `!requestedClose` where `requestedClose` is `record.codexRecoveryFinalClose === true` captured at function ENTRY (see Step 3; a blanket `true` would ring on server shutdown — audit A7); the `kill` path (`:4091-4095`) emits `false`. Tracker `noteExit(input: { terminalId: string; at: number; spontaneous?: boolean })`; `removeState(terminalId, opts?: { spontaneousExit?: boolean })`; `'changed'` payload gains optional `spontaneousExitRemovals?: string[]`. Emitter emits `{ terminalId, at: now(), reason: 'grace' }` immediately for a spontaneous removal while engaged: `(state.busy && !state.pending) || state.graceTimer !== undefined` — input-only pending is NOT engagement (decision 3: `/quit` from an idle pane arrives as phase `'pending'`). Task 12 extends engagement with approval waits (`approvalPendingRemovals`). `unbindTerminal` never passes the flag (requested). **Accepted residual (audit A17, document in Task 13):** the 120s busy-deadman (`BUSY_DEADMAN_MS`, `codex-activity-tracker.ts:20`, demotion `:624-628`) can flip busy→unknown during recovery windows longer than 120s, and `unknown` never arms the death bell — a missed bell, never a false ring; no death-time snapshot is threaded.
 
 - [ ] **Step 1: Write the failing emitter tests**
 
@@ -1204,6 +1428,15 @@ it('stays silent when a busy terminal is removed by a requested close', () => {
 })
 
 it('stays silent when an idle terminal exits spontaneously', () => {})
+
+it('stays silent when an input-pending terminal exits spontaneously (slash-command quit)', () => {
+  // decision 3 / audit A6 red test: /quit typed into an idle pane arrives as
+  // phase 'pending' (the executing Enter looks like a prompt submit —
+  // codex-activity-tracker.ts:181-209). Drive:
+  //   noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'pending' }] })
+  //   noteActivityChanged({ upsert: [], remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+  // assert ZERO 'idle' emissions — input-only pending is never engagement.
+})
 
 it('rings when a spontaneous exit lands during an armed grace window', () => {
   // busy → turn complete (arms grace) → spontaneous removal before expiry
@@ -1229,7 +1462,11 @@ const spontaneous = new Set(change.spontaneousExitRemovals ?? [])
 for (const terminalId of change.remove ?? []) {
   const state = this.states.get(terminalId)
   if (!state) continue
-  const engaged = state.busy || state.graceTimer !== undefined
+  // Engagement for the death bell (decision 3): CONFIRMED busy or an armed
+  // grace window. phase 'pending' is input-only (the Enter that executes a
+  // human /quit looks like a prompt submit) and NEVER counts. Task 12 ORs
+  // in approval waits via change.approvalPendingRemovals.
+  const engaged = (state.busy && !state.pending) || state.graceTimer !== undefined
   this.cancelGrace(state)
   this.states.delete(terminalId)
   if (spontaneous.has(terminalId) && engaged) {
@@ -1242,13 +1479,19 @@ for (const terminalId of change.remove ?? []) {
 ```
 
 Extend the `TrulyIdleActivityChange` type with `spontaneousExitRemovals?: string[]` and update the doc comment at `:57-58` (see Task 13 language).
-2. `terminal-registry.ts`: add `spontaneous: true` to the internal emit at `:1527-1531` and `spontaneous: false` at `:4091-4095` (internal registry EventEmitter only — the client-facing `safeSend({ type: 'terminal.exit', ... })` payloads are wire frames and MUST NOT change).
+2. `terminal-registry.ts` (internal registry EventEmitter only — the client-facing `safeSend({ type: 'terminal.exit', ... })` payloads are wire frames and MUST NOT change). A blanket `spontaneous: true` at `:1527` is WRONG (audit A7): `shutdownGracefully()` (`:4908`) SIGTERMs ptys directly WITHOUT setting `status='exited'` (`:4955-4964`), so its exits flow through `finishTerminalPtyExit` normally and would ring death bells on server shutdown — a requested stop that must stay silent. Instead:
+   - In `finishTerminalPtyExit` (`:1504-1535`), capture `const requestedClose = record.codexRecoveryFinalClose === true` as the FIRST statement — it must be read BEFORE the function's own `this.markCodexRecoveryFinalClose(record)` call at `:1509`, which marks EVERY finishing record and would erase the signal. Then add `spontaneous: !requestedClose` to the internal emit at `:1527-1531`.
+   - Add `spontaneous: false` to the kill-path emit at `:4091-4095`.
+   - Why this flag works: `markCodexRecoveryFinalClose` (`:3574-3576`, field `codexRecoveryFinalClose?: boolean` on `TerminalRecord` at `:644`) is set by every REQUESTED close BEFORE exit dispatch — `kill()` at `:4069` (tab close, `terminal.close`, `remove()`, idle reaper, `killAndWait`) and `shutdownGracefully()` at `:4957` — and, despite the codex-prefixed name, both call it unconditionally on ANY record, so claude/amplifier terminals are covered too.
+   - VERIFY at implementation time: `grep -n markCodexRecoveryFinalClose server/terminal-registry.ts` must show only `:1509` (the finalizer itself), `:4069`, and `:4957` as callers — i.e. no genuinely-spontaneous path sets the flag before exit dispatch. If a new caller has appeared that breaks this invariant, introduce a dedicated `requestedClose` record flag set at `:4069`/`:4957` instead and emit `spontaneous: !record.requestedClose`.
 3. Wirings: widen `onExit` to `(event: { terminalId: string; spontaneous?: boolean })` and pass through: `tracker.noteExit({ terminalId: event.terminalId, at: now(), spontaneous: event.spontaneous === true })` — codex wiring at `codex-activity-wiring.ts:82-84`, and the claude/amplifier wirings' identical handlers.
 4. Trackers (codex `:176-179`/`:640`, claude `:169`/`:200`, amplifier `:343`/`:387`): `noteExit` forwards to `removeState(terminalId, { spontaneousExit: input.spontaneous === true })`; `removeState` includes `spontaneousExitRemovals: [terminalId]` on the emitted `'changed'` payload when the flag is set. `unbindTerminal` (and every other `removeState` caller) stays flag-less. Opencode tracker: DELIBERATELY unchanged (decision 3) — its record-exists⇔busy signal would over-ring; noted as follow-up in Task 13.
 
 - [ ] **Step 4: Add tracker-level tests + integration check**
 
-One test per tracker (codex/claude/amplifier): `noteExit({ spontaneous: true })` emits `'changed'` carrying `spontaneousExitRemovals`; `unbindTerminal` does not. Then run the integration suite that exercises the real WsHandler idle path:
+One test per tracker (codex/claude/amplifier): `noteExit({ spontaneous: true })` emits `'changed'` carrying `spontaneousExitRemovals`; `unbindTerminal` does not.
+
+Add the registry-level shutdown-silence red test (audit A7 — write it RED first, mirror the existing terminal-registry vitest harness; locate with `grep -rl "shutdownGracefully" test/`): create a fake-pty terminal, subscribe to the internal `'terminal.exit'` event, call `shutdownGracefully()`, and assert every emitted exit payload carries `spontaneous: false` (server shutdown is a requested stop — no death bell may ring for it). Then run the integration suite that exercises the real WsHandler idle path:
 
 Run: `npm run test:vitest -- test/unit/server/coding-cli test/server/ws-terminal-idle.test.ts`
 Expected: PASS.
@@ -1292,25 +1535,34 @@ export type CodexApprovalResolvedEvent = { terminalId: string; requestId: string
 onApprovalRequested(event: CodexApprovalRequestedEvent): void
 onApprovalResolved(event: CodexApprovalResolvedEvent): void
 // emits 'attention.boundary' { terminalId, at } (arms the gate, no turn.complete)
+
+// truly-idle-emitter.ts — death-bell engagement extension (decision 3,
+// Node mirror of Rust has_pending_approvals):
+// TrulyIdleActivityChange gains approvalPendingRemovals?: string[] —
+// terminals removed while their pending-approval set was non-empty. The
+// emitter's spontaneous-removal ring condition becomes:
+//   spontaneous && (engaged || approvalPending.has(terminalId))
+// so a pane blocked on an approval whose process dies rings even after its
+// 2s boundary already rang (busy=false, no armed timer).
 ```
 
-- [ ] **Step 1: Write failing proxy tests (mirror Task 6's five cases)**
+- [ ] **Step 1: Write failing proxy tests (mirror Task 6's ELEVEN cases)**
 
-In the existing remote-proxy vitest suite, using its synthetic-frame harness: approval request (id+method in set) → `onApprovalRequested` fires with `{ requestId: '41', method, threadId: 'thread-1' }` AND the frame relays to the client verbatim; `item/tool/call` → no event; client response `{id: 41, result}` → `onApprovalResolved` + forwarded upstream; unknown response id → nothing; missing `params.threadId` → `threadId: undefined`. Const set `CODEX_APPROVAL_REQUEST_METHODS` = the same 7 methods as Rust (decision 6).
+In the existing remote-proxy vitest suite, using its synthetic-frame harness: (1) approval request (id+method in set) → `onApprovalRequested` fires with `{ requestId: '41', method, threadId: 'thread-1' }` AND the frame relays to the client verbatim; (2) `item/tool/call` → no event; (3) client response `{id: 41, result}` → `onApprovalResolved` + forwarded upstream; (4) unknown response id → nothing; (5) missing `params.threadId` → `threadId: undefined`; (6) legacy `execCommandApproval` with `params.conversationId` → `threadId` populated from it (decision 7); (7) client `{id: 41, error}` also resolves (decision 5a); (8) a client frame with BOTH id and method never resolves (decision 5d); (9) upstream notification `serverRequest/resolved` `{threadId, requestId}` resolves and relays (decision 5c); (10) upstream connection teardown/restart emits `onApprovalResolved` for every pending id (decision 5b); (11) an unrecognized server→client request method (e.g. `some/future/method`) emits no event and relays (decision 6 — debug log only). Const set `CODEX_APPROVAL_REQUEST_METHODS` = the same 7 methods as Rust, plus the same `AUTOMATED`/`LEGACY` companion sets (decision 6/7).
 
 - [ ] **Step 2: Red → implement the proxy**
 
-In `handleUpstreamMessage`'s `if (id !== undefined)` branch (`:471`), FIRST read `envelope.method`; if present → it is a server→client request: if in the approval set, record `connection.pendingServerApprovals.set(id, true)` (new `Map`/`Set` beside `pendingMethods`), best-effort parse `params.threadId` when `frame.data.length <= MAX_FULL_PARSE_BYTES`, emit via the new handler set (canonicalize `requestId = String(id)`), then relay verbatim and return. In `forwardClientFrame` (`:831-840`): when `request.id !== undefined && request.method === undefined && connection.pendingServerApprovals.delete(request.id)` → emit resolved. Add the two handler sets + `on*` subscription methods mirroring `:263-273`.
+In `handleUpstreamMessage`'s `if (id !== undefined)` branch (`:471`), FIRST read `envelope.method`; if present → it is a server→client request: if in the approval set, record `connection.pendingServerApprovals.set(id, true)` (new `Map`/`Set` beside `pendingMethods`), best-effort parse `params.threadId` — or `params.conversationId` for the legacy methods — when `frame.data.length <= MAX_FULL_PARSE_BYTES`, emit via the new handler set (canonicalize `requestId = String(id)`), then relay verbatim and return; if the method is in NEITHER the approval set nor the automated set, `log.debug({ method }, 'unrecognized codex server->client request method')` and relay. In `forwardClientFrame` (`:831-840`): when `request.id !== undefined && request.method === undefined && connection.pendingServerApprovals.delete(request.id)` → emit resolved (`method === undefined` is MANDATORY — decision 5d; the frame may carry `result` OR `error`, both resolve). In the upstream NOTIFICATION path (method, no id): `serverRequest/resolved` → parse `params.requestId` (bounded by `MAX_FULL_PARSE_BYTES`), delete from `pendingServerApprovals`, emit resolved when it was pending, relay verbatim. On upstream connection close/teardown/re-dial (mirror how `pendingMethods` is drained there): drain `pendingServerApprovals` and emit resolved for every id — the restarted app-server's id counter begins at 0 again and stale ids would collide. Add the two handler sets + `on*` subscription methods mirroring `:263-273`.
 
 Run: `npm run test:vitest -- <remote-proxy test file>` → PASS.
 
-- [ ] **Step 3: Write failing tracker tests (mirror Task 7's seven cases)**
+- [ ] **Step 3: Write failing tracker tests (mirror Task 7's cases)**
 
-`onApprovalRequested` while busy → phase idle + one `'attention.boundary'` emission, zero `'turn.complete'`; resolved → busy again; resolved with no prior busy → stays idle; foreign-thread request ignored; missing threadId accepted; queued submit does not block the boundary; turn completion clears pending approvals (late resolve is a no-op).
+`onApprovalRequested` while busy → phase idle + one `'attention.boundary'` emission, zero `'turn.complete'`; resolved → busy again; resolved with no prior busy → stays idle; foreign-thread request ignored; missing threadId accepted; queued submit does not block the boundary; turn completion clears pending approvals (late resolve is a no-op). Plus the audit-A9 lane-interference cases (mirror Task 7's Rust tests): a `reconcileProjects` sweep whose newest snapshot event is the turn's `task_started`, landing during a pending approval, does NOT flip the public phase to `'busy'` (anchors still fold; `resumeBusyAfterApproval` set; resolve restores `'busy'`); a `refreshExistingBinding` `reason === 'resume'` re-announce during a pending approval likewise does not promote (`:549-556` promotes idle→busy with no edge-trigger today); resolve normalizes pending-submit input state planted by a mid-pause Enter (a following completed turn records normally, no `'pending'` re-arm). And the death-engagement case: `removeState` with a non-empty pending-approval set emits `'changed'` carrying `approvalPendingRemovals: [terminalId]` (read BEFORE the state is deleted).
 
 - [ ] **Step 4: Red → implement tracker + wiring + emitter arm**
 
-1. Tracker: add `pendingApprovals: Set<string>` + `resumeBusyAfterApproval: boolean` to `CodexTerminalActivity` (`:32-56` area); implement the two methods mirroring the Rust bodies in Task 7 Step 3 (thread guard against `state.sessionId`; phase demotion to `'idle'`; `this.emit('changed', ...)` + `this.emit('attention.boundary', { terminalId, at })`; resolve restores `'busy'` when the set empties and the flag is set). Clear both in the accepted paths of `onTurnCompleted`, in `noteExit`, and on rebind.
+1. Tracker: add `pendingApprovals: Set<string>` + `resumeBusyAfterApproval: boolean` to `CodexTerminalActivity` (`:32-56` area); implement the two methods mirroring the Rust bodies in Task 7 Step 3 (thread guard against `state.sessionId`; phase demotion to `'idle'`; `this.emit('changed', ...)` + `this.emit('attention.boundary', { terminalId, at })`; resolve restores `'busy'` when the set empties and the flag is set, and normalizes pending-submit input state planted mid-pause — mirror Rust Task 7 Step 3.8). Clear both in the accepted paths of `onTurnCompleted`, in `noteExit`, and on rebind — in `noteExit`/`removeState` read the pending set BEFORE deleting state and include `approvalPendingRemovals: [terminalId]` on the emitted `'changed'` payload when it was non-empty (death-bell engagement, decision 3). Lane-interference guards (decision 8 / audit A9): in `reconcileProjects`' busy promotion (the newest-`task_started` compare at `:317-325`) and in `refreshExistingBinding`'s idle→busy promote (`:549-556`), when `state.pendingApprovals.size > 0`, fold the anchors but set `resumeBusyAfterApproval = true` instead of flipping `state.phase` to `'busy'` (no busy upsert reaches the emitter mid-pause).
 2. `terminal-registry.ts`: next to the turn subscriptions (`:1935`/`:1949`) add
 
 ```ts
@@ -1344,7 +1596,8 @@ tracker.on('attention.boundary', onAttentionBoundary)
 ```
 
 (All four trackers pass through this wiring; only the codex tracker ever emits the event — a no-op for the rest.)
-5. Emitter-level test: approval boundary arms grace → after `TERMINAL_IDLE_GRACE_MS` one `'idle'`; a `'changed'` busy upsert within the grace (the resolve path) cancels it → silent.
+5. Emitter death-engagement extension: `TrulyIdleActivityChange` gains `approvalPendingRemovals?: string[]`; in the Task 11 remove loop, ring when `spontaneous.has(terminalId) && (engaged || approvalPending.has(terminalId))` (where `approvalPending = new Set(change.approvalPendingRemovals ?? [])`).
+6. Emitter-level tests: approval boundary arms grace → after `TERMINAL_IDLE_GRACE_MS` one `'idle'`; a `'changed'` busy upsert within the grace (the resolve path) cancels it → silent; a spontaneous removal carrying `approvalPendingRemovals` rings once even when the terminal is not busy and no timer is armed (the approval bell already rang — the pane was still blocked on a human when it died).
 
 - [ ] **Step 5: Green + commit**
 
@@ -1378,12 +1631,16 @@ Replace `shared/ws-protocol.ts:199-209` (keep the schema untouched):
  * "the agent stopped making progress and you don't already know". Emitted once
  * per attention transition. Rings for: completed turns (after a grace window
  * with no new activity and no detectable queued prompt), FAILED turns,
- * non-human rollout abort reasons, spontaneous process death while working
- * (immediate — no grace), and approval-request pauses (managed codex only;
- * unmanaged/PTY-only codex has no approval signal). NEVER emitted after a
- * HUMAN-REQUESTED stop: Esc/interrupt (turn.status 'interrupted', abort
- * reason 'interrupted'/'replaced'), tab close, terminal.close, or server
- * shutdown. Subagent completions inside a running turn never produce it.
+ * non-human rollout abort reasons (forward-compatible policy — no live codex
+ * <= 0.147 emits one), spontaneous process death while ENGAGED (confirmed
+ * turn, armed grace window, or pending approval; immediate — no grace), and
+ * approval-request pauses (managed codex only; unmanaged/PTY-only codex has
+ * no approval signal). NEVER emitted after a HUMAN-REQUESTED stop:
+ * Esc/interrupt (turn.status 'interrupted', abort reason
+ * 'interrupted'/'replaced'), slash-command quits from an idle pane
+ * (input-only pending state never counts as death-bell engagement), tab
+ * close, terminal.close, or server shutdown (including graceful-shutdown
+ * SIGTERMs). Subagent completions inside a running turn never produce it.
  * Queued input suppresses completion bells (work continues) but NOT death
  * bells (a dead process never runs the queue) and NOT approval bells (still
  * blocked on the human). This is the ONLY edge the client rings/shades on
@@ -1396,7 +1653,16 @@ Replace `shared/ws-protocol.ts:199-209` (keep the schema untouched):
 
 - [ ] **Step 2: Update the Rust doc anchors**
 
-Rewrite the three `codex.rs` comments and the `idle.rs:1-24` module doc so no comment still claims "never emitted after crash/interrupt/exit". The canonical sentence to use: *"terminal.idle is never emitted after a HUMAN-REQUESTED stop; it IS emitted for failed turns, non-human abort reasons, spontaneous death while working, and approval pauses (shared/ws-protocol.ts terminal.idle doc)."* In `idle.rs` note that the exit-death bell is emitted by the HUB directly (the gate itself still never emits for a removed terminal). Also note the two scoped follow-ups where the docs discuss coverage: Node opencode death bells (noisy busy proxy — deliberately excluded) and Rust opencode (no hub tracker exists).
+Rewrite the three `codex.rs` comments and the `idle.rs:1-24` module doc so no comment still claims "never emitted after crash/interrupt/exit". The canonical sentence to use: *"terminal.idle is never emitted after a HUMAN-REQUESTED stop; it IS emitted for failed turns, non-human abort reasons (forward-compatible — none emitted at codex <= 0.147), spontaneous death while engaged, and approval pauses (shared/ws-protocol.ts terminal.idle doc)."* In `idle.rs` note that the exit-death bell is emitted by the HUB directly (the gate itself still never emits for a removed terminal) and that `is_engaged` deliberately excludes the input-only Pending state.
+
+Also record the ACCEPTED RESIDUALS + scoped follow-ups where the docs discuss coverage (these are decisions, not deferrals — audit dispositions):
+1. Mid-turn `/quit`/Ctrl+D: codex sends NO `Op::Interrupt` on Ctrl+D, and the TUI's ~2s shutdown budget can exit before the abort evidence lands — may ring on a human force-quit of a visibly-working pane. No in-band discriminator exists; accepted.
+2. Out-of-band `kill -9`/SIGTERM of the CLI by the user: observationally identical to a crash — rings; accepted.
+3. Claude/amplifier Enter-executed quits (`/exit`): input-driven Busy is those trackers' ONLY turn evidence, so it stays death-bell engagement; same residual family as (1); accepted.
+4. Node 120s busy-deadman swallow (audit A17): a recovery window longer than `BUSY_DEADMAN_MS` demotes busy→unknown and `unknown` never arms the death bell — a MISSED bell (never a false ring); accepted.
+5. A SENT approval request auto-resolved server-side slower than ~2s rings once (decision 5); accepted.
+6. Node opencode death bells: deliberately excluded (noisy busy proxy) — follow-up. Rust opencode: no hub tracker exists — N/A.
+7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
 
 - [ ] **Step 3: Verify contract freeze is untouched and everything compiles**
 
@@ -1445,8 +1711,8 @@ Expected: all PASS; `git status --short port/contract/` prints nothing (wire sha
 
 - [ ] **Step 3: Behavior spot-audit (read-only)**
 
-Re-read the policy matrix in this plan's header against the test names now in the tree — every row must map to at least one green test on each server:
-1 completed rings / queued suppresses (pre-existing), 2 failed rings + failed+queued silent, 3 interrupted silent, 4 abort reasons, 5 death bells (spontaneous busy rings once / requested silent / idle silent / queue no-suppress), 6 approvals (rings once / auto-answer silent / resolve→busy / queue no-suppress), 7 deadman untouched (pre-existing tests still green).
+Re-read the goal + locked decisions in this plan's header against the test names now in the tree — every row must map to at least one green test on each server:
+1 completed rings / queued suppresses (pre-existing), 2 failed rings + failed+queued silent, 3 interrupted silent, 4 abort reasons (forward-compatible policy — unknown reason rings, interrupted/replaced/missing silent), 5 death bells (spontaneous CONFIRMED-busy rings once / input-pending slash-quit silent / requested kill silent / shutdownGracefully silent / idle silent / queue no-suppress / pending-approval death rings), 6 approvals (rings once / result AND error responses resolve / serverRequest-resolved resolves / restart clears pendings / method-present frames never resolve / resolve→busy / reconcile-mid-pause does not cancel / queue no-suppress / legacy conversationId scoping), 7 deadman untouched (pre-existing tests still green; the >120s recovery swallow is a documented residual, not a test target).
 
 - [ ] **Step 4: Final commit (only if fixes were needed)**
 
@@ -1461,7 +1727,9 @@ Do NOT open a PR — that requires explicit user approval.
 
 ## Self-review record
 
-- **Spec coverage:** matrix rows → tasks: (1) keep = untouched + re-verified in Task 14; (2) failed → Tasks 1, 8; (3) interrupted keep = pinned tests retained; (4) abort reason → Tasks 3, 10; (5) death bells → Tasks 4, 5, 11 (Rust claude/codex/amplifier via shared gate; Node codex/claude/amplifier via shared emitter; Rust opencode N/A — no tracker; Node opencode deliberately excluded per decision 3, documented in Task 13); (6) approvals → Tasks 6, 7, 12 (unmanaged limitation documented in Task 13); (7) deadman unchanged. Minors: (a) Tasks 2, 9; (b) Task 8. Docs: Task 13. Checks/freeze: Task 14.
-- **No silent deferrals:** every ringing cause is proven by hub/emitter-level tests emitting the REAL `terminal.idle` frame through production code paths (no stubs standing in for behavior). The two scoped exclusions (Node opencode death bell; unmanaged-codex approvals) are spec-sanctioned decisions ("apply where cheap and testable — otherwise note the follow-up"; "no approval signal — acceptable, document it"), not deferrals of required behavior.
-- **Placeholder scan:** no TBDs; steps that modify unseen code bodies cite exact file:line anchors plus the sibling idiom to mirror, with the assertion/behavior contract spelled out in full.
-- **Type consistency:** `spontaneous` (Rust field + Node event field), `latest_turn_aborted_reason`/`latestTurnAbortedReason`, `abort_reason_is_human`/`abortReasonIsHuman`, `AttentionBoundary`/`'attention.boundary'`, `is_engaged`, `pending_approvals`/`pendingApprovals`, `note_approval_requested/resolved` ↔ `onApprovalRequested/Resolved`, `spontaneousExitRemovals` are used with the same names and shapes across all tasks.
+(Re-run 2026-08-01 after folding in the load-bearing-assumption audit — ledger + V1–V8 reports under `.worktrees/.the-usual-logs/codex-attention-bell/`.)
+
+- **Spec coverage:** cause rows → tasks: (0) baseline repair → Task 0 (inherited auto_resume_e2e regression — audit A20 — fixed before any feature work); (1) completed keep = untouched + re-verified in Task 14; (2) failed → Tasks 1, 8 (today's ONLY live failure cause — audit A12/A14); (3) interrupted keep = pinned tests retained; (4) abort reason → Tasks 3, 10 (forward-compatible policy plumbing, rationale corrected — no live producer); (5) death bells → Tasks 4, 5, 7, 11, 12 with the corrected engagement ontology (confirmed busy OR armed deadline OR pending approvals; input-only pending excluded — audit A6/A10/A17), requested-close discrimination via `codexRecoveryFinalClose` captured at finalizer entry (audit A7), and read-before-teardown ordering pinned by test (audit A17/A8); (6) approvals → Tasks 6, 7, 12 with the full resolution set (result|error responses, `serverRequest/resolved`, restart clears — audit A4/A5), legacy `conversationId` scoping (audit A3), lane-interference guards + resume-busy flag (audit A9), and unknown-method drift logging (audit A2); (7) deadman unchanged. Minors: (a) Tasks 2, 9; (b) Task 8. Docs incl. residuals: Task 13. Checks/freeze: Task 14. Every ringing cause AND every mandated silence (slash-quit, shutdown, requested kill, interrupted, mid-pause reconcile) maps to at least one named red test per server.
+- **No silent deferrals:** every ringing cause is proven by hub/emitter-level tests emitting the REAL `terminal.idle` frame through production code paths (no stubs standing in for behavior). All exclusions are recorded DECISIONS with audit dispositions, listed in Task 13: mid-turn `/quit`/Ctrl+D and out-of-band `kill -9` (no in-band discriminator — accepted false-ring residual), claude/amplifier Enter-quits (same family), Node 120s busy-deadman swallow (missed bell only, never false — audit A17), slow (`>2s`) server-side auto-resolutions (one bell, low severity — audit A4), Node opencode death bell (noisy busy proxy — follow-up), unmanaged-codex approvals (no signal — documented).
+- **Placeholder scan:** no TBDs; steps that modify unseen code bodies cite exact file:line anchors plus the sibling idiom to mirror, with the assertion/behavior contract spelled out in full; new audit-sourced anchors were re-verified against the worktree (`terminal-registry.ts:1504/:1509/:1527/:3574/:4069/:4908/:4955-4964/:4957/:644`; `idle.rs:49-60/:91-104/:124-128/:142-144`; `truly-idle-emitter.ts:20-42/:86-110`) or cited to the exact codex tag (v1.rs:126-158, common.rs:1701, v2/notification.rs:53-56, thread_processor.rs:3426/:3528, outgoing_message.rs:283, message_processor.rs:756-758 — all @0.146.0 unless noted).
+- **Type consistency:** `spontaneous` (Rust field + Node event field), `latest_turn_aborted_reason`/`latestTurnAbortedReason`, `abort_reason_is_human`/`abortReasonIsHuman`, `AttentionBoundary`/`'attention.boundary'`, `is_engaged` (same exclusion semantics both sides: Rust `(busy && !pending) || deadline`, Node `(busy && !pending) || graceTimer`), `pending_approvals`/`pendingApprovals`, `resume_busy_after_approval`/`resumeBusyAfterApproval` (the lane-deferral flag), `has_pending_approvals` (Rust accessor) ↔ `approvalPendingRemovals` (Node changed-payload field — the emitter is event-fed, so the set membership travels on the removal payload instead of an accessor), `note_approval_requested/resolved` ↔ `onApprovalRequested/Resolved`, `APPROVAL_REQUEST_METHODS`/`CODEX_APPROVAL_REQUEST_METHODS` with matching `AUTOMATED_*`/`LEGACY_*` companion sets, `ApprovalResolved`/`'codex.approval.resolved'` (also emitted for error responses, `serverRequest/resolved`, and restart drains), `spontaneousExitRemovals` are used with the same names and shapes across all tasks.
