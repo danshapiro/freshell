@@ -1002,11 +1002,16 @@ Import note: `ActivityEvent` must be imported in this test module — add `use f
 
 - [ ] **Step 3: Run to verify the tests fail meaningfully first**
 
-These tests are written AFTER the Task 2 implementation, so they should pass immediately — their red was Task 2's red. To honor red-green discipline, verify each asserts the fixed behavior by temporarily reverting the guard: run `git stash push crates/freshell-activity/src/codex.rs` ONLY if Task 2 is uncommitted — since Task 2 IS committed, instead verify by mutation: in `note_proxy_turn_completed`, temporarily comment out the `if state.session_id.as_deref() != Some(thread_id) { return Vec::new(); }` guard, run:
+These tests are written AFTER the Task 2 implementation, so they should pass immediately — their red was Task 2's red. To honor red-green discipline, verify each asserts the fixed behavior by temporarily reverting the guards: run `git stash push crates/freshell-activity/src/codex.rs` ONLY if Task 2 is uncommitted — since Task 2 IS committed, instead verify by mutation. In `note_proxy_turn_completed`, temporarily comment out BOTH:
+
+1. the thread-scope guard: `if state.session_id.as_deref() != Some(thread_id) { return Vec::new(); }`, AND
+2. the turn-id dedupe guard directly below the `inProgress` check: `if let (Some(current), Some(completed)) = (state.current_proxy_turn_id.as_deref(), turn_id) { if current != completed { return Vec::new(); } }`
+
+Both must be disabled because these tests drive the foreign completion with a DIFFERENT turn id (`turn-c` / `turn-child`) than the bound thread's in-flight one (`turn-1` / `turn-parent` from the preceding `turn/started`): with only the thread guard removed, the turn-id guard would still drop the foreign completion and mask the red (the tests would stay green for the wrong reason). Then run:
 
 `cargo test -p freshell-ws foreign_thread_proxy_completion_does_not_ring turn_events_forward_thread_turn_and_nested_status`
 
-Expected: both FAIL (the foreign completion rings). Restore the guard (`git checkout -- crates/freshell-activity/src/codex.rs` restores the committed version if you edited in place).
+Expected: both FAIL (the foreign completion rings). Restore the guards (`git checkout -- crates/freshell-activity/src/codex.rs` restores the committed version if you edited in place).
 
 - [ ] **Step 4: Run green**
 
@@ -1372,10 +1377,19 @@ In `test/unit/server/coding-cli/codex-activity-wiring.test.ts`, the first test's
 
 (The bound `sessionId` in that test is `'session-1'`, so the events must carry `threadId: 'session-1'` to pass the new filter — the old bare `{ terminalId, at }` fixtures would now be dropped, which is exactly the semantic being pinned.)
 
+Also update the PRE-EXISTING app-server-lane tracker tests to the new event shape. In `test/unit/server/coding-cli/codex-activity-tracker.test.ts`, the `describe('turn.complete emission (server-authoritative)')` block has exactly five `onTurnStarted`/`onTurnCompleted` call sites that pass bare `{ terminalId: 'term-1', at: ... }` (`:1026`, `:1035`, `:1051`, `:1052`, `:1069`). Every test in that block binds with `sessionId: 'session-1'`, so add `threadId: 'session-1'` to each of the five calls, e.g.:
+
+```ts
+    tracker.onTurnStarted({ terminalId: 'term-1', threadId: 'session-1', at: 1_100 })
+    tracker.onTurnCompleted({ terminalId: 'term-1', threadId: 'session-1', at: 1_200 })
+```
+
+(No `turnId` needed — it stays absent, and absent turn ids fall through the dedupe guard by design.) Without this update, Step 4's thread guard (`state.sessionId !== input.threadId`, i.e. `'session-1' !== undefined`) silently drops these events and three tests fail (`promotes busy from app-server turn started and clears from turn completed`, `does not double-emit when app-server completion is followed by BEL and JSONL completion`, `clears a pending submit from app-server completion even when turn started was missed`); and because Task 4 made `threadId: string` required on both event types, the bare calls are also TypeScript errors that would fail Task 7's `npm run check`.
+
 - [ ] **Step 3: Run to verify RED**
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts --run`
-Expected: the new `describe` block FAILS (foreign completion currently flips to idle and records; interrupted currently records; stale turn id currently completes). The wiring test still PASSES (tracker ignores extra fields today) — its red arrives with the Step 4 filter if the fixtures were wrong, so it pins the contract both ways.
+Expected: the new `describe` block FAILS (foreign completion currently flips to idle and records; interrupted currently records; stale turn id currently completes). The wiring test AND the updated `turn.complete emission (server-authoritative)` tests still PASS (the tracker ignores the extra fields today) — their red would arrive with the Step 4 filter if the fixtures were wrong, so they pin the contract both ways.
 
 - [ ] **Step 4: Implement the tracker guards**
 
@@ -1478,7 +1492,7 @@ Apply exactly the same signature + tail change to `transitionPendingAfterTurnCle
 - [ ] **Step 5: Run to verify green**
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/coding-cli/codex-activity-wiring.test.ts --run`
-Expected: PASS (all new tests + all pre-existing tracker tests — the BEL/reconcile/pending suites drive `noteInput`/`noteOutput`/`reconcileProjects` and are unaffected by the app-server-lane guards).
+Expected: PASS (all new tests + all pre-existing tracker tests — the `turn.complete emission (server-authoritative)` suite now carries `threadId: 'session-1'` per Step 2 so it satisfies the thread guard, and the remaining BEL/reconcile/pending suites drive `noteInput`/`noteOutput`/`reconcileProjects`, which the app-server-lane guards do not touch).
 
 - [ ] **Step 6: Commit**
 
