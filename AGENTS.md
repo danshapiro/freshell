@@ -117,7 +117,7 @@ npm run serve               # Build and run production server
 # `npm run check` for safe verification, or build from a worktree.
 ```
 
-Windows desktop builds (`npm run electron:build:win`) must run on native Windows — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
+**On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process (WSL cannot compile `node-pty` for win32); drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
 ```bash
