@@ -7,7 +7,7 @@
 
 **Goal:** Extend the codex attention-bell policy (PR #597) to OPENCODE terminal panes on both servers: policy-correct bells on the Node server (abort-silent, failed-rings, permission pauses, death bells) and a complete, from-scratch OpenCode activity lane on the Rust server (tracker + SSE lane + hub wiring) that lights up the client's existing dead code paths with zero client changes.
 
-**Architecture:** OpenCode terminal panes embed an HTTP+SSE server on a freshell-allocated loopback port. On Node we extend the existing SSE tracker (`opencode-activity-tracker.ts`) and pure ownership reducer with per-turn abort gates, a permission-pause lane, and spontaneous-exit death-bell markers — the already-wired `TrulyIdleEmitter` does the rest. On Rust we build a pure tracker in `crates/freshell-activity/src/opencode.rs` (port of the Node reducer semantics + the new gates), a per-terminal SSE lane in `freshell-ws` reusing `freshell-opencode`'s `SseDecoder`/`parse_serve_event`, and hub wiring (mode arms, `opencode_frames`, death-bell predicate, `opencode.activity.list`).
+**Architecture:** OpenCode terminal panes embed an HTTP+SSE server on a freshell-allocated loopback port. On Node we extend the existing SSE tracker (`opencode-activity-tracker.ts`) and pure ownership reducer with per-turn abort gates (session.error + the abort-marked `message.updated` fallback), a root-resolved permission-pause lane (armed under knownBusy AND candidate ownership), a log-once version drift gate, and spontaneous-exit death-bell markers — the already-wired `TrulyIdleEmitter` does the rest. On Rust we build a pure, resolver-free tracker in `crates/freshell-activity/src/opencode.rs` (port of the Node reducer semantics + the new gates), a per-terminal SSE lane in `freshell-ws` reusing `freshell-opencode`'s `SseDecoder`/`parse_serve_event` (two-phase connect that snapshots only after the `server.connected` subscription ack, a lane-level HTTP root resolver for sessions unseen on-stream, the same log-once version gate, and hub-issued attach-generation stamping), and hub wiring (mode arms, `opencode_frames`, generation-guarded lane ingress, death-bell predicate, `opencode.activity.list`).
 
 **Tech Stack:** TypeScript (Node server, zod, vitest), Rust (tokio, reqwest, serde), OpenCode 1.18.11 SSE protocol (empirically spiked — see `/tmp/opencode-spike/`).
 
@@ -17,7 +17,7 @@
 - **Zero wire-shape changes.** All opencode wire schemas already exist (`OpencodeActivityRecordSchema` at `shared/ws-protocol.ts:124-129` with `phase: z.literal('busy')`, `opencode.activity.updated` `:140-144`, `opencode.activity.list.response` `:133-138`, provider `'opencode'` in `TerminalTurnCompleteSchema` `:190-197`, provider-agnostic `TerminalIdleSchema` `:222-227`). `terminal.idle.reason` reuses `'grace'` for all new causes. Contract freeze (`npm run test:port`) must show zero drift.
 - **Zero client changes.** `src/lib/pane-activity.ts:207` and `src/lib/terminal-output-side-effects.ts:39` already include `'opencode'`; the client is built for this and currently dark on Rust.
 - **Fresh-agent `freshopencode` surface (`server/fresh-agent/adapters/opencode/`) is OUT OF SCOPE** — do not touch. Its `turnAborted`/`turnErrored` gating is reference-only.
-- **Protocol facts derive from OpenCode 1.18.11** (live spike, `/tmp/opencode-spike/`). Any NEW load-bearing protocol assumption must consult `/tmp/opencode-spike/openapi.json` and carry a "derives from opencode 1.18.11" comment.
+- **Protocol facts derive from OpenCode 1.18.11** (live spike, `/tmp/opencode-spike/`; ordering/attribution facts — abort error-before-idle, the W1/W2 abort windows, child permission attribution, parent-scoped fan-out aborts, `/event` no-replay, `GET /session/{id}` exposing `parentID` — additionally verified against the opencode v1.18.11 source, validation pass 2026-08-03). Any NEW load-bearing protocol assumption must consult `/tmp/opencode-spike/openapi.json` and carry a "derives from opencode 1.18.11" comment.
 - **Never** restart the self-hosted server (build ok, deploy not), touch the production server (port 3002), the user's live opencode processes (pts/9, pts/33, pts/37), or `~/.local/share/opencode`.
 - **No PR creation without explicit user approval.** Everything to main via PR eventually.
 - Git author must be `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>` (never `dan@danshapiro.com`). Conventional commits.
@@ -30,33 +30,33 @@
 
 ## Design Decisions (shared by all tasks — read before implementing any task)
 
-**D1 — Abort gate lives in the ownership state machine, per-turn.** `session.error{name:'MessageAbortedError'}` on the owned session while busy sets a `turnAborted` flag on the `knownBusy`/`candidate` state. The NEXT idle edge consumes it: state clears busy silently (activityRemove, NO turnComplete). The flag clears when consumed or when a new busy begins. All other `session.error` names set nothing — the following idle edge completes normally (failed turns ring exactly like completed turns, via the existing turnComplete → grace → `terminal.idle` path). Trailing errors on quiet/idle state are structurally no-ops (the reducer only reads the flag from busy states).
+**D1 — Abort gate lives in the ownership state machine, per-turn.** Abort evidence is `session.error{name:'MessageAbortedError'}` OR a `message.updated` whose message-info error name is `MessageAbortedError` — both on the owned session while busy, and both feeding the SAME `error` observation (the reducer is unchanged; only the tracker/lane vocabulary widens). The second form covers abort window W2: an abort landing between assistant-message creation (processor.create) and LLM stream start emits NO `session.error`, only the abort-marked `message.updated`, always BEFORE idle (derives from opencode 1.18.11, source-verified — validation pass 2026-08-03). Ordering is guaranteed whenever abort evidence is emitted at all: error-before-idle is deterministic (single fiber, FIFO bus→SSE), so the only failure mode is a MISSING error, never a late one. Residual W1: an abort landing between the prompt loop-top and processor.create emits no abort evidence at all — a ms-scale window where the completion bell would ring on a human abort (documented residual, D8(g)). The `error` observation sets a `turnAborted` flag on the `knownBusy`/`candidate` state. The NEXT idle edge consumes it: state clears busy silently (activityRemove, NO turnComplete). The flag clears when consumed or when a new busy begins. All other error names set nothing — the following idle edge completes normally (failed turns ring exactly like completed turns, via the existing turnComplete → grace → `terminal.idle` path). Trailing errors on quiet/idle state are structurally no-ops (the reducer only reads the flag from busy states).
 
 **D2 — Double `session.idle` dedupe is structural.** The first idle observation transitions `knownBusy → quiet`; the second (and the preceding `session.status{idle}` twin, ~7–20ms apart per the spike) lands on `quiet` and produces no actions. Pinned by tests, not by timers.
 
-**D3 — Permission pause maps to record removal + attention boundary.** `permission.asked` for the OWNED busy session removes the public record (opencode's existing not-busy representation — `phase` stays `'busy'`-only on the wire, NO new phase value) and then emits an attention boundary (codex ordering: demote FIRST, boundary SECOND). Only a newly-inserted permission id arms (duplicate `permission.asked` never re-arms). `permission.replied` (or the session going busy again) restores the busy record immediately — busy re-entry cancels within grace. Mid-pause turn end retires the pause WITHOUT a second bell: a mid-pause completion/failure swallows the turnComplete (the pause bell — rung or still in grace — is THE bell for the episode); a mid-pause abort additionally force-emits the removal so the armed grace window is cancelled (human at keyboard → total silence).
+**D3 — Permission pause maps to record removal + attention boundary.** `permission.asked` arms the pause when its raw sessionID RESOLVES to the pane's owned session via the child→root map (multi-level parent-chain walk; mappings retained for the session's lifetime) — NOT raw equality: children CAN ask, their asks are stamped with the CHILD session id, and the parent turn blocks on them (verified against the opencode v1.18.11 source, validation pass 2026-08-03). Arming covers `knownBusy` AND `candidate` ownership (the single busy unbound session observed on the pane's own per-pane endpoint): a fresh pane is candidate for its ENTIRE first turn by construction on Node, and the most common attention scenario — a first-turn tool-permission ask — must ring. The pause removes the public record (opencode's existing not-busy representation — `phase` stays `'busy'`-only on the wire, NO new phase value) and then emits an attention boundary (codex ordering: demote FIRST, boundary SECOND). Only a newly-inserted permission id arms (duplicate `permission.asked` never re-arms). `permission.replied` (or the session going busy again) restores the busy record immediately — busy re-entry cancels within grace. Mid-pause turn end retires the pause WITHOUT a second bell: a mid-pause completion/failure swallows the turnComplete — INCLUDING the DEFERRED completion a candidate turn mints at association confirm (the pause claim survives into `awaitingAssociation` for exactly that purpose); the pause bell — rung or still in grace — is THE bell for the episode. A mid-pause abort additionally force-emits the removal so the armed grace window is cancelled (human at keyboard → total silence). Death-bell scope (D4) is UNCHANGED by candidate arming.
 
-**D4 — Death-bell engagement is ownership-scoped.** 'Engaged' = knownBusy on the owned root session OR an armed grace deadline OR a non-empty pending-permission set — NEVER `candidate`/`ambiguous` ownership (that noise is exactly why death bells were excluded before; tightening this is the fix). The registry's exit event (`spontaneous: !requestedClose`, computed at `server/terminal-registry.ts:1517`/`:1542` on Node; `ActivityEvent::Exit{spontaneous}` on Rust) is the authoritative discriminator. SSE-drop alone is NEVER a death signal (reconnect churn) — corroboration only. Death bells are immediate (`reason: 'grace'`, no grace window).
+**D4 — Death-bell engagement is ownership-scoped.** 'Engaged' = knownBusy on the owned root session OR an armed grace deadline OR a non-empty pending-permission set — NEVER `candidate`/`ambiguous` ownership, even when a candidate-armed permission pause is pending (first-turn deaths stay silent — documented residual, D8(i); that noise is exactly why death bells were excluded before; tightening this is the fix). The registry's exit event (`spontaneous: !requestedClose`, computed at `server/terminal-registry.ts:1517`/`:1542` on Node; `ActivityEvent::Exit{spontaneous}` on Rust) is the authoritative discriminator. SSE-drop alone is NEVER a death signal (reconnect churn) — corroboration only. Death bells are immediate (`reason: 'grace'`, no grace window).
 
-**D5 — Child sessions never gate the root.** `session.created.properties.info.parentID` builds the child→root map. Child BUSY remaps to the root (keeps the root busy — matches existing behavior and snapshot "busy beats idle" collapsing). Child IDLE is SUPPRESSED (today's Node code remaps child idle onto the root, which falsely completes the root's turn — the live trace shows the child idle landing 921ms before the parent's; this plan fixes that). Child `session.error` and child `permission.asked` are ignored (raw sessionID must equal the owned root).
+**D5 — Child sessions never gate the root's turn edges.** `session.created.properties.info.parentID` builds the child→root map. Child BUSY remaps to the root (keeps the root busy — matches existing behavior and snapshot "busy beats idle" collapsing). Child IDLE is SUPPRESSED (today's Node code remaps child idle onto the root, which falsely completes the root's turn — the live trace shows the child idle landing 921ms before the parent's; this plan fixes that). Child `session.error` is ignored (raw sessionID must equal the owned root): a fan-out abort always emits the parent-scoped abort error too, after the child's (verified against the opencode v1.18.11 source, validation pass 2026-08-03). Child `permission.asked` is NOT ignored — it root-resolves and arms the pause (D3): the parent turn blocks on the child's ask.
 
 **D6 — `retry` status is busy.** `session.status{type:'retry'}` was never observed live but is schema-declared; both servers parse it defensively as busy.
 
 **D7 — Rust gate mapping mirrors the Node emitter mechanism.** `opencode_frames` maps `Changed.remove` → `idle.note_exit` (exactly what the existing `note_changed_to_gate` at `activity.rs:1396-1407` does): the removal clears gate state, and the `TurnComplete`/`AttentionBoundary` that FOLLOWS in the same effect batch re-arms grace-only. This is the same "activityRemove followed by turnComplete" contract documented at `truly-idle-emitter.ts:78-79`. Effect ordering (remove before boundary) is therefore load-bearing everywhere.
 
-**D8 — Accepted residuals (documented in Task 11, kept truthful):** (a) ambiguous ownership → no bells, no death bells; (b) SSE reconnect during a permission pause loses the pending-pause bell (the busy snapshot clears it; `GET /permission` resync is a possible follow-up); (c) child sessions created during an SSE reconnect gap can look like separate roots → ambiguous → conservative silence; (d) `permission.v2.*` / `question.*` event families are schema-declared but unobserved on 1.18.11 — unhandled (bell goes deaf if a future server switches families); (e) busy deadman (120s) removal is silent.
+**D8 — Accepted residuals (documented in Task 11, kept truthful):** (a) ambiguous ownership → no bells, no death bells; (b) SSE reconnect during a permission pause loses the pending-pause bell (the busy snapshot clears it; `GET /permission` resync is a possible follow-up); (c) child sessions created during an SSE reconnect gap or before a mid-turn lane attach are recovered by the lane's HTTP root-resolver fallback (`GET /session/{id}` exposes `parentID` — derives from opencode 1.18.11; `/event` has no replay); only resolver FAILURE degrades to ambiguous → conservative silence, retried on the next occurrence; (d) `permission.v2.*` / `question.*` event families are schema-declared but unobserved on 1.18.11 — unhandled (bell goes deaf if a future server switches families); (e) the 120s busy deadman is EVENT-SILENCE-keyed — deltas/heartbeats do NOT refresh it, so a single >120s silent tool call trips it mid-turn; ownership survives and the turn's completion still rings — the cost is the dropped busy light plus lost post-deadman death engagement (the removal itself stays silent); (f) pathological TUI quits — worker dispose exceeding the 5s hard-terminate cap, or a raw SIGTERM (no drain path) — can leave engagement set at spontaneous exit → a death bell can ring on those rare human quits (normal quit paths verified to abort+drain: all four quit inputs dispose runners via the abort path before exit; the wire-flush instant is unprovable from code but mitigated upstream by graceful stream termination); (g) abort window W1 — an abort landing between the prompt loop-top and processor.create emits no abort evidence at all → ms-scale risk of a completion bell on an abort (W2 is closed by D1's `message.updated` fallback); (h) opencode protocol drift: `session.idle` is already deprecated upstream and a v1→v2 event/health migration is in progress — the log-once version gate (Rust lane + Node tracker) converts silent drift into a logged warning, and `/session/status` absence==idle is version-derived behavior (1.18.x); (i) first-turn deaths stay silent (D4 keeps candidate excluded, even mid-pause), and on Rust a no-producer bind tail (locator ambiguity + plugin absence) leaves the pane candidate indefinitely — candidate-armed pauses still ring there, but completions and death bells wait for the bind.
 
 **File structure** (created/modified across tasks):
 
 | File | Responsibility |
 |---|---|
 | `server/coding-cli/opencode-ownership-reducer.ts` (modify) | pure state machine: + error observation, per-turn abort flags |
-| `server/coding-cli/opencode-activity-tracker.ts` (modify) | SSE client: + session.error/permission.* vocabulary, child-idle suppression, permission pause lane, death-bell markers |
+| `server/coding-cli/opencode-activity-tracker.ts` (modify) | SSE client: + session.error/abort-marked message.updated/permission.* vocabulary, child-idle suppression, root-resolved permission pause lane (knownBusy + candidate), death-bell markers, log-once version gate |
 | `server/coding-cli/opencode-activity-wiring.ts` (modify) | + thread `spontaneous` from `terminal.exit` |
-| `crates/freshell-activity/src/opencode.rs` (create) | pure Rust tracker: ownership machine + gates + permission pause + death predicates |
+| `crates/freshell-activity/src/opencode.rs` (create) | pure Rust tracker (resolver-free — unknown-id recovery is lane-level): ownership machine + gates + permission pause + death predicates |
 | `crates/freshell-activity/src/lib.rs` (modify) | + `pub mod opencode;` |
-| `crates/freshell-ws/src/activity.rs` (modify) | hub: opencode mode arms, `opencode_frames`, death predicate, list, deadlines, lane registry |
-| `crates/freshell-ws/src/opencode_lane.rs` (create) | per-terminal SSE lane: health-wait → snapshot → stream → backoff, injected IO seams |
+| `crates/freshell-ws/src/activity.rs` (modify) | hub: opencode mode arms, `opencode_frames`, death predicate, list, deadlines, generation-guarded lane registry |
+| `crates/freshell-ws/src/opencode_lane.rs` (create) | per-terminal SSE lane: health-wait + version gate → two-phase connect (subscribe on `server.connected`) → snapshot → flush buffered → stream → backoff; HTTP root-resolver fallback; generation stamping; injected IO seams |
 | `crates/freshell-ws/src/terminal.rs` (modify) | thread allocated endpoint to hub (create + respawn); swap the `opencode.activity.list` stub |
 | `crates/freshell-ws/src/opencode_association.rs` + `opencode_signal.rs` consumers (modify) | notify hub of session binds (identity only — do not conflate) |
 | `crates/freshell-server/src/main.rs` (modify) | install production lane deps |
@@ -253,7 +253,7 @@ git commit -m "feat(opencode): per-turn abort gate in the ownership reducer"
 
 ---
 
-### Task 2: Node tracker — session.error vocabulary + child-idle suppression
+### Task 2: Node tracker — session.error/message.updated vocabulary + child-idle suppression + version gate
 
 **Files:**
 - Modify: `server/coding-cli/opencode-activity-tracker.ts`
@@ -261,7 +261,7 @@ git commit -m "feat(opencode): per-turn abort gate in the ownership reducer"
 
 **Interfaces:**
 - Consumes: Task 1's `error` observation; existing SSE plumbing (`KNOWN_OPENCODE_EVENT_TYPES` `:115-120`, `OpencodeEventSchema` `:104-109`, `handleOpencodeEvent` `:510-568`, `resolveRootForEvent` `:570-591`).
-- Produces: tracker recognizes `session.error`; child idle edges are suppressed (raw child id never completes the root); tracker events unchanged (`'changed'`, `'turn.complete'`, `'association.requested'`).
+- Produces: tracker recognizes `session.error` AND the abort-marked `message.updated` (W2 fallback, D1 — both forward the same `error` observation); child idle edges are suppressed (raw child id never completes the root); log-once version drift gate in the health path; tracker events unchanged (`'changed'`, `'turn.complete'`, `'association.requested'`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -322,15 +322,36 @@ describe('abort/error episodes (policy: PR #597 extended to opencode)', () => {
     // session.status { sessionID: 'ses-parent', status: { type: 'idle' } }
     // assert exactly one completion (the parent's turn still rings)
   })
+
+  it('W2 abort marker: message.updated carrying error MessageAbortedError then double idle is silent', async () => {
+    // snapshot: { 'ses-root': busy }; then (abort window W2 — derives from opencode 1.18.11:
+    // an abort landing between assistant-message creation and LLM stream start emits NO
+    // session.error, only the abort-marked message.updated, always BEFORE idle):
+    // message.updated { sessionID: 'ses-root', info: { id: 'msg-1', role: 'assistant', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } } }
+    // session.status  { sessionID: 'ses-root', status: { type: 'idle' } }
+    // session.idle    { sessionID: 'ses-root' }
+    // session.status idle + session.idle again (double edge)
+    // assert completions === [] and exactly one remove (same assertions as the session.error abort test)
+  })
+})
+
+describe('version drift gate (log-once)', () => {
+  it('warns once for untested opencode versions and bells stay on', async () => {
+    // fixture health returns { healthy: true, version: '9.9.9' }; vi.spyOn(console, 'warn')
+    // drive the monitor through TWO health polls (let the stream end once so a
+    // reconnect cycle re-polls health); assert exactly ONE warning naming '9.9.9'
+    // and the tested 1.18.x range; then busy -> idle still emits one completion
+    // (bells stay on — the gate only logs)
+  })
 })
 ```
 
-Write the four tests in full (the second through fourth follow the first's fixture pattern verbatim — copy it; the comments above are the exact event sequences to enqueue and the exact assertions to make).
+Write the six tests in full (the comment-annotated ones follow the first's fixture pattern verbatim — copy it; the comments above are the exact event sequences to enqueue and the exact assertions to make).
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `npm run test:vitest -- run test/unit/server/coding-cli/opencode-activity-tracker.test.ts --config config/vitest/vitest.server.config.ts`
-Expected: FAIL — `session.error` events are silently dropped today (abort test sees a completion; child-idle test sees a false root completion).
+Expected: FAIL — `session.error` (and abort-marked `message.updated`) events are silently dropped today (abort tests see a completion; child-idle test sees a false root completion); the version-gate test sees no warning.
 
 - [ ] **Step 3: Implement**
 
@@ -352,9 +373,27 @@ const SessionErrorEventSchema = z
   .passthrough()
 ```
 
-2. Add `SessionErrorEventSchema` to the `OpencodeEventSchema` discriminated union (`:104-109`) and `'session.error'` to `KNOWN_OPENCODE_EVENT_TYPES` (`:115-120`). (Both are required or `parseOpencodeEvent:187-189` drops it silently.)
+2. Add the W2 abort-marker schema next to it (property path verified against the spike traces and the opencode v1.18.11 source — `properties.sessionID` + `properties.info.error.name`):
 
-3. In `handleOpencodeEvent` (`:510-568`), before the generic status handling, add:
+```ts
+const MessageUpdatedEventSchema = z
+  .object({
+    type: z.literal('message.updated'),
+    properties: z
+      .object({
+        sessionID: z.string().min(1),
+        info: z
+          .object({ error: z.object({ name: z.string().min(1) }).passthrough().optional() })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough()
+```
+
+3. Add `SessionErrorEventSchema` and `MessageUpdatedEventSchema` to the `OpencodeEventSchema` discriminated union (`:104-109`) and `'session.error'` + `'message.updated'` to `KNOWN_OPENCODE_EVENT_TYPES` (`:115-120`). (Both are required or `parseOpencodeEvent:187-189` drops them silently.)
+
+4. In `handleOpencodeEvent` (`:510-568`), before the generic status handling, add:
 
 ```ts
     if (event.type === 'session.error') {
@@ -375,7 +414,35 @@ const SessionErrorEventSchema = z
     }
 ```
 
-4. Child-idle suppression — in the idle branch (`:539-549`), guard before observing:
+5. W2 abort-marker forwarding — immediately after the `session.error` branch, add (both feed the SAME `error` observation; the reducer is unchanged):
+
+```ts
+    if (event.type === 'message.updated') {
+      // W2 abort marker (derives from opencode 1.18.11): an abort landing
+      // between assistant-message creation and LLM stream start emits NO
+      // session.error — only message.updated with info.error.name ===
+      // 'MessageAbortedError', always BEFORE the idle edge. Error-less
+      // message.updated is routine message churn: no attention signal.
+      const errorName = event.properties.info.error?.name
+      if (errorName === undefined) return
+      const rawSessionId = event.properties.sessionID
+      const rootSessionId = await this.resolveRootForEvent(monitor, rawSessionId)
+      // Same raw-equality scoping as session.error: child or unresolved
+      // markers never gate the root's turn.
+      if (rootSessionId === undefined || rootSessionId !== rawSessionId) return
+      this.observe(monitor, {
+        kind: 'error',
+        cycleId,
+        streamId,
+        sessionId: rootSessionId,
+        errorName,
+        at: this.now(),
+      })
+      return
+    }
+```
+
+6. Child-idle suppression — in the idle branch (`:539-549`), guard before observing:
 
 ```ts
       // Child sessions go idle mid-parent-turn (live trace: child idle 921ms
@@ -389,15 +456,27 @@ const SessionErrorEventSchema = z
 
 Busy/retry remapping (`:551-567`) stays exactly as-is (child busy keeps the root busy — matches the snapshot path's "busy beats idle" collapsing at `classifyKnownSnapshotStatuses:829-842`).
 
+7. Version drift gate (log-once, per monitor) — in the health-poll success path (where `GET /global/health` parses `{ healthy: true }`), read the response's `version` field (REQUIRED in the 1.18.11 health schema) and add:
+
+```ts
+// derives from opencode 1.18.11: /global/health returns { healthy, version },
+// both required. session.idle is already deprecated upstream and a v1->v2
+// event/health migration is in progress — warn on untested versions, but keep
+// bells ON (best-effort; the gate converts silent drift into a logged warning).
+const TESTED_OPENCODE_VERSION_RANGE = '1.18.'
+```
+
+If `typeof version === 'string' && !version.startsWith(TESTED_OPENCODE_VERSION_RANGE)` and the monitor has not warned yet (`versionWarned` boolean on the monitor state, reset in `trackTerminal`), `console.warn(...)` once naming the observed version and the tested range, then set the flag. No behavior change otherwise.
+
 - [ ] **Step 4: Run to verify pass**
 
-Run: same as Step 2. Expected: PASS — all 24 pre-existing tests plus the 4 new ones. If a pre-existing test pinned the old child-idle remap behavior, rewrite it with a `// SEMANTIC CHANGE (opencode-attention-bell): child idle is suppressed, not remapped` comment. (The explorer sweep found NO existing test emitting a child idle, so none is expected to break.)
+Run: same as Step 2. Expected: PASS — all 24 pre-existing tests plus the 6 new ones. If a pre-existing test pinned the old child-idle remap behavior, rewrite it with a `// SEMANTIC CHANGE (opencode-attention-bell): child idle is suppressed, not remapped` comment. (The explorer sweep found NO existing test emitting a child idle, so none is expected to break.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add server/coding-cli/opencode-activity-tracker.ts test/unit/server/coding-cli/opencode-activity-tracker.test.ts
-git commit -m "feat(opencode): session.error vocabulary, abort-silent episodes, child-idle suppression"
+git commit -m "feat(opencode): abort vocabulary (session.error + message.updated marker), child-idle suppression, version gate"
 ```
 
 ---
@@ -409,7 +488,7 @@ git commit -m "feat(opencode): session.error vocabulary, abort-silent episodes, 
 - Test: `test/unit/server/coding-cli/opencode-activity-tracker.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2's vocabulary plumbing; codex's approval-pause pattern (`codex-activity-tracker.ts:359-409`: demote via `'changed'` FIRST, `'attention.boundary'` SECOND, newly-inserted-id dedupe).
+- Consumes: Task 2's vocabulary plumbing; the existing root resolver `resolveRootForEvent` (`:570-591` — D3's child→root pause resolution reuses it); codex's approval-pause pattern (`codex-activity-tracker.ts:359-409`: demote via `'changed'` FIRST, `'attention.boundary'` SECOND, newly-inserted-id dedupe).
 - Produces (relied on by Task 4 and by the already-wired emitter):
   - Tracker emits `'attention.boundary'` → `{ terminalId: string; at: number }` (the `wireTrulyIdleEmitter` subscription at `truly-idle-emitter.ts:230` already forwards it — ZERO `server/index.ts` changes).
   - `removeRecord(terminalId: string, opts?: { forceEmit?: boolean }): void`
@@ -459,14 +538,36 @@ describe('permission pause semantics (codex approval-pause mirror)', () => {
     // assert: completions === [] (turnComplete swallowed), boundaries.length === 1,
     //         and NO second 'changed' remove was emitted (grace left to fire once)
   })
-  it('permission.asked for a child or foreign session is ignored', async () => {
-    // enqueue permission.asked with sessionID 'ses-child' (registered child) and 'ses-other'
-    // assert boundaries === [] beyond the owned-session case
+  it('child permission.asked root-resolves to the owned root and arms the pause', async () => {
+    // SEMANTIC CHANGE vs raw-equality scoping: children CAN ask — their asks
+    // carry the CHILD sessionID and the parent turn blocks on them (opencode
+    // v1.18.11 source, validation pass 2026-08-03).
+    // register the child: session.created { info: { id: 'ses-child', parentID: 'ses-root' } }
+    // enqueue permission.asked { id: 'per-c1', sessionID: 'ses-child' }
+    // assert: one demotion + one boundary for term-1 (same ordering assertion as the first test)
+  })
+  it('permission.asked for a foreign/unresolvable session is ignored', async () => {
+    // enqueue permission.asked with sessionID 'ses-other' (never registered, not the root)
+    // assert boundaries === [] and no demotion
+  })
+  it('candidate-armed pause: a first-turn ask on a fresh pane rings', async () => {
+    // fresh-pane fixture WITHOUT a resume session id (trackTerminal({ terminalId, endpoint }))
+    // busy for 'ses-new' -> candidate ownership (whole first turn by construction, D3)
+    // enqueue permission.asked { id: 'per-1', sessionID: 'ses-new' }
+    // assert: demotion + one boundary; then permission.replied restores the busy record
+  })
+  it('deferred completion after a candidate pause is swallowed at association confirm', async () => {
+    // candidate pause (previous test's shape, without the reply) -> idle edge (turn end mid-pause)
+    // -> the tracker requests association; confirm it via the tracker's
+    //    confirmSessionAssociation path ({ sessionId: 'ses-new' })
+    // assert: completions === [] (the deferred turnComplete minted at confirm is
+    //         swallowed — the pause bell, rung or still in grace, was THE bell),
+    //         boundaries.length === 1, and no force-emitted second remove
   })
 })
 ```
 
-Write all six tests in full following the comments (they are exact sequences/assertions, same fixture as Task 2).
+Write all nine tests in full following the comments (they are exact sequences/assertions, same fixture as Task 2).
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -514,9 +615,24 @@ Clear the terminal's entry in `untrackTerminal` and in `trackTerminal`'s early-r
 ```ts
     if (event.type === 'permission.asked') {
       const ownership = monitor.ownership
-      // Owned root session only: candidate/ambiguous ownership is conservative
-      // (no bells), and a CHILD's permission must not pause the root.
-      if (ownership.kind !== 'knownBusy' || ownership.sessionId !== event.properties.sessionID) return
+      // Root-resolve the asker (D3): children CAN ask — the event is stamped
+      // with the CHILD session id and the parent turn blocks on it (opencode
+      // v1.18.11 source, validation pass 2026-08-03). Multi-level chain walk;
+      // mappings are retained for the session's lifetime.
+      const rootSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
+      if (rootSessionId === undefined) return
+      // Arm under knownBusy OR candidate ownership: a fresh pane is candidate
+      // for its ENTIRE first turn by construction (the bind lands only at the
+      // first idle edge), and the single busy unbound session on the pane's
+      // own per-pane endpoint is this pane's turn — first-turn tool-permission
+      // asks are the most common attention scenario and must ring (D3).
+      // Ambiguous/quiet stays conservative (no bells).
+      if (
+        (ownership.kind !== 'knownBusy' && ownership.kind !== 'candidate') ||
+        ownership.sessionId !== rootSessionId
+      ) {
+        return
+      }
       const pending = this.pendingPermissions.get(monitor.terminalId) ?? new Set<string>()
       const newlyInserted = !pending.has(event.properties.id)
       pending.add(event.properties.id)
@@ -536,7 +652,8 @@ Clear the terminal's entry in `untrackTerminal` and in `trackTerminal`'s early-r
       if (pending.size > 0) return
       this.pendingPermissions.delete(monitor.terminalId)
       const ownership = monitor.ownership
-      if (ownership.kind !== 'knownBusy') return
+      // Restore under candidate too — pause mechanics are identical (D3).
+      if (ownership.kind !== 'knownBusy' && ownership.kind !== 'candidate') return
       // Resume busy immediately (codex resume_busy_after_approval analog):
       // the reply proves a human is present; busy re-entry cancels the armed
       // grace window without waiting ~1s for the next session.status{busy}.
@@ -563,22 +680,35 @@ Clear the terminal's entry in `untrackTerminal` and in `trackTerminal`'s early-r
   }
 ```
 
-5. Mid-pause coordination in `applyActions` (`:615-652`). Refactor the existing `switch` body into a private `applyAction(terminalId, action)` and wrap:
+5. Mid-pause coordination in `applyActions` (`:615-652`). Refactor the existing `switch` body into a private `applyAction(terminalId, action)` and wrap (NOTE: applyActions runs AFTER the reducer transition, so `monitor.ownership` is the POST-observation state — that is what distinguishes a knownBusy turn end from a candidate one):
 
 ```ts
   private applyActions(terminalId: string, actions: OpencodeOwnershipAction[]): void {
+    const ownership = this.monitors.get(terminalId)?.ownership
     const pauseActive = this.hasPendingPermissions(terminalId)
     const idleEdge = actions.some((a) => a.kind === 'activityRemove')
-    if (pauseActive && idleEdge) {
+    const completionEdge = actions.some((a) => a.kind === 'turnComplete')
+    if (pauseActive && (idleEdge || completionEdge)) {
       // Mid-pause turn end: the pause is THE attention episode for this turn.
-      // Retire it and never mint a second bell (codex PR #597 mid-pause
-      // silent-claim hardening, mirrored).
-      this.pendingPermissions.delete(terminalId)
-      const hasCompletion = actions.some((a) => a.kind === 'turnComplete')
-      if (!hasCompletion) {
-        // Abort mid-pause: human at keyboard — force-emit the removal so the
-        // emitter cancels any still-armed grace window (the record itself was
-        // already removed at pause entry).
+      // Never mint a second bell (codex PR #597 mid-pause silent-claim
+      // hardening, mirrored). A completion WITHOUT an idle edge is the
+      // DEFERRED completion minted at confirmOpencodeAssociation
+      // (candidate-armed pauses, D3) — swallowed the same way.
+      const awaitingBind = ownership?.kind === 'awaitingAssociation'
+      const aborted = awaitingBind && ownership.aborted === true
+      if (awaitingBind && !aborted) {
+        // Candidate turn end mid-pause: KEEP the pause claim alive so the
+        // deferred completion minted at confirm is swallowed on its own pass
+        // through this branch. The armed grace window stays live — the pause
+        // bell (rung or still in grace) is the episode's bell.
+      } else {
+        this.pendingPermissions.delete(terminalId)
+      }
+      if ((!completionEdge && !awaitingBind) || aborted) {
+        // Abort mid-pause (knownBusy -> quiet, or aborted candidate ->
+        // awaitingAssociation{aborted}): human at keyboard — force-emit the
+        // removal so the emitter cancels any still-armed grace window (the
+        // record itself was already removed at pause entry).
         this.removeRecord(terminalId, { forceEmit: true })
       }
       for (const action of actions) {
@@ -636,7 +766,9 @@ describe('death-bell markers on spontaneous exit', () => {
   })
   it('spontaneous exit while candidate or ambiguous carries NO marker', async () => {
     // drive ownership to candidate (busy for an unknown session with no resume id);
-    // untrackTerminal spontaneous; assert the change has no spontaneousExitRemovals
+    // untrackTerminal spontaneous; assert the change has no spontaneousExitRemovals.
+    // Repeat WITH a candidate-armed permission.asked pending: still no marker —
+    // D4 keeps candidate excluded even mid-pause (residual D8(i)).
   })
   it('freshell-initiated untrack (no flag) behaves exactly as before', async () => {
     // untrackTerminal({ terminalId: 'term-1' }) after knownBusy
@@ -936,7 +1068,7 @@ fn clear_record(state: &mut TerminalOpencode, force: bool) -> Vec<OpencodeEffect
 }
 ```
 
-Root resolution: `fn resolve_root<'a>(state: &'a TerminalOpencode, session_id: &'a str) -> &'a str` — walk `session_roots` with a seen-set cycle guard; unknown id resolves to itself.
+Root resolution: `fn resolve_root<'a>(state: &'a TerminalOpencode, session_id: &'a str) -> &'a str` — walk `session_roots` with a seen-set cycle guard; unknown id resolves to itself. The pure tracker stays RESOLVER-FREE (no IO): recovery of ids never seen on-stream is the LANE's job — Task 9's HTTP root-resolver fallback emits synthetic `note_session_created` calls before the triggering event, so by the time an event reaches this tracker the mapping either exists or the conservative-ambiguity rules apply.
 
 `note_status`/`note_session_idle` routing: resolve the root; **child idle (root != raw) is suppressed (D5)**; child busy/retry remaps to the root; then dispatch to the idle/busy reducers below. Every `note_*` updates `last_observed_at = at`.
 
@@ -945,7 +1077,7 @@ Root resolution: `fn resolve_root<'a>(state: &'a TerminalOpencode, session_id: &
 | Ownership | Guard | Next state | Effects (in order) |
 |---|---|---|---|
 | `KnownBusy{session==s, cycle==c, stream==st, turn_aborted}` | id+cycle+stream match | `Quiet{known: Some(s)}` | `clear_record(false)`; then if `!turn_aborted`: `TurnComplete{terminal_id, session_id: Some(s), at, completion_seq: ledger.record_turn_completion(terminal_id, at)}` (Task 7 adds the mid-pause override here) |
-| `Candidate{...}` matching | same | `AwaitingAssociation{session_id, previous_known, completed_at: at, aborted: turn_aborted}` | `clear_record(false)` (completion deferred to `bind_session`) |
+| `Candidate{...}` matching | same | `AwaitingAssociation{session_id, previous_known, completed_at: at, aborted: turn_aborted}` | `clear_record(false)` (completion deferred to `bind_session`; Task 7: a candidate-armed pause claim survives into `AwaitingAssociation`) |
 | `Ambiguous{blocked}` | session in `blocked` | drop it; empty → `Quiet{known}` | empty → `clear_record(false)`; non-empty → `set_busy_record(None, at)` |
 | `Quiet` / `AwaitingAssociation` | — | unchanged | none (this IS the double-idle dedupe, D2) |
 
@@ -985,7 +1117,7 @@ Root resolution: `fn resolve_root<'a>(state: &'a TerminalOpencode, session_id: &
 | `Quiet{known: None}` | multiple | `Ambiguous{None, busy_roots}` | `set_busy_record(None, at)` |
 
 **`bind_session`** (association/rebind identity arriving from the SQLite locator or the TUI rebind plugin — Task 10 wires the producers):
-- `AwaitingAssociation{session_id == bound, aborted: false}` → `Quiet{known: Some(bound)}` + `TurnComplete{..., at: completed_at, completion_seq: ledger...}` (deferred completion, Node `confirmOpencodeAssociation:440-458` — note `at` is the STORED `completed_at`).
+- `AwaitingAssociation{session_id == bound, aborted: false}` → `Quiet{known: Some(bound)}` + `TurnComplete{..., at: completed_at, completion_seq: ledger...}` (deferred completion, Node `confirmOpencodeAssociation:440-458` — note `at` is the STORED `completed_at`; Task 7 adds the mid-pause swallow override here: a surviving candidate-armed pause claim swallows this deferred completion).
 - `AwaitingAssociation{session_id == bound, aborted: true}` → `Quiet{known: Some(bound)}`, no effects.
 - `AwaitingAssociation{different}` → `Quiet{known: previous_known}`, no effects (reject analog).
 - `Ambiguous` → update `known_session_id = Some(bound)` in place (Node's session.created adoption assist; the next snapshot resolves it).
@@ -1058,24 +1190,28 @@ impl OpencodeActivityTracker {
 ```
 
 **Semantics:**
-- `note_error`: only when `session_id` resolves to itself (raw == root — child errors ignored, D5) AND `error_name == "MessageAbortedError"` AND ownership is `KnownBusy`/`Candidate` with matching id+cycle+stream → set `turn_aborted = true`. No effects, ever. All other names/states: no-op (trailing-error rule).
-- `note_permission_asked`: ownership must be `KnownBusy` with `session_id == owned` (raw equality — child/foreign ignored). `let newly_inserted = state.pending_permissions.insert(permission_id.to_string());` — only newly-inserted arms. Effects in order: `clear_record(false)` (demote), then `TrackerEffect::AttentionBoundary { terminal_id, at }`.
-- `note_permission_replied`: remove the id (unknown id → no-op). When the set EMPTIES and ownership is `KnownBusy{session}` → `set_busy_record(Some(session), at)` (immediate resume; busy cancels the armed gate window via `note_phase(Busy)` in the frame mapper).
-- Mid-pause hardening — extend the idle-edge completion row (Task 6, both idle and snapshot-empty paths): before minting, check `let pause_was_active = !state.pending_permissions.is_empty(); state.pending_permissions.clear();` If `pause_was_active`: NEVER mint `TurnComplete` (the pause is the episode's bell); if `turn_aborted` → `clear_record(true)` (force-emit remove → `note_exit` at the gate cancels the armed window → total silence); else → no effects (leave the armed window to fire once, or stay silent if it already rang).
-- Busy re-entry (`KnownBusy` same-session refresh) clears `pending_permissions` (out-of-band resume).
+- `note_error`: only when `session_id` resolves to itself (raw == root — child errors ignored, D5) AND `error_name == "MessageAbortedError"` AND ownership is `KnownBusy`/`Candidate` with matching id+cycle+stream → set `turn_aborted = true`. No effects, ever. All other names/states: no-op (trailing-error rule). (The W2 abort marker — Task 9's `message.updated` translation — arrives through this same entry point as a `SessionError`-shaped call; nothing extra is needed here.)
+- `note_permission_asked`: root-resolve the asker via `resolve_root` (children CAN ask — the event is stamped with the CHILD session id and the parent turn blocks on it; multi-level chain walk, mappings retained for session lifetime — opencode v1.18.11 source, validation pass 2026-08-03). Arm when ownership is `KnownBusy` OR `Candidate` with `session_id == resolved root` (candidate arming, D3: the single busy unbound session on the pane's own per-pane endpoint; first-turn asks must ring). Foreign/unresolvable ids and `Quiet`/`Ambiguous`/`AwaitingAssociation` states: no-op. `let newly_inserted = state.pending_permissions.insert(permission_id.to_string());` — only newly-inserted arms. Effects in order: `clear_record(false)` (demote), then `TrackerEffect::AttentionBoundary { terminal_id, at }`.
+- `note_permission_replied`: remove the id (unknown id → no-op). When the set EMPTIES and ownership is `KnownBusy{session}` or `Candidate{session}` → `set_busy_record(Some(session), at)` (immediate resume; busy cancels the armed gate window via `note_phase(Busy)` in the frame mapper).
+- Mid-pause hardening — extend the idle-edge completion rows (Task 6, both idle and snapshot-empty paths). With `KnownBusy` ownership: `let pause_was_active = !state.pending_permissions.is_empty();` if `pause_was_active`: clear the set and NEVER mint `TurnComplete` (the pause is the episode's bell); if `turn_aborted` → `clear_record(true)` (force-emit remove → `note_exit` at the gate cancels the armed window → total silence); else → no effects (leave the armed window to fire once, or stay silent if it already rang). With `Candidate` ownership (→ `AwaitingAssociation`): if `turn_aborted` → clear the set + `clear_record(true)` (same total-silence contract); else KEEP `pending_permissions` intact — the pause claim survives into `AwaitingAssociation` so the DEFERRED completion is swallowed at `bind_session` (next bullet).
+- `bind_session` mid-pause swallow (extends Task 6's bind rows): on `AwaitingAssociation{session_id == bound, aborted: false}` with `!state.pending_permissions.is_empty()` → clear the set, transition to `Quiet{known: Some(bound)}`, and mint NO deferred `TurnComplete` (mid-pause turn end — the pause was the episode's bell, D3).
+- Busy re-entry (`KnownBusy`/`Candidate` same-session refresh) clears `pending_permissions` (out-of-band resume).
 - `note_exit` clears `pending_permissions` with the state (the hub reads `has_pending_permissions` BEFORE calling `note_exit` — same audit-A17 ordering as codex).
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test] fn abort_then_idle_clears_silently() { /* busy -> note_error(MessageAbortedError) -> idle: Changed{remove} only, no TurnComplete; second idle: nothing */ }
+#[test] fn w2_abort_marker_gates_like_session_error() { /* the message.updated abort marker reaches the tracker through the SAME note_error entry (Task 9's translate maps it to SessionError — derives from opencode 1.18.11, abort window W2): busy -> note_error(MessageAbortedError) sourced from the marker -> idle: Changed{remove} only, no TurnComplete; second idle: nothing */ }
 #[test] fn failed_turn_rings_and_trailing_error_is_noop() { /* busy -> note_error(UnknownError) -> idle: TurnComplete present; note_error after idle: no effects, ownership stays Quiet */ }
 #[test] fn child_abort_does_not_gate_the_root() { /* child registered; note_error(child, MessageAborted); parent idle still completes */ }
 #[test] fn permission_asked_demotes_then_arms_once() { /* busy -> note_permission_asked: [Changed{remove}, AttentionBoundary] in that order; duplicate id: no effects */ }
-#[test] fn permission_replied_resumes_busy() { /* pause -> note_permission_replied: Changed{upsert busy with owned session} */ }
-#[test] fn abort_mid_pause_force_emits_the_cancel() { /* pause -> note_error(abort) -> idle: Changed{remove} EMITTED despite absent record, no TurnComplete, no boundary */ }
+#[test] fn child_permission_asked_resolves_to_root_and_arms() { /* child registered via note_session_created; note_permission_asked(child id) while the root is KnownBusy: [Changed{remove}, AttentionBoundary]; a foreign unregistered id: no effects */ }
+#[test] fn candidate_pause_arms_and_deferred_completion_is_swallowed_at_bind() { /* track with NO session id -> busy(ses-x) = Candidate -> note_permission_asked(ses-x): [Changed{remove}, AttentionBoundary] (candidate arming, D3); idle edge -> AwaitingAssociation with the pause claim intact; bind_session("ses-x"): NO deferred TurnComplete (swallowed), state Quiet{known: Some(ses-x)} */ }
+#[test] fn permission_replied_resumes_busy() { /* pause -> note_permission_replied: Changed{upsert busy with owned session}; repeat under Candidate ownership */ }
+#[test] fn abort_mid_pause_force_emits_the_cancel() { /* pause -> note_error(abort) -> idle: Changed{remove} EMITTED despite absent record, no TurnComplete, no boundary; repeat from Candidate ownership (aborted candidate -> AwaitingAssociation{aborted}, same force-emit) */ }
 #[test] fn completion_mid_pause_mints_nothing() { /* pause -> idle (no error): NO effects at all */ }
-#[test] fn death_predicates() { /* blocks_death_bell: false for KnownBusy/Quiet, true for Candidate and Ambiguous; has_pending_permissions true during pause, false after replied/exit */ }
+#[test] fn death_predicates() { /* blocks_death_bell: false for KnownBusy/Quiet, true for Candidate and Ambiguous — INCLUDING Candidate with a candidate-armed pause pending (D4); has_pending_permissions true during pause, false after replied/exit */ }
 ```
 
 Write each in full.
@@ -1118,12 +1254,14 @@ enum OpencodeLaneEvent {  // pub(crate); carried by HubEvent
 }
 // HubEvent variants:
 //   OpencodeBind { terminal_id: String, session_id: String },
-//   OpencodeLane { terminal_id: String, cycle: u64, stream: u64, event: OpencodeLaneEvent },
+//   OpencodeLane { terminal_id: String, generation: u64, cycle: u64, stream: u64, event: OpencodeLaneEvent },
 // ActivityHub ingress:
 pub fn bind_opencode_session(&self, terminal_id: &str, session_id: &str);
-pub(crate) fn note_opencode_lane_event(&self, terminal_id: &str, cycle: u64, stream: u64, event: OpencodeLaneEvent);
+pub(crate) fn note_opencode_lane_event(&self, terminal_id: &str, generation: u64, cycle: u64, stream: u64, event: OpencodeLaneEvent);
 pub fn opencode_list(&self) -> (Vec<freshell_protocol::OpencodeActivityRecord>, Vec<freshell_protocol::TurnCompletionSnapshot>);
 ```
+
+(`generation` is the hub-issued attach generation — Task 9's `opencode_lanes` registry issues it; ingress drops mismatches. Hub-level tests register a dummy entry via the `#[cfg(test)]` helper below so their injected events pass the guard.)
 
 - [ ] **Step 1: Write the failing episode tests**
 
@@ -1135,7 +1273,8 @@ async fn busy_opencode_terminal(hub: &ActivityHub, rx: &mut tokio::sync::broadca
         terminal_id: "t-oc".into(), mode: "opencode".into(),
         resume_session_id: Some("ses-root".into()), at: 1_000,
     });
-    hub.note_opencode_lane_event("t-oc", 1, 1, OpencodeLaneEvent::Status {
+    hub.register_opencode_lane_for_tests("t-oc", 1); // dummy lanes-map entry: generation 1 passes ingress
+    hub.note_opencode_lane_event("t-oc", 1, 1, 1, OpencodeLaneEvent::Status {
         session_id: "ses-root".into(), status: OpencodeStatus::Busy,
     });
     let frame = next_frame_matching(rx, "opencode.activity.updated", 1_500, |v| {
@@ -1145,6 +1284,8 @@ async fn busy_opencode_terminal(hub: &ActivityHub, rx: &mut tokio::sync::broadca
 }
 ```
 
+(Every episode test that injects lane events registers a test generation first and stamps it — `note_opencode_lane_event(terminal_id, generation, cycle, stream, event)`; `respawn_drops_stale_lane_events` registers generation 2 mid-test to prove the drop.)
+
 Tests (each asserts EXACTLY one `terminal.idle` or none — use `next_frame_of_type(...).await.is_none()` for silence, timeout 1_500ms; ring waits use 3_500ms to cover the 2s grace):
 
 ```rust
@@ -1152,11 +1293,14 @@ Tests (each asserts EXACTLY one `terminal.idle` or none — use `next_frame_of_t
 #[tokio::test(flavor = "multi_thread")] async fn opencode_abort_stays_silent() { /* busy -> SessionError{MessageAbortedError} -> SessionIdle x2 -> NO terminal.turn.complete, NO terminal.idle */ }
 #[tokio::test(flavor = "multi_thread")] async fn opencode_failed_turn_rings() { /* busy -> SessionError{UnknownError} -> SessionIdle -> turn.complete + one terminal.idle; trailing SessionError after idle mints nothing */ }
 #[tokio::test(flavor = "multi_thread")] async fn opencode_permission_pause_rings_once_and_reply_within_grace_is_silent() { /* two scenarios or two tests: (a) PermissionAsked -> one terminal.idle after grace; (b) PermissionAsked -> PermissionReplied quickly -> silence */ }
+#[tokio::test(flavor = "multi_thread")] async fn opencode_child_permission_asked_arms_via_root_resolution() { /* busy root -> SessionCreated{child,parent} -> PermissionAsked{ses-child} -> one terminal.idle after grace (the child's ask root-resolves and pauses the root, D3) */ }
+#[tokio::test(flavor = "multi_thread")] async fn opencode_first_turn_permission_pause_rings_under_candidate() { /* Created WITHOUT resume id -> busy for "ses-new" (candidate) -> PermissionAsked{ses-new} -> one terminal.idle after grace (candidate arming, D3); then SessionIdle + hub.bind_opencode_session("t-oc", "ses-new") -> NO terminal.turn.complete (the deferred completion is swallowed mid-pause) */ }
 #[tokio::test(flavor = "multi_thread")] async fn opencode_mid_pause_abort_is_fully_silent() { /* PermissionAsked -> SessionError{abort} + SessionIdle -> no bell even after grace elapses */ }
 #[tokio::test(flavor = "multi_thread")] async fn opencode_spontaneous_death_while_busy_rings_immediately() { /* busy -> Exit{spontaneous:true} -> terminal.idle arrives fast (no grace) */ }
-#[tokio::test(flavor = "multi_thread")] async fn opencode_death_while_candidate_or_idle_is_silent_and_freshell_kill_is_silent() { /* candidate: Created WITHOUT resume id + busy for unknown session -> Exit{spontaneous:true} -> silence; idle quiet -> Exit spontaneous -> silence; busy -> Exit{spontaneous:false} -> silence */ }
-#[tokio::test(flavor = "multi_thread")] async fn opencode_death_during_pause_rings() { /* PermissionAsked -> Exit{spontaneous:true} -> immediate terminal.idle */ }
+#[tokio::test(flavor = "multi_thread")] async fn opencode_death_while_candidate_or_idle_is_silent_and_freshell_kill_is_silent() { /* candidate: Created WITHOUT resume id + busy for unknown session -> Exit{spontaneous:true} -> silence; candidate + PermissionAsked (candidate-armed pause pending) -> Exit{spontaneous:true} -> STILL silence (D4, residual D8(i)); idle quiet -> Exit spontaneous -> silence; busy -> Exit{spontaneous:false} -> silence */ }
+#[tokio::test(flavor = "multi_thread")] async fn opencode_death_during_pause_rings() { /* knownBusy + PermissionAsked -> Exit{spontaneous:true} -> immediate terminal.idle */ }
 #[tokio::test(flavor = "multi_thread")] async fn opencode_child_idle_mid_parent_turn_does_not_ring() { /* SessionCreated{child,parent} -> child busy -> child SessionIdle -> silence + record survives; parent SessionIdle -> one bell */ }
+#[tokio::test(flavor = "multi_thread")] async fn respawn_drops_stale_lane_events() { /* register generation 1 + busy via gen-1 events; register generation 2 (the respawn's attach); inject gen-1 Status{busy} + gen-1 SessionIdle: NO upsert, NO terminal.turn.complete, NO terminal.idle (ingress drops stale generations, A6); then a gen-2 Snapshot/turn behaves normally */ }
 ```
 
 Write each in full following `busy_opencode_terminal` + the codex episode style.
@@ -1169,7 +1313,7 @@ Run: `cargo test -p freshell-ws opencode` — FAIL (compile: no variants/methods
 
 In `activity.rs`:
 1. `HubInner` (`:192-205`): add `opencode: OpencodeActivityTracker,` (one process-wide instance, like codex).
-2. `HubEvent` (`:104-157`): add `OpencodeBind` and `OpencodeLane` variants (shapes above); ingress methods `bind_opencode_session` / `note_opencode_lane_event` that only `self.tx.send(...)` (single-emitter invariant, `:334-339`).
+2. `HubEvent` (`:104-157`): add `OpencodeBind` and `OpencodeLane` variants (shapes above); ingress methods `bind_opencode_session` / `note_opencode_lane_event` that only `self.tx.send(...)` (single-emitter invariant, `:334-339`). Add a `#[cfg(test)] fn register_opencode_lane_for_tests(&self, terminal_id: &str, generation: u64)` that inserts `(generation, tokio::spawn(async {}))` into `opencode_lanes` (Task 9's registry) so hub-level episode tests pass the generation guard without spawning real lanes.
 3. `handle_event` (`:524-616`): add arms mirroring the codex proxy lane (`:558-614`):
 
 ```rust
@@ -1182,10 +1326,19 @@ HubEvent::OpencodeBind { terminal_id, session_id } => {
     };
     self.emit(frames);
 }
-HubEvent::OpencodeLane { terminal_id, cycle, stream, event } => {
+HubEvent::OpencodeLane { terminal_id, generation, cycle, stream, event } => {
     let at = now_ms();
     let frames = {
         let mut inner = self.inner.lock().expect("activity hub lock");
+        // Attach-generation guard (A6): tokio `abort()` is asynchronous and
+        // never retracts already-enqueued mpsc messages — a replaced lane can
+        // legally enqueue events AFTER its successor's attach. Drop anything
+        // not stamped with the CURRENT lane generation (Exit removes the map
+        // entry, so post-exit stragglers drop too). cycle/stream still guard
+        // intra-lane reconnect staleness inside the tracker.
+        if inner.opencode_lanes.get(&terminal_id).map(|(g, _)| *g) != Some(generation) {
+            return;
+        }
         let effects = match event {
             OpencodeLaneEvent::Snapshot { statuses } => inner.opencode.note_snapshot(&terminal_id, &statuses, cycle, stream, at),
             OpencodeLaneEvent::SessionCreated { session_id, parent_id } => inner.opencode.note_session_created(&terminal_id, &session_id, parent_id.as_deref(), at),
@@ -1208,10 +1361,13 @@ HubEvent::OpencodeLane { terminal_id, cycle, stream, event } => {
 5. Death-bell predicate (`:792-794`) — extend, reading BEFORE teardown (ordering is audit-A17-pinned):
 
 ```rust
+// D4: candidate/ambiguous ownership never death-rings — even when a
+// candidate-armed permission pause is pending (residual D8(i)).
+let opencode_death_eligible = !inner.opencode.blocks_death_bell(&terminal_id);
 let ring_death_bell = spontaneous
-    && ((inner.idle.is_engaged(&terminal_id) && !inner.opencode.blocks_death_bell(&terminal_id))
+    && ((inner.idle.is_engaged(&terminal_id) && opencode_death_eligible)
         || inner.codex.has_pending_approvals(&terminal_id)
-        || inner.opencode.has_pending_permissions(&terminal_id));
+        || (inner.opencode.has_pending_permissions(&terminal_id) && opencode_death_eligible));
 ```
 
 (`blocks_death_bell` is `false` for terminals the opencode tracker doesn't know, so claude/codex/amplifier behavior is unchanged — pin that with the existing tests staying green.)
@@ -1301,18 +1457,33 @@ pub(crate) const OPENCODE_HEALTH_TIMEOUT_MS: u64 = 15_000; // per cycle, Node :2
 pub(crate) const OPENCODE_RECONNECT_BASE_MS: u64 = 250;    // Node :21
 pub(crate) const OPENCODE_RECONNECT_MAX_MS: u64 = 5_000;   // Node :22
 pub(crate) const OPENCODE_READ_STALL_MS: u64 = 30_000;     // Node :24 (production stream impl)
+/// Version drift gate (log-once per lane): prefix match against the REQUIRED
+/// `version` field of GET /global/health (derives from opencode 1.18.11:
+/// { healthy, version } are both required; session.idle is already deprecated
+/// upstream and a v1->v2 event/health migration is in progress — D8(h)).
+pub(crate) const TESTED_OPENCODE_VERSION_RANGE: &str = "1.18.";
 
 pub(crate) trait OpencodeLaneHttp: Send + Sync {
     fn get_json<'a>(&'a self, url: &'a str)
         -> futures::future::BoxFuture<'a, Result<(u16, serde_json::Value), String>>;
 }
 pub(crate) trait OpencodeEventStream: Send + Sync {
-    /// Connect once and deliver parsed events until the stream ends (returns on disconnect).
-    fn run_once<'a>(&'a self, url: &'a str, sink: &'a (dyn Fn(freshell_opencode::ParsedServeEvent) + Send + Sync))
+    /// Two-phase connect (Node connect-then-snapshot parity, A5): resolves
+    /// once the subscription is CONFIRMED — on the FIRST `server.connected`
+    /// SSE frame, detected on the raw decoded event BEFORE `parse_serve_event`
+    /// (which swallows it). Frames arriving after the ack are BUFFERED by the
+    /// returned handle, never dropped.
+    fn connect<'a>(&'a self, url: &'a str)
+        -> futures::future::BoxFuture<'a, Result<Box<dyn ConnectedOpencodeStream>, String>>;
+}
+pub(crate) trait ConnectedOpencodeStream: Send {
+    /// Deliver the buffered frames in order, then live parsed events until the
+    /// stream ends (returns on disconnect).
+    fn drive<'a>(self: Box<Self>, sink: &'a (dyn Fn(freshell_opencode::ParsedServeEvent) + Send + Sync))
         -> futures::future::BoxFuture<'a, Result<(), String>>;
 }
 pub(crate) struct OpencodeLaneDeps { pub http: std::sync::Arc<dyn OpencodeLaneHttp>, pub events: std::sync::Arc<dyn OpencodeEventStream> }
-pub(crate) fn spawn_opencode_lane(deps: std::sync::Arc<OpencodeLaneDeps>, hub: crate::activity::ActivityHub, terminal_id: String, base_url: String) -> tokio::task::JoinHandle<()>;
+pub(crate) fn spawn_opencode_lane(deps: std::sync::Arc<OpencodeLaneDeps>, hub: crate::activity::ActivityHub, terminal_id: String, base_url: String, generation: u64) -> tokio::task::JoinHandle<()>;
 pub(crate) fn translate_serve_event(event: &freshell_opencode::ParsedServeEvent) -> Option<crate::activity::OpencodeLaneEvent>;
 // production impls:
 pub(crate) struct ReqwestLaneHttp(/* reqwest::Client */);
@@ -1321,32 +1492,56 @@ pub(crate) struct ReqwestLaneStream(/* reqwest::Client */);
 //   HubEvent::OpencodeAttach { terminal_id: String, base_url: String }
 //   pub fn attach_opencode_serve(&self, terminal_id: &str, hostname: &str, port: u16)  // base_url = format!("http://{hostname}:{port}")
 //   pub fn set_opencode_lane_deps(&self, deps: Arc<OpencodeLaneDeps>)                  // Option'd; tests leave it unset
-//   HubInner: opencode_lanes: HashMap<String, tokio::task::JoinHandle<()>>
+//   HubInner: opencode_lanes: HashMap<String, (u64 /* attach generation */, tokio::task::JoinHandle<()>)>,
+//             opencode_lane_next_generation: u64  // monotonic; bumped on EVERY OpencodeAttach (A6)
 ```
 
-**Lane loop semantics (Node `runMonitor:321-348` parity):**
+**Lane loop semantics (Node `runMonitor:321-348` + `consumeEvents:411-471` parity — connect BEFORE snapshot):**
 
 ```rust
-// inside spawn_opencode_lane's task:
+// inside spawn_opencode_lane's task (generation is hub-issued at attach and
+// stamped on EVERY note_opencode_lane_event call):
 let mut cycle: u64 = 0;
 let mut stream: u64 = 0;
 let mut backoff = OPENCODE_RECONNECT_BASE_MS;
+let mut warned_version = false;
 loop {
     cycle += 1;
     // 1. health-wait: poll GET {base}/global/health every 200ms, up to 15s this cycle.
     //    On timeout: fall through to backoff and start a new cycle.
-    // 2. snapshot: GET {base}/session/status -> object map; entries whose
+    //    Version drift gate (log-once per lane): on a healthy response, read the
+    //    REQUIRED `version` field (derives from opencode 1.18.11: /global/health
+    //    returns { healthy, version }, both required); if
+    //    !version.starts_with(TESTED_OPENCODE_VERSION_RANGE) && !warned_version,
+    //    tracing::warn! once ("opencode {version} untested for attention-bell
+    //    vocabulary (tested: 1.18.x); bells stay on") and set warned_version.
+    //    Bells stay ON either way (best-effort; D8(h)).
+    // 2. stream += 1; two-phase connect (A5): let conn = deps.events
+    //    .connect(&format!("{base}/event")).await — resolves "subscribed" on the
+    //    FIRST server.connected frame (detected on the raw decoded SSE event
+    //    BEFORE parse_serve_event, which swallows it); frames arriving after the
+    //    ack are buffered inside `conn`. On connect error: fall through to backoff.
+    // 3. snapshot: GET {base}/session/status -> object map; entries whose
     //    status.type is "busy"/"retry" -> OpencodeStatus::{Busy,Retry};
     //    a literal {"type":"idle"} entry parses as Idle (defensive — the live
     //    server DROPS idle sessions; absence == idle; opencode 1.18.11).
-    //    hub.note_opencode_lane_event(&terminal_id, cycle, stream + 1, OpencodeLaneEvent::Snapshot { statuses });
-    // 3. stream += 1; connect: deps.events.run_once(&format!("{base}/event"), &sink).await
-    //    where sink = |parsed| { if let Some(ev) = translate_serve_event(&parsed) {
-    //        hub.note_opencode_lane_event(&terminal_id, cycle, stream, ev); } };
-    //    On successful connect (run_once returned Ok after streaming), reset backoff to base.
-    // 4. sleep(backoff); backoff = (backoff * 2).min(OPENCODE_RECONNECT_MAX_MS);
+    //    Root-resolve unknown snapshot session ids FIRST (resolver below), then
+    //    hub.note_opencode_lane_event(&terminal_id, generation, cycle, stream,
+    //        OpencodeLaneEvent::Snapshot { statuses });
+    //    Subscription strictly precedes the snapshot, so every transition is
+    //    either IN the snapshot or ON the already-open stream — /event has no
+    //    replay (derives from opencode 1.18.11).
+    // 4. drive: conn.drive(&sink).await flushes the buffered frames IN ORDER,
+    //    then delivers live events, where sink = |parsed| { if let Some(ev) =
+    //        translate_serve_event(&parsed) { /* root-resolve unknown session
+    //        ids (resolver below), then */ hub.note_opencode_lane_event(
+    //        &terminal_id, generation, cycle, stream, ev); } };
+    //    On a successful streamed cycle (drive returned Ok), reset backoff to base.
+    // 5. sleep(backoff); backoff = (backoff * 2).min(OPENCODE_RECONNECT_MAX_MS);
 }
 ```
+
+**Lane-level HTTP root resolver (A4 — the Node `resolveRootForEvent`/`classifySnapshotStatuses` seam, ported to HTTP):** the lane owns a lane-lifetime `known_sessions: std::collections::HashSet<String>`; `SessionCreated` events (streamed or synthetic) insert their session (and parent) ids. Before forwarding any `Status`/`SessionIdle`/`SessionError`/`PermissionAsked` event — or noting a snapshot entry — whose session id is NOT in the set, the lane fetches `GET {base}/session/{id}` via the existing `OpencodeLaneHttp` seam (short timeout — the production impl's 2s default) and emits a synthetic `SessionCreated { session_id, parent_id }` to the hub BEFORE the triggering event, first walking the `parentID` chain while the parent is itself unknown (deepest ancestor first, so every mapping lands before its dependents). On resolve failure (non-200, timeout, shape mismatch): forward the triggering event anyway — the tracker's conservative-ambiguity behavior stands, and the next unknown-id occurrence retries. Carry the comment: `// derives from opencode 1.18.11: GET /session/{id} exposes parentID; /event has no replay`.
 
 `translate_serve_event` (kinds and property paths are verbatim from the spike — `/tmp/opencode-spike/vocabulary.md`):
 
@@ -1383,26 +1578,44 @@ pub(crate) fn translate_serve_event(event: &freshell_opencode::ParsedServeEvent)
         "permission.replied" => Some(OpencodeLaneEvent::PermissionReplied {
             permission_id: props.get("requestID")?.as_str()?.to_string(),
         }),
-        _ => None, // message.*, session.updated, session.diff, plugin.added, ... are activity-irrelevant
+        "message.updated" => {
+            // W2 abort marker (derives from opencode 1.18.11): an abort landing
+            // between assistant-message creation and LLM stream start emits NO
+            // session.error — only message.updated with info.error.name ===
+            // "MessageAbortedError", always BEFORE idle. Error-less
+            // message.updated is routine message churn -> None. Both abort
+            // signals feed the same SessionError lane event (D1).
+            let session_id = props.get("sessionID")?.as_str()?.to_string();
+            let error_name = props
+                .get("info")?
+                .get("error")?
+                .get("name")?
+                .as_str()?
+                .to_string();
+            Some(OpencodeLaneEvent::SessionError { session_id, error_name })
+        }
+        _ => None, // message.part.*, message.removed, session.updated, session.diff, plugin.added, ... are activity-irrelevant
     }
 }
 ```
 
-(`ParsedServeEvent.properties` is a `serde_json::Map<String, Value>` — adjust accessor chaining to `props.get("x")` returning `Option<&Value>` accordingly. `parse_serve_event` already swallows `server.connected`/`server.heartbeat` — the lane's explicit per-cycle snapshot replaces the Node "snapshot on server.connected" trigger.)
+(`ParsedServeEvent.properties` is a `serde_json::Map<String, Value>` — adjust accessor chaining to `props.get("x")` returning `Option<&Value>` accordingly. `parse_serve_event` swallows `server.connected`/`server.heartbeat` — which is exactly why the two-phase connect detects the subscription ack on the RAW decoded event before parsing; the per-cycle snapshot is loss-free only because it happens AFTER that ack (Node snapshot-on-`server.connected` parity, A5).)
 
-Production impls: `ReqwestLaneHttp::get_json` = `client.get(url).timeout(2s).send() -> (status, json)`; `ReqwestLaneStream::run_once` = GET with `accept: text/event-stream`, chunk loop with a 30s per-chunk `tokio::time::timeout` (read-stall watchdog — heartbeats arrive every ~10s), a `Vec<u8>` pending buffer for partial UTF-8 (copy the shape of `freshell_opencode::transport::consume_events:145-198`, WITHOUT its internal reconnect loop — the lane owns cycles), feeding `SseDecoder::push_str` and `parse_serve_event`.
+Production impls: `ReqwestLaneHttp::get_json` = `client.get(url).timeout(2s).send() -> (status, json)`; `ReqwestLaneStream::connect` = GET with `accept: text/event-stream`, then a chunk loop with a 30s per-chunk `tokio::time::timeout` (read-stall watchdog — heartbeats arrive every ~10s) and a `Vec<u8>` pending buffer for partial UTF-8 (copy the shape of `freshell_opencode::transport::consume_events:145-198`, WITHOUT its internal reconnect loop — the lane owns cycles), feeding `SseDecoder::push_str` until the FIRST decoded event whose raw JSON `type` is `"server.connected"`; resolve with a handle owning the response body, the decoder, and any frames already decoded past the ack. `ConnectedOpencodeStream::drive` = flush those buffered frames through `parse_serve_event` to the sink in order, then continue the same chunk loop live.
 
-`OpencodeAttach` handling in `handle_event`: abort any existing lane handle for the terminal (`opencode_lanes.insert` returning the old handle → `.abort()` — respawn re-allocates a NEW port, so replacement is the contract), then if deps are set, `spawn_opencode_lane(...)` and store the handle. Exit arm (Task 8 site): `if let Some(handle) = inner.opencode_lanes.remove(&terminal_id) { handle.abort(); }`.
+`OpencodeAttach` handling in `handle_event`: bump `opencode_lane_next_generation` (monotonic, hub-issued — A6) and take the new value as this lane's generation; abort any existing lane for the terminal (`opencode_lanes.insert(terminal_id, (generation, handle))` returning the old entry → `.abort()` — respawn re-allocates a NEW port, so replacement is the contract); if deps are set, `spawn_opencode_lane(deps, hub, terminal_id, base_url, generation)` and store `(generation, handle)`. The ingress guard (Task 8) then drops any `OpencodeLane` event whose stamped generation doesn't match the current map entry. Exit arm (Task 8 site): `if let Some((_, handle)) = inner.opencode_lanes.remove(&terminal_id) { handle.abort(); }` — removal makes post-exit stragglers fail the generation match too.
 
 - [ ] **Step 1: Write the failing lane tests** (in `opencode_lane.rs` `mod tests`, with fake impls of the two traits — model on `crates/freshell-opencode/tests/serve_health_bounded.rs`'s `FakeHttp`/`FakeAllocator` style):
 
 ```rust
-#[test] fn translate_covers_the_attention_vocabulary() { /* feed verbatim spike JSON (session.status busy/idle/retry, session.idle, session.error abort+unknown, permission.asked/replied, session.created child+root) through freshell_opencode::SseDecoder + parse_serve_event + translate_serve_event; assert each OpencodeLaneEvent; assert message.part.delta and session.diff translate to None */ }
-#[tokio::test(flavor = "multi_thread")] async fn lane_gates_on_health_then_snapshots_then_streams() { /* FakeHttp: health returns 500 twice then 200; /session/status returns {"ses-r":{"type":"busy"}}; FakeStream delivers one session.idle then Ok(()); a recording hub (real ActivityHub + broadcast rx) sees Snapshot before SessionIdle with cycle=1 */ }
-#[tokio::test(flavor = "multi_thread")] async fn reconnect_bumps_stream_and_resnapshots() { /* FakeStream returns Ok(()) immediately twice; assert two Snapshot events with cycle 1 and 2 */ }
+#[test] fn translate_covers_the_attention_vocabulary() { /* feed verbatim spike JSON (session.status busy/idle/retry, session.idle, session.error abort+unknown, permission.asked/replied, session.created child+root, message.updated WITH info.error MessageAbortedError -> SessionError, message.updated WITHOUT an error -> None) through freshell_opencode::SseDecoder + parse_serve_event + translate_serve_event; assert each OpencodeLaneEvent; assert message.part.delta and session.diff translate to None */ }
+#[test] fn version_gate_matches_only_the_tested_range() { /* pure prefix check against TESTED_OPENCODE_VERSION_RANGE: "1.18.11" passes; "1.19.0" and "2.0.0" fail (the lane logs once and keeps bells on) */ }
+#[tokio::test(flavor = "multi_thread")] async fn lane_gates_on_health_then_snapshots_then_streams() { /* FakeHttp: health returns 500 twice then 200 (version "1.18.11"); FakeStream::connect resolves "subscribed" with one BUFFERED session.idle frame; /session/status returns {"ses-r":{"type":"busy"}}; a recording hub (real ActivityHub + broadcast rx, test lane generation registered) plus FakeHttp's recorded call order assert: connect precedes the /session/status GET; Snapshot is noted BEFORE the buffered SessionIdle; all with generation=1, cycle=1, stream=1 */ }
+#[tokio::test(flavor = "multi_thread")] async fn reconnect_bumps_stream_and_resnapshots() { /* FakeStream: connect resolves + drive returns Ok(()) immediately, twice; assert two Snapshot events with (cycle 1, stream 1) then (cycle 2, stream 2), each noted after its own connect */ }
+#[tokio::test(flavor = "multi_thread")] async fn unmapped_session_is_resolved_via_http_before_forwarding() { /* FakeStream delivers Status{ses-child, busy} with ses-child NOT in known_sessions; FakeHttp serves GET /session/ses-child -> {"id":"ses-child","parentID":"ses-root"} and GET /session/ses-root -> {"id":"ses-root"}; assert the hub sees SessionCreated{ses-root, None} then SessionCreated{ses-child, Some(ses-root)} BEFORE Status{ses-child}; failure variant: 404 on GET /session/{id} -> Status forwarded anyway (conservative ambiguity stands, next occurrence retries) */ }
 ```
 
-Write in full. Also a hub-level test in `activity.rs`: `opencode_attach_replaces_the_lane_and_exit_tears_it_down` — set fake deps via `set_opencode_lane_deps`, `attach_opencode_serve` twice + `Exit`, assert the lanes map (expose a `#[cfg(test)] fn opencode_lane_count(&self) -> usize`).
+Write in full. Also a hub-level test in `activity.rs`: `opencode_attach_replaces_the_lane_and_exit_tears_it_down` — set fake deps via `set_opencode_lane_deps`, `attach_opencode_serve` twice + `Exit`, assert the lanes map (expose `#[cfg(test)] fn opencode_lane_count(&self) -> usize` and `#[cfg(test)] fn opencode_lane_generation(&self, terminal_id: &str) -> Option<u64>`, asserting the generation bumps on the second attach).
 
 - [ ] **Step 2: Run RED** — `cargo test -p freshell-ws opencode_lane` fails to compile.
 
@@ -1431,7 +1644,7 @@ git commit -m "feat(ws): per-terminal opencode SSE lane with injected IO seams"
 
 - [ ] **Step 1: Write the failing test**
 
-In `activity.rs` tests (hub-level, since terminal.rs's handlers need a full WS harness): `resume_created_opencode_terminal_binds_identity_via_bind_ingress` — `Created` with `resume_session_id: None`, busy for `ses-x` (candidate), idle (awaitingAssociation), then `hub.bind_opencode_session("t-oc", "ses-x")` → expect `terminal.turn.complete{provider:"opencode"}` then one `terminal.idle`. (This pins the deferred-completion bind lane the association producers will drive.) Write it in full following the Task 8 episode style.
+In `activity.rs` tests (hub-level, since terminal.rs's handlers need a full WS harness): `resume_created_opencode_terminal_binds_identity_via_bind_ingress` — `Created` with `resume_session_id: None`, busy for `ses-x` (candidate), idle (awaitingAssociation), then `hub.bind_opencode_session("t-oc", "ses-x")` → expect `terminal.turn.complete{provider:"opencode"}` then one `terminal.idle`. (This pins the deferred-completion bind lane the association producers will drive. Register a test lane generation first — `hub.register_opencode_lane_for_tests("t-oc", 1)` — and stamp the busy/idle lane events with `generation: 1`, as in Task 8's helper.) Write it in full following the Task 8 episode style.
 
 - [ ] **Step 2: Run RED if the bind arm is incomplete; otherwise this is a pin** — `cargo test -p freshell-ws opencode`.
 
@@ -1494,14 +1707,42 @@ git commit -m "feat(ws): thread opencode endpoint and identity binds into the ac
 ```
 //! 6. Opencode death bells now ring on both servers, ownership-scoped:
 //!    candidate/ambiguous ownership never death-rings (the old noisy-busy-proxy
-//!    problem, now excluded by construction).
+//!    problem, now excluded by construction). Consequences kept deliberate:
+//!    first-turn deaths stay silent (candidate covers the whole first turn on
+//!    Node — even with a candidate-armed permission pause pending), and a Rust
+//!    pane whose bind producers all fail (locator ambiguity + plugin absence)
+//!    stays candidate indefinitely — candidate-armed pauses still ring there,
+//!    but completions and death bells wait for the bind.
 //! 8. Opencode: an SSE reconnect during a permission pause loses the pending
 //!    pause bell (the busy snapshot clears it; GET /permission resync is a
 //!    possible follow-up). Ambiguous ownership stays bell-free. Child sessions
-//!    created inside a reconnect gap can force ambiguous (conservative silence).
-//! 9. Opencode permission.v2.* / question.* event families (schema-declared,
-//!    unobserved on 1.18.11) are unhandled — the pause bell goes deaf if a
-//!    future server switches families.
+//!    unseen on-stream (reconnect gap, mid-turn attach) are recovered by the
+//!    lane's HTTP root resolver (GET /session/{id} exposes parentID); only
+//!    resolver FAILURE degrades to ambiguous (conservative silence), retried
+//!    on the next occurrence.
+//! 9. Opencode protocol drift: permission.v2.* / question.* event families
+//!    (schema-declared, unobserved on 1.18.11) are unhandled — the pause bell
+//!    goes deaf if a future server switches families. session.idle is already
+//!    deprecated upstream and a v1->v2 event/health migration is in progress;
+//!    the log-once version gate (Rust lane + Node tracker) converts silent
+//!    drift into a logged warning, and /session/status absence==idle is
+//!    version-derived behavior (1.18.x).
+//! 10. Opencode abort window W1: an abort landing between the prompt loop-top
+//!    and processor.create emits NO abort evidence at all before idle — a
+//!    ms-scale window where a completion bell can ring on a human abort
+//!    (window W2 is closed by the abort-marked message.updated fallback).
+//! 11. Pathological opencode TUI quits — worker dispose exceeding the 5s
+//!    hard-terminate cap, or a raw SIGTERM (no drain path) — can leave
+//!    engagement set at spontaneous exit, so a death bell can ring on those
+//!    rare human quits. Normal quit paths verified to abort+drain (all four
+//!    quit inputs dispose runners via the abort path before exit); the
+//!    wire-flush instant is unprovable from code but mitigated upstream by
+//!    graceful SSE stream termination.
+//! 12. The opencode 120s busy deadman is EVENT-SILENCE-keyed (deltas and
+//!    heartbeats do not refresh it): a single >120s silent tool call trips it
+//!    mid-turn. Ownership survives and the turn's completion still rings —
+//!    the cost is the dropped busy light plus lost post-deadman death
+//!    engagement (the removal itself stays silent).
 ```
 
 (Keep existing entries 1–5 and 7 verbatim; renumber only if the file's style demands it.)
@@ -1574,19 +1815,23 @@ git add -A && git commit -m "chore(opencode): verification sweep fixes"   # only
 
 **1. Spec coverage** — each spec requirement → covering task:
 - Completed turn rings after 2s grace, busy re-entry cancels, double-idle dedupe → Node: already-live path + Tasks 1–2 pins; Rust: Tasks 6, 8.
-- Abort/Esc silent, per-turn flag → Tasks 1–2 (Node), 7–8 (Rust).
+- Abort/Esc silent, per-turn flag, W2 abort-marked `message.updated` fallback → Tasks 1–2 (Node), 7–9 (Rust); W1 no-evidence window documented as residual (D8(g), Task 11).
 - Failed turn rings, trailing error no-op → Tasks 1–2, 7–8.
-- Permission pause: boundary, replied/busy resume, mid-pause hardening, duplicate dedupe, busy-only wire record → Tasks 3 (Node), 7–8 (Rust).
-- Spontaneous death while engaged (knownBusy ∨ armed grace ∨ pending permissions; never candidate/ambiguous), freshell kills silent, exit-while-idle silent, SSE-drop non-signal → Tasks 4 (Node), 7–8 (Rust); D4/D8 documented in Task 11.
+- Permission pause: boundary, replied/busy resume, mid-pause hardening (incl. the deferred-completion swallow at association confirm/bind), duplicate dedupe, busy-only wire record, root-resolved CHILD asks, candidate arming (first-turn asks ring) → Tasks 3 (Node), 7–8 (Rust).
+- Spontaneous death while engaged (knownBusy ∨ armed grace ∨ pending permissions; never candidate/ambiguous — even with a candidate-armed pause pending), freshell kills silent, exit-while-idle silent, SSE-drop non-signal → Tasks 4 (Node), 7–8 (Rust); D4/D8 documented in Task 11.
 - Child-session scoping + live-trace pins → Tasks 2, 5 (Node), 6, 8 (Rust).
-- Ambiguous conservative + residuals truth-up (idle.rs entry 6) → Tasks 6–8, 11.
+- Reconnect-gap / mid-turn-attach child recovery: lane-level HTTP root resolver (`GET /session/{id}` → parentID, synthetic SessionCreated before the triggering event; pure tracker stays resolver-free) → Task 9 (`unmapped_session_is_resolved_via_http_before_forwarding`); D8(c) narrowed to resolver failure → Task 11.
+- Lane/stream loss-free ordering: two-phase connect (subscribe on `server.connected` → snapshot → flush buffered → drive) → Task 9 (`lane_gates_on_health_then_snapshots_then_streams` pins connect-before-snapshot and snapshot-before-buffered-event).
+- Respawn stale-event immunity: hub-issued attach generations, generation-guarded ingress, Exit removes the entry → Tasks 8–9 (`respawn_drops_stale_lane_events`); cycle/stream keep guarding intra-lane staleness.
+- Version drift gate (log-once, bells stay on, `TESTED_OPENCODE_VERSION_RANGE`) → Tasks 2 (Node tracker health path), 9 (Rust lane); drift residuals (D8(h)) → Task 11.
+- Ambiguous conservative + residuals truth-up (idle.rs entries 6/8–12) → Tasks 6–8, 11.
 - Rust parity: pure tracker in freshell-activity, SSE lane reusing freshell-opencode decoder, hub wiring (Created/Exit/IdleGate/death/updated/list/turn.complete), endpoint threading, reconnect+health constants mirrored, zero client changes → Tasks 6–10.
 - opencode.activity.list answered from the hub (codex-mirror routing) → Task 8.
 - resolveOpencodeSessionRoots wiring pin → Task 5.
 - Testing expectations (Rust pure + hub episode + lane fakes; Node mirrors with collectors-before-action; deliberate pinned-test rewrites with SEMANTIC CHANGE comments; contract freeze green; fmt/clippy; targeted suites) → Tasks 1–10 test steps + Task 12.
 
-**1b. No silent deferrals** — every requirement lands as production behavior with a test naming the observable outcome (frames on the broadcast channel / tracker events), not stubs: the Rust lane's injected IO seams are test seams, and Task 10 installs the reqwest production impls in `main.rs` (built by `cargo build -p freshell-server`); hub episode tests prove the end-to-end frame behavior the client consumes. No stub survives without its production replacement task. Known residuals (D8) are protocol-inherent limits documented as residuals, not deferred requirements — none of the 8 required behaviors is moved there. **No unresolved coverage gaps.**
+**1b. No silent deferrals** — every requirement lands as production behavior with a test naming the observable outcome (frames on the broadcast channel / tracker events), not stubs: the Rust lane's injected IO seams are test seams, and Task 10 installs the reqwest production impls in `main.rs` (built by `cargo build -p freshell-server`); hub episode tests prove the end-to-end frame behavior the client consumes. Every validation-pass fix ships as production code with a named test in the same task: W2 marker (Task 2 W2 test; Task 7 `w2_abort_marker_gates_like_session_error`; Task 9 translate coverage), candidate/child pause arming (Task 3 tests; Task 7 `child_permission_asked_resolves_to_root_and_arms` + `candidate_pause_arms_and_deferred_completion_is_swallowed_at_bind`; Task 8 episode tests), HTTP root resolver (Task 9 `unmapped_session_is_resolved_via_http_before_forwarding`), two-phase connect ordering (Task 9 order pins), generation guard (Task 8 `respawn_drops_stale_lane_events`), version gate (Task 2 warn-once test; Task 9 `version_gate_matches_only_the_tested_range`). No stub survives without its production replacement task. The only residualized items are those explicitly adjudicated by the validation pass (W1 window, first-turn death silence, pathological quits, Rust bind tails, drift facts, deadman characterization) — documented in D8/Task 11, not silently dropped. **No unresolved coverage gaps.**
 
-**2. Placeholder scan** — Tasks 2, 3, 5, 8, 9 use comment-annotated test skeletons that specify exact event sequences and assertions with a "write in full" instruction plus a complete worked example in the same task; no TBD/TODO/"handle edge cases" items remain.
+**2. Placeholder scan** — Tasks 2, 3, 5, 7, 8, 9 use comment-annotated test skeletons that specify exact event sequences and assertions with a "write in full" instruction plus a complete worked example in the same task; no TBD/TODO/"handle edge cases" items remain (re-verified after the validation-pass edits).
 
-**3. Type consistency** — checked: `OpencodeActivityChange` marker fields match `TrulyIdleActivityChange` (`spontaneousExitRemovals`/`approvalPendingRemovals`, `:34`/`:41`); `untrackTerminal({ terminalId, spontaneous? })` matches the wiring call; Rust `OpencodeStatus`/`OpencodeLaneEvent` names match between Tasks 6–9; `opencode_frames` signature matches `claude_frames`' single-return shape (no force-reads); `blocks_death_bell`/`has_pending_permissions` names consistent across Tasks 7–8; `attach_opencode_serve(terminal_id, hostname, port)` consistent between Tasks 9–10; reducer `error` observation field names identical in Tasks 1–2.
+**3. Type consistency** — checked: `OpencodeActivityChange` marker fields match `TrulyIdleActivityChange` (`spontaneousExitRemovals`/`approvalPendingRemovals`, `:34`/`:41`); `untrackTerminal({ terminalId, spontaneous? })` matches the wiring call; Rust `OpencodeStatus`/`OpencodeLaneEvent` names match between Tasks 6–9; `opencode_frames` signature matches `claude_frames`' single-return shape (no force-reads); `blocks_death_bell`/`has_pending_permissions` names consistent across Tasks 7–8; `attach_opencode_serve(terminal_id, hostname, port)` consistent between Tasks 9–10; reducer `error` observation field names identical in Tasks 1–2 (and fed by both `session.error` and `message.updated`); `note_opencode_lane_event(terminal_id, generation, cycle, stream, event)` and `HubEvent::OpencodeLane{terminal_id, generation, cycle, stream, event}` consistent across Tasks 8–10 (helper, episode tests, lane loop, ingress guard, bind-lane test); `spawn_opencode_lane(..., generation: u64)` matches the `OpencodeAttach` arm; `opencode_lanes: HashMap<String, (u64, JoinHandle<()>)>` + `opencode_lane_next_generation` consistent between Tasks 8–9; two-phase `OpencodeEventStream::connect`/`ConnectedOpencodeStream::drive` names consistent across the trait, `ReqwestLaneStream` description, and lane tests; Rust root resolution is `resolve_root` (pure tracker, Tasks 6–8) with the lane-level HTTP fallback in Task 9, while Node reuses the existing `resolveRootForEvent` (Tasks 2–3); `TESTED_OPENCODE_VERSION_RANGE` named identically in the Node tracker and the Rust lane.
