@@ -1960,7 +1960,8 @@ impl TerminalRegistry {
 
     /// Same-id double-resume guard claim (see `resume_create_inflight`'s
     /// field doc): reserve a `"resume:{mode}:{sid}"` key for an in-flight
-    /// amplifier resume create. `false` means another create currently holds
+    /// resume-mode amplifier create (spawned as `amplifier session resume
+    /// --full-history <id>`). `false` means another create currently holds
     /// it. Mirrors [`Self::begin_keyed_create`]; pair with
     /// [`Self::end_resume_create`].
     fn begin_resume_create(&self, key: &str) -> bool {

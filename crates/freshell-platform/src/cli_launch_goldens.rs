@@ -750,7 +750,7 @@ fn amplifier_spec() -> CliCommandSpec {
         label: "Amplifier".into(),
         env_var: Some("AMPLIFIER_CMD".into()),
         default_cmd: "amplifier".into(),
-        resume_args: Some(s(&["resume", "{{sessionId}}"])),
+        resume_args: Some(s(&["session", "resume", "--full-history", "{{sessionId}}"])),
         base_env,
         ..Default::default()
     }
@@ -791,8 +791,9 @@ fn g_a1_amplifier_fresh_launch_matches_manifest() {
     assert_eq!(launch.label, "Amplifier");
 }
 
-/// G-A2 — amplifier resume: `["resume", "<sessionId>"]` from the manifest's
-/// `resumeArgs` template (first-occurrence substitution, rev 2.1 pin).
+/// G-A2 — amplifier full-history resume: `["session", "resume",
+/// "--full-history", "<sessionId>"]` from the manifest's `resumeArgs`
+/// template (first-occurrence substitution, rev 2.1 pin).
 #[test]
 fn g_a2_amplifier_resume_appends_resume_args() {
     let mut all_specs = specs();
@@ -806,7 +807,12 @@ fn g_a2_amplifier_resume_appends_resume_args() {
     .unwrap();
     assert_eq!(
         launch.args,
-        vec!["resume".to_string(), "sess-123".to_string()]
+        vec![
+            "session".to_string(),
+            "resume".to_string(),
+            "--full-history".to_string(),
+            "sess-123".to_string(),
+        ]
     );
 }
 
@@ -848,9 +854,10 @@ fn resolve_amplifier_golden_with_intent(
 /// resumeArgs ONLY — `LaunchIntent::Start` with a preallocated session id
 /// is a hard StartIntentUnsupported error. The WS/REST pre-create paths
 /// therefore keep `LaunchIntent::Resume` for fresh amplifier panes
-/// (`amplifier resume <uuid>` of the pre-created stub IS the fresh
-/// launch). This golden pins that requirement so a future "make amplifier
-/// look like claude" refactor fails loudly here instead of at runtime.
+/// (`amplifier session resume --full-history <uuid>` of the pre-created stub
+/// IS the fresh launch). This golden pins that requirement so a future "make
+/// amplifier look like claude" refactor fails loudly here instead of at
+/// runtime.
 #[test]
 fn g_a4_amplifier_start_intent_without_create_session_args_is_rejected() {
     let err = resolve_amplifier_golden_with_intent(
@@ -866,7 +873,8 @@ fn g_a4_amplifier_start_intent_without_create_session_args_is_rejected() {
 }
 
 /// G-A4b: with Resume intent the SAME inputs resolve to
-/// `amplifier resume <id>` (the manifest resumeArgs template).
+/// `amplifier session resume --full-history <id>` (the manifest resumeArgs
+/// template).
 #[test]
 fn g_a4b_amplifier_resume_intent_with_preallocated_id_resolves_resume_argv() {
     let cli = resolve_amplifier_golden_with_intent(
@@ -876,7 +884,12 @@ fn g_a4b_amplifier_resume_intent_with_preallocated_id_resolves_resume_argv() {
     .unwrap();
     assert_eq!(
         cli.args,
-        vec!["resume", "11111111-2222-3333-4444-555555555555"]
+        vec![
+            "session",
+            "resume",
+            "--full-history",
+            "11111111-2222-3333-4444-555555555555",
+        ]
     );
 }
 
@@ -907,7 +920,7 @@ fn amplifier_manifest_matches_legacy_cli_block() {
     assert_eq!(cli["envVar"], "AMPLIFIER_CMD");
     assert_eq!(
         cli["resumeArgs"],
-        serde_json::json!(["resume", "{{sessionId}}"])
+        serde_json::json!(["session", "resume", "--full-history", "{{sessionId}}"])
     );
     assert_eq!(
         cli["env"],

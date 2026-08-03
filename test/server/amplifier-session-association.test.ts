@@ -90,7 +90,7 @@ const COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> = [
     label: 'Amplifier',
     envVar: 'AMPLIFIER_CMD',
     defaultCommand: 'amplifier',
-    resumeArgs: (sessionId: string) => ['resume', sessionId],
+    resumeArgs: (sessionId: string) => ['session', 'resume', '--full-history', sessionId],
   }],
 ]
 

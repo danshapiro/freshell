@@ -74,11 +74,13 @@ let eventsPath = null
 let sessionId = null
 let sessionDir = null
 
-if (argv[0] === 'resume' && argv[1]) {
+if (argv[0] === 'session' && argv[1] === 'resume' && argv.length > 2) {
   // LAUNCHER-ASSIGNED flow: adopt the broker's pre-created stub instead of
   // creating our own session dir (the events lane is already tailing the
   // stub's events.jsonl -- records written anywhere else are invisible).
-  sessionId = argv[1]
+  // Real launch shape: `session resume --full-history <id>` -- the session
+  // id is the argument after `--full-history` (i.e. the last element).
+  sessionId = argv[argv.length - 1]
   sessionDir = findSessionDir(sessionId)
   if (sessionDir) eventsPath = path.join(sessionDir, 'events.jsonl')
   process.stdout.write(`amplifier: resumed session ${sessionId}\r\n`)

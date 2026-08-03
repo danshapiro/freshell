@@ -20,7 +20,8 @@ pub enum ByIdAnswer {
 }
 
 /// Injected by-id amplifier session-dir check (kata 09v1 pattern: the probe
-/// must agree with the attach arm — `amplifier resume <id>` finds the dir
+/// must agree with the attach arm — `amplifier session resume
+/// --full-history <id>` finds the dir
 /// regardless of index state). A closure keeps the probe unit-testable;
 /// precedent: `ClaudeTranscriptLocator`/`OpencodeSessionLocator`.
 pub type AmplifierSessionLocator = Arc<dyn Fn(&str) -> ByIdAnswer + Send + Sync>;

@@ -110,7 +110,7 @@ async fn fresh_amplifier_create_carries_launcher_assigned_session_ref_and_stub()
 /// A requested amplifier RESUME whose session dir does not exist (e.g. a
 /// GC'd never-used stub from a previous run) is RE-STUBBED under the SAME
 /// id before spawn, so restore keeps working instead of hanging a doomed
-/// `amplifier resume <id>`.
+/// `amplifier session resume --full-history <id>`.
 #[tokio::test]
 async fn requested_amplifier_resume_with_missing_dir_is_restubbed_under_same_id() {
     let amp_home = isolate_amplifier_home();
@@ -219,7 +219,7 @@ async fn amplifier_create_with_vanished_cwd_is_rejected_before_spawn() {
 /// placeholder (the old correlation bug's poisoned persisted tab state) —
 /// never a resumable amplifier session. A create carrying one must be
 /// rejected LOUDLY before any stub is written, instead of spawning an
-/// `amplifier resume terminal:...` that hangs forever.
+/// `amplifier session resume --full-history terminal:...` that hangs forever.
 #[tokio::test]
 async fn amplifier_create_rejects_synthetic_terminal_placeholder_refs() {
     let amp_home = isolate_amplifier_home();

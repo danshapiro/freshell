@@ -7,7 +7,7 @@
   "cli": {
     "command": "amplifier",
     "envVar": "AMPLIFIER_CMD",
-    "resumeArgs": ["resume", "{{sessionId}}"],
+    "resumeArgs": ["session", "resume", "--full-history", "{{sessionId}}"],
     "env": { "PROMPT_TOOLKIT_NO_CPR": "1" }
   },
   "picker": {

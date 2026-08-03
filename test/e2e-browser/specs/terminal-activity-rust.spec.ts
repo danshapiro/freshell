@@ -448,7 +448,7 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
       expect(complete.provider).toBe('amplifier')
       expect(complete.completionSeq).toBe(1)
       // The completion carries the BROKER-MINTED session id (launcher-
-      // assigned identity: the pane was spawned `resume <uuid>` against the
+      // assigned identity: the pane was spawned `session resume --full-history <uuid>` against the
       // pre-created stub), never a fixture-invented `fake-amp-*` id.
       expect(String(complete.sessionId ?? '')).toMatch(UUID_RE)
 

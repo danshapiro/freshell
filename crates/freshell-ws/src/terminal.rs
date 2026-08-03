@@ -1420,7 +1420,8 @@ pub(crate) fn build_pty_exit_hook(
             // concurrent re-resume that has already passed `ensure_session`
             // (found our stub) but has NOT yet inserted its registry row is
             // invisible here — its dir can be GC'd in that sub-second window
-            // and its `amplifier resume <id>` then fails LOUDLY in-terminal;
+            // and its `amplifier session resume --full-history <id>` then fails
+            // LOUDLY in-terminal;
             // reopening the pane re-stubs the same id (ensure-after-GC).
             if freshell_terminal::registry::has_other_live_resume(
                 &deps.registry.identity_probe_rows(),
@@ -1510,7 +1511,8 @@ pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchP
         // Launcher-assigned amplifier identity (kata qmpk), the fresh-claude
         // preallocation's sibling: a FRESH amplifier pane gets a
         // server-minted session id, and (below, in the pre-create block) a
-        // pre-created stub dir — `amplifier resume <uuid>` of that stub IS
+        // pre-created stub dir — `amplifier session resume --full-history
+        // <uuid>` of that stub IS
         // the fresh launch. CRITICAL: `launch_intent` STAYS `Resume` —
         // amplifier's manifest has resumeArgs only; `Start` without
         // createSessionArgs is a hard StartIntentUnsupported error
@@ -2188,7 +2190,8 @@ pub(crate) async fn handle_create(
     let effective_shell = resolve_shell(shell, host_os, is_wsl);
     let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
 
-    // Amplifier pre-create (kata qmpk): make `amplifier resume <id>`
+    // Amplifier pre-create (kata qmpk): make
+    // `amplifier session resume --full-history <id>`
     // guaranteed-resumable BEFORE spawn. Fresh creates get a brand-new stub;
     // requested resumes whose dir is gone (e.g. a GC'd never-used stub from
     // a previous run) are re-stubbed under the SAME id so restore keeps
@@ -2352,7 +2355,8 @@ pub(crate) async fn handle_create(
                     amplifier_stub = Some(ensured);
                 }
                 Err(detail) => {
-                    // Fail LOUD: spawning `amplifier resume <id>` without a
+                    // Fail LOUD: spawning `amplifier session resume
+                    // --full-history <id>` without a
                     // resumable dir would hang a doomed CLI (the exact
                     // failure mode this feature deletes).
                     return send_create_error(

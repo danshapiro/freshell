@@ -3,9 +3,10 @@
 // Real Amplifier stub-adoption contract (launcher-assigned session identity).
 //
 // The Rust broker pre-creates ~/.amplifier/projects/<cwd-slug>/sessions/<id>/
-// stubs and spawns `amplifier resume <id>`. This test pins the two external
-// contracts that path rests on, against the REAL CLI:
-//   1. STUB ADOPTION: `amplifier resume <id>` of a pre-created stub is
+// stubs and spawns `amplifier session resume --full-history <id>`. This test
+// pins the two external contracts that path rests on, against the REAL CLI:
+//   1. STUB ADOPTION: `amplifier session resume --full-history <id>` of a
+//      pre-created stub is
 //      accepted (not rejected like an unknown id), the metadata survives in
 //      place, and custom keys (freshell_terminal_id) are preserved.
 //      Adoption also implicitly proves the slug: amplifier only searches the
@@ -107,9 +108,9 @@ async function writeStub(home: string, resolvedCwd: string, sessionId: string): 
   return dir
 }
 
-// Spawn `amplifier resume <id>` (interactive), collect combined output for
-// up to timeoutMs, then SIGTERM. We never make a turn — a zero-turn resume
-// is the validated adoption shape. Resolves the output PLUS exit semantics:
+// Spawn `amplifier session resume --full-history <id>` (interactive), collect
+// combined output for up to timeoutMs, then SIGTERM. We never make a turn — a
+// zero-turn resume is the validated adoption shape. Resolves the output PLUS exit semantics:
 // `exitedBeforeTimeout` distinguishes a self-exiting rejection (validated:
 // exit 1 in ~1-2s, before bundle/provider init) from an adoption that stays
 // interactive until OUR SIGTERM. timeoutMs must absorb the first run's
@@ -120,7 +121,7 @@ function runResume(
   opts: { home: string; cwd: string; timeoutMs: number },
 ): Promise<{ output: string; exitedBeforeTimeout: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(cli.command, [...cli.baseArgs, 'resume', sessionId], {
+    const child = spawn(cli.command, [...cli.baseArgs, 'session', 'resume', '--full-history', sessionId], {
       cwd: opts.cwd,
       // VALIDATED (V1): HOME is the isolation lever — session storage is
       // hardcoded to $HOME/.amplifier; AMPLIFIER_HOME would isolate nothing

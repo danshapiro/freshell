@@ -1,5 +1,6 @@
 //! Launcher-assigned amplifier session identity: pre-create ("stub") session
-//! dirs on disk so the broker can spawn `amplifier resume <id>` with an
+//! dirs on disk so the broker can spawn
+//! `amplifier session resume --full-history <id>` with an
 //! identity it minted itself — no post-spawn correlation.
 //!
 //! Unlike [`crate::amplifier`] (read-only indexing; "never mutates provider
@@ -79,7 +80,8 @@ pub fn resolve_amplifier_home() -> Option<PathBuf> {
 /// slug DIFFERENT from slug(canonical cwd), plus that session's own
 /// metadata `working_dir`. On a divergent find the caller MUST override the
 /// spawn cwd with `working_dir_of_existing` (if it exists and is a dir) or
-/// reject the create — `amplifier resume` only searches the spawn cwd's
+/// reject the create — `amplifier session resume --full-history` only
+/// searches the spawn cwd's
 /// slug, so spawning at the requested cwd would silently find nothing.
 #[derive(Debug, Clone)]
 pub struct EnsuredSession {
@@ -89,7 +91,8 @@ pub struct EnsuredSession {
     pub working_dir_of_existing: Option<String>,
 }
 
-/// Make `amplifier resume <session_id>` guaranteed-resumable from `cwd`
+/// Make `amplifier session resume --full-history <session_id>`
+/// guaranteed-resumable from `cwd`
 /// BEFORE spawn. If the session dir already exists under ANY project slug
 /// (a real session, or a stub from a previous run), it is found and left
 /// untouched — with slug provenance reported (see [`EnsuredSession`]).

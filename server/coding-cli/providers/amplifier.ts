@@ -267,7 +267,7 @@ export const amplifierProvider: CodingCliProvider = {
   },
 
   getResumeArgs(sessionId: string) {
-    return ['resume', sessionId]
+    return ['session', 'resume', '--full-history', sessionId]
   },
 
   parseEvent(line: string): NormalizedEvent[] {

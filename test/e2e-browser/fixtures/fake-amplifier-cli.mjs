@@ -67,8 +67,10 @@ function findSessionDir(sessionId) {
   return null
 }
 
-if (argv[0] === 'resume') {
-  const sessionId = argv[1] ?? ''
+if (argv[0] === 'session' && argv[1] === 'resume') {
+  // Real launch shape: `session resume --full-history <id>` -- the session
+  // id is the argument after `--full-history` (i.e. the last element).
+  const sessionId = argv[argv.length - 1] ?? ''
   process.stdout.write(`amplifier: resumed session ${sessionId}\r\n`)
   process.stdout.write('amplifier> \r\n')
   // Exit cleanly on EOF (Ctrl-D), like the real interactive CLI -- specs use

@@ -1175,7 +1175,8 @@ pub(crate) async fn spawn_terminal_pane(
                     amplifier_stub = Some(ensured);
                 }
                 Err(detail) => {
-                    // Fail LOUD: spawning `amplifier resume <id>` without a
+                    // Fail LOUD: spawning `amplifier session resume
+                    // --full-history <id>` without a
                     // resumable dir would hang a doomed CLI (the exact
                     // failure mode this feature deletes).
                     return Err(fail_json(
@@ -3517,15 +3518,21 @@ mod tests {
     }
 
     /// A recording spec whose `resume_args` mirror the REAL amplifier
-    /// manifest (`extensions/amplifier/freshell.json`: `["resume",
-    /// "{{sessionId}}"]`, no `--resume` flag) so the recorded argv is the
-    /// launcher-assigned identity contract's exact `amplifier resume <uuid>`
-    /// shape (minus argv[0], which the recorder script does not capture).
+    /// manifest (`extensions/amplifier/freshell.json`: `["session", "resume",
+    /// "--full-history", "{{sessionId}}"]`) so the recorded argv is the
+    /// launcher-assigned identity contract's exact `amplifier session resume
+    /// --full-history <uuid>` shape (minus argv[0], which the recorder script
+    /// does not capture).
     fn amplifier_recording_cli_spec(
         argv_file: &std::path::Path,
     ) -> freshell_platform::CliCommandSpec {
         let mut spec = recording_cli_spec("amplifier", argv_file);
-        spec.resume_args = Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]);
+        spec.resume_args = Some(vec![
+            "session".to_string(),
+            "resume".to_string(),
+            "--full-history".to_string(),
+            "{{sessionId}}".to_string(),
+        ]);
         spec
     }
 
@@ -3545,8 +3552,8 @@ mod tests {
     /// Task 11 (launcher-assigned identity, REST twin of the WS Task 8
     /// contract): a fresh `POST /api/tabs {mode:"amplifier"}` mints the
     /// session UUID, pre-creates the on-disk stub BEFORE spawn, spawns
-    /// `amplifier resume <uuid>`, and promotes the minted id into the
-    /// broadcast `paneContent.sessionRef` (EDEV-07).
+    /// `amplifier session resume --full-history <uuid>`, and promotes the
+    /// minted id into the broadcast `paneContent.sessionRef` (EDEV-07).
     #[tokio::test]
     async fn create_amplifier_tab_fresh_mints_identity_prestubs_and_spawns_resume_argv() {
         let argv_file = unique_argv_file("amplifier-fresh");
@@ -3570,13 +3577,19 @@ mod tests {
             .unwrap()
             .is_running(&terminal_id));
 
-        // 1) Recorded argv is exactly `resume <uuid>` (the recorder captures
-        //    "$@" — everything after the program itself).
+        // 1) Recorded argv is exactly `session resume --full-history <uuid>`
+        //    (the recorder captures "$@" — everything after the program itself).
         let argv = read_argv_file_eventually(&argv_file).await;
         let lines: Vec<&str> = argv.lines().collect();
-        assert_eq!(lines.len(), 2, "expected `resume <uuid>` argv, got: {argv}");
-        assert_eq!(lines[0], "resume", "argv: {argv}");
-        let minted = Uuid::parse_str(lines[1])
+        assert_eq!(
+            lines.len(),
+            4,
+            "expected `session resume --full-history <uuid>` argv, got: {argv}"
+        );
+        assert_eq!(lines[0], "session", "argv: {argv}");
+        assert_eq!(lines[1], "resume", "argv: {argv}");
+        assert_eq!(lines[2], "--full-history", "argv: {argv}");
+        let minted = Uuid::parse_str(lines[3])
             .expect("minted amplifier session id must parse as a Uuid")
             .to_string();
 
@@ -3644,7 +3657,8 @@ mod tests {
     }
 
     /// Same-id double-resume guard, REST rung: never spawn a second
-    /// `amplifier resume <sid>` while a live terminal owns <sid>.
+    /// `amplifier session resume --full-history <sid>` while a live terminal
+    /// owns <sid>.
     #[tokio::test]
     async fn create_amplifier_tab_rejects_duplicate_live_resume_with_409() {
         let argv_file = unique_argv_file("amplifier-dup");

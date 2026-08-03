@@ -216,7 +216,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       // At least TWO resume invocations of this id: the create-time spawn
       // and the explicit resume tab (every amplifier spawn is a resume now).
       const amplifierArgvLines = await readArgvLines(amplifierArgLog)
-      const amplifierResumeInvocations = amplifierArgvLines.filter((e) => e.argv[0] === 'resume' && e.argv[1] === amplifierSessionId)
+      const amplifierResumeInvocations = amplifierArgvLines.filter((e) => e.argv[0] === 'session' && e.argv[1] === 'resume' && e.argv[2] === '--full-history' && e.argv[3] === amplifierSessionId)
       expect(amplifierResumeInvocations.length).toBeGreaterThanOrEqual(2)
 
       // -----------------------------------------------------------------

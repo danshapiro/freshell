@@ -117,8 +117,8 @@ describe('amplifier-provider', () => {
     ).toBe('abcd-1234')
   })
 
-  it('getResumeArgs builds resume args', () => {
-    expect(amplifierProvider.getResumeArgs('abc')).toEqual(['resume', 'abc'])
+  it('getResumeArgs builds full-history session resume args', () => {
+    expect(amplifierProvider.getResumeArgs('abc')).toEqual(['session', 'resume', '--full-history', 'abc'])
   })
 
   it('getStreamArgs returns a default run invocation', () => {

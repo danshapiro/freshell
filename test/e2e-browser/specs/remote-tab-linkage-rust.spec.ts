@@ -220,10 +220,10 @@ test.describe('Remote tab linkage (Rust only)', () => {
         // restart proof below asserts a NEW one beyond this count).
         const resumesAfterCreate = await expect.poll(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((e) => e.argv[0] === 'resume' && e.argv[1] === SEEDED_SESSION_ID).length
+          return lines.filter((e) => e.argv[0] === 'session' && e.argv[1] === 'resume' && e.argv[2] === '--full-history' && e.argv[3] === SEEDED_SESSION_ID).length
         }, { timeout: 20_000 }).toBeGreaterThan(0).then(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((e) => e.argv[0] === 'resume' && e.argv[1] === SEEDED_SESSION_ID).length
+          return lines.filter((e) => e.argv[0] === 'session' && e.argv[1] === 'resume' && e.argv[2] === '--full-history' && e.argv[3] === SEEDED_SESSION_ID).length
         })
 
         // ------------------------------------------------------------------
@@ -315,7 +315,7 @@ test.describe('Remote tab linkage (Rust only)', () => {
         // invocation beyond the create-time one(s).
         await expect.poll(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((e) => e.argv[0] === 'resume' && e.argv[1] === SEEDED_SESSION_ID).length
+          return lines.filter((e) => e.argv[0] === 'session' && e.argv[1] === 'resume' && e.argv[2] === '--full-history' && e.argv[3] === SEEDED_SESSION_ID).length
         }, { timeout: 30_000 }).toBeGreaterThan(resumesAfterCreate)
 
         // And the linkage itself survived: the sidebar row is OPEN again

@@ -387,14 +387,15 @@ test.describe('Sidebar Click Resume', () => {
           return typeof buffer === 'string' && buffer.includes(`amplifier: resumed session ${AMPLIFIER_SESSION_ID}`)
         }, { timeout: 20_000 }).toBe(true)
 
+        const isAmplifierResume = (argv: string[]) => argv[0] === 'session' && argv[1] === 'resume' && argv[2] === '--full-history'
         const resumeInvocations = (await expect.poll(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((entry) => entry.argv[0] === 'resume')
+          return lines.filter((entry) => isAmplifierResume(entry.argv))
         }, { timeout: 20_000 }).not.toEqual([]).then(async () => {
           const lines = await readArgvLog(argLogPath)
-          return lines.filter((entry) => entry.argv[0] === 'resume')
+          return lines.filter((entry) => isAmplifierResume(entry.argv))
         }))
-        expect(resumeInvocations.some((entry) => entry.argv[1] === AMPLIFIER_SESSION_ID)).toBe(true)
+        expect(resumeInvocations.some((entry) => entry.argv[3] === AMPLIFIER_SESSION_ID)).toBe(true)
       } finally {
         await server.stop().catch(() => {})
       }

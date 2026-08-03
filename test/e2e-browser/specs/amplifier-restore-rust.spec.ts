@@ -377,12 +377,14 @@ test.describe('Amplifier Restore (Rust only)', () => {
         expect(await findStubDir(negativeSessionId)).not.toBeNull()
 
         // argv log: every amplifier spawn in this scenario was a resume, and
-        // both ids appear as `resume <id>` invocations post-restart.
+        // both ids appear as `session resume --full-history <id>` invocations
+        // post-restart.
         const entries = (await fs.readFile(argLogPath, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as { argv: string[] })
-        const resumes = entries.filter((e) => e.argv[0] === 'resume')
-        expect(resumes.some((e) => e.argv[1] === sessionId)).toBe(true)
-        expect(resumes.some((e) => e.argv[1] === negativeSessionId)).toBe(true)
-        expect(entries.every((e) => e.argv[0] === 'resume')).toBe(true)
+        const isResume = (argv: string[]) => argv[0] === 'session' && argv[1] === 'resume' && argv[2] === '--full-history'
+        const resumes = entries.filter((e) => isResume(e.argv))
+        expect(resumes.some((e) => e.argv[3] === sessionId)).toBe(true)
+        expect(resumes.some((e) => e.argv[3] === negativeSessionId)).toBe(true)
+        expect(entries.every((e) => isResume(e.argv))).toBe(true)
 
         // Invariant pins: the re-homed identity sweep never fires for these
         // launcher-assigned panes, and the boot layout canary stayed quiet.
