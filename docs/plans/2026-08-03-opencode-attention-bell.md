@@ -182,7 +182,7 @@ In `server/coding-cli/opencode-ownership-reducer.ts`:
 
 2. Add the per-turn flags to the state union: on `candidate` (~`:29-36`) and `knownBusy` (~`:37-43`) add `turnAborted?: boolean`; on `awaitingAssociation` (~`:44-51`) add `aborted?: boolean`.
 
-3. Add `reduceError` (near `reduceIdle`):
+3. Widen `sameSessionStream`'s observation parameter (~`:103-110`) from `Extract<OpencodeObservation, { kind: 'sse' }>` to `Extract<OpencodeObservation, { kind: 'sse' | 'error' }>` — the guard only reads `sessionId`/`cycleId`/`streamId`, which both variants carry. Without this widening, `reduceError` below is a TS2345 type error at `npm run check` (Task 12 Step 3) even though esbuild-transpiled vitest runs stay green. Then add `reduceError` (near `reduceIdle`):
 
 ```ts
 function reduceError(
@@ -1751,7 +1751,7 @@ git commit -m "feat(ws): thread opencode endpoint and identity binds into the ac
 
 - [ ] **Step 3: Verify zero wire drift**
 
-Run: `npm run test:vitest -- run test/unit/port/ws-contract-freeze.test.ts --config config/vitest/vitest.server.config.ts`
+Run: `npm run test:port` (the freeze test lives at `test/unit/port/ws-contract-freeze.test.ts`, matched ONLY by `config/vitest/vitest.port.config.ts` — the server config does not include `test/unit/port/`, so never run it under `vitest.server.config.ts`).
 Expected: PASS with NO regenerated JSON (comments don't feed the contract). If it fails, the edit touched schema tokens — revert and re-apply as pure comments.
 
 - [ ] **Step 4: Commit**
@@ -1781,10 +1781,11 @@ Expected: all clean/green. Fix and amend/commit as needed (`fix(...)`/`test(...)
 - [ ] **Step 2: Node targeted suites**
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/ test/unit/port/ws-contract-freeze.test.ts --config config/vitest/vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/coding-cli/ --config config/vitest/vitest.server.config.ts
+npm run test:port
 ```
 
-Expected: PASS.
+Expected: BOTH commands PASS. (Two separate runs on purpose: the contract-freeze test is only matched by the port config — folding it into the server-config invocation silently skips it.)
 
 - [ ] **Step 3: Full gate (coordinator-gated)**
 
