@@ -655,13 +655,13 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
 
     if (event.type === 'permission.asked') {
-      const ownership = monitor.ownership
       // Root-resolve the asker (D3): children CAN ask -- the event is stamped
       // with the CHILD session id and the parent turn blocks on it (opencode
       // v1.18.11 source, validation pass 2026-08-03). Multi-level chain walk;
       // mappings are retained for the session's lifetime.
       const rootSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
       if (rootSessionId === undefined) return
+      const ownership = monitor.ownership
       // Arm under knownBusy OR candidate ownership: a fresh pane is candidate
       // for its ENTIRE first turn by construction (the bind lands only at the
       // first idle edge), and the single busy unbound session on the pane's
