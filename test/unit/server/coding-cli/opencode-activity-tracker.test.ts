@@ -67,6 +67,41 @@ function createControlledSseResponse() {
   }
 }
 
+function createControlledFetchFixture(snapshot: Record<string, unknown>) {
+  const sse = createControlledSseResponse()
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+    if (url.endsWith('/session/status')) return createJsonResponse(snapshot)
+    if (url.endsWith('/event')) return sse.response
+    throw new Error(`unexpected url ${url}`)
+  })
+  return { sse, fetchImpl }
+}
+
+function collectOpencode(tracker: OpencodeActivityTracker) {
+  const collected = {
+    changes: [] as Array<{ upsert: unknown[]; remove: string[] }>,
+    boundaries: [] as Array<{ terminalId: string; at: number }>,
+    completions: [] as unknown[],
+    // combined arrival-order log across streams (demote-before-boundary checks)
+    order: [] as string[],
+  }
+  tracker.on('changed', (c) => {
+    collected.changes.push(c)
+    collected.order.push(c.remove.length > 0 ? 'changed:remove' : 'changed:upsert')
+  })
+  tracker.on('attention.boundary', (e) => {
+    collected.boundaries.push(e)
+    collected.order.push('boundary')
+  })
+  tracker.on('turn.complete', (e) => {
+    collected.completions.push(e)
+    collected.order.push('completion')
+  })
+  return collected
+}
+
 describe('OpencodeActivityTracker', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -1384,6 +1419,193 @@ describe('OpencodeActivityTracker', () => {
       await vi.advanceTimersByTimeAsync(0)
       expect(completions).toEqual([])
       expect(changes.filter((c) => c.remove.length > 0)).toHaveLength(1) // one demotion, no double-remove
+      tracker.dispose()
+    })
+  })
+
+  describe('permission pause semantics (codex approval-pause mirror)', () => {
+    async function setupKnownBusyPause() {
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-root': { type: 'busy' } })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy, record present
+      return { sse, tracker, collected }
+    }
+
+    it('permission.asked on the owned busy session demotes then arms the boundary once', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({
+        type: 'permission.asked',
+        properties: { id: 'per-1', sessionID: 'ses-root', permission: 'bash', patterns: ['sleep 60'], metadata: {}, always: [] },
+      })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([
+        { upsert: [], remove: ['term-1'] },
+      ])
+      expect(collected.boundaries).toEqual([{ terminalId: 'term-1', at: expect.any(Number) }])
+      // demote FIRST, boundary SECOND (codex ordering): the gate must see
+      // not-busy before it arms
+      expect(collected.order.indexOf('changed:remove')).toBeGreaterThanOrEqual(0)
+      expect(collected.order.indexOf('changed:remove')).toBeLessThan(collected.order.indexOf('boundary'))
+      tracker.dispose()
+    })
+
+    it('duplicate permission.asked ids never re-arm', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.boundaries).toHaveLength(1)
+      tracker.dispose()
+    })
+
+    it('permission.replied resumes busy immediately (cancels within grace)', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'permission.replied', properties: { sessionID: 'ses-root', requestID: 'per-1', reply: 'once' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [expect.objectContaining({ terminalId: 'term-1', sessionId: 'ses-root', phase: 'busy' })],
+        remove: [],
+      })
+      tracker.dispose()
+    })
+
+    it('abort mid-pause force-emits the removal and mints nothing', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      // live abort trace (events-B.log): error -> status idle -> session.idle -> status idle -> session.idle
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-root', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.completions).toEqual([])
+      expect(collected.boundaries).toHaveLength(1) // no re-arm
+      // the force-emit that cancels the armed grace window at the emitter:
+      // a SECOND remove for term-1 even though the record was already gone
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([
+        { upsert: [], remove: ['term-1'] },
+        { upsert: [], remove: ['term-1'] },
+      ])
+      tracker.dispose()
+    })
+
+    it('failure mid-pause retires the pause without a second bell', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-root', error: { name: 'UnknownError', data: { message: 'boom' } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.completions).toEqual([]) // turnComplete swallowed: the pause bell was THE bell
+      expect(collected.boundaries).toHaveLength(1)
+      // NO second remove: the armed grace window is left to fire once
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toHaveLength(1)
+      tracker.dispose()
+    })
+
+    it('child permission.asked root-resolves to the owned root and arms the pause', async () => {
+      // SEMANTIC CHANGE vs raw-equality scoping: children CAN ask -- their asks
+      // carry the CHILD sessionID and the parent turn blocks on them (opencode
+      // v1.18.11 source, validation pass 2026-08-03).
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'session.created', properties: { sessionID: 'ses-child', info: { id: 'ses-child', parentID: 'ses-root' } } })
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-c1', sessionID: 'ses-child' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([
+        { upsert: [], remove: ['term-1'] },
+      ])
+      expect(collected.boundaries).toEqual([{ terminalId: 'term-1', at: expect.any(Number) }])
+      expect(collected.order.indexOf('changed:remove')).toBeGreaterThanOrEqual(0)
+      expect(collected.order.indexOf('changed:remove')).toBeLessThan(collected.order.indexOf('boundary'))
+      tracker.dispose()
+    })
+
+    it('permission.asked for a foreign/unresolvable session is ignored', async () => {
+      const { sse, tracker, collected } = await setupKnownBusyPause()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-x', sessionID: 'ses-other' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.boundaries).toEqual([])
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([]) // no demotion
+      tracker.dispose()
+    })
+
+    it('candidate-armed pause: a first-turn ask on a fresh pane rings', async () => {
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({})
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+      // fresh-pane fixture WITHOUT a resume session id
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0)
+      // busy for ses-new -> candidate ownership (whole first turn by construction, D3)
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-new', status: { type: 'busy' } } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-new' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([
+        { upsert: [], remove: ['term-1'] },
+      ])
+      expect(collected.boundaries).toEqual([{ terminalId: 'term-1', at: expect.any(Number) }])
+      expect(collected.order.indexOf('changed:remove')).toBeGreaterThanOrEqual(0)
+      expect(collected.order.indexOf('changed:remove')).toBeLessThan(collected.order.indexOf('boundary'))
+
+      sse.enqueue({ type: 'permission.replied', properties: { sessionID: 'ses-new', requestID: 'per-1', reply: 'once' } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [expect.objectContaining({ terminalId: 'term-1', sessionId: 'ses-new', phase: 'busy' })],
+        remove: [],
+      })
+      tracker.dispose()
+    })
+
+    it('deferred completion after a candidate pause is swallowed at association confirm', async () => {
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({})
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+      tracker.on('association.requested', (payload) => tracker.confirmSessionAssociation(payload))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-new', status: { type: 'busy' } } })
+      await vi.advanceTimersByTimeAsync(0)
+      // candidate pause (no reply)
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-new' } })
+      await vi.advanceTimersByTimeAsync(0)
+      // idle edge (turn end mid-pause) -> tracker requests association,
+      // handler above confirms it via confirmSessionAssociation
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-new', status: { type: 'idle' } } })
+      await vi.advanceTimersByTimeAsync(0)
+
+      // the deferred turnComplete minted at confirm is swallowed -- the pause
+      // bell, rung or still in grace, was THE bell for this episode
+      expect(collected.completions).toEqual([])
+      expect(collected.boundaries).toHaveLength(1)
+      // no force-emitted second remove: the grace window is left to fire once
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toHaveLength(1)
       tracker.dispose()
     })
   })

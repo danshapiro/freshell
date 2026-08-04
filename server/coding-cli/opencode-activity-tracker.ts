@@ -127,6 +127,24 @@ const MessageUpdatedEventSchema = z
   })
   .passthrough()
 
+// derives from opencode 1.18.11: permission.asked carries a unique permission
+// id (echoed back as requestID on permission.replied) and the ASKING session's
+// id -- a child session asks under its OWN sessionID while the parent turn
+// blocks on the answer.
+const PermissionAskedEventSchema = z
+  .object({
+    type: z.literal('permission.asked'),
+    properties: z.object({ id: z.string().min(1), sessionID: z.string().min(1) }).passthrough(),
+  })
+  .passthrough()
+
+const PermissionRepliedEventSchema = z
+  .object({
+    type: z.literal('permission.replied'),
+    properties: z.object({ sessionID: z.string().min(1), requestID: z.string().min(1) }).passthrough(),
+  })
+  .passthrough()
+
 const OpencodeEventSchema = z.discriminatedUnion('type', [
   ServerConnectedEventSchema,
   SessionStatusEventSchema,
@@ -134,6 +152,8 @@ const OpencodeEventSchema = z.discriminatedUnion('type', [
   SessionCreatedEventSchema,
   SessionErrorEventSchema,
   MessageUpdatedEventSchema,
+  PermissionAskedEventSchema,
+  PermissionRepliedEventSchema,
 ])
 
 const OpencodeEventTypeSchema = z.object({
@@ -147,6 +167,8 @@ const KNOWN_OPENCODE_EVENT_TYPES = new Set<z.infer<typeof OpencodeEventSchema>['
   'session.created',
   'session.error',
   'message.updated',
+  'permission.asked',
+  'permission.replied',
 ])
 
 // derives from opencode 1.18.11: /global/health returns { healthy, version },
@@ -246,6 +268,8 @@ export class OpencodeActivityTracker extends EventEmitter {
   private readonly monitors = new Map<string, MonitorState>()
   private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly sessionRootsByTerminal = new Map<string, Map<string, string>>()
+  // Pending permission-request ids per terminal (codex pendingApprovals mirror).
+  private readonly pendingPermissions = new Map<string, Set<string>>()
   private readonly fetchImpl: FetchLike
   private readonly log: TrackerLogger
   private readonly now: () => number
@@ -315,6 +339,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       existing.versionWarned = false
       this.childSessionIds.delete(input.terminalId)
       this.sessionRootsByTerminal.delete(input.terminalId)
+      this.pendingPermissions.delete(input.terminalId)
       return
     }
 
@@ -347,6 +372,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
     this.childSessionIds.delete(input.terminalId)
     this.sessionRootsByTerminal.delete(input.terminalId)
+    this.pendingPermissions.delete(input.terminalId)
     this.removeRecord(input.terminalId)
   }
 
@@ -628,6 +654,61 @@ export class OpencodeActivityTracker extends EventEmitter {
       return
     }
 
+    if (event.type === 'permission.asked') {
+      const ownership = monitor.ownership
+      // Root-resolve the asker (D3): children CAN ask -- the event is stamped
+      // with the CHILD session id and the parent turn blocks on it (opencode
+      // v1.18.11 source, validation pass 2026-08-03). Multi-level chain walk;
+      // mappings are retained for the session's lifetime.
+      const rootSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
+      if (rootSessionId === undefined) return
+      // Arm under knownBusy OR candidate ownership: a fresh pane is candidate
+      // for its ENTIRE first turn by construction (the bind lands only at the
+      // first idle edge), and the single busy unbound session on the pane's
+      // own per-pane endpoint is this pane's turn -- first-turn tool-permission
+      // asks are the most common attention scenario and must ring (D3).
+      // Ambiguous/quiet stays conservative (no bells).
+      if (
+        (ownership.kind !== 'knownBusy' && ownership.kind !== 'candidate') ||
+        ownership.sessionId !== rootSessionId
+      ) {
+        return
+      }
+      const pending = this.pendingPermissions.get(monitor.terminalId) ?? new Set<string>()
+      const newlyInserted = !pending.has(event.properties.id)
+      pending.add(event.properties.id)
+      this.pendingPermissions.set(monitor.terminalId, pending)
+      if (!newlyInserted) return // duplicate asked never re-arms
+      const at = this.now()
+      // Demote FIRST (record removal is opencode's not-busy on the wire),
+      // boundary SECOND -- the gate must see not-busy before it arms
+      // (codex ordering, codex-activity-tracker.ts:377-382).
+      this.removeRecord(monitor.terminalId)
+      this.emit('attention.boundary', { terminalId: monitor.terminalId, at })
+      return
+    }
+
+    if (event.type === 'permission.replied') {
+      const pending = this.pendingPermissions.get(monitor.terminalId)
+      if (!pending?.delete(event.properties.requestID)) return
+      if (pending.size > 0) return
+      this.pendingPermissions.delete(monitor.terminalId)
+      const ownership = monitor.ownership
+      // Restore under candidate too -- pause mechanics are identical (D3).
+      if (ownership.kind !== 'knownBusy' && ownership.kind !== 'candidate') return
+      // Resume busy immediately (codex resume_busy_after_approval analog):
+      // the reply proves a human is present; busy re-entry cancels the armed
+      // grace window without waiting ~1s for the next session.status{busy}.
+      this.upsertRecord({
+        terminalId: monitor.terminalId,
+        sessionId: ownership.sessionId,
+        phase: 'busy',
+        updatedAt: this.now(),
+        lastObservedAt: this.now(),
+      })
+      return
+    }
+
     const observedSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
     const observedStatus = event.type === 'session.idle'
       ? 'idle'
@@ -716,42 +797,88 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.applyActions(monitor.terminalId, result.actions)
   }
 
+  private hasPendingPermissions(terminalId: string): boolean {
+    return (this.pendingPermissions.get(terminalId)?.size ?? 0) > 0
+  }
+
+  // NOTE: applyActions runs AFTER the reducer transition, so the ownership it
+  // reads is the POST-observation state -- that is what distinguishes a
+  // knownBusy turn end (now quiet) from a candidate one (now awaitingAssociation).
   private applyActions(terminalId: string, actions: OpencodeOwnershipAction[]): void {
-    for (const action of actions) {
-      if (action.kind === 'activityUpsert') {
-        this.upsertRecord({
-          terminalId,
-          ...(action.sessionId ? { sessionId: action.sessionId } : {}),
-          phase: 'busy',
-          updatedAt: action.at,
-        })
-        continue
+    const ownership = this.monitors.get(terminalId)?.ownership
+    const pauseActive = this.hasPendingPermissions(terminalId)
+    const idleEdge = actions.some((a) => a.kind === 'activityRemove')
+    const completionEdge = actions.some((a) => a.kind === 'turnComplete')
+    if (pauseActive && (idleEdge || completionEdge)) {
+      // Mid-pause turn end: the pause is THE attention episode for this turn.
+      // Never mint a second bell (codex PR #597 mid-pause silent-claim
+      // hardening, mirrored). A completion WITHOUT an idle edge is the
+      // DEFERRED completion minted at confirmOpencodeAssociation
+      // (candidate-armed pauses, D3) -- swallowed the same way.
+      const awaitingBind = ownership?.kind === 'awaitingAssociation'
+      const aborted = awaitingBind && ownership.aborted === true
+      if (awaitingBind && !aborted) {
+        // Candidate turn end mid-pause: KEEP the pause claim alive so the
+        // deferred completion minted at confirm is swallowed on its own pass
+        // through this branch. The armed grace window stays live -- the pause
+        // bell (rung or still in grace) is the episode's bell.
+      } else {
+        this.pendingPermissions.delete(terminalId)
       }
-      if (action.kind === 'activityRemove') {
-        this.removeRecord(terminalId)
-        continue
+      if ((!completionEdge && !awaitingBind) || aborted) {
+        // Abort mid-pause (knownBusy -> quiet, or aborted candidate ->
+        // awaitingAssociation{aborted}): human at keyboard -- force-emit the
+        // removal so the emitter cancels any still-armed grace window (the
+        // record itself was already removed at pause entry).
+        this.removeRecord(terminalId, { forceEmit: true })
       }
-      if (action.kind === 'requestAssociation') {
-        this.emit('association.requested', {
-          terminalId,
-          sessionId: action.sessionId,
-        } satisfies OpencodeAssociationRequestedEvent)
-        continue
+      for (const action of actions) {
+        if (action.kind === 'turnComplete') continue // swallowed: no frame, no ledger entry
+        if (action.kind === 'activityRemove') continue // handled above / already removed
+        this.applyAction(terminalId, action)
       }
-      if (action.kind === 'turnComplete') {
-        this.emit('turn.complete', this.completionLedger.recordTurnCompletion({
-          terminalId,
-          sessionId: action.sessionId,
-          at: action.at,
-        }))
-        continue
-      }
-      if (action.kind === 'warnAmbiguous') {
-        this.log.warn({
-          terminalId,
-          sessionIds: action.sessionIds,
-        }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
-      }
+      return
+    }
+    if (pauseActive && actions.some((a) => a.kind === 'activityUpsert')) {
+      this.pendingPermissions.delete(terminalId) // busy resumed out-of-band: pause over
+    }
+    for (const action of actions) this.applyAction(terminalId, action)
+  }
+
+  private applyAction(terminalId: string, action: OpencodeOwnershipAction): void {
+    if (action.kind === 'activityUpsert') {
+      this.upsertRecord({
+        terminalId,
+        ...(action.sessionId ? { sessionId: action.sessionId } : {}),
+        phase: 'busy',
+        updatedAt: action.at,
+      })
+      return
+    }
+    if (action.kind === 'activityRemove') {
+      this.removeRecord(terminalId)
+      return
+    }
+    if (action.kind === 'requestAssociation') {
+      this.emit('association.requested', {
+        terminalId,
+        sessionId: action.sessionId,
+      } satisfies OpencodeAssociationRequestedEvent)
+      return
+    }
+    if (action.kind === 'turnComplete') {
+      this.emit('turn.complete', this.completionLedger.recordTurnCompletion({
+        terminalId,
+        sessionId: action.sessionId,
+        at: action.at,
+      }))
+      return
+    }
+    if (action.kind === 'warnAmbiguous') {
+      this.log.warn({
+        terminalId,
+        sessionIds: action.sessionIds,
+      }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
     }
   }
 
@@ -827,8 +954,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     } satisfies OpencodeActivityChange)
   }
 
-  private removeRecord(terminalId: string): void {
-    if (!this.records.delete(terminalId)) return
+  // forceEmit re-broadcasts the removal even when the record is already gone
+  // (mid-pause abort: the emitter must see a fresh not-busy edge to cancel a
+  // still-armed grace window).
+  private removeRecord(terminalId: string, opts?: { forceEmit?: boolean }): void {
+    const existed = this.records.delete(terminalId)
+    if (!existed && !opts?.forceEmit) return
     this.emit('changed', {
       upsert: [],
       remove: [terminalId],
