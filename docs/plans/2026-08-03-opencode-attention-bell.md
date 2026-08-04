@@ -774,10 +774,17 @@ describe('death-bell markers on spontaneous exit', () => {
     // untrackTerminal({ terminalId: 'term-1' }) after knownBusy
     // assert plain { upsert: [], remove: ['term-1'] } with no marker fields
   })
+  it('spontaneous exit of a terminal that was never tracked emits NOTHING', async () => {
+    // NO trackTerminal call for 'term-9'; tracker.untrackTerminal({ terminalId: 'term-9', spontaneous: true })
+    // assert the 'changed' collector saw NO event mentioning 'term-9'.
+    // The wiring feeds EVERY registry terminal.exit (bash/claude/codex panes
+    // included) through untrackTerminal; untracked terminals must stay as
+    // silent as today (removeRecord's existence guard).
+  })
 })
 ```
 
-Write the four tests in full per the comments.
+Write the five tests in full per the comments.
 
 - [ ] **Step 2: Write the failing emitter episode test**
 
@@ -802,7 +809,7 @@ Append to `test/unit/server/coding-cli/truly-idle-emitter.test.ts` (its `beforeE
 
 Run both files:
 `npm run test:vitest -- run test/unit/server/coding-cli/opencode-activity-tracker.test.ts test/unit/server/coding-cli/truly-idle-emitter.test.ts --config config/vitest/vitest.server.config.ts`
-Expected: tracker tests FAIL (no marker fields; TypeScript may reject `spontaneous` on `untrackTerminal`); the emitter test may already PASS (the emitter is generic) — if it passes, note that in the commit message; it is a pin, not a change driver.
+Expected: the marker-asserting tracker tests (knownBusy, permission-pause) FAIL (no marker fields; TypeScript may reject `spontaneous` on `untrackTerminal`); the candidate/no-flag/never-tracked pins may already PASS (they pin existing silence); the emitter test may already PASS (the emitter is generic) — note any already-passing pins in the commit message; they are pins, not change drivers.
 
 - [ ] **Step 4: Implement**
 
@@ -833,8 +840,16 @@ export type OpencodeActivityChange = {
     // candidate/ambiguous ownership never death-rings (D4: that noise is why
     // opencode death bells were excluded before).
     const ownershipKind = monitor?.ownership.kind
+    // `monitor !== undefined` gates the whole path: the wiring subscribes to
+    // EVERY registry terminal.exit (non-opencode panes included), so a
+    // never-tracked terminal must fall through to the silent removeRecord
+    // branch exactly as today. A permission pause removes only the record,
+    // never the monitor, so paused panes keep their monitor and stay eligible.
     const deathBellEligible =
-      input.spontaneous === true && ownershipKind !== 'candidate' && ownershipKind !== 'ambiguous'
+      monitor !== undefined &&
+      input.spontaneous === true &&
+      ownershipKind !== 'candidate' &&
+      ownershipKind !== 'ambiguous'
     const approvalPending = this.hasPendingPermissions(input.terminalId)
     this.pendingPermissions.delete(input.terminalId)
     // ... existing teardown body unchanged (dispose monitor, abort controller,
