@@ -655,3 +655,76 @@ describe('opencode ownership reducer', () => {
     ])
   })
 })
+
+describe('abort gate (session.error MessageAbortedError)', () => {
+  const stream = { cycleId: 1, streamId: 1 }
+
+  function busyKnown() {
+    // quiet(known) + busy sse -> knownBusy
+    const s0 = createOpencodeOwnershipState('ses-root')
+    return reduceOpencodeOwnership(s0, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'busy', at: 1000 }).state
+  }
+
+  it('abort then idle clears busy silently (no turnComplete)', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'MessageAbortedError', at: 1500 })
+    expect(s1.actions).toEqual([])
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1507 })
+    expect(s2.actions).toEqual([{ kind: 'activityRemove', at: 1507 }])
+    expect(s2.state).toEqual({ kind: 'quiet', knownSessionId: 'ses-root' })
+  })
+
+  it('second idle edge after abort is a no-op (double session.idle dedupe)', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'MessageAbortedError', at: 1500 })
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1507 })
+    const s3 = reduceOpencodeOwnership(s2.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1527 })
+    expect(s3.actions).toEqual([])
+  })
+
+  it('non-abort error names do not suppress the completion (failed turns ring)', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'UnknownError', at: 1500 })
+    expect(s1.actions).toEqual([])
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1507 })
+    expect(s2.actions).toEqual([
+      { kind: 'activityRemove', at: 1507 },
+      { kind: 'turnComplete', sessionId: 'ses-root', at: 1507 },
+    ])
+  })
+
+  it('trailing error on quiet state is a no-op (never mint from idle)', () => {
+    const quiet = { kind: 'quiet' as const, knownSessionId: 'ses-root' }
+    const r = reduceOpencodeOwnership(quiet, { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'UnknownError', at: 2000 })
+    expect(r.state).toEqual(quiet)
+    expect(r.actions).toEqual([])
+  })
+
+  it('a new busy clears the abort flag (per-turn semantics)', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'MessageAbortedError', at: 1500 })
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'busy', at: 1600 })
+    const s3 = reduceOpencodeOwnership(s2.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1700 })
+    expect(s3.actions).toContainEqual({ kind: 'turnComplete', sessionId: 'ses-root', at: 1700 })
+  })
+
+  it('abort from a mismatched cycle/stream is ignored', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', cycleId: 9, streamId: 9, sessionId: 'ses-root', errorName: 'MessageAbortedError', at: 1500 })
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'sse', ...stream, sessionId: 'ses-root', status: 'idle', at: 1507 })
+    expect(s2.actions).toContainEqual({ kind: 'turnComplete', sessionId: 'ses-root', at: 1507 })
+  })
+
+  it('snapshot-empty after abort is silent too', () => {
+    const s1 = reduceOpencodeOwnership(busyKnown(), { kind: 'error', ...stream, sessionId: 'ses-root', errorName: 'MessageAbortedError', at: 1500 })
+    const s2 = reduceOpencodeOwnership(s1.state, { kind: 'snapshot', ...stream, statuses: {}, at: 1507 })
+    expect(s2.actions).toEqual([{ kind: 'activityRemove', at: 1507 }])
+  })
+
+  it('aborted candidate turn never mints a completion at association confirm', () => {
+    // quiet(no known) + busy -> candidate
+    const s0 = createOpencodeOwnershipState()
+    const c1 = reduceOpencodeOwnership(s0, { kind: 'sse', ...stream, sessionId: 'ses-x', status: 'busy', at: 1000 })
+    const c2 = reduceOpencodeOwnership(c1.state, { kind: 'error', ...stream, sessionId: 'ses-x', errorName: 'MessageAbortedError', at: 1100 })
+    const c3 = reduceOpencodeOwnership(c2.state, { kind: 'sse', ...stream, sessionId: 'ses-x', status: 'idle', at: 1200 })
+    expect(c3.state.kind).toBe('awaitingAssociation')
+    const confirmed = confirmOpencodeAssociation(c3.state, { sessionId: 'ses-x' })
+    expect(confirmed.actions).toEqual([])
+    expect(confirmed.state).toEqual({ kind: 'quiet', knownSessionId: 'ses-x' })
+  })
+})

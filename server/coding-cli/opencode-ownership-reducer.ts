@@ -20,6 +20,15 @@ export type OpencodeObservation =
     status: OpencodeSessionStatusType
     at: number
   }
+  | {
+    kind: 'error'
+    cycleId: number
+    streamId: number
+    sessionId: string
+    /** OpenCode error class name, e.g. 'MessageAbortedError' (opencode 1.18.11). */
+    errorName: string
+    at: number
+  }
 
 export type OpencodeOwnershipState =
   | {
@@ -33,6 +42,7 @@ export type OpencodeOwnershipState =
     startedBy: 'snapshot' | 'sse'
     cycleId: number
     streamId: number
+    turnAborted?: boolean
   }
   | {
     kind: 'knownBusy'
@@ -40,6 +50,7 @@ export type OpencodeOwnershipState =
     startedBy: 'snapshot' | 'sse'
     cycleId: number
     streamId: number
+    turnAborted?: boolean
   }
   | {
     kind: 'awaitingAssociation'
@@ -48,6 +59,7 @@ export type OpencodeOwnershipState =
     cycleId: number
     streamId: number
     completedAt: number
+    aborted?: boolean
   }
   | {
     kind: 'ambiguous'
@@ -102,7 +114,7 @@ function uniqueSorted(values: string[]): string[] {
 
 function sameSessionStream(
   state: Extract<OpencodeOwnershipState, { kind: 'candidate' | 'knownBusy' }>,
-  observation: Extract<OpencodeObservation, { kind: 'sse' }>,
+  observation: Extract<OpencodeObservation, { kind: 'sse' | 'error' }>,
 ): boolean {
   return state.sessionId === observation.sessionId
     && state.cycleId === observation.cycleId
@@ -160,7 +172,7 @@ function reduceBusy(
   if (state.kind === 'candidate') {
     if (state.sessionId === observation.sessionId) {
       return {
-        state: { ...state, cycleId: observation.cycleId, streamId: observation.streamId, startedBy: 'sse' },
+        state: { ...state, cycleId: observation.cycleId, streamId: observation.streamId, startedBy: 'sse', turnAborted: undefined },
         actions: [{ kind: 'activityUpsert', sessionId: observation.sessionId, at: observation.at }],
       }
     }
@@ -174,7 +186,7 @@ function reduceBusy(
   if (state.kind === 'knownBusy') {
     if (state.sessionId === observation.sessionId) {
       return {
-        state: { ...state, cycleId: observation.cycleId, streamId: observation.streamId, startedBy: 'sse' },
+        state: { ...state, cycleId: observation.cycleId, streamId: observation.streamId, startedBy: 'sse', turnAborted: undefined },
         actions: [{ kind: 'activityUpsert', sessionId: observation.sessionId, at: observation.at }],
       }
     }
@@ -205,6 +217,24 @@ function reduceBusy(
   return { state, actions: [] }
 }
 
+function reduceError(
+  state: OpencodeOwnershipState,
+  observation: Extract<OpencodeObservation, { kind: 'error' }>,
+): OpencodeOwnershipResult {
+  // Only a human abort gates the next idle edge. Every other error name
+  // (UnknownError, ProviderAuthError, ...) leaves the turn to complete
+  // normally: failed turns ring exactly like completed turns.
+  if (observation.errorName !== 'MessageAbortedError') return { state, actions: [] }
+  if (
+    (state.kind === 'knownBusy' || state.kind === 'candidate') &&
+    sameSessionStream(state, observation)
+  ) {
+    return { state: { ...state, turnAborted: true }, actions: [] }
+  }
+  // Trailing errors on quiet/awaitingAssociation/ambiguous never mint anything.
+  return { state, actions: [] }
+}
+
 function reduceIdle(
   state: OpencodeOwnershipState,
   observation: Extract<OpencodeObservation, { kind: 'sse' }>,
@@ -219,6 +249,7 @@ function reduceIdle(
         cycleId: state.cycleId,
         streamId: state.streamId,
         completedAt: observation.at,
+        ...(state.turnAborted ? { aborted: true } : {}),
       },
       actions: [
         { kind: 'activityRemove', at: observation.at },
@@ -229,16 +260,11 @@ function reduceIdle(
 
   if (state.kind === 'knownBusy') {
     if (!sameSessionStream(state, observation)) return { state, actions: [] }
-    return {
-      state: {
-        kind: 'quiet',
-        knownSessionId: state.sessionId,
-      },
-      actions: [
-        { kind: 'activityRemove', at: observation.at },
-        { kind: 'turnComplete', sessionId: state.sessionId, at: observation.at },
-      ],
+    const actions: OpencodeOwnershipAction[] = [{ kind: 'activityRemove', at: observation.at }]
+    if (!state.turnAborted) {
+      actions.push({ kind: 'turnComplete', sessionId: state.sessionId, at: observation.at })
     }
+    return { state: { kind: 'quiet', knownSessionId: state.sessionId }, actions }
   }
 
   if (state.kind === 'ambiguous') {
@@ -321,17 +347,18 @@ function reduceSnapshot(
 
   if (state.kind === 'knownBusy') {
     if (busySessionIds.length === 0) {
+      const actions: OpencodeOwnershipAction[] = [{ kind: 'activityRemove', at: observation.at }]
+      if (!state.turnAborted) {
+        actions.push({ kind: 'turnComplete', sessionId: state.sessionId, at: observation.at })
+      }
       return {
         state: { kind: 'quiet', knownSessionId: state.sessionId },
-        actions: [
-          { kind: 'activityRemove', at: observation.at },
-          { kind: 'turnComplete', sessionId: state.sessionId, at: observation.at },
-        ],
+        actions,
       }
     }
     if (busySessionIds.length === 1 && busySessionIds[0] === state.sessionId) {
       return {
-        state: { ...state, startedBy: 'snapshot', cycleId: observation.cycleId, streamId: observation.streamId },
+        state: { ...state, startedBy: 'snapshot', cycleId: observation.cycleId, streamId: observation.streamId, turnAborted: undefined },
         actions: [{ kind: 'activityUpsert', sessionId: state.sessionId, at: observation.at }],
       }
     }
@@ -352,6 +379,7 @@ function reduceSnapshot(
           cycleId: state.cycleId,
           streamId: state.streamId,
           completedAt: observation.at,
+          ...(state.turnAborted ? { aborted: true } : {}),
         },
         actions: [
           { kind: 'activityRemove', at: observation.at },
@@ -361,7 +389,7 @@ function reduceSnapshot(
     }
     if (busySessionIds.length === 1 && busySessionIds[0] === state.sessionId) {
       return {
-        state: { ...state, startedBy: 'snapshot', cycleId: observation.cycleId, streamId: observation.streamId },
+        state: { ...state, startedBy: 'snapshot', cycleId: observation.cycleId, streamId: observation.streamId, turnAborted: undefined },
         actions: [{ kind: 'activityUpsert', sessionId: state.sessionId, at: observation.at }],
       }
     }
@@ -431,6 +459,9 @@ export function reduceOpencodeOwnership(
   if (observation.kind === 'snapshot') {
     return reduceSnapshot(state, observation)
   }
+  if (observation.kind === 'error') {
+    return reduceError(state, observation)
+  }
   if (observation.status === 'idle') {
     return reduceIdle(state, observation)
   }
@@ -443,6 +474,15 @@ export function confirmOpencodeAssociation(
 ): OpencodeOwnershipResult {
   if (state.kind !== 'awaitingAssociation' || state.sessionId !== input.sessionId) {
     return { state, actions: [] }
+  }
+  if (state.aborted === true) {
+    return {
+      state: {
+        kind: 'quiet',
+        knownSessionId: state.sessionId,
+      },
+      actions: [],
+    }
   }
   return {
     state: {
