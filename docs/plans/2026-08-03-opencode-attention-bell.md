@@ -1127,6 +1127,7 @@ Root resolution: `fn resolve_root<'a>(state: &'a TerminalOpencode, session_id: &
 | `AwaitingAssociation` | any | unchanged | none |
 | `Quiet` | empty | unchanged | `clear_record(false)` |
 | `Quiet{known: Some(k)}` | contains k, single | `KnownBusy{k, ...}` | `set_busy_record(Some(k), at)` |
+| `Quiet{known: Some(k)}` | single s, s != k | `Candidate{s, previous_known: Some(k), ..., false}` | `set_busy_record(Some(s), at)` (Node `reduceSnapshot:406-417` — session switched during an SSE reconnect gap, visible only in the snapshot; mirrors the busy reducer's foreign-busy row) |
 | `Quiet{known: Some(k)}` | multiple | `Ambiguous{Some(k), busy_roots}` | `set_busy_record(None, at)` |
 | `Quiet{known: None}` | exactly one | `Candidate{s, None, ...}` | `set_busy_record(Some(s), at)` |
 | `Quiet{known: None}` | multiple | `Ambiguous{None, busy_roots}` | `set_busy_record(None, at)` |
@@ -1156,6 +1157,7 @@ Create the file with the types above stubbed (`todo!()` bodies are fine for RED)
 #[test] fn candidate_completion_defers_to_bind_session() { /* no resume id: busy(ses-x) -> idle -> no TurnComplete; bind_session("ses-x") -> TurnComplete with at == the idle timestamp */ }
 #[test] fn ambiguous_is_conservative_no_completions() { /* two different busy sessions -> ambiguous; all idles -> no TurnComplete ever; record ends removed */ }
 #[test] fn snapshot_empty_completes_a_known_busy_turn() { /* snapshot path B */ }
+#[test] fn snapshot_single_foreign_busy_from_quiet_known_enters_candidate() { /* track(Some("ses-r")) -> note_snapshot([("ses-x", Busy)]): assert Changed{upsert busy, session ses-x} (Quiet{known: Some(k)} + single foreign busy root -> Candidate{s, previous_known: Some(k)}, Node reduceSnapshot:406-417); then a matching idle for ses-x yields NO TurnComplete (candidate defers); bind_session("ses-x") -> TurnComplete (reconnect-gap session switch is not silently dropped) */ }
 #[test] fn stale_cycle_idle_is_ignored() { /* idle with wrong cycle/stream leaves KnownBusy intact */ }
 #[test] fn deadman_expiry_removes_silently() { /* set_busy_deadman_ms(1000); busy at t=0; expire(t=2000) -> Changed{remove}, no TurnComplete; next_deadline math */ }
 ```
@@ -1492,10 +1494,17 @@ pub(crate) trait OpencodeEventStream: Send + Sync {
         -> futures::future::BoxFuture<'a, Result<Box<dyn ConnectedOpencodeStream>, String>>;
 }
 pub(crate) trait ConnectedOpencodeStream: Send {
-    /// Deliver the buffered frames in order, then live parsed events until the
-    /// stream ends (returns on disconnect).
-    fn drive<'a>(self: Box<Self>, sink: &'a (dyn Fn(freshell_opencode::ParsedServeEvent) + Send + Sync))
-        -> futures::future::BoxFuture<'a, Result<(), String>>;
+    /// Deliver the buffered frames in order, then live parsed events, by
+    /// sending each into `events_tx` until the stream ends (returns on
+    /// disconnect; the sender is dropped on return, which is what lets the
+    /// lane's pump loop drain to `None`). The seam is a CHANNEL rather than a
+    /// sync callback because per-event handling must AWAIT the lane-level
+    /// HTTP root resolver (`OpencodeLaneHttp::get_json` is async) before
+    /// forwarding to the hub — that async work lives in the lane's pump loop
+    /// (below), which owns `known_sessions` mutably. FIFO channel + one
+    /// sequential pump preserves per-stream event ordering.
+    fn drive(self: Box<Self>, events_tx: tokio::sync::mpsc::UnboundedSender<freshell_opencode::ParsedServeEvent>)
+        -> futures::future::BoxFuture<'static, Result<(), String>>;
 }
 pub(crate) struct OpencodeLaneDeps { pub http: std::sync::Arc<dyn OpencodeLaneHttp>, pub events: std::sync::Arc<dyn OpencodeEventStream> }
 pub(crate) fn spawn_opencode_lane(deps: std::sync::Arc<OpencodeLaneDeps>, hub: crate::activity::ActivityHub, terminal_id: String, base_url: String, generation: u64) -> tokio::task::JoinHandle<()>;
@@ -1546,17 +1555,24 @@ loop {
     //    Subscription strictly precedes the snapshot, so every transition is
     //    either IN the snapshot or ON the already-open stream — /event has no
     //    replay (derives from opencode 1.18.11).
-    // 4. drive: conn.drive(&sink).await flushes the buffered frames IN ORDER,
-    //    then delivers live events, where sink = |parsed| { if let Some(ev) =
-    //        translate_serve_event(&parsed) { /* root-resolve unknown session
-    //        ids (resolver below), then */ hub.note_opencode_lane_event(
-    //        &terminal_id, generation, cycle, stream, ev); } };
-    //    On a successful streamed cycle (drive returned Ok), reset backoff to base.
+    // 4. drive + pump (channel seam — per-event handling must AWAIT the async
+    //    root resolver, so a sync callback cannot be the seam):
+    //      let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    //      let drive_task = tokio::spawn(conn.drive(tx)); // buffered frames IN ORDER, then live
+    //      while let Some(parsed) = rx.recv().await {
+    //          if let Some(ev) = translate_serve_event(&parsed) {
+    //              // root-resolve unknown session ids FIRST (resolver below —
+    //              // awaits deps.http HERE in the pump, where &mut known_sessions
+    //              // is in scope), then:
+    //              hub.note_opencode_lane_event(&terminal_id, generation, cycle, stream, ev);
+    //          }
+    //      } // rx drains to None only after drive dropped tx on disconnect — no events lost
+    //    On a successful streamed cycle (drive_task.await == Ok(Ok(()))), reset backoff to base.
     // 5. sleep(backoff); backoff = (backoff * 2).min(OPENCODE_RECONNECT_MAX_MS);
 }
 ```
 
-**Lane-level HTTP root resolver (A4 — the Node `resolveRootForEvent`/`classifySnapshotStatuses` seam, ported to HTTP):** the lane owns a lane-lifetime `known_sessions: std::collections::HashSet<String>`; `SessionCreated` events (streamed or synthetic) insert their session (and parent) ids. Before forwarding any `Status`/`SessionIdle`/`SessionError`/`PermissionAsked` event — or noting a snapshot entry — whose session id is NOT in the set, the lane fetches `GET {base}/session/{id}` via the existing `OpencodeLaneHttp` seam (short timeout — the production impl's 2s default) and emits a synthetic `SessionCreated { session_id, parent_id }` to the hub BEFORE the triggering event, first walking the `parentID` chain while the parent is itself unknown (deepest ancestor first, so every mapping lands before its dependents). On resolve failure (non-200, timeout, shape mismatch): forward the triggering event anyway — the tracker's conservative-ambiguity behavior stands, and the next unknown-id occurrence retries. Carry the comment: `// derives from opencode 1.18.11: GET /session/{id} exposes parentID; /event has no replay`.
+**Lane-level HTTP root resolver (A4 — the Node `resolveRootForEvent`/`classifySnapshotStatuses` seam, ported to HTTP):** the lane owns a lane-lifetime `known_sessions: std::collections::HashSet<String>`; `SessionCreated` events (streamed or synthetic) insert their session (and parent) ids. Before forwarding any `Status`/`SessionIdle`/`SessionError`/`PermissionAsked` event — or noting a snapshot entry — whose session id is NOT in the set, the lane fetches `GET {base}/session/{id}` via the existing `OpencodeLaneHttp` seam (short timeout — the production impl's 2s default) and emits a synthetic `SessionCreated { session_id, parent_id }` to the hub BEFORE the triggering event, first walking the `parentID` chain while the parent is itself unknown (deepest ancestor first, so every mapping lands before its dependents). On resolve failure (non-200, timeout, shape mismatch): forward the triggering event anyway — the tracker's conservative-ambiguity behavior stands, and the next unknown-id occurrence retries. The resolver runs in the lane task itself — for streamed events inside the step-4 pump loop (never inside `drive`, which only feeds the channel), and for snapshot entries inline in step 3 — so every `deps.http.get_json` await happens where `&mut known_sessions` is directly in scope, and the sequential pump preserves the emit-before-trigger ordering. Carry the comment: `// derives from opencode 1.18.11: GET /session/{id} exposes parentID; /event has no replay`.
 
 `translate_serve_event` (kinds and property paths are verbatim from the spike — `/tmp/opencode-spike/vocabulary.md`):
 
@@ -1616,7 +1632,7 @@ pub(crate) fn translate_serve_event(event: &freshell_opencode::ParsedServeEvent)
 
 (`ParsedServeEvent.properties` is a `serde_json::Map<String, Value>` — adjust accessor chaining to `props.get("x")` returning `Option<&Value>` accordingly. `parse_serve_event` swallows `server.connected`/`server.heartbeat` — which is exactly why the two-phase connect detects the subscription ack on the RAW decoded event before parsing; the per-cycle snapshot is loss-free only because it happens AFTER that ack (Node snapshot-on-`server.connected` parity, A5).)
 
-Production impls: `ReqwestLaneHttp::get_json` = `client.get(url).timeout(2s).send() -> (status, json)`; `ReqwestLaneStream::connect` = GET with `accept: text/event-stream`, then a chunk loop with a 30s per-chunk `tokio::time::timeout` (read-stall watchdog — heartbeats arrive every ~10s) and a `Vec<u8>` pending buffer for partial UTF-8 (copy the shape of `freshell_opencode::transport::consume_events:145-198`, WITHOUT its internal reconnect loop — the lane owns cycles), feeding `SseDecoder::push_str` until the FIRST decoded event whose raw JSON `type` is `"server.connected"`; resolve with a handle owning the response body, the decoder, and any frames already decoded past the ack. `ConnectedOpencodeStream::drive` = flush those buffered frames through `parse_serve_event` to the sink in order, then continue the same chunk loop live.
+Production impls: `ReqwestLaneHttp::get_json` = `client.get(url).timeout(2s).send() -> (status, json)`; `ReqwestLaneStream::connect` = GET with `accept: text/event-stream`, then a chunk loop with a 30s per-chunk `tokio::time::timeout` (read-stall watchdog — heartbeats arrive every ~10s) and a `Vec<u8>` pending buffer for partial UTF-8 (copy the shape of `freshell_opencode::transport::consume_events:145-198`, WITHOUT its internal reconnect loop — the lane owns cycles), feeding `SseDecoder::push_str` until the FIRST decoded event whose raw JSON `type` is `"server.connected"`; resolve with a handle owning the response body, the decoder, and any frames already decoded past the ack. `ConnectedOpencodeStream::drive` = flush those buffered frames through `parse_serve_event` into `events_tx` in order, then continue the same chunk loop live, sending each parsed event; return (dropping `events_tx`) on stream end, read-stall timeout, or transport error.
 
 `OpencodeAttach` handling in `handle_event`: bump `opencode_lane_next_generation` (monotonic, hub-issued — A6) and take the new value as this lane's generation; abort any existing lane for the terminal (`opencode_lanes.insert(terminal_id, (generation, handle))` returning the old entry → `.abort()` — respawn re-allocates a NEW port, so replacement is the contract); if deps are set, `spawn_opencode_lane(deps, hub, terminal_id, base_url, generation)` and store `(generation, handle)`. The ingress guard (Task 8) then drops any `OpencodeLane` event whose stamped generation doesn't match the current map entry. Exit arm (Task 8 site): `if let Some((_, handle)) = inner.opencode_lanes.remove(&terminal_id) { handle.abort(); }` — removal makes post-exit stragglers fail the generation match too.
 
