@@ -182,6 +182,17 @@ describe('TrulyIdleEmitter', () => {
     expect(events[0]).toMatchObject({ terminalId: 't1', reason: 'grace' })
   })
 
+  it('opencode death while grace is armed rings immediately (post-turn window)', () => {
+    // opencode shape: turn end = remove followed by turnComplete, then death
+    emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }] })
+    emitter.noteActivityChanged({ remove: ['t1'] })
+    emitter.noteTurnComplete({ terminalId: 't1', at: Date.now() }) // arms grace
+    emitter.noteActivityChanged({ remove: ['t1'], spontaneousExitRemovals: ['t1'] })
+    expect(events).toEqual([{ terminalId: 't1', at: Date.now(), reason: 'grace' }])
+    vi.advanceTimersByTime(TERMINAL_IDLE_GRACE_MS + 1)
+    expect(events).toHaveLength(1) // the armed window was cancelled by the removal — no double ring
+  })
+
   it('never emits on a deadman/signal-loss idle flip (phase idle without a turn boundary)', () => {
     emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'busy' }], remove: [] })
     emitter.noteActivityChanged({ upsert: [{ terminalId: 't1', phase: 'idle' }], remove: [] })

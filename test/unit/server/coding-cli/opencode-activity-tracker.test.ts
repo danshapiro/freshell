@@ -81,7 +81,12 @@ function createControlledFetchFixture(snapshot: Record<string, unknown>) {
 
 function collectOpencode(tracker: OpencodeActivityTracker) {
   const collected = {
-    changes: [] as Array<{ upsert: unknown[]; remove: string[] }>,
+    changes: [] as Array<{
+      upsert: unknown[]
+      remove: string[]
+      spontaneousExitRemovals?: string[]
+      approvalPendingRemovals?: string[]
+    }>,
     boundaries: [] as Array<{ terminalId: string; at: number }>,
     completions: [] as unknown[],
     // combined arrival-order log across streams (demote-before-boundary checks)
@@ -1658,6 +1663,132 @@ describe('OpencodeActivityTracker', () => {
       } finally {
         warnSpy.mockRestore()
       }
+    })
+  })
+
+  describe('death-bell markers on spontaneous exit', () => {
+    async function setupKnownBusy() {
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-root': { type: 'busy' } })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy, record present
+      return { sse, tracker, collected }
+    }
+
+    it('spontaneous exit while knownBusy marks the removal', async () => {
+      const { tracker, collected } = await setupKnownBusy()
+
+      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [],
+        remove: ['term-1'],
+        spontaneousExitRemovals: ['term-1'],
+      })
+    })
+
+    it('spontaneous exit during a permission pause marks approvalPendingRemovals and emits despite the absent record', async () => {
+      const { sse, tracker, collected } = await setupKnownBusy()
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0) // pause entry already removed the record
+
+      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [],
+        remove: ['term-1'],
+        spontaneousExitRemovals: ['term-1'],
+        approvalPendingRemovals: ['term-1'],
+      })
+    })
+
+    it('spontaneous exit while candidate or ambiguous carries NO marker', async () => {
+      vi.useFakeTimers()
+      // candidate: busy for an unknown session on a pane with no resume id --
+      // candidate for the ENTIRE first turn by construction (D4: candidate
+      // noise is why opencode death bells were excluded before).
+      {
+        const { sse, fetchImpl } = createControlledFetchFixture({})
+        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+        const collected = collectOpencode(tracker)
+        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'server.connected', properties: {} })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-new', status: { type: 'busy' } } })
+        await vi.advanceTimersByTimeAsync(0)
+
+        tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+        // plain removal of the candidate busy record -- no marker fields
+        expect(collected.changes.at(-1)).toEqual({ upsert: [], remove: ['term-1'] })
+        expect(collected.changes.some((c) => c.spontaneousExitRemovals !== undefined)).toBe(false)
+      }
+      // candidate WITH an armed permission pause: still no marker -- D4 keeps
+      // candidate excluded even mid-pause (residual D8(i)).
+      {
+        const { sse, fetchImpl } = createControlledFetchFixture({})
+        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+        const collected = collectOpencode(tracker)
+        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'server.connected', properties: {} })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-new', status: { type: 'busy' } } })
+        sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-new' } })
+        await vi.advanceTimersByTimeAsync(0)
+
+        tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+        expect(collected.changes.some((c) => c.spontaneousExitRemovals !== undefined)).toBe(false)
+        expect(collected.changes.some((c) => c.approvalPendingRemovals !== undefined)).toBe(false)
+      }
+      // ambiguous: two busy sessions with no resume id
+      {
+        const { sse, fetchImpl } = createControlledFetchFixture({})
+        const log = { warn: vi.fn() }
+        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, log, random: () => 0 })
+        const collected = collectOpencode(tracker)
+        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'server.connected', properties: {} })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-a', status: { type: 'busy' } } })
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-b', status: { type: 'busy' } } })
+        await vi.advanceTimersByTimeAsync(0)
+
+        tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+        expect(collected.changes.at(-1)).toEqual({ upsert: [], remove: ['term-1'] })
+        expect(collected.changes.some((c) => c.spontaneousExitRemovals !== undefined)).toBe(false)
+      }
+    })
+
+    it('freshell-initiated untrack (no flag) behaves exactly as before', async () => {
+      const { tracker, collected } = await setupKnownBusy()
+
+      tracker.untrackTerminal({ terminalId: 'term-1' })
+
+      expect(collected.changes.at(-1)).toEqual({ upsert: [], remove: ['term-1'] })
+      expect(collected.changes.some((c) => c.spontaneousExitRemovals !== undefined)).toBe(false)
+      expect(collected.changes.some((c) => c.approvalPendingRemovals !== undefined)).toBe(false)
+    })
+
+    it('spontaneous exit of a terminal that was never tracked emits NOTHING', async () => {
+      // The wiring feeds EVERY registry terminal.exit (bash/claude/codex panes
+      // included) through untrackTerminal; untracked terminals must stay as
+      // silent as today (removeRecord's existence guard).
+      const tracker = new OpencodeActivityTracker({ random: () => 0 })
+      const collected = collectOpencode(tracker)
+
+      tracker.untrackTerminal({ terminalId: 'term-9', spontaneous: true })
+
+      expect(collected.changes).toEqual([])
+      tracker.dispose()
     })
   })
 })

@@ -37,6 +37,15 @@ export type OpencodeActivityRecord = {
 export type OpencodeActivityChange = {
   upsert: OpencodeActivityRecord[]
   remove: string[]
+  /**
+   * Terminals whose PTY exit was NOT freshell-initiated (registry
+   * `spontaneous: !requestedClose`). Internal-only: the ws-handler's zod
+   * re-validation strips it from the wire. Death-bell input for the
+   * truly-idle emitter.
+   */
+  spontaneousExitRemovals?: string[]
+  /** Terminals with a pending permission pause at exit time (rings even though the record is absent). */
+  approvalPendingRemovals?: string[]
 }
 
 export type OpencodeAssociationRequestedEvent = {
@@ -356,8 +365,23 @@ export class OpencodeActivityTracker extends EventEmitter {
     void this.runMonitor(monitor)
   }
 
-  untrackTerminal(input: { terminalId: string }): void {
+  untrackTerminal(input: { terminalId: string; spontaneous?: boolean }): void {
     const monitor = this.monitors.get(input.terminalId)
+    // Engagement inputs are captured BEFORE teardown destroys them.
+    // candidate/ambiguous ownership never death-rings (D4: that noise is why
+    // opencode death bells were excluded before).
+    const ownershipKind = monitor?.ownership.kind
+    // `monitor !== undefined` gates the whole path: the wiring subscribes to
+    // EVERY registry terminal.exit (non-opencode panes included), so a
+    // never-tracked terminal must fall through to the silent removeRecord
+    // branch exactly as today. A permission pause removes only the record,
+    // never the monitor, so paused panes keep their monitor and stay eligible.
+    const deathBellEligible =
+      monitor !== undefined &&
+      input.spontaneous === true &&
+      ownershipKind !== 'candidate' &&
+      ownershipKind !== 'ambiguous'
+    const approvalPending = this.hasPendingPermissions(input.terminalId)
     if (monitor) {
       monitor.disposed = true
       monitor.lastSnapshot = undefined
@@ -373,7 +397,20 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.childSessionIds.delete(input.terminalId)
     this.sessionRootsByTerminal.delete(input.terminalId)
     this.pendingPermissions.delete(input.terminalId)
-    this.removeRecord(input.terminalId)
+    if (deathBellEligible) {
+      // Emit UNCONDITIONALLY: the record is usually already gone (turn ended
+      // or pause demoted), and the emitter needs the marked removal to reach
+      // its armed-grace / approval-pending checks.
+      this.records.delete(input.terminalId)
+      this.emit('changed', {
+        upsert: [],
+        remove: [input.terminalId],
+        spontaneousExitRemovals: [input.terminalId],
+        ...(approvalPending ? { approvalPendingRemovals: [input.terminalId] } : {}),
+      } satisfies OpencodeActivityChange)
+    } else {
+      this.removeRecord(input.terminalId)
+    }
   }
 
   dispose(): void {

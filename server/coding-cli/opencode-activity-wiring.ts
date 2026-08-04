@@ -83,9 +83,9 @@ export function wireOpencodeActivityTracker(input: {
     startTracking(record)
   }
 
-  const onExit = (event: { terminalId?: string }) => {
+  const onExit = (event: { terminalId?: string; spontaneous?: boolean }) => {
     if (!event.terminalId) return
-    tracker.untrackTerminal({ terminalId: event.terminalId })
+    tracker.untrackTerminal({ terminalId: event.terminalId, spontaneous: event.spontaneous === true })
   }
 
   input.registry.on('terminal.created', onCreated)
