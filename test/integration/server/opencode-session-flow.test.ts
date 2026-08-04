@@ -417,7 +417,7 @@ describe('opencode session flow (integration)', () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.endsWith('/global/health')) {
-        return createJsonResponse({ ok: true, version: '1.4.11' })
+        return createJsonResponse({ ok: true, version: '1.18.11' })
       }
       if (url.endsWith('/session/status')) {
         return createJsonResponse({})
@@ -459,7 +459,7 @@ describe('opencode session flow (integration)', () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.endsWith('/global/health')) {
-        return createJsonResponse({ ok: true, version: '1.4.11' })
+        return createJsonResponse({ ok: true, version: '1.18.11' })
       }
       if (url.endsWith('/session/status')) {
         return createJsonResponse({

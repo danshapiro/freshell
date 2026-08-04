@@ -101,11 +101,39 @@ const SessionCreatedEventSchema = z.object({
   }).passthrough(),
 }).passthrough()
 
+const SessionErrorEventSchema = z
+  .object({
+    type: z.literal('session.error'),
+    properties: z
+      .object({
+        sessionID: z.string().min(1),
+        error: z.object({ name: z.string().min(1) }).passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough()
+
+const MessageUpdatedEventSchema = z
+  .object({
+    type: z.literal('message.updated'),
+    properties: z
+      .object({
+        sessionID: z.string().min(1),
+        info: z
+          .object({ error: z.object({ name: z.string().min(1) }).passthrough().optional() })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough()
+
 const OpencodeEventSchema = z.discriminatedUnion('type', [
   ServerConnectedEventSchema,
   SessionStatusEventSchema,
   SessionIdleEventSchema,
   SessionCreatedEventSchema,
+  SessionErrorEventSchema,
+  MessageUpdatedEventSchema,
 ])
 
 const OpencodeEventTypeSchema = z.object({
@@ -117,7 +145,15 @@ const KNOWN_OPENCODE_EVENT_TYPES = new Set<z.infer<typeof OpencodeEventSchema>['
   'session.status',
   'session.idle',
   'session.created',
+  'session.error',
+  'message.updated',
 ])
+
+// derives from opencode 1.18.11: /global/health returns { healthy, version },
+// both required. session.idle is already deprecated upstream and a v1->v2
+// event/health migration is in progress — warn on untested versions, but keep
+// bells ON (best-effort; the gate converts silent drift into a logged warning).
+const TESTED_OPENCODE_VERSION_RANGE = '1.18.'
 
 type FetchLike = typeof fetch
 
@@ -134,6 +170,7 @@ type MonitorState = {
   reconnectTimer?: ReturnType<typeof setTimeout>
   reconnectResolve?: () => void
   ownership: OpencodeOwnershipState
+  versionWarned?: boolean
   lastSnapshot?: {
     cycleId: number
     streamId: number
@@ -275,6 +312,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       && !existing.disposed
     ) {
       existing.ownership = createOpencodeOwnershipState(input.sessionId)
+      existing.versionWarned = false
       this.childSessionIds.delete(input.terminalId)
       this.sessionRootsByTerminal.delete(input.terminalId)
       return
@@ -355,6 +393,7 @@ export class OpencodeActivityTracker extends EventEmitter {
           signal,
         })
         if (response.ok) {
+          await this.warnOnVersionDrift(monitor, response)
           return
         }
       } catch (error) {
@@ -367,6 +406,23 @@ export class OpencodeActivityTracker extends EventEmitter {
       }
       await this.sleep(signal, OPENCODE_HEALTH_POLL_MS)
     }
+  }
+
+  private async warnOnVersionDrift(monitor: MonitorState, response: Response): Promise<void> {
+    if (monitor.versionWarned) return
+    let version: unknown
+    try {
+      const body = (await response.json()) as { version?: unknown } | null
+      version = body?.version
+    } catch {
+      return
+    }
+    if (typeof version !== 'string' || version.startsWith(TESTED_OPENCODE_VERSION_RANGE)) return
+    monitor.versionWarned = true
+    console.warn(
+      `OpenCode version ${version} has not been tested with the freshell activity tracker `
+      + `(tested: ${TESTED_OPENCODE_VERSION_RANGE}x); keeping attention bells on best-effort.`,
+    )
   }
 
   private async refreshSnapshot(
@@ -531,12 +587,60 @@ export class OpencodeActivityTracker extends EventEmitter {
       return
     }
 
+    if (event.type === 'session.error') {
+      const rawSessionId = event.properties.sessionID
+      const rootSessionId = await this.resolveRootForEvent(monitor, rawSessionId)
+      // Child or unresolved errors never gate the root's turn (a sub-agent
+      // abort must not silence the parent; conservative for unknown ids).
+      if (rootSessionId === undefined || rootSessionId !== rawSessionId) return
+      this.observe(monitor, {
+        kind: 'error',
+        cycleId,
+        streamId,
+        sessionId: rootSessionId,
+        errorName: event.properties.error.name,
+        at: this.now(),
+      })
+      return
+    }
+
+    if (event.type === 'message.updated') {
+      // W2 abort marker (derives from opencode 1.18.11): an abort landing
+      // between assistant-message creation and LLM stream start emits NO
+      // session.error — only message.updated with info.error.name ===
+      // 'MessageAbortedError', always BEFORE the idle edge. Error-less
+      // message.updated is routine message churn: no attention signal.
+      const errorName = event.properties.info.error?.name
+      if (errorName === undefined) return
+      const rawSessionId = event.properties.sessionID
+      const rootSessionId = await this.resolveRootForEvent(monitor, rawSessionId)
+      // Same raw-equality scoping as session.error: child or unresolved
+      // markers never gate the root's turn.
+      if (rootSessionId === undefined || rootSessionId !== rawSessionId) return
+      this.observe(monitor, {
+        kind: 'error',
+        cycleId,
+        streamId,
+        sessionId: rootSessionId,
+        errorName,
+        at: this.now(),
+      })
+      return
+    }
+
     const observedSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
     const observedStatus = event.type === 'session.idle'
       ? 'idle'
       : event.properties.status.type
 
     if (observedStatus === 'idle') {
+      // Child sessions go idle mid-parent-turn (live trace: child idle 921ms
+      // before the parent, events-D.log). Remapping a CHILD idle onto the
+      // root falsely completes the root's turn — suppress it. The root's own
+      // idle (raw id == resolved root) passes through unchanged.
+      if (observedSessionId !== undefined && observedSessionId !== event.properties.sessionID) {
+        return
+      }
       this.observe(monitor, {
         kind: 'sse',
         cycleId,

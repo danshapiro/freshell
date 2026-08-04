@@ -1230,4 +1230,212 @@ describe('OpencodeActivityTracker', () => {
 
     tracker.dispose()
   })
+
+  describe('abort/error episodes (policy: PR #597 extended to opencode)', () => {
+    it('Esc/abort stays silent: MessageAbortedError then double idle emits no completion', async () => {
+      vi.useFakeTimers()
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-root': { type: 'busy' } })
+        if (url.endsWith('/event')) return sse.response
+        throw new Error(`unexpected url ${url}`)
+      })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const completions: unknown[] = []
+      const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.on('changed', (c) => changes.push(c))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy
+      // live abort trace (events-B.log): error -> status idle -> session.idle -> status idle -> session.idle
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-root', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toEqual([])
+      expect(changes.filter((c) => c.remove.length > 0)).toHaveLength(1) // one demotion, no double-remove
+      tracker.dispose()
+    })
+
+    it('failed turn rings: UnknownError then idle emits exactly one completion; trailing error is a no-op', async () => {
+      vi.useFakeTimers()
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-root': { type: 'busy' } })
+        if (url.endsWith('/event')) return sse.response
+        throw new Error(`unexpected url ${url}`)
+      })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const completions: unknown[] = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy
+      // events-B.log scenario C: busy -> error(UnknownError) -> status idle -> session.idle -> error AFTER idle
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-root', error: { name: 'UnknownError', data: { message: 'boom' } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-root', error: { name: 'UnknownError', data: { message: 'boom', stack: 'Error: boom\n    at run' } } } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toHaveLength(1)
+      expect(completions).toEqual([expect.objectContaining({ sessionId: 'ses-root' })])
+      tracker.dispose()
+    })
+
+    it('child session.idle mid-parent-turn does not complete the root (live trace events-D.log)', async () => {
+      vi.useFakeTimers()
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-parent': { type: 'busy' } })
+        if (url.endsWith('/event')) return sse.response
+        throw new Error(`unexpected url ${url}`)
+      })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const completions: unknown[] = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-parent' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-parent knownBusy
+      sse.enqueue({ type: 'session.created', properties: { sessionID: 'ses-child', info: { id: 'ses-child', parentID: 'ses-parent' } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-child', status: { type: 'busy' } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-child', status: { type: 'idle' } } })
+      // child idle lands 921ms before the parent's (events-D.log) — must be suppressed
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-child' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toEqual([])
+      expect(tracker.list()).toEqual([expect.objectContaining({
+        terminalId: 'term-1',
+        sessionId: 'ses-parent',
+        phase: 'busy',
+      })])
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-parent', status: { type: 'idle' } } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toHaveLength(1)
+      expect(completions).toEqual([expect.objectContaining({ sessionId: 'ses-parent' })])
+      tracker.dispose()
+    })
+
+    it('child session.error does not abort the root turn', async () => {
+      vi.useFakeTimers()
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-parent': { type: 'busy' } })
+        if (url.endsWith('/event')) return sse.response
+        throw new Error(`unexpected url ${url}`)
+      })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const completions: unknown[] = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-parent' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-parent knownBusy
+      sse.enqueue({ type: 'session.created', properties: { sessionID: 'ses-child', info: { id: 'ses-child', parentID: 'ses-parent' } } })
+      // a sub-agent abort must not silence the parent's turn
+      sse.enqueue({ type: 'session.error', properties: { sessionID: 'ses-child', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-parent', status: { type: 'idle' } } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toHaveLength(1)
+      expect(completions).toEqual([expect.objectContaining({ sessionId: 'ses-parent' })])
+      tracker.dispose()
+    })
+
+    it('W2 abort marker: message.updated carrying error MessageAbortedError then double idle is silent', async () => {
+      vi.useFakeTimers()
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-root': { type: 'busy' } })
+        if (url.endsWith('/event')) return sse.response
+        throw new Error(`unexpected url ${url}`)
+      })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const completions: unknown[] = []
+      const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.on('changed', (c) => changes.push(c))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy
+      // abort window W2 — derives from opencode 1.18.11: an abort landing between
+      // assistant-message creation and LLM stream start emits NO session.error,
+      // only the abort-marked message.updated, always BEFORE idle
+      sse.enqueue({ type: 'message.updated', properties: { sessionID: 'ses-root', info: { id: 'msg-1', role: 'assistant', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } } } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toEqual([])
+      expect(changes.filter((c) => c.remove.length > 0)).toHaveLength(1) // one demotion, no double-remove
+      tracker.dispose()
+    })
+  })
+
+  describe('version drift gate (log-once)', () => {
+    it('warns once for untested opencode versions and bells stay on', async () => {
+      vi.useFakeTimers()
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        let eventCalls = 0
+        let healthCalls = 0
+        const sse = createControlledSseResponse()
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input)
+          if (url.endsWith('/global/health')) {
+            healthCalls += 1
+            return createJsonResponse({ healthy: true, version: '9.9.9' })
+          }
+          if (url.endsWith('/session/status')) return createJsonResponse({})
+          if (url.endsWith('/event')) {
+            eventCalls += 1
+            if (eventCalls === 1) {
+              // first stream ends immediately so the reconnect cycle re-polls health
+              return createSseResponse([{ type: 'server.connected', properties: {} }])
+            }
+            return sse.response
+          }
+          throw new Error(`unexpected url ${url}`)
+        })
+        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+        const completions: unknown[] = []
+        tracker.on('turn.complete', (e) => completions.push(e))
+        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+        await vi.advanceTimersByTimeAsync(0) // first cycle: health poll + stream that ends
+        await vi.advanceTimersByTimeAsync(OPENCODE_RECONNECT_BASE_MS) // reconnect: second health poll
+        expect(healthCalls).toBeGreaterThanOrEqual(2)
+        const versionWarnings = warnSpy.mock.calls.filter((call) =>
+          call.some((arg) => typeof arg === 'string' && arg.includes('9.9.9')))
+        expect(versionWarnings).toHaveLength(1)
+        expect(versionWarnings[0]?.some((arg) => typeof arg === 'string' && arg.includes('1.18.'))).toBe(true)
+
+        // bells stay on — the gate only logs
+        sse.enqueue({ type: 'server.connected', properties: {} })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'busy' } } })
+        sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(completions).toHaveLength(1)
+        tracker.dispose()
+      } finally {
+        warnSpy.mockRestore()
+      }
+    })
+  })
 })

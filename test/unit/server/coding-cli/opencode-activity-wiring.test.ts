@@ -138,10 +138,14 @@ describe('wireOpencodeActivityTracker', () => {
       if (url.endsWith('/event')) {
         return createSseResponse([
           { type: 'server.connected', properties: {} },
+          // SEMANTIC CHANGE (opencode-attention-bell): child idle is suppressed,
+          // not remapped — only the ROOT's own idle completes the turn now, so
+          // the completion edge here is ses-root-1's idle (the snapshot already
+          // resolved ses-child-1 to that root).
           {
             type: 'session.idle',
             properties: {
-              sessionID: 'ses-child-1',
+              sessionID: 'ses-root-1',
             },
           },
         ])
