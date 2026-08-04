@@ -1367,6 +1367,44 @@ describe('OpencodeActivityTracker', () => {
       tracker.dispose()
     })
 
+    it('full events-D.log episode: child busy/idle mid-parent-turn yields exactly one parent completion and no early removal', async () => {
+      // The codex sub-agent false-green analog, pinned end-to-end against the
+      // full live trace (events-D.log, server-derived timings in comments).
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-parent': { type: 'busy' } })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-parent' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-parent knownBusy, record present
+      // 21:30:34.304 session.created child (info.parentID = 'ses-parent')
+      sse.enqueue({ type: 'session.created', properties: { sessionID: 'ses-child', info: { id: 'ses-child', parentID: 'ses-parent' } } })
+      // 21:30:34.344 session.status child busy
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-child', status: { type: 'busy' } } })
+      // 21:30:36.089 session.status child idle
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-child', status: { type: 'idle' } } })
+      // 21:30:36.089 session.idle child <- must NOT remove the record or complete
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-child' } })
+      await vi.advanceTimersByTimeAsync(0)
+      // no remove before the parent idle, no completion, record still busy
+      expect(collected.completions).toEqual([])
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([])
+      expect(tracker.list()).toEqual([expect.objectContaining({
+        terminalId: 'term-1',
+        sessionId: 'ses-parent',
+        phase: 'busy',
+      })])
+      // 21:30:37.010 session.status parent idle <- the real edge
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-parent', status: { type: 'idle' } } })
+      // 21:30:37.010 session.idle parent <- deduped
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-parent' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(collected.completions).toEqual([expect.objectContaining({ sessionId: 'ses-parent' })])
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toHaveLength(1)
+      tracker.dispose()
+    })
+
     it('child session.error does not abort the root turn', async () => {
       vi.useFakeTimers()
       const sse = createControlledSseResponse()
