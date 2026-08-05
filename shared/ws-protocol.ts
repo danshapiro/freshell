@@ -204,7 +204,7 @@ export const TerminalTurnCompleteSchema = z.object({
  * non-human rollout abort reasons (forward-compatible policy — no live codex
  * <= 0.147 emits one), spontaneous process death while ENGAGED (confirmed
  * turn, armed grace window, or pending approval; immediate — no grace), and
- * approval-request pauses (managed codex only; unmanaged/PTY-only codex has
+ * approval-request pauses (managed codex; opencode permission pauses; unmanaged/PTY-only codex has
  * no approval signal). NEVER emitted after a HUMAN-REQUESTED stop:
  * Esc/interrupt (turn.status 'interrupted', abort reason
  * 'interrupted'/'replaced'), slash-command quits from an idle pane

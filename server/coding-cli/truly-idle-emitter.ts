@@ -220,7 +220,7 @@ export function wireTrulyIdleEmitter(input: {
     emitter.noteTurnComplete(event)
   }
   const onAttentionBoundary = (event: { terminalId: string; at: number }) => {
-    // Approval-pause boundary (codex only; a no-op stream for the other
+    // Approval-pause boundary (codex, opencode; a no-op stream for the other
     // trackers): arms the same grace window — no terminal.turn.complete
     // frame is involved.
     emitter.noteTurnComplete(event)

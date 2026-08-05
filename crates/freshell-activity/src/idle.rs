@@ -49,9 +49,45 @@
 //!    death bell — a MISSED bell (never a false ring); accepted.
 //! 5. A SENT approval request auto-resolved server-side slower than ~2s rings
 //!    once (decision 5); accepted.
-//! 6. Node opencode death bells: deliberately excluded (noisy busy proxy) —
-//!    follow-up. Rust opencode: no hub tracker exists — N/A.
+//! 6. Opencode death bells now ring on both servers, ownership-scoped:
+//!    candidate/ambiguous ownership never death-rings (the old noisy-busy-proxy
+//!    problem, now excluded by construction). Consequences kept deliberate:
+//!    first-turn deaths stay silent (candidate covers the whole first turn on
+//!    Node — even with a candidate-armed permission pause pending), and a Rust
+//!    pane whose bind producers all fail (locator ambiguity + plugin absence)
+//!    stays candidate indefinitely — candidate-armed pauses still ring there,
+//!    but completions and death bells wait for the bind.
 //! 7. Unmanaged/PTY-only codex has no approval signal — documented limitation.
+//! 8. Opencode: an SSE reconnect during a permission pause loses the pending
+//!    pause bell (the busy snapshot clears it; GET /permission resync is a
+//!    possible follow-up). Ambiguous ownership stays bell-free. Child sessions
+//!    unseen on-stream (reconnect gap, mid-turn attach) are recovered by the
+//!    lane's HTTP root resolver (GET /session/{id} exposes parentID); only
+//!    resolver FAILURE degrades to ambiguous (conservative silence), retried
+//!    on the next occurrence.
+//! 9. Opencode protocol drift: permission.v2.* / question.* event families
+//!    (schema-declared, unobserved on 1.18.11) are unhandled — the pause bell
+//!    goes deaf if a future server switches families. session.idle is already
+//!    deprecated upstream and a v1->v2 event/health migration is in progress;
+//!    the log-once version gate (Rust lane + Node tracker) converts silent
+//!    drift into a logged warning, and /session/status absence==idle is
+//!    version-derived behavior (1.18.x).
+//! 10. Opencode abort window W1: an abort landing between the prompt loop-top
+//!    and processor.create emits NO abort evidence at all before idle — a
+//!    ms-scale window where a completion bell can ring on a human abort
+//!    (window W2 is closed by the abort-marked message.updated fallback).
+//! 11. Pathological opencode TUI quits — worker dispose exceeding the 5s
+//!    hard-terminate cap, or a raw SIGTERM (no drain path) — can leave
+//!    engagement set at spontaneous exit, so a death bell can ring on those
+//!    rare human quits. Normal quit paths verified to abort+drain (all four
+//!    quit inputs dispose runners via the abort path before exit); the
+//!    wire-flush instant is unprovable from code but mitigated upstream by
+//!    graceful SSE stream termination.
+//! 12. The opencode 120s busy deadman is EVENT-SILENCE-keyed (deltas and
+//!    heartbeats do not refresh it): a single >120s silent tool call trips it
+//!    mid-turn. Ownership survives and the turn's completion still rings —
+//!    the cost is the dropped busy light plus lost post-deadman death
+//!    engagement (the removal itself stays silent).
 
 use std::collections::HashMap;
 
