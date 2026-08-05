@@ -615,12 +615,24 @@ pub(crate) async fn layout_snapshot(
 // ── POST /api/panes/:id/navigate ────────────────────────────────────────
 
 /// `POST /api/panes/:id/navigate` (`router.ts:1654-1667`): re-point a
-/// browser pane at a new `url`. Resolved via [`FreshAgentState::pane_tabs`]
-/// (no ambiguous title matching, matching this module's established
-/// precedent). Broadcasts `ui.command{pane.attach}` -- the client folds it
-/// via `updatePaneContent` regardless of the pane's PREVIOUS kind, so
+/// browser pane at a new `url` (or its first-class alias `target` --
+/// legacy reads `req.body?.url || req.body?.target`, so `""` is falsy
+/// there exactly as the `!u.is_empty()` filter is here). Resolved via
+/// [`FreshAgentState::pane_tabs`] (no ambiguous title matching, matching
+/// this module's established precedent). Broadcasts
+/// `ui.command{pane.attach}` -- the client folds it via
+/// `updatePaneContent` regardless of the pane's PREVIOUS kind, so
 /// navigating a currently-terminal/editor pane into a browser is honored
 /// the same way legacy's unconditional `layoutStore.attachPaneContent` is.
+/// Verified against `router.ts:1654-1667`: legacy's route has NO other
+/// validation branch -- the ONLY documented errors are 400 `url required`
+/// and 404 `pane not found`; there is deliberately no "not a browser pane"
+/// error to port. Nor does legacy track any server-side navigation history
+/// or forwarding state on browser panes (browsing history is client-side
+/// webview state; the legacy server's only "forwarding" is WSL
+/// port-forwarding, unrelated to panes) -- repeated navigate simply
+/// REPLACES the stored content in place, last-URL-wins, same pane id,
+/// same tab. The tests below pin all of that.
 pub(crate) async fn navigate_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -1713,6 +1725,224 @@ mod tests {
         assert!(!state.terminal_panes.lock().unwrap().contains_key(&pane_id));
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    #[tokio::test]
+    async fn navigate_pane_empty_url_is_400() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+
+        // `req.body?.url || req.body?.target` treats "" as falsy in legacy
+        // (router.ts:1658-1659) -- the port's `!u.is_empty()` filter matches,
+        // and this is the documented invalid-input error either way.
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/navigate"),
+            json!({ "url": "" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["message"], json!("url required"));
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    #[tokio::test]
+    async fn navigate_pane_accepts_target_alias() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+
+        // Legacy reads `req.body?.url || req.body?.target` (router.ts:1658),
+        // so `target` alone is as valid as `url`.
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/navigate"),
+            json!({ "target": "https://via-target.example" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["message"], json!("navigate requested"));
+        assert_eq!(
+            state.content_panes.lock().unwrap().get(&pane_id).unwrap()["url"],
+            json!("https://via-target.example")
+        );
+        assert!(!state.terminal_panes.lock().unwrap().contains_key(&pane_id));
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    #[tokio::test]
+    async fn navigate_pane_retains_pane_id_layout_and_sibling_bookkeeping() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let mut rx = state.broadcast_tx.subscribe();
+        let (tab_id, navigated_pane_id, navigated_terminal_id) =
+            create_shell_tab(router.clone()).await;
+        let _ = rx.recv().await; // drain tab.create
+
+        // A sibling pane in the SAME tab: navigate must leave it -- and the
+        // tab itself -- exactly as they were.
+        let tmp = std::env::temp_dir();
+        let (status, split_body) = post(
+            router.clone(),
+            &format!("/api/panes/{navigated_pane_id}/split"),
+            json!({ "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{split_body}");
+        let sibling_pane_id = split_body["data"]["paneId"].as_str().unwrap().to_string();
+        let sibling_terminal_id = split_body["data"]["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let _ = rx.recv().await; // drain pane.split
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{navigated_pane_id}/navigate"),
+            json!({ "url": "https://navigated.example" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The broadcast carries the SAME ids -- no new pane is minted and
+        // the pane does not move tabs.
+        let frame = rx.recv().await.expect("pane.attach broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("pane.attach"));
+        assert_eq!(msg["payload"]["tabId"], json!(tab_id));
+        assert_eq!(msg["payload"]["paneId"], json!(navigated_pane_id));
+
+        // Retention: pane_tabs keeps BOTH pane ids mapped at the SAME tab
+        // (no layout mutation), and the tab record survives untouched.
+        let pane_tabs = state.pane_tabs.lock().unwrap();
+        assert_eq!(pane_tabs.get(&navigated_pane_id).unwrap(), &tab_id);
+        assert_eq!(pane_tabs.get(&sibling_pane_id).unwrap(), &tab_id);
+        drop(pane_tabs);
+        assert!(state.tabs.lock().unwrap().get(&tab_id).is_some());
+
+        // The sibling pane's terminal registration is exactly what the
+        // split made it, and it gained no content entry -- navigate touched
+        // ONLY the target pane's bookkeeping.
+        let terminal_panes = state.terminal_panes.lock().unwrap();
+        assert!(!terminal_panes.contains_key(&navigated_pane_id));
+        assert_eq!(
+            terminal_panes.get(&sibling_pane_id).unwrap().terminal_id,
+            sibling_terminal_id
+        );
+        drop(terminal_panes);
+        assert!(
+            state
+                .content_panes
+                .lock()
+                .unwrap()
+                .get(&sibling_pane_id)
+                .is_none()
+        );
+
+        // The navigated pane's terminal is orphaned-from-the-pane but still
+        // running in the shared registry (detach, don't kill -- this
+        // module's documented PTY-cleanup-parity finding).
+        let registry = state.terminal_registry.clone().unwrap();
+        assert!(registry.is_running(&navigated_terminal_id));
+        registry.kill(&navigated_terminal_id);
+        registry.kill(&sibling_terminal_id);
+    }
+
+    #[tokio::test]
+    async fn navigate_browser_pane_twice_replaces_url_in_place_last_wins() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let mut rx = state.broadcast_tx.subscribe();
+
+        // Start with a REAL browser pane (`POST /api/tabs` `{browser}`) so
+        // this pins browser->browser re-navigation (the existing success
+        // test pins terminal->browser) -- plus the verified-parity fact that
+        // legacy has no "not a browser pane" restriction on this route.
+        let (status, create_body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "browser": "https://first.example" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{create_body}");
+        let tab_id = create_body["data"]["tabId"].as_str().unwrap().to_string();
+        let pane_id = create_body["data"]["paneId"].as_str().unwrap().to_string();
+        let _ = rx.recv().await; // drain tab.create
+
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/navigate"),
+            json!({ "url": "https://second.example" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["message"], json!("navigate requested"));
+
+        let frame = rx.recv().await.expect("first pane.attach broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["payload"]["paneId"], json!(pane_id));
+        assert_eq!(msg["payload"]["tabId"], json!(tab_id));
+        assert_eq!(
+            msg["payload"]["content"]["url"],
+            json!("https://second.example")
+        );
+
+        // History rules, server side: legacy's navigate route tracks NO
+        // navigation history anywhere (browsing history is client-side
+        // webview state), so re-navigating REPLACES the stored content --
+        // last URL wins, same pane id, same tab, fresh pane.attach each time.
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/navigate"),
+            json!({ "url": "https://third.example" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["message"], json!("navigate requested"));
+
+        let frame = rx.recv().await.expect("second pane.attach broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("pane.attach"));
+        assert_eq!(
+            msg["payload"]["paneId"],
+            json!(pane_id),
+            "pane id must survive re-navigation"
+        );
+        assert_eq!(msg["payload"]["tabId"], json!(tab_id));
+        assert_eq!(
+            msg["payload"]["content"]["url"],
+            json!("https://third.example")
+        );
+
+        // Stored content is the LATEST url only -- no accumulated history
+        // list, no extra keys -- and the pane id still resolves to its tab.
+        let stored = state
+            .content_panes
+            .lock()
+            .unwrap()
+            .get(&pane_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            stored,
+            json!({ "kind": "browser", "url": "https://third.example", "devToolsOpen": false }),
+            "stored content must be exactly the latest navigate, nothing accumulated"
+        );
+        assert_eq!(
+            state.pane_tabs.lock().unwrap().get(&pane_id).unwrap(),
+            &tab_id
+        );
+        assert!(state.terminal_panes.lock().unwrap().get(&pane_id).is_none());
     }
 
     // ── respawn ──────────────────────────────────────────────────────────
