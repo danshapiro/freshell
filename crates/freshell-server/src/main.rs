@@ -904,6 +904,11 @@ async fn main() -> ExitCode {
         effective_host: Arc::new(bind_host.clone()),
         port,
         facts: Arc::new(tokio::sync::OnceCell::new()),
+        // NET-05: the two-phase elevation-confirmation gate behind
+        // `POST /api/network/configure-firewall` (wsl2-repair slice).
+        gate: Arc::new(std::sync::Mutex::new(
+            freshell_platform::elevated::ConfirmationGate::new(),
+        )),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list

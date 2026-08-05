@@ -81,7 +81,11 @@ pub use path::{
     UserPathFlavor,
 };
 pub use port_forward::{
-    build_port_forwarding_script, build_wsl_port_forwarding_plan, WslPortForwardingPlan,
+    build_port_forwarding_script, build_wsl_port_forwarding_plan,
+    clear_managed_wsl_remote_access_ports, compute_wsl_port_forwarding_plan,
+    managed_wsl_ports_path, persist_managed_wsl_remote_access_ports,
+    read_managed_wsl_remote_access_ports, verify_wsl_repair_plan, WslPortForwardingPlan,
+    MANAGED_WSL_PORTS_FILE,
 };
 pub use spawn::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, resolve_cli_launch,

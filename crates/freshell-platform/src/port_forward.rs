@@ -17,12 +17,17 @@
 //!
 //! ## Safety
 //!
-//! `portproxy`/`firewall` `add`/`delete` are elevated & mutating. This module
-//! only ever **builds** those command strings; the READ-ONLY `show` reads
-//! (`get_existing_*`, [`get_wsl_ip`]) are the only things run against a live
-//! host, and even those go through the injected [`CommandRunner`].
+//! `portproxy`/`firewall` `add`/`delete` are elevated & mutating. The script
+//! builders here only ever **build** those command strings; the READ-ONLY
+//! `show` reads (`get_existing_*`, [`get_wsl_ip`]) and the managed-ports state
+//! file reads are the only IO this module performs itself, all through the
+//! injected [`CommandRunner`]/explicit paths. The elevated *execution* of a
+//! `Ready` plan is wired in the server (`POST /api/network/configure-firewall`,
+//! NET-05) behind the two-phase confirmation gate + injected runner
+//! ([`crate::elevated`]) and is only constructed — never really run — in tests.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::{CommandRunner, Env};
 
@@ -595,6 +600,145 @@ pub fn get_existing_firewall_ports(runner: &dyn CommandRunner) -> Option<Vec<u16
     None
 }
 
+// ---------------------------------------------------------------------------
+// Managed WSL remote-access ports state file (NET-05)
+// ---------------------------------------------------------------------------
+
+/// `MANAGED_WSL_PORTS_FILE` (`wsl-port-forward.ts:10`).
+pub const MANAGED_WSL_PORTS_FILE: &str = "wsl-managed-remote-access-ports.json";
+
+/// `getManagedWslPortsPath` (`wsl-port-forward.ts:59-61`): `<home>/.freshell/
+/// wsl-managed-remote-access-ports.json`. The home dir is injected — the caller
+/// resolves it with Node `os.homedir()` semantics (the reference never consults
+/// `FRESHELL_HOME` for this file).
+pub fn managed_wsl_ports_path(home: &Path) -> PathBuf {
+    home.join(".freshell").join(MANAGED_WSL_PORTS_FILE)
+}
+
+/// `parseManagedWslPorts` (`wsl-port-forward.ts:69-80`): any JSON parse or
+/// shape failure → empty; non-number elements dropped (`typeof port ===
+/// 'number'`); the survivors are normalized (integer `1..=65535`, deduped,
+/// sorted). JS `Number.isInteger(3.0)` is `true`, so an integral float counts.
+fn parse_managed_wsl_ports(raw: &str) -> Vec<u16> {
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(ports) = parsed.get("ports").and_then(|p| p.as_array()) else {
+        return Vec::new();
+    };
+    let nums: Vec<u16> = ports
+        .iter()
+        .filter_map(|v| {
+            let as_int = v
+                .as_i64()
+                .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64));
+            as_int.and_then(|n| u16::try_from(n).ok())
+        })
+        .collect();
+    normalize_managed_ports(&nums)
+}
+
+/// `readManagedWslRemoteAccessPortsAsync` (`wsl-port-forward.ts:82-88`):
+/// READ-ONLY; any read/parse failure (missing file included) → empty set.
+pub fn read_managed_wsl_remote_access_ports(path: &Path) -> Vec<u16> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse_managed_wsl_ports(&raw),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `persistManagedWslRemoteAccessPorts` (`wsl-port-forward.ts:194-209`):
+/// normalize, empty → clear, else `mkdir -p` + write the byte-exact
+/// `JSON.stringify({ports}, null, 2)` body (no trailing newline).
+pub fn persist_managed_wsl_remote_access_ports(path: &Path, ports: &[u16]) -> std::io::Result<()> {
+    let normalized = normalize_managed_ports(ports);
+    if normalized.is_empty() {
+        return clear_managed_wsl_remote_access_ports(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "ports": normalized }))
+        .expect("serializing u16 ports cannot fail");
+    std::fs::write(path, body)
+}
+
+/// `clearManagedWslRemoteAccessPorts` (`wsl-port-forward.ts:211-219`): delete
+/// the state file, tolerating `ENOENT`, propagating any other error.
+pub fn clear_managed_wsl_remote_access_ports(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan compute (async edge in the reference; sync here, injected IO) + the
+// post-run verification outcome mapping (NET-05)
+// ---------------------------------------------------------------------------
+
+/// `computeWslPortForwardingPlanAsync` (`wsl-port-forward.ts:503-543`): the
+/// live reads feeding the pure plan, in the reference's order — WSL2 gate,
+/// env kill-switch, WSL IP, then the portproxy/firewall/managed-ports reads.
+/// `is_wsl2` is the Regime-B (`/proc/version`) answer, computed by the caller.
+pub fn compute_wsl_port_forwarding_plan(
+    is_wsl2: bool,
+    env: &dyn Env,
+    runner: &dyn CommandRunner,
+    managed_ports_path: &Path,
+    required_ports: &[u16],
+    known_owned_ports: &[u16],
+) -> WslPortForwardingPlan {
+    if !is_wsl2 {
+        return WslPortForwardingPlan::NotWsl2;
+    }
+    if is_wsl_port_forwarding_disabled_by_env(env) {
+        return WslPortForwardingPlan::Disabled;
+    }
+    let Some(wsl_ip) = get_wsl_ip(runner) else {
+        return WslPortForwardingPlan::Error("Failed to detect WSL2 IP address".to_string());
+    };
+
+    let existing_rules = get_existing_port_proxy_rules(runner);
+    let existing_firewall_ports = get_existing_firewall_ports(runner);
+    let managed_ports = read_managed_wsl_remote_access_ports(managed_ports_path);
+
+    let (Some(existing_rules), Some(existing_firewall_ports)) =
+        (existing_rules, existing_firewall_ports)
+    else {
+        return WslPortForwardingPlan::Error(
+            "Failed to query existing Windows remote access rules".to_string(),
+        );
+    };
+
+    build_wsl_port_forwarding_plan(
+        required_ports,
+        known_owned_ports,
+        &wsl_ip,
+        &existing_rules,
+        &existing_firewall_ports,
+        &managed_ports,
+    )
+}
+
+/// `verifyWslRepairSuccess`'s outcome mapping (`network-router.ts:380-391`),
+/// applied to a plan recomputed AFTER the elevated run: a query failure → the
+/// plan's message; a still-`Ready` plan (the repair did not take) →
+/// `'WSL2 port forwarding verification failed'`; anything else passes.
+pub fn verify_wsl_repair_plan(plan: &WslPortForwardingPlan) -> Result<(), String> {
+    match plan {
+        WslPortForwardingPlan::Error(message) => Err(message.clone()),
+        WslPortForwardingPlan::Ready { .. } => {
+            Err("WSL2 port forwarding verification failed".to_string())
+        }
+        WslPortForwardingPlan::NotWsl2
+        | WslPortForwardingPlan::Disabled
+        | WslPortForwardingPlan::Noop { .. } => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,5 +1125,314 @@ Address         Port        Address         Port\r\n\
         // `name=FreshellLANAccess` is a READ-ONLY show; the live host has the rule.
         let ports = get_existing_firewall_ports(&runner).expect("firewall show should resolve");
         eprintln!("LIVE FreshellLANAccess ports (read-only): {ports:?}");
+    }
+
+    // ---- NET-05: managed-ports state file -----------------------------------
+
+    #[test]
+    fn managed_wsl_ports_path_layout() {
+        assert_eq!(
+            managed_wsl_ports_path(Path::new("/home/u")),
+            PathBuf::from("/home/u/.freshell/wsl-managed-remote-access-ports.json")
+        );
+    }
+
+    #[test]
+    fn persist_writes_json_stringify_pretty_bytes_and_creates_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let path = managed_wsl_ports_path(home.path());
+        persist_managed_wsl_remote_access_ports(&path, &[3002, 3001, 3001]).unwrap();
+        // Byte-exact `JSON.stringify({ ports }, null, 2)` — 2-space indent,
+        // sorted/deduped, no trailing newline.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"ports\": [\n    3001,\n    3002\n  ]\n}"
+        );
+    }
+
+    #[test]
+    fn persist_empty_clears_existing_file() {
+        let home = tempfile::tempdir().unwrap();
+        let path = managed_wsl_ports_path(home.path());
+        persist_managed_wsl_remote_access_ports(&path, &[3001]).unwrap();
+        assert!(path.exists());
+        persist_managed_wsl_remote_access_ports(&path, &[]).unwrap();
+        assert!(!path.exists());
+        // Clearing a missing file is a silent no-op (ENOENT tolerated).
+        clear_managed_wsl_remote_access_ports(&path).unwrap();
+    }
+
+    #[test]
+    fn propagates_unexpected_delete_errors() {
+        let home = tempfile::tempdir().unwrap();
+        // A DIRECTORY at the state-file path: remove_file fails with a
+        // non-ENOENT error, which must propagate (reference rethrows).
+        let path = home.path().join("wsl-managed-remote-access-ports.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(clear_managed_wsl_remote_access_ports(&path).is_err());
+        assert!(persist_managed_wsl_remote_access_ports(&path, &[]).is_err());
+    }
+
+    #[test]
+    fn read_tolerates_missing_and_garbage_and_filters_non_numbers() {
+        let home = tempfile::tempdir().unwrap();
+        let path = managed_wsl_ports_path(home.path());
+        // Missing file -> empty.
+        assert_eq!(
+            read_managed_wsl_remote_access_ports(&path),
+            Vec::<u16>::new()
+        );
+        // Garbage JSON -> empty.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(
+            read_managed_wsl_remote_access_ports(&path),
+            Vec::<u16>::new()
+        );
+        // `ports` not an array -> empty.
+        std::fs::write(&path, "{\"ports\": \"nope\"}").unwrap();
+        assert_eq!(
+            read_managed_wsl_remote_access_ports(&path),
+            Vec::<u16>::new()
+        );
+        // Non-numbers dropped; rest normalized. Integral floats count
+        // (JS `Number.isInteger(4000.0)` is true); out-of-range filtered.
+        std::fs::write(
+            &path,
+            "{\"ports\": [3001, \"3002\", 4000.0, 0, 70000, -5, true]}",
+        )
+        .unwrap();
+        assert_eq!(
+            read_managed_wsl_remote_access_ports(&path),
+            vec![3001, 4000]
+        );
+    }
+
+    // ---- NET-05: compute wrapper (injected WSL2/env/runner/state-file) -------
+
+    /// Scripted runner for a WSL2 host whose eth0 IP is `172.30.149.249`, with
+    /// the given portproxy table stdout and firewall `show rule` result.
+    /// `FakeCommandRunner` matches its rules FIRST-WINS, so each command must
+    /// be scripted exactly once — never override an installed rule with
+    /// another `.on()` for the same command+needles.
+    fn wsl2_runner_with(portproxy_stdout: &'static str, firewall_out: CommandOutput) -> FakeCommandRunner {
+        FakeCommandRunner::new()
+            .on(
+                "ip",
+                &["eth0"],
+                CommandOutput::success("    inet 172.30.149.249/20 scope global eth0\n"),
+            )
+            .on(
+                NETSH_PATH,
+                &["portproxy", "show"],
+                CommandOutput::success(portproxy_stdout),
+            )
+            .on(NETSH_PATH, &["name=FreshellLANAccess"], firewall_out)
+    }
+
+    /// The empty portproxy table (no rules configured).
+    const PORTPROXY_TABLE_EMPTY: &str =
+        "Listen on ipv4:             Connect to ipv4:\r\n\r\n\
+Address         Port        Address         Port\r\n\
+--------------- ----------  --------------- ----------\r\n";
+
+    /// The netsh `show rule` "rule absent" signature.
+    fn firewall_rule_absent() -> CommandOutput {
+        CommandOutput::failure(1, "No rules match the specified criteria.\r\n", "")
+    }
+
+    /// Scripted runner for a WSL2 host with NOTHING configured yet (empty
+    /// portproxy table, no FreshellLANAccess rule).
+    fn wsl2_runner() -> FakeCommandRunner {
+        wsl2_runner_with(PORTPROXY_TABLE_EMPTY, firewall_rule_absent())
+    }
+
+    #[test]
+    fn compute_plan_not_wsl2_short_circuits_all_reads_and_file_io() {
+        let home = tempfile::tempdir().unwrap();
+        let path = managed_wsl_ports_path(home.path());
+        let runner = FakeCommandRunner::new(); // every call would spawn-fail
+        let plan = compute_wsl_port_forwarding_plan(
+            false,
+            &MapEnv::new(),
+            &runner,
+            &path,
+            &[3001],
+            &[3001],
+        );
+        assert_eq!(plan, WslPortForwardingPlan::NotWsl2);
+        assert_eq!(runner.call_count(), 0, "no reads when not WSL2");
+        assert!(!path.exists(), "no state-file IO when not WSL2");
+    }
+
+    #[test]
+    fn compute_plan_disabled_by_env_short_circuits() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = FakeCommandRunner::new();
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new().with("FRESHELL_DISABLE_WSL_PORT_FORWARD", "1"),
+            &runner,
+            &managed_wsl_ports_path(home.path()),
+            &[3001],
+            &[3001],
+        );
+        assert_eq!(plan, WslPortForwardingPlan::Disabled);
+        assert_eq!(runner.call_count(), 0);
+    }
+
+    #[test]
+    fn compute_plan_error_when_wsl_ip_undetectable() {
+        let home = tempfile::tempdir().unwrap();
+        // ip AND hostname both fail.
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new(),
+            &FakeCommandRunner::new(),
+            &managed_wsl_ports_path(home.path()),
+            &[3001],
+            &[3001],
+        );
+        assert_eq!(
+            plan,
+            WslPortForwardingPlan::Error("Failed to detect WSL2 IP address".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_plan_error_when_rule_query_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = FakeCommandRunner::new()
+            .on(
+                "ip",
+                &["eth0"],
+                CommandOutput::success("    inet 172.30.149.249/20 scope global eth0\n"),
+            )
+            .on(
+                NETSH_PATH,
+                &["name=FreshellLANAccess"],
+                CommandOutput::spawn_failure("netsh gone"),
+            );
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new(),
+            &runner,
+            &managed_wsl_ports_path(home.path()),
+            &[3001],
+            &[3001],
+        );
+        assert_eq!(
+            plan,
+            WslPortForwardingPlan::Error(
+                "Failed to query existing Windows remote access rules".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn compute_plan_ready_when_nothing_configured_yet() {
+        let home = tempfile::tempdir().unwrap();
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new(),
+            &wsl2_runner(),
+            &managed_wsl_ports_path(home.path()),
+            &[3001],
+            &[3001],
+        );
+        match plan {
+            WslPortForwardingPlan::Ready {
+                wsl_ip,
+                script_kind,
+                script,
+            } => {
+                assert_eq!(wsl_ip, "172.30.149.249");
+                assert_eq!(script_kind, ScriptKind::Full);
+                assert!(script.contains("portproxy add"));
+                assert!(script.contains("2>$null"));
+            }
+            other => panic!("expected Ready/full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_plan_reads_managed_ports_from_the_state_file() {
+        // A stale managed 4000 proxy rule exists and the state file (written
+        // by a prior successful repair) records Freshell ownership of it: the
+        // plan must schedule its cleanup (stale-owned in `cleanup_ports`).
+        let home = tempfile::tempdir().unwrap();
+        let path = managed_wsl_ports_path(home.path());
+        persist_managed_wsl_remote_access_ports(&path, &[4000]).unwrap();
+        let runner = wsl2_runner_with(
+            "Listen on ipv4:             Connect to ipv4:\r\n\r\n\
+Address         Port        Address         Port\r\n\
+--------------- ----------  --------------- ----------\r\n\
+0.0.0.0         4000        172.30.149.249  4000\r\n",
+            firewall_rule_absent(),
+        );
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new(),
+            &runner,
+            &path,
+            &[3001],
+            &[3001],
+        );
+        match plan {
+            WslPortForwardingPlan::Ready { script, .. } => {
+                assert!(script
+                    .contains("portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=4000"));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_plan_noop_when_everything_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let runner = wsl2_runner_with(
+            "Listen on ipv4:             Connect to ipv4:\r\n\r\n\
+Address         Port        Address         Port\r\n\
+--------------- ----------  --------------- ----------\r\n\
+0.0.0.0         3001        172.30.149.249  3001\r\n",
+            CommandOutput::success("Rule Name: FreshellLANAccess\r\nLocalPort: 3001\r\n"),
+        );
+        let plan = compute_wsl_port_forwarding_plan(
+            true,
+            &MapEnv::new(),
+            &runner,
+            &managed_wsl_ports_path(home.path()),
+            &[3001],
+            &[3001],
+        );
+        assert_eq!(
+            plan,
+            WslPortForwardingPlan::Noop {
+                wsl_ip: "172.30.149.249".into()
+            }
+        );
+    }
+
+    // ---- NET-05: post-run verification outcome mapping -----------------------
+
+    #[test]
+    fn verify_repair_plan_truth_table() {
+        assert!(
+            verify_wsl_repair_plan(&WslPortForwardingPlan::Noop { wsl_ip: "x".into() }).is_ok()
+        );
+        assert!(verify_wsl_repair_plan(&WslPortForwardingPlan::NotWsl2).is_ok());
+        assert!(verify_wsl_repair_plan(&WslPortForwardingPlan::Disabled).is_ok());
+        assert_eq!(
+            verify_wsl_repair_plan(&WslPortForwardingPlan::Error("boom".into())),
+            Err("boom".to_string())
+        );
+        assert_eq!(
+            verify_wsl_repair_plan(&WslPortForwardingPlan::Ready {
+                wsl_ip: "x".into(),
+                script_kind: ScriptKind::Full,
+                script: "s".into(),
+            }),
+            Err("WSL2 port forwarding verification failed".to_string())
+        );
     }
 }
