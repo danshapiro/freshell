@@ -106,3 +106,18 @@ Each entry: timestamp, category (PROCESS / TECH / REPO), learning.
   uncommitted. Restored from the orchestrator session transcript. Rule: a ledger that lives
   inside a worktree subject to reset/cherry-pick automation must be committed on EVERY
   append (or kept outside the build tree entirely).
+- **10:55 PROCESS/QA** — QA-panel experiment (16 lenses on files.rs). Verification plumbing
+  ate 3 wrong attempts before the right one: (1) shared CARGO_TARGET_DIR served slot-01's
+  cached test binary to all 16 worktrees (WSL2 stale-rlib footgun, AGENTS.md-warned);
+  (2) a fresh dedicated target dir hit an unrelated cross-crate error; (3) per-slot builds
+  same staleness. WINNER: concatenate all 16 uniquely-named qa_probe_NN modules into ONE
+  files.rs, compile+run ONCE, attribute results by module path. One bad module fails the
+  whole build → bisect by line→module, exclude the 2 non-compiling ones, rebuild. Lesson:
+  for N parallel code artifacts that share a package, verify them in ONE build with unique
+  namespaces, not N builds sharing a target.
+- **10:55 QA** — Panel result: 14 compiling lenses → 65 failing proof tests → 17 clusters;
+  narrow adversarial lenses (breaker, spec-clause) beat broad "review this" 3:1; lens
+  DIVERSITY adds clusters, lens REPETITION doesn't; 5-lens set-cover reproduces 100%.
+  Flagship (empty-string allowedFilePaths disables sandbox) found by 7 independent lenses
+  and adjudicated REAL by reading is_path_allowed (files.rs:733). Proof-only rule kept
+  false alarms to 1/66.
