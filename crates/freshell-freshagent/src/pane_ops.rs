@@ -842,10 +842,16 @@ pub(crate) async fn resize_pane(
 /// mirrors legacy's own `{message:'panes not found'}` (200, not an error --
 /// `swapPane`'s tree search only ever finds both leaves within a SINGLE
 /// tab). The actual exchange swaps whichever bookkeeping bucket
-/// (`terminal_panes` or `content_panes`) each pane occupies; a pane
-/// resolving to NEITHER (a fresh-agent pane -- tracked in
-/// `FreshAgentState`'s private `panes` map, unreachable from this module)
-/// is out of this slice's reach and reported the same graceful
+/// each pane occupies -- `terminal_panes`, `content_panes`, OR the
+/// fresh-agent [`FreshAgentState::panes`] map, so a fresh-agent pane's
+/// session binding (placeholder/durable id, cwd, model/effort) MOVES WITH
+/// THE CONTENT to the other pane id, exactly as legacy's `.content` swap
+/// carries the moved leaf's `paneContent.sessionId`
+/// (`layout-store.ts:622-624`; legacy's send-keys/capture then resolve the
+/// session through the moved content). The three maps are kind-disjoint (a
+/// pane id appears in exactly one), so the per-bucket exchange can never
+/// double-move an entry. A pane id present ONLY in `pane_tabs` (drift
+/// bookkeeping, no content bucket at all) is reported the same graceful
 /// `{message:'panes not found'}` way, never a hard error.
 pub(crate) async fn swap_pane(
     State(state): State<FreshAgentState>,
@@ -882,58 +888,37 @@ pub(crate) async fn swap_pane(
         return ok_json(json!({ "message": "panes not found" }), "panes not found");
     }
 
-    let (a_terminal, b_terminal, a_content, b_content) = {
+    let (a_terminal, b_terminal, a_content, b_content, a_agent, b_agent) = {
         let terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
         let content_panes = state.content_panes.lock().expect("content_panes mutex");
+        let agent_panes = state.panes.lock().expect("panes mutex");
         (
             terminal_panes.get(&pane_id).cloned(),
             terminal_panes.get(&other_id).cloned(),
             content_panes.get(&pane_id).cloned(),
             content_panes.get(&other_id).cloned(),
+            agent_panes.get(&pane_id).cloned(),
+            agent_panes.get(&other_id).cloned(),
         )
     };
 
-    if (a_terminal.is_none() && a_content.is_none())
-        || (b_terminal.is_none() && b_content.is_none())
+    if (a_terminal.is_none() && a_content.is_none() && a_agent.is_none())
+        || (b_terminal.is_none() && b_content.is_none() && b_agent.is_none())
     {
         return ok_json(json!({ "message": "panes not found" }), "panes not found");
     }
 
     {
         let mut terminal_panes = state.terminal_panes.lock().expect("terminal_panes mutex");
-        match (a_terminal, b_terminal) {
-            (Some(a), Some(b)) => {
-                terminal_panes.insert(pane_id.clone(), b);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                terminal_panes.remove(&pane_id);
-                terminal_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                terminal_panes.remove(&other_id);
-                terminal_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
-        }
+        swap_bucket_entries(&mut terminal_panes, &pane_id, &other_id, a_terminal, b_terminal);
     }
     {
         let mut content_panes = state.content_panes.lock().expect("content_panes mutex");
-        match (a_content, b_content) {
-            (Some(a), Some(b)) => {
-                content_panes.insert(pane_id.clone(), b);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (Some(a), None) => {
-                content_panes.remove(&pane_id);
-                content_panes.insert(other_id.clone(), a);
-            }
-            (None, Some(b)) => {
-                content_panes.remove(&other_id);
-                content_panes.insert(pane_id.clone(), b);
-            }
-            (None, None) => {}
-        }
+        swap_bucket_entries(&mut content_panes, &pane_id, &other_id, a_content, b_content);
+    }
+    {
+        let mut agent_panes = state.panes.lock().expect("panes mutex");
+        swap_bucket_entries(&mut agent_panes, &pane_id, &other_id, a_agent, b_agent);
     }
 
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
@@ -942,6 +927,37 @@ pub(crate) async fn swap_pane(
     }));
 
     ok_json(json!({ "tabId": tab_a }), "panes swapped")
+}
+
+/// One bucket of [`swap_pane`]'s content exchange: whichever of the two pane
+/// ids occupied `map` hands its entry to the other (cross-insert when both
+/// had one; `remove`+`insert` for a one-sided move). The pane maps are
+/// kind-disjoint by construction (a pane id appears in exactly one of
+/// `terminal_panes`/`content_panes`/`panes` -- see `FreshAgentState`'s field
+/// docs in `lib.rs`), so applying this per-bucket can never move an entry
+/// twice.
+fn swap_bucket_entries<V>(
+    map: &mut HashMap<String, V>,
+    pane_id: &str,
+    other_id: &str,
+    pane_entry: Option<V>,
+    other_entry: Option<V>,
+) {
+    match (pane_entry, other_entry) {
+        (Some(a), Some(b)) => {
+            map.insert(pane_id.to_string(), b);
+            map.insert(other_id.to_string(), a);
+        }
+        (Some(a), None) => {
+            map.remove(pane_id);
+            map.insert(other_id.to_string(), a);
+        }
+        (None, Some(b)) => {
+            map.remove(other_id);
+            map.insert(pane_id.to_string(), b);
+        }
+        (None, None) => {}
+    }
 }
 
 #[cfg(test)]
@@ -2213,6 +2229,223 @@ mod tests {
 
         let registry = state.terminal_registry.clone().unwrap();
         registry.kill(&first_terminal_id);
+        registry.kill(&second_terminal_id);
+    }
+
+    // ── swap: fresh-agent bucket ─────────────────────────────────────────
+
+    /// Insert a fresh-agent pane's bookkeeping directly -- exactly what
+    /// `create_tab`'s agent branch writes (`lib.rs:1554`-1574). Routes can
+    /// mint an agent pane only into a NEW tab (`POST /api/tabs {agent}`); the
+    /// agent-SPLIT route that would co-locate one into an existing tab is an
+    /// honest deferral, so the same-tab agent layout swap must handle is
+    /// assembled by hand. The state is bookkeeping-legal either way (maps
+    /// kind-disjoint, `pane_tabs` reverse index populated).
+    fn insert_fresh_agent_pane(
+        state: &FreshAgentState,
+        tab_id: &str,
+        pane_id: &str,
+        placeholder: &str,
+    ) {
+        state
+            .pane_tabs
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), tab_id.to_string());
+        state.panes.lock().unwrap().insert(
+            pane_id.to_string(),
+            crate::PaneEntry {
+                placeholder_id: placeholder.to_string(),
+                cwd: None,
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_terminal_pane_with_fresh_agent_pane_exchanges_all_buckets_and_broadcasts() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let mut rx = state.broadcast_tx.subscribe();
+        let (tab_id, terminal_pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+        let _ = rx.recv().await; // drain tab.create
+
+        let agent_pane_id = "agent-pane-1";
+        insert_fresh_agent_pane(&state, &tab_id, agent_pane_id, "freshopencode-agent1");
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{terminal_pane_id}/swap"),
+            json!({ "target": agent_pane_id }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["message"], json!("panes swapped"));
+
+        let frame = rx.recv().await.expect("pane.swap broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("pane.swap"));
+        assert_eq!(msg["payload"]["tabId"], json!(tab_id));
+        assert_eq!(msg["payload"]["paneId"], json!(terminal_pane_id));
+        assert_eq!(msg["payload"]["otherId"], json!(agent_pane_id));
+
+        // Content exchange across buckets: the terminal entry moved to the
+        // agent pane id and the fresh-agent session binding moved the other
+        // way -- the session FOLLOWS the content, exactly as legacy's
+        // `.content` swap carries the moved leaf's `paneContent.sessionId`
+        // (layout-store.ts:622-624) with send-keys resolving through it.
+        let terminal_panes = state.terminal_panes.lock().unwrap();
+        assert!(!terminal_panes.contains_key(&terminal_pane_id));
+        assert_eq!(
+            terminal_panes.get(agent_pane_id).unwrap().terminal_id,
+            terminal_id
+        );
+        drop(terminal_panes);
+        let agent_panes = state.panes.lock().unwrap();
+        assert!(!agent_panes.contains_key(agent_pane_id));
+        assert_eq!(
+            agent_panes
+                .get(&terminal_pane_id)
+                .unwrap()
+                .placeholder_id,
+            "freshopencode-agent1"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    #[tokio::test]
+    async fn swap_two_fresh_agent_panes_in_same_tab_exchanges_session_bindings() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (tab_id, terminal_pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+        insert_fresh_agent_pane(&state, &tab_id, "agent-a", "freshopencode-a");
+        insert_fresh_agent_pane(&state, &tab_id, "agent-b", "freshopencode-b");
+
+        // `otherId` alias exercised here (legacy reads `req.body?.target ||
+        // req.body?.otherId`, router.ts:1528).
+        let (status, body) = post(
+            router,
+            "/api/panes/agent-a/swap",
+            json!({ "otherId": "agent-b" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["tabId"], json!(tab_id));
+
+        let agent_panes = state.panes.lock().unwrap();
+        assert_eq!(
+            agent_panes.get("agent-a").unwrap().placeholder_id,
+            "freshopencode-b"
+        );
+        assert_eq!(
+            agent_panes.get("agent-b").unwrap().placeholder_id,
+            "freshopencode-a"
+        );
+        drop(agent_panes);
+
+        // The unrelated terminal pane in the same tab was not a party.
+        assert_eq!(
+            state
+                .terminal_panes
+                .lock()
+                .unwrap()
+                .get(&terminal_pane_id)
+                .unwrap()
+                .terminal_id,
+            terminal_id
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    /// The graceful path preserved: a pane id present in the `pane_tabs`
+    /// reverse index but owning NO content bucket (drift bookkeeping) still
+    /// reports legacy's `{message:'panes not found'}` 200, mutates nothing,
+    /// and does not broadcast.
+    #[tokio::test]
+    async fn swap_pane_whose_content_bookkeeping_is_missing_is_graceful_panes_not_found() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let mut rx = state.broadcast_tx.subscribe();
+        let (tab_id, terminal_pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+        let _ = rx.recv().await; // drain tab.create
+        state
+            .pane_tabs
+            .lock()
+            .unwrap()
+            .insert("drift-pane".to_string(), tab_id.clone());
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{terminal_pane_id}/swap"),
+            json!({ "target": "drift-pane" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["message"], json!("panes not found"));
+        assert!(
+            rx.try_recv().is_err(),
+            "must not broadcast when nothing swapped"
+        );
+        assert_eq!(
+            state
+                .terminal_panes
+                .lock()
+                .unwrap()
+                .get(&terminal_pane_id)
+                .unwrap()
+                .terminal_id,
+            terminal_id
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+    }
+
+    // ── resize (deferral coverage) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn resize_real_pane_post_split_is_still_honest_400_pending_layout_sync() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, terminal_id) = create_shell_tab(router.clone()).await;
+
+        let tmp = std::env::temp_dir();
+        let (status, split_body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/split"),
+            json!({ "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{split_body}");
+        let second_terminal_id = split_body["data"]["terminalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Even against a REAL pane in a REAL post-split layout the route
+        // stays a 400: the blocker is structural (no splitId ever reaches
+        // the server), not input validation or pane resolution.
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/resize"),
+            json!({ "x": 25 }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("ui.layout.sync"), "{msg}");
+        assert!(msg.contains("AUTO-01"), "{msg}");
+
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&terminal_id);
         registry.kill(&second_terminal_id);
     }
 }

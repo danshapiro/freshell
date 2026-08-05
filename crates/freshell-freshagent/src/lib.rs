@@ -154,7 +154,10 @@ pub struct FreshAgentState {
     /// `sessions.changed` are pushed here.
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// paneId → pane record (placeholder id, cwd, model/effort, durable id).
-    panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
+    /// `pub(crate)` like the sibling pane maps so [`pane_ops::swap_pane`] can
+    /// exchange fresh-agent panes as its third content bucket (legacy's
+    /// `swapPane` swaps `.content` on any leaf regardless of kind).
+    pub(crate) panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
     opencode: Arc<tokio::sync::Mutex<Option<OpencodeServeManager>>>,
     /// Monotonic `sessions.changed` revision.
@@ -268,14 +271,18 @@ pub struct FreshAgentState {
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
+/// `pub(crate)` (fields included, the `TerminalPaneEntry` precedent) so
+/// `pane_ops`'s swap can move the whole entry -- the session binding FOLLOWS
+/// the content to the other pane id, matching how legacy's swap carries the
+/// moved leaf's `paneContent.sessionId` (`layout-store.ts:622-624`).
 #[derive(Clone)]
-struct PaneEntry {
-    placeholder_id: String,
-    cwd: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
+pub(crate) struct PaneEntry {
+    pub(crate) placeholder_id: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
     /// The durable `ses_*` id after the first turn materializes it.
-    durable_id: Option<String>,
+    pub(crate) durable_id: Option<String>,
 }
 
 /// A Slice-1 terminal pane's record: just enough to dispatch `send-keys` /
@@ -1595,35 +1602,39 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane. Fixes the
-/// user-visible 'not found' this route previously produced by falling through
-/// to the SPA-fallback 404 (the route did not exist).
+/// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane.
 ///
-/// This port carries no server-side pane layout store (`layoutStore` -- see the
-/// TASK 3 sidebar-join module doc for why that's an explicit non-goal), so
-/// `tabId` is unknowable here: `resolvePaneTarget`/`renamePane`/`tabRenamed`
-/// (`router.ts:1404-1415`) and the `ui.command{pane.rename}` broadcast
-/// (`router.ts:1417-1420`) are not reproduced -- documented deviation, single-client
-/// acceptable. Actual title persistence is Option A (client-driven cascade): the
-/// frozen client's `applyPaneRename` thunk (`src/store/titleSync.ts:30-46`)
-/// separately PATCHes `/api/terminals/:id` or `/api/sessions/:id` right after this
-/// call succeeds, which is what the client has always done for the terminal/
-/// fresh-agent cascade -- this route only needs to validate the name and
-/// acknowledge with the shape `PaneContainer.tsx:311` asserts
-/// (`response.data.paneId === paneId`), so the client can safely apply the
-/// Redux-side rename.
+/// Pane resolution goes through the `pane_tabs` reverse index (the Slice 3b-1
+/// layout-store analog `close_pane`/`select_pane`/`split_pane` already use;
+/// this route's earlier "no server-side pane registry" reduced fidelity
+/// predates that index). Legacy's unknown-pane answer here is NOT a 404:
+/// `resolvePaneTarget` FALLS BACK to the raw id whenever `resolveTarget`
+/// cannot resolve it (`router.ts:530-537` treats only a non-'target not
+/// resolved' message as an error), `renamePane` then answers
+/// `{message:'pane not found'}` (`layout-store.ts:562`), the `result?.tabId`
+/// guard at `router.ts:1411` suppresses every side effect (no persist, no
+/// broadcast), and `:1423` responds `ok({message:'pane not found'})` -- a 200
+/// ok-envelope. The 404/409 branch (`rejectPaneTargetError`, :591-596) fires
+/// only for tab.pane-index/ambiguous-TITLE resolution messages, and this
+/// port deliberately performs no title matching anywhere (the `split_pane`
+/// precedent) -- so raw unknown pane ids mirror the 200 ok-envelope exactly.
 ///
-/// **Disclosed deviation (Minor, spec review of commit d5cf534a):** the legacy
-/// route resolves `paneId` against a server-side pane registry and answers
-/// `404`/`409` for an unresolvable or already-target-mismatched id
-/// (`resolvePaneTarget`, `agent-api/router.ts:530-541`). This port keeps no
-/// such registry (see the `tabId`-unknowable note above), so `rename_pane`
-/// returns `200` for ANY `pane_id` that passes name validation, whether or not
-/// a pane by that id actually exists. Accepted because the frozen client only
-/// ever calls this with a `paneId` it already holds and asserts solely
-/// `data.paneId === paneId` on the response (`PaneContainer.tsx:311`) -- it
-/// never inspects the status code for a 404/409 branch, so the missing
-/// resolution check is unobservable from the single supported client.
+/// On a hit this mirrors the full success path: `tabRenamed` is
+/// `(layoutStore.listPanes(tabId) || []).length === 1` (`:1414`), a sole-pane
+/// tab is retitled as `renamePane`'s `getSinglePaneId` cascade does
+/// (`layout-store.ts:569-573`, applied to the `tabs` record when one exists;
+/// fresh-agent tabs keep no `TabRecord` -- the documented Slice-1 gap -- so
+/// the retitle is a no-op there), and `ui.command{pane.rename}` broadcasts
+/// with legacy's exact payload `{tabId, paneId, title}` (`:1417-1420`),
+/// which the frozen client folds via `applyPaneRename`
+/// (`src/lib/ui-commands.ts:128`).
+///
+/// Terminal/session title PERSISTENCE stays Option A (client-driven
+/// cascade): the frozen client's `applyPaneRename` thunk
+/// (`src/store/titleSync.ts:30-46`) separately PATCHes `/api/terminals/:id`
+/// or `/api/sessions/:id` right after this call succeeds, and it asserts
+/// solely `data.paneId === paneId` on this response (`PaneContainer.tsx:311`)
+/// -- preserved below.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -1644,8 +1655,36 @@ async fn rename_pane(
         );
     }
 
+    // Resolve the pane's owning tab and count its panes (the
+    // `listPanes(tabId).length === 1` `tabRenamed` rule) in one lock hold.
+    let (tab_id, pane_count) = {
+        let pane_tabs = state.pane_tabs.lock().expect("pane_tabs mutex");
+        let tab_id = pane_tabs.get(&pane_id).cloned();
+        let count = tab_id
+            .as_ref()
+            .map_or(0, |tid| pane_tabs.values().filter(|t| *t == tid).count());
+        (tab_id, count)
+    };
+    let Some(tab_id) = tab_id else {
+        // Legacy-observable miss path (doc comment above): a 200 ok-envelope
+        // carrying the not-found message, never a broadcast or title write.
+        return ok_json(json!({ "message": "pane not found" }), "pane not found");
+    };
+
+    let tab_renamed = pane_count == 1;
+    if tab_renamed {
+        if let Some(record) = state.tabs.lock().expect("tabs mutex").get_mut(&tab_id) {
+            record.title = Some(name.clone());
+        }
+    }
+
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "pane.rename".to_string(),
+        payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "title": name })),
+    }));
+
     ok_json(
-        json!({ "paneId": pane_id, "tabRenamed": false }),
+        json!({ "tabId": tab_id, "paneId": pane_id, "tabRenamed": tab_renamed }),
         "pane renamed",
     )
 }
@@ -3117,6 +3156,33 @@ mod rename_pane_tests {
         ))
     }
 
+    /// Same router but keeping the state handle, so a test can populate the
+    /// `pane_tabs` reverse index (what `POST /api/tabs`/`split` write) and
+    /// subscribe to the broadcast bus before patching.
+    fn app_with_state() -> (FreshAgentState, Router) {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let router = router(state.clone());
+        (state, router)
+    }
+
+    async fn patch_pane_on(router: Router, pane_id: &str, name: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/panes/{pane_id}"))
+            .header("content-type", "application/json")
+            .header("x-auth-token", "tok");
+        let resp = router
+            .oneshot(
+                req.body(Body::from(json!({ "name": name }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
     async fn body_json(resp: Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3148,14 +3214,114 @@ mod rename_pane_tests {
     /// succeed, not fall through to the SPA-fallback 404. Success shape mirrors
     /// `router.ts:1396-1423`: `ok({paneId, tabRenamed}, 'pane renamed')`. The
     /// client asserts `data.paneId === paneId` (`PaneContainer.tsx:311`).
+    ///
+    /// On a RESOLVED pane (the `pane_tabs` reverse index Slice 3b-1 added after
+    /// this route's original reduced-fidelity port) the full legacy success
+    /// path runs: a sole-pane tab reports `tabRenamed: true`
+    /// (`(listPanes(tabId) || []).length === 1`, `router.ts:1414`), its `tabs`
+    /// record is retitled as `renamePane`'s `getSinglePaneId` cascade does
+    /// (`layout-store.ts:569-573`), and `ui.command{pane.rename}` broadcasts
+    /// with legacy's exact `{tabId, paneId, title}` payload
+    /// (`router.ts:1417-1420`) -- the side effect the reduced-fidelity port
+    /// never emitted.
     #[tokio::test]
-    async fn renames_pane_and_returns_paneid_and_tab_renamed_false() {
-        let (status, body) = patch_pane(Some("My New Title"), true).await;
+    async fn renames_registered_sole_pane_broadcasts_and_retitles_tab() {
+        let (state, router) = app_with_state();
+        let mut rx = state.broadcast_tx.subscribe();
+        state
+            .pane_tabs
+            .lock()
+            .unwrap()
+            .insert("pane-123".to_string(), "tab-1".to_string());
+        state.tabs.lock().unwrap().insert(
+            "tab-1".to_string(),
+            TabRecord {
+                id: "tab-1".to_string(),
+                title: None,
+                pane_id: "pane-123".to_string(),
+                kind: "shell".to_string(),
+            },
+        );
+
+        let (status, body) = patch_pane_on(router, "pane-123", "My New Title").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], json!("ok"));
         assert_eq!(body["data"]["paneId"], json!("pane-123"));
+        assert_eq!(body["data"]["tabId"], json!("tab-1"));
+        assert_eq!(body["data"]["tabRenamed"], json!(true));
+        assert_eq!(body["message"], json!("pane renamed"));
+
+        let frame = rx.recv().await.expect("pane.rename broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["type"], json!("ui.command"));
+        assert_eq!(msg["command"], json!("pane.rename"));
+        assert_eq!(msg["payload"]["tabId"], json!("tab-1"));
+        assert_eq!(msg["payload"]["paneId"], json!("pane-123"));
+        assert_eq!(msg["payload"]["title"], json!("My New Title"));
+
+        assert_eq!(
+            state
+                .tabs
+                .lock()
+                .unwrap()
+                .get("tab-1")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("My New Title")
+        );
+    }
+
+    /// `tabRenamed` is `listPanes(tabId).length === 1` (`router.ts:1414`), so
+    /// renaming one pane of a two-pane tab leaves the tab title alone but
+    /// still broadcasts the pane.rename ui.command.
+    #[tokio::test]
+    async fn renames_pane_in_multi_pane_tab_keeps_tab_renamed_false() {
+        let (state, router) = app_with_state();
+        let mut rx = state.broadcast_tx.subscribe();
+        {
+            let mut pane_tabs = state.pane_tabs.lock().unwrap();
+            pane_tabs.insert("pane-1".to_string(), "tab-1".to_string());
+            pane_tabs.insert("pane-2".to_string(), "tab-1".to_string());
+        }
+
+        let (status, body) = patch_pane_on(router, "pane-1", "Left").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["paneId"], json!("pane-1"));
         assert_eq!(body["data"]["tabRenamed"], json!(false));
         assert_eq!(body["message"], json!("pane renamed"));
+
+        let frame = rx.recv().await.expect("pane.rename broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("pane.rename"));
+        assert_eq!(msg["payload"]["tabId"], json!("tab-1"));
+        assert_eq!(msg["payload"]["title"], json!("Left"));
+
+        // No tabs record was created or retitled for the two-pane tab.
+        assert!(state.tabs.lock().unwrap().is_empty());
+    }
+
+    /// Legacy's unknown-pane answer is NOT a 404: `resolvePaneTarget` falls
+    /// back to the raw id (`router.ts:530-537`), `renamePane` answers
+    /// `{message:'pane not found'}` (`layout-store.ts:562`), the
+    /// `result?.tabId` guard (`router.ts:1411`) suppresses every side effect,
+    /// and `:1423` still responds 200 ok. The 404/409 branch only fires for
+    /// tab.pane-index/ambiguous-title messages, which raw pane ids never
+    /// produce.
+    #[tokio::test]
+    async fn unknown_pane_is_200_ok_envelope_pane_not_found_and_no_broadcast() {
+        let (state, router) = app_with_state();
+        let mut rx = state.broadcast_tx.subscribe();
+
+        let (status, body) = patch_pane_on(router, "no-such-pane", "Title").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["message"], json!("pane not found"));
+        assert_eq!(body["message"], json!("pane not found"));
+        assert!(
+            rx.try_recv().is_err(),
+            "the miss path must not broadcast or mutate anything"
+        );
     }
 
     /// `parseRequiredName(undefined) -> undefined` -> 400 `'name required'`
