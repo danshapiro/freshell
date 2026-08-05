@@ -41,3 +41,21 @@ Each entry: timestamp, category (PROCESS / TECH / REPO), learning.
   exploration context is preserved in the session, so recovery is cheap vs restarting.
 - **00:57 PROCESS** — Pipeline waves: don't serialize phases. Launched the DIAG-04 (perf
   logging) implementation worker from orchestrator-verified context while audits still run.
+- **05:30 PROCESS** — Rebase-in-worker works for conflicts: EXT-01's cherry-pick conflicted
+  with landed EXT-02/EXT-04 changes; instructing the worker session to `git rebase
+  parity-campaign-20260805` in its own worktree and integrate both behaviors resolved it
+  without orchestrator hand-editing. Reserve orchestrator manual resolution for trivial
+  conflicts (SYNC-02's import-formatting conflict took 2 minutes by hand).
+- **06:20 PROCESS** — Salvage-the-dirty-work pattern: SESSION-04's fix session timed out AFTER
+  fixing both compile errors but BEFORE amending. The orchestrator amended the worker's dirty
+  changes directly — always inspect a "failed" worker's worktree before retrying; the fix is
+  often already sitting there uncommitted.
+- **06:45 PROCESS** — Environment-sensitive tests are a Kimi blind spot: AUTO-10's real-shell
+  route test failed 3 identical rounds until explicitly instructed to make it deterministic
+  (seed registry state instead of spawning a shell). Workers don't internalize "your test runs
+  on a different host" without being told.
+- **07:00 STATS** — Final tally: 28 checklist items landed + 1 AUDIT_WRONG (already done) +
+  1 dropped (SESSION-21: 3 sessions, zero output) + 1 cut at deadline (AUTO-05, dirty
+  uncommitted). ~35 Kimi worker/auditor/fix sessions total. Every landed diff passed
+  targeted cargo/vitest verification on the integration branch; full workspace gates run at
+  the end. First-pass worker success ~30%; with fix loops + fresh-session recovery ~90%.

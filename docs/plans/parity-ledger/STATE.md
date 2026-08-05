@@ -13,13 +13,14 @@
 - Commits use explicit pathspecs. Perf watched continuously (don't crash the 32-core/49Gi box).
 - Baseline suite must be green before merging implementation work.
 
-## Phase status
-- [x] AGENTS.md port fix (committed 47f5c68f5)
-- [ ] Baseline: npm test + cargo test running in bg (PID 2698087, logs /tmp/parity/logs/baseline-*.log)
-- [ ] Phase 0 audit: 16 Kimi auditors → /tmp/parity/audit/*.yaml → docs/plans/parity-ledger/audit/
-- [ ] Triage → waves
-- [ ] Wave 1: perf logging (user-prioritized) + P0 gaps
-- [ ] Final gates + write-up (WRITEUP.md)
+## Phase status (final, 07:05)
+- [x] AGENTS.md port fix (47f5c68f5)
+- [x] Baseline: cargo workspace GREEN; npm suite green except pre-existing api-edge-cases __proto__ failure
+- [x] Phase 0 audit: 18 auditors, 235 items re-verdicted (audit/*.yaml)
+- [x] Implementation waves: 28 items landed (see CAMPAIGN-RESULTS.md)
+- [x] DIAG-04 perf logging landed (user priority)
+- [ ] Final gates: cargo --workspace + npm test running (logs /tmp/parity/logs/gate-*.log)
+- [x] WRITEUP.md + LEARNINGS.md + CAMPAIGN-RESULTS.md written
 
 ## Scratch layout
 - /tmp/parity/sections/  — checklist split by section
