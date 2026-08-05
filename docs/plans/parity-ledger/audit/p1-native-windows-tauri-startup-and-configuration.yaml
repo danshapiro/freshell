@@ -1,0 +1,111 @@
+- id: TAURI-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/config.rs:26-31 — config_dir() resolves FRESHELL_HOME first, then HOME; returns None if neither set"
+    - "test: config_dir_prefers_freshell_home in crates/freshell-tauri/src/config.rs:155 — asserts FRESHELL_HOME wins over HOME and HOME is the fallback"
+    - "grep for USERPROFILE over crates/ — hits only in freshell-freshagent/freshell-ws/freshell-platform/freshell-server (e.g. crates/freshell-server/src/session_directory.rs:441-457, which is the spawned SERVER's own home resolution), ZERO hits in crates/freshell-tauri/src"
+    - "grep for webview2|user_data|data_directory over crates/freshell-tauri/src and tauri.conf.json — no WebView2 user-data-folder or profile-path isolation configured anywhere (renderer_recovery.rs:33 only mentions WebView2 ProcessFailed in a doc comment)"
+  missing: "No %USERPROFILE% fallback when HOME is absent (on native Windows config_dir() returns None, so desktop.json read/writes silently disable and window state stops persisting); no isolation of WebView2 user-data/profile paths under the Freshell home"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/config.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/tauri.conf.json
+
+- id: TAURI-02
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/config.rs:41-48 — read_config_at parses desktop.json, malformed file is a hard error (not silently overwritten); missing file -> {}"
+    - "test: read_malformed_is_error, read_missing_is_empty_object, patch_round_trips_atomically in crates/freshell-tauri/src/config.rs:120-152 — merge preserves unknown keys losslessly across saves"
+    - "crates/freshell-tauri/src/lib.rs:308-318 — cold start reads desktop.json ONLY for windowState via load_persisted_window_state; window-state load/save tested by load_full_window_state_round_trips, load_partial_window_state_fills_defaults, save_preserves_other_config_keys in crates/freshell-tauri/src/window_state.rs:239-314"
+    - "crates/freshell-tauri/src/lib.rs:96-104 + provisioning.rs:162-177 — boot resolves remote ONLY from env pair or one-shot desktop.provision file; a pre-existing desktop.json with serverMode:'remote' is NOT honored on cold start"
+    - "crates/freshell-tauri/src/lib.rs:536 — global hotkey registered from hotkey::DEFAULT_HOTKEY constant ('CommandOrControl+`'), never read from desktop.json.globalHotkey"
+    - "crates/freshell-tauri/src/tray.rs:83-245 — TrayStatus carries only running+mode; minimizeToTray/startOnLogin config keys never read"
+  missing: "Cold-start honoring of serverMode/port/remoteUrl+remoteToken from an existing desktop.json (only provisioning path reads them); knownServers never read; chooser policy (alwaysAskOnLaunch) not consumed at boot (only inside get_launch_options command, commands.rs:366-386); globalHotkey and tray behavior (minimizeToTray/startOnLogin) not honored; no schema validation equivalent to DesktopConfigSchema (no version/type rejection); no backup/reset/edit recovery path for malformed/unsupported config — malformed falls back to window-state defaults silently and launch proceeds"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/config.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/hotkey.rs
+    - crates/freshell-tauri/src/tray.rs
+    - crates/freshell-tauri/src/state_machine.rs
+
+- id: TAURI-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/state_machine.rs:18-122 — explicit Boot->(Wizard|Chooser|Main)->Exiting state machine: decide_initial_phase (no config/setupCompleted=false -> Wizard; app-bound/daemon/remote -> Main), pure transition(), and runnable_phase() which DEGRADES Wizard/Chooser to Main because their windows are 'deferred to Phase 3.14'"
+    - "test: unconfigured_app_decides_wizard, configured_app_bound_decides_main, configured_daemon_and_remote_also_reach_main, boot_resolves_to_decided_phase, aux_windows_return_to_boot_not_recursion, chooser_selection_advances_to_main, quit_from_any_phase_exits, main_ignores_aux_close in crates/freshell-tauri/src/state_machine.rs:124-215"
+    - "crates/freshell-tauri/src/lib.rs:136-148 — the ONLY wired path forces BootInputs{setup_completed:true, AppBound} and debug_asserts the phase is Main; an unconfigured desktop boots straight to Main (Wizard never constructed)"
+    - "crates/freshell-tauri/src/windows.rs:40-78 — wizard/chooser window specs + per-window trust gating exist; commands.rs registers complete_setup/get_launch_options/choose_launch_option; but restartMain re-derive and window construction are documented as deferred (commands.rs:19-24)"
+  missing: "Actual routing execution: no config->wizard never constructs the wizard window (exprunnable degrades to Main); forced/ambiguous/unavailable target->chooser window not constructed (chooser + restartMain transition deferred); daemon->service path absent entirely (daemon managers unwired, ServerMode::Daemon is decision-only); 'exactly one appropriate window' unverifiable headlessly and not enforced"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/state_machine.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/windows.rs
+    - crates/freshell-tauri/src/commands.rs
+
+- id: TAURI-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/shim.rs:65-90 — build_load_url percent-encodes the token with an exact encodeURIComponent clone; tests load_url_percent_encodes_special_token ('a b+c&d#e/f' -> a%20b%2Bc%26d%23e%2Ff) and encode_uri_component_matches_js_semantics cover +, &, #, /, spaces, UTF-8"
+    - "src/lib/auth.ts:31-49 (shared SPA, loaded unchanged by the Tauri webview) — initializeAuthToken reads ?token=, stores it, then window.history.replaceState scrubs the query; covered by replaceState assertions in test/unit/client/lib/auth.test.ts:80-202"
+    - "crates/freshell-tauri/src/lib.rs:458-464 — redact_token strips ?token= from the shell's own log lines; test redact_token_hides_the_credential (lib.rs:600)"
+    - "crates/freshell-tauri/src/server.rs:153-174 + lib.rs:150-154 — app-bound ALWAYS allocates an ephemeral port and generates a fresh 128-bit hex token per boot; no desktop-config/.env/legacy-config.json token or port precedence resolution exists (reference: electron/entry.ts:282 port = desktopConfig.port ?? 3001, electron/startup.ts:295,377 readEnvToken(.env), electron/token-resolver.ts:13-38 .env then legacy config.json)"
+  missing: "Reuse of the configured app-bound port and legacy .env config.json token with documented precedence (desktop config /.env / legacy config) — Rust deliberately regenerates both each boot (server.rs:166-167 documents the divergence); missing .env AUTH_TOKEN parsing (extractTokenFromEnv analog) and config.json authToken/token fallback; no test proving the bootstrap URL never enters retained traces/logs/history/screenshots (only the eprintln redaction is tested), no launch-recorder contract"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/config.rs
+    - crates/freshell-tauri/src/shim.rs
+
+- id: TAURI-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/commands.rs:331-333 — is_port_available bind-check (listen on 0.0.0.0, errs toward occupied), the analog of electron/port-check.ts:11-21"
+    - "test: is_port_available_true_for_free_port and is_port_available_false_for_occupied_port in crates/freshell-tauri/src/commands.rs:730-746"
+    - "crates/freshell-tauri/src/commands.rs:410-416 — chooser start-local path rejects an occupied port with 'Port {port} is already in use. Choose a different port, or connect to that server.' (change path exists in the chooser command)"
+    - "crates/freshell-tauri/src/server.rs:213-239 — reap only ever signals the owned Child handle; an external port occupant is never killed (no pkill anywhere)"
+    - "crates/freshell-tauri/src/health.rs:101-125 — http_probe can detect a 200 from /api/health on an occupied port (primitive for compatibility detection), tested by http_probe_reports_ready_against_a_200_stub"
+  missing: "No boot-time collision handling at all: app-bound startup always silently takes an EPHEMERAL port (server.rs:157-162 allocate_ephemeral_port, lib.rs:152) so the configured port is never probed or bound; no compatible-Freshell-occupant identification (http_probe result is never classified, no /api/health identity/version check); no connect/change/retry offer when the configured port is occupied; chooser window that would present the choices is deferred to Phase 3.14"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/health.rs
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/src/lib.rs
+
+- id: TAURI-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/server.rs:133-151 — resolve_server_binary: FRESHELL_SERVER_BIN env override FIRST, else sibling of current_exe (works for the dev target/<profile>/ layout and any installed layout that places the server beside the app exe); sibling_server_binary handles the .exe suffix — test sibling_binary_uses_exe_suffix (server.rs:349-359)"
+    - "crates/freshell-tauri/tests/server_spawn_smoke.rs:21-37,40-106 — headless integration test discovers the binary via env-or-sibling and drives real spawn/health/reap end-to-end (soft-skips when unbuilt)"
+    - "crates/freshell-tauri/tauri.conf.json:24-28 — bundle.active is FALSE and there is no externalBin/sidecar/resources entry, so no installed-layout bundling of freshell-server is established in the Rust port"
+  missing: "Item requires resolution 'without relying on environment overrides' — FRESHELL_SERVER_BIN is the primary lookup here; installed/packaged layout (sidecar inside app resources) is not configured (bundle.active:false, no externalBin); no existence/permission preflight — resolve returns a path without checking it exists or is executable, so a missing binary surfaces only as a raw spawn io::Error, not a clear 'server binary missing at X' startup UI; no spaced/Unicode-path-specific test (PathBuf joins are space-safe by construction but nothing exercises it)"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/tauri.conf.json
+    - crates/freshell-tauri/src/lib.rs
+
+- id: TAURI-07
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/server.rs:116-126 — spawn_server explicitly DISCARDS stdout (Stdio::null) and only INHERITS stderr (Stdio::inherit); no piping, capture, or structured diagnostics storage"
+    - "crates/freshell-tauri/src/health.rs:31-52,68-95 — supervision exists: fail-fast HealthError::ChildExited ('server process exited before health check succeeded') and Timeout; test poll_fails_fast_when_child_exits"
+    - "crates/freshell-tauri/src/lib.rs:178-186 — a health-gate failure reaps the child and aborts the launch with an eprintln; failed Tauri build also reaps (lib.rs:110-118)"
+    - "test: app_bound_spawn_health_reap_end_to_end in crates/freshell-tauri/tests/server_spawn_smoke.rs asserts Graceful reap and that the port is released afterward (reaping covered); reap tests in server.rs:410-451"
+  missing: "The capture half of the item: child stdout/stderr are discarded/inherited rather than piped and stored as structured diagnostics; no redaction of captured output into desktop logs; the visible startup failure contains only the generic health reason (ChildExited/Timeout), not any safe excerpt of the child's own output; child reaping + failure surface exist (that half is done)"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/health.rs

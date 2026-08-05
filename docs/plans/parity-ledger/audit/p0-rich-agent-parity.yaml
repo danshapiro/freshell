@@ -1,0 +1,297 @@
+# P0 rich-agent parity audit. NOTE: audit was cut short mid-investigation; items marked
+# UNCLEAR/PARTIAL with low confidence were not fully examined. Evidence below cites only
+# lines/test names actually observed by the auditor.
+
+- id: AGENT-01
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-freshagent/src/{claude.rs,codex.rs,opencode_ws.rs} exist as provider implementations (2788/7253/2912 lines respectively, wc -l observed)"
+    - "crates/freshell-freshagent/src/lib.rs:1365-1374 — one shared axum router (tabs/panes/send-keys/capture/wait-for + merged pane_ops router) serving the fresh-agent surface"
+    - "grep -ri kilroy crates/ matched crates/freshell-protocol/src/common.rs, crates/freshell-server/src/session_metadata.rs, crates/freshell-ws/src/terminal.rs — kilroy is at least typed/named in Rust"
+  missing: "Confirmed kilroy create/send through the shared WS+REST orchestration paths; explicit verification that all providers (claude, codex, opencode, kilroy) go through one provider-neutral dispatch for both create and send. Crates-with-tests confirmation per provider not completed."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-freshagent/src/claude.rs
+    - crates/freshell-freshagent/src/opencode_ws.rs
+
+- id: AGENT-02
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-freshagent/src/codex.rs:5225 — test: handle_create_with_resume_session_id_resumes_the_same_thread"
+    - "crates/freshell-freshagent/src/codex.rs:5288 — test: handle_create_with_resume_on_genuinely_missing_thread_emits_create_failed"
+    - "crates/freshell-freshagent/src/codex.rs:5356 — test: handle_create_with_resume_wrong_thread_id_fails_create_and_never_adopts"
+    - "crates/freshell-ws/tests/freshagent_claude_attach.rs exists (ls) — claude attach coverage"
+    - "test/e2e-browser/specs/restore-matrix.spec.ts exists (ls) — restart/resume scenario spec"
+  missing: "'Exactly three user/assistant turn pairs' leg (documented fixture-limited in section notes as unprovable against the shared fixture); verified opencode + kilroy attach/resume/hydration legs; audit of dedup-no-duplicate-turns per provider incomplete."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-freshagent/src/claude.rs
+    - crates/freshell-freshagent/src/snapshot.rs
+    - crates/freshell-ws/src/auto_resume.rs
+
+- id: AGENT-03
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs exists (ls) — claude kill/interrupt coverage"
+    - "crates/freshell-codex/tests/interrupt_rpc.rs exists (ls) — codex interrupt RPC test"
+    - "crates/freshell-server/src/main.rs:259-260 — comment: post-handshake WS loop dispatches freshAgent.create/send/kill/interrupt for opencode"
+    - "crates/freshell-freshagent/src/session_lease.rs (516 lines) — session lease/ownership machinery exists"
+  missing: "Verified per-provider matrix that interrupt preserves session while kill clears ownership (lease/pane-ledger) with tests; 'no completion sound fires for either action' leg; opencode kill/interrupt tests not confirmed."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-freshagent/src/session_lease.rs
+    - crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs
+
+- id: AGENT-04
+  verdict: MISSING
+  confidence: low
+  evidence:
+    - "grep for 'freshAgent.compact' in crates/freshell-freshagent/src/terminal_tabs.rs and crates/freshell-freshagent/src/lib.rs returned no hits (audit ran out of time before searching codex.rs/claude.rs/opencode_ws.rs exhaustively)"
+  missing: "All clauses located: forward compact requests, compacting status exposure, durable-session preservation, return-to-idle. POSSIBLY present in provider files not searched — treat as unconfirmed absence, not proof of absence."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-freshagent/src/codex.rs
+
+- id: AGENT-05
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/src/{client_messages.rs,server_messages.rs,common.rs} contain freshAgent.* message strings (grep file-list hit incl. approve/permission patterns) — approval-related protocol frames plausibly exist, but no implementation/test site was confirmed before time expired"
+  missing: "Unexamined: pending-approval presentation, Allow/Always-Allow(session-scoped)/Deny with request correlation, freshAgent.permission.cancelled removing card without inventing a decision."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-freshagent/src/opencode_ws.rs
+    - crates/freshell-protocol/src/common.rs
+
+- id: AGENT-06
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: provider question rendering support, single-choice/multi-select/Other free-text validation, resume-of-correct-turn. No greps on 'question'/'answer' were run before time expired."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-protocol/src/client_messages.rs
+
+- id: AGENT-07
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-ws/tests/codex_fork_rebind.rs exists (ls) — codex fork rebind coverage implies a Rust fork path exists somewhere (implementation site not read)"
+  missing: "Located fork implementation per provider; verified 'new durable identity while source conversation unchanged' semantics with tests; fork-from-selected-turn/checkpoint granularity."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-ws/tests/codex_fork_rebind.rs
+
+- id: AGENT-08
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:1370 — route POST /api/panes/{id}/send-keys wired in the fresh-agent router"
+    - "crates/freshell-freshagent/src/lib.rs:653 — comment: send-keys/freshAgent.send materializes a real ses_ opencode session (single durable id per pane)"
+    - "test/e2e-browser/specs/agent-continuity-matrix.spec.ts exists (ls); section records it green on rust-chromium 2026-07-20 (one durable id across three REST send-keys; distinct id for second pane; cumulative context 1->2->3)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-09
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-server/src/main.rs:1090-1091 — comment: GET /api/fresh-agent/threads/:sessionType/:provider/:threadId thread-snapshot REST endpoint mounted"
+    - "crates/freshell-freshagent/src/snapshot.rs (557 lines) and claude_snapshot.rs — snapshot machinery exists"
+    - "crates/freshell-freshagent/tests/transcript_cwd_export.rs exists (ls) — transcript-related integration test"
+  missing: "Paged-turn API (cursor + revision) — no evidence seen; error cases invalid cursor / revision mismatch / missing-ambiguous turn / body-size pagination unverified."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/snapshot.rs
+    - crates/freshell-server/src/main.rs
+
+- id: AGENT-10
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: model/capability metadata exposure, cache correctness, refresh-without-restart endpoint. No greps on 'models'/'refresh' were run before time expired."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-11
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: attachment routes/upload handling, size/type limits, name sanitization, isolated storage, history metadata. No greps on 'attach'/'multipart' were run before time expired (likely a gap — attachments were never observed in the fresh-agent router at lib.rs:1365-1374)."
+  effort: L
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-12
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: per-send model/effort/sandbox/permission/plugin choices parsed from freshAgent.send and forwarded in provider payloads; model persistence through the durable turn schema. Not grepped before time expired."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-freshagent/src/codex.rs
+
+- id: AGENT-13
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: legacy command-execution and diff API surface (bounded buffered result, cwd semantics incl. cwd outside allowedFilePaths). Not grepped before time expired; neither endpoint was seen in the fresh-agent router (lib.rs:1365-1374)."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+    - crates/freshell-freshagent/src/pane_ops.rs
+
+- id: AGENT-14
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/checkpoints.rs — 1605 lines with an extensive test module (#[test] fns at lines 694, 704, 712, 953, 960+ observed via grep)"
+    - "crates/freshell-server/src/main.rs:1121 — comment: POST /api/fresh-agent/checkpoints mounted with home-dir handling"
+    - "test/e2e-browser/specs/agent-checkpoint-rewind.spec.ts exists (ls) — UI rewind e2e (green on chromium/legacy-chromium per section; rust-chromium UI-gesture leg explicitly documented as a fixture/client timing limitation, routes proven by crate tests)"
+    - "Section documents commit 96e354ea porting list/restore/metadata routes with 41 Rust tests incl. end-to-end create->list->mutate->restore->verify-bytes over real HTTP routes"
+  missing: "PW-RUST UI-gesture leg on rust-chromium only (shared-fixture local-echo timing); Rust routes themselves fully ported and crate-tested."
+  effort: S
+  files:
+    - crates/freshell-server/src/checkpoints.rs
+
+- id: AGENT-15
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: Freshell MCP tool injection into claude (and other providers), tool discovery preservation, provider-neutral tool-call routing. No greps on 'mcp' in crates/ were completed before time expired."
+  effort: L
+  files:
+    - crates/freshell-freshagent/src/claude.rs
+
+- id: AGENT-16
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-server/src/main.rs:209-211 — comment: all fresh-agent producers push onto one broadcast bus that every /ws connection fans out (i.e., events are globally broadcast, not per-session scoped)"
+    - "crates/freshell-server/src/main.rs:220-232 — codex/claude/opencode fresh-agent slices share the same broadcast bus and auth token"
+    - "crates/freshell-freshagent/src/lib.rs:582-583 — created/send.accepted/materialized frames broadcast onto the shared bus"
+  missing: "Per-client/session event scoping and attach/send authorization (shared-bus fanout suggests global broadcast — isolation clauses likely UNMET but not disproven by targeted search); durable-ID+cwd-route OpenCode isolation proof; reconnect authorization retention."
+  effort: L
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-ws/src/lib.rs
+
+- id: AGENT-17
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-freshagent/src/spawn_gate.rs (648 lines) — spawn gating machinery exists"
+    - "crates/freshell-ws/tests/restore_storm.rs exists (ls) — respawn/storm bounding coverage"
+    - "crates/freshell-freshagent/src/codex.rs:5356 — test covers never adopting a wrong/gone thread on recovery"
+  missing: "Verified per-provider: dead runtime-entry removal, explicit 'exited' status emission, lazy respawn resuming same durable session with no duplicate live record. Not grepped ('exited'/'respawn') before time expired."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/spawn_gate.rs
+    - crates/freshell-freshagent/src/codex.rs
+
+- id: AGENT-18
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: server-authoritative waiting/completion edge emission and dedup across duplicate/out-of-order edges and restart/replay. No greps on 'waiting'/'monotonic' were run before time expired."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+
+- id: AGENT-19
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:1784 — {\"type\": \"freshAgent.error\"} frame construction exists"
+    - "crates/freshell-server/src/checkpoints.rs — test module covers auth/400/404 error parity for the checkpoint routes (per section notes; test fns observed at lines 694-960+)"
+    - "crates/freshell-freshagent/src/codex.rs:5288 — create failure surfaces as explicit create-failed error (lost-session category, codex)"
+  missing: "Verified stable 400/404/409/502/503 mapping table for all 9 categories: invalid cursor/display ID, revision mismatch, ambiguous turn, missing turn, unavailable runtime, unsupported capability, lost session, locator mismatch, malformed provider output — only lost-session (codex) and checkpoint 400/404 have observed evidence."
+  effort: L
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+    - crates/freshell-freshagent/src/snapshot.rs
+    - crates/freshell-server/src/checkpoints.rs
+
+- id: AGENT-20
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:1365-1374 — fresh-agent router lists tabs/panes/send-keys/capture/wait-for + merged pane_ops::router; no '/api/fresh-agent/send' literal observed here (pane_ops.rs, 1988 lines, not read — route may live there)"
+  missing: "Unconfirmed existence of the standalone endpoint; if present, unverified: submittedTurnId return, no-side-effect-conversation, and missing/ambiguous/lost/wrong-provider locator handling."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/pane_ops.rs
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-21
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:1976-2012 — read directly: provider-generic single-flight + replay cache for freshAgent.create keyed by requestId; identical-requestId create on reconnect replays cached freshAgent.created (no new spawn at 2063); caches cleared only from freshAgent.kill handler per 2012 comment"
+  missing: "Send idempotency (duplicate send returns original submitted turn — no code seen); fork idempotency; payload-mismatch-reusing-an-ID conflict-without-mutation leg."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-22
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:2522 — test assertion: assert_eq!(wire[\"type\"], \"freshAgent.session.materialized\")"
+    - "crates/freshell-freshagent/src/lib.rs:582-583 — materialized frame broadcast onto the shared bus alongside created/send.accepted"
+    - "crates/freshell-freshagent/src/lib.rs:1976-2063 — create dedup replay cache prevents a second spawn/materialization on reconnected create (supports exactly-once)"
+  missing: "Verified single effective sessions.changed pairing; placeholder fully absent from DOM/layout/API/MCP after materialization; reload/restart resumes final id without re-emitting the event."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/lib.rs
+    - crates/freshell-freshagent/src/opencode_ws.rs
+
+- id: AGENT-23
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-freshagent/src/lib.rs:677-688 — freshell_opencode::Route built from cwd string; get_session/list_messages keyed by (thread_id, route) — durable-ID + cwd-route locator shape exists"
+    - "crates/freshell-opencode/ crate exists — opencode serve/session manager home"
+    - "crates/freshell-server/src/main.rs:1395 area references legacy serve-manager.ts:573-591 mapping (process reuse mapping noted, not read in full)"
+  missing: "Verified one long-lived shared opencode serve process with distinct per-route sessions; cross-root isolation tests (sends/events/transcript/permissions cannot cross cwd roots)."
+  effort: M
+  files:
+    - crates/freshell-opencode
+    - crates/freshell-freshagent/src/lib.rs
+
+- id: AGENT-24
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "grep -ri kilroy crates/ --include=*.rs matched: crates/freshell-protocol/src/common.rs, crates/freshell-server/src/session_metadata.rs, crates/freshell-ws/src/terminal.rs, crates/freshell-ws/src/lib.rs, crates/freshell-freshagent/src/claude.rs, crates/freshell-freshagent/src/snapshot.rs, crates/freshell-freshagent/src/claude_snapshot.rs — kilroy is named/typed across protocol, ws and freshagent crates"
+  missing: "Established full kilroy lifecycle parity: create, attach/resume, send, approvals, questions, waiting/completion, reload/restart hydration, crash recovery, independent-availability gating. Only naming-level presence confirmed; implementation depth unexamined. Verdict may range from PARTIAL to near-MISSING pending that read."
+  effort: L
+  files:
+    - crates/freshell-protocol/src/common.rs
+    - crates/freshell-freshagent/src/claude.rs
+
+- id: AGENT-25
+  verdict: UNCLEAR
+  confidence: low
+  evidence: []
+  missing: "Unexamined: registered provider capability matrix exposure in Rust and server-side gating of interrupt/kill/compact/fork/approvals/questions/model-refresh/attachments/per-send-choices with explicit unsupported-cell behavior. No greps on 'capabilit' were run before time expired."
+  effort: L
+  files:
+    - crates/freshell-protocol/src/common.rs
+    - crates/freshell-freshagent/src/lib.rs

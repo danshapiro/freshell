@@ -1,0 +1,149 @@
+- id: TAURI-21
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/lib.rs:354-371 — the only on_window_event handler matches Moved|Resized for state save; there is NO CloseRequested interception / close-to-tray anywhere in the crate"
+    - "crates/freshell-tauri/src/window_state.rs:273,288 — 'minimizeToTray' appears ONLY as fixture data in a config-preservation test, never as implemented behavior"
+    - "rg 'minimizeToTray|minimize_to_tray|CloseRequested' across crates/ finds no implementation; reference behavior is electron/main.ts:40-48 (close → preventDefault + hide when minimizeToTray)"
+    - "crates/freshell-tauri/src/config.rs — no field/handler for minimizeToTray; config is raw serde_json with no typed DesktopConfig"
+  missing: "all clauses — no minimizeToTray read from desktop.json, no native-close hides-when-enabled, no exits-when-disabled (isQuitting flag) semantics, no restoring-same-page/state guarantee wiring, no tests"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/config.rs
+
+- id: TAURI-22
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/tray.rs:83-121 — build_menu_model produces Show/Hide, sep, 'Server: Running|Stopped' + 'Mode: {mode}' (disabled), sep, Settings, Check for Updates, Quit"
+    - "crates/freshell-tauri/src/tray.rs:125-133,199-208 — action_for_menu_id routing + dispatch (Show/Settings→show_and_focus_main, CheckUpdates→emit event, Quit→app.exit(0)); build_tray seam at :214-241 incl. left-click show/focus"
+    - "test: menu_model_has_the_reference_shape, status_line_reflects_running_state, mode_line_shows_the_mode, status_lines_are_disabled, menu_ids_route_to_actions, disabled_and_unknown_ids_have_no_action in crates/freshell-tauri/src/tray.rs"
+    - "crates/freshell-tauri/src/lib.rs:552-554,573-593 — tray Check-for-Updates listener → report_updater_state reading real tauri.conf.json plugins.updater config; updater decision logic tested (should_update_offers_newer_only, check_manifest_offers_for_matching_platform, updater_state_reflects_config_presence in updater.rs)"
+    - "crates/freshell-tauri/src/tray.rs:245-254 — refresh_tray_status defined but grep finds NO caller outside tray.rs; lib.rs:541-544 builds the tray ONCE with hardcoded running:true → status/mode frozen at boot, no crash/restart live update"
+    - "crates/freshell-tauri/src/tray.rs:43-53,27-31 — no Hide action (Show only, flagged as faithful replication of the reference's show-only quirk); Settings only shows+focuses (matches reference electron/entry.ts:429-435 which also only shows+focuses)"
+  missing: "live status refresh — refresh_tray_status never driven by any server-liveness watcher so 'reflect current state' after child crash/restart is absent; no Hide handler; live updater check/apply is signing-gated (placeholder pubkey in tauri.conf.json:18 → DisarmedNoPubkey)"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/tray.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/updater.rs
+
+- id: TAURI-23
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/hotkey.rs:172-194 — translate_accelerator (Electron→tauri-plugin-global-shortcut grammar) heavily tested: translates_the_reference_default, command_or_control_variants_canonicalize, maps_modifiers_to_tauri_spelling, maps_letters_digits_and_function_keys, maps_named_and_arrow_keys, maps_punctuation_keys, rejects_modifier_only_and_empty, reference_table_all_translate"
+    - "crates/freshell-tauri/src/hotkey.rs:219-279 — HotkeyManager register/unregister/update state machine, tested with FakeBackend: manager_registers_translated_accelerator, manager_update_unregisters_old_then_registers_new, manager_unregister_clears_current_and_is_idempotent"
+    - "crates/freshell-tauri/src/lib.rs:476-500,506-528,536 — plugin registered with toggle handler; register_global_hotkey called with hotkey::DEFAULT_HOTKEY (hardcoded, never reads desktop.json globalHotkey)"
+    - "crates/freshell-tauri/src/lib.rs:86-92 — invoke_handler has no set-global-hotkey analog; HotkeyManager has NO instantiation outside its own tests (grep: no callers in lib.rs)"
+    - "crates/freshell-tauri/src/hotkey.rs:258-273 + test manager_update_failure_clears_current — on new-registration failure the manager CLEARS current (mirrors hotkey.ts), i.e. NO retain-old-working-key rollback"
+  missing: "honor the SAVED shortcut (desktop.json globalHotkey never read at boot — always default); no change-shortcut IPC command so safe change is unreachable from UI; no retain-old-working-key-on-conflict rollback; error only eprintln'd (lib.rs:524-526), no user-visible error"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/hotkey.rs
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/config.rs
+
+- id: TAURI-24
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "rg 'startOnLogin|start_on_login|Task Scheduler|schtasks|Startup' across crates/freshell-tauri finds no implementation (only unrelated 'startup.ts' doc comments and a state-machine 'Startup' phase comment)"
+    - "crates/freshell-tauri/Cargo.toml — no launch-at-login/auto-start dependency; tauri.conf.json:1-29 has no autostart plugin"
+    - "reference electron/types.ts:17 + desktop-config.ts:23 only declare the schema default; the legacy control was unimplemented per the item text itself"
+    - "validation (per-user Windows Task Scheduler entry, sign-in simulation) can only run on a Windows host — none exists in repo either"
+  missing: "all clauses — no per-user Windows Task Scheduler entry creation/removal, no safely quoted task, no enable/disable wiring, no config read/write, no tests; new product work not started"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/config.rs
+    - crates/freshell-tauri/Cargo.toml
+
+- id: TAURI-25
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/window_state.rs:74-100 — load_from_config (per-field defaults, window-state.ts parity); :108-117 save_into_config preserves every other desktop.json key; :167-217 clamp_to_monitors (off-screen recenter, edge shift, shrink-to-fit, empty-monitor no-op)"
+    - "crates/freshell-tauri/src/lib.rs:270-306 — restore saved x/y/w/h clamped on-screen + maximize if saved maximized; :350-371 debounced 500 ms save on Moved/Resized; :376-414 save via inner_position/inner_size with scale_factor logical conversion (DPI) and atomic write through config.rs:69-82"
+    - "test: load_missing_window_state_returns_defaults, load_full_window_state_round_trips, load_partial_window_state_fills_defaults, save_preserves_other_config_keys, save_then_load_is_stable, on_screen_window_is_unchanged, off_screen_window_recenters_on_primary, partially_off_right_edge_shifts_into_view, window_larger_than_monitor_is_shrunk, window_on_secondary_monitor_stays_there, empty_monitor_list_returns_bounds_unchanged (window_state.rs); patch_round_trips_atomically (config.rs:135)"
+    - "crates/freshell-tauri/src/config.rs:54-64,86-94 — merge_patch/patch_config_at give single-writer merge-preserving semantics; concurrency vs other desktop keys = atomic tmp+rename write, tested"
+    - "note: live multi-monitor/DPI-tolerance Playwright validation (PW-TAURI-WIN) is Windows host-limited and not present; code+unit coverage of every listed clause exists"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-tauri/src/window_state.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/config.rs
+
+- id: TAURI-26
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-tauri/src/lib.rs:69-80 — tauri_plugin_single_instance::init registered FIRST with focus callback (unminimize+show+set_focus on the main window); comment :69-70 documents second-launch focus-first semantics (main.ts:24-28,63-70 parity)"
+    - "crates/freshell-tauri/src/lib.rs:132-176 — server spawn happens only in setup(), which the plugin prevents from running in the second process → never spawns another server (by plugin-contract, not verified by test on this host)"
+    - "crates/freshell-tauri/tests/server_spawn_smoke.rs is the only integration test and covers spawn/health/reap only — grep shows NO test exercising single-instance or the focus callback"
+  missing: "no test coverage at all for the single-instance behavior or focus callback (DONE requires at least one test); second-process prompt-exit assertion unproven; live focus/hide-relaunch validation is Windows host-limited"
+  effort: S
+  files:
+    - crates/freshell-tauri/src/lib.rs
+
+- id: TAURI-27
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "rg -i 'submenu|about|zoom|fullscreen|devtool|set_menu|app.menu' across crates/freshell-tauri/src finds only the TRAY menu (tray.rs:142-187) — no application menu built; lib.rs never calls set_menu"
+    - "crates/freshell-tauri/tauri.conf.json:1-29 — no menu configuration"
+    - "crates/freshell-tauri/src/tray.rs:142-187 — the only Menu construction is the tray context menu (Show/Hide, Settings, Check for Updates, Quit), not Edit/View/Window/Help"
+    - "no Rust counterpart of any Edit/View/Window/Help/Preferences/reload/zoom/fullscreen/DevTools gating exists; PW-TAURI-WIN harnesses absent from scripts/ and test/"
+  missing: "all clauses — Edit, View, Window, Help/About, Preferences, update, reload, zoom (in/out/reset), fullscreen, development-tools gating: no desktop application menu module, no handlers, no tests"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/Cargo.toml
+
+- id: TAURI-28
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/external_url.rs:53-69 — canonicalize_external_url: control-char reject → absolute-parse → http/https-only → embedded-credentials reject, order-matching external-url.ts:6-20; :82-86 open via single tauri_plugin_opener::open_url call (open exactly once, system browser)"
+    - "test: accepts_canonical_http_and_https, rejects_non_http_schemes (file:/javascript:/data:/ftp:/mailto:), rejects_embedded_credentials, rejects_control_characters, rejects_relative_or_garbage, control_char_predicate_boundaries in crates/freshell-tauri/src/external_url.rs"
+    - "crates/freshell-tauri/src/shim.rs:30-50 — SPA window.freshellDesktop.openExternal routes to the open_external_url command; shim tests shim_exposes_exactly_the_two_touchpoints, shim_openexternal_returns_a_promise"
+    - "crates/freshell-tauri/src/windows.rs:107-122,174-211 — is_allowed_window(OpenExternalUrl→main) exists and is tested (per_window_command_gate) but is NOT called by the command: external_url.rs:83-86 takes only `url`, no window label checks"
+    - "crates/freshell-tauri/capabilities/default.json:4-6 — only core:default granted; the file's own description states app-defined commands are NOT permission-gated, so the untrusted-frame/sender rejection has no enforcement seam"
+  missing: "untrusted-frame rejection is defined-but-not-enforced — open_external_url ignores the caller window/frame (is_allowed_window(OpenExternalUrl) never called; hostile-iframe call not blocked); exact-once + Windows Shell delivery validation is packaged-host-limited but the single-open code path is trivially satisfied"
+  effort: S
+  files:
+    - crates/freshell-tauri/src/external_url.rs
+    - crates/freshell-tauri/src/windows.rs
+
+- id: TAURI-29
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/renderer_recovery.rs:39-49 — byte-faithful constants (60 s circuit window, 3 attempts/window, 250/1000/3000 ms backoff, 15 s unresponsive threshold, -3 aborted filter); :80-95 recovery_mode_for; :123-208 RecoveryCircuit state machine"
+    - "test: did_fail_load_filters_subframe_and_aborted, crash_and_unresponsive_reload, first_recovery_is_immediate, backoff_grows_with_consecutive_failures, success_resets_backoff, after_a_failure_next_plan_is_delayed, circuit_opens_after_three_attempts_in_window, circuit_reopens_after_window_elapses, in_flight_and_scheduled_skip, watchdog_triggers_after_sustained_outage etc. in crates/freshell-tauri/src/renderer_recovery.rs"
+    - "crates/freshell-tauri/src/lib.rs:32 — 'pub mod renderer_recovery;' is the ONLY reference in lib.rs: RecoveryCircuit and ReachabilityWatchdog are never instantiated or driven by the app (grep confirms zero callers outside the module)"
+    - "crates/freshell-tauri/src/renderer_recovery.rs:5-35 — module doc itself documents the platform gap: WRY exposes no render-process-gone/did-fail-load/unresponsive signals; no WebView2 ProcessFailed hook exists anywhere in the crate"
+  missing: "real wiring — no native WebView2 renderer-failure/unresponsive event connection (platform gap, Windows host-limited by nature), no reachable driver for the watchdog/circuit, no recovery actuation (reload/load-url on the live window), no window-replacement/state-transfer, no explanation-or-manual-retry surface, no authenticated-tab restore assertion; only the pure decision core exists and is tested"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/renderer_recovery.rs
+    - crates/freshell-tauri/src/lib.rs
+
+- id: TAURI-30
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-tauri/src/health.rs:20-98 — bounded boot-time health gate (100 ms→5 s backoff, 30 s cap; test backoff_doubles_then_caps_at_5s); lib.rs:179-186 (app-bound) and :240-243 (remote) use it at boot"
+    - "crates/freshell-tauri/src/renderer_recovery.rs:216-265 — ReachabilityWatchdog implemented + tested (watchdog_ignores_outage_before_first_reachable, watchdog_triggers_after_sustained_outage, watchdog_recovery_clears_on_reachable_again) but NEVER driven at runtime (no poller in lib.rs)"
+    - "crates/freshell-tauri/src/lib.rs:216-217 — comment states the reference's chooser fallback is a deferred 3.14 window and the port fail-fasts instead: an unreachable/again-unreachable remote aborts launch, no chooser routing"
+    - "crates/freshell-tauri/src/state_machine.rs:13-16,27 — Chooser phase exists in the machine but is deferred/unconstructable (runnable_phase maps it to Main)"
+  missing: "runtime disconnected-state surface after main loads; reconnect app-bound at same URL/token (no restart-respawn of the child or reload-on-recovery wiring); bounded retries with chooser/error actions for a permanently unavailable remote (currently aborts at boot only); driving the ReachabilityWatchdog at runtime; chooser window for fallback"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/health.rs
+    - crates/freshell-tauri/src/renderer_recovery.rs
+    - crates/freshell-tauri/src/state_machine.rs

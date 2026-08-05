@@ -1,0 +1,291 @@
+- id: PACKAGE-01
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/tauri.conf.json:25 — `\"bundle\": { \"active\": false }`: Tauri bundling is explicitly disabled; no resource/app-bundle packaging exists"
+    - "crates/freshell-tauri/tauri.conf.json:6 — frontendDist is `frontend`; crates/freshell-tauri/frontend/ contains only a placeholder index.html splash page"
+    - "tauri.conf.json has no bundle.resources at all: no extension manifests/assets, no wizard/chooser bundles, no provider resources are packaged"
+    - "crates/freshell-tauri/capabilities/{default,chooser,wizard}.json and crates/freshell-tauri/icons/{icon.png,icon.ico} exist in the source tree but are not assembled into any bundle"
+    - "crates/freshell-tauri/src/server.rs:5-9 — design replaces bundled Node with the cargo-built freshell-server binary, but nothing packages/installs it"
+    - "No Tauri packaging/bundling workflow; .github/workflows/ contains only electron-build/electron-release for the legacy app"
+  missing: "Everything: bundling is disabled (bundle.active=false); no packaged artifact containing server binary, client, wizard, chooser, capability files, extension manifests/assets/icons, or provider resources; no install-tree independence from source/Node/Cargo; PW-TAURI-WIN-PACKAGED validation absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/build.rs
+
+- id: PACKAGE-02
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/tauri.conf.json:25 — bundle.active=false and targets:'all' placeholders; no NSIS target configured for Tauri"
+    - "installers/windows/ contains only freshell-task.xml.template (scheduled-task template), no NSIS script"
+    - "Legacy reference only: config/electron-builder.yml:81,92-96 (nsis oneClick/runAfterFinish, include assets/electron/installer.nsh) — Electron builder config, not the Rust/Tauri port"
+    - "No running-process detection, close/retry/cancel, silent-mode, or profile-retention code anywhere in crates/ (grep of crates/ for nsis/installer shows none)"
+  missing: "Everything: no Tauri NSIS installer config or script; no interactive/unattended modes; no running-process detection with exact-name matching; no close/retry/cancel or silent-nonzero-no-mutation behavior; no uninstall registration or profile-retention opt-in; PW validation absent (Windows-host gated regardless)"
+  effort: L
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - installers/windows/
+
+- id: PACKAGE-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/tauri.conf.json:2-4 — productName 'Freshell', version '0.7.0', identifier 'com.freshell.desktop' (identifier matches legacy appId in config/electron-builder.yml:2)"
+    - "crates/freshell-tauri/tauri.conf.json:27 — icon list ['icons/icon.png','icons/icon.ico']; both files exist in crates/freshell-tauri/icons/"
+    - "crates/freshell-tauri/src/tray.rs:236-237 — tray uses app.default_window_icon() at runtime"
+    - "package.json:4 — legacy version is '0.7.5' vs tauri.conf.json '0.7.0': versions are INCONSISTENT"
+    - "No test anywhere asserts identity/icon/metadata consistency (grep found none)"
+  missing: "Version consistency (0.7.0 vs legacy 0.7.5); executable metadata (versioninfo) consistency; any test gating name/identifier/icon consistency; packaged window/taskbar/tray icon validation (PW-TAURI-WIN, Windows-host); permanent gate for the local icon fix"
+  effort: S
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - crates/freshell-tauri/src/tray.rs
+
+- id: PACKAGE-04
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/tauri.conf.json — no signing configuration of any kind"
+    - "crates/freshell-tauri/src/updater.rs:19-24 — module docs state signed release bundle / live feed are 'NOT verifiable on this headless host' and signing-gated"
+    - "crates/freshell-tauri/src/updater.rs:64 — PLACEHOLDER_PUBKEY_MARKER 'REPLACE_WITH_REAL_ED25519_PUBKEY' is what tauri.conf.json:18 ships"
+    - ".github/workflows/ has no Tauri build/sign workflow; no Authenticode/signtool config found"
+  missing: "Everything: no code-signing of executable/server/installer/update artifacts, no publisher/trust-chain/timestamp configuration, no Windows signature-verification step (PW validation inherently Windows-host)"
+  effort: L
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - .github/workflows/
+
+- id: UPDATE-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/tauri.conf.json:17 — production endpoint 'https://releases.freshell.app/latest.json' is present"
+    - "crates/freshell-tauri/tauri.conf.json:18 — pubkey is the literal placeholder 'REPLACE_WITH_REAL_ED25519_PUBKEY': the production public key is NOT registered"
+    - "crates/freshell-tauri/src/updater.rs:91-101 — updater_state() treats placeholder/empty pubkey as DisarmedNoPubkey (no silent arm with a fake key)"
+    - "crates/freshell-tauri/src/lib.rs:574-591 — runtime reports armed/disarmed from the real tauri.conf.json plugins block"
+    - "test: parse_updater_config_reads_plugins_block in crates/freshell-tauri/src/updater.rs:362 — asserts shipped placeholder => DisarmedNoPubkey"
+    - "test: updater_state_reflects_config_presence in crates/freshell-tauri/src/updater.rs:260"
+  missing: "The real production Ed25519 public key in the shipped config (still a placeholder); proof the endpoint is unchanged in the shipped artifact; wrong-key-manifest rejection test run against a packaged artifact; Playwright artifact fingerprint/endpoint validation (PW-TAURI-WIN-PACKAGED, Windows-host) — no packaged artifact exists to inspect"
+  effort: M
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - crates/freshell-tauri/src/updater.rs
+
+- id: UPDATE-02
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/updater.rs:122-134 — should_update(): strictly-newer offer / UpToDate / NoDowngrade / Unparseable (the check-decision + no-downgrade clause)"
+    - "crates/freshell-tauri/src/updater.rs:181-196 — check_manifest(): platform-target matching with NoArtifactForPlatform (platform matching clause)"
+    - "crates/freshell-tauri/src/updater.rs:159-165 — platform_target() windows-x86_64/darwin-aarch64 mapping"
+    - "crates/freshell-tauri/src/updater.rs:37 — FIRST_CHECK_DELAY 10s matching legacy startup.ts:219-221"
+    - "tests: should_update_offers_newer_only (:203), should_update_up_to_date_and_downgrade (:219), should_update_tolerates_v_prefix (:226), should_update_prerelease_ordering (:235), should_update_unparseable (:248), check_manifest_offers_for_matching_platform (:318), check_manifest_up_to_date (:331), check_manifest_no_artifact_for_platform (:344), platform_target_maps_macos_to_darwin (:296), first_check_delay_is_ten_seconds (:357)"
+    - "crates/freshell-tauri/Cargo.toml — tauri-plugin-updater is NOT a dependency; no `.plugin(tauri_plugin_updater...)` registration exists (grep: tauri_plugin_updater absent), so checking/downloaded/install/restart never execute at runtime; the plugins.updater config block is inert except for the state report"
+    - "crates/freshell-tauri/src/updater.rs:18-24 — module documents live update as not implemented/verifiable headlessly"
+  missing: "Runtime wiring of tauri-plugin-updater (not even a dependency); actual checking/downloaded states, download, error state, install/restart actions; tray 'Check for Updates' only reports armed/disarmed (lib.rs:548-591) and never performs a check; no-downgrade/platform-matching exist headlessly but no E2E through feeds; PW-TAURI-WIN/PW-TAURI-WIN-PACKAGED validations absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/updater.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/Cargo.toml
+    - crates/freshell-tauri/src/tray.rs
+
+- id: UPDATE-03
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "grep of crates/freshell-tauri/src/*.rs for relaunch/restart (excluding chooser restartMain references) finds no update-restart, state-migration-across-update, or process-tree replacement code; updater.rs has no install/restart path at all"
+    - "crates/freshell-tauri/src/updater.rs:20 — install/relaunch explicitly deferred ('per-OS install/relaunch ... Phase-4 manual / cross-build QA')"
+    - "No settings/tab state carry-over-across-update logic or single-process-tree guard tied to updates (tauri-plugin-single-instance exists but is launched-at-boot concern, not update handoff)"
+  missing: "Everything: settings/tab migration across update restart, old-tree close, exactly-one-new-tree guarantee, terminal recovery/explanation, orphan-listener checks, and all PW packaged validation"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/updater.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/state_machine.rs
+
+- id: UPDATE-04
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "This item owns only the NSIS property/argument plumbing; no Tauri NSIS installer exists (crates/freshell-tauri/tauri.conf.json:25 bundle.active=false; installers/windows/ has only freshell-task.xml.template)"
+    - "Legacy reference for the plumbing: assets/electron/installer.nsh:29 reads ${StdUtils.GetParameter} $0 \"FRESHELL_REMOTE_URL\" and :40 FileWrite's the desktop.provision file — Electron-builder NSIS only, not Tauri"
+    - "The TAURI-16 receiving side DOES exist and is tested (out of this item's owned scope): crates/freshell-tauri/src/provisioning.rs:55 parse_provisioning (1:1 port), :92 apply_provisioning_file (one-shot consume + desktop.json patch + always-delete), :162 resolve_provisioned_remote (env pair FRESHELL_REMOTE_URL/FRESHELL_TOKEN then provision file)"
+    - "tests (receiver only): apply_patches_config_and_deletes_file (provisioning.rs:261), apply_incomplete_file_deletes_without_patching (:286), apply_preserves_other_desktop_json_keys (:297), parses_both_keys (:186), crlf_line_endings_are_stripped (:210)"
+  missing: "The entire owned scope: a Tauri-side NSIS installer that accepts/exposes FRESHELL_REMOTE_URL + FRESHELL_TOKEN properties, writes the exact desktop.provision values, and hands them to the provisioning path; NSIS-side E2E (PW-TAURI-WIN-PACKAGED, Windows-host). No NSIS installer exists to plumb"
+  effort: M
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - installers/windows/
+    - crates/freshell-tauri/src/provisioning.rs
+
+- id: UPDATE-05
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - ".github/workflows/electron-release.yml — the only release workflow; it runs `npm run electron:build` and uploads Electron installers via scripts/upload-electron-release-assets.ts (electron-builder latest.yml world), no Tauri build at all"
+    - ".github/workflows/rust-clippy.yml:34 — only compiles freshell-tauri for lint; no artifact/release job"
+    - "No latest.json generation, Ed25519 update-signature, or Tauri bundle publish step anywhere in scripts/ or .github/workflows/"
+    - "crates/freshell-tauri/src/updater.rs:6-8 — docs confirm the tauri-plugin-updater signed latest.json + .sig pipeline is the intended-but-unimplemented design"
+  missing: "Everything: release CI producing Tauri platform artifacts, latest.json with matching version/real URLs/hashes/Tauri Ed25519 signature, staging-feed validation, Authenticode identity assertion, and installed-prior-version update-through-UI verification"
+  effort: L
+  files:
+    - .github/workflows/
+    - scripts/
+
+- id: MIGRATE-01
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Electron→Tauri state-policy document exists: grep across docs/ for the policy ('state policy' / 'import, merge, reset') matches only the checklist file itself (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md), i.e. the requirement statement, not a policy definition"
+    - "No migration module/classification code anywhere in crates/ (grep for electron-profile/localStorage/WebView2 import returns nothing)"
+  missing: "Everything: the explicit per-key classify-as import/merge/reset/reject policy for tabs/layout, browser preferences, auth, recency, prompt/input history, device identity, cursors, activity/attention, and unknown/transient keys — neither documented nor implemented"
+  effort: S
+  files:
+    - docs/plans/
+
+- id: MIGRATE-02
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No export/import bridge code found anywhere in crates/ (no legacy localStorage export, no Tauri-side import, no origin/port-independent transfer mechanism)"
+    - "grep of crates/ for localStorage/webview2/electron-profile migration terms returns no matches"
+  missing: "Everything: legacy-side export, Tauri-side import, and the origin/port-independent bridge (no reliance on Chromium/WebView2 shared storage); Electron+Tauri PW validation absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-03
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Electron→Tauri tab/pane layout migration code in crates/ (only server-side tabs persistence for the Rust server's own model: crates/freshell-ws/src/tabs_persist.rs is the Rust-native store, not a legacy importer)"
+    - "No provider-identity/session-resume migration mapping found"
+  missing: "Everything: order/active tab/names/splits/ratios/pane kinds/cwd/URLs/files/agent settings/durable provider identities import from a legacy Electron profile; 16-tab PW comparison absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/
+    - crates/freshell-ws/src/tabs_persist.rs
+
+- id: MIGRATE-04
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No browser-local preference (localStorage) migration code in crates/ — no theme/UI-scale/font/sidebar/sound/panes/rich-agent preference import path"
+    - "Rust server settings (crates/freshell-server/src/settings_store.rs) are config.json-based server settings, not browser-local preferences"
+  missing: "Everything: migration of theme, UI scale, terminal/editor fonts, sidebar visibility/width/sort, local visibility filters, sound/notifications, panes, rich-agent preferences; reimport-on-change suppression test; PW validation absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-05
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No legacy-auth-secret reuse code: grep of crates/freshell-tauri/src/*.rs for legacy token/auth migration returns nothing"
+    - "crates/freshell-tauri/src/server.rs designs a freshly generated AUTH_TOKEN per app-bound spawn (uuid v4); provisioning.rs supports remoteToken for remotes — neither reads a legacy Electron token"
+    - "The TAURI-04 token bootstrap exists only as the ?token= URL load (provisioning.rs:147 remote_load_url percent-encodes into the URL); no scrubbing/exclusion audit of retained artifacts for a migrated secret"
+  missing: "Everything: reading the legacy token into approved credential storage, authenticating Tauri+Rust with it, post-bootstrap URL scrubbing, and trace/log/history redaction validation (PW-TAURI-WIN)"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/provisioning.rs
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/src/commands.rs
+
+- id: MIGRATE-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:371-378 — persist() copies forward all on-disk top-level keys it does not own (completedMigrations, recentDirectories, future/unknown keys round-trip untouched); doc comment cites the fixed data-loss incident"
+    - "tests: settings_patch_preserves_unmanaged_top_level_document_state (settings_store.rs:2614), terminal_override_patch_preserves_unmanaged_top_level_document_state (:2642), session_override_patch_preserves_unmanaged_top_level_document_state (:2669) — assert recentDirectories/serverSecrets/zzFutureKey round-trip through a save and no-op patches don't rewrite config.json"
+    - "test: both_primary_and_backup_corrupt_starts_fresh_but_preserves_both_forensic_copies (settings_store.rs:3460) — corrupt-config recovery"
+    - "CFG-01 lossless-writer half of this item is implemented+tested in the Rust server"
+  missing: "The migration half: no Electron→Tauri server-config migration flow exists that routes legacy config through this writer, so 'through migration' is unexercised; first-chat controls/legacy-seed migration import; PW-TAURI-WIN hash/count validation absent"
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-07
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No migration engine exists in crates/ at all (no Electron→Tauri import), so there is no atomic/backup/resumable/idempotent/reversible migration implementation and no rollback/result receipt"
+    - "(crates/freshell-ws/src/tabs_persist.rs rollback code is the Rust-native snapshot store's own retention rollback, unrelated to Electron→Tauri migration)"
+  missing: "Everything: phase-wise failure handling, backup creation, resume, idempotent second launch, explicit rollback with receipt; fault-fixture PW validation absent"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Electron→Tauri migration code exists, so there is no merge-with-existing-Tauri-profile policy (safe-default keep/unique-tab-add) and no explicit Replace-with-restorable-backup path"
+  missing: "Everything: default merge preserving existing Tauri prefs + adding only unique legacy tabs, separate explicit Replace with restorable Tauri backup receipt first, no-silent-drop guarantee; PW validation absent"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-09
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No legacy-profile parsing/import code exists in crates/, so there is no handling of corrupt JSON / old schema / future schema / oversized legacy storage in a migration context"
+    - "(settings_store corrupt-config recovery at settings_store.rs:3460 covers the Rust server's own config.json, not legacy Electron storage)"
+  missing: "Everything: safe-partial recovery, rejection with nontechnical explanation, backup location surfacing, launchable main/rollback path for malformed/obsolete/future/oversized legacy storage; parameterized PW validation absent"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-10
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-tauri/src/commands.rs:412-415 — authoritative port bind-check before committing start-local: occupied port => error 'Port {port} is already in use. Choose a different port, or connect to that server.' (the don't-steal-the-port + offer-connect/another-port clause, though generic, not legacy-Electron-specific)"
+    - "crates/freshell-tauri/src/commands.rs:331 — is_port_available() real bind probe; :159/:198/:248 — chooser kinds connect | remote | start-local with plan_connect"
+    - "tests: is_port_available_true_for_free_port (commands.rs:731), is_port_available_false_for_occupied_port (:741), connect_requires_url (:584), connect_requires_token_when_auth_required (:594)"
+    - "No code anywhere kills or mutates a foreign/legacy process (grep confirms only owned-child SIGTERM→SIGKILL of the spawned freshell-server in server.rs)"
+    - "commands.rs:418-420 — live token validation (auth_check) against a chosen URL is explicitly deferred"
+  missing: "Legacy-specific coexistence: detection that the occupying process is the legacy Electron install and its session-marker preservation; the legacy-specific connect/change UX flow; live auth validation when connecting; PW-TAURI-WIN + Electron validation that the legacy window/server/session marker survives Tauri launch/close"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/state_machine.rs
+
+- id: MIGRATE-11
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Electron user-data root/origin discovery code anywhere in crates/ (no default-path enumeration, no multiple-profile/origin handling, no database-lock detection, no portable-profile detection)"
+    - "provisioning.rs reads only ~/.freshell/ (its own desktop.json/desktop.provision); nothing locates a legacy install"
+  missing: "Everything: automatic legacy profile discovery without a supplied path, multi-profile/origin candidate choice or chooser, non-destructive close-legacy-and-retry lock state, portable/moved-profile selection, clean no-profile first run; PW validation absent"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-12
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No migration implementation exists, so no migration result receipt (counts, backup/rollback location, skipped items, partial-recovery flag) is produced, displayed, or persisted (grep for receipt in crates/ found only unrelated WebSocket receipt-time comments)"
+  missing: "Everything: receipt content (tabs/panes/preferences/server-settings counts, backup+rollback location, skipped/unsupported items, partial-recovery indication), keyboard-accessible result screen, persistence and later review without rerunning; PW validation absent"
+  effort: M
+  files:
+    - crates/freshell-tauri/src/
+
+- id: MIGRATE-13
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Tauri installer exists (crates/freshell-tauri/tauri.conf.json:25 bundle.active=false; installers/windows/ has only freshell-task.xml.template), so no installer-replacement upgrade/rollback path, registration replacement, or retained-hashed-legacy-data + signed-installer retention exists"
+    - "PACKAGE-02 running-process upgrade rules likewise have no implementation to apply"
+  missing: "Everything: replacement (not side-by-side) install choice, state migration during upgrade, single shortcut/uninstall/startup owner, hashed legacy user-data retention, retained verified Electron installer/version for binary+registration restore, rollback execution; disposable-VM PW validation absent (inherently Windows-host)"
+  effort: L
+  files:
+    - crates/freshell-tauri/tauri.conf.json
+    - installers/windows/
+    - crates/freshell-tauri/src/

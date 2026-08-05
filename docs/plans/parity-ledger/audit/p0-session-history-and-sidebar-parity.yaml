@@ -1,0 +1,293 @@
+- id: SESSION-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-sessions/src/directory_index.rs:227 ClaudeSource, :425 CodexSource, :589 OpencodeSource impl SessionSource"
+    - "crates/freshell-sessions/src/amplifier.rs:1 ff — AmplifierSource indexing metadata.json + transcript preview (port of providers/amplifier.ts)"
+    - "IndexedSession carries session_id/provider/project_path/title/summary/first_user_message/last_activity_at/created_at/cwd — directory_index.rs:49-86"
+    - "test: codex_source_scans_fixture_and_uses_parsed_session_id, claude_source_scans_fixture_home_and_skips_cwdless_files, snapshot_is_sorted_last_activity_desc_then_key_desc in crates/freshell-sessions/src/directory_index.rs"
+    - "resume: crates/freshell-sessions/src/resume_input.rs, resume_resolve.rs; resolve route crates/freshell-server/src/resolve.rs:579"
+    - "e2e: test/e2e-browser/specs/session-directory-matrix.spec.ts (4-provider visibility :328, icons :398, identity/cwd/lastActivityAt ordering :458) and sidebar-click-resume.spec.ts Amplifier leg :287 green; Codex leg :117 is test.fixme (observed FreshCodex JSON-RPC resume, not CLI argv)"
+  missing: "Sidebar-CLICK resume through the UI proven only for Amplifier; Claude/OpenCode click-resume unproven, Codex click-resume routes via FreshCodex JSON-RPC (no CLI-argv-style proof possible today)."
+  effort: M
+  files:
+    - crates/freshell-sessions/src/directory_index.rs
+    - crates/freshell-sessions/src/resume_resolve.rs
+    - crates/freshell-server/src/resolve.rs
+
+- id: SESSION-02
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/session_directory.rs:698-721 apply_session_overrides: deleted removes item, titleOverride/summaryOverride applied, archived overlaid, keyed provider:sessionId"
+    - "test: overrides_overlay_applies_title_summary_archived_and_filters_deleted (session_directory.rs:1946), session_override_applies_to_codex_and_opencode_keys (:2405), override_no_rebuild (:2227)"
+    - "legacy reference server/coding-cli/session-indexer.ts:204-220 applyOverride also applies createdAtOverride and provider-generated title suppression"
+  missing: "Sidebar projection does NOT apply createdAtOverride (ordering by createdAt) and does NOT apply the provider-generated title suppression (title_provider_generated never read in session_directory.rs) — both exist only in resolve.rs:533/545. Archive/delete/title/summary overlay covered."
+  effort: M
+  files:
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-03
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/sessions.rs:108-214 patch_session: titleOverride/summaryOverride/archived/deleted/createdAtOverride validated (validate_session_patch :223-276) and persisted via SettingsStore::patch_session_override; soft-delete is an override flag — provider source files are never deleted (apply_session_overrides merely filters, session_directory.rs:707)"
+    - "sessions.rs:194-211 broadcasts sessions.changed with shared revision after override writes"
+    - "test: patch_rename_persists_and_returns_merged_plus_cascade_null (sessions.rs:370), patch_rename_cascades_all_four_effects_to_a_live_terminal, patch_archive_broadcasts_sessions_changed_and_revision_is_monotonic in crates/freshell-server/src/sessions.rs"
+    - "SettingsStore::patch_session_override with title-source ladder at crates/freshell-server/src/settings_store.rs:701"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/sessions.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: SESSION-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "Title-source ladder: can_upgrade_title rank fn crates/freshell-server/src/settings_store.rs:1208-1227 (tests at :2386-2505: user > ai > first-message > dir, finalized-block rules)"
+    - "Provider-authoritative title suppression: IndexedSession.title_provider_generated directory_index.rs:63-70; resolve.rs:533-545 suppresses dir/first-message override vs provider-generated title"
+    - "POST generate-title (first-message heuristic, extract_title_from_message port of shared/title-utils.ts) sessions.rs:301-341; tests in sessions.rs"
+    - "sessions.rs:296-300 explicitly states 'No Gemini/AI key path in this port' (matches legacy no-key behavior only)"
+  missing: "Real AI-title generation path (legacy server/ai-title.ts + auto-title.ts Gemini call) not ported; one-time stale-AI-title cleanup not found; PW rungs partially closed in legacy probing only."
+  effort: M
+  files:
+    - crates/freshell-server/src/sessions.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: SESSION-05
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Rust route for project colors: grep for 'projectColor'/'project-color' across crates/* only hits settings_store.rs:510-514 (config.json key copy-forward, default {} seeded)"
+    - "legacy reference server/project-colors-router.ts:18 exposes PUT /project-colors"
+    - "ServerSettings (crates/freshell-protocol/src/settings.rs:120) has no projectColors field, so the value is never served to clients nor broadcast"
+  missing: "Entire save/serve/broadcast surface (PUT route, GET surface, live broadcast); only config.json preservation exists."
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-server/src/main.rs
+
+- id: SESSION-06
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/session_metadata.rs:69 SessionMetadataStore, POST route router(:312)/post_session_metadata(:318), validate_post_body(:382), should_apply_session_type_metadata(:269) classification rules"
+    - "test: set_persists_and_get_returns_it (:457), set_does_not_downgrade_explicit_with_materialized (:493), get_all_flattens_provider_session_id_keys (:614), metadata_change_broadcasts_sessions_changed_with_increased_revision (:790)"
+    - "Resume/runtime use: resolve.rs:665-682 overlays sessionType into matches keyed provider:sessionId"
+    - "Directory exposes sessionType on live-terminal items (session_directory.rs:186-188); icons/actions are shared client reading this API"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/session_metadata.rs
+    - crates/freshell-server/src/resolve.rs
+
+- id: SESSION-07
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-sessions/src/search.rs:111-150 search_session_file (userMessages/fullText tiers), extract_snippet :67-89"
+    - "crates/freshell-server/src/session_directory.rs:1202-1253 apply_file_search (scan budget maxScan=limit*10, early stop limit+1, partial/partialReason budget|io_error), cursor encode/decode :1036-1053"
+    - "test: tier_user_messages_matches_only_the_user_turn (:2530), tier_full_text_matches_assistant_turn_too (:2573), tier_search_combined_with_cursor_pagination (:2637), tier_search_reports_partial_budget_when_scan_budget_exceeded (:2701) in session_directory.rs; 13 tests in search.rs"
+    - "search.rs:13-17 documents opencode (single sqlite) and amplifier unsearchable at file tiers; AbortSignal dropped (:102-105)"
+  missing: "Stale-query cancellation (no request supersession observed server-side), file-content search for OpenCode/Amplifier, >100-session multi-provider PW scenario."
+  effort: M
+  files:
+    - crates/freshell-sessions/src/search.rs
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-08
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "session_directory.rs:671-672: \"resolveProjectPath: meta.cwd (git-root resolution deferred), else 'unknown'\" — projectPath = parsed cwd, no git-root/coalescing logic server-side"
+    - "Repository/worktree grouping toggles live in the shared client reading projectPath; no Rust-side Repository/Worktree grouping computation found"
+    - "repos icons helpers exist (crates/freshell-server/src/repo_icon*.rs) but unrelated to history grouping"
+  missing: "Server-side git-root resolution for project identity (deferred per comment); no evidence History worktree grouping vs nested-repo/similarly-named-folder cases covered against Rust."
+  effort: M
+  files:
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-09
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/main.rs:2115-2136 spawn_sessions_sweep (2s poll, MissedTickBehavior::Skip, subsumes ~150ms coalescing), signature sessions_sweep_signature :2055-2075 incl. identity digest"
+    - "Override writes broadcast directly: sessions.rs:204-211; tests new_older_session_file_is_still_detected_as_a_change + identity_updated_at_alone_does_not_move_the_sweep_signature (main.rs sessions_sweep_tests :2139)"
+    - "e2e green both servers: session-directory-matrix.spec.ts:564 (mid-test add appears ~10s no reload) and :668 (file removed disappears no reload)"
+    - "notify-watcher exists only for provider-root discovery: crates/freshell-sessions/src/indexer.rs"
+  missing: "Modified-in-place and moved-between-provider-dir mutation shapes, Codex/OpenCode/Amplifier backend-shape legs, and two-page convergence/stable-focus/no-refresh-storm assertions (per 2026-07-19 note + no contrary evidence found)."
+  effort: M
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: SESSION-10
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "session_directory.rs:761-848 join_running_state + join_live_terminals (isRunning/runningTerminalId, single-owner dedup by provider:sessionId)"
+    - "test: join_live_terminals_matched_terminal_is_never_double_emitted (:995), join_running_state_matches_live_terminal_and_sets_running_fields (:892) in crates/freshell-server/src/session_directory.rs"
+    - "e2e: test/e2e-browser/specs/restore-matrix.spec.ts:634 'SESSION-10: re-clicking a running session from the sidebar focuses the existing tab instead of creating a duplicate' — green 2x legacy-chromium + rust-chromium"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-11
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "Provider scan failure/status plumbing: SessionIndex.scan_failures (directory_index.rs:791,875-879) drives resolve.rs status degraded/ready/warming (resolve.rs:764-789) — truthful index status at the resolve surface"
+    - "Late association: freshell-ws/src/codex_association.rs, opencode_association.rs adopt session ids post-spawn (directory join tests reference 'pre-adoption duplicate is transient', session_directory.rs:1017)"
+    - "Stale running state derives from the in-memory TerminalIdentityRegistry (session_directory.rs:761-780), so a server restart naturally clears isRunning; no explicit repair events named 'sessions.status' found"
+    - "legacy references server/session-association-coordinator.ts, startup-state.ts not fully compared here (ran out of time)"
+  missing: "Explicit repair/status EVENTS to clients (none found by that name); late/missing-association repair proven for codex/opencode adoption legs only; PW delayed-session-init/crash scenarios unverified."
+  effort: M
+  files:
+    - crates/freshell-ws/src/codex_association.rs
+    - crates/freshell-ws/src/opencode_association.rs
+    - crates/freshell-server/src/main.rs
+
+- id: SESSION-12
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "Reverse cascade implemented: sessions.rs:158-192 (session rename → live terminal rename, registry write-through + terminals.changed) — cascadeSessionRenameToTerminal port"
+    - "test: patch_rename_cascades_all_four_effects_to_a_live_terminal + patch_rename_to_a_retired_terminal_identity_does_not_cascade (sessions.rs)"
+    - "Unified priority ladder exists via can_upgrade_title (settings_store.rs:1208-1227)"
+  missing: "Forward direction (terminal/tabs rename → session) and provider-title-update push (updateSessionTitle event) not verified in the time available; tab-level rename path in terminals.rs un-inspected."
+  effort: M
+  files:
+    - crates/freshell-server/src/sessions.rs
+    - crates/freshell-server/src/terminals.rs
+
+- id: SESSION-13
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-protocol/src/settings.rs:58-63 SettingsSidebar { auto_generate_titles, exclude_first_chat_must_start, exclude_first_chat_substrings }"
+    - "GET /api/settings returns full persisted store (settings_store.rs:1623-1628); PATCH validates top-level 'sidebar' (settings_store.rs:1390) and deep_merge persists to config.json (settings_store.rs:1320)"
+    - "test: patch_write_through_reaches_get_and_config_json_and_restart (settings_store.rs:2078) proves settings write-through + restart persistence (generic, not excludeFirstChat-specific)"
+    - "Application is shared client-side: src/store/selectors/sidebarSelectors.ts:69-70,625-660 filter ANY provider's items; WS hello/bootstrap settings fixtures include excludeFirstChatSubstrings (freshell-ws/tests/common/mod.rs:56)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-protocol/src/settings.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: SESSION-14
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-sessions/src/time.rs:26-40 parse_timestamp_ms casts f64→i64 ('f as i64' = floors positive fractional ms); ISO parser zeroes sub-ms beyond 3 digits (:107-118)"
+    - "All directory timestamps are i64: IndexedSession.last_activity_at/created_at (directory_index.rs:74-75); DirItem serialization session_directory.rs:147,162-164"
+    - "Deterministic ordering: sort lastActivityAt DESC then key DESC (session_directory.rs:1092-1096); sessions.changed carries only revision (sessions.rs:209-210; main.rs:2132 via broadcast_sessions_changed)"
+    - "test: snapshot_is_sorted_last_activity_desc_then_key_desc (directory_index.rs:1727) pins ordering"
+  missing: "No test observed pinning FRACTIONAL-millisecond flooring in the directory/API projection (boundary/fractional fixture + restart-stability assertions absent); time.rs module itself has no tests."
+  effort: S
+  files:
+    - crates/freshell-sessions/src/time.rs
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-15
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "Server-side visibility flags: DirQuery include_subagents/include_non_interactive/include_empty parsed (session_directory.rs:208-219) and applied as pre-filter (:1098-1113)"
+    - "test: default_query_hides_non_interactive_fixtures (:1606), include_non_interactive_surfaces_titled_session (:1627), include_empty_surfaces_untitled_sessions_sorted_desc (:1645), codex_exec_session_hidden_by_default_surfaced_with_flag (:2332) in crates/freshell-server/src/session_directory.rs"
+    - "Browser-local persistence/isolation of these switches is shared-frontend (localStorage) code, identical for both servers; server parity surface = the query params above"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-16
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "test: invalid_utf8_transcript_is_indexed_lossily_like_node (session_directory.rs:1568) — invalid UTF-8 record indexed lossily, others stay healthy"
+    - "Bad-record quarantine/skip: excluded files cached as exclusion (item None) but re-parsed when (mtime,size) changes — directory_index.rs module doc :19-27; tests excluded_file_cached (:1967), changed_file_single_reparse (:1844) — a record that becomes valid is indexed on next sweep"
+    - "parse failures never fatal: r10b_cwdless_repair_fixture_never_surfaces_under_any_flags (session_directory.rs:1669); sweep panic preserves cached snapshot: perform_refresh_preserves_cached_snapshot_when_blocking_sweep_panics (directory_index.rs:2329)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-sessions/src/directory_index.rs
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-17
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "Every override/mutation/join keyed provider:sessionId: DirItem::key (session_directory.rs:136-138), composite_key (sessions.rs:80-86), apply_session_overrides lookup by full key (:705), join_running_state matches provider AND session_id (:765-768)"
+    - "test: session_override_applies_to_codex_and_opencode_keys (session_directory.rs:2405) proves provider-scoped override keys"
+    - "Defaults provider=claude only when query param absent (sessions.rs:88-93), mirroring legacy"
+  missing: "No test observed that seeds the SAME raw id under two providers and proves rename/archive/delete/running/open never cross-leak (unit or PW); same-id alias cases untested."
+  effort: S
+  files:
+    - crates/freshell-server/src/session_directory.rs
+    - crates/freshell-server/src/sessions.rs
+
+- id: SESSION-18
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "Extension machinery exists: crates/freshell-server/src/extensions.rs (freshell.json manifest scan :125-181, toClientRegistry, CLI detection specs :208-209)"
+    - "Known-providers auto-enable: settings_store.rs read_persisted_known_providers(:1577) + test newly_discovered_providers_append_and_auto_enable (:1918)"
+    - "Resume provider set is hardcoded: KNOWN_RESUME_PROVIDERS = [claude, codex, opencode, amplifier] (resolve.rs:233); SessionIndex sources are the four built-ins (directory_index.rs/amplifier.rs)"
+  missing: "No generic extension-owned SESSION provider discovery/resume path: scan sources and resume fallbacks are hardcoded built-ins; an installed session-providing extension would not surface history/search/open (Amplifier is close but first-class)."
+  effort: L
+  files:
+    - crates/freshell-sessions/src/directory_index.rs
+    - crates/freshell-server/src/resolve.rs
+    - crates/freshell-server/src/extensions.rs
+
+- id: SESSION-19
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "Match tier labels correct: title/summary/firstUserMessage precedence (session_directory.rs:1259-1276); userMessage/assistantMessage (search.rs:139-146, matched_in)"
+    - "Bounded snippets: title tier truncates to 140 chars (:1270); file tier 50-char context with ... ellipses (search.rs:78-88); no-match returns first-100-chars (search.rs:74-76, test extract_snippet_no_match_returns_first_100_chars)"
+    - "test: tier tests 2530-2738 session_directory.rs; snippet tests search.rs:217-238"
+  missing: "No tests seen for HTML/control-character safety or escaping, and no neighbor-secret isolation test (snippet could include adjacent text by design — bounded but not escape-verified)."
+  effort: S
+  files:
+    - crates/freshell-sessions/src/search.rs
+    - crates/freshell-server/src/session_directory.rs
+
+- id: SESSION-20
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "SessionIndex cached read model: TTL snapshot + per-file (mtime,size) incremental cache, exclusions cached, prune-on-delete — directory_index.rs:1-33 module doc, :969-1130"
+    - "test: within_ttl_a_second_snapshot_call_does_not_rescan (:1749), unchanged_warm_sweep_reparses_zero (:1925), changed_file_single_reparse (:1844), claude_source_warm_sweep_of_6k_files_reparses_zero_and_completes_under_500ms (:2133, #[ignore]d perf), foreground_snapshot_never_blocks_on_an_inflight_sweep (:2243) — scan counters prove zero re-parse after initial indexing and single-file incremental update"
+    - "Foreground latency isolation: stale-while-revalidate snapshot-swap (directory_index.rs:2190-2220 comment block)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-sessions/src/directory_index.rs
+
+- id: SESSION-21
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Rust port of legacy history repair: grep for 'backfill|history_repair|history.jsonl' across crates/* finds only unrelated amplifier-bundle backfill (bundle_config.rs:24) and an unrelated comment in opencode_ws.rs:525; no freshell module implements repairing Claude's history.jsonl"
+    - "legacy reference: server/session-scanner/history-repair.ts (ClaudeHistoryEntry repair with 'created'|'already_present'|'skipped' status)"
+  missing: "Entire orphan-transcript → history.jsonl idempotent backfill (detect, single insert, restart-safe no-duplication)."
+  effort: M
+  files:
+    - crates/freshell-sessions/src/directory_index.rs
+
+- id: SESSION-22
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "Full legacy fallback key chain implemented for resolve only: lookup_session_override resolve.rs:477-502 (composite provider:id → bare id → legacy claude basename keys, first-present-wins, null-filtered)"
+    - "Overrides written with provider-qualified keys: sessions.rs composite_key :80-86; load_session_overrides settings_store.rs:1253"
+    - "test: session_override_applies_to_codex_and_opencode_keys (session_directory.rs:2405) for modern keys"
+  missing: "Sidebar projection applies ONLY the exact provider:sessionId key (apply_session_overrides session_directory.rs:705) — legacy raw-id keys and basename-shaped keys are NOT honored in the directory list the way resolve.rs does it; no migration of old raw-ID keys found; 528-style legacy-entry precedence tests absent."
+  effort: M
+  files:
+    - crates/freshell-server/src/session_directory.rs
+    - crates/freshell-server/src/resolve.rs
+    - crates/freshell-server/src/settings_store.rs

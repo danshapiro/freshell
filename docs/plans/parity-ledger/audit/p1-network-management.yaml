@@ -1,0 +1,168 @@
+- id: NET-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/network.rs:84-88 — Rust router exposes GET /api/network/status, wired in crates/freshell-server/src/main.rs:1202"
+    - "crates/freshell-server/src/network.rs:194-213 — full NetworkStatus shape built (configured, host, remoteAccess*, port, lanIps, machineHostname, firewall{platform,active,portOpen,commands,configuring}, rebinding, devMode, accessUrl)"
+    - "crates/freshell-server/src/network.rs:122-123 — reachability probe deferred: raw_port_open always None, so portOpen is always null and remoteAccessEnabled can never be true on non-WSL2 hosts"
+    - "crates/freshell-server/src/network.rs:159-160 — stale managed Windows firewall rule read deferred: stale hardcoded false"
+    - "crates/freshell-server/src/network.rs:208,210 — in-progress state (firewall.configuring, rebinding) hardcoded false; no mutation machinery exists to ever set them"
+    - "crates/freshell-server/src/main.rs:199 — NetworkState.settings is a boot-time Arc<ServerSettings> snapshot (not re-read after PATCH /api/settings), and network.rs:97-111 caches live facts in a OnceCell for process life — fields do NOT live-update while Settings stays open"
+    - "crates/freshell-server/src/network.rs:247-248 — on native Linux/macOS lanIps is always empty (interfaces edge unwired, documented)"
+    - "test: loopback_wsl2_boot_is_remote_access_off_and_shape_complete in crates/freshell-server/src/network.rs:307"
+    - "test: all_interfaces_unconfigured_requests_remote_access_and_builds_commands in crates/freshell-server/src/network.rs:365"
+    - "test: hostname_strips_dot_local_suffix in crates/freshell-server/src/network.rs:401"
+  missing: "Live port-reachability probe (portOpen forever null), stale managed-rule detection, in-progress states (always false), live refresh while Settings open (boot-time settings snapshot + process-life OnceCell fact cache), LAN IP enumeration on native Linux/macOS (always []), no /api/lan-info route."
+  effort: M
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-platform/src/network.rs
+    - crates/freshell-server/src/main.rs
+
+- id: NET-02
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/network.rs:19-21 — module doc states the mutating paths (configure / configure-firewall / disable-remote-access) are NOT wired in Rust"
+    - "grep for 'network/configure' across crates/ finds only doc comments; no POST /api/network/configure route exists (only .merge(network::router(...)) with the GET at crates/freshell-server/src/main.rs:1202)"
+    - "crates/freshell-server/src/main.rs:1356 — tokio TcpListener binds exactly once at startup; no rebind/hot-rebind machinery exists anywhere in Rust"
+    - "crates/freshell-server/src/settings_store.rs:311 — PATCH /api/settings can persist a network.host change but triggers no listener effect (no rebind side effect in patch_settings, settings_store.rs:1630-1651)"
+    - "crates/freshell-platform/src/network.rs:49 — resolve_bind_host (faithful port of get-network-host.ts) is consumed only at boot (main.rs resolve path ~1620-1640), never at runtime"
+    - "Legacy reference: server/network-manager.ts:400-438 (configure + persist + hostChanged) and :449+ (rebind with old-host listener fallback)"
+  missing: "Entire POST /api/network/configure route, transactional rebind (prove new listener before discarding old), persist-after-proof ordering, rebind-in-flight queueing, and any runtime listener change — the Rust server must restart to change bind."
+  effort: L
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: NET-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/network.rs:227-241 — encode_uri_component implements JS encodeURIComponent unreserved set"
+    - "crates/freshell-platform/src/network.rs:245-260 — access_url builds http://<lanIp|localhost>:<port>/?token=<enc> (protocol/host/port + encoded token)"
+    - "crates/freshell-server/src/network.rs:192,212 — accessUrl included in the live status response using the real bound port and auth token"
+    - "test: access_url_lan_when_share_enabled_and_encodes_token in crates/freshell-platform/src/network.rs:694 (asserts 'a b/c' -> 'a%20b%2Fc')"
+    - "test: access_url_localhost_when_share_disabled (network.rs:686) and access_url_falls_back_to_localhost_without_lan (network.rs:702)"
+    - "crates/freshell-server/src/logging.rs:153-186,455-475 — log scrubber redacts any *token* JSON field and strips ?token= from logged request paths; startup line (main.rs:1368-1371) logs listen URL without the token"
+    - "test: scrub_redacts_the_exact_secret_value_wherever_it_appears (logging.rs:531), sanitize_route_strips_only_the_token_query_param (logging.rs:618)"
+    - "crates/freshell-server/src/network.rs:171-189 — share_route_enabled can only activate via remote_access_enabled (never true: probe deferred) or the WSL2-unknown branch; on native Windows/Linux with remote access actually working, the returned URL is still localhost"
+  missing: "Share-URL accuracy on non-WSL2 0.0.0.0 binds: the share route never activates without the deferred reachability probe, so accessUrl is always localhost even when the server is genuinely reachable on the LAN (coupled to NET-01's missing probe). Copy-from-Settings UI is the retained React client (not Rust)."
+  effort: S
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-platform/src/network.rs
+
+- id: NET-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/elevated.rs:137-266 — ConfirmationGate: one-time action-bound tokens (issue_confirmation:155, matches:168, consume:177), in-progress lock (try_acquire_repair_lock:208), action metadata (windows-repair/windows-disable/wsl2-repair/wsl2-disable, powershell_command:68, response_method:81)"
+    - "crates/freshell-platform/src/firewall.rs:230 — managed_windows_firewall_rule_name gives the exact 'Freshell (port N)' managed rule name; builders at :248 (delete), :261 (add), :278 (repair with stale-delete + missing-add semantics); read-only existence probe at :313"
+    - "test: phase1_issues_token_and_never_spawns (elevated.rs:339) — cancel/no-confirm path performs zero spawns"
+    - "test: phase2_matching_token_spawns_via_injected_fake (elevated.rs:364) — exact elevated command via WSL powershell path; token consumed so replay re-issues"
+    - "test: confirm_with_wrong_token_reissues_and_does_not_spawn (elevated.rs:411) and in_flight_repair_returns_locked_409 (elevated.rs:433)"
+    - "test: managed_delete_uses_plain_dollar_null, managed_add_golden, repair_reachable_adds_only_missing_and_deletes_stale, repair_unreachable_adds_all_required (firewall.rs:391,400,419,431)"
+    - "crates/freshell-server/src/network.rs:19-21 — confirms none of this is exposed over HTTP; builders/gate are library-only, never executed (elevated commands only constructed)"
+  missing: "The /api/network/configure-firewall HTTP route itself, route-level wiring of the gate (409/reissue/consume flow incl. fresh status re-check under lock), the post-operation verification step (no verifySuccess equivalent — request_elevation releases the lock immediately after spawn with no verification), managed-port persistence (persistManagedWindowsRemoteAccessPortsForServer / clear equivalents), and stale-repair detection in status. Actual netsh/UAC execution is inherently Windows-host-only (Tauri/elevated VM) — the gate/lock/builders are tested via fakes."
+  effort: L
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-platform/src/elevated.rs
+    - crates/freshell-platform/src/firewall.rs
+
+- id: NET-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/port_forward.rs:413 — build_wsl_port_forwarding_plan (full port of wsl-port-forward.ts: NotWsl2/Disabled/Error/Noop/Ready); teardown plan at :473 — plan decisions cover Freshell-owned portproxy/FreshellLANAccess-only state incl. stale cleanup"
+    - "crates/freshell-platform/src/port_forward.rs:311,327,354 — firewall-only / port-forwarding / teardown script builders with the byte-load-bearing 2>\\$null escaping; normalize_for_elevated_powershell at :264"
+    - "crates/freshell-platform/src/port_forward.rs:254 — is_wsl_port_forwarding_disabled_by_env kill-switch; read-only state reads get_wsl_ip (:549), get_existing_port_proxy_rules (:565), get_existing_firewall_ports (:578)"
+    - "test: plan_noop_when_rule_and_firewall_correct (763), plan_full_when_portproxy_missing (783), plan_firewall_only_when_proxy_ok_but_firewall_missing (804), plan_full_cleans_up_stale_owned_ports (825), teardown_plan_ready_removes_rule_and_proxy (862), kill_switch_values (749) + parser/live read-only tests (946, 964) in port_forward.rs"
+    - "crates/freshell-platform/src/port_forward.rs:18-23 — safety note: add/delete are only ever built as strings, never executed; no HTTP route or executor consumes the plans anywhere in crates/"
+    - "Native-Windows client aspect: freshell-tauri spawns the server as a child process (crates/freshell-tauri/src/lib.rs:59) with no WSLg dependency found, but no forwarding handshake wiring exists"
+  missing: "Execution + wiring: no /api/network/configure-firewall route to return/run the plans, no persistManagedWslRemoteAccessPorts/clearManagedWslRemoteAccessPorts state file, no post-run verification (verifyWslRepairSuccess equivalent), no status reconcile after repair. Live create/verify of portproxy/firewall state is Windows+WSL2-host-only (the plan logic itself is fully fake-tested)."
+  effort: M
+  files:
+    - crates/freshell-platform/src/port_forward.rs
+    - crates/freshell-server/src/network.rs
+
+- id: NET-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/port_forward.rs:473 — build_wsl_port_forwarding_teardown_plan removes only Freshell-owned portproxy/firewall state (unrelated rules untouched by construction)"
+    - "test: teardown_plan_noop_when_nothing_present and teardown_plan_ready_removes_rule_and_proxy in crates/freshell-platform/src/port_forward.rs:853,862"
+    - "crates/freshell-platform/src/firewall.rs:248-258 — build_windows_firewall_delete_commands targets only the exact 'Freshell (port N)' managed names"
+    - "crates/freshell-platform/src/elevated.rs:51-53 — ConfirmationAction::WindowsDisable / Wsl2Disable exist in the (unwired) gate"
+    - "crates/freshell-server/src/network.rs:19-21 — /network/disable-remote-access is one of the explicitly NOT-wired mutating paths; no route, no rebind (main.rs:1356 binds once), no verification"
+  missing: "The disable endpoint itself (confirmation flow via accessible UI POST), loopback rebind (no runtime rebind exists at all), applyRemoteAccessDisabledState (persist loopback config + clear managed ports), verification-before-claiming-completion (verifyWslDisableSuccess/verifyWindowsDisableSuccess equivalents), and settings.updated broadcast on the disable path."
+  effort: L
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-platform/src/port_forward.rs
+
+- id: NET-07
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/elevated.rs:116-128 — ElevationDecision has Locked (409 overlap) and Reissued (stale token) variants only; no denial/timeout/partial-success/verification-failure outcomes"
+    - "crates/freshell-platform/src/elevated.rs:17-18 — ELEVATED_POWERSHELL_TIMEOUT_MS constant exists but is never enforced (no async spawn/timeout machinery; runner is synchronous and only ever faked)"
+    - "crates/freshell-server/src/network.rs:19-21 — no elevated/mutating network operation is wired, so there is no runtime path that could hit elevation denial, partial success, or verification failure"
+    - "test: in_flight_repair_returns_locked_409 (elevated.rs:433) — only the overlap case is covered; grep found no tests exercising denial, timeout, or verification failure anywhere in crates/"
+    - "Legacy references the Rust lacks: server/network-router.ts:208-211 (spawn error), elevated-powershell timeout/denial, verifyWslRepairSuccess/verifyWindowsDisableSuccess (network-router.ts:380-410), error-side consume_confirmation + 500 envelopes"
+  missing: "All four failure modes (UAC denial, timeout, partial success, verification failure), the fresh-status reconcile after failure, nonstuck-UI state transitions (firewall.configuring/resetFirewallCache), and retry/repair result envelopes — none of the mutating surface exists in Rust."
+  effort: L
+  files:
+    - crates/freshell-platform/src/elevated.rs
+    - crates/freshell-server/src/network.rs
+
+- id: NET-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "grep across crates/: the only network mutation routes named (configure / configure-firewall / disable-remote-access) appear in doc comments — no Rust POST /api/network/* endpoints exist, so there is no mutation surface to validate (crates/freshell-server/src/network.rs:84-88 registers GET only)"
+    - "crates/freshell-server/src/settings_store.rs:1635 — the only route that can change network settings, PATCH /api/settings, is auth-gated (is_authed) and rejects unknown top-level keys strictly (:1380-1402, 'network' known at :1387)"
+    - "crates/freshell-server/src/settings_store.rs:1350-1409 — validate_patch validates allowedFilePaths/panes/codingCli/editor but performs NO field validation of the network section, diverging from the legacy strict network sub-schema {host: enum(127.0.0.1|0.0.0.0), configured: boolean} in shared/settings.ts:815-818 — arbitrary network.host values are accepted and persisted"
+    - "test: check_auth_is_constant_time_and_rejects_absent in crates/freshell-api/src/lib.rs:117 (shared gate used by all authed routers)"
+    - "crates/freshell-platform/src/elevated.rs:227-265 — token-replay/overlap rejection logic exists but only as an unwired library (tested: confirm_with_wrong_token_reissues_and_does_not_spawn, in_flight_repair_returns_locked_409)"
+  missing: "Every mutation endpoint plus its defenses: zod-equivalent body schemas for the network routes (arbitrary-host/malformed-field rejection), command-injection surface hardening at route level, route-wired token replay rejection, and overlapping-privileged-op 409s — and PATCH /api/settings lacks network sub-field validation that legacy enforces."
+  effort: M
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: NET-09
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:311-370 — SettingsStore::patch: validate-then-mutate, persist BEFORE committing the live tree (GAP2 fix), single shared serialized store"
+    - "crates/freshell-server/src/settings_store.rs:419-514 — persist(): advisory ConfigLock across read-modify-write (:430), fresh disk read with copy-forward of unmanaged top-level keys (completedMigrations, recentDirectories), overlay-dirty-keys merge for session/terminal overrides"
+    - "crates/freshell-server/src/settings_store.rs:1387 — 'network' is a known top-level PATCH section; patch_settings route at :1614-1651 (auth + broadcast settings.updated at :1642-1646)"
+    - "test: settings_patch_preserves_unmanaged_top_level_document_state (settings_store.rs:2614), terminal_override_patch_preserves_unmanaged_top_level_document_state (:2642), session_override_patch_preserves_unmanaged_top_level_document_state (:2669), corrupted_primary_restores_from_backup_preserving_every_last_good_value (:3251)"
+    - "test: default_plus_network_overlay_matches_captured_fixture (settings_store.rs:2335) — byte-for-byte network overlay against a captured original settings.updated payload"
+    - "Gap: legacy routes network changes through POST /network/configure -> networkManager.configure -> configStore.patchSettings (server/network-manager.ts:417); that route is absent in Rust, so a network toggle via PATCH persists losslessly but produces NO chosen network behavior (no rebind — see NET-02)"
+  missing: "The canonical network-mutation route through the store (POST /api/network/configure) including its settings.updated broadcast on that path and the resulting listener behavior; storage-level losslessness for PATCH-initiated network writes is implemented and tested."
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-server/src/network.rs
+
+- id: NET-10
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/firewall.rs:93-127,175 — native Linux firewall detection (ufw status / firewall-cmd --state, read-only); tests detect_linux_ufw_active (:492), ufw_inactive_falls_through_to_firewalld (:508), linux_none (:530)"
+    - "crates/freshell-platform/src/firewall.rs:190-223 — firewall_commands emits the legacy guidance strings ('sudo ufw allow <p>/tcp', firewall-cmd joined command, macOS socketfilterfw); golden tests ufw_commands_per_port (:341), firewalld_single_joined_command (:349), macos_app_level_command (:360)"
+    - "crates/freshell-server/src/network.rs:163-169 — active-firewall commands surface in status.firewall.commands (asserted non-empty in test all_interfaces_unconfigured_requests_remote_access_and_builds_commands, :365); privileged add commands are only ever built as strings, never executed (firewall.rs:8-11)"
+    - "crates/freshell-server/src/network.rs:243-249 — on native Linux/macOS the LAN-IP edge is unwired: lanIps is always [] (documented: 'only affects the 0.0.0.0 share path'); no listener enumeration beyond the bind host"
+    - "No configure-firewall route exists, so the legacy Linux guidance response {method:'terminal', command: ...} (server/network-router.ts:316-319) has no Rust equivalent; no macOS release-boundary declaration found (detection + app-level command strings exist instead)"
+  missing: "Native Linux LAN address/listener reporting (lanIps always empty), the terminal-guidance endpoint returning exact copyable commands ({method:'terminal'} response), and the documented macOS support-boundary declaration in UI — ufw/firewalld/macos detection, guidance strings and the no-privileged-execution guarantee are implemented and tested."
+  effort: M
+  files:
+    - crates/freshell-server/src/network.rs
+    - crates/freshell-platform/src/network.rs
+    - crates/freshell-platform/src/firewall.rs

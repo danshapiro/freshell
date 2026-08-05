@@ -1,0 +1,135 @@
+- id: GATE-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/playwright.config.ts:194-211 — Node/Rust matrix machinery EXISTS: `legacy-chromium` project (e2eServerKind 'legacy') and `rust-chromium` project (e2eServerKind 'rust') run the SAME MATRIX_SPECS files via helpers/fixtures.ts server-kind routing"
+    - "test/e2e-browser/playwright.config.ts:13-82 — MATRIX_SPECS is a curated ~21-regex SUBSET; the header comment (lines 5-12) explicitly says 'Deliberately a SUBSET of ./specs, not the whole suite... Grow this list as more specs are verified against the Rust target'"
+    - "test/e2e-browser/specs/ contains ~88 spec files; rust-chromium runs MATRIX_SPECS plus ~40 rust-only specs (playwright.config.ts:221-359), but the majority of the legacy suite (e.g. terminal-lifecycle-adjacent UI specs, mobile-viewport, pane-system, settings, tab-management, etc.) never runs against Rust"
+    - "test/e2e-browser/specs/screenshot-baselines.spec.ts and editor-pane.spec.ts(-snapshots) exist (committed visual baselines) but are NOT in MATRIX_SPECS — visual baselines run on legacy chromium only"
+    - "test/e2e-browser/specs/harness-02-matrix-bite.spec.ts — matrix self-test spec present in MATRIX_SPECS (line 16)"
+    - "grep for 'skip.*report|skipped.*report' across test/ found NO machine-readable skipped-test report generator or validator"
+    - "docs/plans/2026-07-18-checklist-reconciliation.md:349 — reconciliation already grades GATE-01 'P' ('only 8 specs run on rust-chromium; the empty-skip report is not achievable until the full suite runs on Rust'); matrix has since grown but remains a subset"
+  missing: "Full legacy suite not run against Rust (matrix is a deliberately curated subset, not 'every externally and lifecycle targetable spec'); committed visual baselines (screenshot-baselines, editor-pane snapshots) do not run on rust-chromium; no machine-readable skipped-test report exists at all (nothing to be empty or approved)"
+  effort: L
+  files:
+    - test/e2e-browser/playwright.config.ts
+    - test/e2e-browser/helpers/fixtures.ts
+    - test/e2e-browser/specs/
+
+- id: GATE-02
+  verdict: HOST-LIMITED
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/ — full Rust Tauri shell exists (server.rs, tray.rs, updater.rs, renderer_recovery.rs, provisioning.rs, state_machine.rs, windows.rs, hotkey.rs, config.rs, health.rs)"
+    - "crates/freshell-tauri/tests/server_spawn_smoke.rs:1-10 — headless integration smoke driving the REAL freshell-server binary through spawn -> /api/health gate -> reap ('app_bound_spawn_health_reap_end_to_end'), explicitly 'no display and no webview required'; soft-skips without the binary"
+    - "scripts/assert-native-windows-build.ts:1-30 — win32 platform guard for the WINDOWS ELECTRON build (electron:build:win), not a Tauri WebView2 test gate"
+    - "test/e2e-electron/electron-app.test.ts + playwright.electron.config.ts — Playwright suite exists but targets the ELECTRON (Chromium) shell, not the packaged Tauri WebView2 installer"
+    - "grep WebView2/webview2 across the repo: only docs/plans references and one comment in crates/freshell-tauri/src/renderer_recovery.rs:33 — NO HARNESS-07 native Windows Tauri Playwright fixture (chromium.connectOverCDP against real WebView2) exists in code"
+    - "docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:48-50 — HARNESS-07 (native Windows Tauri fixture) and GATE-02 (line 820) are still unchecked box items"
+    - "docs/plans/2026-07-18-checklist-reconciliation.md:350 — GATE-02 graded 'H' (host: clean Windows VM)"
+  missing: "Entire packaged-installer WebView2 gate: disposable clean Windows VM install, connectOverCDP attach to real WebView2, startup/wizard/chooser/tray/recovery/network/provider/migration/update scenario suite, uninstall with retained traces and process/config receipts. This host (Linux) cannot substitute per the gate's own text"
+  effort: L
+  files:
+    - crates/freshell-tauri/src/
+    - crates/freshell-tauri/tests/server_spawn_smoke.rs
+    - test/e2e-electron/playwright.electron.config.ts
+    - scripts/assert-native-windows-build.ts
+
+- id: GATE-03
+  verdict: HOST-LIMITED
+  confidence: high
+  evidence:
+    - "grep '16.?tab|sixteen' repo-wide: matches ONLY in docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md (lines 210, 777, 823) — the 16-tab migration fixture does NOT exist anywhere under test/fixtures/ or crates/"
+    - "test/fixtures/ contains only coding-cli, fresh-agent, resume-input, sessions (jsonl transcript fixtures: corrupted-*.jsonl, healthy.jsonl etc.), testing — no legacy Electron profile fixture, no hashed immutable profile"
+    - "docs/plans/2026-07-18-checklist-reconciliation.md:328 — all MIGRATE-01..13 items graded 'H' (host: Electron->Tauri Windows migration, HARNESS-10); GATE-03 graded 'H' (line 351: 'Windows VM + Electron profile')"
+    - "grep migrate/migration in crates found only settings-schema/config migrations (crates/freshell-server/src/settings_store.rs, settings.rs, session_directory.rs) — NO Electron->Tauri export/import bridge code (MIGRATE-02) found in Rust"
+    - "No rollback-into-restored-working-copy harness or immutable-source byte-identity comparator found in scripts/ or test/"
+  missing: "Everything: the 16-tab fixture, the large loss-detection config fixture, immutable hashed source-profile tooling, migration working-copy clone/migrate/compare harness, rollback-and-relaunch comparator. Gate is only executable on a Windows host with packaged Electron + Tauri installers regardless"
+  effort: L
+  files:
+    - test/fixtures/
+    - crates/freshell-tauri/src/provisioning.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: GATE-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/specs/multi-client.spec.ts:174-420 — six multi-client tests: 'two browser tabs share the same server' (175), 'terminal output appears in both clients' (191), 'reconnecting second viewer keeps page 1 PTY size stable and both pages keep shared output' (217), 'settings change broadcasts to other clients' (325), 'server handles many concurrent connections' (380), 'client disconnect is handled gracefully' (402)"
+    - "test/e2e-browser/playwright.config.ts:24 — multi-client.spec.ts IS in MATRIX_SPECS, so it runs against BOTH legacy-chromium and rust-chromium projects on every matrix pass"
+    - "test/e2e-browser/specs/server-restart-recovery.spec.ts — in MATRIX_SPECS (playwright.config.ts:14), covers the server-restart leg against both kinds"
+    - "test/e2e-browser/specs/create-protection-isolation-rust.spec.ts — two concurrent RustServers storm-isolation proof (rust-chromium only, playwright.config.ts:299-301); partial evidence on the 'no duplicated process owners' axis at server level"
+    - "crates/freshell-ws/tests/max_payload.rs:221-251 — second independent connection unaffected by client A's oversized frame (crate-level isolation test)"
+    - "docs/plans/2026-07-18-checklist-reconciliation.md:352 — GATE-04 graded 'P': 'reconnect leg is a known flake on both kinds + crash/isolation coverage incomplete'"
+  missing: "Tauri client sharing one Rust server alongside two browser profiles (host-limited: needs Windows WebView2 host); explicit private session-event isolation assertions between clients; targeted per-client screenshots; bounded catch-up assertions after reconnect; server-and-browser simultaneous crash/restart shared-state assertions (compound-restart-rust.spec.ts exists but is rust-only and not tied to multi-client shared state); no explicit duplicated-process-owner check in the browser multi-client lane"
+  effort: M
+  files:
+    - test/e2e-browser/specs/multi-client.spec.ts
+    - test/e2e-browser/specs/compound-restart-rust.spec.ts
+    - test/e2e-browser/playwright.config.ts
+
+- id: GATE-05
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "test/e2e-browser/specs/stress.spec.ts:1-60 — existing stress spec: 'handles 6+ panes simultaneously', 'handles 10 tabs', 'rapid tab switching', 'concurrent terminal output' — but it is UI-level stress only, NOT in MATRIX_SPECS (runs legacy chromium project only), and asserts no numeric ceilings"
+    - "test/e2e-browser/perf/visible-first-audit-gate.ts:1-60 — a real gate harness exists comparing latency/offscreen metrics (focusedReadyMs, terminalInputToFirstOutputMs, offscreen HTTP/WS request/byte/frame counts) between a base and candidate audit artifact with violation reporting; test/e2e-browser/perf/audit-contract.ts:1-50 defines the profile/scenario matrix and zod-validated artifact contract; scripts/assert-visible-first-audit-gate.ts + compare-visible-first-audit.ts wire it up"
+    - "grep 'rss|RSS|soak|memory.*ceiling|handle.*ceiling|port.*ceiling' across crates/ — ZERO matches; no server resource-ceiling instrumentation exists in the Rust code"
+    - "perf harness (create-audit-context.ts:1-28) has no e2eServerKind/server-kind routing found — the audit lane does not select the Rust server explicitly"
+    - "docs/plans/2026-07-18-checklist-reconciliation.md:353 — GATE-05 graded 'N' ('No instrumented stress gate (needs HARNESS-12)')"
+  missing: "Explicit RSS/handle/queue/process/port ceilings (none defined anywhere); mixed-load soak run; repeated desktop close/reopen cycles (Tauri host-limited); provider crash/recovery + extension-proxy + update-cycle hygiene legs; zero-owned-leftover assertions with unrelated-sentinel survival checks. Existing pieces are a UI stress spec and a client visible-first latency comparability gate only"
+  effort: L
+  files:
+    - test/e2e-browser/specs/stress.spec.ts
+    - test/e2e-browser/perf/visible-first-audit-gate.ts
+    - test/e2e-browser/perf/audit-contract.ts
+
+- id: GATE-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/specs/safe01-auth-matrix.spec.ts:8-60 — SAFE-01 Playwright matrix: parameterized bad-token startup rejection (empty/short/conflicting) plus good/wrong/missing token over UI/API/WS, driven against BOTH legacy-chromium and rust-chromium (in MATRIX_SPECS, playwright.config.ts:69); header documents which SAFE-01 clauses are covered vs deferred"
+    - "test/e2e-browser/specs/safe03-origin-matrix.spec.ts:8-50 — SAFE-03 origin-policy matrix against BOTH kinds with per-kind-correct assertions (legacy advisory-only control vs Rust enforced 4011 close); in MATRIX_SPECS (playwright.config.ts:70); backed by crates/freshell-ws/src/origin.rs and crates/freshell-ws/tests/origin_policy.rs real-socket tests"
+    - "test/e2e-browser/specs/auth.spec.ts:1-56 — auth modal, wrong-token, URL-token, 401-without-header negatives (chromium/legacy lane)"
+    - "crates/freshell-server/src/rate_limit.rs:1-50,176-330 — SAFE-02 global authenticated API rate limiter (token bucket, 429 + Retry-After, /api/health exempt, per-key buckets) with unit tests (rate_limited_response, try_acquire limits); mounted in main.rs:1132-1341"
+    - "crates/freshell-ws/src/create_limit.rs:1-80 + crates/freshell-ws/tests/create_protection.rs:131-344, restore_spawn_gate.rs:287-722 — per-connection terminal.create rate limit with RATE_LIMITED wire-shape tests; Playwright rust-only legs: create-rate-limit-ladder-rust.spec.ts and rest-spawn-gate-rust.spec.ts (playwright.config.ts:296-298,352-353)"
+    - "crates/freshell-ws/tests/max_payload.rs — oversized-frame rejection + second-client-unaffected test"
+    - "crates/freshell-tauri/tests/../src/updater.rs:8-100,261-384 — updater arm/disarm gate on Ed25519 pubkey presence with unit tests (placeholder pubkey -> DisarmedNoPubkey); signature verification itself delegated to tauri-plugin-updater"
+    - "test/e2e-browser/specs/cfg03-backup-restore.spec.ts — CFG-03 config backup/restore matrix in MATRIX_SPECS (playwright.config.ts:71)"
+  missing: "No single complete negative matrix tying it together with follow-each-negative-with-valid-operation recovery assertions; file-root escape negatives (no traversal-guard test found for Rust static/extension file serving); proxy-destination allowlist negatives; extension path/process permission negatives; event-subscription authorization negatives; privileged-networking negatives; forged/invalid updater-signature rejection test (updater.rs tests only config gating, and packaged-binary signature proof is host-limited)"
+  effort: M
+  files:
+    - test/e2e-browser/specs/safe01-auth-matrix.spec.ts
+    - test/e2e-browser/specs/safe03-origin-matrix.spec.ts
+    - crates/freshell-server/src/rate_limit.rs
+    - crates/freshell-ws/src/origin.rs
+    - crates/freshell-tauri/src/updater.rs
+
+- id: GATE-07
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "Unit-level a11y coverage exists: test/unit/client/components/TabBar.a11y.test.tsx:47-55 ('exposes an accessible name for the new tab button'), TabBar.overflow.test.tsx:222 (aria-labels on arrow buttons), panes/Pane.test.tsx:235-254 (accessibility describe block; tabIndex=0 keyboard accessibility), FloatingActionButton.test.tsx:34 (aria-label), panes/DirectoryPicker.test.tsx:170 (combobox/listbox a11y attributes), TerminalConnectionError.test.tsx:79 (role+label)"
+    - "test/unit/client/components/SettingsView.behavior.test.tsx:76,149 — 'commits keyboard-only slider changes' / 'keyboard-only font size changes' (keyboard interaction unit coverage)"
+    - "test/e2e/network-setup.test.tsx:170 — 'has accessible dialog role' (vitest flow level)"
+    - "grep for a role/label-only Playwright gate or axe-style audit across test/: NOTHING found; docs/plans/2026-07-18-checklist-reconciliation.md:75 — 'HARNESS-11 Accessibility selectors gate: N — No reusable role/label gate or lint self-test found. Blocks GATE-07'; lines 355 GATE-07 graded 'N'"
+    - "No Playwright spec drives first-run setup/launch choice/terminal+provider creation/session search/pane management/settings/approvals/migration/update keyboard-only"
+  missing: "HARNESS-11 role/label-only locator gate; all keyboard-only end-to-end flows (first-run setup, launch choice, terminal/provider creation, session search/mutations, pane management, settings, approvals/questions, migration, update). Existing evidence is scattered unit-test a11y assertions, not an operable-without-a-mouse proof"
+  effort: L
+  files:
+    - test/unit/client/components/TabBar.a11y.test.tsx
+    - test/e2e-browser/specs/
+    - test/e2e-browser/helpers/
+
+- id: GATE-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "grep 'receipt' across all ts/tsx/rs/js/mjs/json in repo: matches are only server/tabs-registry/store.ts 'receiptTime' fields, crates/freshell-activity/src/codex.rs receipt-time comments, and a tabs-registry unit test — NONE relate to a parity/release receipt artifact, reporter, or validator"
+    - "grep 'parity.?receipt' repo-wide: matches only the checklist docs themselves (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:838, docs/plans/2026-07-18-checklist-reconciliation.md:356 which grades GATE-08 'N — No receipt reporter/validator')"
+    - "No receipt schema, emitter, or Playwright reporter/validator linking checklist IDs to test results exists in test/, scripts/, or crates/"
+  missing: "Everything: the receipt format capturing source commits, binary hashes, platforms, test commands/counts, pass/fail/skips, perf ceilings, migration hashes, screenshots/traces, process cleanup, approved deviations; and the final Playwright reporter/validator that rejects missing/stale/mismatched evidence and links every checklist ID to a passing test"
+  effort: M
+  files:
+    - test/e2e-browser/playwright.config.ts
+    - scripts/

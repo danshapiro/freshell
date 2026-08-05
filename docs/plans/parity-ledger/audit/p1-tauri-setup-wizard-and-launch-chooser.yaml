@@ -1,0 +1,142 @@
+- id: TAURI-08
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/commands.rs:59-84 — validate_port/validate_url/validate_wizard_config ported from wizard-logic.ts (remote→URL, daemon/app-bound→port; unknown mode rejected)"
+    - "crates/freshell-tauri/src/commands.rs:89-104 — build_wizard_patch writes serverMode/port/globalHotkey/setupCompleted:true, omits empty remoteUrl/remoteToken (entry.ts:513-528 analog)"
+    - "crates/freshell-tauri/src/commands.rs:344-360 — #[tauri::command] complete_setup: wizard-window-gated, validates, then persists patch to desktop.json (written only at confirmation seam)"
+    - "crates/freshell-tauri/src/windows.rs:40-50 — wizard_spec 640x500 resizable:false centered (wizard-window.ts:14-40 analog); crates/freshell-tauri/capabilities/wizard.json grants wizard window core invoke"
+    - "test: validate_port_bounds, validate_url_accepts_and_rejects, wizard_config_validation_by_mode, wizard_patch_sets_setup_completed_and_omits_empty_remote, wizard_patch_includes_remote_when_present in crates/freshell-tauri/src/commands.rs"
+  missing: "No wizard UI/screens at all (crates/freshell-tauri/frontend/index.html is a 'Starting Freshell…' placeholder; no wizard React bundle). Wizard window is never constructed: lib.rs builds only the 'main' window (lib.rs:272) and setup_app_bound hardcodes setup_completed:true (lib.rs:138-148); state_machine::runnable_phase degrades ShellPhase::Wizard→Main (state_machine.rs:116-122). No wizard→main transition wiring. No token or hotkey validation in validate_wizard_config (only port/URL; commands.rs:78-84). Daemon-mode setup has no install path (CD-5 dead-end noted at commands.rs:26-30, matches reference). PW-TAURI-WIN lane (roles/keyboard, desktop.json timing) not runnable here."
+  effort: L
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/windows.rs
+    - crates/freshell-tauri/src/state_machine.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/frontend/index.html
+
+- id: TAURI-09
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/windows.rs:98-122 — PrivilegedCommand enum, owner_window mapping, is_allowed_window gate (Rust analog of entry.ts:538-541 isAllowedSender / electron webContents.id check, replacing it with window labels)"
+    - "crates/freshell-tauri/src/commands.rs:349-351 (complete_setup), 367-369 (get_launch_options), 397-399 (choose_launch_option) — each privileged command rejects non-owner windows before any config change; rejections return errors / LaunchChoiceResult::err"
+    - "crates/freshell-tauri/capabilities/wizard.json and chooser.json — per-window capability files scoping invoke to 'wizard'/'chooser' windows; main window (capabilities/default.json) has no grant for setup/choice commands"
+    - "test: per_window_command_gate in crates/freshell-tauri/src/windows.rs:175-211 — asserts each privileged command accepts only its owning window and rejects main/wizard/chooser mismatches"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-tauri/src/windows.rs
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/capabilities/wizard.json
+    - crates/freshell-tauri/capabilities/chooser.json
+
+- id: TAURI-10
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/commands.rs:133-152 — build_launch_options (launch-options.ts:16-27 analog) returns candidates/reason/alwaysAskOnLaunch/port/remoteUrl"
+    - "crates/freshell-tauri/src/commands.rs:246-327 — plan_launch_choice: connect/remote and start-local accept/reject matrix, token-required gate, remember→persist serverMode/remoteUrl/remoteToken or app-bound/port, always persists alwaysAskOnLaunch; forced-launch plan"
+    - "crates/freshell-tauri/src/commands.rs:365-428 — get_launch_options reads desktop.json; choose_launch_option validates, runs authoritative port bind-check (is_port_available, commands.rs:331-333, 411-417), persists patch"
+    - "crates/freshell-tauri/src/windows.rs:54-64 — chooser_spec 760x720 shown-after-load (entry.ts:588-608 analog); capabilities/chooser.json"
+    - "test: launch_options_defaults_when_no_pending, launch_options_uses_pending_candidates, connect_requires_token_when_auth_required, connect_remember_persists_remote_defaults, connect_no_remember_only_persists_always_ask, start_local_validates_port_and_requests_bind_check, is_port_available_true_for_free_port / _false_for_occupied_port in crates/freshell-tauri/src/commands.rs"
+  missing: "Candidate list is always empty — live discovery explicitly deferred (commands.rs:20-24, 363-364; get_launch_options passes None). 'Transitioning cleanly' not wired: restartMain/forced-launch handoff deferred (commands.rs:390-391), state_machine LaunchChosen event exists+tested but nothing fires it at runtime. Chooser window never constructed (lib.rs:272 builds only 'main'; runnable_phase, state_machine.rs:116-122, degrades Chooser→Main). No chooser UI/frontend. Auth_check (live token validation) deferred (commands.rs:418-419). No no-duplicate-process guarantee exercised."
+  effort: L
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/windows.rs
+    - crates/freshell-tauri/src/state_machine.rs
+    - crates/freshell-tauri/src/lib.rs
+
+- id: TAURI-11
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/commands.rs:20-24 — module doc explicitly defers live server discovery feeding the chooser's candidate list"
+    - "crates/freshell-tauri/src/commands.rs:363-364,385 — get_launch_options returns empty candidate list ('candidate discovery is deferred')"
+    - "Only normalize_server_url (commands.rs:203-205, provisioning.rs:140-142) is ported from launch-discovery.ts; grep across crates/ found no buildLocalProbeUrls/discoverLocalServers/isLoopbackUrl/HealthPayload analog (reference: electron/launch-discovery.ts:31-96)"
+    - "Reference behavior absent: probe of configured port + 3001-3010 range + knownServers (launch-discovery.ts:31-52), freshness-based ordering/dedup and offline remembered entries (launch-policy.ts) — no Rust module implements any of it; desktop.json 'knownServers' is never read anywhere in crates/freshell-tauri/src"
+    - "No Rust tests for discovery/dedup/ordering exist"
+  missing: "All clauses: probing configured ports and remembered knownServers entries, deduplication, offline-candidate retention, predictable ordering, labels/status population. No Rust implementation found."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/health.rs
+
+- id: TAURI-12
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Reference precedence resolver is electron/token-resolver.ts:52-74 (resolveCandidateToken): saved remoteUrl match→remoteToken, else loopback→.env AUTH_TOKEN (extractTokenFromEnv), else config.json authToken/token (extractTokenFromConfigJson); user entry supplies the rest via the chooser"
+    - "Grep across crates/ for resolveCandidateToken/extractTokenFromEnv/extractTokenFromConfigJson: no analog found (only unrelated AUTH_TOKEN doc in crates/freshell-api/src/lib.rs:34); crates/freshell-tauri never reads .env or legacy config.json"
+    - "crates/freshell-tauri/src/commands.rs:262-272 — plan_connect uses ONLY the user-entered choice.token; no candidate-token resolution or precedence anywhere"
+    - "Secrecy aid already present: redact_token in crates/freshell-tauri/src/lib.rs:459-464 strips ?token= from logs"
+    - "test: redact_token_hides_the_credential in crates/freshell-tauri/src/lib.rs:600-610 (secrecy of logged load URL only — not a precedence test)"
+  missing: "Entire precedence chain (saved remoteToken for matching URL → .env AUTH_TOKEN → legacy config.json authToken/token) and its wiring into chooser candidate selection; user entry exists only as a pass-through of choice.token. Log/UI secrecy verified only for the launch-load URL log line."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/config.rs
+
+- id: TAURI-13
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/lib.rs:240-246 — setup_remote only health-gates via wait_for_health (public, unauthenticated /api/health probe, health.rs:97-125) before creating the main window at the ?token= URL; a 200 health response with a wrong token would still load main"
+    - "crates/freshell-tauri/src/commands.rs:418-419 — choose_launch_option: 'live token validation (auth_check) against {url}/api/settings is deferred (needs an HTTP client + a running target) — flow-gated'; plan_launch_choice surfaces auth_check (commands.rs:234-239, 293-297) but the wrapper never executes it"
+    - "Reference gate: electron/launch-choice-handler.ts:62-72 calls validateServerAuth before restartMain and returns 'The server rejected that token.' — no Rust equivalent (no HTTP client dependency in crates/freshell-tauri/Cargo.toml)"
+    - "No Rust test exists asserting rejection-on-bad-token after a healthy server"
+  missing: "Settings-endpoint authentication check before opening main, both in the chooser command path and in the remote/provisioned boot path; auth error surface that keeps the chooser open; retry after token correction."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/health.rs
+
+- id: TAURI-14
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/health.rs:101-125 — http_probe_inner opens a plain TcpStream and sends cleartext 'GET /api/health HTTP/1.1'; against any TLS port this can never succeed"
+    - "crates/freshell-tauri/Cargo.toml — no reqwest/rustls/native-tls/openssl dependency; no TLS client exists anywhere in the crate"
+    - "https is accepted only at URL-validation level (validate_remote_launch_url, commands.rs:208-213; validate_url, commands.rs:68-73) and the webview would load an https URL, but the health/auth gates preceding it are plaintext-only; no trusted/untrusted certificate handling and no explicit never-downgrade guard in the Rust network path"
+    - "test: http_probe_reports_ready_against_a_200_stub and http_probe_reports_notready_on_closed_port in health.rs exercise plain HTTP only — no TLS tests"
+  missing: "All clauses: TLS for health + authentication probes, trusted/untrusted certificate handling with a clear chooser error, and a guaranteed no-plain-HTTP-fallback path. The current probe speaks only plain HTTP."
+  effort: L
+  files:
+    - crates/freshell-tauri/src/health.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/Cargo.toml
+
+- id: TAURI-15
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/lib.rs:216-217,240-243 — setup_remote on health-gate failure logs and returns Err; comment: 'the reference would fall back to the launch chooser — a deferred 3.14 window — so fail-fast is the honest analog'"
+    - "crates/freshell-tauri/src/lib.rs:110-119 — a failed build/setup path reaps the server and calls std::process::exit(1): the desktop does NOT stay alive"
+    - "Reference chooser fallback reasons: electron/launch-policy.ts ('saved-remote-unreachable', 'saved-remote-token-invalid', retry/change/start-local via chooser) — no Rust port of chooseLaunchAction; grep found no launch-policy analog"
+    - "No chooser window exists to fall back to (lib.rs:272 builds only 'main'; state_machine.rs:116-122 degrades Chooser→Main); no Rust test for saved-target-unavailable retry"
+  missing: "All clauses: chooser fallback with the failed candidate shown as offline, retry/change/start-local choices, keeping the desktop alive instead of aborting, and the Retry→single authenticated main window flow."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/state_machine.rs
+    - crates/freshell-tauri/src/windows.rs
+
+- id: TAURI-16
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/provisioning.rs:55-70 — parse_provisioning 1:1 with desktop-provisioning.ts:23-34 (KEY=value, verbatim value after first '=', unknown/malformed lines ignored)"
+    - "crates/freshell-tauri/src/provisioning.rs:92-122 — apply_provisioning_file: one-shot (provision file always deleted, incl. unreadable case), persists {serverMode:'remote', remoteUrl, remoteToken, setupCompleted:true} via atomic patch, persist errors swallowed so a malformed file cannot brick startup (desktop-provisioning.ts:48-81 analog)"
+    - "crates/freshell-tauri/src/config.rs:69-94 — write_config_atomic (tmp+rename) + patch_config_at (merge-preserving); wired at boot in lib.rs:96-104 (env pair FRESHELL_REMOTE_URL/FRESHELL_TOKEN first, then provision file)"
+    - "test: apply_patches_config_and_deletes_file, apply_incomplete_file_deletes_without_patching (invalid input cannot partially overwrite config), apply_preserves_other_desktop_json_keys, apply_missing_file_returns_false, env_pair_resolves_only_when_both_nonempty, desktop_config_remote_roundtrip in crates/freshell-tauri/src/provisioning.rs:179-327"
+    - "Second-boot reuse helper exists: remote_from_desktop_config (provisioning.rs:126-136) extracts a saved remote from desktop.json"
+  missing: "'Use saved configuration on later cold starts' is not wired: resolve_provisioned_remote (provisioning.rs:162-177) returns None when neither the env pair nor a provision file exists, so setup() proceeds app-bound (lib.rs:100-104) and never consults desktop.json's saved serverMode/remoteUrl/remoteToken on a later cold start — remote_from_desktop_config is only read within the same boot that consumed a provision file. 'Preserve diagnostics for invalid/interrupted input': errors are silently swallowed (let _ = …, provisioning.rs:99,109,120) matching the reference's swallow, so nothing is surfaced/recorded. PW-TAURI-WIN packaged lane (valid/malformed/wrong-token/interrupted matrix) not runnable on this host."
+  effort: S
+  files:
+    - crates/freshell-tauri/src/provisioning.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/config.rs

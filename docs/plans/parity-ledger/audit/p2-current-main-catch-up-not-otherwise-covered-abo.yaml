@@ -1,0 +1,102 @@
+- id: SYNC-00
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "git state: branch parity-campaign-20260805 is current main + 1 docs commit (`git rev-list --count main..HEAD` = 1, `HEAD..main` = 0; HEAD 47f5c68f5 on top of main 4eecc456c) — so 'reconciled with current main' is true TODAY by construction, not via a recorded reconciliation process"
+    - "port/contract/ws-message-inventory.json + port/contract/generate-ws-contract.ts — a generated WS-message inventory exists, regenerated and byte-pinned"
+    - "test: 'committed message inventory deep-equals a fresh regeneration' in test/unit/port/ws-contract-freeze.test.ts:61 (plus counts/consistency guards at :79-84)"
+    - "Canonical checklist docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:783 still lists SYNC-00 unchecked with no completion notes"
+  missing: "The 'generated inventory test that asserts every client-used route/message/provider on current main has a Rust capability or an unchecked checklist ID' (no-unowned-gaps gate) does not exist — the ws-contract-freeze inventory is WS-messages-only and maps to no Rust-capability/checklist-ID ownership; no REST-route or provider drift-inventory/gate was found anywhere under test/ or scripts/ (searched 'unowned', 'checklist ID', 'drift-inventory', route-inventory patterns). The 'again before release' reconciliation is also inherently not yet done."
+  effort: M
+  files:
+    - port/contract/generate-ws-contract.ts
+    - test/unit/port/ws-contract-freeze.test.ts
+    - scripts/
+
+- id: SYNC-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "shared/settings.ts:43-44 — UI_SCALE_MIN = 0.75, UI_SCALE_MAX = 4 (400%); :47 UI_SCALE_PERCENT_OPTIONS"
+    - "test: 'clamps oversized uiScale to the 400% maximum when extracting a legacy seed' and 'pins the UI scale percent options: 5% steps to 200, 25% steps to 400' in test/unit/shared/settings.test.ts:448-465"
+    - "src/components/settings/AppearanceSettings.tsx — consumes UI_SCALE_PERCENT_OPTIONS (settings UI control)"
+    - "uiScale is a LOCAL (client-side) setting — shared/settings.ts:194 `uiScale: number` inside LocalSettings; zero hits for uiScale/ui_scale anywhere under crates/ (grep-verified), and the Rust ServerSettings model (crates/freshell-server/src/settings.rs:32-85) correctly omits it — no Rust server implementation exists or is needed; the Rust server serves the same shared client"
+  missing: "The item-named Playwright validation was never authored/run against the Rust server: no e2e spec exercises boundary/invalid/400% uiScale values or reload-persistence/clamping (no uiScale hits in test/e2e-browser; settings.spec.ts is not in MATRIX_SPECS so it runs legacy-only), and the PW-TAURI-WIN leg is unrunnable on this Linux host. Keyboard accessibility at 400% is unverified by any test."
+  effort: S
+  files:
+    - shared/settings.ts
+    - src/components/settings/AppearanceSettings.tsx
+    - test/e2e-browser/specs/settings.spec.ts
+
+- id: SYNC-02
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "shared/settings.ts:52-53 — TERMINAL_FONT_SIZE_MIN = 12, TERMINAL_FONT_SIZE_MAX = 64; :57 TERMINAL_FONT_SIZE_PX_OPTIONS"
+    - "test: 'pins the terminal font size px options: 1px steps to 32, 2px to 48, 4px to 64' (:475), 'keeps the terminal font size px options strictly ascending integers spanning 12..64' (:483), 'clamps legacy-seed font sizes at the 64px boundary with round-after-clamp' (:508) in test/unit/shared/settings.test.ts"
+    - "test: 'terminal font size input changes setting' (direct spinbutton input) in test/e2e-browser/specs/settings.spec.ts:35-58 — but settings.spec.ts is NOT in MATRIX_SPECS (playwright.config.ts:13-82), so it runs against the legacy server only"
+    - "Client-local setting (LocalSettings.terminal.fontSize, shared/settings.ts:195-196); zero font-size handling under crates/ outside unrelated contexts — no Rust server work exists or is needed"
+  missing: "No rust-chromium e2e coverage of boundary/invalid/64px entry, live xterm cell/canvas metric change, or reload persistence against the Rust server (no dedicated spec; settings.spec.ts excluded from MATRIX_SPECS); PW-TAURI-WIN leg unrunnable on this Linux host."
+  effort: S
+  files:
+    - shared/settings.ts
+    - src/components/settings/AppearanceSettings.tsx
+    - test/e2e-browser/specs/settings.spec.ts
+
+- id: SYNC-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "src/components/panes/EditorPane.tsx:174 — `const editorFontSize = useAppSelector((s) => s.settings.settings.terminal?.fontSize) ?? 16`; applied to the editor at :1034 (`fontSize: editorFontSize`) — editor font follows the terminal font-size setting via Redux, so existing panes update live without remount and new panes get the current value"
+    - "test: describe 'EditorPane font size follows settings.terminal.fontSize' in test/unit/client/components/panes/EditorPane.fontSize.test.tsx:73 — 'defaults to the terminal font size setting (16, not the old hard-coded 14)' (:85), 'uses the current setting when the editor mounts after the setting changed' (:96), 'updates live without remounting when the setting changes (slider drag)' (:104), 'receives the clamped value for out-of-range settings (999 -> 64)' (:120)"
+    - "Pure client-side wiring; no server involvement in either implementation (nothing under crates/ touches editor fonts)"
+  missing: "The 'after restart' leg and the side-by-side terminal-vs-editor computed-text-size comparison are not covered by any Playwright spec (editor-pane.spec.ts has no font-follows assertion), so neither the PW-RUST nor PW-TAURI-WIN validation leg exists; after-restart behavior rests on generic localStorage persistence only (settings-persistence-split.spec.ts covers theme, not font size)."
+  effort: S
+  files:
+    - src/components/panes/EditorPane.tsx
+    - test/unit/client/components/panes/EditorPane.fontSize.test.tsx
+    - test/e2e-browser/specs/editor-pane.spec.ts
+
+- id: SYNC-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "grep-verified: zero hits for `fontScale`/`font_scale` in shared/, server/, src/, and all of crates/ — the deprecated key is fully removed from production code on both implementations (remaining hits are docs and regression tests only); spec record: docs/plans/2026-07-08-remove-freshagent-fontscale-spec.md"
+    - "test: e2e 'freshAgent.fontScale setting is ignored when present in a dispatched patch' in test/e2e-browser/specs/fresh-agent.spec.ts:880-884 (dispatches `{ freshAgent: { fontScale: 2 } }` and asserts no effect)"
+    - "test: test/unit/client/browser-preferences.fresh-agent-settings.test.ts — persistence layer never round-trips fontScale"
+    - "No Rust surface: grep of crates/ for fontScale/font_scale returns zero — nothing to port, nothing stale to override on the Rust server"
+  missing: "The item-named PW-RUST validation leg (seed deprecated property, launch, settings save, verify removed) is not wired against the Rust server — fresh-agent.spec.ts is not in MATRIX_SPECS (playwright.config.ts:13-82), so the seed-and-save regression runs legacy-only. Implementation itself is complete on both stacks."
+  effort: S
+  files:
+    - shared/settings.ts
+    - src/store/browserPreferencesPersistence.ts
+    - test/e2e-browser/specs/fresh-agent.spec.ts
+
+- id: SYNC-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/specs/restore-sync05.spec.ts exists and is registered in MATRIX_SPECS (test/e2e-browser/playwright.config.ts:34, with the SYNC-05 comment at :31-33) — so the quiet-expected-restart suite runs on BOTH legacy-chromium and rust-chromium against the real Rust server restart path"
+    - "Section-file recorded greens (2026-07-18/19): general-leg test 'a live terminal pane reconnects quietly after a deliberate server restart, with no user-facing error noise' and FreshCodex-leg test 'a FreshCodex pane reconnects quietly after a deliberate server restart, targeting the same durable session with no user-facing error noise', both green 2x on both projects (not re-executed in this audit)"
+    - "Dependencies TERM-22/SAFE-11/TAURI-30 are owned by other checklist sections (not audited here)"
+  missing: "The equivalent-crash / diagnostics-retained leg (unexpected crash must retain actionable diagnostics) has no spec, and the PW-TAURI-WIN half of the validation is absent (native Windows WebView2, unrunnable on this host) — both explicitly deferred per the spec file's own doc comment."
+  effort: M
+  files:
+    - test/e2e-browser/specs/restore-sync05.spec.ts
+    - crates/freshell-server/src/boot.rs
+
+- id: SYNC-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/resolve.rs:1 — '`POST /api/sessions/resolve` — SYNC-06 port of the resolve route'; route mounted at resolve.rs:256 (`.route(\"/api/sessions/resolve\", post(resolve_session))`); module doc (resolve.rs:11) states the `sessionResolve` capability flag is declared `true` in main.rs; `homeDir` wire helper at crates/freshell-server/src/main.rs:1715; in-crate route tests exercise the endpoint (resolve.rs:992, :1616)"
+    - "crates/freshell-sessions/src/resume_input.rs (parser port) and crates/freshell-sessions/src/resume_resolve.rs (matching core + budgeted shape-gated fallbacks) exist; test crates: crates/freshell-sessions/tests/resume_input_parser_parity.rs and crates/freshell-sessions/tests/resume_resolve.rs, plus fixture-driven cross-language parity via test/fixtures/resume-input/parser-cases.json"
+    - "test/e2e-browser/specs/resume-button.spec.ts is registered in MATRIX_SPECS (test/e2e-browser/playwright.config.ts:58; comment at :54-57 confirms the Rust server has the hardened response surface: degraded/providerErrors/unsearchedProviders/homeDir) — runs on both Node and Rust"
+    - "Section-file record (2026-07-30, commit 22022a848): hardened-contract follow-up green — `cargo test --workspace` 2368 passed / 0 failed, resume-button.spec.ts green on both projects, flag restored (not re-executed in this audit)"
+  missing: "Only the PW-TAURI-WIN validation half (native Windows WebView2 sidebar Resume button + paste-resume flow) — deliberately out of scope per the SYNC-05/SAFE-11 PARTIAL convention; implementation and logic/e2e coverage on the Rust server are otherwise recorded as at hardened parity with current main."
+  effort: S
+  files:
+    - crates/freshell-server/src/resolve.rs
+    - crates/freshell-sessions/src/resume_resolve.rs
+    - crates/freshell-sessions/src/resume_input.rs
+    - test/e2e-browser/specs/resume-button.spec.ts

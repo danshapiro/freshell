@@ -1,0 +1,144 @@
+- id: EXT-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/extensions.rs:92-105 — ExtensionManifest serde struct; doc at :13-15 and :89-91 states LENIENT parsing (unknown keys ignored), explicitly diverging from the legacy strict zod schema"
+    - "crates/freshell-server/src/extensions.rs:53-78 — CliConfig models args/env/resumeArgs/createSessionArgs/modelArgs/sandboxArgs/permissionModeArgs/supports*/terminalBehavior but NOT permissionModeEnvVar/permissionModeValues (legacy server/extension-manifest.ts:60-61)"
+    - "crates/freshell-server/src/extensions.rs:269-275 — is_valid_manifest requires cli block only for category=cli; client/server accepted as-is (legacy refine at server/extension-manifest.ts:96-103 requires exactly the matching block: client.entry, server.command/args/readyPattern/readyTimeout/healthCheck/singleton — none modeled)"
+    - "reference: server/extension-manifest.ts:14-25 (contentSchema field schema + default-type refine), :31-43 (Client/ServerConfigSchema with defaults args=[], readyTimeout=10000, singleton=true), :45-48 (terminalBehavior enums) — none ported"
+    - "test: scan_discovers_cli_manifests_and_dedups_first_wins in crates/freshell-server/src/extensions.rs:507"
+    - "test: client_registry_matches_frozen_shape_for_claude in crates/freshell-server/src/extensions.rs:529"
+  missing: "strict unknown-field rejection with useful diagnostics; client/server config blocks (entry, command, args, env, readyPattern, readyTimeout, healthCheck, singleton) incl. zod defaults; contentSchema field schema + default-matches-type refine; terminalBehavior enum validation; permissionModeEnvVar/permissionModeValues; min(1) string constraints; tests for every invalid manifest class (no invalid-class test exists)"
+  effort: M
+  files:
+    - crates/freshell-server/src/extensions.rs
+
+- id: EXT-02
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/extensions.rs:418-428 — resolve_extension_dirs mirrors legacy order [<home>/.freshell/extensions, <cwd>/.freshell/extensions, builtin ./extensions] (server/index.ts:294-297)"
+    - "crates/freshell-server/src/extensions.rs:140-179 — scan(): sorted subdir iteration, accepts dirs AND symlinks (:150-154), first-wins dedup via seen set (:170-173), invalid manifests skipped"
+    - "crates/freshell-server/src/extensions.rs:279-340 — client_entry serializes NO filesystem path (paths never exposed), matching legacy toClientRegistry"
+    - "test: scan_discovers_cli_manifests_and_dedups_first_wins in crates/freshell-server/src/extensions.rs:507 — duplicate name in a later root dropped, proving cross-root precedence"
+    - "divergence note: Rust sorts subdir names for determinism vs legacy fs.readdirSync order (documented extensions.rs:136-139)"
+  missing: "test coverage for symlinked extension entries (accepted in code but untested); invalid manifests skipped SILENTLY — legacy logs per-manifest warnings (server/extension-manager.ts:92-111) so diagnostics parity is absent; no test that icons/registry leak no path outside an allowed root"
+  effort: S
+  files:
+    - crates/freshell-server/src/extensions.rs
+
+- id: EXT-03
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/boot.rs:68-71 — extensions registry 'Precomputed at boot (immutable for the process life)'; no rescan path"
+    - "crates/freshell-server/src/main.rs:394-400,874-877 — single ExtensionRegistry::scan at boot; no watcher, no rebroadcast wiring"
+    - "crates/freshell-protocol/src/server_messages.rs:62 — 'extensions.registry' message type declared in protocol (shape pinned by crates/freshell-protocol/tests/activity_extension.rs) but no producer exists in any crate"
+    - "reference: server/index.ts:485-530 — dev-gated chokidar watcher on the three extension dirs, 300ms-debounced rescan, registerCodingCliCommands + wsHandler.refreshExtensionModes + broadcast {type:'extensions.registry'}; decoded broadcasts extension.server.* at :473-484"
+  missing: "entire live-reload feature: extension-dir watcher, rescan, CLI spawn-table refresh, extensions.registry broadcast, invalid-edit diagnostics surfaced to clients; unaffected panes stability is moot (nothing is reloaded)"
+  effort: M
+  files:
+    - crates/freshell-server/src/extensions.rs
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-protocol/src/server_messages.rs
+
+- id: EXT-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:134-150 — boot knownProviders migration ported: seed once from discovered CLI extensions, append newly-discovered names AND auto-enable them (legacy server/index.ts:317-345); explicit user choices preserved because only NOT-known names are appended"
+    - "test: known_providers_seeded_persisted_and_patchable in crates/freshell-server/src/settings_store.rs:1859"
+    - "test: live-pinned auto-enable test (persisted knownProviders ['claude'] + boot discovering 5 → new names appended and enabled) in crates/freshell-server/src/settings_store.rs:1913-1943"
+    - "crates/freshell-protocol/src/settings.rs:107-109 — SettingsExtensions { disabled: Vec<String> } in the settings tree; generic JSON deep_merge PATCH persists extensions.disabled (settings_store.rs:311-346) and PATCH broadcasts settings.updated (settings_store.rs:1630-1647)"
+    - "crates/freshell-server/src/resolve.rs:230,641-645 — disabled providers filtered OUT of the session index; tests disabled_providers_are_reported_unsearched_never_as_errors (:1750), disabled_provider_indexed_sessions_do_not_resolve (:1782)"
+    - "picker launch-availability filtering is CLIENT-side on the retained SPA (src/components/panes/PanePicker.tsx:117,126-155 uses settings.extensions.disabled + codingCli.enabledProviders + availableClis) and updates immediately on settings.updated"
+  missing: "no zod-shape validation of the extensions patch (top-level key whitelisted at settings_store.rs:1384 but disabled: string[] shape unchecked — only the final serde from_value catches wrong types with a generic 400); no dedicated extensions.disabled round-trip/persist test; typed extension-scoped content settings (contentSchema string/number/boolean defaults, manifest-driven field validation) not modeled server-side; no test that a disabled-then-restored CLI extension keeps the user's disabled choice (migration logic implies it, untested)"
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-protocol/src/settings.rs
+
+- id: EXT-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/cli_launch.rs:400-568 — resolve_coding_cli_command: command override via envVar (:412-416), base args/env, model/sandbox/permissionMode arg templates (:538-552), createSessionArgs fresh identity + resumeArgs first-occurrence substitution (:496-510), LaunchIntent/StartIntentUnsupported gating (:144-146,499-505)"
+    - "crates/freshell-server/src/extensions.rs:226-247 — cli_command_specs() compiles every discovered CLI manifest block into CliCommandSpec (port of server/index.ts:231-255)"
+    - "test: golden argv suite incl. g_a1_amplifier_fresh_launch_matches_manifest, g_a2_amplifier_resume_appends_resume_args, g_a3_amplifier_env_var_override, g_a4/g_a4b intent goldens in crates/freshell-platform/src/cli_launch_goldens.rs (~780-896); amplifier manifest pinned by amplifier_manifest_matches_legacy_cli_block"
+    - "explicit doc gap: cli_launch.rs:32-33 — 'permissionModeEnvVar/permissionModeEnvValues are NOT modeled: no shipped manifest sets them, so terminal-registry.ts:355-367 is inert'; re-confirmed in-code at :553"
+    - "legacy disabled-provider launch gate exists ONLY on the WS codingcli create path (server/ws-handler.ts:3286-3292 'Provider disabled'); no equivalent enabledProviders check found in crates/freshell-ws/src/terminal.rs create path"
+  missing: "permissionModeEnvVar + permissionModeValues mapping (explicitly unimplemented); server-side rejection of disabled providers at terminal/CLI launch (WS create path); native Windows quoting/argv verification is host-limited (Windows-only branches exist — ProviderTarget::Windows, cli_launch.rs:74-81 — but cannot be validated on this Linux host); cwd honoring lives in the generic spawn layer, not extension-specific (not verified here)"
+  effort: M
+  files:
+    - crates/freshell-platform/src/cli_launch.rs
+    - crates/freshell-server/src/extensions.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: EXT-06
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/boot.rs:87-88 — the ONLY extension routes in the Rust server are GET /api/extensions and GET /api/extensions/{name}; grep confirms no /icon, no /client/*, no nested-route serving anywhere in crates/freshell-server/src"
+    - "crates/freshell-server/src/extensions.rs:290-297 — iconUrl is GENERATED ('/api/extensions/{name}/icon') but the endpoint it points to is not implemented"
+    - "reference: server/extension-routes.ts:64-125 (GET /:name/client/* with publicRoot scoping, realpath symlink + traversal protection, 404/400 errors) and :127-157 (GET /:name/icon, image/svg+xml, traversal protection)"
+  missing: "entire client-extension static serving: entry/publicRoot resolution, nested route/asset serving with content types, icon endpoint, realpath traversal + symlink protections, error UI handoff (404/400 payloads)"
+  effort: M
+  files:
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-server/src/extensions.rs
+
+- id: EXT-07
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/extensions.rs:110 — RegistryEntry deliberately omits the server-process handle ('this read-only port never spawns'); :286-288 — serverRunning hardcoded false, serverPort always omitted"
+    - "no POST /api/extensions/{name}/start route exists (boot.rs:87-88 is the full extension surface)"
+    - "reference: server/extension-manager.ts:218-309 (startServer: port allocation via listen(0), {{port}}/contentSchema-default env interpolation + ~/ expansion :349-378, spawn with cwd=ext dir, readyPattern/readyTimeout race, concurrent-start dedup via starting map :233-245) and server/extension-routes.ts:33-50"
+  missing: "all of it: free-port allocation, env interpolation ({{port}}, content-schema defaults, ~/ expansion), cwd=extension-dir spawn, ready-pattern/timeout health gate, concurrent-start dedup, POST :name/start route"
+  effort: L
+  files:
+    - crates/freshell-server/src/extensions.rs
+    - crates/freshell-server/src/boot.rs
+
+- id: EXT-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-protocol/src/server_messages.rs:54-60 — wire types extension.server.error/ready/starting/stopped declared; :363-372 payloads; shape pinned by crates/freshell-protocol/tests/activity_extension.rs — but no crate produces them"
+    - "reference: server/extension-manager.ts:249-340 (spawn-error race, kill+server.error on failure, exit-watch cleanup emitting server.stopped, stopServer SIGTERM→5s→SIGKILL, stopAll at server/index.ts:1252) and server/index.ts:473-484 (broadcast wiring)"
+    - "no process table, no health-check polling, no lifecycle events anywhere in crates/ (grep for startServer/stopServer/server.starting producers returns only protocol declarations)"
+  missing: "all of it: starting/ready/error/stopped status publication, failed-child cleanup, post-ready crash detection, targeted stop (SIGTERM grace → SIGKILL), stop-all on shutdown, POST :name/stop route, healthCheck polling"
+  effort: L
+  files:
+    - crates/freshell-server/src/extensions.rs
+    - crates/freshell-server/src/boot.rs
+
+- id: EXT-09
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/boot.rs:100-103,150-152,194-196 — every existing extension route is constant-time-token auth-gated (is_authed) before any registry access, mirroring server/auth.ts httpAuthMiddleware (boot.rs module doc :24-29)"
+    - "crates/freshell-server/src/boot.rs:145-165 — extension_by_name returns 404 {error: Extension not found: '<name>'} byte-matching extension-routes.ts:20-24; name is used only for in-memory lookup (no fs join), so name-based traversal is a no-op on this surface"
+    - "the dangerous surfaces simply do not exist in Rust yet: no icon/client file-serving (so no traversal/absolute/symlink read path), no start/stop (so no process-launch boundary), no POST bodies on extension routes (so no body-limit exposure)"
+  missing: "traversal/absolute-path/symlink file-read protections (blocked on EXT-06), category guards and command-boundary enforcement for process launch (blocked on EXT-07), oversized/malformed body limits on extension mutation routes (none exist); only the two GET routes' auth parity can be claimed today"
+  effort: M
+  files:
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-server/src/extensions.rs
+
+- id: EXT-10
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "extensions/amplifier/freshell.json — built-in manifest present in this worktree and byte-identical to origin/main (git show/ls-tree verified: only freshell.json exists under extensions/amplifier/ on origin/main; no icon asset exists there either)"
+    - "extensions/amplifier/freshell.json cli.env PROMPT_TOOLKIT_NO_CPR=1 — the CPR-warning suppression from main commit 54aeabb96, carried verbatim through Rust launch env"
+    - "test: g_a1_amplifier_fresh_launch_matches_manifest in crates/freshell-platform/src/cli_launch_goldens.rs:780 — asserts PROMPT_TOOLKIT_NO_CPR=1 reaches the launch env; g_a2/g_a3 cover resume argv and AMPLIFIER_CMD override"
+    - "test: amplifier_manifest_matches_legacy_cli_block in crates/freshell-platform/src/cli_launch_goldens.rs:912 — pins the on-disk manifest against silent drift"
+    - "test: fresh_amplifier_create_carries_launcher_assigned_session_ref_and_stub (+4 more amplifier launcher tests) in crates/freshell-ws/tests/amplifier_launcher_identity.rs:21"
+    - "manifest has picker {shortcut:A, group:agents} which Rust to_client_registry serializes (extensions.rs:305-310), so the picker entry is registry-backed"
+  missing: "icon clause: NO icon field or icon asset exists under extensions/amplifier/ even on origin/main (and no /api/extensions/{name}/icon route exists in Rust regardless — see EXT-06), so 'real icon appears in picker/history' is unprovable as written; provider activity/durability/history explicitly belong to TERM-*/SESSION-* sections and were not re-audited here"
+  effort: S
+  files:
+    - extensions/amplifier/freshell.json
+    - crates/freshell-platform/src/cli_launch_goldens.rs
+    - crates/freshell-server/src/boot.rs

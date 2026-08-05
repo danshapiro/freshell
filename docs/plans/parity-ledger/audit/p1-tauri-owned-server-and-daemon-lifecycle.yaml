@@ -1,0 +1,66 @@
+- id: TAURI-17
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/server.rs:200-208 — pure reap_step escalation decision: WaitMore within grace, Escalate only at elapsed >= grace, Done on exit (mirrors server-spawner.ts:168-188, 5s grace)"
+    - "crates/freshell-tauri/src/server.rs:214-239 — reap_child: SIGTERM (unix), waits the full grace interval polling, escalates to kill only after grace elapses; escalate targets only the owned Child handle (no pkill)"
+    - "crates/freshell-tauri/src/lib.rs:55-57 — REAP_GRACE = 5s, REAP_POLL = 50ms, 1:1 with the legacy 5000ms kill timeout (server-spawner.ts:178)"
+    - "crates/freshell-tauri/src/lib.rs:121-125 + 444-456 — RunEvent::Exit triggers reap_server; take()-based exactly-once reap of the owned server"
+    - "test: reap_step_transitions in crates/freshell-tauri/src/server.rs:383"
+    - "test: reap_terminates_a_long_sleeper_gracefully (SIGTERM'd child exits gracefully within grace) in crates/freshell-tauri/src/server.rs:435 (cfg(unix))"
+    - "test: reap_already_exited_short_process in crates/freshell-tauri/src/server.rs:411"
+    - "test: app_bound_spawn_health_reap_end_to_end in crates/freshell-tauri/tests/server_spawn_smoke.rs:39 — real freshell-server binary driven through spawn -> health -> reap"
+  missing: "Windows process-tree close: request_terminate under #[cfg(not(unix))] returns false so reap_child jumps straight to Child.kill() = TerminateProcess of the DIRECT pid only (server.rs:259-264); no job object or taskkill /T anywhere in crates (grep for taskkill/JobObject finds only a comment), so the full grace interval is never applied on Windows and the server's own children (PTY/terminal grandchildren) are never signaled. Flush state/logs on quit: RunEvent::Exit only reaps (lib.rs:121-125); window-state save is debounced 500ms (lib.rs:344-371) with no final flush at exit, and the server's stderr is merely inherited / stdout discarded (server.rs:122-124) with no log stream to flush (legacy pipes child output to ~/.freshell/logs/server.log, server-spawner.ts:142-149). No test covers the Forced escalation outcome (SIGTERM-ignoring child killed only after the full grace). The PW-TAURI-WIN Playwright validation itself is Windows-host-only."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/server.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/tests/server_spawn_smoke.rs
+
+- id: TAURI-18
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/lib.rs:103 + 132-210 — only the app-bound boot path spawns/owns a server child; it is stored in server_slot and reaped on RunEvent::Exit (lib.rs:121-125, 444-456), idempotent via take()"
+    - "crates/freshell-tauri/src/lib.rs:218-255 — setup_remote spawns NO child; the health gate's child-dead fail-fast is `|| false` (lib.rs:240), so quit can never kill a remote server (safe by construction)"
+    - "crates/freshell-tauri/src/state_machine.rs:52-60 — ServerMode::{AppBound,Daemon,Remote} modeled; Daemon explicitly 'Deferred (daemon managers -> 3.14, CD-5)'"
+    - "crates/freshell-tauri/src/lib.rs:239 — remote mode logs 'no app-bound spawn'"
+    - "test: empty_slot_reports_exited_and_reap_is_noop in crates/freshell-tauri/src/lib.rs:613 — a quit with no owned child reaps nothing (the remote-mode quit case)"
+    - "test: reap_terminates_a_long_sleeper_gracefully in crates/freshell-tauri/src/server.rs:435 — the app-bound-owned child IS stopped on reap"
+  missing: "Daemon-owned servers: daemon mode is entirely unimplemented (deferred per state_machine.rs:56 and commands.rs:26-30 CD-5 note), so 'never stop daemon-owned servers' is vacuous rather than implemented/verified. No test asserts that remote/daemon fixture servers remain reachable/reconnectable across an app quit. The PW-TAURI-WIN per-mode quit validation is Windows-host-only."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/state_machine.rs
+
+- id: TAURI-19
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No Rust daemon manager exists: grep for schtasks|Task Scheduler|DaemonManager|windows-service across crates/ returns zero matches; TASK_NAME/task-XML/install/uninstall/start/stop/status code is absent"
+    - "crates/freshell-tauri/src/state_machine.rs:56 — 'Server is an OS service. Deferred (daemon managers -> 3.14, CD-5)'"
+    - "crates/freshell-tauri/src/commands.rs:26-30 — CD-5 note: daemon install/uninstall are never wired even in the reference; the Rust wizard can persist serverMode:'daemon' but cannot install anything"
+    - "crates/freshell-tauri/Cargo.toml:26 — crate description states 'daemon deferred to 3.14'"
+    - "Legacy reference to port: electron/daemon/windows-service.ts:30-159 (schtasks /Create from freshell-task.xml template, /Run, stop via wmic PID match + taskkill /PID, /Query CSV status, /Delete uninstall, /RL LIMITED least-privilege)"
+  missing: "Everything: one Freshell-owned scheduled task creation with safely quoted installed paths, stable task identity, noninteractive startup, install/start/stop/status/uninstall, exact ownership checks, and the PW-TAURI-WIN-PACKAGED packaged-app validation (Windows elevated VM only)."
+  effort: L
+  files:
+    - crates/freshell-tauri/src/daemon/mod.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/commands.rs
+
+- id: TAURI-20
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No daemon status/failure handling exists in Rust because there is no daemon manager at all (see TAURI-19 greps: zero schtasks/DaemonManager matches in crates/)"
+    - "crates/freshell-tauri/src/lib.rs:138-143 — the app-bound boot hardcodes ServerMode::AppBound and never reads a configured serverMode:'daemon', so no daemon failure can even be detected, let alone handled"
+    - "crates/freshell-tauri/src/state_machine.rs:106-110 — decide_initial_phase maps a configured Daemon mode straight to Main without any status check or fallback"
+    - "Legacy reference to port: electron/startup.ts:345-352 — daemon mode calls daemonManager.status(), throws 'Daemon service is not installed. Please re-run setup...' when !installed, starts the service when !running"
+  missing: "All failure/stale-registration handling: access denied, missing binary, stopped service, stale config detection, repair flow, and app-bound fallback; plus the wizard/chooser surfacing with no premature success. Only TD residue exists: wizard validation accepts serverMode:'daemon' (commands.rs:81) per CD-5 parity with the reference dead-end. The PW-TAURI-WIN fault-fixture validation is Windows-host-only. Blocked by TAURI-19 (no daemon manager to query)."
+  effort: M
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/src/state_machine.rs
+    - crates/freshell-tauri/src/commands.rs
+    - crates/freshell-tauri/src/daemon/mod.rs

@@ -1,0 +1,162 @@
+- id: CFG-01
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:372-394 — persist() doc: COPY FORWARD whatever is on disk, overlay only owned keys; doc records the past data-loss bug (completedMigrations removed, recentDirectories emptied 20->0) as now fixed"
+    - "crates/freshell-server/src/settings_store.rs:441-447 — owned keys (version, settings) fully replaced"
+    - "crates/freshell-server/src/settings_store.rs:495-507 — serverSecrets overlaid (codexDisplayIdSecret inserted) so sibling/unknown secrets survive"
+    - "crates/freshell-server/src/settings_store.rs:509-514 — 'Everything else -- completedMigrations, recentDirectories, projectColors, any unrecognized top-level key -- is left exactly as loaded'; projectColors/recentDirectories seeded only when absent"
+    - "test: settings_patch_preserves_unmanaged_top_level_document_state in crates/freshell-server/src/settings_store.rs (~line 2557-2593: asserts completedMigrations and recentDirectories with real entries round-trip)"
+    - "test: terminal_override_patch_preserves_unmanaged_top_level_document_state and session_override_patch_preserves_unmanaged_top_level_document_state in crates/freshell-server/src/settings_store.rs"
+    - "test: external_writer_edits_survive_a_rust_persist_of_a_different_key, dirty_key_wins_over_a_concurrent_external_edit_to_the_same_key, tombstoned_field_stays_removed_despite_external_reintroduction in crates/freshell-server/src/settings_store.rs"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+
+- id: CFG-02
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:40-103 — single SettingsStore struct (Arc<RwLock<ServerSettings>>) is the one config.json caller; all HTTP writers route through patch()/persist()"
+    - "crates/freshell-server/src/settings_store.rs:396-408 — persist() doc: read-modify-write under advisory ConfigLock (sidecar file, never config.json itself)"
+    - "crates/freshell-server/src/settings_store.rs:427-431 — ConfigLock::acquire(&dir) held across the entire read-modify-write, RAII drop at end"
+    - "crates/freshell-server/src/settings_store.rs:419-534 — one queued atomic store: fresh disk read, overlay dirty keys, tmp+rename, single persist function"
+    - "test: concurrent_persists_across_two_store_instances_serialize_without_lost_updates in crates/freshell-server/src/settings_store.rs — proves two store instances serialize without lost updates"
+    - "test: external_writer_edits_survive_a_rust_persist_of_a_different_key in crates/freshell-server/src/settings_store.rs"
+    - "note: desktop.json/Tauri queue (TAURI-25) is explicitly out of scope per the checklist item"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+
+- id: CFG-03
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:93-103,154-166 — config_fallback computed ONCE in load() from the PRE-restore read via classify_boot_config_fallback (mirrors configStore.getLastReadError)"
+    - "crates/freshell-server/src/settings_store.rs:168-177 — maybe_restore_config_from_backup runs BEFORE all tolerant per-field readers so every reader sees the same recovered document"
+    - "crates/freshell-server/src/settings_store.rs:346-367 — GAP2 fix: persist-before-commit; write failure returns 500 error envelope, live tree only updated after successful persist"
+    - "crates/freshell-server/src/settings_store.rs:522-531 — backup refreshed only after successful primary persist, atomically (tmp+rename via atomic_write)"
+    - "crates/freshell-server/src/settings_store.rs:33 — ConfigFallback/ConfigFallbackReason protocol types imported from freshell-protocol (fallback reason surfaced via protocol; client handshake wiring not re-verified in this audit)"
+    - "test: config_fallback_reports_parse_error_when_primary_is_corrupt_json, config_fallback_reports_enoent_when_primary_missing_but_backup_exists, config_fallback_is_none_for_an_ordinary_fresh_install, config_fallback_is_none_for_a_healthy_primary, config_fallback_survives_the_same_boots_auto_restore in crates/freshell-server/src/settings_store.rs"
+    - "test: corrupted_primary_restores_from_backup_preserving_every_last_good_value, parseable_but_surprising_primary_is_never_restored_over, both_primary_and_backup_corrupt_starts_fresh_but_preserves_both_forensic_copies, backup_write_is_atomic_tmp_plus_rename_with_no_leftovers, persist_failure_surfaces_as_error_and_leaves_live_tree_and_backup_untouched in crates/freshell-server/src/settings_store.rs"
+  missing: "Browser-visible warning banner / explicit UI Restore action is client-side (legacy src/, out of Rust-server scope); conservative auto-restore is documented separately per the item's allowance. PW-RUST-level banner assertion not verified by this audit."
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-protocol
+
+- id: CFG-04
+  verdict: MISSING
+  confidence: medium
+  evidence:
+    - "grep for 'legacyLocalSettingsSeed' across crates/ (combined 6-term grep; all 86 matches were other terms) — zero Rust references found"
+    - "crates/freshell-server/src/settings_store.rs:509-510 — unknown top-level keys DO copy-forward, so a seeded legacyLocalSettingsSeed would not be deleted, but nothing in Rust generates/returns/consumes it"
+  missing: "No Rust implementation found that returns/consumes legacyLocalSettingsSeed or runs the one-time browser-preference seeding (theme, sidebar presentation, scale, terminal font, sound); one-time migration marker logic absent. Client-side consumption lives in legacy src/ and was not audited."
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-server/src/boot.rs
+
+- id: CFG-05
+  verdict: HOST-LIMITED
+  confidence: low
+  evidence:
+    - "Item's own text: Playwright validation is PW-TAURI-WIN on HARNESS-10 (Windows/Tauri host) — cannot be validated from this Linux audit"
+    - "crates/freshell-tauri exists in the workspace but was not examined (audit time exhausted); no cfg05 umbrella spec was checked under test/"
+  missing: "Undetermined: contents of crates/freshell-tauri (Electron->Tauri migration code) and any umbrella gate/harness spec not inspected."
+  effort: S
+  files:
+    - crates/freshell-tauri
+    - test/e2e-browser/specs
+
+- id: CFG-06
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:1-21 — module doc: the frozen Arc<ServerSettings> boot snapshot was the R2/R3/R4 root cause; module now owns the live store (Arc<RwLock<ServerSettings>>) shared by BootState, FilesState, and the settings router"
+    - "crates/freshell-server/src/settings_store.rs:283-286 — get() clones the live tree on each call (no stale snapshot)"
+    - "test: patch_applies_auto_kill_idle_minutes_live_to_registry, patch_applies_scrollback_live_to_registry, patch_of_unrelated_field_leaves_live_registry_settings_unchanged, invalid_patch_does_not_change_live_registry_settings in crates/freshell-server/src/settings_store.rs"
+    - "test: patch_write_through_reaches_get_and_config_json_and_restart, default_plus_network_overlay_matches_captured_fixture in crates/freshell-server/src/settings_store.rs"
+  missing: "Per-consumer reconnection/fresh-handshake tests for every consumer (dedicated TERM-*, FILE-05, DIAG-04, provider specs) were not individually verified in this audit; only the registry/settings live-propagatation tests above were seen."
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-server/src/boot.rs
+
+- id: CFG-07
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-server/src/instance_id.rs exists (193 lines, not read before time ran out) — plausible location of the instance-ID implementation"
+    - "not verified: persistence path, same-home reuse across restarts, different-home different ID, or its tests"
+  missing: "All clauses unverified — file exists but contents/tests unexamined."
+  effort: S
+  files:
+    - crates/freshell-server/src/instance_id.rs
+
+- id: CFG-08
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-server/src/tabs_snapshots.rs (147 lines), tabs_snapshots_tests.rs, tabs_snapshots_selectors.rs, and identity_sink.rs exist — plausible durable tab-registry implementation and dedicated test file"
+    - "not verified: disk persistence format/path, caps/hashes/TTLs, migration, corruption quarantine, or which clauses the tests cover"
+  missing: "All clauses unverified — modules and test files exist but contents unexamined."
+  effort: M
+  files:
+    - crates/freshell-server/src/tabs_snapshots.rs
+    - crates/freshell-server/src/tabs_snapshots_tests.rs
+    - crates/freshell-server/src/identity_sink.rs
+
+- id: CFG-09
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/files.rs:18-20 — files router doc: candidate merge documented as live-terminal cwd / indexed projects / recentDirectories / provider cwds, then settings.defaultCwd, de-duplicated"
+    - "crates/freshell-server/src/settings_store.rs:514 — persist() seeds recentDirectories: [] only when absent, preserving existing entries (copy-forward at lines 509-514)"
+    - "grep across crates/ found recentDirectories references only in settings_store.rs + files.rs docs — no dedicated Rust MRU-learning writer located"
+  missing: "A Rust writer that records/updates a deduplicated 20-item MRU on launches was NOT found in this audit (only seed-if-absent and copy-forward preservation seen); no end-to-end test for the full source-precedence merge order or the 20-cap was verified."
+  effort: M
+  files:
+    - crates/freshell-server/src/files.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: CFG-10
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:180-210 — legacy enabledProviders==[claude,codex] set migration to modern default set (incl. amplifier) mirroring server/settings-migrate.ts"
+    - "crates/freshell-server/src/settings_store.rs:212-244 — knownProviders seed-when-missing (persists even when empty), append newly discovered + auto-enable, otherwise serve persisted list as-is (never shrinks)"
+    - "crates/freshell-server/src/settings_store.rs:311-321 — agentChat PATCH key rejected with 400 'agentChat settings have been migrated; use freshAgent'"
+    - "test: known_providers_seeded_persisted_and_patchable, newly_discovered_providers_append_and_auto_enable, persisted_known_providers_survive_cwd_neutral_reboot, legacy_default_enabled_providers_migrated, legacy_default_enabled_providers_migration_includes_amplifier, agent_chat_key_rejected in crates/freshell-server/src/settings_store.rs"
+  missing: "completedMigrations marker recording: Rust preserves the key on persist (lines 509-514) but no code seen that WRITES a marker ('record completion only after success' / 'exactly one schema marker' unverified; migrations appear idempotent-by-derivation instead). Legacy 'freshclaude' config-shape migration (distinct from agentChat rejection) not found. Migration-interruption/restart test not verified."
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+
+- id: CFG-11
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:518-520 — writes config.json.tmp-<pid> then renames over config.json (atomic replace: complete old or complete new, never mixed)"
+    - "crates/freshell-server/src/settings_store.rs:531 — atomic_write(&backup_path(&dir), &text) for the backup (tmp+rename), under the ConfigLock held since line 431"
+    - "test: backup_write_is_atomic_tmp_plus_rename_with_no_leftovers in crates/freshell-server/src/settings_store.rs"
+  missing: "Boot-time stale-temp-file cleanup (remove old config.json.tmp-* without racing a current write) was NOT found/verified in this audit; kill-mid-write crash tests (Windows project) exist only as the PW-RUST plan in the item text, not verified here."
+  effort: M
+  files:
+    - crates/freshell-server/src/settings_store.rs
+
+- id: CFG-12
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/settings_store.rs:322-327 — validate_patch with strict schema rejects any key outside the ServerSettings tree before mutation"
+    - "test: client_only_key_rejected_by_strict_schema, unknown_top_level_key_rejected, enum_and_type_violations_rejected, enum_values_and_unrecognized_key_message_match_the_original in crates/freshell-server/src/settings_store.rs — server refuses to treat browser-local prefs as server state"
+    - "crates/freshell-server/src/settings.rs:32-85 — default_server_settings() tree mirrors shared/settings.ts#createDefaultServerSettings (server-scoped keys only; network overlay documented)"
+    - "crates/freshell-server/src/main.rs:1061 — live settings store feeds terminals broadcast path (replication direction seen; settings.updated broadcast to all clients not individually re-verified)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/settings_store.rs
+    - crates/freshell-server/src/settings.rs

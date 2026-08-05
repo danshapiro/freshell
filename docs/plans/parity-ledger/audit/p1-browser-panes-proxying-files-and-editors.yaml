@@ -1,0 +1,160 @@
+- id: BROWSER-01
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/proxy.rs:101 — /api/proxy/http/{*tail} catch-all route (any method)"
+    - "crates/freshell-server/src/proxy.rs:153-154 — upstream URL preserves path + query (http://127.0.0.1:<port>/<rest>?<query>)"
+    - "crates/freshell-server/src/proxy.rs:158-169 — method preserved; request headers forwarded minus host/connection/transfer-encoding (STRIPPED_REQUEST_HEADERS line 68); body forwarded"
+    - "crates/freshell-server/src/proxy.rs:184-204 — upstream status echoed; response headers forwarded minus exactly the 3 iframe-blocking headers (IFRAME_BLOCKED_HEADERS lines 51-55) and framing headers; body streamed via Body::from_stream (line 201)"
+    - "crates/freshell-server/src/proxy.rs:142-144 — auth gate via boot::is_authed, mounted under /api like legacy (main.rs:1315)"
+    - "test: iframe_blocked_headers_are_the_original_set, port_validation_matches_original_bounds, tail_splits_port_from_path, target_url_composes_path_and_query in crates/freshell-server/src/proxy.rs"
+    - "test: e2e browser-pane.spec.ts runs against the Rust server in the rust-chromium project (test/e2e-browser/playwright.config.ts:23 includes it in MATRIX_SPECS; rust-chromium project at line 210)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/proxy.rs
+
+- id: BROWSER-02
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/proxy.rs:33-35 — module doc explicitly states 'the WS-upgrade proxy (remote-only paths that require netsh/socket relay) are intentionally NOT ported here'"
+    - "grep for 'upgrade' across crates/freshell-server/src shows only the main /ws socket upgrade (logging.rs:42, main.rs:1336); no handler matches /api/proxy/http upgrade requests — they fall to the SPA fallback (main.rs:1317)"
+    - "legacy reference: server/proxy-router.ts:144-219 attachProxyUpgradeHandler — cookie auth (lines 169-185), raw socket relay preserving query/subprotocol/text/binary frames (190-205), 502 + destroy on upstream error (207-213)"
+  missing: "all clauses: WS upgrade interception on /api/proxy/http/<port>/..., query preservation, subprotocol passthrough, cookie authentication, binary/text frame relay, clean/error close behavior (401 unauthorized + 502 upstream-unavailable socket writes)"
+  effort: M
+  files:
+    - crates/freshell-server/src/proxy.rs
+    - crates/freshell-server/src/main.rs
+
+- id: BROWSER-03
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/proxy.rs:33-35 — '/api/proxy/forward TCP port-forward ... intentionally NOT ported here'"
+    - "grep for allowed_ips/max_forwards/requester/forwarder across crates/ found no PortForwardManager equivalent (only WSL netsh portproxy planning in crates/freshell-platform/src/port_forward.rs, a different feature)"
+    - "route inventory of main.rs merges (lines 1156-1316) contains no /api/proxy/forward route"
+    - "legacy reference: server/proxy-router.ts:45-77 (POST /forward, DELETE /forward/:port) + server/port-forward.ts PortForwardManager: per-requester create/reuse (forward(), lines ~51-70), maxForwards=100 cap (~line 40, ~67), 5-min idle cleanup (~line 39 startIdleCleanup), allowedIps connection rejection (~lines 80-96)"
+  missing: "all clauses: create/reuse/delete owned forwarders, per-owner isolation keyed by requester identity, max-forwards cap, idle cleanup, allowed-IP enforcement, protocol/path/query preservation through the forward"
+  effort: L
+  files:
+    - crates/freshell-server/src/proxy.rs
+    - crates/freshell-server/src/main.rs
+
+- id: BROWSER-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/proxy.rs:154 — target host hardcoded to 127.0.0.1; no non-loopback destination is constructible"
+    - "crates/freshell-server/src/proxy.rs:147-150 — port must parse as u32 in 1..=65535, else 400 {error:'Invalid port number'} (encoded targets fail the parse)"
+    - "crates/freshell-server/src/proxy.rs:142 — every proxy request requires auth via boot::is_authed (x-auth-token header or freshell-auth cookie, boot.rs:686-708, constant-time compare)"
+    - "test: port_validation_matches_original_bounds in crates/freshell-server/src/proxy.rs (0/1/65535/65536/-1/abc/empty cases)"
+    - "test: safe01-auth-matrix.spec.ts is in MATRIX_SPECS (playwright.config.ts:69) so the shared auth gate runs against the Rust server (its 'local-file'/'proxy' lanes are noted as not distinctly covered in that spec's doc comment, lines 33-36)"
+  missing: "per-requester forwarder ownership and allowed-IP requester restriction (absent with BROWSER-03 forwarding); unauthorized WebSocket-upgrade rejection (absent with BROWSER-02); no dedicated Rust test asserting wrong-auth rejection on the proxy route itself"
+  effort: M
+  files:
+    - crates/freshell-server/src/proxy.rs
+    - crates/freshell-server/src/boot.rs
+
+- id: BROWSER-05
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/screenshots.rs:58 — POST /api/screenshots ported (scope validation 73-84, 400 bad name/path 91-94, 409 no-overwrite 96-101, 503 no capable client 104-109, 422 failed/imageless reply 136-144, 200 success envelope 161-177)"
+    - "crates/freshell-server/src/screenshots.rs:118-134 — 10s timeout (SCREENSHOT_TIMEOUT line 44) with cancel on timeout/closed socket: never spins forever"
+    - "crates/freshell-ws/src/screenshot.rs — ScreenshotBroker ports ws-handler requestUiScreenshot: capability tracking, register/resolve/send_capture broadcast of 'screenshot.capture' ui.command (lines 78-190)"
+    - "crates/freshell-server/src/proxy.rs:171-179 — upstream connect failure returns a target-specific 502 promptly (no indefinite spin); client Retry UI is retained server-agnostic SPA code (src/components/panes/BrowserPane.tsx)"
+    - "test: base_name_rules_match_original, no_path_uses_tmpdir, explicit_dir_path_joins_base_name, truthy_coercions, write_file_atomic_roundtrips in crates/freshell-server/src/screenshots.rs"
+    - "test: broker tests in crates/freshell-ws/src/screenshot.rs (mod tests ~lines 192-267, incl. capture-command JSON shape asserted at line 267)"
+    - "caveat: e2e browser-pane-screenshot.spec.ts exists but is NOT in MATRIX_SPECS, so it only runs against the legacy server in the current matrix; the Rust round-trip handler's timeout path is implemented but covered only by unit-level tests"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/screenshots.rs
+    - crates/freshell-ws/src/screenshot.rs
+
+- id: FILE-01
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "route inventory of crates/freshell-server/src (main.rs merges lines 1156-1316; files.rs router lines 93-103) contains no /local-file route; unmatched paths fall to the SPA fallback (main.rs:1317-1324)"
+    - "grep for local-file/local_file across crates/ found no implementation"
+    - "legacy reference: server/local-file-router.ts:42-79 — header x-auth-token or freshell-auth cookie auth (45-56), path query required (60-62), 404 File not found / 400 Cannot serve directories / 500 shapes (7-17), res.sendFile bytes with MIME (19-39)"
+    - "impact confirmed client-side: src/components/panes/BrowserPane.tsx:68-91 converts every file:// URL to /local-file?path=... so file-backed Browser panes cannot load authenticated bytes from the Rust server"
+  missing: "all clauses: authenticated /local-file endpoint, header-or-cookie credentials, correct MIME/bytes, stable 400/404/500 error shapes"
+  effort: S
+  files:
+    - crates/freshell-server/src/files.rs
+    - crates/freshell-server/src/main.rs
+
+- id: FILE-02
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "src/components/panes/BrowserPane.tsx:75-87 — retained client decode: file:///C:/path -> C:/path (drive prefix kept via regex-slice), file://server/share -> //server/share (UNC host reattached); this half is server-agnostic and exists today"
+    - "server side: no /local-file endpoint in the Rust server (see FILE-01 evidence), so the exactly-once decode of the path query param and byte-serving for drive/UNC targets has no Rust receiver; generic UNC \\\\server\\share inputs are also treated as unaddressable (resolve_user_path returns fs_path None — test resolve_user_path_windows_unresolvable_forms_are_unaddressable in crates/freshell-server/src/files.rs)"
+    - "validation note: the checklist's Playwright validation is PW-TAURI-WIN (Windows host + real SMB share), so end-to-end validation is Windows/Tauri-host-limited regardless"
+  missing: "server-side exactly-once decode + authenticated byte serving for file:///C:/... and file://server/share/... (rides entirely on the missing /local-file route); UNC/host preservation beyond the retained client conversion"
+  effort: S
+  files:
+    - crates/freshell-server/src/files.rs
+    - crates/freshell-server/src/main.rs
+
+- id: FILE-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/path.rs — ported normalization core: sanitize_user_path_input (39), detect_user_path_flavor (69), get_wsl_mount_prefix (208), win32_resolve (241), convert_wsl_drive_path_to_windows_path /mnt/c branch (330), convert_windows_path_to_wsl_path drive+UNC branches (375), split/join_windows_display_path (454/484)"
+    - "crates/freshell-platform/src/path.rs:569-663 — convert_wsl_path_to_windows with injected WslPathResolver: reg.exe has_wsl_distributions guard + wsl.exe wslpath -w + 256-entry cache (native-Windows-only model; the no-distro guard that avoids the Windows Store prompt is ported as a seam)"
+    - "crates/freshell-server/src/files.rs:526-561,602-640 — ~ expansion, trailing-separator trim, resolve_user_path composing the flavor seam; read/stat/write/complete/mkdir/validate-dir all flow through it"
+    - "test: crates/freshell-platform/tests/path_tests.rs — flavor_detection_matrix, win32_resolve_goldens_from_node, wsl_drive_to_windows_* (default/root/custom mount), windows_to_wsl_default_mount_wsl_env, windows_to_wsl_unc_accepts_any_distro_when_current_is_empty, split/join matrices, launch_cwd matrices"
+    - "test: crates/freshell-platform/tests/wsl_fallback_tests.rs — reg_guard_blocks_wsl_exe_when_no_distributions, mount_mapped_short_circuits_before_touching_wsl_exe, falls_through_to_wslpath_and_caches_the_result, caches_negative_results_too"
+    - "test: crates/freshell-server/src/files.rs — resolve_user_path_windows_drive_on_wsl_maps_to_mount, resolve_user_path_windows_off_wsl_is_unaddressable, complete_wsl_unc_partial_leaf_round_trips, read_stat_write_follow_windows_conversion_on_wsl"
+  missing: "\\\\wsl$ share form explicitly not handled (path.rs:533 note: only \\\\wsl / \\\\wsl.localhost); generic network shares (\\\\server\\share) unaddressable (fs_path None); win32 case-folding semantics absent on this Linux-host port (documented at files.rs:652 — Node lowercases only on win32); native-Windows live behaviors validated only through injected seams, not on a real Windows host"
+  effort: M
+  files:
+    - crates/freshell-platform/src/path.rs
+    - crates/freshell-server/src/files.rs
+
+- id: FILE-04
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/files.rs:93-103 — files router has candidate-dirs/validate-dir/read/stat/write/complete/mkdir only; no /api/files/open"
+    - "grep for resolveOpenCommand/file-opener/open_external file-editor equivalents across crates/ found only URL opening for the desktop shell (crates/freshell-tauri/src/external_url.rs:83 open_external_url), not file/editor opening"
+    - "legacy reference: server/files-router.ts:282-312 (POST /open: path required, 404 missing, resolveOpenCommand with reveal/line/column/editorSetting/customEditorCommand/platform, spawnAndMonitor -> 502 on spawn failure) + server/file-opener.ts (EditorPreset auto|cursor|code|custom at line 12, resolveOpenCommand at 133, spawnAndMonitor at 179)"
+  missing: "all clauses: /api/files/open route, default/configured/custom editor resolution, line/column (--goto) args, reveal mode, argv quoting, spawn-failure reporting (502, no false success)"
+  effort: M
+  files:
+    - crates/freshell-server/src/files.rs
+    - crates/freshell-server/src/main.rs
+
+- id: FILE-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/files.rs:36-40,84-86 — FilesState holds the LIVE SettingsStore; doc comment states the sandbox is read fresh on every request so PATCH /api/settings takes effect immediately"
+    - "crates/freshell-server/src/files.rs — is_path_allowed (653-675) is the single canonical rule, applied per-request after settings.get() in validate_dir (164-169), read_file (202-207), stat_file (248-253), write_file (296-301), complete (339-345), mkdir (459-465); 403 {error:'Path not allowed'} shape at 718-724"
+    - "crates/freshell-server/src/repo_icon.rs — /api/repo-icon shares the same is_path_allowed (per files.rs:665-666 comment about repo_icon.rs call sites)"
+    - "test: validate_dir_denies_path_outside_allowed_roots in crates/freshell-server/src/files.rs — configures allowedFilePaths via the live store patch API and asserts 403 outside / 200 inside"
+    - "test: windows_flavor_allowlist_roots_convert_like_node and sandbox_target_uses_converted_native_path in crates/freshell-server/src/files.rs (both sides of the comparison convert like Node's resolvePathForSandboxComparison)"
+  missing: "the /local-file and /api/files/open surfaces do not exist (FILE-01/FILE-04), so one-canonical-rule coverage of 'every file surface' (local-file/open/editor) is unmet; no explicit test that toggles the setting mid-flight and re-asserts on the same server (live read is structural but untested as a scenario)"
+  effort: S
+  files:
+    - crates/freshell-server/src/files.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: FILE-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/files.rs:653-675 — is_path_allowed is a normalized string prefix check at a directory boundary (target == root or starts_with(root + '/'))"
+    - "test: sandbox_enforces_directory_boundary in crates/freshell-server/src/files.rs — prefix-confusion directory rejected (/home/tester/project-x denied vs /home/tester/proj root); absolute outside path denied (/etc/passwd)"
+    - "GAP vs legacy: server/path-utils.ts:291-301 resolvePathForSandboxComparison runs path.resolve (collapses .. segments) then fs.realpathSync (resolves symlinks) on BOTH sides before comparison; Rust normalize_user_path (files.rs:518-521) only tilde-expands and trims separators — a target like /allowed/../etc/passwd still string-matches the root prefix and is never dot-collapsed or canonicalized"
+    - "GAP vs legacy: server/path-utils.ts:296-299,306 — realpathSync symlink-escape prevention has no Rust counterpart (no fs::canonicalize anywhere in the sandbox compare)"
+    - "GAP vs legacy: server/path-utils.ts:314-321 — win32 case-fold (toLowerCase on win32) explicitly not ported (files.rs:652 comment)"
+    - "no tests in crates/ attempt encoded-../symlink/case-fold escapes through file endpoints"
+  missing: "..-segment collapse before sandbox comparison (encoded or literal), symlink/realpath escape prevention (fs::canonicalize on target+roots), win32 case-folding, and tests exercising escape attempts through each endpoint; only the prefix-confusion/boundary clause is implemented and tested"
+  effort: S
+  files:
+    - crates/freshell-server/src/files.rs

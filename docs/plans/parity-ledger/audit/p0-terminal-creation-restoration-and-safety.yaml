@@ -1,0 +1,388 @@
+- id: TERM-01
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-platform/src/cli_launch.rs:177 — CODEX_MANAGED_REMOTE_CONFIG_ARGS launch-arg constant"
+    - "crates/freshell-platform/src/cli_launch_goldens.rs:278 — golden argv fixtures include features.apps=false (per-mode launch goldens exist)"
+    - "crates/freshell-terminal/src/pty.rs:182 — spawn resolves program via freshell_platform::path::resolve_program_via_path before CommandBuilder"
+    - "crates/freshell-codex/src/launch_plan.rs:33 and crates/freshell-codex/src/launch_lifecycle.rs:848 — codex app-server launch planning/runtime"
+  missing: "Per-mode coverage (shell, WSL, CMD, PowerShell, Claude, Codex, OpenCode, Amplifier, Gemini, Kimi, extension modes) not individually verified; no per-mode e2e/pane-picker spec found in this audit window; Windows/WSL path-conversion behavior unverified (examination interrupted)."
+  effort: L
+  files:
+    - crates/freshell-platform/src/cli_launch.rs
+    - crates/freshell-terminal/src/pty.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: TERM-02
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-freshagent/src/codex.rs:1952,1975 — spawns `codex -c features.apps=false app-server --listen ws://127.0.0.1:<port>` (managed remote path, apps feature disabled)"
+    - "crates/freshell-platform/src/cli_launch.rs:177 — CODEX_MANAGED_REMOTE_CONFIG_ARGS = ['-c','features.apps=false']"
+    - "crates/freshell-codex/src/launch_lifecycle.rs:848 + launch_plan.rs:33,322 — managed argv `--remote <wsUrl> -c features.apps=false` with ownership tag"
+    - "test: crates/freshell-ws/tests/codex_managed_launch_e2e.rs:346,434 — asserts ['-c','features.apps=false'] argv adjacency"
+    - "test: crates/freshell-codex/tests/launch_lifecycle.rs:906 — asserts args[3] == features.apps=false"
+    - "test: test/e2e-browser/specs/restore-matrix.spec.ts:920 — 'FreshCodex targets the same durable thread with no duplicate conversation after a full server restart'"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-codex/src/launch_plan.rs
+    - crates/freshell-ws/tests/codex_managed_launch_e2e.rs
+
+- id: TERM-03
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/tests/roundtrip.rs:286 — terminal.create carries sessionRef + codexDurability{schemaVersion,state} (durable identity shape)"
+    - "crates/freshell-ws/src/reconcile.rs and auto_resume.rs — sessionRef restore/resume machinery present"
+    - "test: crates/freshell-ws/tests/codex_session_ref_resume.rs, session_ref_singleflight.rs, resume_validation_gate.rs (files confirmed to exist via grep hits)"
+    - "test: test/e2e-browser/specs/amplifier-restore-rust.spec.ts and opencode-terminal-restore-rust.spec.ts exist (restore across restart for those providers)"
+  missing: "Migration of older resumeSessionId data unverified; proven identity + durability returned in `terminal.created` not confirmed at payload level; 16-tab imported-fixture restore for all four providers not verified (examination interrupted)."
+  effort: M
+  files:
+    - crates/freshell-ws/src/reconcile.rs
+    - crates/freshell-ws/src/auto_resume.rs
+    - crates/freshell-sessions/src
+
+- id: TERM-04
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-ws/src/create_dedupe.rs — dedicated create-request dedupe module"
+    - "crates/freshell-terminal/src/registry.rs:249,356,366 — create_request_id fields + respawn-generation counters keyed per createRequestId"
+    - "test: crates/freshell-ws/tests/create_protection.rs:338-339 — registry-wide adoption by create_request_id (newest_live_by_create_request_id), same-socket safe"
+    - "test: crates/freshell-ws/tests/pane_reconcile.rs:427-441 — two creates under one createRequestId resolve to the winner via newest_live_by_create_request_id"
+    - "test: crates/freshell-ws/tests/pane_ledger_restore.rs:105-115 — createRequestId lineage across restart (orphaned in-flight create)"
+  missing: "Two-clients-same-request and delayed-response/reconnect idempotency proven at registry/reconcile level, but the PW validation (intercept/delay terminal.created, force reconnect, same request from two pages, one PID) not confirmed in this window."
+  effort: M
+  files:
+    - crates/freshell-ws/src/create_dedupe.rs
+    - crates/freshell-terminal/src/registry.rs
+
+- id: TERM-05
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-protocol/src/client_messages.rs:219 — terminal.create.live_terminal (LiveTerminalRef) protocol field"
+    - "crates/freshell-terminal/src/registry.rs:2374-2375 — live_terminal_for_session_ref() canonical owner lookup; :4636 test second_live_terminal_on_one_key_emits_duplicate_pty_warning"
+    - "crates/freshell-ws/src/reconcile.rs:203-253 — live_terminal_for_claimed_ref; test row1_live_terminal_under_key_yields_attach (:601) and legacy_resume_claim_attaches_to_live_terminal_across_create_request_ids (:1083)"
+    - "test: crates/freshell-ws/tests/session_ref_singleflight.rs:122 — different connections, different createRequestIds, same sessionRef resume -> single owner"
+    - "test: crates/freshell-ws/tests/live_session_ref_guard.rs (exists; guards create within createRequestId ladder)"
+  missing: "Byte-for-byte shared output across two simultaneous contexts and the orchestration-API path of the PW validation not verified; whether ALL views provably attach to one terminal in every path not confirmed."
+  effort: M
+  files:
+    - crates/freshell-terminal/src/registry.rs
+    - crates/freshell-ws/src/reconcile.rs
+    - crates/freshell-ws/tests/session_ref_singleflight.rs
+
+- id: TERM-06
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-protocol/src/client_messages.rs:270,291,301 — expected_session_ref field on attach/input/resize messages"
+    - "crates/freshell-protocol/tests/roundtrip.rs:225 — SESSION_IDENTITY_MISMATCH error wire shape with expectedSessionRef+actualSessionRef"
+    - "crates/freshell-ws/src/terminal.rs:646 — input-path expectedSessionRef guard; :4155 — attach-path guard; :4199-4261 — guard semantics + error construction"
+    - "test: crates/freshell-ws/tests/attach_viewport_resize.rs:58 — mismatched_expected_session_ref_does_not_resize (no resize, no epoch bump)"
+    - "test: crates/freshell-ws/tests/opencode_switch_rebind.rs:530-567 — mismatched expectedSessionRef bounced; matching one delivered"
+  missing: "Restore-operation identity validation not verified; 'block input while identity is UNRESOLVED' (pending, not just mismatched) unverified — that is TERM-24 territory; full four-op table-driven PW validation with exact error frames not confirmed in this window."
+  effort: M
+  files:
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-terminal/src/registry.rs
+
+- id: TERM-07
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-terminal/src/registry.rs:1394 — resize_for_attach(); :232,:1015,:1365-1431 — has_client_geometry first-record-no-bump epoch semantics consulted by resize and resize_for_attach"
+    - "test: crates/freshell-terminal/src/registry.rs tests resize_for_attach_viewport_hydrate_applies_first_geometry_without_bump (:3689), second_change_bumps_epoch (:3700), keepalive_delta_never_resizes_or_records (:3724), transport_reconnect_applies_when_alone (:3739)/skips_when_other_socket_attached (:3749), viewport_hydrate floors dims at broker parity (:3639), missing/exited terminal (:3777,:3784)"
+    - "test: crates/freshell-ws/tests/attach_viewport_resize.rs exists (incl. mismatched_expected_session_ref_does_not_resize:58)"
+    - "crates/freshell-protocol/tests/roundtrip.rs:299 — terminal.attach wire shape carries intent(viewport_hydrate), cols/rows, attachRequestId, priority(foreground), sinceSeq, maxReplayBytes (all fields protocol-defined)"
+  missing: "priority foreground/background POLICY enforcement and maxReplayBytes replay-budget enforcement remain unimplemented per prior audit note (2026-07-24) and not contradicted here; attachRequestId reply-correlation e2e unverified."
+  effort: M
+  files:
+    - crates/freshell-terminal/src/registry.rs
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-ws/tests/attach_viewport_resize.rs
+
+- id: TERM-08
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/src/server_messages.rs:135,202 — terminal.stream.changed frame type exists in protocol inventory"
+    - "crates/freshell-ws/src/backpressure.rs:1-152 — queue-overflow backpressure machinery (drop-oldest with gap-event coalescing per module docs and TERM-09 note)"
+  missing: "Emission sites verified only partially: explicit output-gap events for retention-window loss vs replay-budget truncation vs queue overflow not individually confirmed by me; terminal.stream.changed EMISSION on stream replacement (new streamId + checkpoint reset) not located in this window; no PW validation seen."
+  effort: M
+  files:
+    - crates/freshell-ws/src/backpressure.rs
+    - crates/freshell-protocol/src/server_messages.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: TERM-09
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-ws/src/backpressure.rs — TERM-09 module: bounded per-connection output queue + catastrophic monitor (Term09Config; :60 catastrophic threshold ported from legacy constants.ts:8-11)"
+    - "crates/freshell-ws/src/lib.rs:236-239 — term09: Term09Config wiring on connection state"
+    - "crates/freshell-ws/src/terminal.rs:168 ConnectionOutputQueue, :204 CatastrophicMonitor, :373-378 close code 4008 'Catastrophic backpressure'; :399-425 second 4008 ('can't keep up') path"
+    - "test: crates/freshell-ws/tests/term09_output_queue.rs exists (real-socket queue-cap tests per prior audit, file confirmed)"
+  missing: "visible-first pacing; background throttling (both depend on TERM-07 attach-priority, absent); stress-project PW validation (HARNESS-05 delaying proxy, RSS bounds); known narrow gap: single indefinitely-blocked send with quiet terminal escapes the catastrophic ticker (documented in backpressure.rs)."
+  effort: M
+  files:
+    - crates/freshell-ws/src/backpressure.rs
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-ws/tests/term09_output_queue.rs
+
+- id: TERM-10
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-ws/src/lib.rs:55 — a `create_limit` config knob is referenced alongside auto_resume/backpressure (parsing exists)"
+    - "Examination of throttling/cap/shutdown-rejection enforcement and tests was interrupted before confirmation."
+  missing: "Per-connection creation throttling, running-terminal cap, shutdown-time rejection, canonical error responses — none verified; PW burst-create validation not found (not searched to completion)."
+  effort: M
+  files:
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: TERM-11
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-terminal/src/registry.rs:538-544,720,774-781 — auto_kill_idle_minutes (atomic, legacy default 15 per server/settings.ts:791); :857-879 enforce_idle_kills sweep (<=0 disabled)"
+    - "crates/freshell-ws/src/lib.rs:398-408 — background idle-reaper task reads live registry value each sweep"
+    - "crates/freshell-server/src/main.rs:313-317 — boot seeds registry from settings.safety.autoKillIdleMinutes; settings_store.rs:1660-1678 PATCH /api/settings pushes live"
+    - "test: registry.rs:3842-4134 — enforce_idle_kills suite: new_registry_defaults_auto_kill_idle_minutes_to_legacy_default (:3847), eligibility sweeps (:3860-4118 incl. active/attached preservation cases), disabled at 0 and -1 (:4118,:4134)"
+    - "test: crates/freshell-server/src/settings_store.rs:1730 — patch_applies_auto_kill_idle_minutes_live_to_registry (15 -> 42 live)"
+    - "test: crates/freshell-ws/tests/pane_reconcile.rs:766 — stale idle row eligible for sweep"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-terminal/src/registry.rs
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: TERM-12
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "Examination interrupted before searching for the exited-record cap; no evidence gathered beyond unrelated 'exited' mentions (e.g. crates/freshell-ws/tests/auto_resume_e2e.rs:141)."
+  missing: "Exited-record cap constant/pruning, never-prune-running guarantee, restart non-persistence, and any tests — all unverified."
+  effort: S
+  files:
+    - crates/freshell-terminal/src/registry.rs
+
+- id: TERM-13
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "test: test/e2e-browser/specs/term13-scrollback-boundary.spec.ts exists (two scrollback settings, numbered emoji content, first/last markers + boundary-scoped search per prior audit)"
+    - "test: test/e2e-browser/specs/settings-live-reload.spec.ts exists (live PATCH of terminal.scrollback applies to later-created terminal)"
+    - "crates/freshell-server/src/settings_store.rs:1795,1833 — PATCH merges terminal.scrollback; main.rs:1173 — scrollback kept live"
+  missing: "Rust ingest/eviction code paths (registry.rs/chunk_ring.rs/replay_ring.rs) not personally re-verified this session; legacy's unbounded-mirror search divergence documented — Rust search is boundary-scoped by design, so the item's literal 'search changes at boundary' clause is proven only against the improved Rust behavior."
+  effort: S
+  files:
+    - crates/freshell-terminal/src/registry.rs
+    - crates/freshell-server/src/settings_store.rs
+
+- id: TERM-14
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "Not investigated before time ran out (no greps on metadata/git-branch/token-usage in crates/ were executed)."
+  missing: "Git branch/dirty publication, token usage, provider/model header/sidebar metadata, change-driven refresh — all unverified."
+  effort: L
+  files:
+    - crates/freshell-terminal/src
+    - crates/freshell-ws/src/terminal.rs
+
+- id: TERM-15
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-ws/src/activity.rs:13-14,462-474 — hub answers *.activity.list from live tracker state (reconnect seeding); claude/codex/amplifier list-state fns at :462,:468,:474"
+    - "crates/freshell-activity/src/{claude.rs,codex.rs,amplifier/tracker.rs,ledger.rs} — per-provider trackers + completionSeq ledger (:12-51)"
+    - "test: crates/freshell-protocol/tests/activity_extension.rs exists (amplifier.activity.* extension surface)"
+    - "test: crates/freshell-ws/src/activity.rs:1994 — gemini_and_kimi_are_status_inert"
+    - "test: test/e2e-browser/specs/terminal-activity-rust.spec.ts exists (claude/codex/amplifier updates + reload reseed per prior audit)"
+  missing: "OpenCode live updates lane (legacy uses SSE off the shared opencode-serve sidecar) not confirmed in the activity hub — only three list-state accessors were visible in the grep window (:462-474); whether opencode.activity.updated is broadcast remains unverified."
+  effort: M
+  files:
+    - crates/freshell-ws/src/activity.rs
+    - crates/freshell-activity/src
+
+- id: TERM-16
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-protocol/src/server_messages.rs:1157 + common.rs:392 — terminal.turn.complete carries completionSeq"
+    - "crates/freshell-activity TurnComplete effects: claude.rs:179-285, codex.rs:860-865, amplifier/tracker.rs:230,471 (positive-only signals per prior audit: BEL hooks, events.jsonl turn boundaries)"
+    - "crates/freshell-ws/src/activity.rs:1265-1382 — completion broadcast emission; tests at :1597-1610 (completionSeq 1 on first completion)"
+    - "test: activity.rs:1994 gemini_and_kimi_are_status_inert"
+    - "test: test/e2e-browser/specs/terminal-activity-rust.spec.ts (frame exactly once per turn + monotonic seq across reload, per prior audit; file confirmed)"
+  missing: "Green-attention/sound DOM edge not asserted in PW (client-side edge); dedup after full SERVER restart (vs page reload) not verified here; 'one sound only on success across all signal-capable providers' beyond claude/codex/amplifier unproven."
+  effort: M
+  files:
+    - crates/freshell-activity/src
+    - crates/freshell-ws/src/activity.rs
+
+- id: TERM-17
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/src/server_messages.rs:131,137 — terminal.session.associated and terminal.title.updated frame types defined"
+    - "crates/freshell-ws/src/{codex_association.rs,opencode_association.rs} — association modules with tests (codex_association.rs:545,658 and opencode_association.rs:289,614 test hits confirmed)"
+    - "test: test/e2e-browser/specs/amplifier-restore-rust.spec.ts and opencode-terminal-restore-rust.spec.ts exist (association written into pane.content.sessionRef/resumeSessionId per prior audit)"
+  missing: "terminal.title.updated monotonic/dedup-under-replay ordering (old/duplicate events must not revert newer identity/title) not implemented/verified; amplifier association source files not located by my single-level glob of freshell-sessions (may live in a subdirectory — unverified); title-update emission sites not confirmed."
+  effort: M
+  files:
+    - crates/freshell-ws/src/codex_association.rs
+    - crates/freshell-ws/src/opencode_association.rs
+    - crates/freshell-sessions/src
+
+- id: TERM-18
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "test: test/e2e-browser/specs/restore-matrix.spec.ts:1141 — 'a crashed Codex provider process is recovered mid-turn with no chime, and the same durable session continues' (crash detection, activity cleared via seeded positive control, no chime, durable id preserved; prior audit: green both projects 2x)"
+    - "test: crates/freshell-freshagent/src/codex.rs:5469 — crash_recovery_resume_wrong_thread_id_is_rejected_not_silently_recovered (crash-recovery resume path exists and is hardened)"
+    - "crates/freshell-activity/src tracker reversion paths + freshell-ws activity hub referenced by prior audit for blue-clear / no-false-completion on crash"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - crates/freshell-ws/src/activity.rs
+    - test/e2e-browser/specs/restore-matrix.spec.ts
+
+- id: TERM-19
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-ws/src/terminal.rs:17,:678,:4305-4311 — input to unknown terminal answers terminal.input.blocked{reason:unknown_terminal} (not silently ignored)"
+    - "test: crates/freshell-ws/tests/unknown_terminal_reply.rs:11 input_to_unknown_terminal_answers_input_blocked; :23 input_to_live_terminal_round_trips_without_a_blocked_frame"
+    - "test: crates/freshell-protocol/tests/roundtrip.rs:217,225 — INVALID_TERMINAL_ID and SESSION_IDENTITY_MISMATCH error wire shapes roundtrip"
+    - "crates/freshell-ws/src/terminal.rs:5799-5847 — invalid_dims_error / terminal_dims_in_range / unknown_terminal serialization tests"
+  missing: "Unknown-id behavior for ATTACH, RESIZE and DETACH not fully verified (detach must not be falsely acknowledged); malformed-message rejection consistency across the dispatch not confirmed; legacy error-code parity table and the HARNESS-05 PW validation unverified."
+  effort: M
+  files:
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-protocol/src/server_messages.rs
+
+- id: TERM-20
+  verdict: HOST-LIMITED
+  confidence: low
+  evidence:
+    - "crates/freshell-platform/src/{cli_launch.rs,cli_launch_goldens.rs,spawn.rs,elevated.rs} exist — launch planning + golden argv fixtures are present (cli_launch_goldens.rs:278 shows golden argv entries)"
+    - "Native Windows quoting/WSL path-conversion specifics were not examined (interrupted); the item's PW validation is a native-Windows project, unrunnable on this Linux host."
+  missing: "Windows argv quoting (spaces, quotes, backticks, Unicode, hooks, model names) and WSL/Windows path conversion unverified; per-character-class golden coverage unknown; PW-RUST native-Windows validation outstanding."
+  effort: L
+  files:
+    - crates/freshell-platform/src/cli_launch.rs
+    - crates/freshell-platform/src/cli_launch_goldens.rs
+    - crates/freshell-terminal/src/pty.rs
+
+- id: TERM-21
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "Not investigated before time ran out (no greps for viewport/paged-scrollback endpoints were executed against crates/ API surface)."
+  missing: "Viewport endpoint, paged-scrollback endpoint, cursor/revision semantics, invalid/stale/unknown request responses — all unverified."
+  effort: L
+  files:
+    - crates/freshell-api/src
+    - crates/freshell-server/src
+
+- id: TERM-22
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "test: crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs exists (real binary boot, real PTY + fake-codex session, SIGTERM descendant reaping with zombie/stale-pid hardening per prior audit; .env FRESHELL_HOME at :269 confirmed)"
+    - "crates/freshell-codex/src/launch_lifecycle.rs exists (CodexLaunchRuntime, managed spawn with ownership tag per :848 and launch_plan.rs:322)"
+  missing: "Failed-startup/cancellation/crash/resume cycle hardening, startup-child reaping beyond shutdown, leak/OOM protection, expected-restart silence, and the PW/stress-project (HARNESS-12 RSS, in-browser no-toast) validation — not verified here; existing proof is a Rust integration test, not the item's PW validation."
+  effort: L
+  files:
+    - crates/freshell-server/tests/safe11_term22_shutdown_reaping.rs
+    - crates/freshell-codex/src/launch_lifecycle.rs
+    - crates/freshell-freshagent/src/codex.rs
+
+- id: TERM-23
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/tests/roundtrip.rs:286 — codexDurability{schemaVersion:1,state:'identity_pending'} is protocol-defined on terminal.create"
+    - "crates/freshell-freshagent/src/terminal_tabs.rs:2908 — create_tab_passes_codex_durability_through_and_records_restore_key; :4149,:4240,:5169 — PIN 2 durability-before-registration ordering tests"
+  missing: "The candidate-persistence handshake itself: processing terminal.codex.candidate.persisted from the client, durability-status publication, and promoting a candidate identity ONLY after client persistence — no handling of a persisted-ack message was found in this audit window; PW validation unverified."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/terminal_tabs.rs
+    - crates/freshell-protocol/src/client_messages.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: TERM-24
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-protocol/src/server_messages.rs:117,193 — terminal.input.blocked frame type in protocol inventory"
+    - "crates/freshell-ws/src/terminal.rs:4305-4311 + test crates/freshell-ws/tests/unknown_terminal_reply.rs — unknown_terminal blocked reason emitted; roundtrip.rs:475-479 pins the wire shape"
+  missing: "The reason MATRIX beyond unknown_terminal (identity pending, capture timeout, identity unavailable, recovery pending, clean-exit decision pending, lifecycle-loss pending) not found in the greps run; blocked-input buffering/exactly-once-or-returned-for-retry semantics unverified; PW table-drive unverified."
+  effort: L
+  files:
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-protocol/src/server_messages.rs
+    - crates/freshell-freshagent/src/codex.rs
+
+- id: TERM-25
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "test: crates/freshell-freshagent/src/codex.rs:5356 handle_create_with_resume_wrong_thread_id_fails_create_and_never_adopts; :5420 handle_attach_unknown_session_wrong_thread_id_is_rejected_not_adopted; :5469 crash_recovery_resume_wrong_thread_id_is_rejected_not_silently_recovered (all three resume sites reject wrong-thread answers)"
+    - "test: test/e2e-browser/specs/restore-matrix.spec.ts:1682 — SCENARIO 7 TERM-25 wrong-thread recovery (prior audit: green unpinned both projects after a test bug fix; pin status not personally re-read)"
+  missing: "Per prior audit: 'B output never appears' at e2e level, 'input stays blocked' during the mismatch, a dedicated expected/actual identity UI surface, and the explicit recovery choice (start fresh / reconnect A) e2e — these remain unproven."
+  effort: M
+  files:
+    - crates/freshell-freshagent/src/codex.rs
+    - test/e2e-browser/specs/restore-matrix.spec.ts
+
+- id: TERM-26
+  verdict: HOST-LIMITED
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/main.rs:1708-1741 — resolve_home(): FRESHELL_HOME preferred; USERPROFILE-backed on Windows, passwd-entry on POSIX (Node os.homedir() semantics ported; :1297,:1645,:1717-1741)"
+    - "test: main.rs:2449-2493 — POSIX must NEVER consult USERPROFILE (:2464-2469); Windows must read USERPROFILE and never consult HOME (:2489-2493); main.rs:2532-2588 exact-id USERPROFILE fallback tests"
+    - "test: crates/freshell-server/src/session_directory.rs:1362-1516 — passwd-entry vs USERPROFILE platform rules incl. 'Windows must read USERPROFILE...' (:1502-1507), empty-HOME (:1444-1452), set-HOME wins (:1473-1478)"
+    - "crates/freshell-ws/src/codex_identity.rs:30 — USERPROFILE consulted for Windows codex home; crates/freshell-tauri/src/server.rs:90-92 — Tauri passes HOME+FRESHELL_HOME"
+  missing: "Native-Windows PW validation cannot run on this Linux host (isolated USERPROFILE boot + terminal cwd ~ expansion); terminal cwd `~` EXPANSION specifically not verified in the greps run (home resolution itself is thoroughly unit-tested)."
+  effort: M
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/session_directory.rs
+    - crates/freshell-platform/src/path.rs
+
+- id: TERM-27
+  verdict: PARTIAL
+  confidence: low
+  evidence:
+    - "crates/freshell-activity/src/amplifier/tracker.rs:230,471 — amplifier events reducer/tracker emits TurnComplete with completionSeq (events-lane completion; deadman force-read stays busy per prior audit)"
+    - "test: test/e2e-browser/specs/amplifier-restore-rust.spec.ts exists (amplifier pane restores across restart via `amplifier resume <id>`; never-submitted pane restores fresh)"
+    - "crates/freshell-protocol/tests/activity_extension.rs — amplifier.activity.* extension surface pinned"
+  missing: "Per-clause mapping was not completed (interrupted): spawn/prompt race order, cwd ambiguity, EOF resume, partial/reset/schema-invalid logs, missed-watcher force-read, long-turn no-false-completion, and sidecar-authoritative recency are not individually verified here; no dedicated TERM-27 PW table-drive spec was confirmed."
+  effort: L
+  files:
+    - crates/freshell-activity/src/amplifier/tracker.rs
+    - crates/freshell-sessions/src
+    - crates/freshell-ws/src
+
+- id: TERM-28
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-platform/src/path.rs:868 — resolve_program_via_path ($PATH-only, cwd never consulted, is_file/executable validated per candidate); exported at lib.rs:80"
+    - "crates/freshell-terminal/src/pty.rs:182 — PtyTerminal spawn resolves bare names via resolve_program_via_path BEFORE CommandBuilder/portable-pty"
+    - "test: crates/freshell-platform/tests/path_resolve_tests.rs — shadow-dir resolution (:84), missing command structured error (:102-106), absolute-path unchanged (:118-122), non-executable/directory skipped, search continues (:149-153)"
+    - "test: test/e2e-browser/specs/term28-path-shadow-rust.spec.ts exists (shadow-directory + genuinely-missing-command scenarios per prior audit, upstream portable-pty clause waived)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-platform/src/path.rs
+    - crates/freshell-terminal/src/pty.rs

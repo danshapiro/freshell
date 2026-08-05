@@ -1,0 +1,133 @@
+- id: DIAG-01
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/logging.rs:368-441 — JsonLayer emits one JSONL line per event with ts/level/target/msg plus flattened span fields"
+    - "crates/freshell-server/src/logging.rs:492-524 — request_logging_middleware assigns req-<pid>-<n> correlation id, logs route/method/status/duration_ms per HTTP request, echoes x-request-id"
+    - "crates/freshell-ws/src/terminal.rs:146-154 — ws.connection.established lifecycle event with connection_id + origin_kind"
+    - "crates/freshell-ws/src/terminal.rs:437-451 — ws.connection.closed summary lifecycle event with reason + close code"
+    - "crates/freshell-terminal/src/registry.rs:1100-1107 — terminal.created event (terminal_id, mode, resume_applied, cwd, pid)"
+    - "crates/freshell-terminal/src/registry.rs:1540 — terminal.killed (by: api|idle|shutdown); registry.rs:1658 terminal.exited (exit_code); registry.rs:920 terminal.idle_reap summary"
+    - "test: diag01_diag03_operator_experience in crates/freshell-server/tests/diag01_diag03_logging.rs (black-box binary boot; JSONL parse, correlated 404, request_id)"
+    - "test: enforce_idle_kills_emits_killed_by_idle_and_a_sweep_summary_event and terminal.created/exited tracing_capture tests in crates/freshell-terminal/src/registry.rs (~2750-2900)"
+    - "crates/freshell-tauri/src/lib.rs:113,170,187 — Tauri side uses plain eprintln! only; no structured JSONL Tauri log"
+  missing: "app version field on log lines (never emitted); explicit server boot/startup/quit lifecycle events (only subsystem events exist); structured JSONL Tauri-side logs (eprintln only); fresh-agent lifecycle event wiring in freshell-freshagent; no PW-RUST/PW-TAURI-WIN Playwright spec driving auth/terminal/provider/restart/quit flows and asserting field-level log contracts"
+  effort: M
+  files:
+    - crates/freshell-server/src/logging.rs
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-freshagent/src/claude.rs
+
+- id: DIAG-02
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/boot.rs:89 — route POST /api/logs/client registered"
+    - "crates/freshell-server/src/boot.rs:206-247 — logs_client validates body (zod-parity client_logs_issues, 400 with details; express-style 400 for malformed/empty JSON), returns 204, emits entries"
+    - "crates/freshell-server/src/boot.rs:363-446 — emit_client_log_entries re-emits each entry at its OWN severity (error/warn/debug/info) into target freshell_server::client_logs, preserving client, client_timestamp, client_event, console_method, args, context, stack"
+    - "crates/freshell-server/src/boot.rs:491-514 — entries array bounded to 1..=200 (client_logs_issues); malformed batches 400 without crash"
+    - "crates/freshell-server/src/boot.rs:305-361 — scrub_client_supplied redacts nested/escaped-JSON token+cookie secrets before emission"
+    - "test: client_log_entries_are_emitted_into_the_structured_log in crates/freshell-server/tests/diag02_client_log_emission.rs:218+ (all four severities land in rust-server.jsonl at own level)"
+    - "test: nested_json_encoded_secrets_in_client_log_strings_are_redacted in crates/freshell-server/tests/diag02_client_log_emission.rs:106+"
+    - "test: scrub_client_supplied_* unit tests in crates/freshell-server/src/boot.rs:823-857"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-server/tests/diag02_client_log_emission.rs
+
+- id: DIAG-03
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/logging.rs:181-202 — scrub(): verbatim AUTH_TOKEN replacement (covers URL/header/body/nested-error occurrences), token-keyed JSON field regex, cookie field + raw Cookie:/Set-Cookie: header redaction, applied on every line before disk (RotatingWriter::write_line logging.rs:288-303)"
+    - "crates/freshell-server/src/logging.rs:227-251 — rotate(): shift .1->.2->..., total file count bounded at 1+max_backups; size-based rotation default 10MiB x 2, env-overridable (FRESHELL_LOG_MAX_BYTES/MAX_BACKUPS, logging.rs:111-118)"
+    - "crates/freshell-server/src/logging.rs:288-303 — synchronous write+flush per line: no buffered-but-unflushed window, so final-flush-on-shutdown concern is structurally eliminated; Mutex serializes concurrent writers (write_line lock, lines 289-292)"
+    - "test: diag01_diag03_operator_experience in crates/freshell-server/tests/diag01_diag03_logging.rs:114-312 (tiny 2000-byte cap, ~80 requests, no raw token in any file, active file bounded, .1 backup exists, <=3 files, every line valid JSON)"
+    - "test: scrub_* and rotation_bounds_total_files_and_active_size unit tests in crates/freshell-server/src/logging.rs:530-624"
+    - "Playwright (PW-RUST): test/e2e-browser/specs/diag03-rotation-redaction-rust.spec.ts:57-164 — 'small-limit rotation: valid JSON, no raw secret, bounded file count, chronological coverage', 'concurrent writers: no interleaved or corrupted JSON lines', 'final shutdown flush: last request entry present after server stop'"
+  missing: "PW-TAURI-WIN lane (native Windows Tauri/WebView2 build unavailable on Linux — host-side validation only; implementation itself is platform-neutral Rust)"
+  effort: S
+  files:
+    - crates/freshell-server/src/logging.rs
+    - crates/freshell-server/tests/diag01_diag03_logging.rs
+    - test/e2e-browser/specs/diag03-rotation-redaction-rust.spec.ts
+
+- id: DIAG-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/diag.rs:238-269 — POST /api/perf patches settings.logging.debug and broadcasts settings.updated to connected clients (live toggle, no restart)"
+    - "crates/freshell-server/src/settings_store.rs:311-366 — patch() persists merged settings to disk (self.persist(&merged)) before committing to live tree, so the toggle survives restart"
+    - "crates/freshell-server/src/boot.rs:123-140 — bootstrap perf.logging reported from PERF_LOGGING/PERF_DEBUG env (boot-time state only)"
+    - "test: perf_handler_toggles_debug_setting_and_broadcasts + perf_only_a_literal_true_enables_matching_js_strict_equality in crates/freshell-server/src/diag.rs:569-628"
+    - "crates/freshell-ws/src/lib.rs:459 — WS handshake emits PerfLogging { enabled: false } — HARDCODED false, does not reflect live toggle state (legacy reads live perfConfig.enabled in handshakeSnapshotProvider, server/index.ts:~420)"
+  missing: "no applyDebugLogging equivalent: no server-side perf sampling timers to start/stop (legacy perf-logger.ts:185 setInterval process sample + event-loop histogram + shouldLog gating has no Rust counterpart); no debug/perf-gated detailed event emission before/during/after toggle; WS handshake perf.logging state hardcoded false (reconnect state not synchronized); no PW-RUST Playwright toggle spec"
+  effort: M
+  files:
+    - crates/freshell-server/src/diag.rs
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-server/src/main.rs
+
+- id: DIAG-05
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/diag.rs:71-77 — router serves GET /api/server-info, GET /api/debug, POST /api/perf, all behind the shared auth gate (is_authed)"
+    - "crates/freshell-server/src/diag.rs:92-106 — server_info body: version, monotonic uptime (Instant-based), runtime:'rust', platform, arch, commit + buildDirty provenance (build.rs baked)"
+    - "crates/freshell-server/src/diag.rs:137-162 — debug body: version, appVersion, wsConnections (live registry), redacted settings, sessionsProjects, tabsRegistry record/device counts, terminals, time"
+    - "crates/freshell-server/src/diag.rs:193-232 — redact_settings: schema-based structural walker; key-vocabulary match (token/apikey/api_key/secret/password/credential/cookie/authorization/auth-header) at any depth PLUS secretMarked:true marker redaction for unknown future fields; non-secret siblings preserved"
+    - "test: redacts_known_secret_keys_at_any_depth, redacts_unknown_future_secret_marked_field_by_marker_not_name, redaction_is_case_insensitive_and_substring_based, debug_body_has_the_legacy_field_set_with_redacted_settings (seeded geminiApiKey never serialized), server_info_* (3 tests), perf_* (2 tests), all_three_routes_reject_unauthenticated_requests, server_info_accepts_the_correct_token — all in crates/freshell-server/src/diag.rs:271-681"
+  missing: "Playwright PW-RUST live spec comparing counts across real clients/tabs/terminals (unit/integration coverage exists instead); provider-credentials and remote-token seeding validated only via key-vocabulary unit tests, not end-to-end"
+  effort: S
+  files:
+    - crates/freshell-server/src/diag.rs
+    - crates/freshell-server/build.rs
+
+- id: DIAG-06
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Route inventory of crates/freshell-server/src/*.rs: no /api/ai or /terminals/{id}/summary route exists (routes enumerated: bootstrap, debug, perf, server-info, terminals, terminals/{id}/search, sessions/resolve, ... — no summary)"
+    - "Legacy reference server/ai-router.ts:19-69 — POST /terminals/:terminalId/summary with ai_summary perf timer, summarySource ai|heuristic, fallback on error — has no Rust port"
+    - "crates/freshell-server/src/main.rs:1903 — featureFlags.kilroy HARDCODED false ('no KILROY_ENABLED wiring yet'), diverging from legacy detectFeatureFlags (server/platform-router.ts:22 reads isTruthy(process.env.KILROY_ENABLED)); aiEnabled computed via ai_enabled (main.rs:1911-1913) and tested"
+    - "crates/freshell-server/src/sessions.rs:297-335 — only first-message title heuristic exists (session auto-title, a different feature), not terminal-output summarization"
+  missing: "entire terminal-summary endpoint (heuristic fallback over terminal buffer + optional AI with timeout/500/malformed/empty handling and no-stuck-spinner semantics); truthful independent Kilroy availability reporting (kilroy flag hardcoded false, ignores KILROY_ENABLED); summary-AI availability reporting tied to the (absent) summary feature; PW-RUST summary spec"
+  effort: M
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/diag.rs
+    - server/ai-router.ts
+
+- id: DIAG-07
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/boot.rs:99-126 — GET /api/bootstrap returns settings + platform + shell{authenticated,ready,tasks} + perf{logging}"
+    - "crates/freshell-server/src/boot.rs:104-122 — shell.tasks and ready are HARDCODED true for sessionRepairService/codingCliIndexer with comment that init runs before bind; NOT the actual startup-task status (legacy wires getShellTaskStatus to live startupState.snapshot().tasks, server/index.ts:191)"
+    - "crates/freshell-ws/src/lib.rs:104-113,459-470 — WS handshake carries boot-frozen config_fallback (ConfigFallback frame) with tests handshake_includes_config_fallback_when_boot_fell_back_and_in_correct_order, handshake_omits_config_fallback_when_boot_was_healthy, handshake_delivers_config_fallback_identically_across_multiple_connections"
+    - "grep for MAX_BOOTSTRAP_PAYLOAD_BYTES / readModelScheduler / payloadBytes in crates/: NO matches — no payload budget, no scheduling/cancellation machinery in the Rust bootstrap"
+  missing: "actual (non-hardcoded) startup-task status with barriers; configFallback in the /api/bootstrap HTTP payload (only WS handshake has it); legacyLocalSettingsSeed (no Rust occurrence at all); MAX_BOOTSTRAP_PAYLOAD_BYTES budget check (500 error on oversize, shell-bootstrap-router.ts:84-87); read-model scheduling + request cancellation/abort handling; truthful perf state (env-only, ignores runtime toggle); PW-RUST barrier/oversize/abort spec"
+  effort: M
+  files:
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-server/src/main.rs
+
+- id: DIAG-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/main.rs:66 — const APP_VERSION: &str = \"0.7.0\" (the exact stale value the checklist calls out); NOT derived from CARGO_PKG_VERSION (freshell-server crate version is 0.1.0) nor from package.json (0.7.5); overridable only via FRESHELL_APP_VERSION env"
+    - "crates/freshell-tauri/tauri.conf.json:3 — \"version\": \"0.7.0\" (Tauri-reported version also stale)"
+    - "package.json:4 — \"version\": \"0.7.5\" (release source of truth diverges from both Rust surfaces); crates/freshell-server/Cargo.toml:11 and crates/freshell-tauri/Cargo.toml:25 are 0.1.0"
+    - "crates/freshell-server/src/updater.rs:36-120 — live version-check comparator exists (parse_version/isMinorOrMajorNewer) but consumes whatever current_version string it is handed (the stale 0.7.0)"
+    - "grep for any test asserting cross-surface version equality (0.7.5) in crates/: none; test/unit/electron/release-assets.test.ts asserts 0.7.5 filenames but is legacy-Node-side, not Rust"
+    - "crates/freshell-api/src/lib.rs:128 — health fixture version also hardcoded \"0.7.0\""
+  missing: "single version source of truth: server health/version/bootstrap/debug/server-info all report hardcoded 0.7.0; no build-time injection from package.json/git tag; tauri.conf.json and Cargo crate versions diverge (0.7.0/0.1.0/0.7.5 across surfaces); no test asserting one-version equality; PW-RUST/PW-TAURI-WIN packaged version assertions absent"
+  effort: M
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/build.rs
+    - crates/freshell-tauri/tauri.conf.json
+    - crates/freshell-server/src/updater.rs

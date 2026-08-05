@@ -1,0 +1,196 @@
+# Parity audit: P1 — Protocol, security, and reliability limits
+# Repo audited (read-only): /home/dan/code/freshell/.worktrees/parity-campaign
+# Legacy Node behavior reference: server/ ; Rust port: crates/
+# Time-boxed breadth-first triage. SAFE-01..06 fully examined; SAFE-07..13
+# interrupted mid-triage (marked UNCLEAR with partial findings recorded).
+
+- id: SAFE-01
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-server/src/main.rs:1554-1569 — validate_auth_token() rejects empty/whitespace-only, <16 chars, and DEFAULT_BAD_TOKENS {changeme,default,password,token} (case-insensitive) in the legacy message order; called from the AUTH_TOKEN env read at main.rs:92"
+    - "crates/freshell-server/src/main.rs:2822-2850 — unit tests: empty, whitespace-only (20 spaces), short, each weak/default value, and a valid token"
+    - "crates/freshell-server/src/boot.rs:686-708 — is_authed(): 'x-auth-token' header wins UNCONDITIONALLY over the 'freshell-auth' cookie (percent-decoded), empty header falls through to cookie, constant-time compare via freshell_api::constant_time_eq"
+    - "test: wrong_header_rejects_even_with_correct_cookie_present (crates/freshell-server/src/boot.rs:794)"
+    - "test: empty_header_value_falls_back_to_cookie (crates/freshell-server/src/boot.rs:810); cookie_token_authorizes_url_decoded (:782); header_token_authorizes (:767); wrong_and_absent_token_rejected (:773)"
+    - "crates/freshell-ws/src/lib.rs:517-526 — evaluate_hello(): protocolVersion checked BEFORE token; constant-time token compare; wrong OR missing token both close 4001 'Invalid token' (lib.rs:613,640) matching legacy"
+    - "test: evaluate_hello_checks_version_before_token (crates/freshell-ws/src/lib.rs:859)"
+    - "test/e2e-browser/specs/safe01-auth-matrix.spec.ts — 12 tests (empty/short/'changeme'/whitespace startup rejection; API good/wrong/missing header, cookie-only, conflicting sources, empty-header fall-through; UI ?token= query + URL strip; WS hello good/wrong/missing). Section notes record green 12/12 x2 runs on BOTH legacy-chromium and rust-chromium (2026-07-19)"
+    - "Deliberate hardening divergence asserted in the spec: whitespace-only token rejected on Rust (token.trim().is_empty()), accepted by legacy's JS-falsy check — documented as KNOWN DIVERGENCE, not a bug (safe01-auth-matrix.spec.ts:141)"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-ws/src/lib.rs
+
+- id: SAFE-02
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/rate_limit.rs (527 lines) — global process-wide token bucket (capacity 300, refill 5/s = legacy's windowMs 60_000/max 300 at server/index.ts:165-166); try_acquire returns Err(retry_after_secs) when empty; warn-once-per-streak 'api_rate_limited' log (rate_limit.rs:213-254)"
+    - "crates/freshell-server/src/rate_limit.rs:262-287 — is_limited_path limits /api/* EXCEPT /api/health; ws/static exempt; enforce() middleware returns 429 with JSON {ok:false,error:'rate_limited',message} + integer Retry-After header (rate_limit.rs:301-324)"
+    - "Wired into the production app: crates/freshell-server/src/main.rs:1138-1139 constructs RateLimiter::new_system(RateLimitConfig::default_api()); main.rs:1340-1341 layers rate_limit::enforce via axum::middleware::from_fn"
+    - "test: sustained_over_limit_returns_429_with_retry_after (rate_limit.rs:370); refill_restores_service_after_synthetic_clock_advance (:388, injectable TestClock — no real sleeps); concurrent_hammering_never_exceeds_capacity_and_never_panics (:411)"
+    - "test: exceeding_limit_on_an_api_route_returns_429_with_retry_after_and_envelope (rate_limit.rs:482, real router round-trip); health_path_is_exempt_even_when_bucket_is_exhausted (:460); ws_path_is_exempt_even_when_bucket_is_exhausted (:471)"
+    - "Deliberate deviation documented in module doc (rate_limit.rs:38-50): bucket is GLOBAL (one per process), not legacy's per-IP default — chosen to honor the checklist item's own word 'global'"
+    - "No PW-RUST browser spec exists (no safe02* in test/e2e-browser/specs/); two-context boundary/clock-advance/recovery legs are covered only at crate level via the synthetic-clock tests above"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-server/src/rate_limit.rs
+    - crates/freshell-server/src/main.rs
+
+- id: SAFE-03
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "crates/freshell-ws/src/origin.rs:104 — evaluate_origin(origin, host, allowed_origins) allow-list policy (same-origin, allow-listed remote, explicit handling of missing/null/malformed origins); 8+ unit tests in its #[cfg(test)] module (origin.rs:129-201+); resolve_allowed_origins wires ALLOWED_ORIGINS + EXTRA_ALLOWED_ORIGINS"
+    - "crates/freshell-ws/src/lib.rs:540-549 — origin evaluated BEFORE the first frame is read; Rejected -> error frame + close 4011 'Origin not allowed' (CLOSE_ORIGIN_REJECTED, lib.rs:722) and return, so no ready/settings/terminal.inventory ever reaches a rejected client (structurally — the code returns before handshake build)"
+    - "crates/freshell-ws/src/main-server wiring: crates/freshell-server/src/main.rs:1613-1618 resolve_allowed_origins() passes env-derived list into WsState.allowed_origins (lib.rs:235)"
+    - "test: hostile_origin_with_valid_token_is_rejected_before_session_state (crates/freshell-ws/tests/origin_policy.rs:194, real axum server + real tokio-tungstenite client); null_origin_is_rejected (:203); allow_listed_origin_is_accepted (:212); same_origin_matching_host_is_allowed (:181); no_origin_header_is_allowed_through_to_handshake (:172)"
+    - "test/e2e-browser/specs/safe03-origin-matrix.spec.ts — 6 raw-socket tests against a server booted with ALLOWED_ORIGINS=https://trusted.example; section notes record green 6/6 x2 runs on BOTH legacy-chromium and rust-chromium (2026-07-19), with the intentional Rust-rejects/legacy-advisory-only difference asserted as KNOWN DIVERGENCE"
+    - "Narrowed caveat (documented in section notes): a broadcast-vs-close race (background terminal.inventory/settings.updated while a rejection lands) was not attempted in the PW spec; proven instead to the next-frame-after-reject-is-close level by the crate real-socket tests"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-ws/src/origin.rs
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-ws/tests/origin_policy.rs
+
+- id: SAFE-04
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Legacy reference exists: server/ws-handler.ts:237 (maxConnections: Number(process.env.MAX_CONNECTIONS || 50)), :271 (CLOSE_CODES.MAX_CONNECTIONS = 4003), :1132-1135 (onConnection closes 'Too many connections' when connections.size >= maxConnections, before hello)"
+    - "Exhaustive grep across crates/ for '4003', 'MAX_CONNECTIONS', 'Too many connections', 'max_connections', 'MAX_WS_CONNECTIONS' finds NO enforcement code; freshell-ws close codes are only 4001/4002/4010/4011 (crates/freshell-ws/src/lib.rs:713-722)"
+    - "crates/freshell-terminal/src/registry.rs:745-746 exposes connection_count() (increment :737 / decrement :1280) but its ONLY consumer is diagnostics (crates/freshell-server/src/diag.rs:152 'wsConnections') — observability, not enforcement"
+    - "No safe04* spec in test/e2e-browser/specs/; no max-connections option on WsState (lib.rs:91-235 state fields carry no cap)"
+  missing: "Entire clause: MAX_CONNECTIONS env config (default 50) plumbed through main.rs into WsState; pre-session rejection close 4003 'Too many connections' when the authenticated-connection cap is reached; prompt capacity release on close; preservation of existing clients; PW max-two scenario (third socket 4003s, close-one/reconnect succeeds, survivor keeps terminal I/O)"
+  effort: M
+  files:
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-terminal/src/registry.rs
+
+- id: SAFE-05
+  verdict: DONE
+  confidence: medium
+  evidence:
+    - "Hello timeout: crates/freshell-ws/src/lib.rs:566-590 wraps the whole pre-hello read loop in tokio::time::timeout(hello_deadline) and closes CLOSE_HELLO_TIMEOUT=4002 'Hello timeout' on elapse (constant lib.rs:716); config resolve_hello_timeout_ms() env HELLO_TIMEOUT_MS default 5000 (crates/freshell-server/src/main.rs:1591-1596) mirrors ws-handler.ts:223"
+    - "test: connection_with_no_hello_is_closed_with_hello_timeout_code (crates/freshell-ws/tests/hello_timeout.rs:122, real socket, ephemeral port); connection_with_timely_hello_stays_open_past_the_deadline (:160 — authenticated connection immune)"
+    - "JSON ping/pong: crates/freshell-ws/src/terminal.rs:861-865 — ClientMessage::Ping arm replies ServerMessage::Pong(Pong{ timestamp: crate::now_iso() }) (types: crates/freshell-protocol/src/client_messages.rs:22, crates/freshell-protocol/src/server_messages.rs:87,764), byte-parity with legacy ws-handler.ts ping/pong"
+    - "test: test/e2e-browser/specs/ws-ping-pong-matrix.spec.ts — 2 tests (exact {type:'pong',timestamp} shape; fresh timestamp per ping); section notes record green 2/2 x2 on BOTH legacy-chromium and rust-chromium after the Ping-arm fix (2026-07-18 follow-on)"
+    - "Transport heartbeat, independent of app ping: crates/freshell-ws/tests/keepalive.rs — idle_connection_receives_periodic_pings_and_survives_multiple_cycles (:162) and connection_with_no_pong_reply_is_terminated_after_one_missed_cycle (:266), both real-socket; PING_INTERVAL_MS plumbing at main.rs:1581-1586 mirrors ws-handler.ts:224"
+    - "Detached-terminal survival is structural (terminals owned by freshell-terminal TerminalRegistry, not the socket) and exercised by the restore e2e suites (e.g. server-restart-recovery.spec.ts, double-restart-terminal-restore-rust.spec.ts present in test/e2e-browser/specs/)"
+    - "Caveat: no PW controllable-proxy leg for control-frame heartbeat suppression (per section notes; covered by the keepalive.rs real-socket tests instead), and no single test explicitly asserting 'heartbeat close never kills a detached terminal' — hence medium, not high"
+  missing: ""
+  effort: S
+  files:
+    - crates/freshell-ws/src/lib.rs
+    - crates/freshell-ws/src/terminal.rs
+    - crates/freshell-server/src/main.rs
+
+- id: SAFE-06
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "DONE clause — WS inbound frame/message bound at legacy parity: WS_MAX_PAYLOAD_BYTES env, default 16 MiB (crates/freshell-server/src/main.rs:1601-1607 -> ws_max_payload_bytes passed at main.rs:765), mirroring ws-handler.ts:226"
+    - "test: message_at_exactly_the_limit_is_accepted_and_processed (crates/freshell-ws/tests/max_payload.rs:201, real socket); message_one_byte_over_the_limit_is_rejected_without_affecting_other_clients (:223 — rejection does not cross-contaminate a second client)"
+    - "MISSING — HTTP body bound at legacy parity: legacy is express.json({limit:'1mb'}) (server/index.ts:185); Rust has NO explicit DefaultBodyLimit anywhere in crates/ (grep confirms) and only inherits axum 0.8's implicit 2 MB Json-extractor limit — recorded as an 'accepted deviation' comment (crates/freshell-server/src/resolve.rs:113) but never implemented to 1mb and never tested"
+    - "MISSING — bootstrap payload budget: legacy rejects an oversized bootstrap with 500 'Bootstrap payload exceeds budget' when > MAX_BOOTSTRAP_PAYLOAD_BYTES (12*1024, shared/read-models.ts:4; check server/shell-bootstrap-router.ts:85-88); the Rust handler (crates/freshell-server/src/boot.rs:100-126) has no byte-count/budget check at all"
+    - "MISSING — outbound chunk knob: legacy declares maxChunkBytes (MAX_WS_CHUNK_BYTES, default 500KiB) at server/ws-handler.ts:132,244 (it is declared-but-never-consumed even in legacy); no Rust equivalent declaration exists; no PW just-below/just-above matrix, bounded-RSS, or chunk-reassembly assertions found (no safe06* spec)"
+  missing: "HTTP body limit at 1mb legacy parity (explicit DefaultBodyLimit + rejection test); bootstrap payload budget check (MAX_BOOTSTRAP_PAYLOAD_BYTES 12KiB -> 500 'Bootstrap payload exceeds budget') in the Rust /api/bootstrap handler; outbound chunk byte cap plumbing (MAX_WS_CHUNK_BYTES) if non-dead behavior is desired; PW just-below/just-above-limit HTTP+WS matrix with RSS and second-client-health assertions"
+  effort: S
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-ws/src/lib.rs
+
+- id: SAFE-07
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "Schema side exists: crates/freshell-protocol/src/client_messages.rs defines a ~30-variant ClientMessage enum (hello, ping, client.diagnostic, terminal.create/attach/detach/input/resize/kill/autoResumeCancel, terminal.codex.candidate.persisted, codex/opencode/claude/amplifier activity.list, ui.layout.sync, ui.screenshot.result, codingcli.create/input/kill, freshAgent create/attach/send/interrupt/compact/approval.respond/question.respond/kill/fork, pane.reconcile.request)"
+    - "Handler dispatch exists: crates/freshell-ws/src/terminal.rs handle_client_text with explicit arms (e.g. ClientMessage::Ping -> Pong at :861-865); many WS behavior tests exist in crates/freshell-ws/tests/ (create_protection.rs, unknown_terminal_reply.rs, create_limit.rs-adjacent suites, term09_output_queue.rs, rest_ws_shared_gate.rs, etc.)"
+    - "NOT verified: per-variant valid-minimum and negative-payload coverage, request-correlation on errors, the schema-row-to-scenario table, or a PW-RUST matrix generator — no safe07* spec in the test/e2e-browser/specs/ listing"
+  missing: "Unknown whether every ClientMessage variant has its correct success effect/response and graded negative-case errors; the PW-RUST generated-table spec (valid minimum + negative payload per variant, follow each nonfatal negative with a valid terminal command) was not found. Audit was interrupted before handler-coverage mapping could be completed."
+  effort: L
+  files:
+    - crates/freshell-protocol/src/client_messages.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: SAFE-08
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "A test file named for this exact item exists: crates/freshell-ws/tests/safe08_restore_diagnostics.rs (present in the tests/ listing) — its contents were not read"
+    - "Adjacent restore infrastructure exists in the same crate: restore_spawn_gate.rs, restore_storm.rs, restore_plan_queue_cap.rs, pane_ledger_restore.rs, resume_validation_gate.rs tests; restore/ledger/reconcile modules in crates/freshell-ws/src/ (pane_ledger.rs, reconcile.rs, resume_validation.rs, restore-gate files)"
+    - "No safe08* PW spec in test/e2e-browser/specs/ listing"
+  missing: "Unverified: structured diagnostics recording, one-shot stale-handle reconcile (repair/recreation) semantics, restore-loop prevention, and the PW seed-dead/mismatched-handles scenario. Audit interrupted before safe08_restore_diagnostics.rs or the implementation modules were read."
+  effort: M
+  files:
+    - crates/freshell-ws/src/reconcile.rs
+    - crates/freshell-ws/tests/safe08_restore_diagnostics.rs
+
+- id: SAFE-09
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "No search was performed for cancellation of abandoned work (snapshot, wait-for, exec, provider start, search, bootstrap) before the audit was interrupted"
+    - "No safe09* PW spec in the test/e2e-browser/specs/ listing"
+  missing: "Everything unverified: abort/cancellation wiring (CancellationToken/AbortHandle-equivalents) for snapshot/wait-for/exec/provider-start/search/bootstrap work, task-count-returns-to-zero assertions, and the PW abort/navigate-away scenario"
+  effort: M
+  files:
+    - crates/freshell-server/src/boot.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: SAFE-10
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-ws/src/backpressure.rs exists (not read)"
+    - "test: slow_broadcast_consumer_lag_closes_with_backpressure_code_for_resync (crates/freshell-ws/tests/keepalive.rs:206, real-socket) — the test NAME suggests lag -> close-with-backpressure-code-for-resync behavior, matching legacy's CLOSE_CODES.BACKPRESSURE=4008 (server/ws-handler.ts:272, backpressureCloseCode at :1656); contents not verified"
+    - "NOT verified: the resync/snapshot side for the named families (settings, lifecycle, activity, association, materialization, extensions, tabs), i.e. whether a resumed lagged client is made equal to authoritative API state; no safe10* PW spec in the specs listing"
+  missing: "Unverified resync/recovery surface per event family and the PW freeze-context/burst-events/resume/equality-to-authoritative-state scenario (no ghost terminals, no stale busy state)"
+  effort: M
+  files:
+    - crates/freshell-ws/src/backpressure.rs
+    - crates/freshell-ws/src/terminal.rs
+
+- id: SAFE-11
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "crates/freshell-server/src/shutdown_forensics.rs exists (name implies shutdown logging/forensics; not read)"
+    - "WsState carries shutdown: Arc<Notify> (crates/freshell-ws/src/lib.rs:815) and lib.rs:208 documents the client observing close code 4009 'Server shutting down' — legacy CLOSE_CODES.SERVER_SHUTDOWN=4009 (server/ws-handler.ts:272, used at :1129); enforcement path not read"
+    - "crates/freshell-tauri crate exists for the Windows/Tauri host (relevant to the 'ownership-safe / never touch unrelated processes' clause)"
+    - "The checklist's PW validation is explicitly a native Windows project (kill exact server, sentinel PID safety) — that layer is host-specific and was not assessable here; no safe11*-style spec was observed in the specs listing"
+  missing: "Unverified: stop-accepting-work gate, state/log flush, exact terminal/provider/extension process-tree termination, full-grace-period usage, unrelated-process safety, and the Windows-host PW scenario. Audit interrupted before shutdown_forensics.rs / main.rs shutdown wiring were read."
+  effort: L
+  files:
+    - crates/freshell-server/src/main.rs
+    - crates/freshell-server/src/shutdown_forensics.rs
+    - crates/freshell-ws/src/lib.rs
+
+- id: SAFE-12
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "test/e2e-browser/specs/stress.spec.ts exists (not read); whether it is a bounded MIXED-load soak (terminals + agent events + tab sync + proxy traffic + indexing + API captures + reconnects together) or runs against rust-chromium is unverified"
+    - "No evidence gathered for the 30-minute CI / 2-hour release-gate soak runner, latency/RSS/handle/queue ceiling assertions, cross-session leak checks, or zero-owned-PID teardown assertions"
+  missing: "Unverified: bounded mixed-load soak scenario, duration tiers (30 min CI / 2 h gate), marker/latency/RSS/handle/queue ceilings, cross-session leakage assertions, and post-teardown owned-PID accounting"
+  effort: L
+  files:
+    - test/e2e-browser/specs/stress.spec.ts
+
+- id: SAFE-13
+  verdict: UNCLEAR
+  confidence: low
+  evidence:
+    - "Server-message schema exists: crates/freshell-protocol/src/server_messages.rs defines the ServerMessage enum (e.g. Pong at :87; Pong struct at :764) — full variant inventory not read"
+    - "NOT verified: per-variant semantic owner map, payload/correlation contracts, reconnect behavior, retirement inventory, or a PW-RUST generated coverage manifest; no safe13* spec in the test/e2e-browser/specs/ listing"
+  missing: "Unverified: complete server-to-client event inventory with owners/contracts/reconnect behavior, the PW coverage-manifest generator (raw-frame capture + user-visible effect assertion per variant, fail-on-unowned-type)"
+  effort: L
+  files:
+    - crates/freshell-protocol/src/server_messages.rs

@@ -1,0 +1,196 @@
+- id: HARNESS-01
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "test/e2e-browser/helpers/rust-server.ts:277 — class RustServer implements the owned fixture: builds/locates the binary via resolveRustServerBin/ensureRustServerBuilt (:82-138, cargo build --release -p freshell-server or FRESHELL_E2E_RUST_SERVER_BIN override), ephemeral port via findFreePort (:308), unique token via randomUUID (:309), isolated FRESHELL_HOME via mkdtemp + applyIsolatedHomeEnvironment (:303, :477-492), records exact PID (:513, :540), waits for /api/health plus token-gated /api/server-info identity check (:322-352, waitForHealth :659), spawns own process group (detached:true :510) and stop() group-kills only that PID + verifies owned descendants dead (ownedDescendantPids :222, killCurrentProcess :573-610, reapSurvivingChildren :619)"
+    - "test: 'boots, survives restart, and reaps only its own process group' in test/e2e-browser/specs/harness-01-rust-server.spec.ts:84 — drives /?token=...&e2e=1 (:129), creates a shell pane + echo marker (:139-141), spawns unrelated sentinel (:144-148), restart()s the same owned server against same home/port/token (:157-161), proves post-restart functional reconnect with a second marker (:206-238), captures real PTY child PIDs (server.ownedChildPids(), :248-251) and after stop() asserts server PID, process group, each child PID dead, port freed, sentinel alive (:257-277), and that real ~/.freshell was untouched (:289-314)"
+    - "test/e2e-browser/helpers/rust-server.test.ts and rust-server-bin.test.ts — unit tests for the fixture helper exist"
+    - "Matches the item's own checked-off evidence note (commits 334f834b, 2cb57287) and checklist is marked [x]"
+  missing: ""
+  effort: S
+  files:
+    - test/e2e-browser/helpers/rust-server.ts
+    - test/e2e-browser/specs/harness-01-rust-server.spec.ts
+
+- id: HARNESS-02
+  verdict: DONE
+  confidence: high
+  evidence:
+    - "test/e2e-browser/playwright.config.ts:204-211 — projects legacy-chromium (e2eServerKind:'legacy') and rust-chromium (e2eServerKind:'rust') share testMatch MATRIX_SPECS (:13-82) over the same testDir"
+    - "MATRIX_SPECS covers all five named categories: settings (settings-persistence-split.spec.ts :15, settings-live-reload.spec.ts :48), session (session-directory-matrix.spec.ts :25), terminal (terminal-lifecycle.spec.ts :17), browser-pane (browser-pane.spec.ts :23), multi-client (multi-client.spec.ts :24), plus restart/fs coverage (server-restart-recovery.spec.ts :14) routed through handle.restart()"
+    - "test/e2e-browser/helpers/fixtures.ts:5 + external-target.ts — generalized target seam with E2eServerKind routed per project option"
+    - "test: 'the fixture-owned server is the one THIS project claims to own, across a restart' in test/e2e-browser/specs/harness-02-matrix-bite.spec.ts:87 — bite proof keyed on the permanent structural discriminator GET /api/server-info (Rust emits runtime:'rust' and no nodeVersion; legacy emits real nodeVersion and no runtime, assertions at :137-146), with a documented permanent RED demonstration of a mis-wired rust project failing only the rust leg (:44-49)"
+    - "Checklist is marked [x] with matching evidence text"
+  missing: ""
+  effort: S
+  files:
+    - test/e2e-browser/playwright.config.ts
+    - test/e2e-browser/helpers/fixtures.ts
+    - test/e2e-browser/helpers/external-target.ts
+    - test/e2e-browser/specs/harness-02-matrix-bite.spec.ts
+
+- id: HARNESS-03
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/fixtures/ contains fakes: fake-claude-cli.mjs, fake-claude-sidecar.mjs (Claude-SDK-bridge sidecar — Kilroy is a hidden claude-backed fresh-agent type, so the Kilroy/Claude-SDK lane rides this same fake), fake-codex-cli.mjs, fake-codex-terminal.mjs, fake-opencode.cjs (opencode server/sidecar with sqlite schema), fake-opencode-terminal.mjs, fake-amplifier-cli.mjs, fake-amplifier-activity-cli.mjs (activity events), fake-crashing-claude-cli.mjs (crash lane), plus test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs for the Codex app-server protocol"
+    - "Argument/request recording exists per-fake: fake-amplifier-cli.mjs:26-32 appends argv JSONL to FAKE_AMPLIFIER_ARGV_LOG; fake-opencode.cjs:12-24 appendAudit() records argv+payload to FAKE_OPENCODE_AUDIT_LOG; fake-claude-sidecar.mjs logs inbound requests to FAKE_CLAUDE_SIDECAR_LOG (logRequest, ~:50)"
+    - "Fakes are exercised by many rust-lane specs (restore-matrix.spec.ts, session-directory-matrix.spec.ts, agent-continuity-matrix.spec.ts, terminal-activity-rust.spec.ts, fake-crashing-claude via agent-crash-autoresume-rust.spec.ts, etc.)"
+  missing: "No fake Gemini or fake Kimi executable exists anywhere (no fake-gemini*/fake-kimi* in test/e2e-browser/fixtures or test/fixtures). No fixture-only contract spec that invokes each executable/protocol DIRECTLY and asserts its recorded ledger/emitted events independent of server/provider parity — every fake is only driven indirectly through the server inside parity specs. Approval/question/completion/resume event coverage is not uniform across all seven named providers (e.g. no ledger-asserting contract for bel/generic or the missing two providers)."
+  effort: M
+  files:
+    - test/e2e-browser/fixtures/fake-claude-cli.mjs
+    - test/e2e-browser/fixtures/fake-claude-sidecar.mjs
+    - test/e2e-browser/fixtures/fake-opencode.cjs
+    - test/e2e-browser/fixtures/fake-amplifier-cli.mjs
+    - test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs
+    - test/e2e-browser/specs/ (new fixture-only contract spec)
+
+- id: HARNESS-04
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/specs/session-directory-matrix.spec.ts — inline multi-provider seeding: Claude JSONL corpus (buildSessionJsonl :44-97 with system/init, turn pairs, trailing summary line :98-100), Codex (CODEX_SESSION_ID :28), OpenCode sqlite rows with time_archived columns (:203-214), Amplifier (:32-35), plus a deletion leg test ('a session file removed from disk disappears from the sidebar without a reload', ~:657) and live-create mid-test"
+    - "test/e2e-browser/perf/seed-server-home.ts:4-7 — large deterministic Claude-only corpus (12 projects * 15 sessions, 36 alpha sessions, 240-turn long history) used by the visible-first perf audit"
+    - "Pagination search slice exists in session-directory-matrix.spec.ts (:602-note and the filter test :614) but is explicitly self-described as a SLICE, not the full corpus-based pagination proof"
+  missing: "No standalone multi-provider corpus BUILDER with a parseable corpus manifest + content hashes. Not evidenced: archived AND deleted sessions as canned artifacts across all four providers (only live create/delete mid-test), provider titles, nested git repositories, worktrees, fractional timestamps, or more-than-one-page-of-results in a reusable fixture. No fixture-only contract spec that parses the corpus manifest/hashes (optionally via legacy) and proves the temp home was deleted and the real home untouched."
+  effort: M
+  files:
+    - test/e2e-browser/specs/session-directory-matrix.spec.ts
+    - test/e2e-browser/perf/seed-server-home.ts
+    - test/e2e-browser/fixtures/ (new corpus builder + contract spec)
+
+- id: HARNESS-05
+  verdict: PARTIAL
+  confidence: high
+  evidence:
+    - "test/e2e-browser/helpers/ws-capture.ts:8 — WsCapture raw Node 'ws' client: completes the hello handshake and records every received JSON frame with waitFor/count accessors; used by multiple raw-socket specs"
+    - "test/e2e-browser/specs/safe01-auth-matrix.spec.ts:76-104 — ad-hoc raw WebSocket helper records closeCode/closeReason (asserts 4001 at :224-237); safe03-origin-matrix.spec.ts:63-100 similarly captures close codes (asserts 4011 at :143-171); 15+ specs open raw 'ws' WebSockets directly (ws-ping-pong-matrix, reconcile-handshake-rust, rest-spawn-gate-rust, etc.)"
+  missing: "No reusable raw HTTP/WS helper supporting: sending malformed frames, delaying reads or the hello, slow-consumer backpressure (WsCapture parses every message immediately, no pause/drain control), recorded sent/received byte counts, or abort. No deterministic echo/error socket fixture and no fixture self-test proving 'delayed receive truly stops socket draining', close-code recording, abort, and a second normal socket staying usable. Orchestration-route calls exist only via ordinary fetch/page.request inside specs, not as part of a raw-client surface."
+  effort: M
+  files:
+    - test/e2e-browser/helpers/ws-capture.ts
+    - test/e2e-browser/specs/safe01-auth-matrix.spec.ts
+    - test/e2e-browser/specs/safe03-origin-matrix.spec.ts
+    - test/e2e-browser/helpers/ (new raw HTTP/WS client helper + echo/error fixture)
+
+- id: HARNESS-06
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Direct evidence of absence in-repo: test/e2e-browser/specs/ws-ping-pong-matrix.spec.ts:30-31 — spec comment names the needed suppression/reply-to-pings behavior as 'via a controllable proxy ... needs proxy infrastructure this lane does not own'; test/e2e-browser/specs/safe01-auth-matrix.spec.ts:36 — the 'proxy' auth leg is noted as needing controllable proxy infrastructure 'this lane does not' have"
+    - "Search of test/ found no SMB/Windows-share fixture, no fake external-editor executable or invocation recorder (FAKE_EDITOR/EDITOR= searches empty), no signed update-feed fixture (no latest.json fixture under test/), and no trusted-HTTPS/test-certificate fixture under test/e2e-browser"
+    - "Only tangential building blocks exist: browser-pane*.spec.ts small local HTTP canary servers for the /api/proxy path and editor-pane.spec.ts's route.delay trick — these are per-spec scaffolding, not the deterministic proxy/file/SMB/editor/AI/Kilroy/update/HTTPS fixture set"
+    - "2026-07-18 reconciliation doc (docs/plans/2026-07-18-checklist-reconciliation.md:70) also graded this N (absent)"
+  missing: "All clauses: controllable proxy (HTTP+WS), hot-reload file trees, local/Windows-share (SMB) trees, fake editor with recorded invocations, summary-AI and full Kilroy runtime fixtures, signed update feed, trusted-HTTPS test certificate; plus the fixture smoke that reaches every target directly, mounts/reads the disposable SMB share on Windows, records editor/Kilroy invocations, returns fixed AI output, downloads a signed artifact, and verifies the test certificate."
+  effort: L
+  files:
+    - test/e2e-browser/fixtures/ (new deterministic fixture set)
+    - test/e2e-browser/helpers/
+
+- id: HARNESS-07
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "No occurrence of connectOverCDP, freshell-tauri.exe launching, WebView2 user-data isolation, or USERPROFILE/LOCALAPPDATA/APPDATA isolation anywhere in test/ (grep across test/**/*.ts found zero matches for connectOverCDP/tauri fixtures)"
+    - "test/e2e-electron/electron-app.test.ts exists but launches the LEGACY Electron app, not the Tauri app, and has no CDP-over-WebView2 attach"
+    - "The item is inherently Windows-only (native freshell-tauri.exe + WebView2 remote-debugging port), but no fixture code exists at all — the gap is missing code, not merely host validation. 2026-07-18 reconciliation doc (:71) graded it H (host-limited); current tree shows no new fixture"
+  missing: "Everything: Playwright fixture launching the exact freshell-tauri.exe with unique USERPROFILE/LOCALAPPDATA/APPDATA/WebView2 user-data paths, optional FRESHELL_HOME, ephemeral WebView2 remote-debugging port, chromium.connectOverCDP attach, two-isolated-runs leakage assertions, and owned-PID reaping proof. Requires a Windows host to implement and validate."
+  effort: L
+  files:
+    - test/e2e-browser/helpers/ (new tauri fixture)
+    - test/ (new native Tauri playwright config/spec)
+
+- id: HARNESS-08
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "crates/freshell-tauri/src/ contains only production modules (commands.rs, tray.rs, hotkey.rs, updater.rs, renderer_recovery.rs, server.rs, state_machine.rs, window_state.rs, windows.rs, provisioning.rs); grep for 'control plane|control-plane|e2e|E2E' across crates/freshell-tauri/src returned no files"
+    - "Feature flags in the crate are limited to 'tray' (tray.rs:139, :257; lib.rs:539-573) — no e2e/test-only build flag and no test-only command surface exists"
+    - "No Tauri e2e spec exists anywhere in test/ (see HARNESS-07), so the 'bridge present in E2E build / absent in release build' validation spec is also absent"
+    - "Validation is inherently Windows/Tauri-host-bound, but the blocking gap is absent code, not the host"
+  missing: "All clauses: an explicit E2E-build-flag-gated control plane exposing read-only desktop state and safe triggers for the production close/tray/hotkey/updater/renderer-failure/daemon handlers; compile-time exclusion from release; a spec proving presence in the E2E build and absence in a release build. Requires Windows Tauri host to validate."
+  effort: L
+  files:
+    - crates/freshell-tauri/src/lib.rs
+    - crates/freshell-tauri/Cargo.toml (new e2e feature gate)
+    - crates/freshell-tauri/src/ (new control-plane module)
+
+- id: HARNESS-09
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Grep across test/ for SMB/firewall/scheduled-task/shortcut/window-visibility helpers found only legacy server-side API tests with mocked detection (test/integration/server/network-api.test.ts uses vi.mock of server/firewall.js) — these are not Playwright-runner host-assertion helpers and are not ownership-safe disposable-fixture driven"
+    - "No helper module for Windows process trees, listening ports, desktop shortcuts, scheduled tasks/services, firewall rules, installed-application metadata, or window visibility exists under test/e2e-browser/helpers/ or test/helpers/"
+    - "Inherently Windows-host-bound (and mutating checks would need a disposable VM/Sandbox), but no code exists"
+  missing: "All clauses: ownership-safe helpers for process trees, listening ports, files, shortcuts, scheduled tasks/services, firewall rules, installed application metadata, and window visibility in the Playwright runner; plus the self-test creating uniquely named disposable process/file/firewall fixtures with sentinel preservation. Windows host required."
+  effort: M
+  files:
+    - test/e2e-browser/helpers/ (new windows host-assertion helpers)
+
+- id: HARNESS-10
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "test/e2e-electron/electron-app.test.ts:1-50 — the existing Playwright Electron launcher does start the legacy Electron app against a temp HOME with an optional minimal desktop.json, and could host this item's validation; but it contains no synthetic profile construction"
+    - "Grep across test/ for 'migrate|migration|legacy.?profile|electron profile|MIGRATE' returned no synthetic-profile/manifest/hash fixture or spec"
+    - "Electron desktop config code (electron/ and crates/freshell-tauri config/desktop.json handling) exists as port targets, but no fixture builds the synthetic 16-tab profile"
+  missing: "All fixture clauses: a synthetic Electron profile containing server/desktop config, browser preferences, 16 representative tabs/panes, overrides, recents, colors, and migration markers; plus the validation spec asserting legacy Electron source manifest, hashes, visible state, and safe copy behavior against it. (Electron launch against it runs headless-Linux today, but the 'Tauri import' half is Windows-host-deferred per the item itself.)"
+  effort: M
+  files:
+    - test/e2e-electron/electron-app.test.ts
+    - test/fixtures/ (new synthetic legacy-profile builder)
+
+- id: HARNESS-11
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Grep of test/e2e-browser/helpers/ for a11y helpers ('a11y|accessib|aria-') returned no files; role/label usage is ad hoc per-spec (e.g. helpers/pane-picker.ts:5-26 getByRole('toolbar'/'menuitem'/'button'), harness-01-rust-server.spec.ts:48)"
+    - "Specs routinely drive CSS implementation details (page.locator('.xterm') throughout, e.g. harness-01-rust-server.spec.ts:38-50), opposite to the 'must not rely on CSS' gate"
+    - "eslint.config.js:5 includes eslint-plugin-jsx-a11y, but that is a source-tree lint plugin, not the required Playwright-side reusable helpers/lint gate with a self-test that fails on an inaccessible fixture control"
+    - "2026-07-18 reconciliation doc (:75) graded this N (absent); nothing new found in the current tree"
+  missing: "All clauses: reusable accessibility-selector helpers/lint assertions requiring stable roles and accessible names, the self-test that uses only roles/labels/keyboard on main UI controls and deliberately fails on an inaccessible fixture control, and enforcement that feature tests avoid CSS implementation details."
+  effort: M
+  files:
+    - test/e2e-browser/helpers/ (new a11y gate helpers)
+    - eslint.config.js (optional lint rule wiring)
+
+- id: HARNESS-12
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "test/e2e-browser/specs/stress.spec.ts:6-25 — repeated create stress scenarios exist ('handles 6+ panes simultaneously', 'handles 10 tabs')"
+    - "test/e2e-browser/perf/run-sample.ts:259-311 — process-forest enumeration (ps -eo pid,ppid BFS incl. chromium process tree) used for audit teardown; perf/ visible-first audit captures latency/transport/network metrics (run-sample.ts, network-recorder.ts, derive-visible-first-metrics.ts) but contains no RSS/handle measurement (grep for memoryUsage/rss/heapUsed across test/e2e-browser returned nothing)"
+  missing: "All measurement clauses: no capture of server/Tauri/provider child PIDs as metrics, handles, RSS, queue sizes, or listening ports before/after stress; no repeated create/send/close/restart loop asserting return to a bounded resource baseline; no 'no owned process or port left behind' post-condition wired to the owned fixtures; no retained process-tree artifact on bound breach."
+  effort: M
+  files:
+    - test/e2e-browser/perf/ (extend with resource collectors)
+    - test/e2e-browser/specs/stress.spec.ts
+    - test/e2e-browser/helpers/ (new leak/resource measurement helper)
+
+- id: HARNESS-13
+  verdict: MISSING
+  confidence: high
+  evidence:
+    - "Grep across the whole repo for 'uiautomation|UI Automation|SendInput|keybd_event|robotjs|nut.js' returned no files — no Windows UI Automation or real-OS-keystroke automation exists"
+    - "No packaged-release Tauri install/launch spec exists in test/ at all (see HARNESS-07)"
+    - "scripts/assert-native-windows-build.ts exists as a build assertion script, but it does not drive tray/menu/hotkey via OS automation"
+    - "Inherently Windows-host-bound (installed release build + UI Automation), and no code exists"
+  missing: "All clauses: Windows UI Automation + real OS keystrokes/clicks from the Playwright runner; installing an exact release build; opening the real tray menu and native app menu; invoking a production action from each plus the saved global hotkey; asserting the real WebView/process effect with no E2E control plane in the build. Windows host with packaged release required."
+  effort: L
+  files:
+    - test/e2e-browser/helpers/ (new UI-automation bridge)
+    - scripts/assert-native-windows-build.ts
+
+- id: HARNESS-14
+  verdict: PARTIAL
+  confidence: medium
+  evidence:
+    - "crates/freshell-server/src/rate_limit.rs:111 — pub struct TestClock implementing the crate's Clock trait (:129 impl Clock for TestClock), with explicit advance (:105, advance_ms) used by rate-limiter unit tests (:335-351) — a real in-crate fake-clock seam, but scoped to the rate limiter only"
+    - "Grep for a server-exposed test clock found nothing: no '/api/test' clock route and no test-clock surface anywhere in crates/ (searched 'test/clock|test-clock|/api/test' — no files), so Playwright cannot advance/freeze/reset time on a running server"
+  missing: "A shared test clock across idle cleanup, rate windows, tab/device TTLs, retention, and timeout paths (TestClock today is rate_limit.rs-local); any Playwright-reachable control surface (build-flag-gated) to advance/freeze/reset it; the serial spec asserting deterministic fixture-timer ordering; and a normal-build absence proof of the control surface."
+  effort: M
+  files:
+    - crates/freshell-server/src/rate_limit.rs (existing TestClock to generalize)
+    - crates/freshell-server/src/ (gate/idle/ttl call sites to wire onto a shared clock)
+    - test/e2e-browser/specs/ (new serial clock spec)
