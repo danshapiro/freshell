@@ -260,6 +260,12 @@ impl OpencodeActivityTracker {
                 if aborted {
                     return Vec::new();
                 }
+                if !state.pending_permissions.is_empty() {
+                    // Mid-pause turn end: the pause was the episode's bell —
+                    // the deferred completion is swallowed (D3).
+                    state.pending_permissions.clear();
+                    return Vec::new();
+                }
                 // DEFERRED completion (Node confirmOpencodeAssociation):
                 // stamped at the STORED turn-end instant, not the bind's.
                 let seq = ledger.record_turn_completion(&state.terminal_id, completed_at);
@@ -343,9 +349,7 @@ impl OpencodeActivityTracker {
         match parent_id {
             Some(parent) => {
                 let root = resolve_root(state, parent).to_string();
-                state
-                    .session_roots
-                    .insert(parent.to_string(), root.clone());
+                state.session_roots.insert(parent.to_string(), root.clone());
                 state
                     .session_roots
                     .insert(session_id.to_string(), root.clone());
@@ -411,7 +415,14 @@ impl OpencodeActivityTracker {
     ) -> Vec<OpencodeEffect> {
         // Same routing as a status idle edge; dedupe is structural (D2):
         // the first edge lands the machine in Quiet, the twin no-ops.
-        self.note_status(terminal_id, session_id, OpencodeStatus::Idle, cycle, stream, at)
+        self.note_status(
+            terminal_id,
+            session_id,
+            OpencodeStatus::Idle,
+            cycle,
+            stream,
+            at,
+        )
     }
 
     /// `/session/status` snapshot (absence == idle; a literal idle entry is
@@ -433,7 +444,161 @@ impl OpencodeActivityTracker {
         reduce_snapshot(state, ledger, busy_roots, cycle, stream, at)
     }
 
-    /// PTY exit: drop the whole state.
+    /// `session.error` — and Task 9's abort-marked `message.updated`, which
+    /// the lane translates into this SAME SessionError-shaped call (abort
+    /// window W2, derives from opencode 1.18.11). Only `MessageAbortedError`
+    /// on the owned root's OWN turn (matching id+cycle+stream) arms the
+    /// per-turn abort gate (D1); every other name/state is a no-op — failed
+    /// turns ring like completed turns, and trailing errors on quiet states
+    /// change nothing. Child `session.error` is ignored: the raw sessionID
+    /// must equal the owned root, no root-remapping for aborts (D5). No
+    /// effects, ever.
+    pub fn note_error(
+        &mut self,
+        terminal_id: &str,
+        session_id: &str,
+        error_name: &str,
+        cycle: u64,
+        stream: u64,
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        state.last_observed_at = at;
+        if error_name != "MessageAbortedError" {
+            return Vec::new();
+        }
+        if resolve_root(state, session_id) != session_id {
+            return Vec::new();
+        }
+        match &mut state.ownership {
+            Ownership::KnownBusy {
+                session_id: own,
+                cycle: c,
+                stream: st,
+                turn_aborted,
+            }
+            | Ownership::Candidate {
+                session_id: own,
+                cycle: c,
+                stream: st,
+                turn_aborted,
+                ..
+            } if own.as_str() == session_id && *c == cycle && *st == stream => {
+                *turn_aborted = true;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// `permission.asked`: the turn pauses on a human. Children CAN ask —
+    /// the event is stamped with the CHILD session id while the parent turn
+    /// blocks on it (opencode 1.18.11, validation pass 2026-08-03) — so the
+    /// asker is root-resolved first. Arms when the resolved root is the
+    /// owned session under `KnownBusy` OR `Candidate` (candidate arming,
+    /// D3: the single busy unbound session on the pane's own per-pane
+    /// endpoint — first-turn asks must ring). Foreign/unresolvable ids and
+    /// Quiet/Ambiguous/AwaitingAssociation states are no-ops. Only a NEWLY
+    /// inserted permission id arms — a duplicate asked never re-arms.
+    /// Effect ORDER is load-bearing (D7): record removal FIRST (demote),
+    /// attention boundary SECOND.
+    pub fn note_permission_asked(
+        &mut self,
+        terminal_id: &str,
+        session_id: &str,
+        permission_id: &str,
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        state.last_observed_at = at;
+        let root = resolve_root(state, session_id).to_string();
+        let owned = match &state.ownership {
+            Ownership::KnownBusy {
+                session_id: own, ..
+            }
+            | Ownership::Candidate {
+                session_id: own, ..
+            } => *own == root,
+            _ => false,
+        };
+        if !owned {
+            return Vec::new();
+        }
+        let newly_inserted = state.pending_permissions.insert(permission_id.to_string());
+        if !newly_inserted {
+            return Vec::new();
+        }
+        let mut effects = clear_record(state, false);
+        effects.push(TrackerEffect::AttentionBoundary {
+            terminal_id: state.terminal_id.clone(),
+            at,
+        });
+        effects
+    }
+
+    /// `permission.replied`: the pause ends. Unknown ids are no-ops. When
+    /// the LAST pending id clears and the turn is still owned
+    /// (`KnownBusy`/`Candidate`), the busy record is restored immediately —
+    /// busy cancels the armed gate window via `note_phase(Busy)` in the
+    /// frame mapper.
+    pub fn note_permission_replied(
+        &mut self,
+        terminal_id: &str,
+        permission_id: &str,
+        at: i64,
+    ) -> Vec<OpencodeEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        state.last_observed_at = at;
+        if !state.pending_permissions.remove(permission_id) {
+            return Vec::new();
+        }
+        if !state.pending_permissions.is_empty() {
+            return Vec::new();
+        }
+        match state.ownership.clone() {
+            Ownership::KnownBusy { session_id, .. } | Ownership::Candidate { session_id, .. } => {
+                set_busy_record(state, Some(session_id), at)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Death-bell engagement extension (D4): a pane blocked on a permission
+    /// whose process dies spontaneously must ring. Read by the hub's Exit
+    /// arm BEFORE `note_exit` (audit-A17 ordering, same as codex).
+    pub fn has_pending_permissions(&self, terminal_id: &str) -> bool {
+        self.states
+            .get(terminal_id)
+            .map(|s| !s.pending_permissions.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Candidate/ambiguous ownership never death-rings (D4): unconfirmed
+    /// identity stays conservatively silent even with a candidate-armed
+    /// pause pending. `AwaitingAssociation` is the candidate pause's
+    /// continuation (the claim survives into it, D3), so it blocks too.
+    pub fn blocks_death_bell(&self, terminal_id: &str) -> bool {
+        self.states
+            .get(terminal_id)
+            .map(|s| {
+                matches!(
+                    s.ownership,
+                    Ownership::Candidate { .. }
+                        | Ownership::Ambiguous { .. }
+                        | Ownership::AwaitingAssociation { .. }
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// PTY exit: drop the whole state (`pending_permissions` goes with it —
+    /// the hub reads [`Self::has_pending_permissions`] BEFORE calling this).
     pub fn note_exit(&mut self, terminal_id: &str) -> Vec<OpencodeEffect> {
         match self.states.remove(terminal_id) {
             Some(state) if state.record.is_some() => vec![TrackerEffect::Changed {
@@ -488,6 +653,20 @@ fn reduce_idle_edge(
             state.ownership = Ownership::Quiet {
                 known_session_id: Some(own.clone()),
             };
+            // Mid-pause turn end: the pause was the episode's bell — NEVER
+            // a second completion (D3). The record is already absent while
+            // paused, so the only frame question is the abort cancel.
+            if !state.pending_permissions.is_empty() {
+                state.pending_permissions.clear();
+                if turn_aborted {
+                    // Force-emit the remove: at the gate it cancels the
+                    // armed window (note_exit) — total silence.
+                    return clear_record(state, true);
+                }
+                // Leave the armed window to fire once, or stay silent if
+                // it already rang.
+                return Vec::new();
+            }
             // D7 ordering: remove BEFORE TurnComplete.
             let mut effects = clear_record(state, false);
             if !turn_aborted {
@@ -515,6 +694,14 @@ fn reduce_idle_edge(
                 completed_at: at,
                 aborted: turn_aborted,
             };
+            if turn_aborted && !state.pending_permissions.is_empty() {
+                // Aborted mid-pause: same total-silence contract as the
+                // KnownBusy arm — force-emit the cancel.
+                state.pending_permissions.clear();
+                return clear_record(state, true);
+            }
+            // A non-aborted pause claim SURVIVES into AwaitingAssociation
+            // so the DEFERRED completion is swallowed at bind_session (D3).
             clear_record(state, false)
         }
         Ownership::Ambiguous {
@@ -574,7 +761,9 @@ fn reduce_busy_edge(
             ..
         } => {
             if own == session_id {
-                // Refresh: a new busy begins a new turn — abort gate re-arms.
+                // Refresh: a new busy begins a new turn — abort gate
+                // re-arms; a pause resumes out-of-band (D3).
+                state.pending_permissions.clear();
                 state.ownership = Ownership::Candidate {
                     session_id: own.clone(),
                     previous_known,
@@ -595,6 +784,8 @@ fn reduce_busy_edge(
             session_id: own, ..
         } => {
             if own == session_id {
+                // Refresh: abort gate re-arms; a pause resumes out-of-band.
+                state.pending_permissions.clear();
                 state.ownership = Ownership::KnownBusy {
                     session_id: own.clone(),
                     cycle,
@@ -716,6 +907,16 @@ fn reduce_snapshot(
                 state.ownership = Ownership::Quiet {
                     known_session_id: Some(own.clone()),
                 };
+                // Mid-pause turn end: mirror of the idle-edge hardening —
+                // the pause was the episode's bell, NEVER a second
+                // completion (D3).
+                if !state.pending_permissions.is_empty() {
+                    state.pending_permissions.clear();
+                    if turn_aborted {
+                        return clear_record(state, true);
+                    }
+                    return Vec::new();
+                }
                 let mut effects = clear_record(state, false);
                 if !turn_aborted {
                     let seq = ledger.record_turn_completion(&state.terminal_id, at);
@@ -728,6 +929,8 @@ fn reduce_snapshot(
                 }
                 effects
             } else if busy_roots.len() == 1 && busy_roots[0] == own {
+                // Refresh: abort gate re-arms; a pause resumes out-of-band.
+                state.pending_permissions.clear();
                 state.ownership = Ownership::KnownBusy {
                     session_id: own.clone(),
                     cycle,
@@ -758,8 +961,18 @@ fn reduce_snapshot(
                     completed_at: at,
                     aborted: turn_aborted,
                 };
+                if turn_aborted && !state.pending_permissions.is_empty() {
+                    // Aborted mid-pause: force-emit the cancel (mirror of
+                    // the idle-edge hardening).
+                    state.pending_permissions.clear();
+                    return clear_record(state, true);
+                }
+                // A non-aborted pause claim survives into
+                // AwaitingAssociation (swallowed at bind_session, D3).
                 clear_record(state, false)
             } else if busy_roots.len() == 1 && busy_roots[0] == own {
+                // Refresh: abort gate re-arms; a pause resumes out-of-band.
+                state.pending_permissions.clear();
                 state.ownership = Ownership::Candidate {
                     session_id: own.clone(),
                     previous_known,
@@ -868,6 +1081,13 @@ mod tests {
         }
     }
 
+    fn boundary(at: i64) -> OpencodeEffect {
+        TrackerEffect::AttentionBoundary {
+            terminal_id: "t1".to_string(),
+            at,
+        }
+    }
+
     fn completions(effects: &[OpencodeEffect]) -> Vec<i64> {
         effects
             .iter()
@@ -903,7 +1123,9 @@ mod tests {
             vec![1]
         );
         // Structural dedupe (D2): the state is already Quiet — no effects.
-        assert!(tracker.note_session_idle("t1", "ses-r", 1, 1, 207).is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 207)
+            .is_empty());
     }
 
     #[test]
@@ -918,7 +1140,9 @@ mod tests {
             "session.status{{idle}} completes the turn"
         );
         // The spike's 7ms twin: session.idle trails session.status{idle}.
-        assert!(tracker.note_session_idle("t1", "ses-r", 1, 1, 207).is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 207)
+            .is_empty());
         assert_eq!(tracker.list_latest_completions().len(), 1);
     }
 
@@ -953,7 +1177,9 @@ mod tests {
             .is_empty());
         assert_eq!(tracker.list(), vec![rec(Some("ses-r"), 120)]);
         // Child idle is SUPPRESSED (D5): no effects, the record survives.
-        assert!(tracker.note_session_idle("t1", "ses-c", 1, 1, 130).is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-c", 1, 1, 130)
+            .is_empty());
         assert_eq!(tracker.list(), vec![rec(Some("ses-r"), 120)]);
         // The parent's own idle ends the turn: exactly one completion.
         assert_eq!(
@@ -994,7 +1220,9 @@ mod tests {
         );
         // First idle drops ses-a from the blocked set; record stays (no
         // public change: session already None).
-        assert!(tracker.note_session_idle("t1", "ses-a", 1, 1, 120).is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-a", 1, 1, 120)
+            .is_empty());
         assert_eq!(tracker.list(), vec![rec(None, 120)]);
         // Last idle empties the blocked set: record removed, still silent.
         assert_eq!(
@@ -1045,8 +1273,12 @@ mod tests {
         tracker.track_terminal("t1", Some("ses-r"), 0);
         tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
         // Wrong cycle, then wrong stream: both leave KnownBusy intact.
-        assert!(tracker.note_session_idle("t1", "ses-r", 2, 1, 150).is_empty());
-        assert!(tracker.note_session_idle("t1", "ses-r", 1, 2, 160).is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 2, 1, 150)
+            .is_empty());
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 2, 160)
+            .is_empty());
         assert_eq!(tracker.list(), vec![rec(Some("ses-r"), 100)]);
         // The matching idle still completes the turn.
         assert_eq!(
@@ -1070,5 +1302,314 @@ mod tests {
         assert_eq!(tracker.expire(2000), vec![remove()]);
         assert!(tracker.list_latest_completions().is_empty());
         assert_eq!(tracker.next_deadline(), None);
+    }
+
+    #[test]
+    fn abort_then_idle_clears_silently() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        // D1: the abort observation only arms the per-turn flag — no effects.
+        assert!(tracker
+            .note_error("t1", "ses-r", "MessageAbortedError", 1, 1, 150)
+            .is_empty());
+        // The idle clears busy silently: remove only, no TurnComplete.
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
+            vec![remove()]
+        );
+        assert!(tracker.list_latest_completions().is_empty());
+        // Second idle: structural dedupe (D2) — nothing.
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 207)
+            .is_empty());
+    }
+
+    #[test]
+    fn w2_abort_marker_gates_like_session_error() {
+        // The message.updated abort marker (abort window W2, opencode
+        // 1.18.11) reaches the tracker through the SAME note_error entry:
+        // Task 9's translate maps the marker to a SessionError-shaped call.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        // The marker-sourced abort observation: no effects.
+        assert!(tracker
+            .note_error("t1", "ses-r", "MessageAbortedError", 1, 1, 160)
+            .is_empty());
+        // Idle: remove only, no TurnComplete.
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
+            vec![remove()]
+        );
+        assert!(tracker.list_latest_completions().is_empty());
+        // Second idle: nothing.
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 207)
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_turn_rings_and_trailing_error_is_noop() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        // Any error name other than MessageAbortedError changes nothing:
+        // failed turns ring like completed turns (D1).
+        assert!(tracker
+            .note_error("t1", "ses-r", "UnknownError", 1, 1, 150)
+            .is_empty());
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
+            vec![remove(), turn_complete("ses-r", 200, 1)]
+        );
+        // Trailing error on the now-quiet state: no effects, no state change.
+        assert!(tracker
+            .note_error("t1", "ses-r", "MessageAbortedError", 1, 1, 210)
+            .is_empty());
+        assert!(tracker.list().is_empty());
+        // Ownership stayed Quiet{known}: the next turn completes normally
+        // (the trailing abort did not poison it).
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 300);
+        assert_eq!(
+            completions(&tracker.note_session_idle("t1", "ses-r", 1, 1, 400)),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn child_abort_does_not_gate_the_root() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_session_created("t1", "ses-c", Some("ses-r"), 110);
+        // Child session.error is ignored: the raw sessionID must equal the
+        // owned root (D5), and ses-c root-resolves to ses-r ≠ ses-c.
+        assert!(tracker
+            .note_error("t1", "ses-c", "MessageAbortedError", 1, 1, 150)
+            .is_empty());
+        // The parent's own idle still completes the turn.
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
+            vec![remove(), turn_complete("ses-r", 200, 1)]
+        );
+    }
+
+    #[test]
+    fn permission_asked_demotes_then_arms_once() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        // D3/D7 ordering (load-bearing): record removal FIRST, attention
+        // boundary SECOND.
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-r", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        // A duplicate asked never re-arms: one boundary per pause.
+        assert!(tracker
+            .note_permission_asked("t1", "ses-r", "perm-1", 160)
+            .is_empty());
+    }
+
+    #[test]
+    fn child_permission_asked_resolves_to_root_and_arms() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_session_created("t1", "ses-c", Some("ses-r"), 110);
+        // Children CAN ask (the event is stamped with the CHILD session id
+        // and the parent turn blocks on it): root-resolve, then arm (D3).
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-c", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        // A foreign, unregistered id resolves to itself and never matches.
+        assert!(tracker
+            .note_permission_asked("t1", "ses-z", "perm-2", 160)
+            .is_empty());
+    }
+
+    #[test]
+    fn candidate_pause_arms_and_deferred_completion_is_swallowed_at_bind() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        // Busy with no binding: Candidate ownership.
+        assert_eq!(
+            tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100),
+            vec![upsert(rec(Some("ses-x"), 100))]
+        );
+        // Candidate arming (D3): the single busy unbound session on the
+        // pane's own per-pane endpoint — first-turn asks must ring.
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-x", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        // Idle edge: AwaitingAssociation with the pause claim intact (the
+        // record was already removed at the ask — no effects here).
+        assert!(tracker
+            .note_session_idle("t1", "ses-x", 1, 1, 200)
+            .is_empty());
+        assert!(tracker.has_pending_permissions("t1"));
+        // Bind: NO deferred TurnComplete — the pause was the episode's bell
+        // (mid-pause turn end, D3).
+        assert!(tracker.bind_session("t1", "ses-x", 300).is_empty());
+        assert!(!tracker.has_pending_permissions("t1"));
+        assert!(tracker.list_latest_completions().is_empty());
+        // State is Quiet{known: Some(ses-x)}: the next busy+idle turn
+        // completes normally (KnownBusy path, first ledger completion).
+        tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 400);
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-x", 2, 1, 500),
+            vec![remove(), turn_complete("ses-x", 500, 1)]
+        );
+    }
+
+    #[test]
+    fn permission_replied_resumes_busy() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        // The reply empties the set: the busy record is restored
+        // immediately with the OWNED session (KnownBusy ownership).
+        assert_eq!(
+            tracker.note_permission_replied("t1", "perm-1", 180),
+            vec![upsert(rec(Some("ses-r"), 180))]
+        );
+        // An unknown id is a no-op.
+        assert!(tracker
+            .note_permission_replied("t1", "perm-9", 185)
+            .is_empty());
+
+        // Repeat under Candidate ownership (re-track with no binding; the
+        // re-track drops the restored record).
+        assert_eq!(tracker.track_terminal("t1", None, 300), vec![remove()]);
+        tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 310);
+        tracker.note_permission_asked("t1", "ses-x", "perm-2", 320);
+        assert_eq!(
+            tracker.note_permission_replied("t1", "perm-2", 330),
+            vec![upsert(rec(Some("ses-x"), 330))]
+        );
+    }
+
+    #[test]
+    fn abort_mid_pause_force_emits_the_cancel() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        assert!(tracker
+            .note_error("t1", "ses-r", "MessageAbortedError", 1, 1, 160)
+            .is_empty());
+        // The remove frame is FORCE-emitted despite the absent record: the
+        // gate's note_exit cancels the armed window — total silence. No
+        // TurnComplete, no boundary.
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 1, 200),
+            vec![remove()]
+        );
+        assert!(tracker.list_latest_completions().is_empty());
+        assert!(!tracker.has_pending_permissions("t1"));
+
+        // Repeat from Candidate ownership: the aborted candidate parks in
+        // AwaitingAssociation{aborted} with the same force-emit.
+        assert!(tracker.track_terminal("t1", None, 300).is_empty());
+        tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 2, 1, 310);
+        tracker.note_permission_asked("t1", "ses-x", "perm-2", 320);
+        assert!(tracker
+            .note_error("t1", "ses-x", "MessageAbortedError", 2, 1, 330)
+            .is_empty());
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-x", 2, 1, 400),
+            vec![remove()]
+        );
+        assert!(!tracker.has_pending_permissions("t1"));
+        // The bind of the aborted awaiting turn mints nothing.
+        assert!(tracker.bind_session("t1", "ses-x", 500).is_empty());
+        assert!(tracker.list_latest_completions().is_empty());
+    }
+
+    #[test]
+    fn completion_mid_pause_mints_nothing() {
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        // Mid-pause turn end (no error): the pause was the episode's bell —
+        // NO effects at all (no second completion, no frames; the armed
+        // window is left to fire once or stay silent if it already rang).
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 200)
+            .is_empty());
+        assert!(tracker.list_latest_completions().is_empty());
+        assert!(!tracker.has_pending_permissions("t1"));
+    }
+
+    #[test]
+    fn death_predicates() {
+        // Quiet and KnownBusy never block (the hub's own criteria — owned
+        // busy, armed grace, pending permissions — decide engagement).
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        assert!(!tracker.blocks_death_bell("t1"));
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        assert!(!tracker.blocks_death_bell("t1"));
+        // has_pending_permissions over the pause lifecycle: true during the
+        // pause, false after replied.
+        assert!(!tracker.has_pending_permissions("t1"));
+        tracker.note_permission_asked("t1", "ses-r", "perm-1", 150);
+        assert!(tracker.has_pending_permissions("t1"));
+        tracker.note_permission_replied("t1", "perm-1", 180);
+        assert!(!tracker.has_pending_permissions("t1"));
+
+        // Candidate blocks — INCLUDING with a candidate-armed pause pending
+        // (D4: candidate ownership never death-rings).
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100);
+        assert!(tracker.blocks_death_bell("t1"));
+        tracker.note_permission_asked("t1", "ses-x", "perm-1", 150);
+        assert!(tracker.has_pending_permissions("t1"));
+        assert!(tracker.blocks_death_bell("t1"));
+        // The pause claim survives into AwaitingAssociation — still
+        // candidate-armed, still blocked (D4).
+        tracker.note_session_idle("t1", "ses-x", 1, 1, 200);
+        assert!(tracker.has_pending_permissions("t1"));
+        assert!(tracker.blocks_death_bell("t1"));
+        // Exit drops the pending set with the state (the hub reads
+        // has_pending_permissions BEFORE note_exit — audit-A17 ordering).
+        tracker.note_exit("t1");
+        assert!(!tracker.has_pending_permissions("t1"));
+        assert!(!tracker.blocks_death_bell("t1"));
+
+        // Ambiguous blocks (D4).
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_status("t1", "ses-a", OpencodeStatus::Busy, 1, 1, 100);
+        tracker.note_status("t1", "ses-b", OpencodeStatus::Busy, 1, 1, 110);
+        assert!(tracker.blocks_death_bell("t1"));
+    }
+
+    #[test]
+    fn busy_snapshot_refresh_rearms_the_abort_gate() {
+        // Node parity pin (Task 6 review note): busy re-entry/refresh
+        // re-arms `turn_aborted: false`, so a stale abort flag never
+        // swallows the NEXT turn's completion.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        assert!(tracker
+            .note_error("t1", "ses-r", "MessageAbortedError", 1, 1, 150)
+            .is_empty());
+        // Same-session busy snapshot refresh: same public shape (dedupe, no
+        // frame) but a NEW turn — the abort flag is cleared.
+        let statuses = vec![("ses-r".to_string(), OpencodeStatus::Busy)];
+        assert!(tracker.note_snapshot("t1", &statuses, 1, 2, 160).is_empty());
+        // The refreshed turn's idle completes normally.
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 1, 2, 200),
+            vec![remove(), turn_complete("ses-r", 200, 1)]
+        );
     }
 }
