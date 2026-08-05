@@ -3198,6 +3198,68 @@ mod tests {
         assert_eq!(b[0].attach_request_id.as_deref(), Some("bbb"));
     }
 
+    /// TERM-05 (PW-RUST unit pin): two contexts attached to the SAME terminal
+    /// at the same time are two VIEWS of one owner, never two sessions — each
+    /// receives the same replay window AND every subsequent live frame,
+    /// byte-for-byte identical in payload. The only per-view difference is
+    /// the `attachRequestId` routing stamp. Includes multi-byte payloads so
+    /// "byte-for-byte" is a real claim, not an ASCII triviality.
+    #[test]
+    fn two_simultaneous_views_of_one_terminal_receive_byte_for_byte_identical_output() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Scrollback produced BEFORE either view attaches (the history both
+        // contexts open onto).
+        reg.feed("T", frame(1, "hist-\u{03B3}\r\n", "S")); // γ: 2 UTF-8 bytes
+        reg.feed("T", frame(2, "hist-\u{1F600}\r\n", "S")); // 4-byte emoji
+
+        let (sink_a, seen_a) = collector();
+        let (sink_b, seen_b) = collector();
+        let out_a = reg.attach("T", 41, sink_a, Some("ctx-A".into()), 0, false, None);
+        let out_b = reg.attach("T", 42, sink_b, Some("ctx-B".into()), 0, false, None);
+        assert!(out_a.found && out_b.found);
+
+        // Both views replay the identical retained window, in seq order.
+        let key_of = |frames: &[TerminalOutput]| -> Vec<(i64, i64, Vec<u8>)> {
+            frames
+                .iter()
+                .map(|f| (f.seq_start, f.seq_end, f.data.as_bytes().to_vec()))
+                .collect()
+        };
+        assert_eq!(
+            key_of(&outputs(&seen_a)),
+            key_of(&outputs(&seen_b)),
+            "both contexts replay byte-identical scrollback"
+        );
+
+        // Live frames appended while BOTH views are attached fan out to each.
+        for (seq, chunk) in [(3, "live-\u{03B1}\r\n"), (4, "live-\u{03B2}\r\n"), (5, "live-3\r\n")] {
+            reg.feed("T", frame(seq, chunk, "S"));
+        }
+
+        let a = outputs(&seen_a);
+        let b = outputs(&seen_b);
+        assert_eq!(a.len(), 5, "2 replayed + 3 live frames on view A");
+        assert_eq!(b.len(), 5, "2 replayed + 3 live frames on view B");
+        // Byte-for-byte: every frame's seq span and raw UTF-8 bytes agree.
+        assert_eq!(key_of(&a), key_of(&b));
+        for (fa, fb) in a.iter().zip(b.iter()) {
+            assert_eq!(fa.stream_id, fb.stream_id);
+            assert_eq!(fa.terminal_id, fb.terminal_id);
+        }
+        // The concatenated payload reconstructs ONE identical byte stream.
+        let stream_a: Vec<u8> = a.iter().flat_map(|f| f.data.bytes()).collect();
+        let stream_b: Vec<u8> = b.iter().flat_map(|f| f.data.bytes()).collect();
+        assert_eq!(stream_a, stream_b);
+        // Only the routing stamp differs per view.
+        assert!(a
+            .iter()
+            .all(|f| f.attach_request_id.as_deref() == Some("ctx-A")));
+        assert!(b
+            .iter()
+            .all(|f| f.attach_request_id.as_deref() == Some("ctx-B")));
+    }
+
     #[test]
     fn reconnect_catches_up_by_seq_only_replaying_newer_frames() {
         let reg = TerminalRegistry::new();

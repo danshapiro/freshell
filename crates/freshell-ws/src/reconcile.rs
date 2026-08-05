@@ -1107,6 +1107,93 @@ mod tests {
         );
     }
 
+    /// TERM-05 convergence pin (PW-RUST "every path", unit level): whatever
+    /// DOOR a view arrives through, it attaches to the ONE canonical owner of
+    /// a live sessionRef — never a second terminal. Asserts a single
+    /// terminalId out of every consult the codebase exposes:
+    ///   1. the reconcile door’s derive for THREE simultaneous claims (two
+    ///      structured sessionRef claims with different createRequestIds —
+    ///      the two-browser-contexts shape — plus a legacy
+    ///      mode+resumeSessionId promotion);
+    ///   2. the D8 lease consult every create door runs before spawning
+    ///      (WS `handle_create` AND the REST/orchestration spawn pipeline,
+    ///      freshell-freshagent `terminal_tabs.rs`): BoundElsewhere{winner};
+    ///   3. the REST door’s D7 guard predicate (`live_session_owner`, with
+    ///      the identity arm armed as production wiring provides);
+    ///   4. the orchestrator’s guard consult (`live_terminal_for_session_ref`
+    ///      — auto_resume.rs’s pre_respawn_guard).
+    #[test]
+    fn every_claim_path_converges_on_the_one_live_owner_of_a_session_ref() {
+        use freshell_terminal::registry::SessionRefClaim;
+
+        let f = Fixture::new();
+        let locator = sref("claude", "s-canonical");
+        // Winner lifecycle mirrors the WS create path: claim BEFORE the row,
+        // the spawn registers the row, the claim completes into the binding.
+        assert!(matches!(
+            f.registry.claim_session_ref(&locator, "cr-WINNER", 7, 1_000),
+            SessionRefClaim::Acquired
+        ));
+        f.registry.register_headless(HeadlessTerminal {
+            terminal_id: "T-owner".to_string(),
+            stream_id: "S-owner".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s-canonical".to_string()),
+            create_request_id: Some("cr-WINNER".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(f
+            .registry
+            .complete_session_ref_claim(&locator, "cr-WINNER", "T-owner"));
+        f.identity
+            .upsert("T-owner", Some("claude"), Some("s-canonical"), None, 1);
+        // Session Present on disk — every fall-through path would otherwise
+        // respawn (the duplicate-writer shape this test proves unreachable).
+        f.probe.set("claude", "s-canonical", SessionExistence::Present);
+
+        // 1. Three simultaneous claims through the reconcile door, one
+        //    derive call (two contexts + a legacy-claiming view).
+        let mut p_ctx_a = pane("cr-ctx-A");
+        p_ctx_a.session_ref = Some(sref("claude", "s-canonical"));
+        let mut p_ctx_b = pane("cr-ctx-B");
+        p_ctx_b.session_ref = Some(sref("claude", "s-canonical"));
+        let mut p_legacy = pane("cr-ctx-C");
+        p_legacy.resume_session_id = Some("s-canonical".to_string()); // promotion only
+        let verdicts = derive_verdicts(&f.deps(), &[p_ctx_a, p_ctx_b, p_legacy]);
+        assert_eq!(verdicts.len(), 3);
+        for v in &verdicts {
+            assert_eq!(v.verdict, ReconcileVerdict::Attach);
+            assert_eq!(v.terminal_id.as_deref(), Some("T-owner"));
+            assert_eq!(v.session_ref, Some(sref("claude", "s-canonical")));
+            assert_eq!(v.corrected, None, "every claim matched server truth");
+        }
+
+        // 2. The create-door lease consult (shared by WS create and the
+        //    REST/orchestration spawn pipeline) names the same winner.
+        match f
+            .registry
+            .claim_session_ref(&locator, "cr-ORCHESTRATION", 99, 2_000)
+        {
+            SessionRefClaim::BoundElsewhere { terminal_id } => {
+                assert_eq!(terminal_id, "T-owner")
+            }
+            other => panic!("the orchestration door must see BoundElsewhere, got {other:?}"),
+        }
+
+        // 3. The REST D7 guard predicate with the identity arm armed.
+        assert_eq!(
+            f.registry
+                .live_session_owner(Some(&f.identity), "claude", "s-canonical"),
+            Some("T-owner".to_string())
+        );
+
+        // 4. The orchestrator's guard consult (auto-resume pre-respawn).
+        assert_eq!(
+            f.registry.live_terminal_for_session_ref(&locator),
+            Some("T-owner".to_string())
+        );
+    }
+
     /// §9.1 test 8 trust boundary, respawn shape: the claim contradicts the
     /// retired server identity → server ref + corrected: true.
     #[test]
