@@ -1911,74 +1911,138 @@ describe('OpencodeActivityTracker', () => {
     })
 
     it('rejectSessionAssociation with mismatched sessionId is no-op (pending-permission claim preserved)', async () => {
-      // Finding 2: rejectSessionAssociation must gate the pending-permission clear
-      // on the rejection matching the current ownership state (awaitingAssociation +
-      // matching sessionId). A mismatched-session reject should be a no-op.
-      // This is a placeholder test - the scenario is complex to set up. The gate is verified
-      // by the existing "after rejectSessionAssociation, pending-permission claim is cleared"
-      // test, which confirms the matching case works. This test verifies the mismatched
-      // case leaves the claim intact.
-      vi.useFakeTimers()
-      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-root': { type: 'busy' }, 'ses-other': { type: 'busy' } })
-      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
-      const collected = collectOpencode(tracker)
+      // Finding 2: rejectSessionAssociation clears the pending-permission claim
+      // ONLY when the rejection matches the pre-reducer ownership state
+      // (awaitingAssociation + matching sessionId). Both mismatch arms of that
+      // gate are pinned here against the unconditional clear it replaced.
+      //
+      // Arm 1 -- ownership-KIND mismatch: a live knownBusy pause (ask armed,
+      // turn NOT ended -- a knownBusy idle edge would retire the claim as the
+      // episode's bell via applyActions' mid-pause turn-end branch, so the
+      // claim only survives while the turn is still open). The mismatched
+      // reject must leave the claim alive, so a subsequent spontaneous exit
+      // still carries the approval-pending death-bell marker.
+      {
+        const { sse, tracker, collected } = await setupKnownBusy()
+        sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+        await vi.advanceTimersByTimeAsync(0) // pause armed: claim alive, ownership still knownBusy(ses-root)
 
-      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
-      await vi.advanceTimersByTimeAsync(0)
-      sse.enqueue({ type: 'server.connected', properties: {} })
-      await vi.advanceTimersByTimeAsync(0)
+        tracker.rejectSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-other' })
 
-      // Arm a permission pause
-      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
-      await vi.advanceTimersByTimeAsync(0)
+        tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
 
-      // Transition to awaitingAssociation
-      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
-      await vi.advanceTimersByTimeAsync(0)
-
-      // Reject with wrong sessionId - should NOT clear the claim
-      const beforeRejectChanges = collected.changes.length
-      tracker.rejectSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-other' })
-      await vi.advanceTimersByTimeAsync(0)
-
-      // Because the rejection didn't match, the claim should still be alive.
-      // The test passes if the rejection didn't produce any unexpected changes
-      // and the subsequent spontaneous exit shows the claim still exists:
-      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
-
-      // The last change should have approvalPendingRemovals (claim was preserved)
-      const lastChange = collected.changes.at(-1)
-      if (lastChange?.approvalPendingRemovals !== undefined) {
-        // Success: claim was preserved through mismatched reject
-        expect(lastChange.approvalPendingRemovals).toContain('term-1')
-      } else {
-        // Acceptable: the test setup may not have preserved the claim through SSE
-        // The gate is covered by the matching case test above
-        console.log('Note: mismatched sessionId test didnt preserve claim, but gate is covered by matching test')
+        expect(collected.changes.at(-1)).toEqual({
+          upsert: [],
+          remove: ['term-1'],
+          spontaneousExitRemovals: ['term-1'],
+          approvalPendingRemovals: ['term-1'],
+        })
       }
-      tracker.dispose()
+      // Arm 2 -- SESSION-ID mismatch with matching kind: a candidate pause
+      // whose claim deliberately survives the idle edge into
+      // awaitingAssociation(ses-a). Rejecting a DIFFERENT sessionId must not
+      // clear the claim. Survival is observable because the deferred
+      // completion minted at the matching confirm is swallowed while the
+      // claim is alive (the pause bell was THE bell); had the mismatched
+      // reject cleared the claim, confirm would emit turn.complete.
+      {
+        const { sse, fetchImpl } = createControlledFetchFixture({})
+        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+        const collected = collectOpencode(tracker)
+        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'server.connected', properties: {} })
+        await vi.advanceTimersByTimeAsync(0)
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-a', status: { type: 'busy' } } })
+        await vi.advanceTimersByTimeAsync(0) // first-turn candidate busy
+        sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-a' } })
+        await vi.advanceTimersByTimeAsync(0) // candidate-armed pause, claim alive
+        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-a', status: { type: 'idle' } } })
+        await vi.advanceTimersByTimeAsync(0) // awaitingAssociation(ses-a), claim survives (D8(i))
+
+        tracker.rejectSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-other' })
+        tracker.confirmSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-a' })
+
+        // Claim survived the mismatched reject: the deferred completion is swallowed.
+        expect(collected.completions).toEqual([])
+        expect(collected.boundaries).toHaveLength(1) // the pause bell stays the episode's only bell
+        tracker.dispose()
+      }
     })
   })
 
   describe('TOCTOU fix verification', () => {
-    it('permission.asked ownership read after async root-resolution avoids stale ownership boundary', async () => {
-      // Commit 48e4966cd moved the permission.asked handler's ownership read to
-      // AFTER the async root-resolution await. This guards against TOCTOU:
-      // ownership changes mid-await (via reject/confirm) -> the handler must see
-      // the CURRENT ownership, not the pre-await one.
-      //
-      // The fix is verified by confirming that permission-pause boundaries are
-      // emitted only under valid ownership states (knownBusy or candidate with
-      // matching sessionId). The permission pause test suite covers:
-      // - valid cases (boundaries emit correctly)
-      // - invalid cases (no boundary when ownership is wrong/changed)
-      // The ownership-scoping is enforced at line ~712 after ownership read.
-      // If the fix regresses (ownership read moves before await), the gate
-      // condition would use stale ownership and boundaries would emit incorrectly.
-      // This is implicitly covered by permission pause tests; explicit TOCTOU
-      // simulation with held promises is fragile and doesn't add new coverage
-      // given the gate condition is already under test.
-      expect(true).toBe(true) // Placeholder: coverage is in permission-pause tests
+    it('permission.asked reads ownership AFTER root resolution: mid-await invalidation stays silent', async () => {
+      // Commit 48e4966cd moved the permission.asked handler's ownership read
+      // to AFTER the async root-resolution await. Pin the ordering: ownership
+      // invalidated while the resolver is in flight must gate the pause (no
+      // boundary, no claim). With the pre-fix ordering (read before await)
+      // the handler arms from the STALE knownBusy snapshot and rings.
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-root': { type: 'busy' } })
+      const resolverCalls: string[][] = []
+      let releaseChildResolution: ((resolution: OpencodeRootResolution) => void) | undefined
+      const resolveOpencodeSessionRoots = async (
+        sessionIds: readonly string[],
+      ): Promise<OpencodeRootResolution> => {
+        resolverCalls.push([...sessionIds])
+        if (sessionIds.includes('ses-child')) {
+          // Hold the child lookup open: this suspension is the TOCTOU window.
+          return await new Promise<OpencodeRootResolution>((resolve) => {
+            releaseChildResolution = resolve
+          })
+        }
+        // Snapshot lookups (ses-root) resolve immediately as identity roots.
+        return {
+          rootsBySessionId: new Map(sessionIds.map((sessionId) => [sessionId, sessionId])),
+          unresolvedSessionIds: new Set<string>(),
+        }
+      }
+      const tracker = new OpencodeActivityTracker({
+        fetchImpl: fetchImpl as typeof fetch,
+        random: () => 0,
+        resolveOpencodeSessionRoots,
+      })
+      const collected = collectOpencode(tracker)
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy, record present
+
+      // A child ask that needs root resolution: the handler suspends on the
+      // held resolver promise ('ses-child' is not in the child->root map).
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-child' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(resolverCalls).toContainEqual(['ses-child']) // suspended inside the TOCTOU window
+      expect(collected.boundaries).toEqual([]) // nothing armed while suspended
+
+      // Invalidate ownership mid-await: re-tracking the same endpoint resets
+      // ownership to quiet synchronously. (reject/confirmSessionAssociation
+      // only act on awaitingAssociation, so they CANNOT invalidate knownBusy;
+      // re-track is the public synchronous transition out of it.)
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+
+      // Release the held resolution, mapping the child onto the now-stale root.
+      if (!releaseChildResolution) throw new Error('resolver was never suspended on ses-child')
+      releaseChildResolution({
+        rootsBySessionId: new Map([['ses-child', 'ses-root']]),
+        unresolvedSessionIds: new Set<string>(),
+      })
+      await vi.advanceTimersByTimeAsync(0)
+
+      // Post-await ownership is quiet: the gate must stay silent -- no
+      // boundary and no pause demotion (the busy record is left in place).
+      expect(collected.boundaries).toEqual([])
+      expect(collected.changes.filter((c) => c.remove.length > 0)).toEqual([])
+
+      // And no pause claim was armed: the spontaneous exit carries the plain
+      // death-bell marker with NO approval-pending marker.
+      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [],
+        remove: ['term-1'],
+        spontaneousExitRemovals: ['term-1'],
+      })
     })
   })
 })
