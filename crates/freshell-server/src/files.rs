@@ -46,6 +46,11 @@
 //! (read errors). NOTE: unlike the `/api/files/*` handlers, the original
 //! applies NO `allowedFilePaths` sandbox to this route (`server/index.ts:189`
 //! mounts it bare), so none is applied here.
+//! FILE-02: `/local-file` preserves Windows drive and UNC file URLs —
+//! `file:///C:/…` and `file://server/share/…` arrive (exactly-once decoded
+//! from the query param) as `C:/…` and `//server/share/…`, and
+//! [`resolve_for_local_file`] keeps the drive / `\\server\share` device
+//! instead of losing it to cwd-anchoring or separator folding.
 //!
 //! R3 (security-relevant): `allowedFilePaths` sandbox enforcement reads the LIVE
 //! [`SettingsStore`] on every request (not a boot-time snapshot), so a
@@ -524,9 +529,11 @@ async fn mkdir(
 /// (e.g. an unreadable file) → 500 `Failed to send file`.
 ///
 /// The path runs through Node's `path.resolve` semantics only (lexical
-/// `.`/`..` collapse, relative inputs anchored at the server cwd): the
-/// original does NOT expand `~`, does NOT do WSL conversion, and does NOT
-/// apply any sandbox on this route — none are applied here either.
+/// `.`/`..` collapse, relative inputs anchored at the server cwd — plus the
+/// FILE-02 drive/UNC device preservation for `C:/…` and `//server/share/…`
+/// inputs; see [`resolve_for_local_file`]): the original does NOT expand
+/// `~`, does NOT do WSL conversion, and does NOT apply any sandbox on this
+/// route — none are applied here either.
 async fn local_file(
     State(state): State<FilesState>,
     headers: HeaderMap,
@@ -845,15 +852,39 @@ fn case_fold_for_platform(comparison: String) -> String {
     }
 }
 
-/// Node's `path.resolve(filePath)` (`local-file-router.ts:64`) for this POSIX
-/// host: an absolute input is normalized lexically (`.`/`..` collapsed,
-/// redundant separators folded, trailing separators stripped — exactly
-/// [`collapse_dot_segments`]); a relative input is anchored at the process
-/// cwd first, like `path.resolve`. Deliberately NOT
-/// [`resolve_user_path`]: the original performs no `~` expansion and no WSL
-/// conversion here, so a `~foo` or `C:\…` input is simply a (usually
-/// nonexistent) cwd-relative name and 404s naturally.
+/// Node's `path.resolve(filePath)` (`local-file-router.ts:64`):
+///
+/// * FILE-02: drive-absolute (`C:\…` and the client's forward-slash spelling
+///   `C:/…`) and UNC (`\\server\share\…` and the client's forward-slash
+///   spelling `//server/share/…` — `BrowserPane.tsx:75-87` sends exactly
+///   these two forms) resolve through [`win32_resolve`], Node's
+///   `path.win32.resolve` — which is what `path.resolve` IS on the win32
+///   Tauri host this route serves `file://` bytes for. The drive is never
+///   mistaken for a cwd-relative name and the UNC host is never
+///   separator-folded into a `/server/share` POSIX cousin, so on a Windows
+///   host build the result addresses the file natively. On a POSIX host the
+///   resulting backslash literal has no native address and stats `NotFound`
+///   → the same 404 the original yields from its own cwd-anchored (`C:/…` →
+///   `<cwd>/C:/…`) / folded (`//server/share/…` → `/server/share/…`)
+///   spellings — with one deliberate fail-closed divergence: Node-on-POSIX
+///   folds a crafted `//etc/x` input to `/etc/x` and could serve it, while
+///   keeping the UNC device means such an input can never resolve to a
+///   same-named local path here.
+/// * an absolute POSIX input is normalized lexically (`.`/`..` collapsed,
+///   redundant separators folded, trailing separators stripped — exactly
+///   [`collapse_dot_segments`]);
+/// * a relative input is anchored at the process cwd first, like
+///   `path.resolve`.
+///
+/// Deliberately NOT [`resolve_user_path`]: the original performs no `~`
+/// expansion and no WSL conversion here, so a `~foo` input is simply a
+/// (usually nonexistent) cwd-relative name and 404s naturally; a drive/UNC
+/// target on a WSL host likewise stats the backslash literal and 404s
+/// (`local-file-router.ts` contains no `toFilesystemPath` call).
 fn resolve_for_local_file(input: &str) -> String {
+    if let Some(resolved) = win32_resolve(input) {
+        return resolved;
+    }
     if input.starts_with('/') {
         collapse_dot_segments(input)
     } else {
@@ -2716,5 +2747,158 @@ mod tests {
             "text/plain; charset=UTF-8"
         );
         assert_eq!(body_bytes(resp).await, "châu 🍜".as_bytes());
+    }
+
+    // ---- FILE-02: drive/UNC device preservation + exactly-once decode ----
+
+    #[test]
+    fn local_file_resolve_preserves_windows_drive() {
+        // The client's `file:///C:/…` conversion strips only the leading
+        // slash (`BrowserPane.tsx:75-80`) — the server must keep the drive
+        // instead of cwd-anchoring it as a relative name. On the win32 host
+        // `C:\…` is natively addressable; on POSIX it stats NotFound -> the
+        // same 404 the original yields.
+        assert_eq!(
+            resolve_for_local_file("C:/Users/dan/notes.txt"),
+            "C:\\Users\\dan\\notes.txt"
+        );
+        // Drive-letter case is preserved as typed (path.win32.resolve).
+        assert_eq!(resolve_for_local_file("c:/"), "c:\\");
+        // Backslash drive spellings keep the drive too…
+        assert_eq!(
+            resolve_for_local_file("D:\\proj\\sub\\..\\x.txt"),
+            "D:\\proj\\x.txt"
+        );
+        // …and dot segments collapse INSIDE the drive (never above its root).
+        assert_eq!(resolve_for_local_file("D:/../x.txt"), "D:\\x.txt");
+        // A drive-absolute input is never treated as cwd-relative.
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        assert!(!resolve_for_local_file("E:/data/f.bin").starts_with(&cwd));
+    }
+
+    #[test]
+    fn local_file_resolve_preserves_unc_host() {
+        // `BrowserPane.tsx:82-85` reattaches the URL hostname as a
+        // forward-slash `//server/share` prefix; the host must survive —
+        // folding `//srv/sh` to `/srv/sh` would address a same-named LOCAL
+        // path instead of the share.
+        assert_eq!(
+            resolve_for_local_file("//file-server/Projects/report FINAL.txt"),
+            "\\\\file-server\\Projects\\report FINAL.txt"
+        );
+        // Spaces and Unicode share/dir names survive (HARNESS-06 shape).
+        assert_eq!(
+            resolve_for_local_file("//srv/Archïve/café 世界.txt"),
+            "\\\\srv\\Archïve\\café 世界.txt"
+        );
+        // Backslash UNC spellings keep the device as well.
+        assert_eq!(
+            resolve_for_local_file("\\\\srv\\share\\x.txt"),
+            "\\\\srv\\share\\x.txt"
+        );
+        // A `..` hop is clamped at the share root — it cannot cross into a
+        // sibling share (path.win32.resolve semantics).
+        assert_eq!(
+            resolve_for_local_file("//srv/share/../x.txt"),
+            "\\\\srv\\share\\x.txt"
+        );
+        // Bare share root gets Node's trailing `\\server\share\` form.
+        assert_eq!(resolve_for_local_file("//srv/share"), "\\\\srv\\share\\");
+    }
+
+    #[test]
+    fn local_file_resolve_other_lanes_unchanged() {
+        // Single-slash absolutes still collapse lexically (never reclassified
+        // as UNC: a `//` prefix is a Windows UNC spelling, `/` alone is not).
+        assert_eq!(resolve_for_local_file("/a//b/../c/"), "/a/c");
+        // Relatives still anchor at the process cwd, and `~` is NOT expanded
+        // on this route (both Node `path.resolve` parity).
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        assert_eq!(resolve_for_local_file("rel/x.txt"), format!("{cwd}/rel/x.txt"));
+        assert_eq!(resolve_for_local_file("~/x.txt"), format!("{cwd}/~/x.txt"));
+        // Drive-relative `C:foo` is cwd-dependent, so win32_resolve refuses it
+        // (like deterministic-core `resolve_user_path`) and it keeps the
+        // legacy cwd-anchored lane.
+        let resolved = resolve_for_local_file("C:foo");
+        assert!(resolved.ends_with("/C:foo"), "{resolved}");
+        // The documented fail-closed divergence: a crafted `//etc/x` input
+        // keeps its UNC device and can never fold onto the local `/etc/x`
+        // (Node-on-POSIX would fold and could serve it). The share root gets
+        // Node's trailing `\\server\share\` form (path.win32.resolve renders
+        // device roots with the separator, exactly like `C:\`).
+        assert_eq!(resolve_for_local_file("//etc/x"), "\\\\etc\\x\\");
+    }
+
+    #[tokio::test]
+    async fn local_file_unc_and_drive_targets_fail_with_bounded_error() {
+        // PW-TAURI-WIN's "remove the share" leg, server-side: an
+        // unreachable/unaddressable drive or share target must produce the
+        // original's bounded recoverable JSON error — never a hang, never a
+        // 500, never bytes from a same-named local cousin. (On this POSIX
+        // host the backslash literal has no native address; on a Windows
+        // host with the share removed the UNC stat fails the same way.)
+        for path in [
+            "//removed-share-server/public/x.txt",
+            "\\\\removed-share-server\\public\\x.txt",
+            "C:/definitely/not/here.bin",
+        ] {
+            let resp = local_file_resp(&test_state(), auth_headers(), Some(path)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"], "File not found", "{path}");
+        }
+        // …and the auth gate still runs BEFORE any path handling for these
+        // forms (a drive/UNC probe without credentials is a 401, not a 404).
+        let resp = local_file_resp(
+            &test_state(),
+            HeaderMap::new(),
+            Some("//removed-share-server/public/x.txt"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A double-decoding server would fetch the space-name neighbor when the
+    /// request names a literal `%20` file — pin exactly-once decode and
+    /// exact-target serving through the real HTTP layer.
+    #[tokio::test]
+    async fn local_file_decodes_path_exactly_once_and_never_serves_encoded_neighbor() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Neighbor pair whose names differ ONLY by literal `%20` vs a space —
+        // the "similarly prefixed neighbor" must never be served for the
+        // other's URL.
+        let literal_pct = tmp.path().join("My%20Doc.txt");
+        let spaced = tmp.path().join("My Doc.txt");
+        std::fs::write(&literal_pct, b"literal-percent-name").unwrap();
+        std::fs::write(&spaced, b"space-name").unwrap();
+
+        let get = |file: &std::path::Path| {
+            let encoded = encode_uri_component(&file.to_string_lossy());
+            let state = test_state();
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(format!("/local-file?path={encoded}"))
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap();
+                router(state).oneshot(req).await.unwrap()
+            }
+        };
+
+        // `My%2520Doc.txt` decodes ONCE to `My%20Doc.txt` (the literal file);
+        // a second decode would land on `My Doc.txt` and serve its bytes.
+        let resp = get(&literal_pct).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"literal-percent-name");
+
+        // And the plain `%20` form decodes once to the space-named neighbor.
+        let resp = get(&spaced).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"space-name");
     }
 }
