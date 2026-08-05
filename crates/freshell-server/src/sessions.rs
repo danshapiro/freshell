@@ -1094,6 +1094,168 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// SESSION-17: the PATCH route's storage key is `composite_key(raw_id,
+    /// provider)` (`rawId.includes(':') ? rawId : makeSessionKey(provider,
+    /// rawId)`, `sessions-router.ts`). Seeding the SAME raw id under three
+    /// different `provider` params must produce three INDEPENDENT overrides:
+    /// a rename of the claude row, an archive of the codex row, and a delete
+    /// of the opencode row coexist in one store with zero cross-leak into
+    /// the sibling keys.
+    #[tokio::test]
+    async fn patch_same_raw_id_under_different_providers_writes_isolated_overrides() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+        let app = super::router(st.clone());
+
+        let patch = |app: axum::Router, provider: &'static str, body: &'static str| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/sessions/shared-raw?provider={provider}"))
+                        .header("x-auth-token", "tok")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "provider={provider}");
+            body_json(resp).await
+        };
+
+        let rename = patch(
+            app.clone(),
+            "claude",
+            r#"{"titleOverride":"Claude Name"}"#,
+        )
+        .await;
+        let _archive = patch(app.clone(), "codex", r#"{"archived":true}"#).await;
+        let _delete = patch(app, "opencode", r#"{"deleted":true}"#).await;
+
+        // The rename response echoes only its own key's merged override.
+        assert_eq!(rename["titleOverride"], serde_json::json!("Claude Name"));
+        assert_eq!(rename["titleSource"], serde_json::json!("user"));
+
+        let overrides = st.settings.session_overrides();
+        let mut keys: Vec<&str> = overrides.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["claude:shared-raw", "codex:shared-raw", "opencode:shared-raw"],
+            "exactly three provider-qualified keys — no shared/bare key, no extras"
+        );
+
+        // claude: renamed, neither archived nor deleted.
+        let claude = &overrides["claude:shared-raw"];
+        assert_eq!(claude["titleOverride"], serde_json::json!("Claude Name"));
+        assert!(claude.get("archived").is_none());
+        assert!(claude.get("deleted").is_none());
+
+        // codex: archived, NOT renamed by the claude patch.
+        let codex = &overrides["codex:shared-raw"];
+        assert_eq!(codex["archived"], serde_json::json!(true));
+        assert!(codex.get("titleOverride").is_none());
+        assert!(codex.get("deleted").is_none());
+
+        // opencode: deleted, untouched by both sibling writes.
+        let opencode = &overrides["opencode:shared-raw"];
+        assert_eq!(opencode["deleted"], serde_json::json!(true));
+        assert!(opencode.get("titleOverride").is_none());
+        assert!(opencode.get("archived").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SESSION-17 (live-association half): when two LIVE terminals run
+    /// sessions with the SAME raw id under different providers, a rename
+    /// PATCH must cascade ONLY to the same-provider terminal — the reverse
+    /// cascade resolves the target via `find_by_session(sessionProvider,
+    /// sessionId)` (`rename-cascade.ts:39-50`), never by raw id alone.
+    /// Proves: the response's `cascadedTerminalId`, the terminal-override
+    /// write, and the in-memory registry title update all land on the codex
+    /// terminal and nowhere near the claude one.
+    #[tokio::test]
+    async fn patch_rename_cascades_only_to_the_same_provider_terminal_on_raw_id_collision() {
+        let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let st = state(&dir);
+
+        st.identity
+            .upsert("term-cl", Some("claude"), Some("sess-shared"), None, 1000);
+        st.identity
+            .upsert("term-cx", Some("codex"), Some("sess-shared"), None, 2000);
+        spawn_headless_terminal_for_test(&st.registry, "term-cl");
+        spawn_headless_terminal_for_test(&st.registry, "term-cx");
+        let claude_title_before = st
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "term-cl")
+            .map(|e| e.title)
+            .expect("term-cl registered");
+
+        let app = super::router(st.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/sessions/sess-shared?provider=codex")
+                    .header("x-auth-token", "tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"titleOverride":"Codex Only Name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        assert_eq!(
+            v["cascadedTerminalId"],
+            serde_json::json!("term-cx"),
+            "the cascade target is the same-provider (codex) terminal only"
+        );
+
+        let terminal_overrides = st.settings.terminal_overrides();
+        assert_eq!(
+            terminal_overrides["term-cx"]["titleOverride"],
+            serde_json::json!("Codex Only Name")
+        );
+        assert!(
+            terminal_overrides.get("term-cl").is_none(),
+            "the claude terminal with the same raw session id must be untouched"
+        );
+
+        let directory = st.registry.directory();
+        let term_cx = directory
+            .iter()
+            .find(|e| e.terminal_id == "term-cx")
+            .expect("term-cx registered");
+        assert_eq!(term_cx.title, "Codex Only Name");
+        let term_cl = directory
+            .iter()
+            .find(|e| e.terminal_id == "term-cl")
+            .expect("term-cl still registered");
+        assert_eq!(
+            term_cl.title, claude_title_before,
+            "registry write-through must not reach the sibling provider's terminal"
+        );
+
+        // The session override itself landed under the codex key only.
+        let overrides = st.settings.session_overrides();
+        assert_eq!(
+            overrides["codex:sess-shared"]["titleOverride"],
+            serde_json::json!("Codex Only Name")
+        );
+        assert!(overrides.get("claude:sess-shared").is_none());
+
+        st.registry.kill("term-cl");
+        st.registry.kill("term-cx");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn generate_title_blank_first_message_is_400() {
         let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));

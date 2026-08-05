@@ -1112,6 +1112,69 @@ mod join_tests {
             "pre-adoption: unassociated codex terminal + its session file don't merge yet"
         );
     }
+
+    // ── SESSION-17: provider-qualified running-state identity ──
+
+    /// SESSION-17: the SAME raw session id indexed under claude, codex, AND
+    /// opencode must never share running state. `join_running_state`'s
+    /// matcher requires provider AND session_id (`service.ts:77-95`), and
+    /// `join_live_terminals`'s dedupe set is keyed `provider:sessionId`
+    /// (`buildSessionKey`, `service.ts:36-38`) — so a live claude terminal
+    /// for raw id `shared` lights up ONLY the claude item, a live codex
+    /// terminal for the same raw id ONLY the codex item, the opencode item
+    /// stays dark, and none of the three collides in dedupe (exactly 3
+    /// items, no synthesized `liveTerminalOnly` row for either live
+    /// terminal — both are matched against their own provider's file item).
+    #[test]
+    fn join_live_terminals_same_raw_id_across_providers_never_cross_leaks_running_state() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("term-cl", Some("claude"), Some("shared"), None, 1000);
+        reg.upsert("term-cx", Some("codex"), Some("shared"), None, 2000);
+
+        let items = vec![
+            file_item("claude", "shared", 500),
+            file_item("codex", "shared", 500),
+            file_item("opencode", "shared", 500),
+        ];
+
+        let joined = join_live_terminals(items, &reg.list());
+        assert_eq!(
+            joined.len(),
+            3,
+            "no dedupe collapse across providers and no synthesized duplicates"
+        );
+
+        for item in &joined {
+            assert_eq!(item.session_id, "shared");
+            assert!(!item.live_terminal_only);
+            match item.provider.as_str() {
+                "claude" => {
+                    assert!(item.is_running, "claude:shared must join term-cl");
+                    assert_eq!(item.running_terminal_id.as_deref(), Some("term-cl"));
+                }
+                "codex" => {
+                    assert!(item.is_running, "codex:shared must join term-cx");
+                    assert_eq!(item.running_terminal_id.as_deref(), Some("term-cx"));
+                }
+                other => {
+                    assert_eq!(other, "opencode");
+                    assert!(
+                        !item.is_running,
+                        "opencode:shared has no live terminal — must stay dark"
+                    );
+                    assert_eq!(item.running_terminal_id, None);
+                }
+            }
+        }
+
+        // Sanity at the matcher level too: a codex identity must NOT mark the
+        // claude item running even when the raw id is identical.
+        let codex_only = TerminalIdentityRegistry::new();
+        codex_only.upsert("term-cx", Some("codex"), Some("shared"), None, 2000);
+        let claude_item = join_running_state(file_item("claude", "shared", 500), &codex_only.list());
+        assert!(!claude_item.is_running);
+        assert_eq!(claude_item.running_terminal_id, None);
+    }
 }
 
 // ── Cursor (base64url of `{lastActivityAt, key}`) ───────────────────────────
@@ -2274,6 +2337,77 @@ mod tests {
         assert_eq!(v["title"], json!("Renamed"));
         assert_eq!(v["summary"], json!("New sum"));
         assert_eq!(v["archived"], json!(true));
+    }
+
+    /// SESSION-17: `provider:sessionId` keys (`buildSessionKey`,
+    /// `service.ts:36-38`) mean a rename/archive/delete stored against one
+    /// provider's raw id must NEVER touch a sibling provider's session that
+    /// happens to share the SAME raw id. Seeds `shared` under all three
+    /// providers, then: codex gets renamed+archived, opencode gets deleted,
+    /// claude gets nothing — and asserts each outcome lands on exactly its
+    /// own row.
+    #[test]
+    fn overrides_overlay_same_raw_id_is_scoped_by_provider_rename_archive_delete() {
+        let mk = |provider: &str| DirItem {
+            session_id: "shared".into(),
+            provider: provider.into(),
+            project_path: "/p".into(),
+            title: Some("parsed".into()),
+            title_provider_generated: false,
+            summary: Some("parsed-sum".into()),
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        };
+        let items = vec![mk("claude"), mk("codex"), mk("opencode")];
+
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "codex:shared".into(),
+            json!({ "titleOverride": "Codex Rename", "archived": true }),
+        );
+        overrides.insert("opencode:shared".into(), json!({ "deleted": true }));
+
+        let overlaid = apply_session_overrides(items, &overrides);
+        assert_eq!(
+            overlaid.len(),
+            2,
+            "only opencode:shared is deleted — the other providers' rows survive"
+        );
+
+        let claude = overlaid
+            .iter()
+            .find(|i| i.provider == "claude")
+            .expect("claude row untouched by sibling overrides");
+        assert_eq!(claude.title.as_deref(), Some("parsed"));
+        assert!(!claude.archived);
+        // The wire projection agrees.
+        let v = claude.to_value();
+        assert_eq!(v["title"], json!("parsed"));
+        assert_eq!(v["archived"], json!(false));
+
+        let codex = overlaid
+            .iter()
+            .find(|i| i.provider == "codex")
+            .expect("codex row present");
+        assert_eq!(codex.title.as_deref(), Some("Codex Rename"));
+        assert!(codex.archived);
+
+        assert!(
+            overlaid.iter().all(|i| i.provider != "opencode"),
+            "deleted:true on opencode:shared must filter ONLY the opencode row"
+        );
     }
 
     #[test]
