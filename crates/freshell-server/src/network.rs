@@ -417,4 +417,227 @@ mod tests {
         });
         assert_eq!(status["machineHostname"], json!("macbook"));
     }
+
+    // ---- NET-03: accurate share URL across the reachability truth table ---
+    //
+    // `share_route_enabled` and `accessUrl` below are the faithful port of
+    // `network-manager.ts:349-375`; the live probe that feeds `raw_port_open`
+    // (`network-manager.ts:303-320`) is NET-01's deferred slice. These tests
+    // pin the contract that probe completes: for each probe outcome the share
+    // URL is accurate — protocol/host/port + percent-encoded token
+    // (`network-manager.ts:370-375`) — or degrades to loopback exactly where
+    // the reference does (`portOpen === null/false`), never a wrong LAN URL.
+
+    #[test]
+    fn share_url_uses_first_lan_ip_when_probe_reachable_on_non_wsl2_bind() {
+        // Windows host explicitly configured for 0.0.0.0 (the PW-TAURI-WIN
+        // surface), probe says the LAN address reaches the server: the share
+        // route activates and accessUrl points at the first LAN IP with the
+        // real bound port.
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::Windows,
+            active: false,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.50".to_string(), "10.0.0.5".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: Some(true),
+            wsl_forwarding_disabled_by_env: false,
+            token: "tok",
+        });
+        assert_eq!(status["remoteAccessRequested"], json!(true));
+        assert_eq!(status["remoteAccessEnabled"], json!(true));
+        assert_eq!(status["remoteAccessNeedsRepair"], json!(false));
+        assert_eq!(status["firewall"]["portOpen"], json!(true));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://192.168.1.50:3001/?token=tok")
+        );
+    }
+
+    #[test]
+    fn share_url_uses_lan_ip_when_probe_reachable_on_unconfigured_linux_bind() {
+        // Unconfigured 0.0.0.0 bind (HOST/FRESHELL_BIND_HOST path): remote
+        // access is requested by default off-WSL2 (`network-access.ts:16-18`),
+        // so a reachable probe turns the LAN share URL on here too.
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::LinuxUfw,
+            active: true,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: false,
+            network_host: "127.0.0.1",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.20".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: Some(true),
+            wsl_forwarding_disabled_by_env: false,
+            token: "t",
+        });
+        assert_eq!(status["remoteAccessRequested"], json!(true));
+        assert_eq!(status["remoteAccessEnabled"], json!(true));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://192.168.1.20:3001/?token=t")
+        );
+    }
+
+    #[test]
+    fn share_url_stays_loopback_when_probe_unreachable_on_non_wsl2_bind() {
+        // Bound 0.0.0.0 and requested, but the port provably does not reach
+        // the LAN: the reference never advertises a broken URL — loopback URL
+        // (`network-manager.ts:371-372`), and Windows flags the repair state
+        // (`network-manager.ts:357-361`).
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::Windows,
+            active: true,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.50".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: Some(false),
+            wsl_forwarding_disabled_by_env: false,
+            token: "tok",
+        });
+        assert_eq!(status["remoteAccessEnabled"], json!(false));
+        assert_eq!(status["firewall"]["portOpen"], json!(false));
+        assert_eq!(status["remoteAccessNeedsRepair"], json!(true));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://localhost:3001/?token=tok")
+        );
+    }
+
+    #[test]
+    fn share_url_stays_loopback_while_probe_unknown_on_non_wsl2_bind() {
+        // `None` == the reference's `rawPortOpen === null` (probe threw /
+        // not run): NO share route even when remote access is requested
+        // (`network-manager.ts:349-352`, `362-369`). This is exactly what the
+        // live handler serves today while NET-01's probe is deferred —
+        // reference-faithful, never an over-claimed LAN URL.
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::LinuxUfw,
+            active: true,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: false,
+            network_host: "127.0.0.1",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.20".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: None,
+            wsl_forwarding_disabled_by_env: false,
+            token: "t",
+        });
+        assert_eq!(status["remoteAccessRequested"], json!(true));
+        assert_eq!(status["remoteAccessEnabled"], json!(false));
+        assert_eq!(status["firewall"]["portOpen"], Value::Null);
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://localhost:3001/?token=t")
+        );
+    }
+
+    #[test]
+    fn share_url_uses_lan_ip_on_wsl2_when_requested_and_probe_unknown() {
+        // The WSL2-unknown branch (`network-manager.ts:362-369` + `371-372`):
+        // WSL2 LAN reachability is a portproxy question, not a firewall one,
+        // so an unknown probe (env opt-out unset) still advertises the LAN URL.
+        let fw = wsl2_inactive();
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.3.50".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: None,
+            wsl_forwarding_disabled_by_env: false,
+            token: "tok",
+        });
+        // Requested via the configured 0.0.0.0 host — the host check
+        // (`network-access.ts:8-10`) precedes the wsl2 early-false.
+        assert_eq!(status["remoteAccessRequested"], json!(true));
+        // Unknown probe: not enabled, but also not a repair (portOpen null,
+        // not false).
+        assert_eq!(status["remoteAccessEnabled"], json!(false));
+        assert_eq!(status["remoteAccessNeedsRepair"], json!(false));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://192.168.3.50:3001/?token=tok")
+        );
+    }
+
+    #[test]
+    fn share_url_stays_loopback_on_wsl2_unknown_probe_when_forwarding_disabled_by_env() {
+        // Same WSL2-unknown inputs but with the env opt-out: the share route
+        // stays off and the URL degrades to loopback.
+        let fw = wsl2_inactive();
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.3.50".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: None,
+            wsl_forwarding_disabled_by_env: true,
+            token: "tok",
+        });
+        assert_eq!(status["remoteAccessEnabled"], json!(false));
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://localhost:3001/?token=tok")
+        );
+    }
+
+    #[test]
+    fn access_url_percent_encodes_token_and_embeds_the_raw_secret_nowhere() {
+        // NET-03 safety at the server layer: a query-hostile token goes out
+        // percent-encoded INSIDE accessUrl (a raw `&`/`=` would corrupt the
+        // URL's own query string) and appears nowhere else in the serialized
+        // status payload.
+        let token = "a b+c/d=&e";
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::Windows,
+            active: false,
+        };
+        let status = build_network_status(NetworkStatusInputs {
+            configured: true,
+            network_host: "0.0.0.0",
+            effective_host: "0.0.0.0",
+            port: 3001,
+            lan_ips: &["192.168.1.50".to_string()],
+            machine_hostname: "host",
+            firewall: &fw,
+            raw_port_open: Some(true),
+            wsl_forwarding_disabled_by_env: false,
+            token,
+        });
+        assert_eq!(
+            status["accessUrl"],
+            json!("http://192.168.1.50:3001/?token=a%20b%2Bc%2Fd%3D%26e")
+        );
+        let wire = status.to_string();
+        assert!(
+            !wire.contains(token),
+            "raw token leaked into status payload: {wire}"
+        );
+    }
 }

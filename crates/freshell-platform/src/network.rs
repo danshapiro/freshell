@@ -707,6 +707,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn access_url_encodes_query_delimiters_and_utf8_bytes() {
+        // NET-03: the token sits inside the URL's own query string, so a raw
+        // `&`/`=`/`+`/`#`/`%` would corrupt it — all must percent-encode.
+        // Multibyte chars encode per UTF-8 byte, byte-identical to JS
+        // `encodeURIComponent("🔥") === "%F0%9F%94%A5"`.
+        assert_eq!(
+            access_url(true, &["192.168.1.5".into()], 3001, "a+b&c=d#e%f\u{1F525}"),
+            "http://192.168.1.5:3001/?token=a%2Bb%26c%3Dd%23e%25f%F0%9F%94%A5"
+        );
+    }
+
+    #[test]
+    fn access_url_passes_the_full_unreserved_set_through_untouched() {
+        // JS `encodeURIComponent`'s complete unreserved set — `A-Za-z0-9` plus
+        // `-_.!~*'()` — must pass through unencoded (over-encoding would
+        // diverge from the URL the legacy client copies/compares).
+        assert_eq!(
+            access_url(true, &["192.168.1.5".into()], 3001, "AZaz09-_.!~*'()"),
+            "http://192.168.1.5:3001/?token=AZaz09-_.!~*'()"
+        );
+    }
+
     // ---- P12: LAN scoring / ipconfig parse --------------------------------
 
     #[test]
