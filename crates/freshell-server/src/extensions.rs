@@ -100,10 +100,92 @@ struct ExtensionManifest {
     category: String,
     icon: Option<String>,
     url: Option<String>,
-    #[serde(rename = "contentSchema")]
-    content_schema: Option<Value>,
+    /// Tri-state: zod's `.optional()` accepts ABSENT (`undefined`) but REJECTS
+    /// an explicit `null` (`contentSchema: z.record(...).optional()`,
+    /// `extension-manifest.ts:90`); a bare `Option<Value>` would collapse the
+    /// two. `Present` values are shape-checked by [`content_schema_valid`] at
+    /// scan time (the original's `safeParse` gate, extension-manager.ts:104-110).
+    #[serde(rename = "contentSchema", default, deserialize_with = "de_content_schema")]
+    content_schema: ContentSchemaSlot,
     picker: Option<PickerConfig>,
     cli: Option<CliConfig>,
+}
+
+/// Tri-state for the manifest's optional `contentSchema` block (see the field
+/// doc above): the original distinguishes "key absent" (valid, block omitted
+/// from the client entry) from "key present but `null`/malformed" (manifest
+/// rejected outright).
+#[derive(Debug, Clone, PartialEq)]
+enum ContentSchemaSlot {
+    Absent,
+    Present(Value),
+}
+
+impl Default for ContentSchemaSlot {
+    fn default() -> Self {
+        ContentSchemaSlot::Absent
+    }
+}
+
+/// Any PRESENT value (including `null`) deserializes as `Present(..)` — the
+/// absent case is handled by `#[serde(default)]`, which never calls this.
+fn de_content_schema<'de, D>(deserializer: D) -> Result<ContentSchemaSlot, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(ContentSchemaSlot::Present(Value::deserialize(deserializer)?))
+}
+
+/// The `contentSchema` record validation (`ContentSchemaFieldSchema`,
+/// `extension-manifest.ts:14-28`): `z.record(z.string(), field)` where each
+/// field is `z.strictObject({ type: z.enum(['string','number','boolean']),
+/// label: z.string(), required: z.boolean().optional(), default:
+/// z.union([z.string(), z.number(), z.boolean()]).optional() }).refine(
+/// default matches the declared type)`. A failure rejects the WHOLE manifest
+/// at scan (the original's single `safeParse` gate) — so an extension whose
+/// declared settings fields are malformed is never served to the picker and
+/// its typed defaults never reach a launch env.
+fn content_schema_valid(slot: &ContentSchemaSlot) -> bool {
+    let ContentSchemaSlot::Present(value) = slot else {
+        return true;
+    };
+    let Value::Object(fields) = value else {
+        return false;
+    };
+    fields.values().all(content_schema_field_valid)
+}
+
+/// One `ContentSchemaFieldSchema` member (strict keys, typed fields, and the
+/// `default`-matches-`type` refinement).
+fn content_schema_field_valid(field: &Value) -> bool {
+    let Value::Object(map) = field else {
+        return false;
+    };
+    const KNOWN: &[&str] = &["type", "label", "required", "default"];
+    if map.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return false;
+    }
+    let Some(ty) = map.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(ty, "string" | "number" | "boolean") {
+        return false;
+    }
+    if !map.get("label").is_some_and(Value::is_string) {
+        return false;
+    }
+    if let Some(required) = map.get("required") {
+        if !required.is_boolean() {
+            return false;
+        }
+    }
+    match map.get("default") {
+        None => true,
+        Some(default) => matches!(
+            (ty, default),
+            ("string", Value::String(_)) | ("number", Value::Number(_)) | ("boolean", Value::Bool(_))
+        ),
+    }
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -224,9 +306,15 @@ impl ExtensionRegistry {
                         continue;
                     }
                 };
-                if !is_valid_manifest(&manifest) {
+                if !is_valid_manifest(&manifest)
+                    || !content_schema_valid(&manifest.content_schema)
+                {
                     // The refinement half of `invalid manifest` (:104-110): the
-                    // declared category must carry exactly its own config block.
+                    // declared category must carry exactly its own config block
+                    // (extension-manifest.ts:96-103), and a present
+                    // `contentSchema` must satisfy the typed field schema
+                    // incl. the default-matches-type refinement (:14-28) — the
+                    // original's one `safeParse` covers both.
                     tracing::warn!(
                         manifest_path = %manifest_path.display(),
                         category = %manifest.category,
@@ -381,7 +469,9 @@ fn client_entry(m: &ExtensionManifest) -> Value {
     if let Some(url) = &m.url {
         obj.insert("url".into(), json!(url));
     }
-    if let Some(cs) = &m.content_schema {
+    // Only VALID present schemas reach here (invalid ones were rejected at
+    // scan); absent → key omitted, mirroring `undefined` elision (:167-169).
+    if let ContentSchemaSlot::Present(cs) = &m.content_schema {
         obj.insert("contentSchema".into(), cs.clone());
     }
     if let Some(p) = &m.picker {
@@ -1004,5 +1094,110 @@ mod tests {
         let get = |_: &str| None;
         let out = detect_available_clis(&specs, &get, HostOs::Linux, &runner);
         assert_eq!(out["kimi"], json!(false));
+    }
+
+    /// Build a minimal `client`-category manifest with an optional raw
+    /// `contentSchema` snippet (each name distinct — scan dedups by name).
+    fn schema_manifest(name: &str, schema_json: Option<&str>) -> String {
+        let schema = schema_json
+            .map(|s| format!(r#", "contentSchema": {s}"#))
+            .unwrap_or_default();
+        format!(
+            r#"{{ "name": "{name}", "version": "1.0.0", "label": "{name}", "description": "d", "category": "client"{schema} }}"#
+        )
+    }
+
+    /// EXT-04: extension-scoped settings fields are TYPED
+    /// (`extension-manifest.ts:14-28` — `type` ∈ string/number/boolean,
+    /// required `label`, optional `required`/`default`). A manifest whose
+    /// contentSchema satisfies the schema registers, and the schema reaches
+    /// the client registry byte-IDENTICAL to the manifest source
+    /// (`toClientRegistry`, extension-manager.ts:167-169) — the UI renders
+    /// text/toggle fields from exactly these declarations, so no key may be
+    /// dropped, renamed, or re-typed in transit.
+    #[test]
+    fn valid_content_schema_registers_and_passes_through_verbatim() {
+        let root = tmp();
+        let full_schema = r#"{
+          "apiUrl": { "type": "string", "label": "API URL", "required": true, "default": "http://localhost:3000" },
+          "pollSeconds": { "type": "number", "label": "Poll interval (s)", "default": 30 },
+          "verbose": { "type": "boolean", "label": "Verbose logging", "default": false },
+          "optionalNote": { "type": "string", "label": "Note" }
+        }"#;
+        write_manifest(&root, "notes", &schema_manifest("notes", Some(full_schema)));
+        // An empty record is a valid schema (`z.record` of zero entries).
+        write_manifest(&root, "empty", &schema_manifest("empty", Some("{}")));
+        // An ABSENT contentSchema key stays absent on the wire.
+        write_manifest(&root, "none", &schema_manifest("none", None));
+
+        let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
+        assert_eq!(reg.entries.len(), 3, "all three manifests valid, got:\n{logs}");
+        assert!(
+            !logs.contains("extension.scan.invalid_manifest"),
+            "no invalid manifest here, got:\n{logs}"
+        );
+
+        let entries = reg.to_client_registry();
+        let by_name = |n: &str| entries.iter().find(|e| e["name"] == json!(n)).unwrap().clone();
+        let expected: Value = serde_json::from_str(full_schema).unwrap();
+        assert_eq!(
+            by_name("notes")["contentSchema"],
+            expected,
+            "typed fields pass through verbatim (string/number/boolean + defaults)"
+        );
+        assert_eq!(by_name("empty")["contentSchema"], json!({}));
+        assert!(
+            by_name("none").get("contentSchema").is_none(),
+            "absent key is omitted, mirroring the original's `undefined` elision"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// EXT-04: a manifest whose contentSchema violates the field schema is
+    /// rejected WHOLE at scan — the original's single
+    /// `ExtensionManifestSchema.safeParse` gate (extension-manager.ts:104-110)
+    /// — and is therefore never served to the picker and never launches.
+    /// Before this, the port carried the block as an opaque `Value` and
+    /// registered these manifests anyway.
+    #[test]
+    fn invalid_content_schema_rejects_the_whole_manifest_with_parity_warning() {
+        let root = tmp();
+        write_manifest(&root, "good", MINI_VALID_MANIFEST);
+        let cases: [(&str, &str); 9] = [
+            // `type` outside the string/number/boolean enum.
+            ("bad-type-enum", r#"{"f": {"type": "date", "label": "F"}}"#),
+            // Missing the required `label` string.
+            ("bad-missing-label", r#"{"f": {"type": "string"}}"#),
+            // `default` must match the declared type (the `.refine`).
+            ("bad-default-mismatch", r#"{"f": {"type": "string", "label": "F", "default": 42}}"#),
+            ("bad-default-null", r#"{"f": {"type": "number", "label": "F", "default": null}}"#),
+            // `required` is boolean-or-absent.
+            ("bad-required", r#"{"f": {"type": "boolean", "label": "F", "required": "yes"}}"#),
+            // The field object is `.strictObject` — unknown keys reject.
+            ("bad-unknown-key", r#"{"f": {"type": "string", "label": "F", "bogus": 1}}"#),
+            // A field must be an object.
+            ("bad-field-nonobject", r#"{"f": "string"}"#),
+            // contentSchema itself must be a record.
+            ("bad-schema-nonobject", r#"[{"type": "string"}]"#),
+            // `.optional()` accepts ABSENT, not explicit `null`.
+            ("bad-schema-null", "null"),
+        ];
+        for (name, schema) in &cases {
+            write_manifest(&root, name, &schema_manifest(name, Some(schema)));
+        }
+
+        let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
+        let names: Vec<&str> = reg.entries.iter().map(|e| e.manifest.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["mini-cli"],
+            "every contentSchema violation rejects the whole manifest, got:\n{logs}"
+        );
+        assert_eq!(
+            logs.matches("extension.scan.invalid_manifest").count(),
+            cases.len(),
+            "one `invalid manifest` warning per rejected manifest (legacy :104-110), got:\n{logs}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

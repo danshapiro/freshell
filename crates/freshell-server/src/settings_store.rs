@@ -1374,6 +1374,9 @@ fn validate_patch(patch: &Value, valid_cli_providers: &[String]) -> Option<Value
             issues.push(enum_issue(&["editor", "externalEditor"], VALID));
         }
     }
+    if let Some(ext) = map.get("extensions") {
+        validate_extensions_patch(ext, &mut issues);
+    }
 
     // Strict-object unknown-key issue: ONE issue carrying ALL unknown keys,
     // appended LAST (live-pinned M3/M6).
@@ -1490,6 +1493,55 @@ fn validate_coding_cli_patch(cli: &Value, valid: &[String], issues: &mut Vec<Val
         .collect();
     if !unknown.is_empty() {
         issues.push(unrecognized_keys_issue(&unknown, &json!(["codingCli"])));
+    }
+}
+
+/// The `extensions` sub-schema (`disabled`, then its own strict unknown-key
+/// issue) — `extensions: z.object({ disabled: z.array(z.string()).optional()
+/// }).strict().optional()` (`shared/settings.ts:812-814`), which the audit had
+/// whitelisted at the top level WITHOUT checking the shape (only the final
+/// `serde_json::from_value` caught a wrong type, with a shapeless generic 400
+/// carrying no `details`). `disabled` items are plain `z.string()` — NO
+/// provider allowlist applies (the list spans CLI AND non-CLI extension
+/// names), unlike `codingCli.enabledProviders`.
+fn validate_extensions_patch(ext: &Value, issues: &mut Vec<Value>) {
+    let Value::Object(ext_map) = ext else {
+        issues.push(invalid_type_issue("object", &json!(["extensions"]), ext));
+        return;
+    };
+    if let Some(v) = ext_map.get("disabled") {
+        match v {
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if !item.is_string() {
+                        issues.push(invalid_type_issue(
+                            "string",
+                            &json!(["extensions", "disabled", i]),
+                            item,
+                        ));
+                    }
+                }
+            }
+            _ => issues.push(invalid_type_issue(
+                "array",
+                &json!(["extensions", "disabled"]),
+                v,
+            )),
+        }
+    }
+    // `extensions` is itself `.strict()` — the retained SPA's own
+    // `extensions.contentDefaults` save path casts `as any` to get past the
+    // client types (`src/components/ExtensionsView.tsx:383,387`) and is
+    // REJECTED by the original's schema, so those values never persist; the
+    // strict reject here is the legacy behavior, not a hardening invention.
+    const EXT_KEYS: &[&str] = &["disabled"];
+    let unknown: Vec<&str> = ext_map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !EXT_KEYS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        issues.push(unrecognized_keys_issue(&unknown, &json!(["extensions"])));
     }
 }
 
@@ -2147,6 +2199,162 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// EXT-04: `extensions.disabled` round-trips through `config.json` and a
+    /// "restart" (fresh `SettingsStore::load` off the same home); arrays
+    /// REPLACE (never append) on re-patch; a malformed patch is rejected by
+    /// `validate_patch` BEFORE any mutation, leaving the live tree AND the
+    /// disk exactly as they were.
+    #[tokio::test]
+    async fn extensions_disabled_round_trips_through_disk_and_restart() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+        assert_eq!(store.get().await.extensions.disabled, Vec::<String>::new());
+
+        let merged = store
+            .patch(&json!({ "extensions": { "disabled": ["notes", "weather"] } }))
+            .await
+            .unwrap();
+        assert_eq!(merged.extensions.disabled, vec!["notes", "weather"]);
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["settings"]["extensions"]["disabled"],
+            json!(["notes", "weather"])
+        );
+
+        // Re-patch REPLACES the list (deep_merge: arrays replace), and CLI
+        // provider names are legal here too (no allowlist on `disabled`).
+        let merged = store
+            .patch(&json!({ "extensions": { "disabled": ["claude"] } }))
+            .await
+            .unwrap();
+        assert_eq!(merged.extensions.disabled, vec!["claude"]);
+
+        // "Restart": a fresh store off the same home serves the persisted list.
+        let restarted = store_at(&dir);
+        assert_eq!(restarted.get().await.extensions.disabled, vec!["claude"]);
+
+        // A malformed patch 400s with the zod-shaped detail and leaves both
+        // the live tree and the disk untouched (validation runs pre-mutation).
+        let (status, body) = store
+            .patch(&json!({ "extensions": { "disabled": "nope" } }))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["details"][0]["code"], "invalid_type");
+        assert_eq!(body["details"][0]["path"], json!(["extensions", "disabled"]));
+        assert_eq!(store.get().await.extensions.disabled, vec!["claude"]);
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["extensions"]["disabled"], json!(["claude"]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// EXT-04 ("an explicit user-disabled choice always wins"): a CLI
+    /// extension the user has disabled (the client handler removes it from
+    /// `enabledProviders`, `src/components/ExtensionsView.tsx:292-296`) must
+    /// NOT be auto-enabled again when its manifest is invalidated and later
+    /// restored — the boot migration only auto-enables names MISSING from the
+    /// persisted `knownProviders` (`server/index.ts:288-297`), and the restore
+    /// boot finds the name already there. Control: a GENUINELY new name in
+    /// that same restore boot IS auto-enabled, proving the gate is
+    /// "not-known", not "never append".
+    #[tokio::test]
+    async fn user_disabled_cli_provider_survives_invalidate_and_restore() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let four = || {
+            ["claude", "codex", "opencode", "amplifier"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Boot 1 (fresh home, 4 CLI manifests discovered): knownProviders is
+        // seeded with all discovered names; the default enabled set is on.
+        let store = SettingsStore::load(Some(&dir), four());
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "opencode", "amplifier"]
+        );
+        assert_eq!(s.coding_cli.known_providers, Some(four()));
+
+        // The user disables `opencode` (enabledProviders minus the id).
+        let merged = store
+            .patch(&json!({ "codingCli": { "enabledProviders": ["claude", "codex", "amplifier"] } }))
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.coding_cli.enabled_providers,
+            vec!["claude", "codex", "amplifier"]
+        );
+
+        // Boot 2: the manifest is "invalidated" (scan no longer discovers
+        // opencode). Nothing new is discovered, so the persisted lists are
+        // served AS-IS — the disabled choice is untouched, the known list does
+        // not shrink.
+        let store = SettingsStore::load(
+            Some(&dir),
+            ["claude", "codex", "amplifier"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "amplifier"]
+        );
+        assert_eq!(s.coding_cli.known_providers, Some(four()));
+
+        // Boot 3: the manifest is RESTORED (opencode re-discovered) PLUS a
+        // genuinely new `kimi` appears. `opencode` is already KNOWN, so the
+        // migration must NOT re-enable it — the explicit disabled choice wins
+        // — while `kimi` is new and therefore appended AND auto-enabled. (The
+        // remaining enabled set is deliberately NOT exactly `["claude",
+        // "codex"]` so the legacy-default migration,
+        // `server/settings-migrate.ts:17-49`, correctly does not fire — same
+        // as the original.)
+        let store = SettingsStore::load(
+            Some(&dir),
+            ["claude", "codex", "opencode", "amplifier", "kimi"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let s = store.get().await;
+        assert_eq!(
+            s.coding_cli.enabled_providers,
+            vec!["claude", "codex", "amplifier", "kimi"],
+            "kimi auto-enabled; opencode NOT re-enabled (user choice wins)"
+        );
+        assert_eq!(
+            s.coding_cli.known_providers,
+            Some(
+                ["claude", "codex", "opencode", "amplifier", "kimi"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            )
+        );
+        // ... and the migration persisted exactly that outcome.
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["settings"]["codingCli"]["enabledProviders"],
+            json!(["claude", "codex", "amplifier", "kimi"])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn valid5() -> Vec<String> {
         ["claude", "codex", "gemini", "kimi", "opencode"]
             .iter()
@@ -2354,6 +2562,114 @@ mod tests {
             validate_patch(&json!({ "panes": { "defaultNewPane": "terminal" } }), &v).is_some()
         );
         assert!(validate_patch(&json!({ "panes": { "defaultNewPane": "editor" } }), &v).is_none());
+    }
+
+    /// EXT-04: the `extensions` patch sub-schema is checked with the SAME zod
+    /// v4 issue shapes the other sections already pin (`expected`-first
+    /// `invalid_type`, strict `unrecognized_keys`), in schema key order
+    /// (extensions comes after editor, before network; the top-level
+    /// strict-object issue still lands LAST). Before this, `extensions` was
+    /// only top-level-whitelisted: a wrong-typed `disabled` slipped past
+    /// `validate_patch` and died in the final `serde_json::from_value` with a
+    /// shapeless `{"error":"Invalid request","details":[]}` 400 — nothing
+    /// like the original's per-field zod details.
+    #[test]
+    fn extensions_patch_shape_validated_like_the_original() {
+        let v = valid5();
+
+        // Valid: absent, empty, and populated lists — and `disabled` items are
+        // NOT allowlist-checked (`z.string()`, not `CliProviderNameSchema`):
+        // non-CLI names and uninstalled names are both legal.
+        assert!(validate_patch(&json!({ "extensions": {} }), &v).is_none());
+        assert!(validate_patch(&json!({ "extensions": { "disabled": [] } }), &v).is_none());
+        assert!(
+            validate_patch(
+                &json!({ "extensions": { "disabled": ["notes", "claude", "not-a-provider"] } }),
+                &v
+            )
+            .is_none()
+        );
+
+        // Non-array `disabled` (incl. `null`) — E5 container shape.
+        let details =
+            validate_patch(&json!({ "extensions": { "disabled": null } }), &v).unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "expected": "array", "code": "invalid_type", "path": ["extensions", "disabled"], "message": "Invalid input: expected array, received null" },
+            ])
+        );
+        let details =
+            validate_patch(&json!({ "extensions": { "disabled": "notes" } }), &v).unwrap();
+        assert_eq!(
+            details[0]["message"],
+            "Invalid input: expected array, received string"
+        );
+
+        // Per-item invalid_type in item order; valid items silent (M5 shape).
+        let details = validate_patch(
+            &json!({ "extensions": { "disabled": [42, "ok", false] } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "expected": "string", "code": "invalid_type", "path": ["extensions", "disabled", 0], "message": "Invalid input: expected string, received number" },
+                { "expected": "string", "code": "invalid_type", "path": ["extensions", "disabled", 2], "message": "Invalid input: expected string, received boolean" },
+            ])
+        );
+
+        // `extensions` is `.strict()` — nested unrecognized key at
+        // path ["extensions"] (E3 shape), AFTER the field issues, and NOT
+        // swallowed when `disabled` is itself malformed.
+        let details = validate_patch(
+            &json!({ "extensions": { "disabled": [42], "bogus": 1 } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            details,
+            json!([
+                { "expected": "string", "code": "invalid_type", "path": ["extensions", "disabled", 0], "message": "Invalid input: expected string, received number" },
+                { "code": "unrecognized_keys", "keys": ["bogus"], "path": ["extensions"], "message": "Unrecognized key: \"bogus\"" },
+            ])
+        );
+
+        // The retained SPA's non-CLI settings save path writes
+        // `extensions.contentDefaults` with an `as any` cast
+        // (`src/components/ExtensionsView.tsx:383,387`); the original's strict
+        // schema rejects it, so those values never persist server-side.
+        let details = validate_patch(
+            &json!({ "extensions": { "contentDefaults": { "notes": { "url": "http://x" } } } }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            details,
+            json!([{ "code": "unrecognized_keys", "keys": ["contentDefaults"], "path": ["extensions"], "message": "Unrecognized key: \"contentDefaults\"" }])
+        );
+
+        // Non-object `extensions` — E4 container shape.
+        let details = validate_patch(&json!({ "extensions": "x" }), &v).unwrap();
+        assert_eq!(
+            details,
+            json!([{ "expected": "object", "code": "invalid_type", "path": ["extensions"], "message": "Invalid input: expected object, received string" }])
+        );
+
+        // Ordering: editor (schema key 10) precedes extensions (key 12); the
+        // TOP-LEVEL strict issue is still appended last.
+        let details = validate_patch(
+            &json!({ "extensions": { "disabled": "x" }, "editor": { "externalEditor": "bogus" }, "zzz": 1 }),
+            &v,
+        )
+        .unwrap();
+        assert_eq!(details[0]["code"], "invalid_value");
+        assert_eq!(details[1]["code"], "invalid_type");
+        assert_eq!(
+            details[2],
+            json!({ "code": "unrecognized_keys", "keys": ["zzz"], "path": [], "message": "Unrecognized key: \"zzz\"" })
+        );
     }
 
     fn uuid_like() -> String {
