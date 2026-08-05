@@ -926,19 +926,21 @@ async fn handle_client_text(
             )
             .await
         }
-        // OpenCode terminal-mode live tracking is deferred (the legacy lane
-        // is SSE-driven off the shared `opencode serve` sidecar, which
-        // terminal panes on this server do not run). The list contract is
-        // still answered — legacy's `OpencodePhase` only has `busy`, so "no
-        // records" IS the correct idle-state response shape.
+        // Task 8 (opencode-attention-bell): the list is now hub-backed —
+        // live tracker state, same reconnect-seeding contract as the other
+        // three families (per-terminal `completionSeq` completions).
         ClientMessage::OpencodeActivityList(list) => {
+            let (terminals, latest) = match &state.activity {
+                Some(hub) => hub.opencode_list(),
+                None => (Vec::new(), Vec::new()),
+            };
             send(
                 ws_tx,
                 &ServerMessage::OpencodeActivityListResponse(
                     freshell_protocol::OpencodeActivityListResponse {
                         request_id: list.request_id.clone(),
-                        terminals: Vec::new(),
-                        latest_turn_completions: Some(Vec::new()),
+                        terminals,
+                        latest_turn_completions: Some(latest),
                     },
                 ),
             )

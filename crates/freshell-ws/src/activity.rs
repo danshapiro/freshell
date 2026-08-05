@@ -42,11 +42,13 @@ use freshell_activity::amplifier::{
 use freshell_activity::claude::ClaudeActivityTracker;
 use freshell_activity::codex::CodexActivityTracker;
 use freshell_activity::idle::{IdleGate, IdleGatePhase};
+use freshell_activity::opencode::{OpencodeActivityTracker, OpencodeStatus};
 use freshell_activity::TrackerEffect;
 use freshell_protocol::{
     AgentProvider, AmplifierActivityRecord, AmplifierActivityUpdated, ClaudeActivityRecord,
-    ClaudeActivityUpdated, CodexActivityRecord, CodexActivityUpdated, ServerMessage, TerminalIdle,
-    TerminalIdleReason, TerminalTurnComplete, TurnCompletionSnapshot,
+    ClaudeActivityUpdated, CodexActivityRecord, CodexActivityUpdated, OpencodeActivityRecord,
+    OpencodeActivityUpdated, ServerMessage, TerminalIdle, TerminalIdleReason, TerminalTurnComplete,
+    TurnCompletionSnapshot,
 };
 use freshell_terminal::ActivityEvent;
 
@@ -154,6 +156,64 @@ enum HubEvent {
         request_id: String,
         requested: bool,
     },
+    /// Task 8: bind an opencode terminal's adopted session identity
+    /// (hub-task emission, mirror of `CodexBind`; Task 10 wires the
+    /// producers).
+    OpencodeBind {
+        terminal_id: String,
+        session_id: String,
+    },
+    /// Task 8: one generation-stamped opencode SSE-lane event (Task 9's
+    /// lane is the producer; hub-level tests inject directly).
+    /// `generation` is the hub-issued attach generation the ingress guard
+    /// matches against `opencode_lanes`; `cycle`/`stream` guard intra-lane
+    /// reconnect staleness inside the tracker.
+    /// dead_code: until Task 9 lands, hub-level tests are the only producer.
+    #[allow(dead_code)]
+    OpencodeLane {
+        terminal_id: String,
+        generation: u64,
+        cycle: u64,
+        stream: u64,
+        event: OpencodeLaneEvent,
+    },
+}
+
+/// The opencode SSE lane's event vocabulary (Task 9 produces these from the
+/// per-pane sidecar's `/event` stream + `/session/status` snapshots; the hub
+/// routes them into the pure `OpencodeActivityTracker`).
+/// dead_code: until Task 9 lands, hub-level tests are the only producer.
+#[allow(dead_code)]
+pub(crate) enum OpencodeLaneEvent {
+    /// `/session/status` snapshot (absence == idle).
+    Snapshot {
+        statuses: Vec<(String, OpencodeStatus)>,
+    },
+    /// `session.created` — folds the parentID chain into the root map.
+    SessionCreated {
+        session_id: String,
+        parent_id: Option<String>,
+    },
+    /// `session.status` edge (busy | retry | idle).
+    Status {
+        session_id: String,
+        status: OpencodeStatus,
+    },
+    /// `session.idle` — the deprecated twin of `session.status{idle}`.
+    SessionIdle { session_id: String },
+    /// `session.error` (and Task 9's abort-marked `message.updated`,
+    /// translated into this same shape).
+    SessionError {
+        session_id: String,
+        error_name: String,
+    },
+    /// `permission.asked` — the turn pauses on a human.
+    PermissionAsked {
+        session_id: String,
+        permission_id: String,
+    },
+    /// `permission.replied` — the pause ends.
+    PermissionReplied { permission_id: String },
 }
 
 struct AmplifierLane {
@@ -194,6 +254,7 @@ struct HubInner {
     claude: ClaudeActivityTracker,
     codex: CodexActivityTracker,
     amplifier: AmplifierActivityTracker,
+    opencode: OpencodeActivityTracker,
     idle: IdleGate,
     /// terminal id → mode, for every tracked CLI terminal.
     modes: HashMap<String, String>,
@@ -202,6 +263,12 @@ struct HubInner {
     lane_retries: HashMap<String, LaneRetry>,
     codex_lanes: HashMap<String, CodexLane>,
     codex_rollout_locator: Option<CodexRolloutLocator>,
+    /// Task 8/9: terminal id → (hub-issued attach generation, lane task).
+    /// The `OpencodeLane` ingress guard drops any event whose stamped
+    /// generation doesn't match the CURRENT entry; Exit removes the entry
+    /// so post-exit stragglers fail the match too. Task 9's SSE lane
+    /// registry populates this for real; hub-level tests insert dummies.
+    opencode_lanes: HashMap<String, (u64, tokio::task::JoinHandle<()>)>,
 }
 
 /// Cloneable handle to the hub (stored on `WsState`).
@@ -322,6 +389,51 @@ impl ActivityHub {
             request_id: request_id.to_string(),
             requested,
         });
+    }
+
+    /// Task 8: bind an opencode terminal's session identity into the
+    /// activity tracker (SQLite locator / TUI rebind plugin — Task 10
+    /// wires the producers). Channel-deferred (mirror of
+    /// `bind_codex_session`) so all frame emission stays on the hub task.
+    pub fn bind_opencode_session(&self, terminal_id: &str, session_id: &str) {
+        let _ = self.tx.send(HubEvent::OpencodeBind {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+
+    /// Task 8: generation-stamped SSE-lane ingress (Task 9's lane is the
+    /// caller). Channel-deferred like every other producer — the
+    /// single-emitter frame-ordering invariant.
+    /// dead_code: until Task 9 lands, hub-level tests are the only caller.
+    #[allow(dead_code)]
+    pub(crate) fn note_opencode_lane_event(
+        &self,
+        terminal_id: &str,
+        generation: u64,
+        cycle: u64,
+        stream: u64,
+        event: OpencodeLaneEvent,
+    ) {
+        let _ = self.tx.send(HubEvent::OpencodeLane {
+            terminal_id: terminal_id.to_string(),
+            generation,
+            cycle,
+            stream,
+            event,
+        });
+    }
+
+    /// Hub-level episode tests register a dummy `opencode_lanes` entry so
+    /// their injected lane events pass the generation guard without
+    /// spawning a real SSE lane (Task 9 owns the real registry).
+    #[cfg(test)]
+    fn register_opencode_lane_for_tests(&self, terminal_id: &str, generation: u64) {
+        let mut inner = self.inner.lock().expect("activity hub lock");
+        inner.opencode_lanes.insert(
+            terminal_id.to_string(),
+            (generation, tokio::spawn(async {})),
+        );
     }
 
     /// Install the resume-time rollout locator (called once from
@@ -471,6 +583,15 @@ impl ActivityHub {
         (inner.codex.list(), inner.codex.list_latest_completions())
     }
 
+    /// `opencode.activity.list` state.
+    pub fn opencode_list(&self) -> (Vec<OpencodeActivityRecord>, Vec<TurnCompletionSnapshot>) {
+        let inner = self.inner.lock().expect("activity hub lock");
+        (
+            inner.opencode.list(),
+            inner.opencode.list_latest_completions(),
+        )
+    }
+
     /// `amplifier.activity.list` state.
     pub fn amplifier_list(&self) -> (Vec<AmplifierActivityRecord>, Vec<TurnCompletionSnapshot>) {
         let inner = self.inner.lock().expect("activity hub lock");
@@ -612,6 +733,85 @@ impl ActivityHub {
                 };
                 self.emit(frames);
             }
+            HubEvent::OpencodeBind {
+                terminal_id,
+                session_id,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = inner.opencode.bind_session(&terminal_id, &session_id, at);
+                    opencode_frames(&mut inner.idle, effects)
+                };
+                self.emit(frames);
+            }
+            HubEvent::OpencodeLane {
+                terminal_id,
+                generation,
+                cycle,
+                stream,
+                event,
+            } => {
+                let at = now_ms();
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    // Attach-generation guard (A6): tokio `abort()` is asynchronous and
+                    // never retracts already-enqueued mpsc messages — a replaced lane can
+                    // legally enqueue events AFTER its successor's attach. Drop anything
+                    // not stamped with the CURRENT lane generation (Exit removes the map
+                    // entry, so post-exit stragglers drop too). cycle/stream still guard
+                    // intra-lane reconnect staleness inside the tracker.
+                    if inner.opencode_lanes.get(&terminal_id).map(|(g, _)| *g) != Some(generation) {
+                        return;
+                    }
+                    let effects =
+                        match event {
+                            OpencodeLaneEvent::Snapshot { statuses } => inner
+                                .opencode
+                                .note_snapshot(&terminal_id, &statuses, cycle, stream, at),
+                            OpencodeLaneEvent::SessionCreated {
+                                session_id,
+                                parent_id,
+                            } => inner.opencode.note_session_created(
+                                &terminal_id,
+                                &session_id,
+                                parent_id.as_deref(),
+                                at,
+                            ),
+                            OpencodeLaneEvent::Status { session_id, status } => inner
+                                .opencode
+                                .note_status(&terminal_id, &session_id, status, cycle, stream, at),
+                            OpencodeLaneEvent::SessionIdle { session_id } => inner
+                                .opencode
+                                .note_session_idle(&terminal_id, &session_id, cycle, stream, at),
+                            OpencodeLaneEvent::SessionError {
+                                session_id,
+                                error_name,
+                            } => inner.opencode.note_error(
+                                &terminal_id,
+                                &session_id,
+                                &error_name,
+                                cycle,
+                                stream,
+                                at,
+                            ),
+                            OpencodeLaneEvent::PermissionAsked {
+                                session_id,
+                                permission_id,
+                            } => inner.opencode.note_permission_asked(
+                                &terminal_id,
+                                &session_id,
+                                &permission_id,
+                                at,
+                            ),
+                            OpencodeLaneEvent::PermissionReplied { permission_id } => inner
+                                .opencode
+                                .note_permission_replied(&terminal_id, &permission_id, at),
+                        };
+                    opencode_frames(&mut inner.idle, effects)
+                };
+                self.emit(frames);
+            }
         }
     }
 
@@ -655,6 +855,17 @@ impl ActivityHub {
                             );
                             let (mut f, _force) = amplifier_frames(&mut inner.idle, effects);
                             frames.append(&mut f);
+                        }
+                        // Task 8: opencode tracking starts at create; the
+                        // SSE lane attach itself is Task 9/10.
+                        "opencode" => {
+                            inner.modes.insert(terminal_id.clone(), mode.clone());
+                            let effects = inner.opencode.track_terminal(
+                                &terminal_id,
+                                resume_session_id.as_deref(),
+                                at,
+                            );
+                            frames.extend(opencode_frames(&mut inner.idle, effects));
                         }
                         // Gemini/Kimi and every other mode: status-inert.
                         _ => {}
@@ -743,6 +954,9 @@ impl ActivityHub {
                             let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
                             frames
                         }
+                        // Task 8: SSE-driven — PTY bytes carry no protocol
+                        // signal for opencode, NO heuristic bells.
+                        "opencode" => Vec::new(),
                         _ => Vec::new(),
                     }
                 };
@@ -772,6 +986,9 @@ impl ActivityHub {
                             inner.amplifier.note_output(&terminal_id, at);
                             Vec::new()
                         }
+                        // Task 8: SSE-driven — PTY bytes carry no protocol
+                        // signal for opencode, NO heuristic bells.
+                        "opencode" => Vec::new(),
                         _ => Vec::new(),
                     }
                 };
@@ -789,9 +1006,17 @@ impl ActivityHub {
                     // Task 7: a pane blocked on an approval whose process dies must
                     // ring even after its 2s boundary already rang, so pending
                     // approvals count as engagement too.
+                    // D4: candidate/ambiguous opencode ownership never death-rings —
+                    // even when a candidate-armed permission pause is pending
+                    // (residual D8(i)). `blocks_death_bell` is false for terminals
+                    // the opencode tracker doesn't know, so claude/codex/amplifier
+                    // behavior is unchanged.
+                    let opencode_death_eligible = !inner.opencode.blocks_death_bell(&terminal_id);
                     let ring_death_bell = spontaneous
-                        && (inner.idle.is_engaged(&terminal_id)
-                            || inner.codex.has_pending_approvals(&terminal_id));
+                        && ((inner.idle.is_engaged(&terminal_id) && opencode_death_eligible)
+                            || inner.codex.has_pending_approvals(&terminal_id)
+                            || (inner.opencode.has_pending_permissions(&terminal_id)
+                                && opencode_death_eligible));
                     let mut frames = Vec::new();
                     if ring_death_bell {
                         // Spontaneous death while engaged: same frame, same reason —
@@ -817,6 +1042,13 @@ impl ActivityHub {
                         inner.lanes.remove(&terminal_id);
                         inner.lane_retries.remove(&terminal_id);
                         inner.codex_lanes.remove(&terminal_id);
+                        if let Some((_, lane_task)) = inner.opencode_lanes.remove(&terminal_id) {
+                            // Stop the SSE lane with its pane; the map removal
+                            // ALSO makes any already-enqueued stragglers fail
+                            // the generation guard (abort never retracts
+                            // enqueued events).
+                            lane_task.abort();
+                        }
                         let tracker_frames = match mode.as_str() {
                             "claude" => {
                                 let effects = inner.claude.note_exit(&terminal_id);
@@ -831,6 +1063,10 @@ impl ActivityHub {
                                 let effects = inner.amplifier.note_exit(&terminal_id);
                                 let (frames, _force) = amplifier_frames(&mut inner.idle, effects);
                                 frames
+                            }
+                            "opencode" => {
+                                let effects = inner.opencode.note_exit(&terminal_id);
+                                opencode_frames(&mut inner.idle, effects)
                             }
                             _ => Vec::new(),
                         };
@@ -1125,6 +1361,8 @@ impl ActivityHub {
             let amplifier = inner.amplifier.expire(now);
             let (mut f, force_reads) = amplifier_frames(&mut inner.idle, amplifier);
             frames.append(&mut f);
+            let opencode = inner.opencode.expire(now);
+            frames.extend(opencode_frames(&mut inner.idle, opencode));
             for emission in inner.idle.expire(now) {
                 frames.push(ServerMessage::TerminalIdle(TerminalIdle {
                     terminal_id: emission.terminal_id,
@@ -1219,6 +1457,7 @@ fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
         inner.claude.next_deadline(),
         inner.codex.next_deadline(),
         inner.amplifier.next_deadline(),
+        inner.opencode.next_deadline(),
         inner.idle.next_deadline(),
         inner
             .lane_retries
@@ -1336,6 +1575,60 @@ fn codex_frames(
         }
     }
     (frames, force_reads)
+}
+
+/// Map opencode tracker effects onto wire frames + idle-gate interactions.
+/// No force-reads: the opencode lane is SSE-push, not file-tail.
+fn opencode_frames(
+    idle: &mut IdleGate,
+    effects: Vec<TrackerEffect<OpencodeActivityRecord>>,
+) -> Vec<ServerMessage> {
+    let mut frames = Vec::new();
+    for effect in effects {
+        match effect {
+            TrackerEffect::Changed { upsert, remove } => {
+                // remove -> note_exit clears gate state; the boundary that FOLLOWS
+                // in the same batch re-arms grace-only (D7 — the Node emitter's
+                // "activityRemove followed by turnComplete" contract). Busy is
+                // the ONLY opencode phase on the wire, so every upsert maps to
+                // IdleGatePhase::Busy.
+                note_changed_to_gate(
+                    idle,
+                    upsert
+                        .iter()
+                        .map(|r| (r.terminal_id.as_str(), IdleGatePhase::Busy)),
+                    &remove,
+                );
+                frames.push(ServerMessage::OpencodeActivityUpdated(
+                    OpencodeActivityUpdated { remove, upsert },
+                ));
+            }
+            TrackerEffect::TurnComplete {
+                terminal_id,
+                session_id,
+                at,
+                completion_seq,
+            } => {
+                idle.note_turn_boundary(&terminal_id, at);
+                frames.push(turn_complete_frame(
+                    AgentProvider::Opencode,
+                    terminal_id,
+                    session_id,
+                    at,
+                    completion_seq,
+                ));
+            }
+            TrackerEffect::AttentionBoundary { terminal_id, at } => {
+                // Arms the bell WITHOUT a frame — a permission pause is not a
+                // turn end. Effect order guarantees the record removal was
+                // processed first, so the boundary arms.
+                idle.note_turn_boundary(&terminal_id, at);
+            }
+            // The opencode tracker never emits force-reads (SSE lane, no tailer).
+            TrackerEffect::ForceRead { .. } => {}
+        }
+    }
+    frames
 }
 
 /// Amplifier effects additionally surface force-read requests (the lane
@@ -3826,5 +4119,769 @@ mod tests {
             .await
             .expect("death bell: pending approvals count as engagement");
         assert_eq!(second["terminalId"], "t1");
+    }
+
+    // ---- OpenCode lane (attention bell, Task 8) ----
+
+    /// Shared setup: an opencode terminal created with a resume identity
+    /// ("ses-root"), a dummy generation-1 lanes-map entry, and a gen-1 busy
+    /// edge for the known root — CONFIRMED busy (`KnownBusy`).
+    async fn busy_opencode_terminal(
+        hub: &ActivityHub,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+    ) {
+        observer_send(
+            hub,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: Some("ses-root".into()),
+                at: 1_000,
+            },
+        );
+        hub.register_opencode_lane_for_tests("t-oc", 1); // dummy lanes-map entry: generation 1 passes ingress
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-root".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        let frame = next_frame_matching(rx, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(frame.is_some(), "expected the busy upsert");
+    }
+
+    /// Assert that NOTHING attention-relevant (`terminal.turn.complete` or
+    /// `terminal.idle`) is broadcast within `timeout_ms`. Unlike two
+    /// sequential `next_frame_of_type(..).is_none()` waits, a single pass
+    /// cannot mask one frame type by consuming it while waiting for the
+    /// other.
+    async fn assert_no_attention_frames(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        timeout_ms: u64,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(frame)) => {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&frame).expect("frame json");
+                    assert!(
+                        value["type"] != "terminal.turn.complete"
+                            && value["type"] != "terminal.idle",
+                        "expected attention silence, got {frame}"
+                    );
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// D7: the owned root's idle edge ends the turn — remove frame, then
+    /// terminal.turn.complete{provider:"opencode"}, then exactly ONE
+    /// terminal.idle{reason:"grace"} after the 2s grace. The deprecated
+    /// `session.idle` twin landing second mints nothing (structural dedupe,
+    /// D2: the first edge lands the machine in Quiet).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_completed_turn_rings_once_after_grace() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
+            .await
+            .expect("turn complete for the owned root's idle edge");
+        assert_eq!(complete["provider"], "opencode");
+        assert_eq!(complete["terminalId"], "t-oc");
+        assert_eq!(complete["sessionId"], "ses-root");
+
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("exactly one terminal.idle after the grace");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+
+        // The deprecated twin idle edge lands second: nothing further.
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        assert_no_attention_frames(&mut rx, 1_500).await;
+    }
+
+    /// D1: a human abort (`MessageAbortedError` on the owned root's own
+    /// turn) clears busy silently — no completion, no bell, even after the
+    /// grace would have elapsed, and the double idle edge stays silent too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_abort_stays_silent() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionError {
+                session_id: "ses-root".into(),
+                error_name: "MessageAbortedError".into(),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        // 3_500ms covers the 2s grace: a wrongly armed bell would have rung.
+        assert_no_attention_frames(&mut rx, 3_500).await;
+    }
+
+    /// D1: failed turns ring like completed turns — a non-abort error is a
+    /// no-op and the following idle edge completes the turn. A trailing
+    /// error on the quiet state mints nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_failed_turn_rings() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionError {
+                session_id: "ses-root".into(),
+                error_name: "UnknownError".into(),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
+            .await
+            .expect("a failed turn still completes");
+        assert_eq!(complete["provider"], "opencode");
+        assert_eq!(complete["terminalId"], "t-oc");
+
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("one terminal.idle for the failed turn");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+
+        // Trailing error after the idle edge: quiet state, nothing minted.
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionError {
+                session_id: "ses-root".into(),
+                error_name: "UnknownError".into(),
+            },
+        );
+        assert_no_attention_frames(&mut rx, 1_500).await;
+    }
+
+    /// D3: (a) an unanswered permission ask demotes the record and rings
+    /// exactly once after the grace; (b) an ask answered within the grace
+    /// restores busy and stays silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_permission_pause_rings_once_and_reply_within_grace_is_silent() {
+        // (a) unanswered ask: one bell after the grace, never a second.
+        let (hub_a, mut rx_a) = hub();
+        busy_opencode_terminal(&hub_a, &mut rx_a).await;
+        hub_a.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-root".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        let removed = next_frame_matching(&mut rx_a, "opencode.activity.updated", 1_500, |v| {
+            v["remove"][0] == "t-oc"
+        })
+        .await;
+        assert!(removed.is_some(), "the pause demotes the busy record (D7)");
+        let idle = next_frame_of_type(&mut rx_a, "terminal.idle", 3_500)
+            .await
+            .expect("the unanswered ask rings after the grace");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx_a, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one bell per pause"
+        );
+
+        // (b) ask answered within the grace: busy restored, total silence.
+        let (hub_b, mut rx_b) = hub();
+        busy_opencode_terminal(&hub_b, &mut rx_b).await;
+        hub_b.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-root".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        hub_b.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionReplied {
+                permission_id: "perm-1".into(),
+            },
+        );
+        let resumed = next_frame_matching(&mut rx_b, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(resumed.is_some(), "the reply restores the busy record");
+        assert!(
+            next_frame_of_type(&mut rx_b, "terminal.idle", 3_500)
+                .await
+                .is_none(),
+            "an ask answered within the grace must stay silent"
+        );
+    }
+
+    /// D3: children CAN ask — the permission event is stamped with the
+    /// CHILD session id while the parent turn blocks on it, so the asker
+    /// root-resolves onto the owned root and the pause rings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_child_permission_asked_arms_via_root_resolution() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionCreated {
+                session_id: "ses-child".into(),
+                parent_id: Some("ses-root".into()),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-child".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("the child's ask root-resolves and pauses the root (D3)");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one bell for the child's ask"
+        );
+    }
+
+    /// D3 candidate arming: a first-turn ask (no resume identity, the busy
+    /// session is an unconfirmed CANDIDATE) still rings. The turn then ends
+    /// mid-pause and identity proof arrives — the DEFERRED completion is
+    /// swallowed (the pause was the episode's bell).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_first_turn_permission_pause_rings_under_candidate() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: None,
+                at: 1_000,
+            },
+        );
+        hub.register_opencode_lane_for_tests("t-oc", 1);
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-new".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        let busy = next_frame_matching(&mut rx, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(busy.is_some(), "candidate busy upsert");
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-new".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("candidate arming (D3): first-turn asks must ring");
+        assert_eq!(idle["terminalId"], "t-oc");
+
+        // Turn end mid-pause, then the identity proof: the deferred
+        // completion is swallowed — NO terminal.turn.complete.
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-new".into(),
+            },
+        );
+        hub.bind_opencode_session("t-oc", "ses-new");
+        assert_no_attention_frames(&mut rx, 1_500).await;
+    }
+
+    /// D1 + D3: an abort landing mid-pause force-emits the cancel — the
+    /// armed pause window dies with it, total silence even after the grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_mid_pause_abort_is_fully_silent() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-root".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionError {
+                session_id: "ses-root".into(),
+                error_name: "MessageAbortedError".into(),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        // 3_500ms covers the grace: the armed pause bell must be cancelled.
+        assert_no_attention_frames(&mut rx, 3_500).await;
+    }
+
+    /// D4: spontaneous death while KnownBusy rings IMMEDIATELY (no grace —
+    /// a dead process emits nothing further, so nothing could cancel it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_spontaneous_death_while_busy_rings_immediately() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        // Well inside the 2s grace window: proves the immediate path.
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+            .await
+            .expect("immediate death bell for a spontaneous exit while busy");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one terminal.idle for the death"
+        );
+    }
+
+    /// D4: candidate/ambiguous ownership never death-rings — even with a
+    /// candidate-armed pause pending (residual D8(i)); an idle quiet pane is
+    /// silent; a freshell-initiated kill (spontaneous=false) is silent even
+    /// mid-turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_death_while_candidate_or_idle_is_silent_and_freshell_kill_is_silent() {
+        // (a) candidate busy: unconfirmed identity stays silent.
+        let (hub_a, mut rx_a) = hub();
+        observer_send(
+            &hub_a,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: None,
+                at: 1_000,
+            },
+        );
+        hub_a.register_opencode_lane_for_tests("t-oc", 1);
+        hub_a.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-new".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        let busy = next_frame_matching(&mut rx_a, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(busy.is_some(), "candidate busy upsert");
+        observer_send(
+            &hub_a,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx_a, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a candidate death must stay silent (D4)"
+        );
+
+        // (b) candidate + candidate-armed pause pending: STILL silent
+        // (residual D8(i)); 3_500ms also proves the armed pause window died
+        // with the pane instead of ringing at the grace deadline.
+        let (hub_b, mut rx_b) = hub();
+        observer_send(
+            &hub_b,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: None,
+                at: 1_000,
+            },
+        );
+        hub_b.register_opencode_lane_for_tests("t-oc", 1);
+        hub_b.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-new".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        let busy = next_frame_matching(&mut rx_b, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(busy.is_some(), "candidate busy upsert");
+        hub_b.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-new".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        observer_send(
+            &hub_b,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx_b, "terminal.idle", 3_500)
+                .await
+                .is_none(),
+            "a candidate-armed pause must not death-ring (residual D8(i))"
+        );
+
+        // (c) quiet idle pane: a spontaneous exit is not an attention event.
+        let (hub_c, mut rx_c) = hub();
+        observer_send(
+            &hub_c,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: Some("ses-root".into()),
+                at: 1_000,
+            },
+        );
+        observer_send(
+            &hub_c,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx_c, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a spontaneous exit while idle must stay silent"
+        );
+
+        // (d) freshell-initiated kill mid-turn: silent.
+        let (hub_d, mut rx_d) = hub();
+        busy_opencode_terminal(&hub_d, &mut rx_d).await;
+        observer_send(
+            &hub_d,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: false,
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx_d, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "a requested exit must never ring the death bell"
+        );
+    }
+
+    /// D4: a pane blocked on a permission whose process dies spontaneously
+    /// rings immediately — pending permissions count as engagement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_death_during_pause_rings() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::PermissionAsked {
+                session_id: "ses-root".into(),
+                permission_id: "perm-1".into(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: now_ms(),
+                spontaneous: true,
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+            .await
+            .expect("death during a pending permission pause must ring (D4)");
+        assert_eq!(idle["terminalId"], "t-oc");
+        // Exactly one: the exit teardown also cancels the armed pause window.
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+                .await
+                .is_none(),
+            "exactly one bell for the death"
+        );
+    }
+
+    /// D5: a child's idle mid-parent-turn is suppressed — the busy record
+    /// survives and only the parent's own idle edge ends the turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_child_idle_mid_parent_turn_does_not_ring() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await;
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionCreated {
+                session_id: "ses-child".into(),
+                parent_id: Some("ses-root".into()),
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-child".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-child".into(),
+            },
+        );
+        // 3_500ms covers the grace: a wrongly armed bell would have rung.
+        assert_no_attention_frames(&mut rx, 3_500).await;
+        // The busy record survives the child's idle.
+        let (records, _) = hub.opencode_list();
+        assert_eq!(records.len(), 1, "the parent's busy record must survive");
+        assert_eq!(records[0].terminal_id, "t-oc");
+
+        // The parent's own idle edge ends the turn: one completion, one bell.
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
+            .await
+            .expect("the parent's own idle edge completes the turn");
+        assert_eq!(complete["provider"], "opencode");
+        assert_eq!(complete["terminalId"], "t-oc");
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("one bell for the parent's turn end");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one bell"
+        );
+    }
+
+    /// A6: a respawn re-registers the lane under a NEW generation — events
+    /// still stamped with the replaced generation are dropped WHOLE at
+    /// ingress (tokio `abort()` never retracts already-enqueued events);
+    /// current-generation events flow normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn respawn_drops_stale_lane_events() {
+        let (hub, mut rx) = hub();
+        busy_opencode_terminal(&hub, &mut rx).await; // generation 1 registered + gen-1 busy accepted
+
+        // The respawn's attach REPLACES the map entry under generation 2.
+        hub.register_opencode_lane_for_tests("t-oc", 2);
+
+        // Stragglers from the replaced lane: a busy for a DIFFERENT session
+        // (would demote to Ambiguous + emit frames if processed) and the
+        // turn's idle edge (would mint turn.complete + the bell).
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-stale".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-root".into(),
+            },
+        );
+        // NO upsert, NO terminal.turn.complete, NO terminal.idle — nothing
+        // at all may be broadcast (3_500ms covers the would-be grace bell).
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(3_500), rx.recv()).await;
+        assert!(
+            frame.is_err(),
+            "stale-generation lane events must be dropped whole, got {frame:?}"
+        );
+
+        // A gen-2 snapshot flows normally: no busy roots -> the still-busy
+        // turn completes and rings.
+        hub.note_opencode_lane_event(
+            "t-oc",
+            2,
+            1,
+            1,
+            OpencodeLaneEvent::Snapshot { statuses: vec![] },
+        );
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
+            .await
+            .expect("current-generation events flow normally");
+        assert_eq!(complete["provider"], "opencode");
+        assert_eq!(complete["terminalId"], "t-oc");
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("the completed turn rings after the grace");
+        assert_eq!(idle["terminalId"], "t-oc");
     }
 }
