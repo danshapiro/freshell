@@ -212,6 +212,23 @@ describe('browserPreferencesPersistence', () => {
     expect('agentChat' in rehydrated).toBe(false)
   })
 
+  it('round-trips terminal.fontSize through localStorage', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      terminal: { fontSize: 22 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved.settings.terminal).toEqual({ fontSize: 22 })
+
+    // Rehydrate the way the settings slice does when the app boots after a restart.
+    const rehydrated = resolveLocalSettings(saved.settings)
+    expect(rehydrated.terminal.fontSize).toBe(22)
+  })
+
   it('does not persist freshAgent when set to defaults', () => {
     const store = createStore()
 
