@@ -397,6 +397,24 @@ mod tests {
         })
     }
 
+    /// A real `terminal.created` frame so a test can assert the IDENTITY
+    /// (`requestId`/`terminalId`) of what each connection receives — the
+    /// guard treats frames opaquely (`created_frame` above), but the TERM-04
+    /// two-clients contract is about one terminal identity reaching both
+    /// clients. Field set mirrors `handle_create`'s literal (terminal.rs).
+    fn terminal_created_frame(request_id: &str, terminal_id: &str) -> ServerMessage {
+        ServerMessage::TerminalCreated(freshell_protocol::TerminalCreated {
+            created_at: 1,
+            request_id: request_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            clear_codex_durability: None,
+            cwd: None,
+            notice: None,
+            restore_error: None,
+            session_ref: None,
+        })
+    }
+
     /// A FrameSink that records every frame it is handed.
     fn recording_sink() -> (FrameSink, Arc<Mutex<Vec<ServerMessage>>>) {
         let frames = Arc::new(Mutex::new(Vec::new()));
@@ -714,5 +732,166 @@ mod tests {
             d.begin("r1", &other, None, |_| true),
             DedupeDecision::Proceed
         ));
+    }
+
+    /// TERM-04 two-clients + delayed-response/reconnect scenario, pinned at
+    /// the guard seam where the outcome is decided: client A's create is
+    /// answered LATE (spawn still in flight), client B sends the SAME
+    /// requestId (two-clients-same-request), and client A's socket dies and
+    /// reconnects (a NEW sink) and re-drives the same createRequestId — all
+    /// before the first `terminal.created` exists. The checklist's "one PTY
+    /// PID, one terminal ID, one pane owner, one fixture launch record"
+    /// reduces at this layer to: exactly ONE `Proceed` for the whole
+    /// sequence (every downstream effect — the PTY spawn, the registry
+    /// record, the fixture launch — happens only behind that single
+    /// decision) and every live connection answering with the IDENTICAL
+    /// `terminal.created` frame.
+    #[test]
+    fn reconnect_and_second_client_during_delayed_create_get_one_frame_for_one_terminal() {
+        let d = CreateDedupe::default();
+        let (client_a_conn1, a_conn1_frames) = recording_sink();
+        let (client_b, b_frames) = recording_sink();
+        let (client_a_conn2, a_conn2_frames) = recording_sink();
+        let frame = terminal_created_frame("r1", "t1");
+
+        // Client A, connection 1: the original create; its response is
+        // delayed (spawn in flight). The ONLY Proceed this scenario yields.
+        let mut proceeds = 0;
+        if matches!(
+            d.begin("r1", &client_a_conn1, None, |_| true),
+            DedupeDecision::Proceed
+        ) {
+            proceeds += 1;
+        }
+        // Client B resends the same requestId while A's create is still
+        // unanswered: deduped into the in-flight window, never a respawn.
+        assert!(matches!(
+            d.begin("r1", &client_b, None, |_| true),
+            DedupeDecision::DuplicateInFlight
+        ));
+        // A's socket dies mid-delay; the reconnect (fresh sink) re-drives.
+        assert!(matches!(
+            d.begin("r1", &client_a_conn2, None, |_| true),
+            DedupeDecision::DuplicateInFlight
+        ));
+        // The delayed response still hasn't been written anywhere.
+        assert!(a_conn1_frames.lock().expect("frames").is_empty());
+        assert!(b_frames.lock().expect("frames").is_empty());
+        assert!(a_conn2_frames.lock().expect("frames").is_empty());
+
+        // The delayed create finally settles — its origin reply lands on the
+        // DEAD connection (dropped), while the guard forwards the ONE settled
+        // frame to both live waiters. Identical frame ⇒ the checklist's one
+        // requestId AND one terminalId for every client.
+        d.settle("r1", "t1", &frame, None, |_| true);
+        {
+            let b_got = b_frames.lock().expect("frames");
+            assert_eq!(b_got.len(), 1, "client B receives exactly one frame");
+            assert_eq!(b_got[0], frame);
+        }
+        {
+            let a2_got = a_conn2_frames.lock().expect("frames");
+            assert_eq!(
+                a2_got.len(),
+                1,
+                "client A's reconnect receives exactly one frame"
+            );
+            assert_eq!(a2_got[0], frame);
+        }
+        assert!(
+            a_conn1_frames.lock().expect("frames").is_empty(),
+            "the dead connection is the origin — the create path, not the \
+             waiter fan-out, owed it the reply it never read"
+        );
+
+        // Resends AFTER the settle (A's delayed response racing its already-
+        // sent reconnect resend; a later blind resend) replay the stored
+        // frame for EITHER live connection — same requestId, same terminalId,
+        // no respawn. The liveness probe stays live throughout.
+        for sink in [&client_a_conn2, &client_b] {
+            match d.begin("r1", sink, None, |_| true) {
+                DedupeDecision::DuplicateSettled(replayed) => assert_eq!(replayed, frame),
+                _ => panic!("post-settle resend must replay the stored frame"),
+            }
+        }
+        assert_eq!(
+            proceeds, 1,
+            "one Proceed for the whole two-clients/reconnect sequence ⇒ one spawn"
+        );
+        let map = d.entries.lock().expect("lock");
+        assert_eq!(
+            map.len(),
+            1,
+            "exactly one dedupe record remains, keyed by the one requestId"
+        );
+    }
+
+    /// The failure half of the delayed-response/reconnect scenario: the
+    /// in-flight create exits NON-settled (spawn failed / cancelled /
+    /// shutdown) after client B and client A's reconnect have both re-sent
+    /// the requestId. Every waiter fails LOUD with a matching requestId (so
+    /// the frozen client's requestId match at TerminalView.tsx:3995-3999
+    /// trips its retry ladder instead of wedging in 'creating'), the
+    /// sentinel is gone, and of the two same-requestId retries EXACTLY ONE
+    /// becomes the fresh create — the other folds into the new in-flight
+    /// window as its waiter and settles on the new terminal.
+    #[test]
+    fn failed_delayed_create_fails_every_waiter_loud_then_one_retry_wins() {
+        let d = CreateDedupe::default();
+        let (origin, origin_frames) = recording_sink();
+        let (client_b, b_frames) = recording_sink();
+        let (client_a_reconnect, a_reconnect_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, None, |_| true);
+        let _ = d.begin("r1", &client_b, None, |_| true);
+        let _ = d.begin("r1", &client_a_reconnect, None, |_| true);
+
+        d.clear_if_in_flight("r1");
+        for frames in [&b_frames, &a_reconnect_frames] {
+            let got = frames.lock().expect("frames");
+            assert_eq!(
+                got.len(),
+                1,
+                "each waiting client receives exactly one fail-loud error"
+            );
+            assert!(matches!(
+                &got[0],
+                ServerMessage::Error(err)
+                    if err.code == ErrorCode::PtySpawnFailed
+                        && err.request_id.as_deref() == Some("r1")
+            ));
+        }
+        assert!(
+            origin_frames.lock().expect("frames").is_empty(),
+            "the origin's own error rides the create path, never the waiter \
+             fan-out"
+        );
+
+        // Client B's same-requestId retry proceeds as the fresh create...
+        assert!(matches!(
+            d.begin("r1", &client_b, None, |_| true),
+            DedupeDecision::Proceed
+        ));
+        // ...and A's reconnect retry folds into B's in-flight window.
+        assert!(matches!(
+            d.begin("r1", &client_a_reconnect, None, |_| true),
+            DedupeDecision::DuplicateInFlight
+        ));
+        let frame = terminal_created_frame("r1", "t2");
+        d.settle("r1", "t2", &frame, None, |_| true);
+        {
+            let got = a_reconnect_frames.lock().expect("frames");
+            assert_eq!(
+                got.len(),
+                2,
+                "fail-loud error, then the retry's settled frame"
+            );
+            assert_eq!(got[1], frame);
+        }
+        assert_eq!(
+            b_frames.lock().expect("frames").len(),
+            1,
+            "the retry's origin receives its created frame via the create \
+             path, never a second waiter copy"
+        );
     }
 }
