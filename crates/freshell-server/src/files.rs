@@ -1221,6 +1221,16 @@ mod tests {
         let r = resolve_user_path("C:\\Users");
         assert_eq!(r.display, "C:\\Users");
         assert_eq!(r.fs_path, None);
+        // FILE-03: the UNC share forms are likewise Windows-flavored and
+        // unaddressable without the WSL seam — the `\\wsl$` alias and a
+        // generic network share alike (win32-resolve still normalizes the
+        // display string; there is simply no native address).
+        for input in ["\\\\wsl$\\Ubuntu\\home\\dan", "\\\\server\\share\\dir"] {
+            let r = resolve_user_path(input);
+            assert_eq!(r.flavor, UserPathFlavor::Windows, "{input:?}");
+            assert_eq!(r.display, input, "{input:?}");
+            assert_eq!(r.fs_path, None, "{input:?}");
+        }
     }
 
     #[test]
@@ -1236,6 +1246,37 @@ mod tests {
             let r = resolve_user_path(input);
             assert_eq!(r.fs_path, None, "{input:?}");
         }
+    }
+
+    #[test]
+    fn resolve_user_path_wsl_dollar_unc_is_unaddressable_even_on_wsl() {
+        let _guard = env_lock();
+        // WSL env with WSL_DISTRO_NAME=Ubuntu — matching the distro named in
+        // the UNC does NOT rescue the `\\wsl$` share form: only `\\wsl` /
+        // `\\wsl.localhost` enter the converter's UNC branch (path.rs
+        // `match_wsl_unc`), matching the reference's
+        // `^\\wsl(?:\.localhost)?\\([^\\]+)(?:\\(.*))?$` exactly.
+        let _fixture = WslMountFixture::new();
+        let r = resolve_user_path("\\\\wsl$\\Ubuntu\\home\\dan");
+        assert_eq!(r.flavor, UserPathFlavor::Windows);
+        assert_eq!(r.display, "\\\\wsl$\\Ubuntu\\home\\dan");
+        assert_eq!(r.fs_path, None);
+        // The share ROOT still display-resolves (Node's UNC-root trailing
+        // separator) but stays unaddressable.
+        let r = resolve_user_path("\\\\wsl$\\Ubuntu");
+        assert_eq!(r.display, "\\\\wsl$\\Ubuntu\\");
+        assert_eq!(r.fs_path, None);
+        // Flavor predicates case-insensitive host side: an uppercase `WSL$`
+        // is likewise Windows-flavored and unaddressable.
+        let r = resolve_user_path("\\\\WSL$\\Ubuntu\\x");
+        assert_eq!(r.flavor, UserPathFlavor::Windows);
+        assert_eq!(r.display, "\\\\WSL$\\Ubuntu\\x");
+        assert_eq!(r.fs_path, None);
+        // Contrast: the canonical `\\wsl.localhost` form DOES convert to the
+        // distro root under the same env (no prefix-confusion between them).
+        let r = resolve_user_path("\\\\wsl.localhost\\Ubuntu\\home\\dan");
+        assert_eq!(r.display, "\\\\wsl.localhost\\Ubuntu\\home\\dan");
+        assert_eq!(r.fs_path, Some("/home/dan".to_string()));
     }
 
     #[test]
@@ -1532,6 +1573,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn sandbox_wsl_unc_converts_but_wsl_dollar_and_network_shares_fail_closed() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        let roots = vec!["/home".to_string()];
+        // FILE-03 no-prefix-confusion: the canonical WSL UNC converts to its
+        // native root and is judged against it (in-sandbox here)…
+        assert!(is_path_allowed(
+            "\\\\wsl.localhost\\Ubuntu\\home\\dan",
+            Some(&roots)
+        ));
+        // …while `\\wsl$` and generic `\\server\share` targets never convert,
+        // so their literal display strings fail closed against any absolute
+        // root — even though the same textual tail (`/home/dan`, `/home`)
+        // would have been in-sandbox as a native path (no cross-root access).
+        assert!(!is_path_allowed("\\\\wsl$\\Ubuntu\\home\\dan", Some(&roots)));
+        assert!(!is_path_allowed("\\\\server\\share\\home", Some(&roots)));
+    }
+
     // ---- read/stat/write (R-WIN4: sandbox + fs access via the converted path) ----
 
     // Intentional: env lock held across `.await` BY DESIGN (see above).
@@ -1603,6 +1663,84 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["exists"], false);
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn read_stat_complete_mkdir_treat_unc_shares_as_inert_on_wsl() {
+        let _guard = env_lock();
+        let _fixture = WslMountFixture::new();
+        // FILE-03: the `\\wsl$\<distro>` share form and generic network shares
+        // (`\\server\share`) never convert — even live on WSL — so every
+        // endpoint must leave the filesystem untouched (no prefix-confusion,
+        // no cross-root access, no literal backslash-named entries).
+        for target in ["\\\\wsl$\\Ubuntu\\home\\dan", "\\\\server\\share\\dir"] {
+            // read -> 404 ("File not found"): Node's toFilesystemPath
+            // fallthrough stats the literal display string, which exists
+            // nowhere (same pin as the off-WSL cases above).
+            let resp = read_file(
+                State(test_state()),
+                auth_headers(),
+                Query(PathQuery {
+                    path: Some(target.to_string()),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{target:?}");
+            // stat -> 200 { exists:false, … }.
+            let resp = stat_file(
+                State(test_state()),
+                auth_headers(),
+                Query(PathQuery {
+                    path: Some(target.to_string()),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "{target:?}");
+            let v = body_json(resp).await;
+            assert_eq!(v["exists"], false, "{target:?}");
+            // complete -> 200 with empty suggestions (the fs_path None branch,
+            // mirroring Node's readdir-ENOENT empty result).
+            let resp = complete(
+                State(test_state()),
+                auth_headers(),
+                Query(CompleteQuery {
+                    prefix: Some(target.to_string()),
+                    root: None,
+                    dirs: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "{target:?}");
+            let v = body_json(resp).await;
+            assert_eq!(v["suggestions"], json!([]), "{target:?}");
+            // mkdir -> 400 "cannot be resolved", and creates nothing.
+            let resp = mkdir_resp(target).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{target:?}");
+            let v = body_json(resp).await;
+            assert!(
+                v["error"].as_str().unwrap().contains("cannot be resolved"),
+                "{target:?}"
+            );
+        }
+        // validate-dir keeps the flavor-preserving display string while
+        // reporting the share root as not-a-directory (Node's
+        // isReachableDirectorySync shape).
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": "\\\\wsl$\\Ubuntu" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], false);
+        assert_eq!(v["resolvedPath"], "\\\\wsl$\\Ubuntu\\");
     }
 
     // ---- validate_dir sandbox (closes the Node-parity gap: files-router.ts:232

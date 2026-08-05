@@ -116,6 +116,23 @@ fn falls_through_to_wslpath_and_caches_the_result() {
 }
 
 #[test]
+fn wslpath_wsl_dollar_unc_output_is_win32_normalized() {
+    let env = MapEnv::new();
+    // FILE-03: older `wslpath -w` emits the `\\wsl$\<distro>` share alias
+    // (newer builds emit `\\wsl.localhost\…`); either way the output is
+    // trimmed and run through path.win32.normalize (the win32 UNC machinery
+    // accepts `\\wsl$` — only the WSL->Linux converter rejects it).
+    let resolver = MockResolver::new(true, Some("\\\\wsl$\\Ubuntu\\home\\dan\r\n"));
+    let mut cache = WslPathCache::new();
+    assert_eq!(
+        convert_wsl_path_to_windows("/home/dan", HostOs::Windows, &env, &resolver, &mut cache)
+            .as_deref(),
+        Some("\\\\wsl$\\Ubuntu\\home\\dan")
+    );
+    assert_eq!(*resolver.wslpath_calls.borrow(), 1);
+}
+
+#[test]
 fn caches_negative_results_too() {
     let env = MapEnv::new();
     let resolver = MockResolver::new(true, None); // wsl.exe fails/empty -> None

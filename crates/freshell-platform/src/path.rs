@@ -933,6 +933,17 @@ mod helper_tests {
             win32_resolve("//wsl.localhost/Ubuntu/x").as_deref(),
             Some("\\\\wsl.localhost\\Ubuntu\\x")
         );
+        // FILE-03: the `\\wsl$` share alias is a well-formed UNC for
+        // win32-resolve purposes — only the WSL-specific converter
+        // (`match_wsl_unc`, below) rejects it.
+        assert_eq!(
+            win32_resolve("\\\\wsl$\\Ubuntu\\home\\dan").as_deref(),
+            Some("\\\\wsl$\\Ubuntu\\home\\dan")
+        );
+        assert_eq!(
+            win32_resolve("\\\\wsl$\\Ubuntu").as_deref(),
+            Some("\\\\wsl$\\Ubuntu\\")
+        );
     }
 
     #[test]
