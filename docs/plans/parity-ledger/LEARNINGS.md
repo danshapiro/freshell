@@ -41,6 +41,47 @@ Each entry: timestamp, category (PROCESS / TECH / REPO), learning.
   exploration context is preserved in the session, so recovery is cheap vs restarting.
 - **00:57 PROCESS** — Pipeline waves: don't serialize phases. Launched the DIAG-04 (perf
   logging) implementation worker from orchestrator-verified context while audits still run.
+- **01:15 PROCESS** — Audit spot-checks (SAFE-01, SESSION-10, TERM-28 DONE claims): evidence
+  citations check out against real code (e.g. validate_auth_token at main.rs:1554 confirmed).
+  Kimi audit quality is high WHEN it finishes.
+- **01:23 PROCESS** — The AUDIT_WRONG escape hatch works: SYNC-06 worker independently
+  discovered the feature already landed (PR #592) and refused to invent work instead of
+  fabricating a diff. Give every worker an explicit honest-stop path; it converts audit
+  false-positives from wasted diffs into free re-verification.
+- **01:24 PROCESS** — Continuous-flow beats discrete waves: verify+merge each worker the
+  moment it commits (SESSION-14 landed while 6 peers still ran). Shared CARGO_TARGET_DIR
+  with the main checkout's warm 28G cache made worktree builds fast instead of cold.
+- **01:50 PROCESS** — Topology B (write-only workers + central serial build) first results:
+  6 committed items -> 2 passed unchanged, 3 failed with exactly ONE failing test each
+  (their own new tests — assertion bugs), 1 landed after review. Fix loops via
+  `opencode run -c` with the exact panic output are cheap.
+- **01:55 PROCESS** — Timeouts must be sized to Kimi's thoroughness: 40-min impl timeout was
+  too short for M items (DIAG-04, SESSION-21 both hit it mid-flight). Plan 45-60 min for
+  M-effort items, and instruct WIP commits.
+- **02:00 PROCESS** — `git branch --list` prefixes worktree-checked-out branches with `+`;
+  scripting refs from its porcelain output silently breaks (use --format='%(refname:short)').
+- **02:07 PROCESS/PERF** — DANGER SPIKE: load hit 148 (32 cores), availG down to 13Gi when a
+  4-item cargo verify chain overlapped 8 live agents + 2 session resumes. Recovered without
+  crash; rule adopted: at most ONE verify chain at a time, no new agent launches while a
+  chain runs.
+- **02:11 PROCESS** — Fix-loop effectiveness: 3/3 failed items passed on re-verify after one
+  resume round with exact panic output. Wave-1 Rust yield: 8/8 attempted items landed or
+  honestly closed (7 merged + 1 AUDIT_WRONG).
+- **02:38 PROCESS** — TS/client items are the cheapest wins: SYNC-01/03 (test-coverage gaps)
+  passed vitest first-try. Two workers touching the SAME test file sequentially (fork after
+  the first lands) avoids conflicts entirely. Slot-refill discipline: worker slots are cheap,
+  orchestrator attention is the scarce resource — batch status checks and resume in groups.
+- **04:15 PROCESS** — DIAG-04 escalation path: after FOUR Kimi sessions timed out on the same
+  M item (each produced good docs/skeleton but kept exploring), the orchestrator implemented
+  it directly reusing the sessions' module docs as the spec. Cap retries at ~3, then split
+  the item into S-slices or escalate. Sunk subagent work (docs, skeletons) is still input.
+- **04:23 PROCESS** — FRESH sessions beat resumed sessions for stuck items: BROWSER-02 and
+  AUTO-10 both committed within ~35 min of a fresh-session restart pointed at their own
+  dirty worktrees, after resume rounds failed repeatedly. Resumed sessions inherit
+  exploration momentum; fresh ones inherit only the artifacts.
+- **04:29 TECH** — My own DIAG-04 first verify failed on a trivial Rust lifetime error in a
+  test helper — the same class of single-test failure the Kimi workers produce. The central
+  build catches everyone equally; nobody skips verification.
 - **05:30 PROCESS** — Rebase-in-worker works for conflicts: EXT-01's cherry-pick conflicted
   with landed EXT-02/EXT-04 changes; instructing the worker session to `git rebase
   parity-campaign-20260805` in its own worktree and integrate both behaviors resolved it
@@ -59,3 +100,9 @@ Each entry: timestamp, category (PROCESS / TECH / REPO), learning.
   uncommitted). ~35 Kimi worker/auditor/fix sessions total. Every landed diff passed
   targeted cargo/vitest verification on the integration branch; full workspace gates run at
   the end. First-pass worker success ~30%; with fix loops + fresh-session recovery ~90%.
+- **09:15 PROCESS** — NOTE-KEEPING BUG FOUND POST-CAMPAIGN: twelve mid-campaign entries
+  (01:15-04:29) were silently destroyed during the night because the verify script's
+  failure path ran `git reset --hard` in the SAME worktree where LEARNINGS.md appends sat
+  uncommitted. Restored from the orchestrator session transcript. Rule: a ledger that lives
+  inside a worktree subject to reset/cherry-pick automation must be committed on EVERY
+  append (or kept outside the build tree entirely).
