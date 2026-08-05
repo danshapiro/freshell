@@ -319,6 +319,7 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
         queue_max_bytes: 8 * 1024,
         catastrophic_buffered_bytes: 32 * 1024,
         catastrophic_stall_ms: 300,
+        send_stall_window_ms: 50,
     };
     let url = spawn_server(term09).await;
 
@@ -386,4 +387,119 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
          a terminal.output.gap (drop-oldest fired) or a closed connection \
          (catastrophic backpressure fired); observed neither"
     );
+}
+
+/// Narrow-gap regression test (the gap `backpressure.rs` documented pre-fix):
+/// a client whose receive window closes COMPLETELY mid-flood leaves one
+/// `send().await` blocked indefinitely. Pre-fix the connection loop parked
+/// inside that one send, the catastrophic ticker could never tick again,
+/// and the peer was never closed. Post-fix every loop send is bounded by
+/// `send_stall_window_ms`, the un-accepted output stays held (counted toward
+/// the catastrophic threshold), and the monitor closes the wedged
+/// connection 4008 within roughly the stall budget. Fast-client completion
+/// is already asserted by the test above; this one asserts the wedged
+/// connection's close/decision is real and client-observable.
+///
+/// Two realities this test's configuration must respect:
+///
+/// * One serialized `terminal.output` frame can reach the fragment budget
+///   (`TERMINAL_STREAM_BATCH_MAX_BYTES`, 16 KiB default; `framing.rs`). A
+///   queue cap at/below one frame self-evicts on EVERY `push`
+///   (`OutputQueue::evict_overflow`): queue depth then sits near ZERO and
+///   the catastrophic monitor can never observe sustained pressure. So the
+///   cap here holds MANY whole frames (256 KiB) with the threshold (32 KiB)
+///   comfortably below the saturated queue depth.
+/// * A peer whose TCP receive window never re-opens CANNOT observe the close
+///   while it refuses to read: the 4008 close frame (and, after teardown,
+///   the FIN) are TCP-ordered BEHIND the kernel-buffered flood bytes the
+///   peer never ACKs -- exactly as legacy's `ws.close(4008, 'Catastrophic
+///   backpressure')` is invisible to a never-reading socket
+///   (`broker.ts:1123`; legacy's answer for a QUIET dead socket is the
+///   keepalive's `ws.terminate()`, a different path). The client-observable
+///   form of "documented close" (the checklist's "gap/recovery or
+///   documented close") surfaces only once the peer resumes reading and
+///   drains the backlog to the close/EOF. So this test first waits OUT the
+///   stall budget WITHOUT reading (keeping the wedge so the monitor fires),
+///   then resumes draining and requires the close (or stream end) to
+///   surface promptly.
+#[tokio::test]
+async fn indefinitely_blocked_output_send_still_gets_catastrophic_close() {
+    let term09 = Term09Config {
+        queue_max_bytes: 256 * 1024,
+        // Threshold far below the queue cap yet above a couple of frames, so
+        // sustained wedged pressure (queue + held) definitely exceeds it.
+        catastrophic_buffered_bytes: 32 * 1024,
+        catastrophic_stall_ms: 400,
+        send_stall_window_ms: 25,
+    };
+    let url = spawn_server(term09).await;
+
+    let mut creator = connect_and_complete_handshake(&url).await;
+    let terminal_id = create_shell_terminal(&mut creator, "create-wedge").await;
+
+    // The wedged client: tiny SO_RCVBUF so the window closes fast and
+    // deterministically; it does not read again until the grace below ends.
+    let mut wedged = connect_with_tiny_recv_buffer(&url, 4096).await;
+    complete_handshake(&mut wedged).await;
+    attach(&mut wedged, &terminal_id, "attach-wedge").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    creator
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.input",
+                "terminalId": terminal_id,
+                "data": flood_command(300_000, "FLOOD-DONE-MARKER"),
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send flood input");
+
+    // Phase 1: hold the wedge (read NOTHING) well past the point the
+    // catastrophic monitor must have fired: ~400ms sustained over-threshold
+    // pressure (reached once the kernel's few-MB send buffer fills, early in
+    // a 27MB flood) + the 100ms tick cadence + margin. Reading here would
+    // re-open the window and reset the monitor before it could fire.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Phase 2: resume reading. If the monitor fired, the connection was
+    // torn down; the queued backlog drains and the stream ends (or a 4008
+    // Close frame surfaces) promptly. If it did NOT fire (the pre-fix
+    // behavior), the now-unwedged client instead keeps receiving output/gap
+    // frames and the stream stays OPEN until this deadline -- a loud
+    // regression signal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut close_frame = None;
+    let mut stream_ended = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), wedged.next()).await {
+            Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                close_frame = frame;
+                break;
+            }
+            Ok(Some(Ok(_))) => {} // queued backlog/gaps: keep draining
+            Ok(Some(Err(_))) | Ok(None) => {
+                stream_ended = true;
+                break;
+            }
+            Err(_) => break, // per-read timeout: check deadline
+        }
+    }
+
+    assert!(
+        close_frame.is_some() || stream_ended,
+        "a client whose receive window closes completely must be closed by \
+         the catastrophic monitor in bounded time (pre-fix the loop parked \
+         inside one blocked send and the close NEVER came)"
+    );
+    if let Some(frame) = close_frame {
+        assert_eq!(
+            frame.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(4008),
+            "close code must match legacy"
+        );
+        assert_eq!(&*frame.reason, "Catastrophic backpressure");
+    }
 }

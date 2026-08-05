@@ -88,6 +88,137 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     }
 }
 
+/// TERM-09: serialize + send one server→client message bounded by the stall
+/// window (mirrors `send`'s failure mapping; see
+/// [`crate::backpressure::send_guarded`]).
+async fn send_bounded(
+    ws_tx: &mut WsSink,
+    msg: &ServerMessage,
+    window: std::time::Duration,
+) -> crate::backpressure::SendDisposition {
+    match serde_json::to_string(msg) {
+        Ok(json) => {
+            crate::backpressure::send_guarded(ws_tx, Message::Text(json.into()), window).await
+        }
+        Err(_) => crate::backpressure::SendDisposition::Failed,
+    }
+}
+
+/// TERM-09: close-frame sends are stall-windowed so teardown (shutdown /
+/// catastrophic close) can never park on a wedged socket.
+async fn send_close_bounded(
+    ws_tx: &mut WsSink,
+    frame: axum::extract::ws::CloseFrame,
+    window: std::time::Duration,
+) {
+    let _ = crate::backpressure::send_guarded(ws_tx, Message::Close(Some(frame)), window).await;
+}
+
+/// The result of one bounded flush pass over held/queued terminal output.
+enum FlushOutcome {
+    /// Everything absorbable was handed to the transport.
+    Clear,
+    /// The sink stalled mid-pass; un-accepted frames are back in `held`.
+    Stalled,
+    /// Hard send/serialize failure — the connection must close.
+    Failed,
+}
+
+/// One bounded TERM-09 flush pass: direct (`conn_rx`) frames FIRST, then one
+/// absorb generation of queued output held in `held`, handed to the
+/// transport oldest-first under the stall window.
+///
+/// Protocol-order guarantee: `attach.ready` (and every other non-output
+/// frame) travels the DIRECT `conn_rx` channel while replay/live output
+/// travels the bounded queue. The enclosing `select!` is unbiased, so it
+/// could otherwise deliver already-queued replay frames BEFORE the
+/// `attach.ready` enqueued ahead of them — inverting the documented
+/// "attach.ready, then replay, then live" order the client depends on (it
+/// arms its pendingReplay window only on ready;
+/// src/lib/terminal-attach-seq-state.ts:143, "attach.ready arrives before
+/// replay frames"). Drain every direct frame already pending before any
+/// queued output.
+///
+/// Output frames are popped from `held` as soon as the sink ACCEPTS the
+/// frame (`feed` resolves) — transport-accepted, exactly-once, never resent
+/// and never gap-eligible (the same line legacy draws at "`ws.send()`
+/// returned"). If `feed` stalls, the sink never accepted the frame: it's
+/// pushed back to the FRONT of `held` intact (`FlushOutcome::Stalled`), and
+/// the caller re-arms the retry timer. A direct frame can never be
+/// pushed back (it may be partially flushed), so a stall there is `Failed`:
+/// the connection closes, matching legacy's close-not-drop remedy for the
+/// non-output families (`ws-send.ts` buffered>2MiB -> close(4008)).
+async fn flush_outbound(
+    ws_tx: &mut WsSink,
+    conn_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    output_queue: &crate::backpressure::ConnectionOutputQueue,
+    held: &mut crate::backpressure::HeldOutput,
+    send_window: std::time::Duration,
+) -> FlushOutcome {
+    while let Ok(out) = conn_rx.try_recv() {
+        match send_bounded(ws_tx, &out, send_window).await {
+            crate::backpressure::SendDisposition::Sent => {}
+            crate::backpressure::SendDisposition::Failed
+            | crate::backpressure::SendDisposition::Stalled => return FlushOutcome::Failed,
+        }
+    }
+    if held.is_empty() {
+        held.absorb(output_queue.drain_all());
+    }
+    while let Some((msg, bytes)) = held.pop_front() {
+        let Ok(json) = serde_json::to_string(&msg) else {
+            return FlushOutcome::Failed;
+        };
+        // Split feed/flush so a stall can be told apart from acceptance:
+        // `feed` resolving means the sink TOOK the frame (never replay it);
+        // a stalled `feed` means it never did (safe to hold and re-offer).
+        match tokio::time::timeout(send_window, ws_tx.feed(Message::Text(json.into()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return FlushOutcome::Failed,
+            Err(_) => {
+                held.push_front(msg, bytes);
+                return FlushOutcome::Stalled;
+            }
+        }
+        match tokio::time::timeout(send_window, ws_tx.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return FlushOutcome::Failed,
+            Err(_) => return FlushOutcome::Stalled,
+        }
+    }
+    FlushOutcome::Clear
+}
+
+/// Fold one flush-pass result back into loop state: on `Clear`, disarm the
+/// retry (further output re-wakes the loop through the queue's `Notify`
+/// permit, exactly as pre-TERM-09: `ConnectionOutputQueue::route` calls
+/// `notify_one` on every push, so a mid-pass refill resolves the very next
+/// `notified()` poll -- no busy retry needed for a healthy sink); on
+/// `Stalled`, re-arm on the stall-window cadence (legacy's
+/// `scheduleFlush(retryMs)`, `broker.ts:829-839`); on `Failed`, record the
+/// close reason and tell the caller to break. Returns `false` to break.
+fn fold_flush_outcome(
+    outcome: FlushOutcome,
+    retry_flush: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    send_window: std::time::Duration,
+    close_reason: &mut &'static str,
+) -> bool {
+    match outcome {
+        FlushOutcome::Clear => {
+            *retry_flush = None;
+            true
+        }
+        FlushOutcome::Stalled => {
+            *retry_flush = Some(Box::pin(tokio::time::sleep(send_window)));
+            true
+        }
+        FlushOutcome::Failed => {
+            *close_reason = "send_error";
+            false
+        }
+    }
+}
+
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
 /// reused by the locator association seams and the identity invariant
 /// sweep -- one wall-clock source for the whole crate.
@@ -200,11 +331,23 @@ pub async fn run(
     // output stays above `catastrophic_buffered_bytes` continuously for
     // `catastrophic_stall_ms` (mirrors `broker.ts`'s `catastrophicBlocked`).
     // Checked on a dedicated ticker rather than only between sends -- see
-    // `crate::backpressure` module doc for why, and its one known trade-off.
+    // `crate::backpressure` module doc for why.
     let mut catastrophic = crate::backpressure::CatastrophicMonitor::new(
         state.term09.catastrophic_buffered_bytes,
         state.term09.catastrophic_stall_ms,
     );
+    // TERM-09 stall-windowed sending (closes the "one indefinitely-blocked
+    // send escapes the ticker" gap): `send_window` bounds EVERY send this
+    // loop performs, so no single in-flight send can park the loop and hide
+    // a stall from the catastrophic ticker; output frames drained but not
+    // yet transport-accepted live in `held` (counted toward the
+    // catastrophic threshold); `retry_flush` re-tries a stalled pass on the
+    // window cadence (legacy's `scheduleFlush(retryMs)`). See
+    // `crate::backpressure`'s module doc.
+    let send_window =
+        std::time::Duration::from_millis(state.term09.send_stall_window_ms.max(1));
+    let mut held = crate::backpressure::HeldOutput::new();
+    let mut retry_flush: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut catastrophic_ticker = tokio::time::interval(std::time::Duration::from_millis(
         (state.term09.catastrophic_stall_ms / 4).max(10),
     ));
@@ -245,11 +388,16 @@ pub async fn run(
         tokio::select! {
             // Graceful shutdown (`ws-handler.ts:3843`): close 4009 "Server shutting
             // down" so a live client sees the original's exact disconnect UX.
+            // The close send is stall-windowed (TERM-09): teardown must never
+            // park on a wedged socket.
             _ = state.shutdown.notified() => {
                 use axum::extract::ws::CloseFrame;
-                let _ = ws_tx
-                    .send(Message::Close(Some(CloseFrame { code: 4009, reason: "Server shutting down".into() })))
-                    .await;
+                send_close_bounded(
+                    &mut ws_tx,
+                    CloseFrame { code: 4009, reason: "Server shutting down".into() },
+                    send_window,
+                )
+                .await;
                 close_reason = "server_shutdown";
                 close_code = Some(4009);
                 break;
@@ -262,9 +410,21 @@ pub async fn run(
                     break;
                 }
                 pong_since_last_ping = false;
-                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    close_reason = "send_error";
-                    break;
+                match crate::backpressure::send_guarded(
+                    &mut ws_tx,
+                    Message::Ping(Vec::new().into()),
+                    send_window,
+                )
+                .await
+                {
+                    crate::backpressure::SendDisposition::Sent => {}
+                    // A ping that can't be handed over inside the window is a
+                    // hard send failure (legacy closes this family too).
+                    crate::backpressure::SendDisposition::Failed
+                    | crate::backpressure::SendDisposition::Stalled => {
+                        close_reason = "send_error";
+                        break;
+                    }
                 }
             }
             inbound = ws_rx.next() => {
@@ -314,44 +474,55 @@ pub async fn run(
             maybe_out = conn_rx.recv() => {
                 if let Some(out) = maybe_out {
                     // A terminal frame destined for THIS connection (registry fan-out).
-                    if !send(&mut ws_tx, &out).await {
-                        close_reason = "send_error";
-                        break;
-                    }
-                }
-            }
-            // TERM-09: this connection's bounded terminal-output queue has new
-            // (or still-pending) frames -- drain everything currently queued
-            // and send it, in order (gaps first, then frames; see
-            // `OutputQueue::drain_all`).
-            _ = output_queue.notified() => {
-                let mut send_failed = false;
-                // Protocol-order guarantee: `attach.ready` (and every other
-                // non-output frame) travels the DIRECT `conn_rx` channel while
-                // replay/live output travels this bounded queue. This unbiased
-                // `select!` could otherwise deliver already-queued replay
-                // frames BEFORE the `attach.ready` enqueued ahead of them —
-                // inverting the documented "attach.ready, then replay, then
-                // live" order the client depends on (it arms its pendingReplay
-                // window only on ready; src/lib/terminal-attach-seq-state.ts:143,
-                // "attach.ready arrives before replay frames"). Drain every
-                // direct frame already pending before any queued output.
-                while let Ok(out) = conn_rx.try_recv() {
-                    if !send(&mut ws_tx, &out).await {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if !send_failed {
-                    for out in output_queue.drain_all() {
-                        if !send(&mut ws_tx, &out).await {
-                            send_failed = true;
+                    // Stall-windowed like every loop send (TERM-09); a direct
+                    // frame can never be parked/resent (it may be partially
+                    // flushed), so a stall is treated as a hard failure --
+                    // legacy's own remedy for this family is closing
+                    // (`ws-send.ts` buffered>2MiB -> close(4008)).
+                    match send_bounded(&mut ws_tx, &out, send_window).await {
+                        crate::backpressure::SendDisposition::Sent => {}
+                        crate::backpressure::SendDisposition::Failed
+                        | crate::backpressure::SendDisposition::Stalled => {
+                            close_reason = "send_error";
                             break;
                         }
                     }
                 }
-                if send_failed {
-                    close_reason = "send_error";
+            }
+            // TERM-09: this connection's bounded terminal-output queue has new
+            // (or still-pending) frames -- one bounded flush pass (direct
+            // frames first, then held/queued output, in order; gaps first).
+            // Skipped while a stall retry is pending (the retry arm owns the
+            // pass cadence then; its wake re-checks anyway).
+            _ = output_queue.notified(), if retry_flush.is_none() => {
+                if !fold_flush_outcome(
+                    flush_outbound(&mut ws_tx, &mut conn_rx, &output_queue, &mut held, send_window)
+                        .await,
+                    &mut retry_flush,
+                    send_window,
+                    &mut close_reason,
+                ) {
+                    break;
+                }
+            }
+            // TERM-09 stalled-flush retry, on the stall-window cadence
+            // (legacy's `scheduleFlush(retryMs)`). Every send inside the pass
+            // is itself stall-windowed, so the loop can never park inside ANY
+            // in-flight send, and the catastrophic ticker keeps ticking:
+            // held bytes still count toward its threshold.
+            _ = async {
+                match retry_flush.as_mut() {
+                    Some(timer) => timer.await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if !fold_flush_outcome(
+                    flush_outbound(&mut ws_tx, &mut conn_rx, &output_queue, &mut held, send_window)
+                        .await,
+                    &mut retry_flush,
+                    send_window,
+                    &mut close_reason,
+                ) {
                     break;
                 }
             }
@@ -360,20 +531,26 @@ pub async fn run(
             // full stall duration -- close now (mirrors `broker.ts`'s
             // `catastrophicBlocked` closing with 4008 "Catastrophic backpressure").
             _ = catastrophic_ticker.tick() => {
-                if catastrophic.tick(output_queue.pending_bytes()) {
+                // Held (wedged, not-yet-transport-accepted) output is still
+                // THIS connection's pressure -- count it, so a stall that
+                // began mid-drain is as visible to the monitor as one still
+                // sitting in the queue.
+                let pressure = output_queue.pending_bytes().saturating_add(held.bytes());
+                if catastrophic.tick(pressure) {
                     tracing::warn!(
                         connection_id = conn_id,
-                        pending_bytes = output_queue.pending_bytes(),
+                        pending_bytes = pressure,
+                        queued_bytes = output_queue.pending_bytes(),
+                        held_bytes = held.bytes(),
                         threshold = state.term09.catastrophic_buffered_bytes,
                         "ws.terminal_stream.catastrophic_close"
                     );
-                    use axum::extract::ws::CloseFrame;
-                    let _ = ws_tx
-                        .send(Message::Close(Some(CloseFrame {
-                            code: 4008,
-                            reason: "Catastrophic backpressure".into(),
-                        })))
-                        .await;
+                    send_close_bounded(
+                        &mut ws_tx,
+                        crate::backpressure::catastrophic_close_frame(),
+                        send_window,
+                    )
+                    .await;
                     close_reason = "catastrophic_backpressure";
                     close_code = Some(4008);
                     break;
@@ -383,9 +560,19 @@ pub async fn run(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
-                        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-                            close_reason = "send_error";
-                            break;
+                        match crate::backpressure::send_guarded(
+                            &mut ws_tx,
+                            Message::Text(json.into()),
+                            send_window,
+                        )
+                        .await
+                        {
+                            crate::backpressure::SendDisposition::Sent => {}
+                            crate::backpressure::SendDisposition::Failed
+                            | crate::backpressure::SendDisposition::Stalled => {
+                                close_reason = "send_error";
+                                break;
+                            }
                         }
                     }
                     // SAFE-10: this connection missed `dropped` broadcast frames
@@ -415,12 +602,15 @@ pub async fn run(
                             "ws.broadcast.lagged.close"
                         );
                         use axum::extract::ws::CloseFrame;
-                        let _ = ws_tx
-                            .send(Message::Close(Some(CloseFrame {
+                        send_close_bounded(
+                            &mut ws_tx,
+                            CloseFrame {
                                 code: 4008,
                                 reason: "Backpressure".into(),
-                            })))
-                            .await;
+                            },
+                            send_window,
+                        )
+                        .await;
                         close_reason = "broadcast_lagged";
                         close_code = Some(4008);
                         break;
