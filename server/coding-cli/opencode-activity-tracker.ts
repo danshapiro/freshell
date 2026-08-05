@@ -825,10 +825,17 @@ export class OpencodeActivityTracker extends EventEmitter {
   rejectSessionAssociation(input: { terminalId: string; sessionId: string }): void {
     const monitor = this.monitors.get(input.terminalId)
     if (!monitor || monitor.disposed) return
+    // Gate the pending-permission clear on actual rejection: only clear if the
+    // rejection matched the current ownership state (awaitingAssociation + matching sessionId).
+    // Rust parity: rejectOpencodeAssociation only modifies state if matched; we only
+    // clear pendingPermissions inside that matched arm to avoid stale-claim leaks.
+    const preRejectOwnership = monitor.ownership
     const result = rejectOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
     monitor.ownership = result.state
-    // Clear any pending permissions so the stale pause claim cannot leak into the death-bell window
-    this.pendingPermissions.delete(input.terminalId)
+    // Clear pending permissions only if ownership actually changed (rejection matched)
+    if (preRejectOwnership.kind === 'awaitingAssociation' && preRejectOwnership.sessionId === input.sessionId) {
+      this.pendingPermissions.delete(input.terminalId)
+    }
     this.applyActions(monitor.terminalId, result.actions)
   }
 
