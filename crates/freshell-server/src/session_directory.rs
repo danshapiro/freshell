@@ -92,6 +92,15 @@ struct DirItem {
     provider: String,
     project_path: String,
     title: Option<String>,
+    /// Node's cached parse-layer `titleSource === 'provider-generated'`
+    /// (`IndexedSession::title_provider_generated`, whose own doc cites
+    /// `session-indexer.ts`): gates the title-override suppression in
+    /// [`apply_session_overrides`] — a `dir`/`first-message`-sourced stored
+    /// `titleOverride` must NOT replace the provider's own generated title
+    /// (Node's `shouldApplyTitleOverride`, `session-indexer.ts:210-211`).
+    /// Same input the resolve wire already consults
+    /// (`resolve.rs::project_session_through_overrides`).
+    title_provider_generated: bool,
     summary: Option<String>,
     first_user_message: Option<String>,
     last_activity_at: i64,
@@ -523,6 +532,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         provider: idx.provider.clone(),
         project_path: idx.project_path.clone(),
         title: idx.title.clone(),
+        title_provider_generated: idx.title_provider_generated,
         summary: idx.summary.clone(),
         first_user_message: idx.first_user_message.clone(),
         last_activity_at: idx.last_activity_at,
@@ -671,6 +681,7 @@ fn item_from_meta(
         // resolveProjectPath: `meta.cwd` (git-root resolution deferred), else 'unknown'.
         project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
         title: meta.title.clone(),
+        title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
         // lastActivityAt is a required, non-negative number; absent → 0.
@@ -691,10 +702,32 @@ fn item_from_meta(
     }
 }
 
-/// Overlay `config.sessionOverrides` onto parsed items (`service.ts` metadata-store
-/// flavor merge): `title`/`summary` prefer the override; `archived` reflects the
-/// override (default false); a `deleted: true` override removes the item. Keyed by
-/// `provider:sessionId` (`buildSessionKey`, `service.ts:36-38`).
+/// Overlay `config.sessionOverrides` onto parsed items — a faithful port of
+/// Node's `applyOverride` (`session-indexer.ts:204-220`), which the original's
+/// `buildProjectGroups` (:1186) runs on every cached session BEFORE the
+/// directory service sorts/pages it:
+///
+/// * `deleted: true` removes the item (`if (ov?.deleted) return null`).
+/// * `title` takes the override only under Node's `shouldApplyTitleOverride`
+///   (:210-211): a NON-EMPTY `titleOverride` (`!!ov?.titleOverride` — an empty
+///   string is falsy, never applied) AND NOT (`title_provider_generated` —
+///   Node's cached parse-layer `titleSource === 'provider-generated'` — while
+///   the stored override's recorded `titleSource` is `dir` or `first-message`).
+///   The suppressed case is the provider's own generated title outranking a
+///   stale auto-derived override; every other override source (`user`, `ai`,
+///   `legacy`, absent) still substitutes. Same predicate
+///   `resolve.rs::project_session_through_overrides` already enforces on the
+///   resolve wire.
+/// * `summary` prefers `summaryOverride`; `archived` reflects the override
+///   (default false).
+/// * `createdAt` takes `createdAtOverride` under Node's `??` (:216): any
+///   present non-null value applies — INCLUDING `0` (unlike `||`) — while an
+///   absent or explicit-null override keeps the parsed `createdAt`. Stored
+///   values are integer epoch-ms
+///   (`SessionPatchSchema.createdAtOverride`, `sessions-router.ts:31-63`); a
+///   non-integer JSON number (`as_i64` → `None`) falls back like an absent key.
+///
+/// Keyed by `provider:sessionId` (`buildSessionKey`, `service.ts:36-38`).
 fn apply_session_overrides(
     items: Vec<DirItem>,
     overrides: &serde_json::Map<String, Value>,
@@ -707,11 +740,24 @@ fn apply_session_overrides(
                 if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
                     return None;
                 }
-                if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
+                // `shouldApplyTitleOverride` (`session-indexer.ts:210-211`).
+                let title_override_suppressed = item.title_provider_generated
+                    && matches!(
+                        ov.get("titleSource").and_then(Value::as_str),
+                        Some("dir" | "first-message")
+                    );
+                if let Some(t) = ov
+                    .get("titleOverride")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty() && !title_override_suppressed)
+                {
                     item.title = Some(t.to_string());
                 }
                 if let Some(s) = ov.get("summaryOverride").and_then(Value::as_str) {
                     item.summary = Some(s.to_string());
+                }
+                if let Some(c) = ov.get("createdAtOverride").and_then(Value::as_i64) {
+                    item.created_at = Some(c);
                 }
                 item.archived = ov.get("archived").and_then(Value::as_bool).unwrap_or(false);
             }
@@ -800,6 +846,11 @@ fn build_live_terminal_session_item(
         provider: provider.clone(),
         project_path,
         title: Some(provider_display_name(&provider)),
+        // Synthesized live-terminal rows never pass through
+        // `applyOverride` in Node (`buildLiveTerminalSessionItem`,
+        // `service.ts:110-130`), and here [`apply_session_overrides`]
+        // runs BEFORE the live join — the flag is inert on these items.
+        title_provider_generated: false,
         summary: None,
         first_user_message: None,
         last_activity_at: identity.updated_at,
@@ -858,6 +909,7 @@ mod join_tests {
             provider: provider.to_string(),
             project_path: "/repo".to_string(),
             title: Some("A real session".to_string()),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at,
@@ -1737,6 +1789,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some(format!("t-{sid}")),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at: at,
@@ -1792,6 +1845,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some(format!("t-{sid}")),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at: at,
@@ -2036,6 +2090,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("parsed".into()),
+            title_provider_generated: false,
             summary: Some("parsed-sum".into()),
             first_user_message: None,
             last_activity_at: 100,
@@ -2079,6 +2134,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("t".into()),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at: 1,
@@ -2100,6 +2156,222 @@ mod tests {
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
         assert_eq!(v["title"], json!("t"));
+    }
+
+    // ── SESSION-02: full `applyOverride` parity (`session-indexer.ts:204-220`) ──
+
+    /// Test-local `DirItem` factory; per-field tweaks via `provider_generated`
+    /// and the default `created_at`, mirroring the literal-style factories above.
+    fn session02_item(sid: &str, title: &str, provider_generated: bool, created_at: Option<i64>) -> DirItem {
+        DirItem {
+            session_id: sid.into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some(title.into()),
+            title_provider_generated: provider_generated,
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        }
+    }
+
+    /// `createdAt: ov?.createdAtOverride ?? session.createdAt`
+    /// (`session-indexer.ts:216`): a present override REPLACES the parsed
+    /// createdAt — including `0` (nullish coalescing, not `||`) — while an
+    /// absent or explicit-null override keeps the parsed value; the replaced
+    /// value reaches the wire `createdAt` (the field the sidebar orders by).
+    #[test]
+    fn overrides_overlay_applies_created_at_override_nullish_semantics() {
+        let items = vec![
+            session02_item("keep", "t", false, Some(500)),
+            session02_item("zero", "t", false, Some(500)),
+            session02_item("absent", "t", false, None),
+        ];
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("claude:keep".into(), json!({ "createdAtOverride": 123_456_789_000i64 }));
+        overrides.insert("claude:zero".into(), json!({ "createdAtOverride": 0 }));
+        overrides.insert("claude:absent".into(), json!({ "createdAtOverride": Value::Null }));
+
+        let overlaid = apply_session_overrides(items, &overrides);
+        assert_eq!(overlaid.len(), 3);
+
+        let keep = &overlaid[0];
+        assert_eq!(keep.created_at, Some(123_456_789_000));
+        assert_eq!(keep.to_value()["createdAt"], json!(123_456_789_000i64));
+
+        // `0` is NOT null — Node's `??` applies it (a falsy `||` would drop it).
+        assert_eq!(overlaid[1].created_at, Some(0));
+
+        // Explicit null behaves like absence: the parsed value is kept.
+        assert_eq!(overlaid[2].created_at, None);
+        assert_eq!(overlaid[2].to_value()["createdAt"], Value::Null);
+    }
+
+    /// A session with NO override at all keeps its parsed createdAt (the
+    /// baseline the `createdAtOverride` cases above compare against).
+    #[test]
+    fn overrides_overlay_without_created_at_override_keeps_parsed_value() {
+        let items = vec![session02_item("plain", "t", false, Some(777))];
+        let overlaid = apply_session_overrides(items, &serde_json::Map::new());
+        assert_eq!(overlaid[0].created_at, Some(777));
+    }
+
+    /// `shouldApplyTitleOverride` (`session-indexer.ts:210-211`): when the
+    /// CURRENT parsed title is provider-generated, a stored override recorded
+    /// under the `dir` or `first-message` source is SUPPRESSED — the provider's
+    /// own title survives on the wire. (Pre-SESSION-02 this never ran here:
+    /// `title_provider_generated` was read only by the resolve wire.)
+    #[test]
+    fn overrides_overlay_suppresses_dir_and_first_message_overrides_for_provider_generated_titles() {
+        for ov in [
+            json!({ "titleOverride": "Stale Guess", "titleSource": "dir" }),
+            json!({ "titleOverride": "Stale Guess", "titleSource": "first-message" }),
+        ] {
+            let items = vec![session02_item("s", "Provider Title", true, None)];
+            let mut overrides = serde_json::Map::new();
+            overrides.insert("claude:s".into(), ov);
+            let source = overrides["claude:s"]["titleSource"].clone();
+
+            let overlaid = apply_session_overrides(items, &overrides);
+            assert_eq!(
+                overlaid[0].title.as_deref(),
+                Some("Provider Title"),
+                "titleSource {source} must NOT replace a provider-generated title"
+            );
+            assert_eq!(overlaid[0].to_value()["title"], json!("Provider Title"));
+        }
+    }
+
+    /// The suppression is narrow (`session-indexer.ts:210-211`): it requires
+    /// BOTH a provider-generated current title AND a `dir`/`first-message`
+    /// recorded source. Every other combination substitutes the override:
+    /// `user`/`ai`/`legacy`/absent sources always win, and a `dir`-sourced
+    /// override still lands on a session whose current title is NOT
+    /// provider-generated (nothing authoritative to protect).
+    #[test]
+    fn overrides_overlay_still_applies_title_override_outside_the_suppressed_pair() {
+        // Provider-generated current title + non-suppressed sources.
+        for source in ["user", "ai", "legacy"] {
+            let items = vec![session02_item("s", "Provider Title", true, None)];
+            let mut overrides = serde_json::Map::new();
+            overrides.insert(
+                "claude:s".into(),
+                json!({ "titleOverride": "Renamed", "titleSource": source }),
+            );
+            let overlaid = apply_session_overrides(items, &overrides);
+            assert_eq!(
+                overlaid[0].title.as_deref(),
+                Some("Renamed"),
+                "titleSource {source} must win even against a provider-generated title"
+            );
+        }
+
+        // Provider-generated current title + NO recorded titleSource.
+        let items = vec![session02_item("s", "Provider Title", true, None)];
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("claude:s".into(), json!({ "titleOverride": "Renamed" }));
+        let overlaid = apply_session_overrides(items, &overrides);
+        assert_eq!(overlaid[0].title.as_deref(), Some("Renamed"));
+
+        // NOT provider-generated + a `dir`-sourced override: applied.
+        let items = vec![session02_item("s", "Parsed Title", false, None)];
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:s".into(),
+            json!({ "titleOverride": "Renamed", "titleSource": "dir" }),
+        );
+        let overlaid = apply_session_overrides(items, &overrides);
+        assert_eq!(overlaid[0].title.as_deref(), Some("Renamed"));
+    }
+
+    /// `!!ov?.titleOverride` (`session-indexer.ts:210`): an EMPTY-string
+    /// override is falsy in JS and never applied — verified here against both
+    /// a provider-generated and a parsed title (mirrors the resolve wire's
+    /// existing `!t.is_empty()` guard, `resolve.rs:541`).
+    #[test]
+    fn overrides_overlay_ignores_empty_title_override() {
+        for provider_generated in [true, false] {
+            let items = vec![session02_item("s", "Parsed Title", provider_generated, None)];
+            let mut overrides = serde_json::Map::new();
+            overrides.insert("claude:s".into(), json!({ "titleOverride": "" }));
+            let overlaid = apply_session_overrides(items, &overrides);
+            assert_eq!(
+                overlaid[0].title.as_deref(),
+                Some("Parsed Title"),
+                "empty titleOverride applied (provider_generated={provider_generated})"
+            );
+        }
+    }
+
+    /// The production mapping carries the parse-layer flag:
+    /// `dir_item_from_indexed` must copy `IndexedSession::title_provider_generated`
+    /// into the `DirItem` so the suppression above can see it, and the
+    /// `createdAt` suppression/override combo composes on one item (both
+    /// regressions in ONE object — the real `applyOverride` merge shape).
+    #[test]
+    fn dir_item_from_indexed_preserves_title_provider_generated_and_composes_with_created_at_override() {
+        for flag in [true, false] {
+            let idx = IndexedSession {
+                session_id: "s".into(),
+                provider: "claude".into(),
+                project_path: "/p".into(),
+                title: Some("t".into()),
+                title_provider_generated: flag,
+                summary: None,
+                first_user_message: None,
+                last_activity_at: 7,
+                created_at: Some(3),
+                cwd: Some("/p".into()),
+                is_subagent: false,
+                is_non_interactive: false,
+                source_file: None,
+            };
+            let item = dir_item_from_indexed(&idx);
+            assert_eq!(item.title_provider_generated, flag);
+        }
+
+        // End-to-end on one item: provider-generated title + dir-sourced
+        // titleOverride SUPPRESSED while createdAtOverride still applies.
+        let idx = IndexedSession {
+            session_id: "s".into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("Provider Title".into()),
+            title_provider_generated: true,
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 7,
+            created_at: Some(3),
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            source_file: None,
+        };
+        let item = dir_item_from_indexed(&idx);
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:s".into(),
+            json!({
+                "titleOverride": "Stale Guess",
+                "titleSource": "dir",
+                "createdAtOverride": 999_000_000i64,
+            }),
+        );
+        let overlaid = apply_session_overrides(vec![item], &overrides);
+        assert_eq!(overlaid[0].title.as_deref(), Some("Provider Title"));
+        assert_eq!(overlaid[0].created_at, Some(999_000_000));
     }
 
     // -- Batch B: the `SessionIndex`-backed production path --
@@ -2855,6 +3127,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some("original parsed title".into()),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at: 100,
@@ -2908,6 +3181,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: Some(long_html_title.clone()),
+            title_provider_generated: false,
             summary: None,
             first_user_message: None,
             last_activity_at: 100,
@@ -2970,6 +3244,7 @@ mod tests {
             provider: "claude".into(),
             project_path: "/p".into(),
             title: title.map(str::to_string),
+            title_provider_generated: false,
             summary: summary.map(str::to_string),
             first_user_message: fum.map(str::to_string),
             last_activity_at: 100,
