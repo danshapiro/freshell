@@ -326,6 +326,13 @@ pub struct DirectoryEntry {
     /// `record.buffer.snapshot()` — both sides are byte-capped rings, so this is
     /// the same tail the original's `lastEmittedLine` reads).
     pub snapshot: String,
+    /// The exit code from the last `terminal.exit` fan-out (`record.exitCode` in
+    /// the original — read by the REST `wait-for?exit=true` response,
+    /// `agent-api/router.ts`'s `{matched:true, reason:'exit', exitCode}` shape).
+    /// `Some` iff `status == Exited` (natural exit via `finish_pty_exit` RETAINS
+    /// the row; `kill` sets it to 0 before row removal, so a directory reader
+    /// never observes a killed row at all).
+    pub exit_code: Option<i64>,
 }
 
 /// The registry's control handle for one terminal: the shared stream state plus the
@@ -1799,6 +1806,7 @@ impl TerminalRegistry {
                     has_clients: !s.subscribers.is_empty(),
                     cwd: s.cwd.clone(),
                     snapshot: s.replay.iter().map(|f| f.output.data.as_str()).collect(),
+                    exit_code: s.exit_code,
                 }
             })
             .collect()
@@ -1856,6 +1864,41 @@ impl TerminalRegistry {
         {
             self.warn_on_duplicate_live_ptys(&key);
         }
+    }
+
+    /// Append output bytes to a terminal's replay ring exactly as the PTY
+    /// reader sink would: one `terminal.output` frame through `ingest` (live
+    /// source, one fresh seq). Headless terminals
+    /// ([`register_headless`](Self::register_headless)) never produce output
+    /// on their own; this is the deterministic snapshot-seeding seam for
+    /// cross-crate route tests (e.g. the freshagent REST `wait-for`
+    /// prompt-mode test) that must not spawn a real child. Returns `false`
+    /// for an unknown terminal.
+    pub fn feed_output(&self, terminal_id: &str, data: &str) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get(terminal_id) {
+                Some(handle) => Arc::clone(&handle.shared),
+                None => return false,
+            }
+        };
+        let (stream_id, seq) = {
+            let s = shared.lock().expect("terminal lock");
+            (s.stream_id.clone(), s.head_seq + 1)
+        };
+        ingest(
+            &shared,
+            ServerMessage::TerminalOutput(TerminalOutput {
+                data: data.to_string(),
+                seq_start: seq,
+                seq_end: seq,
+                stream_id,
+                terminal_id: terminal_id.to_string(),
+                attach_request_id: None,
+                source: Some(OutputSource::Live),
+            }),
+        );
+        true
     }
 
     /// Terminals (of any status) matching a `createRequestId`, NEWEST

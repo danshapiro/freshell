@@ -48,12 +48,12 @@ use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
     RealFileProbe, ShellType, SpawnSpec,
 };
-use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
+use freshell_protocol::{ServerMessage, SessionLocator, TerminalRunStatus, UiCommand};
 use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
-    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
-    TerminalPaneEntry,
+    approx_json, authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState,
+    TabRecord, TerminalPaneEntry,
 };
 
 /// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
@@ -2504,13 +2504,115 @@ fn apply_capture_start(snapshot: &str, start: Option<i64>) -> String {
     out
 }
 
-/// `GET /api/panes/:id/wait-for` (`router.ts:959-1067`), terminal branch only
-/// (fresh-agent wait-for is Slice 3 -- not needed by the shell-mode QA lever
-/// this spec's smoke test drives). `pattern` (regex) and `T`/`timeout` are
-/// honored; `stable`/`exit`/`prompt` are Slice 3 (documented deferral -- an
-/// absent pattern with none of those set matches legacy's "stable" fallback
-/// path, which Slice 1 does not reproduce; such a request 400s here instead
-/// of silently no-op-succeeding).
+/// Legacy `truthy` (`router.ts:42`): only `true` / `'true'` / `'1'` / `'yes'`.
+fn truthy_param(value: Option<&String>) -> bool {
+    matches!(
+        value.map(String::as_str),
+        Some("true") | Some("1") | Some("yes")
+    )
+}
+
+/// Legacy `parseRegex` (`router.ts:476-484`): a `/body/flags` wrapper is read
+/// as a JS regex literal; only the `i`/`m`/`s` flags change single `.test()`
+/// semantics, so they are mapped to fancy-regex inline flags and stateful/JS
+/// flags (`g`/`u`/`y`) are dropped. Anything else is compiled verbatim.
+fn parse_wait_for_regex(raw: &str) -> Result<fancy_regex::Regex, fancy_regex::Error> {
+    if raw.starts_with('/') {
+        if let Some(last) = raw.rfind('/') {
+            if last > 0 {
+                let body = &raw[1..last];
+                let flags: String = raw[last + 1..]
+                    .chars()
+                    .filter(|f| matches!(f, 'i' | 'm' | 's'))
+                    .collect();
+                // `(?)` with no flags is a compile error -- only prefix when
+                // at least one supported flag survived.
+                return if flags.is_empty() {
+                    fancy_regex::Regex::new(body)
+                } else {
+                    fancy_regex::Regex::new(&format!("(?{flags}){body}"))
+                };
+            }
+        }
+    }
+    fancy_regex::Regex::new(raw)
+}
+
+/// Legacy `looksLikePrompt` (`router.ts:486-489`): the last non-empty capture
+/// line ends with `#`/`$`/`>` (the regex's optional trailing space is subsumed
+/// by the trim). Legacy runs this on an ANSI-free render; the retained
+/// snapshot here is raw PTY output, so escape sequences are stripped first
+/// (bash's bracketed-paste `\x1b[?2004h` lands right after the prompt).
+fn looks_like_prompt(text: &str) -> bool {
+    let stripped = strip_ansi_escapes(text);
+    let last_line = stripped
+        .lines()
+        .filter(|l| !l.is_empty())
+        .last()
+        .unwrap_or("");
+    let last_line = last_line.trim_end();
+    last_line.ends_with('#') || last_line.ends_with('$') || last_line.ends_with('>')
+}
+
+/// Dependency-free ANSI CSI/OSC/ESC-sequence stripper (prompt detection only).
+fn strip_ansi_escapes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                // CSI: skip parameter/intermediate bytes plus one final byte.
+                b'[' => {
+                    i += 2;
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&b) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: skip until BEL or ST (`ESC \`).
+                b']' => {
+                    i += 2;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Any other two-byte ESC sequence.
+                _ => {
+                    i += 2;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `GET /api/panes/:id/wait-for` (`router.ts:959-1067`), terminal branch. The
+/// legacy wait modes are honored: `pattern`/`p` (regex, including the
+/// `/body/flags` JS-literal wrapper), `exit`, `prompt`, `stable`/`s` (seconds
+/// of unchanged output, with legacy's 1s fallback when no other condition is
+/// given -- the fallback resolves via `approx`, not `ok`), and `T`/`timeout`
+/// (seconds, default 30s). Two documented divergences from legacy: the codex
+/// prompt-blocked sub-branch (`term.mode === 'codex' && isPromptBlocked(...)`)
+/// is not ported (the Rust port has no codexActivityTracker and REST shell
+/// panes are never mode `codex`), and the fresh-agent idle/waiting branch is
+/// still Slice 3 (fresh-agent panes 404 here). Legacy has no explicit
+/// cancellation route either -- a disconnected client drops this handler's
+/// future, which cancels the poll loop.
 pub(crate) async fn wait_for(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -2537,48 +2639,104 @@ pub(crate) async fn wait_for(
         );
     };
 
-    let raw_pattern = params.get("pattern").or_else(|| params.get("p"));
-    let pattern = match raw_pattern {
-        Some(p) => match fancy_regex::Regex::new(p) {
+    let pattern = match params.get("pattern").or_else(|| params.get("p")) {
+        Some(raw) => match parse_wait_for_regex(raw) {
             Ok(re) => Some(re),
             Err(_) => return fail_json(StatusCode::BAD_REQUEST, "invalid pattern".to_string()),
         },
         None => None,
     };
-    if pattern.is_none() {
-        // Slice 1 scope: `stable`/`exit`/`prompt` fallback modes are deferred.
-        return fail_json(
-            StatusCode::BAD_REQUEST,
-            "wait-for requires `pattern` in this Rust port slice (stable/exit/prompt \
-             are deferred -- see docs/plans/2026-07-18-agent-api-mcp-parity-spec.md §8)"
-                .to_string(),
-        );
+    let wait_exit = truthy_param(params.get("exit"));
+    let wait_prompt = truthy_param(params.get("prompt"));
+    let mut stable_secs = params
+        .get("stable")
+        .or_else(|| params.get("s"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let mut used_fallback = false;
+    if wait_prompt && stable_secs.is_none() {
+        stable_secs = Some(1.0);
+        used_fallback = true;
     }
-    let pattern = pattern.expect("checked above");
-
+    if pattern.is_none() && !wait_exit && !wait_prompt && stable_secs.is_none() {
+        stable_secs = Some(1.0);
+        used_fallback = true;
+    }
     let timeout_secs = params
         .get("T")
         .or_else(|| params.get("timeout"))
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(30.0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs_f64(timeout_secs);
+    let mut last_text: Option<String> = None;
+    let mut stable_since = start;
 
     loop {
-        let text = registry
+        // Pane isolation by construction: only THIS terminal's directory row
+        // is ever read (re-read each poll; legacy holds a stale row reference
+        // across the loop, which is observably identical for live rows).
+        let entry = registry
             .directory()
             .into_iter()
-            .find(|d| d.terminal_id == terminal_id)
-            .map(|d| d.snapshot)
+            .find(|d| d.terminal_id == terminal_id);
+        let text = entry
+            .as_ref()
+            .map(|d| d.snapshot.clone())
             .unwrap_or_default();
-        if pattern.is_match(&text).unwrap_or(false) {
+        if let Some(pattern) = &pattern {
+            if pattern.is_match(&text).unwrap_or(false) {
+                return ok_json(
+                    json!({ "matched": true, "reason": "pattern" }),
+                    "pattern matched",
+                );
+            }
+        }
+        if wait_exit
+            && entry
+                .as_ref()
+                .map_or(false, |d| d.status == TerminalRunStatus::Exited)
+        {
             return ok_json(
-                json!({ "matched": true, "reason": "pattern" }),
-                "pattern matched",
+                json!({
+                    "matched": true,
+                    "reason": "exit",
+                    "exitCode": entry.as_ref().and_then(|d| d.exit_code),
+                }),
+                "terminal exited",
             );
         }
+        if wait_prompt && looks_like_prompt(&text) {
+            return ok_json(
+                json!({ "matched": true, "reason": "prompt" }),
+                "prompt detected",
+            );
+        }
+        if let Some(secs) = stable_secs {
+            if last_text.as_deref() == Some(text.as_str()) {
+                if stable_since.elapsed().as_secs_f64() >= secs {
+                    let message = if wait_prompt && used_fallback {
+                        "prompt not detected; output stable"
+                    } else if used_fallback {
+                        "no wait condition; output stable"
+                    } else {
+                        "output stable"
+                    };
+                    let data = json!({ "matched": true, "reason": "stable" });
+                    return if used_fallback {
+                        approx_json(data, message)
+                    } else {
+                        ok_json(data, message)
+                    };
+                }
+            } else {
+                last_text = Some(text);
+                stable_since = std::time::Instant::now();
+            }
+        }
         if std::time::Instant::now() >= deadline {
-            return crate::approx_json(json!({ "matched": false }), "timeout");
+            return approx_json(json!({ "matched": false }), "timeout");
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -3349,6 +3507,243 @@ mod tests {
         assert_eq!(body["status"], json!("approx"));
         assert_eq!(body["data"]["matched"], json!(false));
         assert_eq!(body["message"], json!("timeout"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_invalid_regex_pattern_is_400_invalid_pattern() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_id, _terminal_id) = create_shell(router.clone()).await;
+
+        // `%5B` is `[` -- an unbalanced character class: a compile error, not
+        // merely a pattern that never matches.
+        let (status, body) = get(
+            router,
+            &format!("/api/panes/{pane_id}/wait-for?pattern=%5B&T=1"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], json!("invalid pattern"));
+    }
+
+    /// Legacy `/body/flags` wrapper: `/re/i` must match case-insensitively.
+    #[tokio::test]
+    async fn wait_for_slash_wrapped_pattern_honors_the_i_flag() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_id, _terminal_id) = create_shell(router.clone()).await;
+
+        let (send_status, _send_body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "echo UnIqUe_SLASH_MaRkEr\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+
+        let (status, body) = get(
+            router,
+            &format!("/api/panes/{pane_id}/wait-for?pattern=/unique_slash_marker/i&T=15"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["matched"], json!(true));
+        assert_eq!(body["data"]["reason"], json!("pattern"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_mode_reports_exit_reason_and_code() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_id, _terminal_id) = create_shell(router.clone()).await;
+
+        let (send_status, _send_body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "exit 7\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+
+        let (status, body) = get(
+            router,
+            &format!("/api/panes/{pane_id}/wait-for?exit=true&T=15"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["matched"], json!(true));
+        assert_eq!(body["data"]["reason"], json!("exit"));
+        assert_eq!(body["data"]["exitCode"], json!(7));
+    }
+
+    /// `stable=<secs>` with an explicit value resolves via `ok` once the
+    /// output has been unchanged for that window (the spawned shell prints
+    /// its prompt once and then goes quiet).
+    #[tokio::test]
+    async fn wait_for_stable_mode_matches_after_output_settles() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_id, _terminal_id) = create_shell(router.clone()).await;
+
+        let (status, body) = get(
+            router,
+            &format!("/api/panes/{pane_id}/wait-for?stable=0.3&T=15"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["matched"], json!(true));
+        assert_eq!(body["data"]["reason"], json!("stable"));
+        assert_eq!(body["message"], json!("output stable"));
+    }
+
+    /// No condition at all: legacy falls back to a 1s stable window but,
+    /// because no wait condition was requested, resolves via `approx`.
+    #[tokio::test]
+    async fn wait_for_without_conditions_falls_back_to_approx_stable() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_id, _terminal_id) = create_shell(router.clone()).await;
+
+        let (status, body) =
+            get(router, &format!("/api/panes/{pane_id}/wait-for?T=15"), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("approx"));
+        assert_eq!(body["data"]["matched"], json!(true));
+        assert_eq!(body["data"]["reason"], json!("stable"));
+        assert_eq!(body["message"], json!("no wait condition; output stable"));
+    }
+
+    /// `prompt=true` against a deterministic seeded snapshot (NO shell spawn:
+    /// an ambient interactive shell's output timing/content differs across
+    /// build hosts, and legacy's `looksLikePrompt` only recognizes `[#$>]` as
+    /// the final prompt char, so a real shell's OWN prompt is
+    /// environment-dependent -- zsh's default ends with `%`, which legacy
+    /// legitimately misses). A headless registry row + the `feed_output`
+    /// seam seed a bash-style raw PTY tail (OSC/CSI included, exercising the
+    /// route's ANSI stripping) whose last line is literally `user@host:~$ `.
+    #[tokio::test]
+    async fn wait_for_prompt_mode_matches_a_shell_prompt() {
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "t-waitfor-prompt".to_string(),
+            stream_id: "s-waitfor-prompt".to_string(),
+            mode: "shell".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: None,
+        });
+        state
+            .terminal_panes
+            .lock()
+            .expect("terminal_panes mutex")
+            .insert(
+                "p-waitfor-prompt".to_string(),
+                TerminalPaneEntry {
+                    terminal_id: "t-waitfor-prompt".to_string(),
+                },
+            );
+        assert!(registry.feed_output(
+            "t-waitfor-prompt",
+            "\u{1b}]0;user@host: ~\u{7}\r\nuser@host:~$ \u{1b}[?2004h"
+        ));
+
+        let (status, body) = get(
+            app(state),
+            "/api/panes/p-waitfor-prompt/wait-for?prompt=true&T=5",
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["data"]["matched"], json!(true));
+        assert_eq!(body["data"]["reason"], json!("prompt"));
+        assert_eq!(body["message"], json!("prompt detected"));
+    }
+
+    /// Pure truth table for the prompt matcher, pinned to legacy's
+    /// `looksLikePrompt` regex `[#$>] ?$` over the ANSI-free last line
+    /// (`router.ts:486-489`) -- deterministic in every test environment,
+    /// unlike the route-level test above which must spawn a real shell.
+    #[test]
+    fn looks_like_prompt_matches_legacy_truth_table() {
+        // Recognized prompt chars, trailing space included or trimmed.
+        assert!(looks_like_prompt("user@host:/tmp$ "));
+        assert!(looks_like_prompt("user@host:/tmp$"));
+        assert!(looks_like_prompt("root@host:~# "));
+        assert!(looks_like_prompt("PS C:\\Users> "));
+        // A `$`/`#`/`>` anywhere but the END of the last line is not a prompt.
+        assert!(!looks_like_prompt("$ echo hi"));
+        assert!(!looks_like_prompt("price: $5"));
+        assert!(!looks_like_prompt(""));
+        // zsh's default `%` prompt is NOT recognized by legacy either -- the
+        // stable-fallback `approx` is the legacy-faithful resolution there.
+        assert!(!looks_like_prompt("build-host% "));
+        // Only the LAST non-empty line counts.
+        assert!(looks_like_prompt("compiling...\nuser@host:~$ "));
+        assert!(!looks_like_prompt("user@host:~$ \npartially-typed inp"));
+    }
+
+    /// The matcher sees legacy's ANSI-free render, but the retained snapshot
+    /// is raw PTY output: CSI/OSC escapes (bash's bracketed paste lands right
+    /// after the prompt) must be stripped before the prompt check, and UTF-8
+    /// must survive the byte-wise strip.
+    #[test]
+    fn looks_like_prompt_ignores_escape_sequences() {
+        assert!(looks_like_prompt(
+            "\u{1b}]0;user@host:/tmp\u{7}user@host:/tmp$ \u{1b}[?2004h"
+        ));
+        assert!(looks_like_prompt("\u{1b}[36mPS /tmp\u{1b}[0m> "));
+        assert!(looks_like_prompt("héllo wörld\nuser@host:~$ "));
+        assert!(!looks_like_prompt("\u{1b}[?2004hbuild-host% "));
+    }
+
+    /// Pane isolation: a marker echoed in pane A must never resolve a wait on
+    /// pane B -- the loop only ever reads pane B's own directory row.
+    #[tokio::test]
+    async fn wait_for_does_not_match_another_panes_output() {
+        let state = state_with_registry();
+        let router = app(state);
+        let (pane_a, _terminal_a) = create_shell(router.clone()).await;
+        let (pane_b, _terminal_b) = create_shell(router.clone()).await;
+
+        let (send_status, _send_body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_a}/send-keys"),
+            json!({ "data": "echo ISOLATION_MARKER_AAA\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+
+        // Confirm the marker landed in pane A before waiting on pane B.
+        let (status_a, body_a) = get(
+            router.clone(),
+            &format!("/api/panes/{pane_a}/wait-for?pattern=ISOLATION_MARKER_AAA&T=15"),
+            true,
+        )
+        .await;
+        assert_eq!(status_a, StatusCode::OK, "{body_a}");
+        assert_eq!(body_a["data"]["matched"], json!(true));
+
+        let (status_b, body_b) = get(
+            router,
+            &format!("/api/panes/{pane_b}/wait-for?pattern=ISOLATION_MARKER_AAA&T=1"),
+            true,
+        )
+        .await;
+        assert_eq!(status_b, StatusCode::OK);
+        assert_eq!(body_b["status"], json!("approx"));
+        assert_eq!(body_b["data"]["matched"], json!(false));
     }
 
     // ── content-pane capture semantics ───────────────────────────────────────
