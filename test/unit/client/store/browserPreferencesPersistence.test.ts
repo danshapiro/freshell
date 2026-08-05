@@ -258,4 +258,56 @@ describe('browserPreferencesPersistence', () => {
     expect('fontScale' in rehydrated.freshAgent).toBe(false)
     expect('agentChat' in rehydrated).toBe(false)
   })
+
+  it('persists a 400% uiScale and round-trips it through a reload', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      uiScale: 4,
+    }))
+
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved).toEqual({
+      settings: {
+        uiScale: 4,
+      },
+    })
+
+    // Reload simulation: rehydrate fresh local settings from the saved blob.
+    const rehydrated = resolveLocalSettings(saved.settings)
+    expect(rehydrated.uiScale).toBe(4)
+  })
+
+  it('clamps an out-of-range uiScale before persisting it', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      uiScale: 999,
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        uiScale: 4,
+      },
+    })
+  })
+
+  it('omits uiScale from browser preferences when reset to the 100% default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      uiScale: 1,
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings?.uiScale).toBeUndefined()
+  })
 })

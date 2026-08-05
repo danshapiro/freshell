@@ -131,6 +131,57 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.uiScale).toBe(initialUiScale)
     })
 
+    it('commits an exact 400% entry from the direct UI scale percentage input', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' }) as HTMLInputElement
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' }) as HTMLInputElement
+
+      // The direct percentage input advertises the 75%-400% bounds to the browser.
+      expect(uiScaleInput.getAttribute('min')).toBe('75')
+      expect(uiScaleInput.getAttribute('max')).toBe('400')
+
+      fireEvent.change(uiScaleInput, { target: { value: '400' } })
+      fireEvent.keyDown(uiScaleInput, { key: 'Enter' })
+
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+      expect(uiScaleInput.value).toBe('400')
+      expect(uiScaleSlider.value).toBe('33')
+      expect(uiScaleSlider.getAttribute('aria-valuetext')).toBe('400%')
+    })
+
+    it('keeps the UI scale controls focusable and keyboard-operable at 400%', () => {
+      const store = createSettingsViewStore({ settings: { uiScale: 4 } })
+      renderSettingsView(store)
+
+      const uiScaleSlider = screen.getByRole('slider', { name: 'UI scale' }) as HTMLInputElement
+      const uiScaleInput = screen.getByRole('spinbutton', { name: 'UI scale' }) as HTMLInputElement
+
+      // Both controls stay enabled and reachable via keyboard focus at 400%.
+      expect(uiScaleSlider).not.toBeDisabled()
+      expect(uiScaleInput).not.toBeDisabled()
+      uiScaleSlider.focus()
+      expect(document.activeElement).toBe(uiScaleSlider)
+      uiScaleInput.focus()
+      expect(document.activeElement).toBe(uiScaleInput)
+
+      // The slider sits on the 400% stop and announces it.
+      expect(uiScaleSlider.value).toBe('33')
+      expect(uiScaleSlider.getAttribute('aria-valuetext')).toBe('400%')
+
+      // Keyboard-style changes (no active pointer) commit immediately in both
+      // directions from the 400% ceiling.
+      fireEvent.change(uiScaleSlider, { target: { value: '32' } })
+      expect(store.getState().settings.settings.uiScale).toBe(3.75)
+      expect(uiScaleSlider.getAttribute('aria-valuetext')).toBe('375%')
+      expect(uiScaleInput.value).toBe('375')
+
+      fireEvent.change(uiScaleSlider, { target: { value: '33' } })
+      expect(store.getState().settings.settings.uiScale).toBe(4)
+      expect(uiScaleSlider.getAttribute('aria-valuetext')).toBe('400%')
+    })
+
     it('updates font size slider to the max stop', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
