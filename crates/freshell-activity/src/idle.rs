@@ -73,21 +73,21 @@
 //!    drift into a logged warning, and /session/status absence==idle is
 //!    version-derived behavior (1.18.x).
 //! 10. Opencode abort window W1: an abort landing between the prompt loop-top
-//!    and processor.create emits NO abort evidence at all before idle — a
-//!    ms-scale window where a completion bell can ring on a human abort
-//!    (window W2 is closed by the abort-marked message.updated fallback).
+//!     and processor.create emits NO abort evidence at all before idle — a
+//!     ms-scale window where a completion bell can ring on a human abort
+//!     (window W2 is closed by the abort-marked message.updated fallback).
 //! 11. Pathological opencode TUI quits — worker dispose exceeding the 5s
-//!    hard-terminate cap, or a raw SIGTERM (no drain path) — can leave
-//!    engagement set at spontaneous exit, so a death bell can ring on those
-//!    rare human quits. Normal quit paths verified to abort+drain (all four
-//!    quit inputs dispose runners via the abort path before exit); the
-//!    wire-flush instant is unprovable from code but mitigated upstream by
-//!    graceful SSE stream termination.
+//!     hard-terminate cap, or a raw SIGTERM (no drain path) — can leave
+//!     engagement set at spontaneous exit, so a death bell can ring on those
+//!     rare human quits. Normal quit paths verified to abort+drain (all four
+//!     quit inputs dispose runners via the abort path before exit); the
+//!     wire-flush instant is unprovable from code but mitigated upstream by
+//!     graceful SSE stream termination.
 //! 12. The opencode 120s busy deadman is EVENT-SILENCE-keyed (deltas and
-//!    heartbeats do not refresh it): a single >120s silent tool call trips it
-//!    mid-turn. Ownership survives and the turn's completion still rings —
-//!    the cost is the dropped busy light plus lost post-deadman death
-//!    engagement (the removal itself stays silent).
+//!     heartbeats do not refresh it): a single >120s silent tool call trips it
+//!     mid-turn. Ownership survives and the turn's completion still rings —
+//!     the cost is the dropped busy light plus lost post-deadman death
+//!     engagement (the removal itself stays silent).
 
 use std::collections::HashMap;
 
