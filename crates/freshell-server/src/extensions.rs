@@ -9,7 +9,9 @@
 //! * `server/extension-manager.ts` `scan()` (62-131) and `toClientRegistry()`
 //!   (144-191) — discover `freshell.json` manifests under the extension dirs and
 //!   serialize the client registry the SPA fetches at `GET /api/extensions`
-//!   (`src/hooks/useEnsureExtensionsRegistry.ts`).
+//!   (`src/hooks/useEnsureExtensionsRegistry.ts`). The original's per-skip
+//!   `Extension scan: …` log diagnostics (:66-130) are mirrored as structured
+//!   `extension.scan.*` tracing events (EXT-02).
 //! * `server/extension-manifest.ts` (81-103) — the manifest schema subset used by
 //!   the registry + CLI detection (lenient: unknown keys ignored rather than the
 //!   original's strict reject, since the bundled manifests are trusted).
@@ -24,7 +26,7 @@
 //! * `shared/extension-types.ts` `ClientExtensionEntry` (22-45) — the exact client
 //!   registry entry shape.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use freshell_platform::detect::{host_os_live, is_windows, HostOs};
@@ -107,7 +109,9 @@ struct ExtensionManifest {
 // ── Registry ─────────────────────────────────────────────────────────────────
 
 /// One discovered extension (`ExtensionRegistryEntry` — `extension-manager.ts:25-29`,
-/// minus the server-process handle, which this read-only port never spawns).
+/// minus the entry `path` and `serverPort`: this read-only port never allocates a
+/// port, and the path only matters during scanning (the duplicate diagnostic's
+/// `existingPath`, :117), where the `seen` map tracks it).
 #[derive(Debug, Clone)]
 struct RegistryEntry {
     manifest: ExtensionManifest,
@@ -131,7 +135,9 @@ pub struct ExtensionRegistry {
 impl ExtensionRegistry {
     /// `scan(dirs)` (`extension-manager.ts:62-131`): for each dir, read `freshell.json`
     /// from each subdirectory, parse it, and register under `manifest.name`
-    /// (first-wins on duplicate). Invalid/missing manifests are skipped.
+    /// (first-wins on duplicate). Invalid/missing manifests are skipped with the
+    /// original's per-skip log diagnostics mirrored as structured
+    /// `extension.scan.*` tracing events (line refs below).
     ///
     /// **Determinism note:** the original iterates `fs.readdirSync` order (which is
     /// filesystem-dependent, i.e. nondeterministic); this port sorts subdirectory
@@ -139,12 +145,29 @@ impl ExtensionRegistry {
     /// re-groups anyway, so this cannot change what the user sees).
     pub fn scan(dirs: &[PathBuf]) -> Self {
         let mut entries: Vec<RegistryEntry> = Vec::new();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
+        // Name → winning entry dir (`registry.set(manifest.name, { manifest, path })`,
+        // :123) so the duplicate warning can report the original's `existingPath`
+        // field (:117).
+        let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
 
         for dir in dirs {
-            let Ok(read) = std::fs::read_dir(dir) else {
+            // `if (!fs.existsSync(dir))` (:66): missing scan roots are routine
+            // (user/project dirs usually absent), so the original logs at debug.
+            if !dir.exists() {
+                tracing::debug!(dir = %dir.display(), "extension.scan.dir_missing");
                 continue;
+            }
+            let read = match std::fs::read_dir(dir) {
+                Ok(read) => read,
+                Err(err) => {
+                    // `failed to read directory` (:74-77).
+                    tracing::warn!(dir = %dir.display(), error = %err, "extension.scan.dir_read_failed");
+                    continue;
+                }
             };
+            // Only directories and symlinks (`entry.isDirectory() || entry.isSymbolicLink()`,
+            // :80-81) — a symlink target may live outside the scan root; like the
+            // original, this port registers the link's NAME, never a path.
             let mut sub_names: Vec<String> = read
                 .filter_map(|e| e.ok())
                 .filter(|e| {
@@ -157,23 +180,82 @@ impl ExtensionRegistry {
             sub_names.sort();
 
             for name in sub_names {
-                let manifest_path = dir.join(&name).join(MANIFEST_FILE);
-                let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+                let entry_dir = dir.join(&name);
+                let manifest_path = entry_dir.join(MANIFEST_FILE);
+                // `if (!fs.existsSync(manifestPath)) continue` (:86) is SILENT in
+                // the original — a subdir without a manifest simply is not an
+                // extension. `exists()` follows links, so dangling symlinks land
+                // here too (legacy `fs.existsSync` likewise follows).
+                if !manifest_path.exists() {
                     continue;
+                }
+                let raw = match std::fs::read_to_string(&manifest_path) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        // `failed to read manifest file` (:91-94).
+                        tracing::warn!(
+                            manifest_path = %manifest_path.display(),
+                            error = %err,
+                            "extension.scan.manifest_read_failed"
+                        );
+                        continue;
+                    }
                 };
-                let Ok(manifest) = serde_json::from_str::<ExtensionManifest>(&raw) else {
-                    continue;
+                let manifest: ExtensionManifest = match serde_json::from_str(&raw) {
+                    Ok(manifest) => manifest,
+                    Err(err) => {
+                        // The original splits this in two: `invalid JSON in
+                        // manifest` on a JSON.parse throw (:99-101) and `invalid
+                        // manifest` on a schema reject (:104-110). serde_json folds
+                        // both into one error; its classification restores the split.
+                        if err.is_syntax() || err.is_eof() {
+                            tracing::warn!(
+                                manifest_path = %manifest_path.display(),
+                                error = %err,
+                                "extension.scan.invalid_json_in_manifest"
+                            );
+                        } else {
+                            tracing::warn!(
+                                manifest_path = %manifest_path.display(),
+                                error = %err,
+                                "extension.scan.invalid_manifest"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 if !is_valid_manifest(&manifest) {
+                    // The refinement half of `invalid manifest` (:104-110): the
+                    // declared category must carry exactly its own config block.
+                    tracing::warn!(
+                        manifest_path = %manifest_path.display(),
+                        category = %manifest.category,
+                        "extension.scan.invalid_manifest"
+                    );
                     continue;
                 }
-                if seen.contains(&manifest.name) {
-                    continue; // duplicate name — first wins
+                if let Some(existing_path) = seen.get(&manifest.name) {
+                    // `duplicate name, skipping` with { name, path, existingPath }
+                    // (:115-121) — first wins.
+                    tracing::warn!(
+                        name = %manifest.name,
+                        path = %entry_dir.display(),
+                        existing_path = %existing_path.display(),
+                        "extension.scan.duplicate_name"
+                    );
+                    continue;
                 }
-                seen.insert(manifest.name.clone());
+                seen.insert(manifest.name.clone(), entry_dir);
                 entries.push(RegistryEntry { manifest });
             }
         }
+
+        // `Extension scan complete` with { count, names } (:127-130).
+        tracing::info!(
+            count = entries.len(),
+            names = ?entries.iter().map(|e| e.manifest.name.as_str()).collect::<Vec<_>>(),
+            "extension.scan.complete"
+        );
 
         ExtensionRegistry { entries }
     }
@@ -484,6 +566,79 @@ mod tests {
         d
     }
 
+    /// Extension dirs may be SYMLINKS (`t.is_dir() || t.is_symlink()` in `scan`).
+    /// Unix-only helper: symlink creation on Windows requires privileges, so the
+    /// symlink tests below are `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn symlink_dir(original: &Path, link: &Path) {
+        std::os::unix::fs::symlink(original, link).unwrap();
+    }
+
+    /// Run `f` with a THREAD-LOCAL tracing subscriber that records every event
+    /// `scan()` emits as one `LEVEL target field=value … message=…` line,
+    /// returning (captured log text, f's result). Threads the assert on the
+    /// diagnostics parity added for EXT-02 (legacy `Extension scan: …` warnings,
+    /// extension-manager.ts:66-130). The subscriber is hand-rolled with
+    /// `enabled() == true` rather than routed through tracing-subscriber's
+    /// fmt/LevelFilter machinery, so per-callsite interest caching and any
+    /// level/EnvFilter configuration can never silence the events under test.
+    /// `with_default` (not a global init) keeps parallel unit tests isolated,
+    /// and `scan()` is synchronous on this thread so its events all land here.
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (String, T) {
+        use std::fmt::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{span, Event, Metadata, Subscriber};
+
+        // `%`-displayed values (`manifest_path = %p.display()` and friends)
+        // arrive at `record_debug` via `DisplayValue`, whose `Debug` impl is a
+        // passthrough to `Display` (tracing-core field.rs) — so they are
+        // written RAW (no quotes) and path-substring asserts apply directly.
+        struct FieldVisitor(String);
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                let _ = write!(self.0, " {}={}", field.name(), value);
+            }
+        }
+
+        struct Capture {
+            lines: Arc<Mutex<Vec<String>>>,
+            next_span: AtomicU64,
+        }
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed))
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let meta = event.metadata();
+                let mut visitor = FieldVisitor(format!("{} {}", meta.level(), meta.target()));
+                event.record(&mut visitor);
+                self.lines.lock().unwrap().push(visitor.0);
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Capture {
+            lines: Arc::clone(&lines),
+            // `Id::from_u64` must never be 0 (NonZeroU64) — start at 1.
+            next_span: AtomicU64::new(1),
+        };
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let captured = lines.lock().unwrap().join("\n");
+        (captured, result)
+    }
+
     const CLAUDE_MANIFEST: &str = r#"{
       "name": "claude", "version": "1.0.0", "label": "Claude CLI",
       "description": "Anthropic's Claude Code CLI agent", "category": "cli",
@@ -502,6 +657,40 @@ mod tests {
         "supportsModel": true,
         "terminalBehavior": { "preferredRenderer": "canvas", "scrollInputPolicy": "native" } },
       "picker": { "group": "agents" }
+    }"#;
+
+    /// Same `name` as CLAUDE_MANIFEST (duplicate candidate), distinct label so
+    /// the winning entry is identifiable.
+    const CLAUDE_DUP_MANIFEST: &str = r#"{
+      "name": "claude", "version": "9.9.9", "label": "Claude DUP",
+      "description": "duplicate claude entry from a later root", "category": "cli",
+      "cli": { "command": "claude-dup" }
+    }"#;
+
+    const MINI_VALID_MANIFEST: &str = r#"{
+      "name": "mini-cli", "version": "1.0.0", "label": "Mini CLI",
+      "description": "minimal valid cli manifest", "category": "cli",
+      "cli": { "command": "mini" }
+    }"#;
+
+    /// Missing the required `label` field — schema-shape reject (legacy zod
+    /// `invalid manifest`, extension-manager.ts:104-110).
+    const MISSING_LABEL_MANIFEST: &str = r#"{
+      "name": "no-label", "version": "1.0.0",
+      "description": "missing required label", "category": "cli",
+      "cli": { "command": "nolabel" }
+    }"#;
+
+    /// `category: "cli"` without a `cli` block — refinement reject
+    /// (`is_valid_manifest`, mirroring extension-manifest.ts:96-103).
+    const CLI_WITHOUT_BLOCK_MANIFEST: &str = r#"{
+      "name": "cli-no-block", "version": "1.0.0", "label": "No Block",
+      "description": "cli category but no cli block", "category": "cli"
+    }"#;
+
+    const UNKNOWN_CATEGORY_MANIFEST: &str = r#"{
+      "name": "weird-cat", "version": "1.0.0", "label": "Weird",
+      "description": "unknown category", "category": "widget"
     }"#;
 
     #[test]
@@ -523,6 +712,154 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&root2).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_accepts_symlinked_dirs_and_skips_dangling_links() {
+        // Symlinked extension entries are discovered exactly like real dirs
+        // (`entry.isDirectory() || entry.isSymbolicLink()`, extension-manager.ts:80-81
+        // → `t.is_dir() || t.is_symlink()` above), INCLUDING links whose targets
+        // live outside the scan root — the `outside` dir here stands in for one.
+        let outside = tmp();
+        write_manifest(&outside, "real-opencode", OPENCODE_MANIFEST);
+        let root = tmp();
+        symlink_dir(&outside.join("real-opencode"), &root.join("linked-opencode"));
+        // A dangling symlink is silently NOT an extension: `existsSync(manifestPath)`
+        // follows links and fails (:86) — mirrored here by `manifest_path.exists()`.
+        symlink_dir(&outside.join("no-such-target"), &root.join("dangling"));
+
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert_eq!(
+            reg.entries.len(),
+            1,
+            "symlinked dir discovered, dangling link skipped"
+        );
+        assert_eq!(reg.entries[0].manifest.name, "opencode");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_duplicate_in_later_root_loses_first_wins() {
+        // First-wins dedup keyed on `manifest.name` (extension-manager.ts:115-121)
+        // holds when the LATER root's candidate arrives via symlink — and the skip
+        // is logged with the original's { name, path, existingPath } fields.
+        let root1 = tmp();
+        write_manifest(&root1, "claude-code", CLAUDE_MANIFEST);
+        let outside = tmp();
+        write_manifest(&outside, "claude-elsewhere", CLAUDE_DUP_MANIFEST);
+        let root2 = tmp();
+        symlink_dir(&outside.join("claude-elsewhere"), &root2.join("claude-dup-link"));
+
+        let (logs, reg) = capture_tracing(|| {
+            ExtensionRegistry::scan(&[root1.clone(), root2.clone()])
+        });
+        assert_eq!(reg.entries.len(), 1, "symlinked duplicate dropped");
+        assert_eq!(
+            reg.entries[0].manifest.label, "Claude CLI",
+            "the FIRST root's entry wins"
+        );
+        assert!(
+            logs.contains("extension.scan.duplicate_name"),
+            "dup skip must be diagnosed (legacy :115-121 warn), got:\n{logs}"
+        );
+        assert!(logs.contains("existing_path="), "existingPath field");
+        assert!(
+            logs.contains(&root1.join("claude-code").display().to_string()),
+            "existing_path points at the winner's dir, got:\n{logs}"
+        );
+
+        std::fs::remove_dir_all(&root1).ok();
+        std::fs::remove_dir_all(&root2).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn invalid_manifests_are_skipped_with_parity_warnings() {
+        // Each invalid class is skipped WITHOUT producing an entry, and each skip
+        // is DIAGNOSED (legacy was silent in a previous port of this file — the
+        // EXT-02 gap; legacy warnings at extension-manager.ts:91-119).
+        let root = tmp();
+        write_manifest(&root, "good", MINI_VALID_MANIFEST);
+        // `invalid JSON in manifest` (:99-101):
+        write_manifest(&root, "bad-json", "{ this is not json");
+        // `invalid manifest` — schema-shape rejects (:104-110):
+        write_manifest(&root, "missing-field", MISSING_LABEL_MANIFEST);
+        // `invalid manifest` — refinement rejects (extension-manifest.ts:96-103):
+        write_manifest(&root, "cli-no-block", CLI_WITHOUT_BLOCK_MANIFEST);
+        write_manifest(&root, "unknown-cat", UNKNOWN_CATEGORY_MANIFEST);
+        // Subdir without freshell.json — silently skipped in the original (:86),
+        // so NO warning may fire for it here either.
+        std::fs::create_dir_all(root.join("no-manifest")).unwrap();
+
+        let (logs, reg) =
+            capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
+
+        let names: Vec<&str> = reg.entries.iter().map(|e| e.manifest.name.as_str()).collect();
+        assert_eq!(names, ["mini-cli"], "only the valid manifest registers");
+        assert_eq!(
+            logs.matches("extension.scan.invalid_json_in_manifest").count(),
+            1,
+            "one JSON-parse warning (bad-json), got:\n{logs}"
+        );
+        assert_eq!(
+            logs.matches("extension.scan.invalid_manifest").count(),
+            3,
+            "missing-field + cli-no-block + unknown-cat, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("no-manifest"),
+            "missing freshell.json is a SILENT skip (legacy :86), got:\n{logs}"
+        );
+        // `Extension scan complete` with { count, names } (:127-130).
+        assert!(logs.contains("extension.scan.complete"), "got:\n{logs}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_registry_exposes_no_filesystem_paths_for_symlinked_entries() {
+        // The serialized client registry must never reveal WHERE an extension
+        // lives (`toClientRegistry`, extension-manager.ts:143-191, emits manifest
+        // fields only) — even when the entry dir is a symlink whose TARGET is
+        // outside the allowed scan root. `iconUrl` is an API route built from the
+        // NAME (`/api/extensions/${encodeURIComponent(name)}/icon`, :160), never
+        // a filesystem path.
+        let outside = tmp();
+        let icon_manifest = r#"{
+          "name": "icon-ext", "version": "1.0.0", "label": "Icon Ext",
+          "description": "client extension with an icon", "category": "client",
+          "icon": "assets/icon.svg"
+        }"#;
+        write_manifest(&outside, "icon-extension", icon_manifest);
+        let root = tmp();
+        symlink_dir(&outside.join("icon-extension"), &root.join("linked-icon-ext"));
+
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
+        assert_eq!(reg.entries.len(), 1);
+        let entries = reg.to_client_registry();
+        let e = &entries[0];
+        assert_eq!(e["name"], json!("icon-ext"));
+        assert_eq!(e["iconUrl"], json!("/api/extensions/icon-ext/icon"));
+        assert!(e.get("path").is_none());
+        assert!(e.get("dir").is_none());
+
+        let serialized = serde_json::to_string(&entries).unwrap();
+        assert!(
+            !serialized.contains(root.to_str().unwrap()),
+            "scan root path must not leak: {serialized}"
+        );
+        assert!(
+            !serialized.contains(outside.to_str().unwrap()),
+            "symlink target path (outside the allowed root) must not leak: {serialized}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
