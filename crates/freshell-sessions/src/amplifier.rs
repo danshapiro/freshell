@@ -26,6 +26,13 @@
 //! `AMPLIFIER_FIRST_USER_MESSAGE_MAX_READ_BYTES` (`providers/amplifier.ts:8-10`)
 //! -- never the whole file, mirroring `readFirstUserMessageFromTranscript`
 //! (`providers/amplifier.ts:106-140`) byte-for-byte.
+//!
+//! SESSION-07 adds ONE more transcript reader, deliberately NOT part of the
+//! listing sweep: the `userMessages`/`fullText` file-tier search scans a
+//! session's `transcript.jsonl` per search REQUEST
+//! (`crate::search::search_session_file`), so [`IndexedSession::source_file`]
+//! points there when the transcript exists (`parse_amplifier_file`). The
+//! listing path itself stays metadata+preview only.
 
 use std::path::{Path, PathBuf};
 
@@ -356,10 +363,10 @@ fn indexed_from_meta(
         cwd: meta.cwd.clone(),
         is_subagent: meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
-        // SESSION-07: amplifier session-file content search is not ported
-        // (the amplifier transcript shape has no ported file-search parser);
-        // `None` makes it un-searchable at the `userMessages`/`fullText`
-        // tiers (title-tier metadata search is unaffected).
+        // SESSION-07: defaulted `None` here; `parse_amplifier_file` points
+        // this at the sibling `transcript.jsonl` when one exists (see the
+        // amendment there), making amplifier searchable at the
+        // `userMessages`/`fullText` tiers.
         source_file: None,
     }
 }
@@ -393,7 +400,26 @@ fn parse_amplifier_file(path: &Path) -> Option<IndexedSession> {
         .unwrap_or("")
         .to_string();
 
-    Some(indexed_from_meta(&meta, &fallback, activity_mtime_ms))
+    let mut session = indexed_from_meta(&meta, &fallback, activity_mtime_ms);
+
+    // SESSION-07: the `userMessages`/`fullText` file tiers
+    // (`crate::search::search_session_file`) scan the sibling
+    // `transcript.jsonl` -- the session's actual message bodies.
+    // SPEC-over-REFERENCE (documented in search.rs's scope notes): the
+    // reference points amplifier's `sourceFile` at metadata.json itself
+    // (`session-indexer.ts:1037`), a role-less document its own `parseEvent`
+    // can never turn into a message event, so the original NEVER produced an
+    // amplifier message-body match; the SESSION-07 checklist ("message
+    // bodies across all providers") overrides that reference defect. An
+    // ABSENT transcript (e.g. a session whose process was killed before its
+    // first prompt:complete -- the reference's INDEXER POLICY E6 case,
+    // `providers/amplifier.ts:204-216`) keeps
+    // `None`, which `apply_file_search` skips WITHOUT consuming its scan
+    // budget, exactly like the reference's `if (!sourceFile) continue`
+    // (`service.ts:191-192`).
+    session.source_file = transcript_path.exists().then(|| transcript_path.clone());
+
+    Some(session)
 }
 
 #[cfg(test)]
@@ -721,6 +747,73 @@ mod tests {
         let items = source.scan();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].key(), "amplifier:override-me");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- SESSION-07: source_file points at the sibling transcript --
+
+    /// The file-tier search (`crate::search::search_session_file`) needs a
+    /// per-session transcript path. When `transcript.jsonl` exists,
+    /// `source_file` must name it (NOT the metadata.json the reference
+    /// points at -- search.rs documents why the spec overrides that
+    /// reference defect).
+    #[test]
+    fn amplifier_source_file_points_at_existing_transcript_jsonl() {
+        let home = unique_temp_dir("source-file");
+        write_session(
+            &home,
+            "proj",
+            "sess-src",
+            &sample_metadata("sess-src", "/p", "Sourced"),
+            Some("{\"role\":\"user\",\"content\":\"hello\"}\n"),
+        );
+        let source = AmplifierSource::new(home.clone());
+        let items = source.scan();
+        assert_eq!(items.len(), 1);
+        let expected = home
+            .join("projects")
+            .join("proj")
+            .join("sessions")
+            .join("sess-src")
+            .join("transcript.jsonl");
+        assert_eq!(
+            items[0].source_file.as_deref(),
+            Some(expected.as_path()),
+            "source_file must name the sibling transcript.jsonl"
+        );
+        // And the wiring is live end-to-end at this layer: a user-tier
+        // search over that transcript finds the user turn.
+        let m = crate::search::search_session_file(
+            items[0].source_file.as_deref().unwrap(),
+            "amplifier",
+            "hello",
+            crate::search::FileSearchTier::UserMessages,
+            None,
+        )
+        .unwrap();
+        assert_eq!(m.map(|m| m.matched_in), Some("userMessage"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A session killed before its first `prompt:complete` has NO
+    /// `transcript.jsonl`: `source_file` stays `None`
+    /// so the file-tier search skips it WITHOUT an I/O error degrading the
+    /// page (a missing file would be `SearchFileError::Io` →
+    /// `partialReason: 'io_error'`).
+    #[test]
+    fn amplifier_source_file_stays_none_without_a_transcript() {
+        let home = unique_temp_dir("no-transcript");
+        write_session(
+            &home,
+            "proj",
+            "sess-none",
+            &sample_metadata("sess-none", "/p", "No Transcript"),
+            None,
+        );
+        let source = AmplifierSource::new(home.clone());
+        let items = source.scan();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_file, None);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

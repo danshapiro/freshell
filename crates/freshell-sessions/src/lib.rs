@@ -40,7 +40,9 @@ pub(crate) static HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 pub use meta::{CodexTaskEventSnapshot, ParsedSessionMeta, TokenSummary};
 pub use parse::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
-pub use search::{extract_snippet, search_session_file, FileSearchMatch, FileSearchTier};
+pub use search::{
+    extract_snippet, search_session_file, FileSearchMatch, FileSearchTier, SearchFileError,
+};
 
 #[cfg(test)]
 mod tests {

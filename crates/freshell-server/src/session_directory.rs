@@ -48,7 +48,7 @@ use base64::Engine as _;
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
 // SESSION-07: the `userMessages`/`fullText` tier file-content search
 // (`apply_file_search`, below) -- ports `server/session-directory/file-search.ts`.
-use freshell_sessions::{search_session_file, FileSearchTier};
+use freshell_sessions::{search_session_file, FileSearchTier, SearchFileError};
 // Batch B: only the `#[cfg(test)]`-gated reference functions below
 // (`list_claude_sessions`/`parse_claude_file`/`item_from_meta`) still need the
 // raw parse layer directly -- production reads `IndexedSession` from the
@@ -412,12 +412,43 @@ async fn session_directory(
     // `TerminalMetadataService.list()` input to `toItems`.
     let identities = state.identity.list();
     let items = join_live_terminals(items, &identities);
-    match apply_query(items, &query, &identities) {
-        Ok(page) => Json(page).into_response(),
+    // SESSION-07 stale-query cancellation (request supersession): port of the
+    // reference's request-abort plumbing (`read-models/request-abort.ts` --
+    // the client aborts its fetch when a newer sidebar query supersedes this
+    // one, `sessionsThunks.ts` `abortSurface`). The derivation (which reads
+    // transcript files at the file tiers) runs on a blocking worker -- never
+    // the async runtime thread -- and is CANCELLED COOPERATIVELY when this
+    // handler future is dropped (hyper drops an in-flight handler future
+    // when its connection dies): the guard's `Drop` fires the token, and the
+    // scan abandons at its next per-item/per-line probe
+    // (`service.ts:188,209-210`, `file-search.ts:43,56`). A superseded query
+    // therefore stops consuming transcript I/O and never completes a stale
+    // page. NB: `_cancel_on_drop` (named) lives to end-of-scope -- a bare
+    // `_` binding would drop (and cancel) immediately.
+    let cancel = SearchCancel::default();
+    let _cancel_on_drop = CancelOnDrop(cancel.clone());
+    let derivation = tokio::task::spawn_blocking(move || {
+        let probe = || cancel.is_cancelled();
+        apply_query_cancellable(items, &query, &identities, Some(&probe))
+    });
+    match derivation.await {
+        Ok(Ok(page)) => Json(page).into_response(),
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
-        Err(msg) => (
+        Ok(Err(QueryError::BadCursor(msg))) => (
             axum::http::StatusCode::BAD_REQUEST,
             Json(json!({ "error": msg })),
+        )
+            .into_response(),
+        // Unreachable over the wire: the only canceller is this future's own
+        // drop, after which no response can be produced. The arm is the
+        // closest axum can express the reference's silent swallow of an
+        // aborted request (`sessions-router.ts:128-131`): no page payload.
+        Ok(Err(QueryError::Cancelled)) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        // A panicking derivation task: the reference route's generic 500
+        // (`sessions-router.ts:132-138`).
+        Err(_join_error) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Session directory query failed" })),
         )
             .into_response(),
     }
@@ -1106,20 +1137,111 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String), String> {
 
 // ── The query derivation (querySessionDirectory, title tier) ────────────────
 
+/// `apply_query`'s failure modes. SESSION-07 widened the lone cursor error
+/// (a `String` → 400) into an enum to carry the cancellation outcome.
+#[derive(Debug)]
+enum QueryError {
+    /// Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400
+    /// (`sessions-router.ts:139-141`, pre-existing parity).
+    BadCursor(String),
+    /// The file-tier scan was cancelled mid-flight (SESSION-07 stale-query
+    /// cancellation). The reference SWALLOWS an aborted request without
+    /// writing a response (`sessions-router.ts:128-131`'s
+    /// `if (signal.aborted || isReadModelAbortError(error)) return`). Over
+    /// the wire here this arm is UNREACHABLE -- the only canceller is the
+    /// handler future's own drop ([`CancelOnDrop`]), after which no response
+    /// can be produced anyway -- but the variant keeps the types total and
+    /// the supersession semantics unit-testable at the `apply_query` level.
+    Cancelled,
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::BadCursor(msg) => write!(f, "{msg}"),
+            QueryError::Cancelled => write!(f, "Session-directory request aborted"),
+        }
+    }
+}
+
+/// Cooperative cancellation token for the file-tier transcript scan — the
+/// port of the reference's `AbortSignal` plumbing
+/// (`read-models/request-abort.ts` → `service.ts:188,209-210` →
+/// `file-search.ts:43,56`). In the original, the CLIENT aborts its fetch
+/// when a newer sidebar query supersedes the in-flight one
+/// (`sessionsThunks.ts` `abortSurface(surface)`); `req.once('aborted')`
+/// fires the signal and the scan throws mid-item/mid-line.
+///
+/// This port wires the same lifecycle: the request handler future owns a
+/// [`CancelOnDrop`] guard; hyper drops an in-flight handler future when its
+/// connection dies, the guard's `Drop` cancels this token, and the scan —
+/// running on a `spawn_blocking` worker — abandons the query at its next
+/// probe point instead of scanning stale work to completion. (A blocking
+/// task cannot be killed; it is abandoned cooperatively — the same
+/// containment `resolve.rs::bounded_fallback` documents.)
+#[derive(Clone, Default)]
+struct SearchCancel {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SearchCancel {
+    fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// `Drop` ⇒ [`SearchCancel::cancel`]. Held by the request handler future
+/// across the scan's `JoinHandle` await, so a client-aborted (superseded)
+/// request cancels its own scan. NB: must be bound to a NAMED binding
+/// (`_cancel_on_drop`, never bare `_`) so it lives to end-of-scope.
+struct CancelOnDrop(SearchCancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// `querySessionDirectory` (`service.ts:228-298`), title tier: sort, visibility
 /// pre-filter, cursor page, revision. Returns the `SessionDirectoryPage` value, or
 /// an error string when the cursor is invalid (→ 400).
+///
+/// SESSION-07: the cancellation-aware core is [`apply_query_cancellable`];
+/// this adapter preserves the original 3-argument/`String`-error contract
+/// for the (extensive) pre-existing test suite below (cancellation can never
+/// fire without a probe, so the `Cancelled` arm is structurally unreachable
+/// here). The production handler uses [`apply_query_cancellable`] directly.
+#[cfg(test)]
 fn apply_query(
-    mut items: Vec<DirItem>,
+    items: Vec<DirItem>,
     q: &DirQuery,
     identities: &[freshell_ws::identity::TerminalIdentity],
 ) -> Result<Value, String> {
+    apply_query_cancellable(items, q, identities, None).map_err(|e| e.to_string())
+}
+
+/// The cancellation-aware query core (`service.ts:228-298` with its
+/// `throwIfAborted` checks at :238/:261 and the abort-propagating
+/// `applyFileSearch` at :153-226). `should_cancel` is the ported
+/// `AbortSignal`: consulted before any search work and inside the per-item
+/// scan loop; a fired probe aborts the WHOLE query ([`QueryError::Cancelled`]),
+/// never a degraded page -- matching the reference's abort rethrow
+/// (`service.ts:209-210`).
+fn apply_query_cancellable(
+    mut items: Vec<DirItem>,
+    q: &DirQuery,
+    identities: &[freshell_ws::identity::TerminalIdentity],
+    should_cancel: Option<&(dyn Fn() -> bool)>,
+) -> Result<Value, QueryError> {
     let limit = q
         .limit
         .unwrap_or(MAX_DIRECTORY_PAGE_ITEMS)
         .min(MAX_DIRECTORY_PAGE_ITEMS);
     let cursor = match &q.cursor {
-        Some(c) => Some(decode_cursor(c)?),
+        Some(c) => Some(decode_cursor(c).map_err(QueryError::BadCursor)?),
         None => None,
     };
 
@@ -1187,12 +1309,17 @@ fn apply_query(
                     .collect();
             }
             Tier::UserMessages | Tier::FullText => {
+                // `throwIfAborted(input.signal)` (`service.ts:261`), checked
+                // before the search work starts.
+                if should_cancel.is_some_and(|probe| probe()) {
+                    return Err(QueryError::Cancelled);
+                }
                 let file_tier = if q.tier == Tier::UserMessages {
                     FileSearchTier::UserMessages
                 } else {
                     FileSearchTier::FullText
                 };
-                let result = apply_file_search(items, query_text, file_tier, limit);
+                let result = apply_file_search(items, query_text, file_tier, limit, should_cancel)?;
                 items = result.items;
                 partial = result.partial;
                 partial_reason = result.partial_reason;
@@ -1242,21 +1369,31 @@ struct FileSearchOutcome {
 /// source transcript for the `userMessages`/`fullText` tiers. Bounded by a
 /// scan budget (`maxScan = limit * 10`, `service.ts:176`) and an early stop
 /// once `limit + 1` matches accumulate (`service.ts:182`) -- the `+1` lets
-/// [`apply_query`]'s existing `items.len() > limit` next-cursor check detect
-/// "more exist" without this function ever scanning the entire remaining
-/// list (unlike the title tier, which does).
+/// [`apply_query_cancellable`]'s existing `items.len() > limit` next-cursor
+/// check detect "more exist" without this function ever scanning the entire
+/// remaining list (unlike the title tier, which does).
 ///
-/// An item with no [`DirItem::source_file`] (a live-terminal-only item, or a
-/// provider with no per-file source -- opencode/amplifier) or an unsupported
-/// `provider` is skipped WITHOUT counting against the scan budget, mirroring
-/// `service.ts:191-195`'s `if (!sourceFile) continue` / `if (!provider) continue`
-/// (both `continue` before the `scanned++` at :197).
+/// An item with no [`DirItem::source_file`] (a live-terminal-only item, an
+/// opencode session -- direct-listed from one sqlite db, no per-session
+/// file -- or an amplifier session whose transcript was never written) or an
+/// unsupported `provider` is skipped WITHOUT counting against the scan
+/// budget, mirroring `service.ts:191-195`'s `if (!sourceFile) continue` /
+/// `if (!provider) continue` (both `continue` before the `scanned++` at :197).
+///
+/// Cancellation (SESSION-07): `should_cancel` is the ported `AbortSignal`,
+/// consulted per ITEM (`throwIfAborted(input.signal)`, `service.ts:188`) and
+/// threaded into the per-line scan. A fired probe aborts the WHOLE query
+/// with [`QueryError::Cancelled`] -- the reference re-throws the abort error
+/// instead of degrading (`service.ts:209-210`'s
+/// `if (input.signal?.aborted) throw error`), so a superseded query must
+/// never surface as a stale partial page.
 fn apply_file_search(
     items: Vec<DirItem>,
     query_text: &str,
     tier: FileSearchTier,
     limit: usize,
-) -> FileSearchOutcome {
+    should_cancel: Option<&(dyn Fn() -> bool)>,
+) -> Result<FileSearchOutcome, QueryError> {
     let max_scan = limit * 10;
     let mut results: Vec<DirItem> = Vec::new();
     let mut scanned = 0usize;
@@ -1272,15 +1409,24 @@ fn apply_file_search(
             partial_reason = Some("budget");
             break;
         }
+        if should_cancel.is_some_and(|probe| probe()) {
+            return Err(QueryError::Cancelled);
+        }
         let Some(source_file) = item.source_file.clone() else {
             continue;
         };
-        if !matches!(item.provider.as_str(), "claude" | "codex") {
+        if !matches!(item.provider.as_str(), "claude" | "codex" | "amplifier") {
             continue;
         }
         scanned += 1;
 
-        match search_session_file(&source_file, &item.provider, query_text, tier) {
+        match search_session_file(
+            &source_file,
+            &item.provider,
+            query_text,
+            tier,
+            should_cancel,
+        ) {
             Ok(Some(m)) => {
                 let mut matched = item;
                 matched.matched_in = Some(m.matched_in.to_string());
@@ -1288,7 +1434,10 @@ fn apply_file_search(
                 results.push(matched);
             }
             Ok(None) => {}
-            Err(_) => {
+            // The abort RE-THROW (`service.ts:209-210`), kept distinct from
+            // the degradable I/O arm.
+            Err(SearchFileError::Cancelled) => return Err(QueryError::Cancelled),
+            Err(SearchFileError::Io(_)) => {
                 partial = true;
                 if partial_reason.is_none() {
                     partial_reason = Some("io_error");
@@ -1297,11 +1446,11 @@ fn apply_file_search(
         }
     }
 
-    FileSearchOutcome {
+    Ok(FileSearchOutcome {
         items: results,
         partial,
         partial_reason,
-    }
+    })
 }
 
 /// `applySearch` (`service.ts:66-75`) at the title tier: match the query against
@@ -3089,6 +3238,343 @@ mod tests {
         assert_eq!(page["items"].as_array().unwrap().len(), 0);
         assert_eq!(page["partial"], json!(true));
         assert_eq!(page["partialReason"], json!("budget"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── SESSION-07: stale-query cancellation (request supersession) ──
+
+    /// The handler-side lifecycle hook: dropping the guard (which the
+    /// handler owns across the scan await) must fire the token -- this is
+    /// what makes hyper dropping a superseded/disconnected request's future
+    /// cancel its blocking scan.
+    #[test]
+    fn cancel_on_drop_fires_the_search_token() {
+        let cancel = SearchCancel::default();
+        assert!(!cancel.is_cancelled());
+        {
+            let _guard = CancelOnDrop(cancel.clone());
+            assert!(!cancel.is_cancelled());
+        }
+        assert!(
+            cancel.is_cancelled(),
+            "dropping the guard must cancel the token"
+        );
+    }
+
+    /// Supersession mid-scan: the per-item probe (`throwIfAborted`,
+    /// `service.ts:188`) must abandon the query BEFORE the next session's
+    /// transcript is read -- even though a LATER session would have matched.
+    /// Deterministic probe: the per-item/per-line checks fire in a fixed
+    /// order; the probe turns true exactly at the second item's loop-top
+    /// check, so session B's file is never opened.
+    #[test]
+    fn file_tier_scan_abandons_at_the_per_item_probe_before_reading_the_late_match() {
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-cancel-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let project = home.join(".claude").join("projects").join("-home-dan-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // Session A (NEWER, scanned first): ONE non-matching user line, NO
+        // trailing newline, so its scan consults the probe exactly: pre-read
+        // + one line check.
+        let sid_a = "eeeeeeee-0000-4000-8000-00000000000a";
+        std::fs::write(
+            project.join(format!("{sid_a}.jsonl")),
+            format!(
+                "{{\"parentUuid\":null,\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{sid_a}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"no match in A\"}},\"uuid\":\"{sid_a}-u001\",\"timestamp\":\"2026-01-30T06:20:00.000Z\"}}"
+            ),
+        )
+        .unwrap();
+        // Session B (older, scanned second): the ONLY match.
+        let sid_b = "eeeeeeee-0000-4000-8000-00000000000b";
+        std::fs::write(
+            project.join(format!("{sid_b}.jsonl")),
+            format!(
+                "{{\"parentUuid\":null,\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{sid_b}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"needle-late-user-turn\"}},\"uuid\":\"{sid_b}-u001\",\"timestamp\":\"2026-01-30T06:10:00.000Z\"}}\n\
+                 {{\"parentUuid\":\"{sid_b}-u001\",\"cwd\":\"/home/dan/proj\",\"sessionId\":\"{sid_b}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"second turn for B\"}},\"uuid\":\"{sid_b}-u002\",\"timestamp\":\"2026-01-30T06:10:30.000Z\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let items = list_claude_sessions(&claude_home(&home));
+        assert_eq!(items.len(), 2);
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("needle-late-user-turn".into()),
+            ..DirQuery::default()
+        };
+
+        // Probe consult order: (1) pre-search check, (2) item-A loop top,
+        // (3) A pre-read, (4) A's single line, then (5) item-B loop top.
+        // `n >= 4` (n = calls BEFORE this one) makes call 5 the first true.
+        let calls = std::cell::Cell::new(0usize);
+        let probe = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            n >= 4
+        };
+        let outcome = apply_query_cancellable(items.clone(), &q, &[], Some(&probe));
+        assert!(
+            matches!(outcome, Err(QueryError::Cancelled)),
+            "a superseded query must abort with Cancelled, never a stale page, got {outcome:?}"
+        );
+
+        // Control: an un-cancelled scan DOES reach session B's match,
+        // proving the cancelled run abandoned EARLY (before B was read),
+        // not merely failed to match.
+        let page = apply_query_cancellable(items, &q, &[], Some(&|| false)).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["sessionId"], json!(sid_b));
+        assert_eq!(arr[0]["matchedIn"], json!("userMessage"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A pre-cancelled probe yields NO page at all (`QueryError::Cancelled`)
+    /// -- the port of the reference swallowing an aborted request without
+    /// writing a response (`sessions-router.ts:128-131`). In particular it
+    /// must NOT collapse into a degraded `partial`/`partialReason: io_error`
+    /// page.
+    #[test]
+    fn pre_cancelled_file_tier_query_yields_no_page_and_no_partial() {
+        let home = synthetic_claude_home_with_turns(
+            "eeeeeeee-0000-4000-8000-00000000000c",
+            "pre-cancelled-needle",
+            "irrelevant assistant",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("pre-cancelled-needle".into()),
+            ..DirQuery::default()
+        };
+        let outcome = apply_query_cancellable(items, &q, &[], Some(&|| true));
+        assert!(
+            matches!(outcome, Err(QueryError::Cancelled)),
+            "got {outcome:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// End-to-end through the route: the file tier still serves matches now
+    /// that the derivation runs on a blocking worker behind the cancellation
+    /// wiring (the guard lives across the await; the probe never fires for a
+    /// live request).
+    #[tokio::test]
+    async fn router_file_tier_query_is_served_through_the_cancellable_worker() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = synthetic_claude_home_with_turns(
+            "eeeeeeee-0000-4000-8000-00000000000d",
+            "router-tier-needle",
+            "irrelevant assistant",
+        );
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index = std::sync::Arc::new(SessionIndex::new(vec![std::sync::Arc::new(
+            freshell_sessions::directory_index::ClaudeSource::new(claude_home(&home)),
+        )
+            as std::sync::Arc<dyn SessionSource>]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1&query=router-tier-needle&tier=userMessages")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "the file tier must still find the match");
+        assert_eq!(items[0]["matchedIn"], json!("userMessage"));
+        assert_eq!(page["nextCursor"], Value::Null);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── SESSION-07: amplifier file-tier search (transcript.jsonl) ──
+
+    /// Seed `<amp_home>/projects/proj/sessions/<id>/{metadata.json,
+    /// transcript.jsonl}` via the REAL `AmplifierSource` so the test
+    /// exercises the production `source_file` wiring end to end.
+    fn synthetic_amplifier_home_with_turns(
+        session_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+        thinking_text: &str,
+    ) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-amp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let dir = home
+            .join("projects")
+            .join("proj")
+            .join("sessions")
+            .join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            format!(
+                "{{\"session_id\":\"{session_id}\",\"working_dir\":\"/p\",\"created\":1000,\"description_updated_at\":2000,\"name\":\"Amp Session\"}}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("transcript.jsonl"),
+            format!(
+                "{{\"role\":\"user\",\"content\":\"{user_text}\"}}\n\
+                 {{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"{thinking_text}\"}},{{\"type\":\"text\",\"text\":\"{assistant_text}\"}}]}}\n"
+            ),
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn amplifier_file_tier_search_scans_the_transcript_with_tier_scoping() {
+        let home = synthetic_amplifier_home_with_turns(
+            "amp-sess-1",
+            "amplifier-user-needle",
+            "amplifier-assistant-needle",
+            "amplifier-thinking-secret",
+        );
+        let items: Vec<DirItem> = freshell_sessions::amplifier::AmplifierSource::new(home.clone())
+            .scan()
+            .iter()
+            .map(dir_item_from_indexed)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].provider, "amplifier");
+        assert!(
+            items[0].source_file.is_some(),
+            "an amplifier session with a transcript must carry a source_file"
+        );
+
+        // userMessages: matches the user turn only.
+        let q_user = DirQuery {
+            tier: Tier::UserMessages,
+            query: Some("amplifier-user-needle".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items.clone(), &q_user, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "userMessages must match the amplifier user turn"
+        );
+        assert_eq!(arr[0]["matchedIn"], json!("userMessage"));
+        assert!(arr[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("amplifier-user-needle"));
+
+        // userMessages: the assistant-only phrase must NOT match.
+        let q_asst_user_tier = DirQuery {
+            tier: Tier::UserMessages,
+            query: Some("amplifier-assistant-needle".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items.clone(), &q_asst_user_tier, &[]).unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap().len(),
+            0,
+            "userMessages must never match amplifier assistant-only text"
+        );
+
+        // fullText: the assistant turn matches.
+        let q_asst_full = DirQuery {
+            tier: Tier::FullText,
+            query: Some("amplifier-assistant-needle".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items.clone(), &q_asst_full, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "fullText must match the amplifier assistant turn"
+        );
+        assert_eq!(arr[0]["matchedIn"], json!("assistantMessage"));
+
+        // fullText: thinking-block text (a `reasoning` event in the
+        // reference, never searched) must NOT match.
+        let q_thinking = DirQuery {
+            tier: Tier::FullText,
+            query: Some("amplifier-thinking-secret".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q_thinking, &[]).unwrap();
+        assert_eq!(
+            page["items"].as_array().unwrap().len(),
+            0,
+            "thinking-block content must stay unsearchable (reasoning events are filtered)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// An amplifier session killed before its first `prompt:complete` has NO
+    /// `transcript.jsonl`: it must be SKIPPED without consuming scan budget
+    /// and without degrading the page to `partial` -- the file-tier analogue
+    /// of the reference's `if (!sourceFile) continue` (`service.ts:191-192`).
+    #[test]
+    fn amplifier_session_without_transcript_is_skipped_cleanly_at_file_tiers() {
+        let home = std::env::temp_dir().join(format!(
+            "freshell-s07-amp-no-transcript-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let dir = home
+            .join("projects")
+            .join("proj")
+            .join("sessions")
+            .join("amp-sess-no-transcript");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            "{\"session_id\":\"amp-sess-no-transcript\",\"working_dir\":\"/p\",\"created\":1000,\"description_updated_at\":2000,\"name\":\"Amp No Transcript\"}",
+        )
+        .unwrap();
+        let items: Vec<DirItem> = freshell_sessions::amplifier::AmplifierSource::new(home.clone())
+            .scan()
+            .iter()
+            .map(dir_item_from_indexed)
+            .collect();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_file, None);
+
+        let q = DirQuery {
+            tier: Tier::FullText,
+            query: Some("anything".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 0);
+        assert!(
+            page.get("partial").is_none(),
+            "skipping a transcript-less session must not degrade the page"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
