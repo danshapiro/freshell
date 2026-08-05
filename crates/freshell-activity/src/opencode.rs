@@ -278,6 +278,11 @@ impl OpencodeActivityTracker {
             }
             Ownership::AwaitingAssociation { previous_known, .. } => {
                 // Reject analog: the ended turn belonged to someone else.
+                // A surviving candidate pause claim (D3) is STALE here —
+                // without its confirm-swallow it would swallow the next
+                // turn's completion and leak into the death-bell window
+                // (Quiet never blocks). Retire it.
+                state.pending_permissions.clear();
                 state.ownership = Ownership::Quiet {
                     known_session_id: previous_known,
                 };
@@ -710,6 +715,11 @@ fn reduce_idle_edge(
         } if blocked.iter().any(|b| b == session_id) => {
             let blocked: Vec<String> = blocked.into_iter().filter(|b| b != session_id).collect();
             if blocked.is_empty() {
+                // Draining into Quiet retires any pause claim that survived
+                // the KnownBusy/Candidate → Ambiguous demotion — stale in
+                // Quiet (would swallow the next turn's bell / spurious
+                // death-bell).
+                state.pending_permissions.clear();
                 state.ownership = Ownership::Quiet { known_session_id };
                 clear_record(state, false)
             } else {
@@ -864,6 +874,10 @@ fn reduce_snapshot(
             known_session_id, ..
         } => {
             if busy_roots.is_empty() {
+                // Same staleness as the idle-edge drain: a pause claim that
+                // survived the demotion into Ambiguous must not land in
+                // Quiet.
+                state.pending_permissions.clear();
                 state.ownership = Ownership::Quiet { known_session_id };
                 return clear_record(state, false);
             }
@@ -1610,6 +1624,102 @@ mod tests {
         assert_eq!(
             tracker.note_session_idle("t1", "ses-r", 1, 2, 200),
             vec![remove(), turn_complete("ses-r", 200, 1)]
+        );
+    }
+
+    #[test]
+    fn rejected_bind_clears_stale_pause_claim() {
+        // A candidate pause claim survives into AwaitingAssociation (D3,
+        // load-bearing for the confirm-swallow), but a REJECTED bind lands
+        // in Quiet where the claim is stale: it must not swallow the next
+        // turn's completion or leak into the death-bell predicate.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        // Foreign busy: Candidate{ses-x, previous_known: ses-r}.
+        assert_eq!(
+            tracker.note_status("t1", "ses-x", OpencodeStatus::Busy, 1, 1, 100),
+            vec![upsert(rec(Some("ses-x"), 100))]
+        );
+        // Candidate arming, then idle: claim survives into AwaitingAssociation.
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-x", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        assert!(tracker
+            .note_session_idle("t1", "ses-x", 1, 1, 200)
+            .is_empty());
+        assert!(tracker.has_pending_permissions("t1"));
+        // REJECTED bind (different session id): Quiet{ses-r}, claim retired.
+        assert!(tracker.bind_session("t1", "ses-y", 300).is_empty());
+        assert!(!tracker.has_pending_permissions("t1"));
+        // The next same-known-session turn completes normally — no
+        // mid-pause swallow of a genuinely completed turn's bell.
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 2, 1, 400);
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 2, 1, 500),
+            vec![remove(), turn_complete("ses-r", 500, 1)]
+        );
+    }
+
+    #[test]
+    fn ambiguous_drain_via_idle_clears_stale_pause_claim() {
+        // A pause claim survives the KnownBusy → Ambiguous demotion; the
+        // idle-edge drain into Quiet must retire it.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-r", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        // Foreign busy mid-pause: Ambiguous{known: ses-r, blocked: [b, r]}.
+        assert_eq!(
+            tracker.note_status("t1", "ses-b", OpencodeStatus::Busy, 1, 1, 160),
+            vec![upsert(rec(None, 160))]
+        );
+        assert!(tracker.has_pending_permissions("t1"));
+        // Drain the blocked set one idle at a time.
+        assert!(tracker
+            .note_session_idle("t1", "ses-r", 1, 1, 170)
+            .is_empty());
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-b", 1, 1, 180),
+            vec![remove()]
+        );
+        // Quiet: the stale claim is gone.
+        assert!(!tracker.has_pending_permissions("t1"));
+        // The next turn's busy→idle cycle mints a completion normally.
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 2, 1, 300);
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 2, 1, 400),
+            vec![remove(), turn_complete("ses-r", 400, 1)]
+        );
+    }
+
+    #[test]
+    fn ambiguous_drain_via_snapshot_clears_stale_pause_claim() {
+        // Same staleness, drained through the snapshot reducer's
+        // empty-busy-roots arm instead of the idle edge.
+        let mut tracker = OpencodeActivityTracker::new();
+        tracker.track_terminal("t1", Some("ses-r"), 0);
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 1, 1, 100);
+        assert_eq!(
+            tracker.note_permission_asked("t1", "ses-r", "perm-1", 150),
+            vec![remove(), boundary(150)]
+        );
+        assert_eq!(
+            tracker.note_status("t1", "ses-b", OpencodeStatus::Busy, 1, 1, 160),
+            vec![upsert(rec(None, 160))]
+        );
+        assert!(tracker.has_pending_permissions("t1"));
+        // Empty snapshot drains Ambiguous → Quiet.
+        assert_eq!(tracker.note_snapshot("t1", &[], 2, 1, 200), vec![remove()]);
+        assert!(!tracker.has_pending_permissions("t1"));
+        // The next turn's busy→idle cycle mints a completion normally.
+        tracker.note_status("t1", "ses-r", OpencodeStatus::Busy, 3, 1, 300);
+        assert_eq!(
+            tracker.note_session_idle("t1", "ses-r", 3, 1, 400),
+            vec![remove(), turn_complete("ses-r", 400, 1)]
         );
     }
 }
