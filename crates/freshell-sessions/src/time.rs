@@ -31,7 +31,13 @@ pub fn parse_timestamp_ms(value: &Value) -> Option<i64> {
         Value::Number(n) => {
             let f = n.as_f64()?;
             if f.is_finite() {
-                Some(f as i64)
+                // Floor fractional passthroughs exactly like the reference's
+                // `Math.floor` ("Floor numeric passthroughs: downstream
+                // read-model schemas require integer epoch-ms",
+                // `providers/codex.ts:47-48`) — a bare `f as i64` truncates
+                // toward zero, which only coincides with `Math.floor` for
+                // non-negative values.
+                Some(f.floor() as i64)
             } else {
                 None
             }
@@ -156,4 +162,92 @@ fn date_parse_ms(s: &str) -> Option<i64> {
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60;
     Some(secs * 1_000 + millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // SESSION-14: fractional epoch-ms passthroughs normalize to integers by
+    // FLOORING (`Math.floor` parity with `providers/codex.ts`'s
+    // `parseTimestampMs`) — the directory/API read-model schemas require
+    // integer epoch-ms, and sort keys, cursors, and revisions are computed
+    // from these integers, so a fractional provider clock can never make a
+    // projected page oscillate around a millisecond boundary.
+    #[test]
+    fn fractional_numeric_epoch_ms_is_floored_not_rounded() {
+        // Boundary/fractional fixtures around real transcript timestamps.
+        assert_eq!(
+            parse_timestamp_ms(&json!(1_769_753_756_713.9)),
+            Some(1_769_753_756_713)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&json!(1_738_231_200_000.5)),
+            Some(1_738_231_200_000)
+        );
+        // Just below the next millisecond boundary must NOT round up.
+        assert_eq!(
+            parse_timestamp_ms(&json!(1_738_231_200_000.999)),
+            Some(1_738_231_200_000)
+        );
+        // Exact integers pass through unchanged.
+        assert_eq!(parse_timestamp_ms(&json!(0.0)), Some(0));
+        assert_eq!(
+            parse_timestamp_ms(&json!(1_738_231_200_000i64)),
+            Some(1_738_231_200_000)
+        );
+    }
+
+    #[test]
+    fn negative_fractional_epoch_ms_floors_like_math_floor() {
+        // `Math.floor(-0.5)` is -1; a bare `f as i64` truncation would give 0.
+        assert_eq!(parse_timestamp_ms(&json!(-0.5)), Some(-1));
+        assert_eq!(
+            parse_timestamp_ms(&json!(-1_738_231_200_000.5)),
+            Some(-1_738_231_200_001)
+        );
+    }
+
+    // ISO strings: sub-second fractions normalize at millisecond precision —
+    // digits beyond the third are dropped (never rounded), fewer digits
+    // right-pad, exactly as `Date.parse` resolves to whole ms.
+    #[test]
+    fn iso_fractional_seconds_are_truncated_at_millisecond_precision() {
+        // Base: "2025-01-30T10:00:00.000Z" == 1_738_231_200_000 (pinned by
+        // `timestamps_match_date_parse_for_fixture_values` in lib.rs).
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.999999Z")),
+            Some(1_738_231_200_999)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.123456789Z")),
+            Some(1_738_231_200_123)
+        );
+        // A purely sub-ms remainder contributes nothing.
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.000001Z")),
+            Some(1_738_231_200_000)
+        );
+        // Fewer than three digits right-pad (`.1` = 100ms, `.12` = 120ms).
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.1Z")),
+            Some(1_738_231_200_100)
+        );
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T10:00:00.12Z")),
+            Some(1_738_231_200_120)
+        );
+        // A fraction survives an explicit offset unharmed.
+        assert_eq!(
+            parse_timestamp_ms(&json!("2025-01-30T12:00:00.5555+02:00")),
+            Some(1_738_231_200_555)
+        );
+    }
+
+    #[test]
+    fn date_only_iso_is_midnight_utc() {
+        assert_eq!(parse_timestamp_ms(&json!("1970-01-01")), Some(0));
+        assert_eq!(parse_timestamp_ms(&json!("1969-12-31")), Some(-86_400_000));
+    }
 }

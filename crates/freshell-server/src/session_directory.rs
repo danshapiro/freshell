@@ -1778,6 +1778,92 @@ mod tests {
         assert_eq!(page2["nextCursor"], Value::Null);
     }
 
+    // SESSION-14: timestamps reach the projection already normalized to
+    // integer epoch-ms (`freshell_sessions::time::parse_timestamp_ms` floors
+    // fractional numeric passthroughs like Node's `Math.floor`; ISO fractions
+    // drop digits beyond the third). The directory page therefore carries
+    // integer `lastActivityAt`/`createdAt`/`revision` only, and a rebuild
+    // from identical index state (the refresh/restart cycle) reproduces the
+    // exact same ordering + cursor — no millisecond-boundary oscillation.
+    #[test]
+    fn projected_timestamps_are_integers_and_paging_is_stable_across_rebuilds() {
+        let mk = |sid: &str, at: i64, created: Option<i64>| DirItem {
+            session_id: sid.into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some(format!("t-{sid}")),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: at,
+            created_at: created,
+            cwd: None,
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        };
+        // Boundary integers a fractional provider value floors INTO
+        // (e.g. `1769753756713.9` → `1769753756713`); `a` and `b` tie on
+        // `lastActivityAt` so the key-DESC tiebreak is exercised.
+        let build = || {
+            vec![
+                mk("a", 1_769_753_756_713, Some(1_738_231_200_000)),
+                mk("b", 1_769_753_756_713, Some(1_738_231_200_000)),
+                mk("c", 1_738_231_200_000, None),
+            ]
+        };
+
+        let q = DirQuery {
+            limit: Some(2),
+            ..DirQuery::default()
+        };
+        let page1 = apply_query(build(), &q, &[]).unwrap();
+        // Identical rebuild → identical page (the refresh/restart pin).
+        let page1_rebuilt = apply_query(build(), &q, &[]).unwrap();
+        assert_eq!(page1, page1_rebuilt);
+
+        let arr = page1["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // lastActivityAt DESC, then session-key DESC: "claude:b" before "claude:a".
+        assert_eq!(arr[0]["sessionId"], json!("b"));
+        assert_eq!(arr[1]["sessionId"], json!("a"));
+        // Projected timestamps are plain JSON integers, never fractional.
+        assert_eq!(arr[0]["lastActivityAt"], json!(1_769_753_756_713i64));
+        assert!(arr[0]["lastActivityAt"].is_i64());
+        assert_eq!(arr[0]["createdAt"], json!(1_738_231_200_000i64));
+        assert!(arr[0]["createdAt"].is_i64());
+        assert_eq!(page1["revision"], json!(1_769_753_756_713i64));
+        assert!(page1["revision"].is_i64());
+
+        // The cursor payload embeds the same integer boundary timestamp +
+        // the tiebreak key, and paging with it is itself rebuild-stable.
+        let cursor = page1["nextCursor"].as_str().expect("paged");
+        let (c_last, c_key) = decode_cursor(cursor).unwrap();
+        assert_eq!(c_last, 1_769_753_756_713);
+        assert_eq!(c_key, "claude:a");
+        let q2 = DirQuery {
+            limit: Some(2),
+            cursor: Some(cursor.to_string()),
+            ..DirQuery::default()
+        };
+        let page2 = apply_query(build(), &q2, &[]).unwrap();
+        let page2_rebuilt = apply_query(build(), &q2, &[]).unwrap();
+        assert_eq!(page2, page2_rebuilt);
+        let arr2 = page2["items"].as_array().unwrap();
+        assert_eq!(arr2.len(), 1);
+        assert_eq!(arr2[0]["sessionId"], json!("c"));
+        assert_eq!(arr2[0]["lastActivityAt"], json!(1_738_231_200_000i64));
+        // `createdAt` omitted when absent (matching the zod `.optional()`s).
+        assert_eq!(arr2[0]["createdAt"], Value::Null);
+        assert_eq!(page2["nextCursor"], Value::Null);
+    }
+
     #[test]
     fn invalid_cursor_is_rejected() {
         let q = DirQuery {
