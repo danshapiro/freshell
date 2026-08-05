@@ -233,6 +233,88 @@ describe('browserPreferencesPersistence', () => {
     expect(rehydrated.terminal.fontSize).toBe(22)
   })
 
+  it('persists a 64px terminal font size and round-trips it through a reload', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      terminal: { fontSize: 64 },
+    }))
+
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved).toEqual({
+      settings: {
+        terminal: {
+          fontSize: 64,
+        },
+      },
+    })
+
+    // Reload simulation: the 64px ceiling value must survive rehydration intact.
+    const rehydrated = resolveLocalSettings(saved.settings)
+    expect(rehydrated.terminal.fontSize).toBe(64)
+  })
+
+  it('clamps an out-of-range terminal font size before persisting it', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      terminal: { fontSize: 999 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        terminal: {
+          fontSize: 64,
+        },
+      },
+    })
+  })
+
+  it('clamps a stale out-of-range persisted font size to the 64px ceiling on load', () => {
+    // Hand-written or legacy-max blob: 999px must clamp when the next session
+    // reads the browser-preferences store at boot.
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: { terminal: { fontSize: 999 } },
+    }))
+
+    const record = loadBrowserPreferencesRecord()
+    expect(record.settings).toEqual({ terminal: { fontSize: 64 } })
+    expect(resolveBrowserPreferenceSettings(record).terminal.fontSize).toBe(64)
+  })
+
+  it('omits terminal.fontSize from browser preferences when reset to the 16px default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      terminal: { fontSize: 64 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        terminal: {
+          fontSize: 64,
+        },
+      },
+    })
+
+    store.dispatch(updateSettingsLocal({
+      terminal: { fontSize: 16 },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    // Default values are dropped so a stale 64px cannot linger into a reload.
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({})
+  })
+
   it('does not persist freshAgent when set to defaults', () => {
     const store = createStore()
 

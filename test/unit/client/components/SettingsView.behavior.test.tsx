@@ -259,6 +259,62 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.terminal.fontSize).toBe(initialFontSize)
     })
 
+    it('commits an exact 64px entry from the direct font size input', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' }) as HTMLInputElement
+      const fontSizeSlider = screen.getByRole('slider', { name: 'Font size' }) as HTMLInputElement
+
+      // The direct px input advertises the 12px-64px bounds to the browser.
+      expect(fontSizeInput.getAttribute('min')).toBe('12')
+      expect(fontSizeInput.getAttribute('max')).toBe('64')
+
+      fireEvent.change(fontSizeInput, { target: { value: '64' } })
+      fireEvent.keyDown(fontSizeInput, { key: 'Enter' })
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
+      expect(fontSizeInput.value).toBe('64')
+      // Index 32 is the last stop (64px) on the slider's stops list.
+      expect(fontSizeSlider.value).toBe('32')
+      expect(fontSizeSlider.getAttribute('aria-valuetext')).toBe('64px (400%)')
+      // The terminal preview re-renders at the newly entered size.
+      expect(screen.getByLabelText('Terminal preview').style.fontSize).toBe('64px')
+    })
+
+    it('rounds fractional direct font size input to the nearest pixel, never past 64', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' })
+
+      fireEvent.change(fontSizeInput, { target: { value: '30.5' } })
+      fireEvent.blur(fontSizeInput)
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(31)
+
+      // Rounding can land above the ceiling; the 64px clamp still wins.
+      fireEvent.change(fontSizeInput, { target: { value: '64.5' } })
+      fireEvent.keyDown(fontSizeInput, { key: 'Enter' })
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(64)
+    })
+
+    it('discards the typed font size draft on Escape', () => {
+      const store = createSettingsViewStore({ settings: { terminal: { fontSize: 18 } } })
+      renderSettingsView(store)
+
+      const fontSizeInput = screen.getByRole('spinbutton', { name: 'Font size' }) as HTMLInputElement
+      expect(fontSizeInput.value).toBe('18')
+
+      fireEvent.change(fontSizeInput, { target: { value: '40' } })
+      expect(fontSizeInput.value).toBe('40')
+
+      fireEvent.keyDown(fontSizeInput, { key: 'Escape' })
+      fireEvent.blur(fontSizeInput)
+
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(18)
+      expect(fontSizeInput.value).toBe('18')
+    })
+
     it('updates sidebar sort mode locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
