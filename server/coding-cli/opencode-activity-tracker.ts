@@ -380,7 +380,8 @@ export class OpencodeActivityTracker extends EventEmitter {
       monitor !== undefined &&
       input.spontaneous === true &&
       ownershipKind !== 'candidate' &&
-      ownershipKind !== 'ambiguous'
+      ownershipKind !== 'ambiguous' &&
+      ownershipKind !== 'awaitingAssociation'
     const approvalPending = this.hasPendingPermissions(input.terminalId)
     if (monitor) {
       monitor.disposed = true
@@ -482,7 +483,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
     if (typeof version !== 'string' || version.startsWith(TESTED_OPENCODE_VERSION_RANGE)) return
     monitor.versionWarned = true
-    console.warn(
+    this.log.warn(
+      { terminalId: monitor.terminalId, endpoint: monitor.endpoint, version },
       `OpenCode version ${version} has not been tested with the freshell activity tracker `
       + `(tested: ${TESTED_OPENCODE_VERSION_RANGE}x); keeping attention bells on best-effort.`,
     )
@@ -825,6 +827,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     if (!monitor || monitor.disposed) return
     const result = rejectOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
     monitor.ownership = result.state
+    // Clear any pending permissions so the stale pause claim cannot leak into the death-bell window
+    this.pendingPermissions.delete(input.terminalId)
     this.applyActions(monitor.terminalId, result.actions)
   }
 

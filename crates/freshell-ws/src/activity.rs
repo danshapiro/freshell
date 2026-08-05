@@ -900,7 +900,7 @@ impl ActivityHub {
                 // nothing ever removes. Race-free because Exit and
                 // OpencodeAttach are processed serially on the hub task.
                 if inner.modes.get(&terminal_id).map(String::as_str) != Some("opencode") {
-                    tracing::debug!(
+                    tracing::warn!(
                         terminal_id = %terminal_id,
                         "opencode lane attach skipped: terminal no longer tracked"
                     );

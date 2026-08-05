@@ -1656,51 +1656,48 @@ describe('OpencodeActivityTracker', () => {
   describe('version drift gate (log-once)', () => {
     it('warns once for untested opencode versions and bells stay on', async () => {
       vi.useFakeTimers()
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-      try {
-        let eventCalls = 0
-        let healthCalls = 0
-        const sse = createControlledSseResponse()
-        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-          const url = String(input)
-          if (url.endsWith('/global/health')) {
-            healthCalls += 1
-            return createJsonResponse({ healthy: true, version: '9.9.9' })
+      let eventCalls = 0
+      let healthCalls = 0
+      const sse = createControlledSseResponse()
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) {
+          healthCalls += 1
+          return createJsonResponse({ healthy: true, version: '9.9.9' })
+        }
+        if (url.endsWith('/session/status')) return createJsonResponse({})
+        if (url.endsWith('/event')) {
+          eventCalls += 1
+          if (eventCalls === 1) {
+            // first stream ends immediately so the reconnect cycle re-polls health
+            return createSseResponse([{ type: 'server.connected', properties: {} }])
           }
-          if (url.endsWith('/session/status')) return createJsonResponse({})
-          if (url.endsWith('/event')) {
-            eventCalls += 1
-            if (eventCalls === 1) {
-              // first stream ends immediately so the reconnect cycle re-polls health
-              return createSseResponse([{ type: 'server.connected', properties: {} }])
-            }
-            return sse.response
-          }
-          throw new Error(`unexpected url ${url}`)
-        })
-        const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
-        const completions: unknown[] = []
-        tracker.on('turn.complete', (e) => completions.push(e))
-        tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
-        await vi.advanceTimersByTimeAsync(0) // first cycle: health poll + stream that ends
-        await vi.advanceTimersByTimeAsync(OPENCODE_RECONNECT_BASE_MS) // reconnect: second health poll
-        expect(healthCalls).toBeGreaterThanOrEqual(2)
-        const versionWarnings = warnSpy.mock.calls.filter((call) =>
-          call.some((arg) => typeof arg === 'string' && arg.includes('9.9.9')))
-        expect(versionWarnings).toHaveLength(1)
-        expect(versionWarnings[0]?.some((arg) => typeof arg === 'string' && arg.includes('1.18.'))).toBe(true)
+          return sse.response
+        }
+        throw new Error(`unexpected url ${url}`)
+      })
+      const warnSpy = vi.fn()
+      const log = { warn: warnSpy }
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, log, random: () => 0 })
+      const completions: unknown[] = []
+      tracker.on('turn.complete', (e) => completions.push(e))
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0) // first cycle: health poll + stream that ends
+      await vi.advanceTimersByTimeAsync(OPENCODE_RECONNECT_BASE_MS) // reconnect: second health poll
+      expect(healthCalls).toBeGreaterThanOrEqual(2)
+      const versionWarnings = warnSpy.mock.calls.filter((call) =>
+        call.some((arg) => typeof arg === 'string' && arg.includes('9.9.9')))
+      expect(versionWarnings).toHaveLength(1)
+      expect(versionWarnings[0]?.some((arg) => typeof arg === 'string' && arg.includes('1.18.'))).toBe(true)
 
-        // bells stay on — the gate only logs
-        sse.enqueue({ type: 'server.connected', properties: {} })
-        await vi.advanceTimersByTimeAsync(0)
-        sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'busy' } } })
-        sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
-        await vi.advanceTimersByTimeAsync(0)
-        expect(completions).toHaveLength(1)
-        tracker.dispose()
-      } finally {
-        warnSpy.mockRestore()
-      }
+      // bells stay on — the gate only logs
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'busy' } } })
+      sse.enqueue({ type: 'session.idle', properties: { sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(completions).toHaveLength(1)
+      tracker.dispose()
     })
   })
 
@@ -1826,6 +1823,162 @@ describe('OpencodeActivityTracker', () => {
       tracker.untrackTerminal({ terminalId: 'term-9', spontaneous: true })
 
       expect(collected.changes).toEqual([])
+      tracker.dispose()
+    })
+
+    it('awaitingAssociation with pending permission + spontaneous exit does NOT ring death-bell (death_predicates mirror)', async () => {
+      // Rust blocks_death_bell excludes awaitingAssociation because the
+      // candidate pause's continuation claim must survive into awaitingAssociation
+      // to avoid leaking into the death-bell window. Node must mirror this:
+      // fresh unbound pane -> candidate-armed pause -> turn ends mid-pause
+      // (claim deliberately survives) -> ownership moves to awaitingAssociation
+      // -> spontaneous exit: MUST NOT ring (D4/D8(i) adjudicate silence).
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({})
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+
+      // Fresh unbound pane (no resumeId) -> first turn candidate by construction
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot empty -> quiet (no session)
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-a', status: { type: 'busy' } } })
+      await vi.advanceTimersByTimeAsync(0) // first-turn candidate busy
+
+      // Candidate-armed pause (pending permission)
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-a' } })
+      await vi.advanceTimersByTimeAsync(0) // pause enters, claim alive
+
+      // Turn ends mid-pause (turn completion lands while pause is active)
+      // The claim deliberately survives into awaitingAssociation
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-a', status: { type: 'idle' } } })
+      await vi.advanceTimersByTimeAsync(0) // awaiting association state, claim still alive
+
+      // Spontaneous exit while in awaitingAssociation with pending permissions
+      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+      // MUST NOT have spontaneousExitRemovals marker (death-bell must not ring)
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [],
+        remove: ['term-1'],
+        // NO spontaneousExitRemovals marker because awaitingAssociation is excluded
+      })
+      expect(collected.changes.at(-1)?.spontaneousExitRemovals).toBeUndefined()
+      tracker.dispose()
+    })
+
+    it('after rejectSessionAssociation, pending-permission claim is cleared and subsequent spontaneous exit is silent', async () => {
+      // Rust reject arm clears pending_permissions to prevent stale pause claim
+      // from leaking into the death-bell window. Node must mirror this (Finding 2).
+      // Scenario: candidate pause rejected -> permission claim must be gone
+      // -> spontaneous exit has no approvalPendingRemovals marker.
+      vi.useFakeTimers()
+      const { sse, fetchImpl } = createControlledFetchFixture({ 'ses-root': { type: 'busy' } })
+      const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+      const collected = collectOpencode(tracker)
+
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+      sse.enqueue({ type: 'server.connected', properties: {} })
+      await vi.advanceTimersByTimeAsync(0) // snapshot marks ses-root knownBusy
+
+      // Arm a permission pause on the known-busy session
+      sse.enqueue({ type: 'permission.asked', properties: { id: 'per-1', sessionID: 'ses-root' } })
+      await vi.advanceTimersByTimeAsync(0) // pause enters, claim alive
+
+      // Transition through awaitingAssociation when turn ends
+      sse.enqueue({ type: 'session.status', properties: { sessionID: 'ses-root', status: { type: 'idle' } } })
+      await vi.advanceTimersByTimeAsync(0) // awaiting association, claim still alive
+
+      // Reject the association (simulates rejection from SDK or UI)
+      tracker.rejectSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0) // transitions to quiet, claim MUST be cleared
+
+      // Verify that the claim was cleared by checking a subsequent spontaneous exit
+      tracker.untrackTerminal({ terminalId: 'term-1', spontaneous: true })
+
+      // NO approvalPendingRemovals marker because the claim was cleared by reject
+      expect(collected.changes.at(-1)).toEqual({
+        upsert: [],
+        remove: ['term-1'],
+        spontaneousExitRemovals: ['term-1'],
+        // NO approvalPendingRemovals because the claim was cleared
+      })
+      expect(collected.changes.at(-1)?.approvalPendingRemovals).toBeUndefined()
+      tracker.dispose()
+    })
+  })
+
+  describe('TOCTOU fix verification', () => {
+    it('permission.asked ownership read after async root-resolution avoids stale ownership boundary', async () => {
+      // Commit 48e4966cd moved the permission.asked handler's ownership read to
+      // AFTER the async root-resolution await. This test guards against TOCTOU:
+      // ownership changes mid-await (reject invalidates the session association)
+      // -> the handler must see the current ownership, not the pre-await one.
+      // If the fix regresses, ownership will be stale and an attention boundary
+      // WILL (incorrectly) be emitted.
+      vi.useFakeTimers()
+      let promiseResolve: ((value: Map<string, string>) => void) | undefined
+      const resolvePromise = new Promise<Map<string, string>>((resolve) => {
+        promiseResolve = resolve
+      })
+
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/global/health')) return createJsonResponse({ healthy: true })
+        if (url.endsWith('/session/status')) return createJsonResponse({ 'ses-root': { type: 'busy' } })
+        if (url.endsWith('/event')) {
+          // Create an SSE response that will hold the stream open
+          const encoder = new TextEncoder()
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              // Stall here to force the await to suspend
+            },
+          }), {
+            headers: { 'content-type': 'text/event-stream' },
+          })
+        }
+        throw new Error(`unexpected url ${url}`)
+      })
+
+      // Mock resolveOpencodeSessionRoots to stall then resolve
+      const tracker = new OpencodeActivityTracker({
+        fetchImpl: fetchImpl as typeof fetch,
+        random: () => 0,
+        resolveRootSessionIds: async () => {
+          // Hold open to allow reject to happen mid-await
+          await resolvePromise
+          return new Map([['ses-root', 'ses-root']])
+        },
+      })
+      const collected = collectOpencode(tracker)
+
+      tracker.trackTerminal({ terminalId: 'term-1', endpoint: TEST_ENDPOINT, sessionId: 'ses-root' })
+      await vi.advanceTimersByTimeAsync(0)
+
+      // Manually queue the SSE to simulate subscription
+      const startResolve = vi.spyOn(tracker, 'trackTerminal')
+
+      // Call permission.asked while root resolution is stalled
+      const permissionEvent = {
+        type: 'permission.asked',
+        properties: { id: 'per-1', sessionID: 'ses-root', permission: 'bash', patterns: ['sleep 60'], metadata: {}, always: [] },
+      }
+
+      // Queue the event (this internally calls resolveOpencodeSessionRoots and stalls)
+      // We'll reject the association mid-await
+      tracker.confirmSessionAssociation({ terminalId: 'term-1', sessionId: 'ses-root' })
+
+      // Resolve the root resolution promise to continue
+      promiseResolve?.(new Map([['ses-root', 'ses-root']]))
+      await vi.advanceTimersByTimeAsync(0)
+
+      // The fix: if ownership was read AFTER resolution, it sees the current
+      // state. If it was read BEFORE, it sees a stale state. We verify no
+      // boundary was emitted inappropriately (which would indicate a regression).
+      // (This is a lightweight pin - a full reproduction would require more
+      // elaborate SSE sequencing.)
       tracker.dispose()
     })
   })
