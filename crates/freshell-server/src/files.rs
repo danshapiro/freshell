@@ -647,31 +647,139 @@ fn mtime_iso(meta: &std::fs::Metadata) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// Port of `isPathAllowed` (`path-utils.ts`): a target is allowed iff there are no
-/// configured roots, or it equals / is nested under one (at a directory boundary).
-/// Roots resolve through resolve_user_path — the same conversion as targets (Node converts both sides, path-utils.ts:313/319). Case-folding stays absent: Node lowercases only when process.platform === 'win32', which this Linux-host port never is.
+/// Port of `isPathAllowed` (`path-utils.ts:308-337`): a target is allowed iff
+/// there are no configured roots, or it equals / is nested under one (at a
+/// directory boundary). BOTH sides first run through
+/// [`resolve_path_for_sandbox_comparison`] — flavor conversion (a
+/// Windows-flavor root matches WSL-converted targets, pinned by Node's
+/// test/unit/server/path-utils.test.ts:236-252), `..`-segment collapse, and
+/// symlink realpath (`path-utils.ts:291-301,313,319`) — then compare,
+/// lowercased only on win32 (`path-utils.ts:314-321`; see
+/// [`case_fold_for_platform`]). `resolve_user_path`'s non-Windows branch IS
+/// `normalize_user_path`, and canonicalizing an already-canonical POSIX path
+/// is the identity, so plain POSIX/~ roots and targets (including the
+/// repo_icon.rs call sites) compare byte-identically to the pre-FILE-06
+/// string check whenever no symlink or `..` segment is involved.
 pub(crate) fn is_path_allowed(target: &str, allowed_roots: Option<&[String]>) -> bool {
     let roots = match allowed_roots {
         Some(roots) if !roots.is_empty() => roots,
         _ => return true,
     };
-    let target_norm = normalize_user_path(target);
+    let target_cmp = case_fold_for_platform(resolve_path_for_sandbox_comparison(target));
     for root in roots {
-        // Node parity: isPathAllowed converts BOTH sides through
-        // resolvePathForSandboxComparison (path-utils.ts:313/319), so a
-        // Windows-flavor root like `C:\Users` matches WSL-converted targets
-        // (pinned by Node's test/unit/server/path-utils.test.ts:236-252).
-        // resolve_user_path's non-Windows branch IS normalize_user_path, so
-        // POSIX/~ roots compare byte-identically to before (including the
-        // repo_icon.rs call sites). On a non-WSL host a Windows-flavor root
-        // stays literal — fail-closed, same stance as unaddressable targets.
-        let root_resolved = resolve_user_path(root);
-        let root_norm = root_resolved.sandbox_target();
-        if target_norm == root_norm || target_norm.starts_with(&format!("{root_norm}/")) {
+        let root_cmp = case_fold_for_platform(resolve_path_for_sandbox_comparison(root));
+        // Ensure the prefix match is at a directory boundary
+        // (`path-utils.ts:323-327`; `MAIN_SEPARATOR` is Node's `path.sep`).
+        if target_cmp == root_cmp
+            || target_cmp.starts_with(&format!("{root_cmp}{}", std::path::MAIN_SEPARATOR))
+        {
             return true;
         }
     }
     false
+}
+
+/// Port of `resolvePathForSandboxComparison` (`path-utils.ts:291-301`), the
+/// normalization `isPathAllowed` applies to BOTH sides before comparing:
+/// 1. flavor conversion + `toFilesystemPath` — this module's existing
+///    [`resolve_user_path`];
+/// 2. Node's `path.resolve` dot-segment collapse ([`collapse_dot_segments`]),
+///    so `/root/../outside` compares as `/outside` and can never string-match
+///    the root prefix. Encoded `..` reaches these handlers already URL-decoded
+///    (the query/body extractor decodes exactly once), so this collapse covers
+///    the percent-encoded forms too — the sandbox itself never decodes again;
+/// 3. symlink realpath — Node's `fs.realpathSync` — via
+///    [`canonicalize_lenient`], so a symlink inside an allowed root pointing
+///    outside it compares at its true location.
+fn resolve_path_for_sandbox_comparison(input: &str) -> String {
+    let resolved = resolve_user_path(input);
+    let collapsed = collapse_dot_segments(resolved.sandbox_target());
+    if !collapsed.starts_with('/') {
+        // Non-slash-absolute inputs (relative names, or the unaddressable
+        // Windows-literal fallback like `C:\…` off-WSL) keep this module's
+        // documented fail-closed stance: compared literally, they can never
+        // prefix-match an absolute root. (Node's `path.resolve` would
+        // cwd-anchor such literals — path-utils.ts:294 — which is what lets
+        // the `C:\…` literal-write hazard through on the original; we
+        // deliberately do not, matching the sandbox_target doc comment.)
+        return collapsed;
+    }
+    canonicalize_lenient(&collapsed)
+}
+
+/// Lexical `path.resolve` segment collapse (`path-utils.ts:294`) for
+/// slash-absolute inputs: `.` dropped, `..` pops the last component (clamped
+/// at the filesystem root), redundant separators folded, trailing separators
+/// stripped. Non-absolute inputs are returned unchanged (see the fail-closed
+/// note in [`resolve_path_for_sandbox_comparison`]).
+fn collapse_dot_segments(input: &str) -> String {
+    if !input.starts_with('/') {
+        return input.to_string();
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for segment in input.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(segment),
+        }
+    }
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+/// `fs::canonicalize` in Node's `realpathSync` fallback seat
+/// (`path-utils.ts:296-300`), hardened: a bare canonicalize is all-or-nothing,
+/// so for a not-yet-created target (`write`/`mkdir` of a NEW entry) Node falls
+/// back to comparing the UNRESOLVED string — which lets a symlinked parent
+/// smuggle a new file outside every root. Instead, canonicalize the longest
+/// EXISTING ancestor and re-attach the missing tail: symlinked prefixes still
+/// resolve to their true location (closing the fallback hole; FILE-06 requires
+/// rejecting symlink escapes), while real prefixes canonicalize to themselves,
+/// so every previously-allowed comparison keeps its byte-exact form and new
+/// in-sandbox files keep working. Trailing separators are trimmed like Node's
+/// `trimTrailingSeparators`.
+fn canonicalize_lenient(collapsed: &str) -> String {
+    let mut probe = PathBuf::from(collapsed);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(mut canonical) => {
+                for component in tail.iter().rev() {
+                    canonical.push(component);
+                }
+                return trim_trailing_separators(&canonical.to_string_lossy());
+            }
+            Err(_) => {
+                let Some(name) = probe.file_name() else {
+                    return collapsed.to_string();
+                };
+                tail.push(name.to_os_string());
+                if !probe.pop() {
+                    return collapsed.to_string();
+                }
+            }
+        }
+    }
+}
+
+/// Node's win32-only case fold (`path-utils.ts:314-321`): NTFS compares
+/// case-insensitively, so Node lowercases both sides only when
+/// `process.platform === 'win32'`. `cfg!(windows)` is the Rust twin of that
+/// runtime gate — deliberately a runtime check, not `#[cfg]`, so the fold
+/// compiles on every host — on this POSIX host (WSL-inclusive) the comparison
+/// stays byte-exact, exactly like Node off win32.
+fn case_fold_for_platform(comparison: String) -> String {
+    if cfg!(windows) {
+        comparison.to_lowercase()
+    } else {
+        comparison
+    }
 }
 
 /// Port of `resolveCompletionInput` (`files-router.ts:44`): resolve a completion
@@ -1546,7 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_dirs_empty_state_has_no_home_fallback() {
-        // R8: an empty candidate set stays `[]` \u2014 no `$HOME` fallback entry.
+        // R8: an empty candidate set stays `[]` — no `$HOME` fallback entry.
         let state = FilesState {
             auth_token: Arc::new("tok".to_string()),
             settings: SettingsStore::load(None, Vec::new()),
@@ -1560,5 +1668,502 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["directories"], json!([]));
+    }
+
+    // ---- FILE-06: traversal / symlink / case-fold escapes are rejected ----
+    //
+    // These tests pin `resolvePathForSandboxComparison` parity
+    // (path-utils.ts:291-301): the `..` collapse, the both-sides canonicalize,
+    // and the win32-only case fold, first at the allowlist level and then
+    // through every file endpoint. They are self-contained (tempdir fixtures +
+    // a per-state settings patch, no env mutation), so no HOME_ENV_TEST_LOCK.
+
+    /// A sandbox fixture: `<tmp>/allowed` is the configured root (holding the
+    /// `work/inside.txt` positive control); `<tmp>/outside` holds the sentinel
+    /// every escape attempt must leave unread and unmodified.
+    struct EscapeFixture {
+        tmp: tempfile::TempDir,
+    }
+
+    impl EscapeFixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("allowed/work")).unwrap();
+            std::fs::write(tmp.path().join("allowed/work/inside.txt"), b"inside").unwrap();
+            std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+            std::fs::write(tmp.path().join("outside/sentinel.txt"), b"outside-secret").unwrap();
+            EscapeFixture { tmp }
+        }
+
+        fn allowed(&self) -> String {
+            self.tmp.path().join("allowed").to_string_lossy().into_owned()
+        }
+
+        fn outside(&self) -> std::path::PathBuf {
+            self.tmp.path().join("outside")
+        }
+
+        fn sentinel(&self) -> std::path::PathBuf {
+            self.outside().join("sentinel.txt")
+        }
+
+        /// An escape spelling: under the root, then a literal `..` hop out.
+        fn dotdot_escape(&self, leaf: &str) -> String {
+            format!("{}/../outside/{leaf}", self.allowed())
+        }
+
+        /// The outside sentinel remains byte-identical.
+        fn assert_sentinel_untouched(&self) {
+            assert_eq!(
+                std::fs::read(self.sentinel()).unwrap(),
+                b"outside-secret",
+                "outside sentinel must remain unmodified"
+            );
+        }
+    }
+
+    /// A state whose settings store has `allowedFilePaths: [root]` (the
+    /// persist path no-ops for home:None stores — settings_store.rs:420).
+    async fn sandboxed_state(root: &str) -> FilesState {
+        let state = test_state();
+        state
+            .settings
+            .patch(&json!({ "allowedFilePaths": [root] }))
+            .await
+            .unwrap();
+        state
+    }
+
+    #[test]
+    fn collapse_dot_segments_mirrors_node_path_resolve() {
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects/../../etc/passwd"),
+            "/home/etc/passwd" // two `..` pop `projects` and `user`
+        );
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects//../../../etc/passwd"),
+            "/etc/passwd" // three `..` pop everything down to the root
+        );
+        assert_eq!(collapse_dot_segments("/a/./b/"), "/a/b");
+        assert_eq!(collapse_dot_segments("/a/b/../b/file.txt"), "/a/b/file.txt");
+        // `..` clamps at the filesystem root, like path.resolve.
+        assert_eq!(collapse_dot_segments("/../.."), "/");
+        assert_eq!(collapse_dot_segments("/"), "/");
+        // Non-absolute / literal fallback strings stay byte-exact (fail-closed).
+        assert_eq!(collapse_dot_segments("C:\\Users\\..\\x"), "C:\\Users\\..\\x");
+        assert_eq!(collapse_dot_segments("rel/../x"), "rel/../x");
+    }
+
+    #[test]
+    fn sandbox_dotdot_collapse_cannot_string_match_the_root() {
+        // Node's pinned traversal cases (test/unit/server/path-utils.test.ts:
+        // 86-118) — with the collapse in place these decide exactly like the
+        // original even though none of these paths exists on disk (the
+        // comparison falls back to the collapsed string).
+        let roots = vec![
+            "/home/user/projects".to_string(),
+            "/tmp/workspace".to_string(),
+        ];
+        assert!(is_path_allowed(
+            "/home/user/projects/myapp/src/index.ts",
+            Some(&roots)
+        ));
+        assert!(is_path_allowed(
+            "/home/user/projects/a/../b/file.txt",
+            Some(&roots)
+        ));
+        assert!(!is_path_allowed(
+            "/home/user/projects/../../etc/passwd",
+            Some(&roots)
+        ));
+        assert!(!is_path_allowed(
+            "/home/user/projects/../../../etc/shadow",
+            Some(&roots)
+        ));
+        assert!(!is_path_allowed(
+            "/home/user/projects//../../../etc/passwd",
+            Some(&roots)
+        ));
+        // The pre-FILE-06 bypass this closes: a lexical prefix match on
+        // `/home/user/projects/...` alone must NOT suffice.
+        assert!(!is_path_allowed(
+            "/home/user/projects/../projects-evil/x",
+            Some(&roots)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_symlinks_compare_at_their_real_location() {
+        let fixture = EscapeFixture::new();
+        let allowed = fixture.allowed();
+        // A symlink INSIDE the root pointing at the OUTSIDE directory…
+        std::os::unix::fs::symlink(
+            fixture.outside(),
+            fixture.tmp.path().join("allowed/uplink"),
+        )
+        .unwrap();
+        // …a symlink wrapping the root toward ANOTHER in-root prefix (stays
+        // allowed)…
+        std::os::unix::fs::symlink(
+            fixture.tmp.path().join("allowed"),
+            fixture.tmp.path().join("allowed/work/innerlink"),
+        )
+        .unwrap();
+        // …and a root configured THROUGH a symlink must still match its own
+        // real entries (Node realpaths BOTH sides, path-utils.ts:313/319).
+        let rootlink = fixture.tmp.path().join("rootlink");
+        std::os::unix::fs::symlink(fixture.tmp.path().join("allowed"), &rootlink).unwrap();
+        let symlinked_roots = vec![rootlink.to_string_lossy().into_owned()];
+        let real_roots = vec![allowed.clone()];
+
+        // Existing real entry under a symlink-configured root: allowed.
+        assert!(is_path_allowed(
+            &fixture
+                .tmp
+                .path()
+                .join("allowed/work/inside.txt")
+                .to_string_lossy(),
+            Some(&symlinked_roots)
+        ));
+        // An in-root symlink that stays in-root: allowed at its real location.
+        assert!(is_path_allowed(
+            &format!("{allowed}/work/innerlink/work/inside.txt"),
+            Some(&real_roots)
+        ));
+        // Existing targets through the escaping symlink resolve fully -> deny.
+        assert!(!is_path_allowed(
+            &format!("{allowed}/uplink"),
+            Some(&real_roots)
+        ));
+        assert!(!is_path_allowed(
+            &format!("{allowed}/uplink/sentinel.txt"),
+            Some(&real_roots)
+        ));
+        // A `..` hop off the symlink-configured root still lands outside.
+        assert!(!is_path_allowed(
+            &format!(
+                "{}/../outside/sentinel.txt",
+                rootlink.to_string_lossy()
+            ),
+            Some(&symlinked_roots)
+        ));
+        // A NOT-YET-EXISTING leaf behind the escaping symlink: Node's
+        // whole-path realpathSync fallback would compare the unresolved
+        // string and ALLOW (its write would then land outside); the lenient
+        // ancestor canonicalize still resolves the symlinked prefix and
+        // denies — the deliberate FILE-06 hardening of path-utils.ts:296-300.
+        assert!(!is_path_allowed(
+            &format!("{allowed}/uplink/brand-new.txt"),
+            Some(&real_roots)
+        ));
+        // …while a new leaf under a REAL in-root prefix still compares as
+        // in-root (write/mkdir of new sandbox files keeps working).
+        assert!(is_path_allowed(
+            &format!("{allowed}/work/brand-new.txt"),
+            Some(&real_roots)
+        ));
+    }
+
+    #[test]
+    fn sandbox_case_fold_follows_nodes_win32_gate() {
+        // Node lowercases ONLY when process.platform === 'win32'
+        // (path-utils.ts:314-321); cfg!(windows) is the Rust twin of that gate,
+        // so on this POSIX host the fold is the identity…
+        if cfg!(windows) {
+            assert_eq!(case_fold_for_platform("AbCd".to_string()), "abcd");
+        } else {
+            assert_eq!(case_fold_for_platform("AbCd".to_string()), "AbCd");
+        }
+        // …and the comparison itself is case-sensitive here: a differently-
+        // cased spelling must not match. (These fixtures never exist on disk,
+        // so the lenient canonicalize contributes nothing either way.)
+        let roots = vec!["/tmp/freshell-sbx-CaseRoot".to_string()];
+        assert!(
+            !is_path_allowed("/tmp/freshell-sbx-caseroot/anything", Some(&roots))
+                || cfg!(windows)
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoints_reject_dotdot_traversal_escapes() {
+        let fixture = EscapeFixture::new();
+        let state = sandboxed_state(&fixture.allowed()).await;
+
+        // `POST /api/files/validate-dir`
+        let resp = validate_dir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": fixture.dotdot_escape("") })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "validate-dir");
+
+        // `GET /api/files/read` — the sentinel content must not come back.
+        let resp = read_file(
+            State(state.clone()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(fixture.dotdot_escape("sentinel.txt")),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read");
+        let v = body_json(resp).await;
+        assert!(v.get("content").is_none(), "sentinel content must not leak");
+
+        // `GET /api/files/stat`
+        let resp = stat_file(
+            State(state.clone()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(fixture.dotdot_escape("sentinel.txt")),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "stat");
+
+        // `POST /api/files/write` — must not MODIFY the sentinel.
+        let resp = write_file(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({
+                "path": fixture.dotdot_escape("sentinel.txt"),
+                "content": "pwned",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "write");
+
+        // `POST /api/files/mkdir` — must not create anything outside.
+        let resp = mkdir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": fixture.dotdot_escape("evil-dir") })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mkdir");
+
+        // `GET /api/files/complete` — both the absolute-prefix form and the
+        // root-anchored relative form (resolve_completion_input joins the
+        // relative prefix under the root first; the collapse catches it after).
+        let resp = complete(
+            State(state.clone()),
+            auth_headers(),
+            Query(CompleteQuery {
+                prefix: Some(fixture.dotdot_escape("")),
+                root: None,
+                dirs: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "complete prefix");
+        let resp = complete(
+            State(state.clone()),
+            auth_headers(),
+            Query(CompleteQuery {
+                prefix: Some("../outside".to_string()),
+                root: Some(fixture.allowed()),
+                dirs: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "complete root-anchored");
+
+        fixture.assert_sentinel_untouched();
+        assert!(!fixture.outside().join("evil-dir").exists());
+
+        // Positive control: a real in-root file still reads (no over-denial).
+        let inside = fixture
+            .tmp
+            .path()
+            .join("allowed/work/inside.txt")
+            .to_string_lossy()
+            .into_owned();
+        let resp = read_file(
+            State(state),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(inside),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "read of a real in-root file");
+        let v = body_json(resp).await;
+        assert_eq!(v["content"], "inside");
+    }
+
+    #[tokio::test]
+    async fn endpoints_reject_percent_encoded_dotdot_after_decode() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let fixture = EscapeFixture::new();
+        let state = sandboxed_state(&fixture.allowed()).await;
+        // `%2e%2e%2f` is exactly what a client URL-encoding a `../` hop sends;
+        // the HTTP layer URL-decodes ONCE on receipt, so the handler-side
+        // collapse must still catch it (the sandbox never decodes a second
+        // time). Drive the real router so the decode-then-collapse chain is
+        // exercised end-to-end.
+        let encoded = format!("{}%2f%2e%2e%2foutside%2fsentinel.txt", fixture.allowed());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/files/read?path={encoded}"))
+            .header("x-auth-token", "tok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        fixture.assert_sentinel_untouched();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn endpoints_reject_symlink_escapes() {
+        let fixture = EscapeFixture::new();
+        std::os::unix::fs::symlink(
+            fixture.outside(),
+            fixture.tmp.path().join("allowed/uplink"),
+        )
+        .unwrap();
+        let state = sandboxed_state(&fixture.allowed()).await;
+        let uplink = format!("{}/uplink", fixture.allowed());
+
+        // A NEW leaf through the symlink: the Node whole-path realpathSync
+        // fallback hole — the lenient canonicalize resolves the symlinked
+        // prefix and denies, so nothing materializes outside.
+        let resp = write_file(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({
+                "path": format!("{uplink}/brand-new.txt"),
+                "content": "pwned",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "write new via symlink");
+        assert!(!fixture.outside().join("brand-new.txt").exists());
+        let resp = mkdir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": format!("{uplink}/brand-new-dir") })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "mkdir new via symlink");
+        assert!(!fixture.outside().join("brand-new-dir").exists());
+
+        // Existing targets through the symlink resolve fully -> deny…
+        let resp = read_file(
+            State(state.clone()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(format!("{uplink}/sentinel.txt")),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "read via symlink");
+        let resp = stat_file(
+            State(state.clone()),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(format!("{uplink}/sentinel.txt")),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "stat via symlink");
+        let resp = validate_dir(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({ "path": uplink.clone() })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "validate-dir via symlink");
+        let resp = complete(
+            State(state.clone()),
+            auth_headers(),
+            Query(CompleteQuery {
+                prefix: Some(format!("{uplink}/")),
+                root: None,
+                dirs: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "complete via symlink");
+        // …and writing THROUGH the symlink onto the sentinel itself is denied.
+        let resp = write_file(
+            State(state.clone()),
+            auth_headers(),
+            Json(json!({
+                "path": format!("{uplink}/sentinel.txt"),
+                "content": "pwned",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "write sentinel via symlink");
+        fixture.assert_sentinel_untouched();
+
+        // Positive control: writing a NEW file under a real in-root prefix
+        // still works (the lenient canonicalize re-attaches the missing tail).
+        let new_inside = fixture.tmp.path().join("allowed/work/brand-new.txt");
+        let resp = write_file(
+            State(state),
+            auth_headers(),
+            Json(json!({
+                "path": new_inside.to_string_lossy(),
+                "content": "fresh",
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "write of a new in-root file");
+        assert_eq!(std::fs::read_to_string(&new_inside).unwrap(), "fresh");
+    }
+
+    #[tokio::test]
+    async fn case_variant_paths_do_not_confuse_the_boundary_on_this_host() {
+        // A case-fold escape only reads against a case-insensitive comparison
+        // — Node's win32-only toLowerCase (path-utils.ts:314-321) never runs
+        // on this POSIX host, so a differently-cased spelling of the root must
+        // NOT match. (The cfg!(windows) arm keeps the assertion honest if this
+        // ever executes where Node WOULD fold.)
+        let fixture = EscapeFixture::new();
+        let state = sandboxed_state(&fixture.allowed()).await;
+        let variant = fixture
+            .tmp
+            .path()
+            .join("ALLOWED")
+            .to_string_lossy()
+            .into_owned();
+        let resp = stat_file(
+            State(state),
+            auth_headers(),
+            Query(PathQuery {
+                path: Some(format!("{variant}/work/inside.txt")),
+            }),
+        )
+        .await
+        .into_response();
+        if cfg!(windows) {
+            assert_eq!(resp.status(), StatusCode::OK);
+        } else {
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        fixture.assert_sentinel_untouched();
     }
 }

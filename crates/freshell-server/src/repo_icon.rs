@@ -76,8 +76,10 @@ fn failure_response(failure: ResolveFailure) -> Response {
 /// 1. on the raw normalized cwd (parity with the files.rs surfaces),
 /// 2. re-checked on the CANONICAL cwd — a symlinked cwd inside an allowed root
 ///    must not escape it (parity with Node's realpath-before-allowlist in
-///    `isPathAllowed`, `server/path-utils.ts:291-313`; the Rust
-///    `files::is_path_allowed` does NOT canonicalize),
+///    `isPathAllowed`, `server/path-utils.ts:291-313`; since FILE-06
+///    `files::is_path_allowed` itself canonicalizes both sides, check (1)
+///    already resolves symlinks — this re-check is retained to keep the
+///    raw → canonical → repo-root containment chain explicit),
 /// 3. on the CANONICAL resolved repo root — the `.git` walk can land on an
 ///    ancestor outside every allowed root, and everything served comes from
 ///    under it.
@@ -93,8 +95,9 @@ fn resolve_repo_and_icon(
     if !Path::new(&normalized).is_absolute() {
         return Err(ResolveFailure::BadRequest("cwd must be an absolute path"));
     }
-    // (1) raw-path check first: clearly-disallowed paths get Forbidden without
-    // an existence probe (matches files.rs ordering).
+    // (1) raw-path check first: clearly-disallowed paths get Forbidden before
+    // any repo resolution (matches files.rs ordering; since FILE-06
+    // is_path_allowed itself canonicalizes, so symlinked raw paths deny here).
     if !crate::files::is_path_allowed(&normalized, allowed_roots) {
         return Err(ResolveFailure::Forbidden);
     }
