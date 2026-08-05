@@ -2805,6 +2805,14 @@ pub(crate) async fn handle_create(
         resume_session_id.clone(),
     );
 
+    // Task 10: attach the per-terminal opencode SSE lane (attention bell).
+    // The endpoint was allocated pre-launch and rode into argv; the hub's
+    // OpencodeAttach arm re-checks the tracked mode, so this only arms for
+    // opencode panes. Channel-deferred — safe off the dispatch path.
+    if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
+        hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+    }
+
     // Restore-across-restart fix (opencode): arm the opencode locator for a
     // FRESH (non-resuming) opencode pane. No-ops for every other mode/resume
     // case.
@@ -3497,6 +3505,14 @@ pub async fn respawn_agent_terminal(
         Some(mode.clone()),
         resume_session_id.clone(),
     );
+
+    // Task 10: attach the per-terminal opencode SSE lane (attention bell).
+    // The respawn re-allocated a fresh loopback port above;
+    // `attach_opencode_serve` replaces the old lane by contract (A6
+    // generation bump retires the predecessor whole).
+    if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
+        hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+    }
 
     // Arm the provider locators the way `handle_create` does for this mode
     // (both gate on a FRESH — non-resuming — pane, so they no-op for a

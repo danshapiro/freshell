@@ -512,6 +512,14 @@ async fn main() -> ExitCode {
             freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
         }));
     }
+    // Task 10: the opencode SSE lane's production IO seams (reqwest impls;
+    // fakes in tests). Unset would leave OpencodeAttach retire-only.
+    activity_hub.set_opencode_lane_deps(std::sync::Arc::new(
+        freshell_ws::opencode_lane::OpencodeLaneDeps {
+            http: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneHttp::new()),
+            events: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneStream::new()),
+        },
+    ));
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();

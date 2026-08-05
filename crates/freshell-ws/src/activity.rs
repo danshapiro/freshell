@@ -450,11 +450,10 @@ impl ActivityHub {
     }
 
     /// Task 9: install the SSE lane's injected IO seams (reqwest impls in
-    /// production; fakes in tests). Option'd — hub tests that never attach
-    /// leave it unset, and `OpencodeAttach` then only retires old lanes.
-    /// dead_code: Task 10's boot wiring is the production caller.
-    #[allow(dead_code)]
-    pub(crate) fn set_opencode_lane_deps(&self, deps: Arc<crate::opencode_lane::OpencodeLaneDeps>) {
+    /// production, wired by `freshell-server` at boot — Task 10; fakes in
+    /// tests). Option'd — hub tests that never attach leave it unset, and
+    /// `OpencodeAttach` then only retires old lanes.
+    pub fn set_opencode_lane_deps(&self, deps: Arc<crate::opencode_lane::OpencodeLaneDeps>) {
         let mut inner = self.inner.lock().expect("activity hub lock");
         inner.opencode_lane_deps = Some(deps);
     }
@@ -4627,6 +4626,76 @@ mod tests {
         );
         hub.bind_opencode_session("t-oc", "ses-new");
         assert_no_attention_frames(&mut rx, 1_500).await;
+    }
+
+    /// Task 10 producer contract (D3 deferred completion): a restore-created
+    /// opencode terminal WITHOUT resume identity goes busy for `ses-x`
+    /// (unconfirmed CANDIDATE), then idle — the completion is DEFERRED
+    /// (awaitingAssociation), total silence. The identity bind arriving via
+    /// `bind_opencode_session` (the ingress Task 10's association sweep and
+    /// TUI rebind-signal producers drive) confirms ownership and releases it:
+    /// terminal.turn.complete{provider:"opencode"} then exactly ONE
+    /// terminal.idle{reason:"grace"}.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_created_opencode_terminal_binds_identity_via_bind_ingress() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: None,
+                at: 1_000,
+            },
+        );
+        hub.register_opencode_lane_for_tests("t-oc", 1);
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::Status {
+                session_id: "ses-x".into(),
+                status: OpencodeStatus::Busy,
+            },
+        );
+        let busy = next_frame_matching(&mut rx, "opencode.activity.updated", 1_500, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await;
+        assert!(busy.is_some(), "candidate busy upsert");
+
+        hub.note_opencode_lane_event(
+            "t-oc",
+            1,
+            1,
+            1,
+            OpencodeLaneEvent::SessionIdle {
+                session_id: "ses-x".into(),
+            },
+        );
+        // Candidate turn end: the completion must DEFER, not ring.
+        assert_no_attention_frames(&mut rx, 1_500).await;
+
+        // Identity proof (the Task 10 producers): the deferred completion
+        // releases — turn.complete first, then one idle after the grace.
+        hub.bind_opencode_session("t-oc", "ses-x");
+        let complete = next_frame_of_type(&mut rx, "terminal.turn.complete", 1_500)
+            .await
+            .expect("the bind releases the deferred completion");
+        assert_eq!(complete["terminalId"], "t-oc");
+        assert_eq!(complete["provider"], "opencode");
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 3_500)
+            .await
+            .expect("one grace idle after the released completion");
+        assert_eq!(idle["terminalId"], "t-oc");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_500)
+                .await
+                .is_none(),
+            "exactly one terminal.idle for the released completion"
+        );
     }
 
     /// D1 + D3: an abort landing mid-pause force-emits the cancel — the

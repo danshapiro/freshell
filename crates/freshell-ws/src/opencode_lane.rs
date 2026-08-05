@@ -52,7 +52,7 @@ pub(crate) fn version_in_tested_range(version: &str) -> bool {
 /// Injected HTTP seam: one JSON GET (health poll, `/session/status`
 /// snapshot, `/session/{id}` root resolve). The production impl applies the
 /// 2s per-request timeout.
-pub(crate) trait OpencodeLaneHttp: Send + Sync {
+pub trait OpencodeLaneHttp: Send + Sync {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
@@ -60,7 +60,7 @@ pub(crate) trait OpencodeLaneHttp: Send + Sync {
 }
 
 /// Injected SSE seam.
-pub(crate) trait OpencodeEventStream: Send + Sync {
+pub trait OpencodeEventStream: Send + Sync {
     /// Two-phase connect (Node connect-then-snapshot parity, A5): resolves
     /// once the subscription is CONFIRMED — on the FIRST `server.connected`
     /// SSE frame, detected on the raw decoded event BEFORE `parse_serve_event`
@@ -73,7 +73,7 @@ pub(crate) trait OpencodeEventStream: Send + Sync {
 }
 
 /// A connected, ack'd `/event` subscription.
-pub(crate) trait ConnectedOpencodeStream: Send {
+pub trait ConnectedOpencodeStream: Send {
     /// Deliver the buffered frames in order, then live parsed events, by
     /// sending each into `events_tx` until the stream ends (returns on
     /// disconnect; the sender is dropped on return, which is what lets the
@@ -91,7 +91,7 @@ pub(crate) trait ConnectedOpencodeStream: Send {
 
 /// The lane's injected IO seams. Installed on the hub once at boot
 /// (`ActivityHub::set_opencode_lane_deps`); fakes in tests.
-pub(crate) struct OpencodeLaneDeps {
+pub struct OpencodeLaneDeps {
     pub http: Arc<dyn OpencodeLaneHttp>,
     pub events: Arc<dyn OpencodeEventStream>,
 }
@@ -466,19 +466,23 @@ pub(crate) fn translate_serve_event(event: &ParsedServeEvent) -> Option<Opencode
 
 /// Production [`OpencodeLaneHttp`]: `GET url` with the 2s per-request timeout
 /// (the loopback serve's AbortController analog — DEV-0001), JSON body.
-/// dead_code: constructed by Task 10's boot wiring; the seam lands here.
-#[allow(dead_code)]
-pub(crate) struct ReqwestLaneHttp(reqwest::Client);
+/// Constructed by `freshell-server`'s boot wiring (Task 10).
+pub struct ReqwestLaneHttp(reqwest::Client);
 
-#[allow(dead_code)]
 impl ReqwestLaneHttp {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         // Loopback plain-HTTP only; a plain client never fails to build.
         Self(
             reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         )
+    }
+}
+
+impl Default for ReqwestLaneHttp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -509,18 +513,22 @@ impl OpencodeLaneHttp for ReqwestLaneHttp {
 /// arrive every ~10s) and a byte pending-buffer for partial UTF-8 — the
 /// shape of `freshell_opencode::transport::consume_events:145-198`, WITHOUT
 /// its internal reconnect loop (the lane owns cycles).
-/// dead_code: constructed by Task 10's boot wiring; the seam lands here.
-#[allow(dead_code)]
-pub(crate) struct ReqwestLaneStream(reqwest::Client);
+/// Constructed by `freshell-server`'s boot wiring (Task 10).
+pub struct ReqwestLaneStream(reqwest::Client);
 
-#[allow(dead_code)]
 impl ReqwestLaneStream {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(
             reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         )
+    }
+}
+
+impl Default for ReqwestLaneStream {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

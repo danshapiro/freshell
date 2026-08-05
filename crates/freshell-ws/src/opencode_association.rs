@@ -165,6 +165,13 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             &located.session_id,
             entry.cwd.clone(),
         );
+        // Task 10: feed the identity proof into the activity hub — the
+        // opencode tracker's deferred (awaitingAssociation) completions
+        // release on this bind (channel-deferred, safe off the sweep task;
+        // codex_identity.rs:221 precedent).
+        if let Some(hub) = &state.activity {
+            hub.bind_opencode_session(&located.terminal_id, &located.session_id);
+        }
     }
 }
 

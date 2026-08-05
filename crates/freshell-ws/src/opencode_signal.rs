@@ -426,6 +426,14 @@ async fn rebind_fanout(
         cwd.map(str::to_string),
         previous,
     );
+    // Task 10: feed the identity proof into the activity hub — the in-TUI
+    // session-switch (and first-bind) signal rebinds the tracker's owned
+    // root; deferred (awaitingAssociation) completions release on this bind
+    // (channel-deferred, safe off the sweep task; codex_identity.rs:221
+    // precedent).
+    if let Some(hub) = &state.activity {
+        hub.bind_opencode_session(&sig.terminal_id, &sig.session_id);
+    }
 }
 
 /// Outcome of applying one signal: `Acted` (rebind done), `Retain` (might
