@@ -1,12 +1,13 @@
 # Overnight Parallel-Agent Campaign — What I Learned (fable, 2026-08-05, 00:15–09:00)
 
-**The headline:** 28 parity checklist items landed on a single review-ready branch
+**The headline:** 31 parity checklist items landed on a single review-ready branch
 (`parity-campaign-20260805`), each verified by targeted cargo/vitest runs on the integration
 branch, using ~35 opencode sessions running `ms-runpod/moonshotai/Kimi-K3` as the workforce —
 plus a complete evidence-cited re-audit of all 235 checklist items that corrects a badly stale
 ledger (only 7 boxes were checked; reality is 31 DONE / 118 PARTIAL / 58 MISSING / 23 UNCLEAR /
-5 HOST-LIMITED). One item honestly closed as already-done (SYNC-06), one dropped after three
-zero-output sessions (SESSION-21), one cut at deadline with salvageable work (AUTO-05).
+5 HOST-LIMITED). One item honestly closed as already-done (SYNC-06), and one dropped after three
+zero-output sessions (SESSION-21). Even the item cut at the first deadline (AUTO-05) was
+salvaged by a fresh session pointed at its dirty worktree in a bonus round after gates went green.
 
 **What worked — the winning process shape.** The most effective topology was *write-only
 workers + central serial verification*: each worker gets its own git worktree and a spec

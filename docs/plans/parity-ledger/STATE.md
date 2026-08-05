@@ -19,7 +19,7 @@
 - [x] Phase 0 audit: 18 auditors, 235 items re-verdicted (audit/*.yaml)
 - [x] Implementation waves: 28 items landed (see CAMPAIGN-RESULTS.md)
 - [x] DIAG-04 perf logging landed (user priority)
-- [ ] Final gates: cargo --workspace + npm test running (logs /tmp/parity/logs/gate-*.log)
+- [x] Final gates rd1 GREEN (cargo 0, npm 0); rd2 running after bonus round (gate2-*.log)
 - [x] WRITEUP.md + LEARNINGS.md + CAMPAIGN-RESULTS.md written
 
 ## Scratch layout

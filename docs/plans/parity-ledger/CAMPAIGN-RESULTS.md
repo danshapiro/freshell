@@ -4,7 +4,7 @@
 **Workers:** opencode CLI + `ms-runpod/moonshotai/Kimi-K3` (≈35 sessions: 18 auditors, ~17 implementers + fix/fresh recovery sessions)
 **Verification bar:** every landed item cherry-picked onto this branch and passed targeted `cargo test` / vitest runs centrally; full workspace + npm gates run at campaign end (see GATES section below).
 
-## Landed items (28 checklist items, 28 feature commits)
+## Landed items (31 checklist items, 31 feature commits)
 
 | Item | Commit | Area |
 |------|--------|------|
@@ -36,6 +36,9 @@
 | SESSION-04 | 6757ee326 | provider-aware titles + Gemini AI title path |
 | FILE-02 | 4e3fadee8 | Windows drive/UNC targets in /local-file |
 | FILE-03 | 87eee486b | \\wsl$ + network-share UNC unaddressable pinning |
+| AUTO-05 | (bonus) | pane split/close ops parity slice |
+| SESSION-17 | (bonus) | session title sync + PATCH provider lanes |
+| NET-09 | (bonus) | network settings persistence + share-URL settings lanes |
 
 Plus docs: AGENTS.md port correction (47f5c68f5), audit ledger (d85561a8c).
 
@@ -43,8 +46,8 @@ Plus docs: AGENTS.md port correction (47f5c68f5), audit ledger (d85561a8c).
 
 - **SYNC-06** — AUDIT_WRONG: worker proved the feature already landed via PR #592; no work needed.
 - **SESSION-21** — DROPPED: three sessions (2 resumes) produced zero committed output.
-- **AUTO-05** — CUT AT DEADLINE: worker timed out with uncommitted partial work in
-  `.worktrees/w-AUTO-05` (pane_ops.rs); salvageable in a follow-up.
+- **AUTO-05** — initially cut at deadline, then SALVAGED in the bonus round (fresh session
+  finished the dirty worktree; landed and verified).
 
 ## Checkbox policy (IMPORTANT)
 
