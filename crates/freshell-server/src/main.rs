@@ -27,6 +27,7 @@ mod identity_sink;
 mod instance_id;
 mod logging;
 mod network;
+mod perf;
 mod proxy;
 mod rate_limit;
 mod recovery_inventory;
@@ -1138,6 +1139,21 @@ async fn main() -> ExitCode {
     let rate_limiter =
         rate_limit::RateLimiter::new_system(rate_limit::RateLimitConfig::default_api());
 
+    // DIAG-04: the live perf logger. Env is boot-authoritative in the
+    // ENABLING direction (`PERF_LOGGING`/`PERF_DEBUG`), and a persisted
+    // `logging.debug: true` also enables at boot (legacy
+    // `applyDebugLogging(!!settings.logging?.debug, 'settings')`,
+    // `server/index.ts:708`) -- see the module docs for why the DISABLING
+    // direction of the persisted setting is deliberately not applied here.
+    let perf_logger = Arc::new(perf::PerfLogger::new(perf::PerfConfig::from_env(|k| {
+        std::env::var(k).ok()
+    })));
+    if perf_logger.config().enabled {
+        perf_logger.set_enabled(true, "env");
+    } else if settings_store.get().await.logging.debug {
+        perf_logger.set_enabled(true, "settings");
+    }
+
     // DIAG-05: `/api/server-info`, `/api/debug`, `/api/perf` -- shares the
     // live settings store, terminal registry, tabs registry, and session
     // index every other authenticated REST surface above already threads.
@@ -1150,6 +1166,7 @@ async fn main() -> ExitCode {
         tabs: tabs.clone(),
         session_index: diag_session_index,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        perf: perf_logger,
     };
 
     let app = freshell_api::router(api_state)

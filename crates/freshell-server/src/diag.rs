@@ -65,6 +65,9 @@ pub struct DiagState {
     /// The shared server->client broadcast bus -- `POST /api/perf` pushes
     /// `settings.updated` here on every successful toggle.
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// DIAG-04: the live perf logger -- `POST /api/perf` flips it (source
+    /// `"api"`) so sampling starts/stops WITHOUT a restart.
+    pub perf: Arc<crate::perf::PerfLogger>,
 }
 
 /// The REST sub-router, pre-bound to its state (mergeable into the server app).
@@ -257,6 +260,10 @@ async fn perf(State(state): State<DiagState>, headers: HeaderMap, raw_body: Stri
         .await
     {
         Ok(merged) => {
+            // DIAG-04: apply the toggle LIVE (start/stop the sampler without
+            // a restart), mirroring legacy's `applyDebugLogging(enabled,
+            // 'api')` running alongside the settings persist.
+            state.perf.set_enabled(enabled, "api");
             if let Ok(frame) =
                 serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
             {
@@ -299,6 +306,9 @@ mod tests {
             tabs: freshell_ws::tabs::TabsRegistry::new(),
             session_index: None,
             broadcast_tx: Arc::new(broadcast_tx),
+            perf: Arc::new(crate::perf::PerfLogger::new(
+                crate::perf::PerfConfig::default(),
+            )),
         }
     }
 
@@ -591,6 +601,13 @@ mod tests {
         assert!(
             updated.logging.debug,
             "settings.logging.debug must now be true"
+        );
+
+        // DIAG-04: the toggle must also flip the LIVE perf logger (sampler
+        // starts without a restart), not just persist the setting.
+        assert!(
+            state.perf.is_enabled(),
+            "perf logger must be live-enabled by the API toggle"
         );
 
         let frame = rx
