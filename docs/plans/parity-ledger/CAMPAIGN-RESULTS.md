@@ -68,3 +68,8 @@ should flip boxes item-by-item.
 - `npm test` (coordinated full suite, campaign worktree): **EXIT 0** — fully green; note the
   pre-existing `api-edge-cases` __proto__ failure seen at baseline did NOT reproduce here
   (log: /tmp/parity/logs/gate-npm.log).
+
+## GATES round 2 (07:56, final branch state with 31 items)
+
+- `cargo test --workspace`: **EXIT 0**
+- `npm test` (coordinated full suite): **EXIT 0**
