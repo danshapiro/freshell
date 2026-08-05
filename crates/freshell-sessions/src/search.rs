@@ -237,6 +237,86 @@ mod tests {
         assert!(!snippet.starts_with("..."));
     }
 
+    // ── SESSION-19: safe, bounded, isolated snippets ──
+
+    /// Neighbor-secret isolation: text outside the bounded context window
+    /// (`context_length` chars on either side of the match) must never leak
+    /// into the snippet, even though it is part of the SAME message.
+    #[test]
+    fn extract_snippet_excludes_distant_neighbor_text_on_both_sides() {
+        let text = format!(
+            "SECRET-BEFORE-SENTINEL {}needle-match{} SECRET-AFTER-SENTINEL",
+            "x".repeat(120),
+            "x".repeat(120)
+        );
+        let snippet = extract_snippet(&text, "needle-match", 50);
+        assert!(snippet.contains("needle-match"));
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+        assert!(
+            !snippet.contains("SECRET-BEFORE-SENTINEL"),
+            "text before the context window must never leak into the snippet, got {snippet:?}"
+        );
+        assert!(
+            !snippet.contains("SECRET-AFTER-SENTINEL"),
+            "text after the context window must never leak into the snippet, got {snippet:?}"
+        );
+    }
+
+    /// The snippet is plain DATA, not markup: HTML-special characters pass
+    /// through un-escaped and un-stripped. Like the reference's
+    /// `extractSnippet` (`file-search.ts:12-27`), this layer never
+    /// transforms matched text -- escaping is the transport layer's job
+    /// (JSON string encoding) plus the client rendering the snippet as
+    /// text, so the server must neither HTML-encode nor strip tags.
+    #[test]
+    fn extract_snippet_html_markup_is_returned_verbatim_as_data() {
+        let text = "intro <script>alert('xss')</script> html-needle <b>bold</b> outro";
+        let snippet = extract_snippet(text, "html-needle", 50);
+        assert_eq!(
+            snippet, text,
+            "a match whose context window spans the whole text returns it verbatim"
+        );
+        assert!(snippet.contains("<script>alert('xss')</script>"));
+        assert!(
+            !snippet.contains("&lt;") && !snippet.contains("&gt;"),
+            "the server must not HTML-encode the snippet, got {snippet:?}"
+        );
+    }
+
+    /// Control characters (ANSI escapes, U+2028, etc.) are char-indexed data:
+    /// extraction never panics or splits mid-codepoint, stays within the
+    /// `query + 2*context + two ellipses` bound, and -- once serialized by
+    /// serde_json (the role `JSON.stringify` plays in the reference) -- the
+    /// wire form carries no raw C0 control bytes and round-trips exactly.
+    #[test]
+    fn extract_snippet_control_characters_stay_bounded_and_json_escape_on_the_wire() {
+        let text = format!(
+            "\u{1b}[31m red \u{1b}[0m ctrl-needle\u{2028}{} TAIL-SECRET",
+            "y".repeat(120)
+        );
+        let snippet = extract_snippet(&text, "ctrl-needle", 50);
+        assert!(snippet.contains("ctrl-needle"));
+        assert!(snippet.contains("\u{1b}[31m"), "control chars survive verbatim in the data");
+        assert!(snippet.contains('\u{2028}'));
+        assert!(!snippet.contains("TAIL-SECRET"));
+        assert!(snippet.ends_with("..."));
+        assert!(
+            snippet.chars().count() <= "ctrl-needle".chars().count() + 2 * 50 + 2 * 3,
+            "snippet must stay within query + 2*context + 2 ellipses, got {} chars",
+            snippet.chars().count()
+        );
+
+        let wire = serde_json::to_string(&snippet).unwrap();
+        assert!(
+            !wire.chars().any(|c| (c as u32) < 0x20),
+            "serialized wire form must contain no raw control bytes: {wire:?}"
+        );
+        assert!(wire.contains("\\u001b"), "ESC must be serialized as a \\u escape");
+        let round: String = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round, snippet, "wire form must round-trip to the exact snippet");
+    }
+
     // ── extract_claude_message ──
 
     #[test]
@@ -444,6 +524,41 @@ mod tests {
         )
         .unwrap()
         .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SESSION-19 -- "avoid leaking unrelated messages": the snippet is
+    /// extracted from the SINGLE matching message's text only. Even at the
+    /// `FullText` tier (both lines eligible), a same-message secret placed
+    /// beyond the 50-char context window AND a secret in the immediate
+    /// neighboring assistant message must both stay out of the snippet.
+    #[test]
+    fn search_session_file_snippet_is_bounded_to_the_matching_message() {
+        let user_line = format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"shared-needle {} SAME-MESSAGE-SECRET\"}}}}",
+            "p".repeat(200)
+        );
+        let assistant_line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"NEIGHBOR-SECRET-SENTINEL shared-needle"}]}}"#;
+        let path = write_temp(
+            "claude-isolation.jsonl",
+            &format!("{user_line}\n{assistant_line}\n"),
+        );
+        let result =
+            search_session_file(&path, "claude", "shared-needle", FileSearchTier::FullText)
+                .unwrap();
+        let m = result.expect("the user turn must match first");
+        assert_eq!(m.matched_in, "userMessage");
+        assert!(m.snippet.starts_with("shared-needle"));
+        assert!(
+            !m.snippet.contains("SAME-MESSAGE-SECRET"),
+            "text beyond the context window of the matching message must not leak, got {:?}",
+            m.snippet
+        );
+        assert!(
+            !m.snippet.contains("NEIGHBOR-SECRET-SENTINEL"),
+            "a neighboring message's text must never appear in the snippet, got {:?}",
+            m.snippet
+        );
         std::fs::remove_file(&path).ok();
     }
 }

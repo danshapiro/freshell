@@ -2888,4 +2888,225 @@ mod tests {
         assert_eq!(arr[0]["title"], json!("My Renamed Special Project"));
         assert_eq!(arr[0]["matchedIn"], json!("title"));
     }
+
+    // ── SESSION-19: accurate match tier + safe, bounded, isolated snippets ──
+
+    /// SESSION-19 (title tier): the snippet is the MATCHED FIELD's first 140
+    /// chars returned as literal data -- the server neither HTML-encodes nor
+    /// strips markup (the client renders snippets as text; escaping is the
+    /// JSON transport layer, matching the reference's `applySearch` +
+    /// `JSON.stringify`, `service.ts:66-75`). The serialized wire page must
+    /// carry the snippet byte-exactly through a JSON round-trip.
+    #[test]
+    fn title_tier_snippet_is_bounded_verbatim_and_wire_safe() {
+        let long_html_title = format!(
+            "<img src=x onerror=alert(1)> needle-title {}",
+            "z".repeat(200)
+        );
+        let item = DirItem {
+            session_id: "html1".into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some(long_html_title.clone()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: None,
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        };
+        let q = DirQuery {
+            query: Some("needle-title".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(vec![item], &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matchedIn"], json!("title"));
+        let snippet = arr[0]["snippet"].as_str().unwrap();
+        assert_eq!(
+            snippet.chars().count(),
+            140,
+            "title-tier snippet is the matched field truncated to 140 chars"
+        );
+        assert_eq!(
+            snippet,
+            long_html_title.chars().take(140).collect::<String>()
+        );
+        assert!(
+            snippet.contains("<img src=x onerror=alert(1)>"),
+            "HTML is data and must be returned verbatim, got {snippet:?}"
+        );
+        assert!(
+            !snippet.contains("&lt;") && !snippet.contains("&gt;"),
+            "the server must not HTML-encode the snippet, got {snippet:?}"
+        );
+
+        // The wire form is valid JSON and round-trips the snippet exactly.
+        let wire = serde_json::to_string(&page).unwrap();
+        let round: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round["items"][0]["snippet"], json!(snippet));
+        assert_eq!(round["items"][0]["matchedIn"], json!("title"));
+    }
+
+    /// SESSION-19 (title tier) -- neighbor-secret isolation across metadata
+    /// FIELDS: the snippet is drawn ONLY from the matched field
+    /// (title → summary → firstUserMessage precedence, `service.ts:66-75`),
+    /// never spliced with the other fields' text, even though those fields
+    /// are returned alongside it on the same item.
+    #[test]
+    fn title_tier_snippet_comes_only_from_the_matched_field() {
+        let mk = |title: Option<&str>, summary: Option<&str>, fum: Option<&str>| DirItem {
+            session_id: "iso1".into(),
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: title.map(str::to_string),
+            summary: summary.map(str::to_string),
+            first_user_message: fum.map(str::to_string),
+            last_activity_at: 100,
+            created_at: None,
+            cwd: None,
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            source_file: None,
+        };
+
+        // Query matching BOTH title and summary: title wins the tier label
+        // and the snippet; the summary's sentinel stays out.
+        let item = mk(
+            Some("shared-needle in the title"),
+            Some("shared-needle SUMMARY-SECRET-SENTINEL"),
+            None,
+        );
+        let q = DirQuery {
+            query: Some("shared-needle".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(vec![item], &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matchedIn"], json!("title"));
+        assert_eq!(arr[0]["snippet"], json!("shared-needle in the title"));
+        assert!(
+            !arr[0]["snippet"].as_str().unwrap().contains("SUMMARY-SECRET-SENTINEL"),
+            "a non-matched field's text must never leak into the snippet"
+        );
+
+        // Query matching only the summary: field-accurate tier label and an
+        // exact, un-padded snippet despite sentinels in the other fields.
+        let item = mk(
+            Some("TITLE-SECRET-SENTINEL"),
+            Some("summary holds needle-two here"),
+            Some("FIRST-USER-SECRET-SENTINEL"),
+        );
+        let q = DirQuery {
+            query: Some("needle-two".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(vec![item], &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matchedIn"], json!("summary"));
+        assert_eq!(arr[0]["snippet"], json!("summary holds needle-two here"));
+        let snippet = arr[0]["snippet"].as_str().unwrap();
+        assert!(!snippet.contains("TITLE-SECRET-SENTINEL"));
+        assert!(!snippet.contains("FIRST-USER-SECRET-SENTINEL"));
+
+        // Query matching only firstUserMessage (title/summary absent):
+        // matchedIn is "firstUserMessage" and the snippet is that field.
+        let item = mk(None, None, Some("first user needle-three message"));
+        let q = DirQuery {
+            query: Some("needle-three".into()),
+            include_empty: true,
+            ..DirQuery::default()
+        };
+        let page = apply_query(vec![item], &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matchedIn"], json!("firstUserMessage"));
+        assert_eq!(arr[0]["snippet"], json!("first user needle-three message"));
+    }
+
+    /// SESSION-19 (file tiers), end-to-end through `apply_query`: a
+    /// transcript line storing JSON-escaped control characters and HTML
+    /// markup is decoded, matched with the correct tier label, and snippeted
+    /// verbatim-but-bounded -- the same-message secret beyond the 50-char
+    /// context window and the neighboring assistant turn's secret both stay
+    /// out, and the serialized page carries no raw control bytes.
+    #[test]
+    fn file_tier_snippet_escapes_control_chars_and_isolates_neighbor_secrets() {
+        // `user_text` is embedded verbatim into a JSONL line by the helper,
+        // so ESC must arrive as the 6-char `\u001b` JSON escape (a literal
+        // ESC byte would make the line unparseable) -- mirroring how real
+        // transcripts store control characters.
+        let user_text = format!(
+            "\\u001b[31m red \\u001b[0m ctrl-needle <script>alert(1)</script> {} SAME-FILE-SECRET",
+            "p".repeat(200)
+        );
+        let home = synthetic_claude_home_with_turns(
+            "eeeeeeee-0000-4000-8000-000000000001",
+            &user_text,
+            "ASSISTANT-NEIGHBOR-SECRET",
+        );
+        let items = list_claude_sessions(&claude_home(&home));
+        assert_eq!(items.len(), 1);
+
+        let q = DirQuery {
+            include_non_interactive: true,
+            tier: Tier::UserMessages,
+            query: Some("ctrl-needle".into()),
+            ..DirQuery::default()
+        };
+        let page = apply_query(items, &q, &[]).unwrap();
+        let arr = page["items"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matchedIn"], json!("userMessage"));
+        let snippet = arr[0]["snippet"].as_str().unwrap();
+        assert!(snippet.contains("ctrl-needle"));
+        assert!(
+            snippet.contains('\u{1b}'),
+            "decoded control characters are snippet data, preserved verbatim"
+        );
+        assert!(
+            snippet.contains("<script>alert(1)</script>"),
+            "HTML within the context window is returned verbatim, got {snippet:?}"
+        );
+        assert!(
+            !snippet.contains("SAME-FILE-SECRET"),
+            "same-message text beyond the context window must not leak, got {snippet:?}"
+        );
+        assert!(
+            !snippet.contains("ASSISTANT-NEIGHBOR-SECRET"),
+            "a neighboring message must not leak into the snippet, got {snippet:?}"
+        );
+
+        let wire = serde_json::to_string(&page).unwrap();
+        assert!(
+            !wire.chars().any(|c| (c as u32) < 0x20),
+            "the wire page must carry no raw control bytes: {wire:?}"
+        );
+        assert!(
+            wire.contains("\\u001b"),
+            "ESC must reach the wire as a \\u escape"
+        );
+        let round: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round["items"][0]["snippet"], json!(snippet));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
