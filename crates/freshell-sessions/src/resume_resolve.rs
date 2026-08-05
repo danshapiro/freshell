@@ -441,3 +441,150 @@ fn dedupe(matches: Vec<ResumeResolveMatch>) -> Vec<ResumeResolveMatch> {
         .filter(|m| seen.insert(format!("{}:{}", m.provider, m.session_id)))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    //! SESSION-01 sidebar/History resumable-identity pins. A sidebar click
+    //! (`openSessionTab`, `src/store/tabsSlice.ts:569`) carries the directory
+    //! row's identity as `{provider, sessionId, cwd, title}`; these tests pin
+    //! that the identity every provider's history row carries resolves back
+    //! to EXACTLY one exact match carrying that SAME identity — the
+    //! resumable identity the click dispatches. Amplifier's bare full UUID
+    //! and its `amplifier resume <id>` command form are pinned at this layer
+    //! for the first time; claude/codex/opencode gain FULL-identity
+    //! assertions (cwd/sessionType/title/firstUserMessage/lastActivityAt),
+    //! not just provider+id. The broad matrix (prefix/case/fallback/budget
+    //! semantics) lives in `tests/resume_resolve.rs`; this mod is scoped to
+    //! the four-provider sidebar-identity round trip.
+    use super::*;
+
+    const CLAUDE_ID: &str = "ed2afda6-a340-443e-ba60-024a1b3554b4";
+    const CODEX_ID: &str = "019fac27-69d7-78a0-b972-b339d551042e";
+    const OPENCODE_ID: &str = "ses_root0000000000000000000000";
+    const AMPLIFIER_ID: &str = "417e8345-90ab-4cde-8f01-234567890abc";
+
+    /// One indexed history row, shaped exactly as the sidebar consumes it
+    /// (distinct cwd/title/lastActivityAt per provider so a cross-provider
+    /// identity mix-up cannot pass silently).
+    fn sidebar_row(provider: &str, session_id: &str, last_activity_at: i64) -> IndexedSession {
+        IndexedSession {
+            session_id: session_id.to_string(),
+            provider: provider.to_string(),
+            project_path: format!("/repo/{provider}"),
+            title: Some(format!("{provider} sidebar title")),
+            title_provider_generated: false,
+            summary: None,
+            first_user_message: Some(format!("{provider} first message")),
+            last_activity_at,
+            created_at: None,
+            cwd: Some(format!("/repo/{provider}")),
+            is_subagent: false,
+            is_non_interactive: false,
+            source_file: None,
+        }
+    }
+
+    fn four_provider_directory() -> Vec<IndexedSession> {
+        vec![
+            sidebar_row("claude", CLAUDE_ID, 400),
+            sidebar_row("codex", CODEX_ID, 300),
+            sidebar_row("opencode", OPENCODE_ID, 200),
+            sidebar_row("amplifier", AMPLIFIER_ID, 100),
+        ]
+    }
+
+    /// Index-only resolve (no overlays, no fallbacks): the sidebar-click
+    /// identity lives IN the index, so nothing else may be consulted.
+    fn resolve_bare(input: &str, sessions: &[IndexedSession]) -> ResumeResolveOutcome {
+        let session_types: HashMap<String, String> = HashMap::new();
+        resolve_resume_input(
+            input,
+            &ResolveDeps {
+                sessions: Some(sessions),
+                session_types: &session_types,
+                locate_claude_transcript: None,
+                opencode_session_by_id: None,
+            },
+        )
+    }
+
+    /// Every provider's history-row identity — submitted either as the bare
+    /// session id the row carries or as the provider's resume command line —
+    /// resolves to exactly that row, exact-match, with the full resumable
+    /// identity intact.
+    #[test]
+    fn sidebar_identity_resolves_to_a_single_exact_match_for_every_provider() {
+        let sessions = four_provider_directory();
+        let cases: Vec<(String, &str, &str, i64)> = vec![
+            (CLAUDE_ID.to_string(), "claude", CLAUDE_ID, 400),
+            (format!("claude --resume {CLAUDE_ID}"), "claude", CLAUDE_ID, 400),
+            (CODEX_ID.to_string(), "codex", CODEX_ID, 300),
+            (format!("codex resume {CODEX_ID}"), "codex", CODEX_ID, 300),
+            (OPENCODE_ID.to_string(), "opencode", OPENCODE_ID, 200),
+            (
+                format!("opencode --session {OPENCODE_ID}"),
+                "opencode",
+                OPENCODE_ID,
+                200,
+            ),
+            (AMPLIFIER_ID.to_string(), "amplifier", AMPLIFIER_ID, 100),
+            (
+                format!("amplifier resume {AMPLIFIER_ID}"),
+                "amplifier",
+                AMPLIFIER_ID,
+                100,
+            ),
+        ];
+        for (input, provider, id, last_activity_at) in cases {
+            let out = resolve_bare(&input, &sessions);
+            assert_eq!(out.status, ResumeResolveStatus::Ready, "input {input:?}");
+            assert!(out.provider_errors.is_empty(), "input {input:?}");
+            assert_eq!(out.matches.len(), 1, "input {input:?}");
+            let m = &out.matches[0];
+            assert_eq!(m.provider, provider, "input {input:?}");
+            assert_eq!(m.session_id, id, "input {input:?}");
+            assert_eq!(m.match_kind, ResumeMatchKind::Exact, "input {input:?}");
+            assert_eq!(
+                m.cwd.as_deref(),
+                Some(format!("/repo/{provider}").as_str()),
+                "input {input:?}"
+            );
+            // No metadata-store overlay: sessionType defaults to the provider.
+            assert_eq!(m.session_type.as_deref(), Some(provider), "input {input:?}");
+            assert_eq!(
+                m.title.as_deref(),
+                Some(format!("{provider} sidebar title").as_str()),
+                "input {input:?}"
+            );
+            assert_eq!(
+                m.first_user_message.as_deref(),
+                Some(format!("{provider} first message").as_str()),
+                "input {input:?}"
+            );
+            assert_eq!(m.last_activity_at, Some(last_activity_at), "input {input:?}");
+        }
+    }
+
+    /// The amplifier exact match serializes with the SAME camelCase wire
+    /// field names claude's match already pins
+    /// (`tests/resume_resolve.rs`'s `match_carries_full_resume_metadata`) —
+    /// the client's auto-resume reads `sessionType`/`cwd` off this payload.
+    #[test]
+    fn amplifier_exact_match_wire_shape_matches_claude_field_names() {
+        let sessions = vec![sidebar_row("amplifier", AMPLIFIER_ID, 100)];
+        let out = resolve_bare(AMPLIFIER_ID, &sessions);
+        assert_eq!(
+            serde_json::to_value(&out.matches).expect("serialize matches"),
+            serde_json::json!([{
+                "provider": "amplifier",
+                "sessionId": AMPLIFIER_ID,
+                "cwd": "/repo/amplifier",
+                "sessionType": "amplifier",
+                "title": "amplifier sidebar title",
+                "firstUserMessage": "amplifier first message",
+                "lastActivityAt": 100,
+                "matchKind": "exact",
+            }])
+        );
+    }
+}
