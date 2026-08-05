@@ -8,7 +8,11 @@ import {
   browserPreferencesPersistenceMiddleware,
   resetBrowserPreferencesFlushListenersForTests,
 } from '@/store/browserPreferencesPersistence'
-import { seedBrowserPreferencesSettingsIfEmpty } from '@/lib/browser-preferences'
+import {
+  loadBrowserPreferencesRecord,
+  resolveBrowserPreferenceSettings,
+  seedBrowserPreferencesSettingsIfEmpty,
+} from '@/lib/browser-preferences'
 import { resetPersistBroadcastForTests } from '@/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
@@ -274,6 +278,61 @@ describe('browserPreferencesPersistence', () => {
     expect(rehydrated.freshAgent.showTools).toBe(true)
     expect('fontScale' in rehydrated.freshAgent).toBe(false)
     expect('agentChat' in rehydrated).toBe(false)
+  })
+
+  it('removes a seeded deprecated freshAgent.fontScale on the next settings save', () => {
+    // Seed browser preferences the way a pre-removal client wrote them: supported
+    // rich-agent sizing (terminal.fontSize) plus the deprecated freshAgent.fontScale.
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        terminal: {
+          fontSize: 20,
+        },
+        freshAgent: {
+          showTools: true,
+          fontScale: 2,
+        },
+      },
+    }))
+
+    const store = createStore()
+
+    // Launch: hydrate local settings from the seeded browser preferences.
+    store.dispatch(setLocalSettings(resolveBrowserPreferenceSettings(loadBrowserPreferencesRecord())))
+
+    // The deprecated key never reaches store state; supported sizing applies.
+    expect(store.getState().settings.localSettings.terminal.fontSize).toBe(20)
+    expect(store.getState().settings.localSettings.freshAgent).toEqual({
+      showThinking: false,
+      showTools: true,
+      showTimecodes: false,
+    })
+    expect('fontScale' in store.getState().settings.settings.freshAgent).toBe(false)
+
+    // Perform a settings save.
+    store.dispatch(updateSettingsLocal({
+      freshAgent: {
+        showThinking: true,
+      },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    // The persisted blob is rebuilt without the stale key while supported
+    // rich-agent sizing and settings survive the round-trip.
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved).toEqual({
+      settings: {
+        terminal: {
+          fontSize: 20,
+        },
+        freshAgent: {
+          showThinking: true,
+          showTools: true,
+        },
+      },
+    })
+    expect(JSON.stringify(saved)).not.toContain('fontScale')
   })
 
   it('persists a 400% uiScale and round-trips it through a reload', () => {

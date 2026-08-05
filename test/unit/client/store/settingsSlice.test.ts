@@ -43,6 +43,42 @@ describe('settingsSlice', () => {
     expect(state.loaded).toBe(false)
   })
 
+  it('hydrates without fontScale when seeded browser preferences still contain the deprecated key', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        terminal: {
+          fontSize: 20,
+        },
+        freshAgent: {
+          showTools: true,
+          fontScale: 2,
+        },
+      },
+    }))
+
+    const { default: settingsReducer } = await importFreshSettingsSlice()
+    const state = settingsReducer(undefined, { type: 'unknown' })
+
+    // Supported rich-agent sizing comes from terminal.fontSize and applies on boot.
+    expect(state.localSettings.terminal.fontSize).toBe(20)
+    expect(state.settings.terminal.fontSize).toBe(20)
+    expect(state.localSettings.freshAgent).toEqual({
+      showThinking: false,
+      showTools: true,
+      showTimecodes: false,
+    })
+    expect(state.settings.freshAgent).toEqual({
+      enabled: false,
+      defaultPlugins: [],
+      providers: {},
+      showThinking: false,
+      showTools: true,
+      showTimecodes: false,
+    })
+    expect('fontScale' in state.localSettings.freshAgent).toBe(false)
+    expect('fontScale' in state.settings.freshAgent).toBe(false)
+  })
+
   it('keeps defaultSettings exported as resolved settings', async () => {
     const { defaultSettings } = await importFreshSettingsSlice()
 
