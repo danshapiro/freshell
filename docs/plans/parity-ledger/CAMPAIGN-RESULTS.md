@@ -57,3 +57,11 @@ should flip boxes item-by-item.
 
 `docs/plans/parity-ledger/audit/*.yaml` — all 235 items re-verdicted with file:line evidence:
 31 DONE / 118 PARTIAL / 58 MISSING / 23 UNCLEAR / 5 HOST-LIMITED as of main@4eecc456c.
+
+## GATES (07:08)
+
+- `cargo test --workspace` (shared warm target): **EXIT 0** — all workspace crates green
+  including the 28 landed items (log: /tmp/parity/logs/gate-cargo.log).
+- `npm test` (coordinated full suite, campaign worktree): **EXIT 0** — fully green; note the
+  pre-existing `api-edge-cases` __proto__ failure seen at baseline did NOT reproduce here
+  (log: /tmp/parity/logs/gate-npm.log).
