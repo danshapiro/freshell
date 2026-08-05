@@ -168,8 +168,6 @@ enum HubEvent {
     /// `generation` is the hub-issued attach generation the ingress guard
     /// matches against `opencode_lanes`; `cycle`/`stream` guard intra-lane
     /// reconnect staleness inside the tracker.
-    /// dead_code: until Task 9 lands, hub-level tests are the only producer.
-    #[allow(dead_code)]
     OpencodeLane {
         terminal_id: String,
         generation: u64,
@@ -177,13 +175,20 @@ enum HubEvent {
         stream: u64,
         event: OpencodeLaneEvent,
     },
+    /// Task 9: attach (or re-attach) a terminal's opencode SSE lane.
+    /// Channel-deferred so the hub task issues the attach generation and
+    /// swaps the lane registry entry serially with Exit (A6).
+    OpencodeAttach {
+        terminal_id: String,
+        base_url: String,
+    },
 }
 
-/// The opencode SSE lane's event vocabulary (Task 9 produces these from the
-/// per-pane sidecar's `/event` stream + `/session/status` snapshots; the hub
-/// routes them into the pure `OpencodeActivityTracker`).
-/// dead_code: until Task 9 lands, hub-level tests are the only producer.
-#[allow(dead_code)]
+/// The opencode SSE lane's event vocabulary ([`crate::opencode_lane`]
+/// produces these from the per-pane sidecar's `/event` stream +
+/// `/session/status` snapshots; the hub routes them into the pure
+/// `OpencodeActivityTracker`).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OpencodeLaneEvent {
     /// `/session/status` snapshot (absence == idle).
     Snapshot {
@@ -266,9 +271,22 @@ struct HubInner {
     /// Task 8/9: terminal id → (hub-issued attach generation, lane task).
     /// The `OpencodeLane` ingress guard drops any event whose stamped
     /// generation doesn't match the CURRENT entry; Exit removes the entry
-    /// so post-exit stragglers fail the match too. Task 9's SSE lane
-    /// registry populates this for real; hub-level tests insert dummies.
+    /// so post-exit stragglers fail the match too. The `OpencodeAttach`
+    /// arm populates this for real; hub-level tests insert dummies.
     opencode_lanes: HashMap<String, (u64, tokio::task::JoinHandle<()>)>,
+    /// Task 9: monotonic attach-generation counter — bumped on EVERY
+    /// `OpencodeAttach` (A6), so events from a replaced lane can never
+    /// impersonate its successor.
+    opencode_lane_next_generation: u64,
+    /// Task 9: the SSE lane's injected IO seams. `None` until installed
+    /// (Task 10 wires the reqwest impls at boot); attach without deps only
+    /// retires old lanes.
+    opencode_lane_deps: Option<Arc<crate::opencode_lane::OpencodeLaneDeps>>,
+    /// Test-only send-side recorder of `note_opencode_lane_event` calls:
+    /// (generation, cycle, stream, event), in call order. The stamps are
+    /// not wire-visible, so lane tests pin them here.
+    #[cfg(test)]
+    lane_ingress_log: Vec<(u64, u64, u64, OpencodeLaneEvent)>,
 }
 
 /// Cloneable handle to the hub (stored on `WsState`).
@@ -405,8 +423,6 @@ impl ActivityHub {
     /// Task 8: generation-stamped SSE-lane ingress (Task 9's lane is the
     /// caller). Channel-deferred like every other producer — the
     /// single-emitter frame-ordering invariant.
-    /// dead_code: until Task 9 lands, hub-level tests are the only caller.
-    #[allow(dead_code)]
     pub(crate) fn note_opencode_lane_event(
         &self,
         terminal_id: &str,
@@ -415,6 +431,15 @@ impl ActivityHub {
         stream: u64,
         event: OpencodeLaneEvent,
     ) {
+        // Test-only send-side recorder: generation/cycle/stream stamps are
+        // not wire-visible (frames carry neither), so lane tests pin them
+        // here — BEFORE the ingress guard, recording what the lane produced.
+        #[cfg(test)]
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .lane_ingress_log
+            .push((generation, cycle, stream, event.clone()));
         let _ = self.tx.send(HubEvent::OpencodeLane {
             terminal_id: terminal_id.to_string(),
             generation,
@@ -424,11 +449,64 @@ impl ActivityHub {
         });
     }
 
-    /// Hub-level episode tests register a dummy `opencode_lanes` entry so
-    /// their injected lane events pass the generation guard without
-    /// spawning a real SSE lane (Task 9 owns the real registry).
+    /// Task 9: install the SSE lane's injected IO seams (reqwest impls in
+    /// production; fakes in tests). Option'd — hub tests that never attach
+    /// leave it unset, and `OpencodeAttach` then only retires old lanes.
+    /// dead_code: Task 10's boot wiring is the production caller.
+    #[allow(dead_code)]
+    pub(crate) fn set_opencode_lane_deps(&self, deps: Arc<crate::opencode_lane::OpencodeLaneDeps>) {
+        let mut inner = self.inner.lock().expect("activity hub lock");
+        inner.opencode_lane_deps = Some(deps);
+    }
+
+    /// Task 9: attach (or re-attach) the per-terminal opencode SSE lane.
+    /// Channel-deferred (mirror of `attach_codex_rollout`) so the hub task
+    /// issues the attach generation and swaps the registry entry serially
+    /// with Exit — the single-emitter frame-ordering invariant.
+    pub fn attach_opencode_serve(&self, terminal_id: &str, hostname: &str, port: u16) {
+        let _ = self.tx.send(HubEvent::OpencodeAttach {
+            terminal_id: terminal_id.to_string(),
+            base_url: format!("http://{hostname}:{port}"),
+        });
+    }
+
+    /// Test-only view of the send-side lane ingress recorder.
     #[cfg(test)]
-    fn register_opencode_lane_for_tests(&self, terminal_id: &str, generation: u64) {
+    pub(crate) fn lane_ingress_log(&self) -> Vec<(u64, u64, u64, OpencodeLaneEvent)> {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .lane_ingress_log
+            .clone()
+    }
+
+    /// Test-only view of the lane registry size.
+    #[cfg(test)]
+    pub(crate) fn opencode_lane_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .opencode_lanes
+            .len()
+    }
+
+    /// Test-only view of a terminal's current attach generation.
+    #[cfg(test)]
+    pub(crate) fn opencode_lane_generation(&self, terminal_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("activity hub lock")
+            .opencode_lanes
+            .get(terminal_id)
+            .map(|(generation, _)| *generation)
+    }
+
+    /// Hub-level episode tests register a dummy `opencode_lanes` entry so
+    /// their injected lane events pass the generation guard without going
+    /// through `OpencodeAttach`; `opencode_lane` tests use it to admit a
+    /// directly-spawned lane's stamped generation.
+    #[cfg(test)]
+    pub(crate) fn register_opencode_lane_for_tests(&self, terminal_id: &str, generation: u64) {
         let mut inner = self.inner.lock().expect("activity hub lock");
         inner.opencode_lanes.insert(
             terminal_id.to_string(),
@@ -811,6 +889,58 @@ impl ActivityHub {
                     opencode_frames(&mut inner.idle, effects)
                 };
                 self.emit(frames);
+            }
+            HubEvent::OpencodeAttach {
+                terminal_id,
+                base_url,
+            } => {
+                let mut inner = self.inner.lock().expect("activity hub lock");
+                // Deferred-attach guard (mirror of `attach_codex_lane`'s):
+                // an Exit processed before this attach already tore the
+                // terminal down — spawning now would leak a lane task
+                // nothing ever removes. Race-free because Exit and
+                // OpencodeAttach are processed serially on the hub task.
+                if inner.modes.get(&terminal_id).map(String::as_str) != Some("opencode") {
+                    tracing::debug!(
+                        terminal_id = %terminal_id,
+                        "opencode lane attach skipped: terminal no longer tracked"
+                    );
+                    return;
+                }
+                // A6: hub-issued monotonic generation, bumped on EVERY
+                // attach — events from a replaced lane can never impersonate
+                // the current one.
+                inner.opencode_lane_next_generation += 1;
+                let generation = inner.opencode_lane_next_generation;
+                match inner.opencode_lane_deps.clone() {
+                    Some(deps) => {
+                        let handle = crate::opencode_lane::spawn_opencode_lane(
+                            deps,
+                            self.clone(),
+                            terminal_id.clone(),
+                            base_url,
+                            generation,
+                        );
+                        // Replacement is the contract: a respawned pane
+                        // re-allocates a NEW port, so the old lane is
+                        // aborted, never shared. (Its already-enqueued
+                        // events fail the generation guard.)
+                        if let Some((_, old)) = inner
+                            .opencode_lanes
+                            .insert(terminal_id, (generation, handle))
+                        {
+                            old.abort();
+                        }
+                    }
+                    None => {
+                        // No deps installed (unit tests / pre-Task-10 boot):
+                        // still retire any existing lane so stragglers fail
+                        // the guard.
+                        if let Some((_, old)) = inner.opencode_lanes.remove(&terminal_id) {
+                            old.abort();
+                        }
+                    }
+                }
             }
         }
     }
@@ -4883,5 +5013,115 @@ mod tests {
             .await
             .expect("the completed turn rings after the grace");
         assert_eq!(idle["terminalId"], "t-oc");
+    }
+
+    /// Task 9: `OpencodeAttach` spawns the SSE lane under a hub-issued
+    /// generation, a re-attach REPLACES it (generation bumps, still exactly
+    /// one lane), and Exit tears the registry entry down (post-exit
+    /// stragglers fail the generation match).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_attach_replaces_the_lane_and_exit_tears_it_down() {
+        use crate::opencode_lane::{
+            ConnectedOpencodeStream, OpencodeEventStream, OpencodeLaneDeps, OpencodeLaneHttp,
+        };
+
+        /// A health endpoint that never answers: the spawned lane parks in
+        /// its health-wait, so the test observes pure registry bookkeeping.
+        struct PendingHttp;
+        impl OpencodeLaneHttp for PendingHttp {
+            fn get_json<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> futures::future::BoxFuture<'a, Result<(u16, serde_json::Value), String>>
+            {
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            }
+        }
+        struct NeverConnects;
+        impl OpencodeEventStream for NeverConnects {
+            fn connect<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> futures::future::BoxFuture<'a, Result<Box<dyn ConnectedOpencodeStream>, String>>
+            {
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            }
+        }
+
+        async fn wait_until(pred: impl Fn() -> bool, what: &str) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+            while !pred() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for: {what}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        let (hub, _rx) = hub();
+        hub.set_opencode_lane_deps(Arc::new(OpencodeLaneDeps {
+            http: Arc::new(PendingHttp),
+            events: Arc::new(NeverConnects),
+        }));
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t-oc".into(),
+                mode: "opencode".into(),
+                resume_session_id: None,
+                at: 1_000,
+            },
+        );
+
+        hub.attach_opencode_serve("t-oc", "127.0.0.1", 4096);
+        {
+            let hub = hub.clone();
+            wait_until(
+                move || hub.opencode_lane_generation("t-oc") == Some(1),
+                "first attach registers generation 1",
+            )
+            .await;
+        }
+        assert_eq!(hub.opencode_lane_count(), 1);
+
+        // Re-attach REPLACES the lane (respawn re-allocates a NEW port):
+        // generation bumps, still exactly one lane.
+        hub.attach_opencode_serve("t-oc", "127.0.0.1", 4097);
+        {
+            let hub = hub.clone();
+            wait_until(
+                move || hub.opencode_lane_generation("t-oc") == Some(2),
+                "second attach bumps to generation 2",
+            )
+            .await;
+        }
+        assert_eq!(hub.opencode_lane_count(), 1);
+
+        // Exit tears the lane down: the map removal also makes post-exit
+        // stragglers fail the generation match.
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t-oc".into(),
+                at: 2_000,
+                spontaneous: false,
+            },
+        );
+        {
+            let hub = hub.clone();
+            wait_until(
+                move || hub.opencode_lane_count() == 0,
+                "exit removes the lane entry",
+            )
+            .await;
+        }
+        assert_eq!(hub.opencode_lane_generation("t-oc"), None);
     }
 }

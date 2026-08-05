@@ -76,6 +76,15 @@ freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 # `freshell-server` installs (`crates/freshell-server/src/logging.rs`) --
 # this crate only emits events, it never installs its own subscriber.
 tracing = "0.1"
+# Task 9 opencode SSE lane: the injected IO seams' object-safe async traits
+# (`futures::future::BoxFuture` in `opencode_lane`'s OpencodeLaneHttp /
+# OpencodeEventStream / ConnectedOpencodeStream). Lean facade: std (implies
+# alloc, where BoxFuture lives); no executor/io machinery needed.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+# Task 9 opencode SSE lane production impls (ReqwestLaneHttp/ReqwestLaneStream):
+# loopback plain-HTTP only, same lean no-default-features shape as
+# freshell-opencode's real-transport dep (the workspace already resolves 0.13).
+reqwest = { version = "0.13", default-features = false }
 # tabs-sync snapshot generation ids (continuity trio): SHA-256 over the
 # canonical `records` serialization, truncated to 128 bits. Same version the
 # workspace already resolves via crates/freshell-terminal/Cargo.toml:36.

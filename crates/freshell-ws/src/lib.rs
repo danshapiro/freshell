@@ -35,6 +35,7 @@ pub mod existence;
 pub mod identity;
 pub mod invariants;
 pub mod opencode_association;
+pub(crate) mod opencode_lane;
 pub mod opencode_signal;
 pub mod origin;
 pub mod pane_identity_binder;
