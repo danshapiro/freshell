@@ -1365,6 +1365,8 @@ dependencies = [
  "freshell-terminal",
  "freshell-ws",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "regex",
  "reqwest",
