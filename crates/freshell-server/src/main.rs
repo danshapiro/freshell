@@ -915,12 +915,16 @@ async fn main() -> ExitCode {
         // R5: one shared live GitHub update-checker (its own internal cache).
         update_checker: updater::UpdateChecker::new(),
     };
-    // The read-only network status surface (`GET /api/network/status`, Follow-up
-    // 3.19): the full `NetworkStatus` shape, with firewall/LAN facts detected
-    // lazily via READ-ONLY probes and cached. `effective_host` is the actual bind.
+    // The network surface (`GET /api/network/status`, Follow-up 3.19; NET-09's
+    // `POST /api/network/configure`): the full `NetworkStatus` shape, with
+    // firewall/LAN facts detected lazily via READ-ONLY probes and cached.
+    // `effective_host` is the actual bind. The settings read is the LIVE store
+    // (the reference's `getStatus()` re-reads `configStore.getSettings()` per
+    // call), and configure routes its mutation through the SAME serialized
+    // store + broadcasts `settings.updated` on the shared bus.
     let network_state = network::NetworkState {
         auth_token: Arc::clone(&auth_token),
-        settings: Arc::clone(&settings),
+        store: settings_store.clone(),
         effective_host: Arc::new(bind_host.clone()),
         port,
         facts: Arc::new(tokio::sync::OnceCell::new()),
@@ -929,6 +933,7 @@ async fn main() -> ExitCode {
         gate: Arc::new(std::sync::Mutex::new(
             freshell_platform::elevated::ConfirmationGate::new(),
         )),
+        broadcast_tx: Arc::clone(&broadcast_tx),
     };
 
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list

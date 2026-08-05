@@ -16,16 +16,40 @@
 //!
 //! Every live probe here is READ-ONLY (`freshell_platform::detect_firewall` runs
 //! only `netsh … show` / `ufw status`; LAN detection runs only `ipconfig.exe`).
-//! Of the **mutating** network paths, NET-05 wires exactly one:
-//! `POST /api/network/configure-firewall`'s **WSL2-repair slice** (the elevated
+//! Of the **mutating** network paths, two are wired: NET-09's
+//! `POST /api/network/configure` (see below — a pure settings-store mutation,
+//! no subprocess/elevation) and NET-05's **WSL2-repair slice** of
+//! `POST /api/network/configure-firewall` (the elevated
 //! `netsh portproxy`/`FreshellLANAccess` plan, behind the two-phase confirmation
 //! gate, with the reference's post-run recompute + verify + managed-ports
-//! persist). The remaining mutating paths (`configure`, `disable-remote-access`,
-//! the native-Windows elevated repair) stay golden-string builders in
-//! `freshell-platform`, never executed here. The live facts are computed lazily
-//! (on first request) and cached for the process life, mirroring the original's
-//! `getFirewallInfo` / `ensureLanIps` memoization (so boot stays fast and repeat
-//! reads are instant).
+//! persist). The remaining mutating paths (`disable-remote-access`, the
+//! configure-route live socket rebind (NET-02), the native-Windows elevated
+//! repair) stay golden-string builders in `freshell-platform`, never executed
+//! here. The live facts are computed lazily (on first request) and cached for
+//! the process life, mirroring the original's `getFirewallInfo` /
+//! `ensureLanIps` memoization (so boot stays fast and repeat reads are
+//! instant).
+//!
+//! ## NET-09 — `POST /api/network/configure`: network writes through the ONE store
+//!
+//! `POST /api/network/configure` (`network-router.ts:431-446`) is the canonical
+//! network-mutation route: `networkManager.configure()`
+//! (`network-manager.ts:400-439`) deep-merges the intent into
+//! `configStore.patchSettings({ network })` — the SAME serialized config store
+//! as `PATCH /api/settings` — then the route answers the post-patch `getStatus()`
+//! preview plus `rebindScheduled`, and finally `broadcastSettingsUpdated()`
+//! (`network-router.ts:104-111`) pushes `{type:'settings.updated', settings}`.
+//! Of that pipeline this port wires: the exact request schema, the host-change
+//! derivation, the store patch (lossless persist: unmanaged top-level keys
+//! copy-forward — see `settings_store.rs`), the preview response, and the
+//! broadcast. The LIVE SOCKET SWAP on a host change (the reference's
+//! `rebind()`, `network-manager.ts:449-532`, incl. `rebuildAllowedOrigins`)
+//! stays NET-02's documented deferral: `rebindScheduled` is DERIVED exactly,
+//! but no listener is re-bound — on WSL2 (the verified matrix, where the bind
+//! is always `0.0.0.0` and the saved host is an intent flag) and on unchanged
+//! hosts the reference itself performs no rebind and reports `false`, so those
+//! paths match byte-for-byte; elsewhere the chosen host takes effect on the
+//! next boot via the persisted settings.
 //!
 //! ## NET-05 synchronous-reduction notes
 //!
@@ -77,19 +101,25 @@ use freshell_platform::{
     detect_firewall, firewall_commands, CommandRunner, Env, FirewallInfo, FirewallPlatform,
     RealEnv, StdCommandRunner,
 };
-use freshell_protocol::{NetworkHost, ServerSettings};
+use freshell_protocol::NetworkHost;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 
 use crate::boot::is_authed;
+use crate::settings_store::SettingsStore;
 
-/// Shared state for the network-status route.
+/// Shared state for the network routes.
 #[derive(Clone)]
 pub struct NetworkState {
     /// The auth gate (`AUTH_TOKEN`) — same gate as the rest of `/api/*`.
     pub auth_token: Arc<String>,
-    /// The full server settings tree (for `network.{configured,host}`).
-    pub settings: Arc<ServerSettings>,
+    /// NET-09: the ONE live settings tree. The reference's `getStatus()` reads
+    /// `configStore.getSettings()` FRESH on every call (`network-manager.ts:283`),
+    /// so a `POST /api/network/configure` must be visible to the very next
+    /// status read (and to that route's own preview response) without a
+    /// restart — the boot-time `Arc<ServerSettings>` snapshot this field used
+    /// to hold could never show that.
+    pub store: SettingsStore,
     /// The actual bound host (`127.0.0.1` / `0.0.0.0`) — the original uses the
     /// live `server.address()`; here that is the resolved bind host.
     pub effective_host: Arc<String>,
@@ -104,6 +134,11 @@ pub struct NetworkState {
     /// (`network-router.ts:90-91`). `std::sync::Mutex` — held only for the
     /// nanosecond-scale token checks, never across `.await` or subprocess IO.
     pub gate: Arc<Mutex<ConfirmationGate>>,
+    /// NET-09: the shared server→client broadcast bus for the configure route's
+    /// `settings.updated` frame (`broadcastSettingsUpdated`,
+    /// `network-router.ts:104-111`) — the same serialization
+    /// `PATCH /api/settings` uses.
+    pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// The live, read-only host facts consulted by `getStatus`.
@@ -114,11 +149,13 @@ pub struct LiveNetworkFacts {
     pub hostname: String,
 }
 
-/// The network sub-router (`GET /api/network/status` + the NET-05 WSL2 slice
-/// of `POST /api/network/configure-firewall`), pre-bound to state.
+/// The network sub-router (`GET /api/network/status`, the NET-09
+/// `POST /api/network/configure`, and the NET-05 WSL2 slice of
+/// `POST /api/network/configure-firewall`), pre-bound to state.
 pub fn router(state: NetworkState) -> Router {
     Router::new()
         .route("/api/network/status", get(network_status))
+        .route("/api/network/configure", post(configure_network))
         .route("/api/network/configure-firewall", post(configure_firewall))
         .with_state(state)
 }
@@ -150,9 +187,13 @@ async fn network_status(State(state): State<NetworkState>, headers: HeaderMap) -
 
     let facts = cached_facts(&state).await;
 
-    let network_host = network_host_str(&state.settings.network.host);
+    // `getStatus()` reads the settings LIVE (`configStore.getSettings()`,
+    // `network-manager.ts:283`) — after `POST /api/network/configure` patches
+    // the store, the very next status read reflects the new intent.
+    let live = state.store.get().await;
+    let network_host = network_host_str(&live.network.host);
     let inputs = NetworkStatusInputs {
-        configured: state.settings.network.configured,
+        configured: live.network.configured,
         network_host,
         effective_host: state.effective_host.as_str(),
         port: state.port,
@@ -331,6 +372,178 @@ fn firewall_platform_fallback() -> FirewallPlatform {
     } else {
         FirewallPlatform::LinuxNone
     }
+}
+
+// ---------------------------------------------------------------------------
+// `POST /api/network/configure` — NET-09
+// ---------------------------------------------------------------------------
+
+/// The parsed body of `POST /api/network/configure` (`NetworkConfigureSchema`,
+/// `network-router.ts:18-21`). Both fields REQUIRED; `host` is the bind-intent
+/// enum string (`"127.0.0.1"`/`"0.0.0.0"`).
+#[derive(Debug)]
+pub struct NetworkConfigureRequest {
+    pub configured: bool,
+    pub host: String,
+}
+
+/// Port of `NetworkConfigureSchema.safeParse(req.body || {})`
+/// (`network-router.ts:18-21,431-434`): a NON-strict zod object — unknown keys
+/// are STRIPPED, never rejected (unlike `ConfigureFirewallRequestSchema`'s
+/// `.strict()`); `host` must be exactly `'127.0.0.1'` or `'0.0.0.0'`;
+/// `configured` must be a boolean; both are required. `req.body || {}` means
+/// an empty/missing/non-JSON body 400s here too (the fields are required —
+/// different from configure-firewall, where `{}` parses). Any violation → 400
+/// `{error:'Invalid request', details}` (zod's `issues` array itself is not
+/// reproduced — its content is zod-internal; same reduction as
+/// [`parse_configure_firewall_body`]).
+pub fn parse_network_configure_body(body: &[u8]) -> Result<NetworkConfigureRequest, Response> {
+    let invalid = || {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid request", "details": [] })),
+        )
+            .into_response()
+    };
+    let value: Value = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        json!({})
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => return Err(invalid()),
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        return Err(invalid());
+    };
+    // `z.enum(['127.0.0.1', '0.0.0.0'])` — required.
+    let host = match obj.get("host").and_then(Value::as_str) {
+        Some(h @ ("127.0.0.1" | "0.0.0.0")) => h.to_string(),
+        _ => return Err(invalid()),
+    };
+    // `z.boolean()` — required.
+    let configured = match obj.get("configured").and_then(Value::as_bool) {
+        Some(b) => b,
+        None => return Err(invalid()),
+    };
+    // (Non-strict: any remaining keys are dropped here.)
+    Ok(NetworkConfigureRequest { configured, host })
+}
+
+/// Port of `networkManager.configure`'s host-change derivation
+/// (`network-manager.ts:402-415`): compare the NEW intent host against the
+/// actual current bind (`server.address()` — the `::`/`::1` spellings fold
+/// onto their IPv4 twins; anything else reads as the reference's
+/// `effectiveCurrentHost === null`, no detection). On WSL2 the listener stays
+/// on `0.0.0.0` regardless — the saved host is an intent flag only and NEVER
+/// rebinds.
+pub fn host_changed_for_rebind(
+    platform: FirewallPlatform,
+    effective_current_host: &str,
+    new_host: &str,
+) -> bool {
+    if platform == FirewallPlatform::Wsl2 {
+        return false;
+    }
+    let current = match effective_current_host {
+        "0.0.0.0" | "::" => "0.0.0.0",
+        "127.0.0.1" | "::1" => "127.0.0.1",
+        _ => return false,
+    };
+    current != new_host
+}
+
+/// `POST /api/network/configure` (`network-router.ts:431-446`) — the canonical
+/// network-mutation route. Faithful port of
+/// `networkManager.configure()` (`network-manager.ts:400-439`):
+///
+/// 1. derive `hostChanged` from the live bind + firewall platform
+///    ([`host_changed_for_rebind`]);
+/// 2. route the write through the ONE serialized store
+///    (`configStore.patchSettings({ network })` → [`SettingsStore::patch`]):
+///    validate-then-mutate, persist BEFORE the live tree commits, and the
+///    persist copy-forwards every unmanaged `config.json` key
+///    (`completedMigrations`, `recentDirectories`, …) — the write is lossless;
+/// 3. answer the POST-patch `getStatus()` preview plus `rebindScheduled`
+///    (the reference sets `rebindInFlight` BEFORE its response when a rebind
+///    is scheduled, so the preview's `rebinding` is likewise `true` there);
+/// 4. `broadcastSettingsUpdated()` — `{type:'settings.updated', settings}`
+///    with the FULL post-patch tree (success path only, exactly like the
+///    reference's early `return` after its 500).
+///
+/// The reference's cache resets in configure (`this.firewallInfo = null`,
+/// `refreshLanIpsAsync`) are no-ops here: the cached [`LiveNetworkFacts`] are
+/// host-environment facts a settings write cannot change. The LIVE SOCKET
+/// SWAP (`rebind()`, incl. `rebuildAllowedOrigins`) is NET-02's documented
+/// deferral (module docs): `rebindScheduled` is derived exactly, but no
+/// listener is re-bound this process — the chosen host applies on next boot.
+async fn configure_network(
+    State(state): State<NetworkState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return crate::boot::unauthorized();
+    }
+    let req = match parse_network_configure_body(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let facts = cached_facts(&state).await;
+    // `server.listening` is always true on this live route, so the reference's
+    // `hostChanged && this.server.listening` collapses to the derivation.
+    let rebind_scheduled =
+        host_changed_for_rebind(facts.firewall.platform, &state.effective_host, &req.host);
+
+    // The ONE serialized config store (`network-manager.ts:417`).
+    let patch = json!({ "network": { "host": req.host, "configured": req.configured } });
+    let merged = match state.store.patch(&patch).await {
+        Ok(m) => m,
+        Err(_) => {
+            // The route's catch (`network-router.ts:440-443`): ANY configure
+            // failure collapses to this fixed 500 envelope, broadcast skipped.
+            // For the self-built, schema-valid patch above the only reachable
+            // failure is the persist IO error — exactly the legacy
+            // `saveInternal` throw the catch swallows.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to configure network" })),
+            )
+                .into_response();
+        }
+    };
+
+    // `getStatus()` AFTER the patch (`network-router.ts:438`): the preview
+    // reflects the NEW intent, built from the same inputs as the status route
+    // (deferred probe → `portOpen` null, exactly as there).
+    let status_inputs = NetworkStatusInputs {
+        configured: merged.network.configured,
+        network_host: network_host_str(&merged.network.host),
+        effective_host: state.effective_host.as_str(),
+        port: state.port,
+        lan_ips: &facts.lan_ips,
+        machine_hostname: &facts.hostname,
+        firewall: &facts.firewall,
+        raw_port_open: None,
+        wsl_forwarding_disabled_by_env: is_wsl_port_forwarding_disabled_by_env(&RealEnv),
+        token: state.auth_token.as_str(),
+    };
+    let mut status = build_network_status(status_inputs);
+    // At the reference's respond time a scheduled rebind already has
+    // `rebindInFlight === true` (`network-manager.ts:429-435` runs before the
+    // route's `getStatus()`), so the preview reports it.
+    status["rebinding"] = json!(rebind_scheduled);
+    status["rebindScheduled"] = json!(rebind_scheduled);
+
+    // `broadcastSettingsUpdated()` (`network-router.ts:104-111`): the FULL
+    // post-patch tree, serialized exactly like `PATCH /api/settings' frame.
+    if let Ok(frame) =
+        serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
+    {
+        let _ = state.broadcast_tx.send(frame);
+    }
+    Json(status).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -732,9 +945,12 @@ async fn configure_firewall(
     // here exactly as in `getStatus`).
     let facts = cached_facts(&state).await;
     let platform = facts.firewall.platform;
+    // `resolveRepairAction(status, settings)` derives from the LIVE settings
+    // (the status it consumes comes from `getStatus()`).
+    let live = state.store.get().await;
     let network = NetworkIntent {
-        configured: state.settings.network.configured,
-        host: network_host_str(&state.settings.network.host).to_string(),
+        configured: live.network.configured,
+        host: network_host_str(&live.network.host).to_string(),
     };
     let remote_access_requested =
         is_remote_access_enabled(Some(&network), state.effective_host.as_str(), platform);
@@ -1644,11 +1860,14 @@ Address         Port        Address         Port\r\n\
 
     // ---- NET-05: the route itself (in-process, READ-ONLY paths) ------------
 
-    fn test_network_state(
+    /// A `NetworkState` with pre-computed `facts`, a store loaded from `home`
+    /// (`None` = the in-memory-only homeless store), and a fresh broadcast bus
+    /// whose receiver is handed back for the NET-09 broadcast assertions.
+    async fn network_state_at(
+        home: Option<&Path>,
         fw: FirewallInfo,
-        settings_host: NetworkHost,
         effective_host: &str,
-    ) -> NetworkState {
+    ) -> (NetworkState, tokio::sync::broadcast::Receiver<String>) {
         let facts = OnceCell::new();
         facts
             .set(LiveNetworkFacts {
@@ -1657,17 +1876,36 @@ Address         Port        Address         Port\r\n\
                 hostname: "testhost".to_string(),
             })
             .expect("fresh OnceCell");
-        let mut settings = crate::settings::default_server_settings();
-        settings.network.configured = true;
-        settings.network.host = settings_host;
-        NetworkState {
-            auth_token: Arc::new("tok".to_string()),
-            settings: Arc::new(settings),
-            effective_host: Arc::new(effective_host.to_string()),
-            port: 3001,
-            facts: Arc::new(facts),
-            gate: Arc::new(Mutex::new(ConfirmationGate::new())),
-        }
+        let (broadcast_tx, rx) = tokio::sync::broadcast::channel::<String>(16);
+        (
+            NetworkState {
+                auth_token: Arc::new("tok".to_string()),
+                store: SettingsStore::load(home, Vec::new()),
+                effective_host: Arc::new(effective_host.to_string()),
+                port: 3001,
+                facts: Arc::new(facts),
+                gate: Arc::new(Mutex::new(ConfirmationGate::new())),
+                broadcast_tx: Arc::new(broadcast_tx),
+            },
+            rx,
+        )
+    }
+
+    async fn test_network_state(
+        fw: FirewallInfo,
+        settings_host: NetworkHost,
+        effective_host: &str,
+    ) -> NetworkState {
+        let (state, _rx) = network_state_at(None, fw, effective_host).await;
+        // Seed the network intent through the SAME store path production uses.
+        state
+            .store
+            .patch(&json!({
+                "network": { "configured": true, "host": network_host_str(&settings_host) }
+            }))
+            .await
+            .expect("seed patch");
+        state
     }
 
     async fn post_configure_firewall(
@@ -1696,7 +1934,7 @@ Address         Port        Address         Port\r\n\
 
     #[tokio::test]
     async fn route_rejects_unauthenticated() {
-        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1");
+        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1").await;
         let (code, body) = post_configure_firewall(state, false, "{}").await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         assert_eq!(body, json!({ "error": "Unauthorized" }));
@@ -1706,7 +1944,7 @@ Address         Port        Address         Port\r\n\
     async fn route_loopback_boot_is_remote_access_disabled_none() {
         // Loopback bind: remote access not requested, so the route short-
         // circuits BEFORE any WSL2 plan compute (no live netsh reads).
-        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1");
+        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1").await;
         let (code, body) = post_configure_firewall(state, true, "{}").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(
@@ -1724,7 +1962,7 @@ Address         Port        Address         Port\r\n\
             platform: FirewallPlatform::LinuxUfw,
             active: true,
         };
-        let state = test_network_state(fw, NetworkHost::AllInterfaces, "0.0.0.0");
+        let state = test_network_state(fw, NetworkHost::AllInterfaces, "0.0.0.0").await;
         let (code, body) = post_configure_firewall(state, true, "{}").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(
@@ -1738,7 +1976,7 @@ Address         Port        Address         Port\r\n\
 
     #[tokio::test]
     async fn route_invalid_body_is_400_after_auth() {
-        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1");
+        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1").await;
         let (code, body) =
             post_configure_firewall(state, true, r#"{"confirmElevation": false}"#).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -1747,11 +1985,356 @@ Address         Port        Address         Port\r\n\
 
     #[tokio::test]
     async fn route_in_flight_precheck_is_409() {
-        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1");
+        let state = test_network_state(wsl2_inactive(), NetworkHost::Loopback, "127.0.0.1").await;
         assert!(state.gate.lock().unwrap().try_acquire_repair_lock());
         let (code, body) = post_configure_firewall(state.clone(), true, "{}").await;
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(body["method"], json!("in-progress"));
         state.gate.lock().unwrap().release_repair_lock();
+    }
+
+    // ---- NET-09: POST /api/network/configure -----------------------------
+
+    #[test]
+    fn configure_body_parse_table() {
+        // Happy paths: both enum hosts, and unknown keys STRIPPED (NON-strict
+        // zod object — `network-router.ts:18-21` has no `.strict()`, unlike
+        // configure-firewall's schema).
+        // (`unwrap_or_else`, not `expect`: `Response` need not be `Debug`.)
+        let req = parse_network_configure_body(br#"{"host":"0.0.0.0","configured":true}"#)
+            .unwrap_or_else(|_| panic!("valid body parses"));
+        assert_eq!(req.host, "0.0.0.0");
+        assert!(req.configured);
+        let req = parse_network_configure_body(
+            br#"{"host":"127.0.0.1","configured":false,"extra":7,"nested":{"x":1}}"#,
+        )
+        .unwrap_or_else(|_| panic!("extra keys are stripped, not rejected"));
+        assert_eq!(req.host, "127.0.0.1");
+        assert!(!req.configured);
+
+        // 400s: empty body (Express hands `{}` → required fields missing),
+        // non-object, non-JSON, either required field missing, bad enum value,
+        // wrong types.
+        let bad_bodies: &[&[u8]] = &[
+            b"",
+            b"  \n",
+            b"{}",
+            b"[]",
+            b"\"x\"",
+            b"not json",
+            br#"{"host":"0.0.0.0"}"#,          // configured required
+            br#"{"configured":true}"#,         // host required
+            br#"{"host":"localhost","configured":true}"#, // enum violation
+            br#"{"host":"::","configured":true}"#,
+            br#"{"host":1,"configured":true}"#,
+            br#"{"host":"0.0.0.0","configured":"yes"}"#,
+            br#"{"host":"0.0.0.0","configured":1}"#,
+        ];
+        for body in bad_bodies {
+            match parse_network_configure_body(body) {
+                Ok(_) => panic!("must 400: {body:?}"),
+                Err(resp) => assert_eq!(resp.status(), StatusCode::BAD_REQUEST),
+            }
+        }
+    }
+
+    #[test]
+    fn configure_host_changed_truth_table() {
+        // WSL2: the listener stays on 0.0.0.0 — NEVER a rebind, for any
+        // transition (`network-manager.ts:413-414`).
+        assert!(!host_changed_for_rebind(
+            FirewallPlatform::Wsl2,
+            "0.0.0.0",
+            "127.0.0.1"
+        ));
+        assert!(!host_changed_for_rebind(
+            FirewallPlatform::Wsl2,
+            "0.0.0.0",
+            "0.0.0.0"
+        ));
+        // Non-WSL: a real bind change is detected, both directions.
+        assert!(host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "127.0.0.1",
+            "0.0.0.0"
+        ));
+        assert!(host_changed_for_rebind(
+            FirewallPlatform::Windows,
+            "0.0.0.0",
+            "127.0.0.1"
+        ));
+        // Same bind → no change.
+        assert!(!host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "127.0.0.1",
+            "127.0.0.1"
+        ));
+        assert!(!host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "0.0.0.0",
+            "0.0.0.0"
+        ));
+        // The IPv6 `server.address()` spellings fold onto their IPv4 twins
+        // (`network-manager.ts:407-410`).
+        assert!(host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "::",
+            "127.0.0.1"
+        ));
+        assert!(host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "::1",
+            "0.0.0.0"
+        ));
+        // An unrecognizable bind (the reference's `effectiveCurrentHost ===
+        // null`) → no detection, no rebind.
+        assert!(!host_changed_for_rebind(
+            FirewallPlatform::LinuxUfw,
+            "10.0.0.5",
+            "0.0.0.0"
+        ));
+    }
+
+    async fn post_configure_network(
+        state: NetworkState,
+        authed: bool,
+        body: &'static str,
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/network/configure")
+            .header("content-type", "application/json");
+        if authed {
+            req = req.header("x-auth-token", "tok");
+        }
+        let resp = router(state)
+            .oneshot(req.body(axum::body::Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn route_configure_rejects_unauthenticated_and_touches_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".freshell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": { "network": { "configured": true, "host": "127.0.0.1" } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (state, mut rx) =
+            network_state_at(Some(home.path()), wsl2_inactive(), "127.0.0.1").await;
+
+        let (code, body) =
+            post_configure_network(state.clone(), false, r#"{"host":"0.0.0.0","configured":true}"#)
+                .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({ "error": "Unauthorized" }));
+        // No mutation in the live tree, none on disk, no broadcast.
+        assert_eq!(state.store.get().await.network.host, NetworkHost::Loopback);
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["network"]["host"], json!("127.0.0.1"));
+        assert!(rx.try_recv().is_err(), "no broadcast on a rejected configure");
+    }
+
+    #[tokio::test]
+    async fn route_configure_invalid_body_is_400_and_mutates_nothing() {
+        let (state, mut rx) = network_state_at(None, wsl2_inactive(), "127.0.0.1").await;
+        state
+            .store
+            .patch(&json!({ "network": { "configured": true, "host": "127.0.0.1" } }))
+            .await
+            .unwrap();
+
+        let (code, body) =
+            post_configure_network(state.clone(), true, r#"{"host":"::","configured":true}"#).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], json!("Invalid request"));
+
+        // A rejected schema never reaches the store and never broadcasts.
+        assert_eq!(state.store.get().await.network.host, NetworkHost::Loopback);
+        assert!(state.store.get().await.network.configured);
+        assert!(rx.try_recv().is_err(), "no broadcast on a 400");
+    }
+
+    /// THE NET-09 core (the PW clause mirrored at unit level): seed every
+    /// config sentinel, toggle remote access through the canonical route, and
+    /// assert the chosen network behavior (the store + the broadcast + the
+    /// preview) plus byte-preserved unrelated sections.
+    #[tokio::test]
+    async fn route_configure_wsl2_toggle_persists_losslessly_and_broadcasts() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".freshell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": { "network": { "configured": false, "host": "127.0.0.1" } },
+                // Unmanaged-key sentinels: configure's persist must copy these
+                // forward byte-for-byte (the losslessness the checklist pins).
+                "completedMigrations": ["network-intent-v1"],
+                "recentDirectories": ["/seed/alpha", "/seed/beta"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // WSL boots 0.0.0.0; the saved host is intent only.
+        let (state, mut rx) = network_state_at(Some(home.path()), wsl2_inactive(), "0.0.0.0").await;
+
+        let (code, body) =
+            post_configure_network(state.clone(), true, r#"{"host":"0.0.0.0","configured":true}"#)
+                .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // The post-patch `getStatus()` preview plus `rebindScheduled`
+        // (the reference response shape, `network-router.ts:438-439`).
+        for key in [
+            "configured",
+            "host",
+            "remoteAccessEnabled",
+            "remoteAccessRequested",
+            "remoteAccessNeedsRepair",
+            "port",
+            "lanIps",
+            "machineHostname",
+            "firewall",
+            "rebinding",
+            "devMode",
+            "accessUrl",
+            "rebindScheduled",
+        ] {
+            assert!(body.get(key).is_some(), "missing {key}: {body}");
+        }
+        assert_eq!(body["configured"], json!(true));
+        assert_eq!(body["host"], json!("0.0.0.0"));
+        // Configured 0.0.0.0 intent → remote access requested (the host check
+        // runs BEFORE the wsl2 early-false, `network-access.ts:8-10`).
+        assert_eq!(body["remoteAccessRequested"], json!(true));
+        // WSL2 NEVER rebinds (`network-manager.ts:413-414`).
+        assert_eq!(body["rebindScheduled"], json!(false));
+        assert_eq!(body["rebinding"], json!(false));
+
+        // The mutation went through the SAME serialized store: the live tree…
+        assert_eq!(
+            state.store.get().await.network.host,
+            NetworkHost::AllInterfaces
+        );
+        assert!(state.store.get().await.network.configured);
+
+        // …and the persist was LOSSLESS: the new intent lands while every
+        // unmanaged top-level key round-trips untouched.
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["settings"]["network"],
+            json!({ "configured": true, "host": "0.0.0.0" })
+        );
+        assert_eq!(cfg["completedMigrations"], json!(["network-intent-v1"]));
+        assert_eq!(
+            cfg["recentDirectories"],
+            json!(["/seed/alpha", "/seed/beta"])
+        );
+        assert_eq!(cfg["version"], json!(1));
+
+        // `broadcastSettingsUpdated()` (`network-router.ts:104-111`): exactly
+        // one settings.updated frame carrying the FULL post-patch tree.
+        let frame: Value =
+            serde_json::from_str(&rx.try_recv().expect("one broadcast")).unwrap();
+        assert_eq!(frame["type"], json!("settings.updated"));
+        assert_eq!(
+            frame["settings"]["network"],
+            json!({ "configured": true, "host": "0.0.0.0" })
+        );
+        assert!(
+            frame["settings"]["terminal"].is_object(),
+            "the broadcast carries the full tree: {frame}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one broadcast per configure");
+    }
+
+    #[tokio::test]
+    async fn route_configure_host_change_on_non_wsl_reports_rebind_and_toggles_back() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".freshell");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "settings": { "network": { "configured": true, "host": "127.0.0.1" } },
+                "completedMigrations": ["seed"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let fw = FirewallInfo {
+            platform: FirewallPlatform::LinuxUfw,
+            active: true,
+        };
+        let (state, mut rx) = network_state_at(Some(home.path()), fw, "127.0.0.1").await;
+
+        // 127.0.0.1 → 0.0.0.0 on a non-WSL host: the reference's rebind branch
+        // (`network-manager.ts:422-438`). The socket swap itself is NET-02's
+        // documented deferral; the derivation + preview + persist + broadcast
+        // are exact.
+        let (code, body) =
+            post_configure_network(state.clone(), true, r#"{"host":"0.0.0.0","configured":true}"#)
+                .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["rebindScheduled"], json!(true));
+        // The reference preview: rebindInFlight is already true at respond time.
+        assert_eq!(body["rebinding"], json!(true));
+        assert_eq!(body["configured"], json!(true));
+        let frame: Value = serde_json::from_str(&rx.try_recv().expect("broadcast")).unwrap();
+        assert_eq!(frame["settings"]["network"]["host"], json!("0.0.0.0"));
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["network"]["host"], json!("0.0.0.0"));
+        assert_eq!(cfg["completedMigrations"], json!(["seed"]));
+
+        // Toggle back: the (NET-02-deferred) listener never actually moved, so
+        // the live bind still reads 127.0.0.1 == the new intent → no rebind.
+        // (This is also the wire shape `disable-remote-access` funnels through
+        // `applyRemoteAccessSetting('127.0.0.1')` → this same configure path.)
+        let (code, body) = post_configure_network(
+            state.clone(),
+            true,
+            r#"{"host":"127.0.0.1","configured":true}"#,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["rebindScheduled"], json!(false));
+        assert_eq!(body["rebinding"], json!(false));
+        let frame: Value =
+            serde_json::from_str(&rx.try_recv().expect("second broadcast")).unwrap();
+        assert_eq!(frame["settings"]["network"]["host"], json!("127.0.0.1"));
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["settings"]["network"],
+            json!({ "configured": true, "host": "127.0.0.1" })
+        );
+        assert_eq!(cfg["completedMigrations"], json!(["seed"]));
     }
 }
