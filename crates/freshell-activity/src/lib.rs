@@ -29,6 +29,7 @@ pub mod claude;
 pub mod codex;
 pub mod idle;
 pub mod ledger;
+pub mod opencode;
 pub mod signal;
 
 /// Effects a tracker interaction can produce, drained by the caller (the
