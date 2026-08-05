@@ -198,6 +198,26 @@ async fn main() -> ExitCode {
             .discovered_cli_names();
     let settings_store = settings_store::SettingsStore::load(home.as_deref(), known_providers);
     let settings = Arc::new(settings_store.get().await);
+    // SESSION-04: the one-time stale-AI-title cleanup (`server/index.ts:1076-1091`)
+    // — drop every auto-written (non-user) title override that SHADOWS a
+    // provider's own authoritative title (claude custom-title/agent-name,
+    // amplifier's AI name — the providers whose parse layer sets
+    // `title_provider_generated`), mark `ai-title-shadow-cleanup` in
+    // `completedMigrations`, and never run again. Awaited at boot so the very
+    // first served read model of a migrated install is already clean
+    // (cold-restart stability); explicit user renames are always preserved.
+    // The legacy's follow-up `codingCliIndexer.refresh()` on non-empty is
+    // unnecessary in this port: the directory/resolve surfaces overlay
+    // `sessionOverrides` LIVE from the store at read time, never cached.
+    let cleared_shadows = settings_store
+        .run_ai_title_shadow_cleanup_once(&["claude", "amplifier"])
+        .await;
+    if !cleared_shadows.is_empty() {
+        tracing::info!(
+            cleared = cleared_shadows.len(),
+            "sessions.ai_title_shadow_cleanup"
+        );
+    }
     // GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
     // notice, if the primary config needed to fall back at boot. `None` for
     // a healthy config or an ordinary fresh install. Threaded into
@@ -1037,7 +1057,10 @@ async fn main() -> ExitCode {
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
-        session_index,
+        // Cloned, not moved: `sessions::SessionsState` below ALSO needs the
+        // same index for the generate-title provider-generated short-circuit
+        // (SESSION-04, `sessions-router.ts:180-190`).
+        session_index: session_index.clone(),
         identity: terminal_identity.clone(),
     };
 
@@ -1237,6 +1260,13 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
+            // SESSION-04: `AI_CONFIG.enabled()` env read + the REAL Gemini
+            // transport (`generateAiSessionTitle`, `server/ai-title.ts`) +
+            // the shared session index for the provider-generated
+            // short-circuit (`sessions-router.ts:180-190`).
+            env: Arc::new(freshell_platform::RealEnv),
+            ai_title_generator: Some(sessions::gemini_ai_title_generator()),
+            session_index,
         }))
         .merge(resolve::router(resolve::ResolveState {
             auth_token: Arc::clone(&auth_token),

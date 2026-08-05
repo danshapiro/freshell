@@ -780,7 +780,108 @@ impl SettingsStore {
         }
         next
     }
+
+    /// `configStore.isMigrationDone(id)` (`config-store.ts:565-568`): whether
+    /// `config.completedMigrations` already contains `id`. Read from DISK
+    /// (the store round-trips `completedMigrations` through `persist` without
+    /// tracking it in memory), tolerantly — a missing home/file/array is
+    /// simply "not done", matching the original's `?? []`.
+    pub fn is_migration_done(&self, id: &str) -> bool {
+        let Some(home) = &self.home else { return false };
+        let path = home.join(".freshell").join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|doc| doc.get("completedMigrations").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.as_str() == Some(id))
+    }
+
+    /// `configStore.markMigrationDone(id)` (`config-store.ts:570-580`): append
+    /// `id` to `completedMigrations` ONCE (idempotent), full-document
+    /// read-modify-write under the same advisory [`ConfigLock`] `persist`
+    /// uses, with the same atomic tmp+rename write and backup refresh
+    /// (CFG-03). Every OTHER top-level key copy-forwards untouched — only
+    /// `completedMigrations` is owned here. A missing home degrades silently
+    /// (there is nothing to persist to), like every other write in this
+    /// module.
+    pub fn mark_migration_done(&self, id: &str) {
+        let Some(home) = &self.home else { return };
+        let dir = home.join(".freshell");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let _lock = ConfigLock::acquire(&dir);
+        let path = dir.join("config.json");
+        let mut doc = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let map = doc
+            .as_object_mut()
+            .expect("filtered to an object above, or defaulted to one");
+        let entry = map
+            .entry("completedMigrations".to_string())
+            .or_insert_with(|| json!([]));
+        if !entry.is_array() {
+            // A corrupt non-array marker list is rebuilt rather than bubbling
+            // an error up a migration checkpoint path (the original's
+            // `?? []` guards the same value when absent).
+            *entry = json!([]);
+        }
+        let arr = entry.as_array_mut().expect("normalized to an array above");
+        if arr.iter().any(|m| m.as_str() == Some(id)) {
+            return; // already marked -- idempotent
+        }
+        arr.push(json!(id));
+        let Ok(text) = serde_json::to_string_pretty(&doc) else {
+            return;
+        };
+        let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, &text).is_err() {
+            return;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            return;
+        }
+        atomic_write(&backup_path(&dir), &text);
+    }
+
+    /// The one-time stale-AI-title cleanup (`server/index.ts:1076-1091`):
+    /// drop every auto-written (non-user) title override that SHADOWS a
+    /// provider's own authoritative title (e.g. Amplifier's own AI name),
+    /// then mark `ai-title-shadow-cleanup` done in `completedMigrations` and
+    /// never run again (a cold restart re-runs nothing). Explicit user
+    /// renames are always preserved. Returns the cleared keys so callers can
+    /// refresh whatever read model they maintain (the original calls
+    /// `codingCliIndexer.refresh()` when non-empty).
+    pub async fn run_ai_title_shadow_cleanup_once(
+        &self,
+        authoritative_providers: &[&str],
+    ) -> Vec<String> {
+        if self.is_migration_done(AI_TITLE_SHADOW_CLEANUP_MIGRATION) {
+            return Vec::new();
+        }
+        let snapshot = self.session_overrides();
+        let keys = override_keys_to_clear(&snapshot, authoritative_providers);
+        for key in &keys {
+            // `{ titleOverride: undefined, titleSource: undefined }` —
+            // `patch_session_override` applies both removals unconditionally
+            // (the ladder only engages on a Write, never a clear, exactly like
+            // `config-store.ts:501`'s `!== undefined` gate).
+            self.patch_session_override(key, &[("titleOverride", None), ("titleSource", None)])
+                .await;
+        }
+        self.mark_migration_done(AI_TITLE_SHADOW_CLEANUP_MIGRATION);
+        keys
+    }
 }
+
+/// The legacy migration id (`server/index.ts:1080,
+/// 1089`): persisted in `config.completedMigrations`.
+pub const AI_TITLE_SHADOW_CLEANUP_MIGRATION: &str = "ai-title-shadow-cleanup";
 
 /// Advisory cross-process serialization for `persist()`'s read-modify-write
 /// window (bake-in with the legacy Node server on the SAME real home). Held
@@ -1225,6 +1326,46 @@ fn can_upgrade_title(existing: Option<&str>, incoming: &str) -> bool {
         return false;
     }
     rank(Some(incoming)) > rank(existing)
+}
+
+/// `parseSessionKey`'s provider half (`server/coding-cli/types.ts:15-24`):
+/// the segment before the FIRST `:`; a colon-less key is a legacy key from
+/// before the provider prefix and parses as `claude`.
+fn session_key_provider(key: &str) -> &str {
+    match key.split_once(':') {
+        Some((provider, _)) => provider,
+        None => "claude",
+    }
+}
+
+/// `overrideKeysToClear` (`server/coding-cli/provider-title-cleanup.ts:17-30`)
+/// — the session-override KEYS whose auto-written title override the one-time
+/// `ai-title-shadow-cleanup` migration should drop. A key qualifies when ALL
+/// hold: its provider is authoritative for titles (`providesAuthoritativeTitle`),
+/// the override carries a non-empty `titleOverride` (JS `!ov.titleOverride`
+/// is missing/null/""), and its source is NOT `'user'` — explicit user
+/// renames are always preserved. Output is sorted for determinism
+/// (`Object.entries` order carries no semantic weight in the original).
+pub fn override_keys_to_clear(
+    session_overrides: &serde_json::Map<String, Value>,
+    authoritative_providers: &[&str],
+) -> Vec<String> {
+    let mut keys: Vec<String> = session_overrides
+        .iter()
+        .filter(|(key, ov)| {
+            if !authoritative_providers.contains(&session_key_provider(key)) {
+                return false;
+            }
+            match ov.get("titleOverride").and_then(Value::as_str) {
+                Some(t) if !t.is_empty() => {}
+                _ => return false,
+            }
+            ov.get("titleSource").and_then(Value::as_str) != Some("user")
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// Load `config.terminalOverrides` from `<home>/.freshell/config.json` (tolerant:
@@ -3957,6 +4098,251 @@ mod tests {
         // Restore permissions so cleanup (and any other test running
         // concurrently against a colliding tmp dir name) can proceed.
         std::fs::set_permissions(&freshell, original_perms).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // SESSION-04: one-time stale-AI-title cleanup
+    // (`server/coding-cli/provider-title-cleanup.ts` + `server/index.ts:1076-1091`).
+    // ------------------------------------------------------------------
+
+    /// `overrideKeysToClear` qualification rules: provider-authoritative key +
+    /// a non-empty `titleOverride` + a NON-user source. Every auto-written
+    /// source (ai / first-message / dir / legacy / absent) clears; explicit
+    /// user renames and non-authoritative providers survive
+    /// (`provider-title-cleanup.ts:17-30`).
+    #[test]
+    fn override_keys_to_clear_keeps_user_renames_and_other_providers() {
+        let overrides: serde_json::Map<String, Value> = json!({
+            "amplifier:ai-shadow": { "titleOverride": "Stale AI Name", "titleSource": "ai" },
+            "amplifier:dir-shadow": { "titleOverride": "proj", "titleSource": "dir" },
+            "amplifier:first-msg-shadow": { "titleOverride": "Fix it", "titleSource": "first-message" },
+            "amplifier:legacy-shadow": { "titleOverride": "Old", "titleSource": "legacy" },
+            "amplifier:no-source": { "titleOverride": "Adrift" },
+            "amplifier:user-rename": { "titleOverride": "My Name", "titleSource": "user" },
+            "amplifier:empty-title": { "titleOverride": "", "titleSource": "ai" },
+            "amplifier:no-title": { "archived": true },
+            "claude:other-provider": { "titleOverride": "Stale AI Name", "titleSource": "ai" }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        let cleared = super::override_keys_to_clear(&overrides, &["amplifier"]);
+        assert_eq!(
+            cleared,
+            vec![
+                "amplifier:ai-shadow".to_string(),
+                "amplifier:dir-shadow".to_string(),
+                "amplifier:first-msg-shadow".to_string(),
+                "amplifier:legacy-shadow".to_string(),
+                "amplifier:no-source".to_string(),
+            ],
+            "sorted, deterministic; every non-user auto source clears, user renames and empty/absent titles skip"
+        );
+
+        // Nothing is authoritative → nothing clears.
+        assert!(super::override_keys_to_clear(&overrides, &[]).is_empty());
+        // `claude` authoritative clears its own ai shadow -- and the
+        // colon-less legacy key parses as `claude` (`parseSessionKey` fallback).
+        let legacy_key: serde_json::Map<String, Value> = json!({
+            "plain-legacy-key": { "titleOverride": "Stale", "titleSource": "ai" }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        assert_eq!(
+            super::override_keys_to_clear(&legacy_key, &["claude"]),
+            vec!["plain-legacy-key".to_string()]
+        );
+    }
+
+    /// The one-time migration (`server/index.ts:1076-1091`): clears the
+    /// shadowing auto titles, preserves user renames + untouched fields, marks
+    /// `ai-title-shadow-cleanup` in `config.completedMigrations`, and reports
+    /// the cleared keys.
+    #[tokio::test]
+    async fn ai_title_shadow_cleanup_clears_once_and_marks_the_migration() {
+        let dir = std::env::temp_dir().join(format!("frs-store-shadow-cleanup-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = SettingsStore::load(Some(&dir), vec!["claude".into()]);
+
+        store
+            .patch_session_override(
+                "amplifier:a",
+                &[
+                    ("titleOverride", Some(json!("Stale AI Guess"))),
+                    ("titleSource", Some(json!("ai"))),
+                    ("archived", Some(json!(true))),
+                ],
+            )
+            .await;
+        store
+            .patch_session_override(
+                "amplifier:b",
+                &[
+                    ("titleOverride", Some(json!("proj"))),
+                    ("titleSource", Some(json!("dir"))),
+                ],
+            )
+            .await;
+        store
+            .patch_session_override(
+                "amplifier:c",
+                &[
+                    ("titleOverride", Some(json!("Mine"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        store
+            .patch_session_override(
+                "claude:d",
+                &[
+                    ("titleOverride", Some(json!("Stale Claude AI"))),
+                    ("titleSource", Some(json!("ai"))),
+                ],
+            )
+            .await;
+
+        assert!(!store.is_migration_done(super::AI_TITLE_SHADOW_CLEANUP_MIGRATION));
+        let cleared = store
+            .run_ai_title_shadow_cleanup_once(&["amplifier"])
+            .await;
+        assert_eq!(
+            cleared,
+            vec!["amplifier:a".to_string(), "amplifier:b".to_string()],
+            "exactly the shadowing non-user amplifier overrides"
+        );
+
+        let after = store.session_overrides();
+        let a = after.get("amplifier:a").expect("override record kept");
+        assert!(
+            a.get("titleOverride").is_none() && a.get("titleSource").is_none(),
+            "title+source both cleared"
+        );
+        assert_eq!(
+            a.get("archived"),
+            Some(&json!(true)),
+            "unrelated override fields survive the clear"
+        );
+        let b = after.get("amplifier:b").expect("override record kept");
+        assert!(b.get("titleOverride").is_none() && b.get("titleSource").is_none());
+        assert_eq!(
+            after.get("amplifier:c").and_then(|o| o.get("titleOverride")),
+            Some(&json!("Mine")),
+            "explicit user rename is preserved"
+        );
+        assert_eq!(
+            after.get("claude:d").and_then(|o| o.get("titleOverride")),
+            Some(&json!("Stale Claude AI")),
+            "a NON-authoritative provider's override is untouched"
+        );
+
+        // The marker persisted in the legacy shape.
+        assert!(store.is_migration_done(super::AI_TITLE_SHADOW_CLEANUP_MIGRATION));
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg["completedMigrations"]
+                .as_array()
+                .expect("completedMigrations array")
+                .iter()
+                .any(|m| m == &json!("ai-title-shadow-cleanup"))
+        );
+
+        // Cold-restart stability: a FRESH store over the same home still sees
+        // the migration as done and the cleared titles stay cleared on disk.
+        let reloaded = SettingsStore::load(Some(&dir), vec!["claude".into()]);
+        assert!(reloaded.is_migration_done(super::AI_TITLE_SHADOW_CLEANUP_MIGRATION));
+        let persisted = reloaded.session_overrides();
+        assert!(
+            persisted
+                .get("amplifier:a")
+                .and_then(|o| o.get("titleOverride"))
+                .is_none(),
+            "the clear survives a cold restart, not just the live tree"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One-time means ONE TIME: a second pass returns nothing and a
+    /// later-written shadowing override is left alone (the migration of record
+    /// already ran -- auto-naming going forward is the indexer/route's job,
+    /// not this cleanup's).
+    #[tokio::test]
+    async fn ai_title_shadow_cleanup_second_run_is_a_complete_noop() {
+        let dir = std::env::temp_dir().join(format!("frs-store-shadow-cleanup-2nd-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = SettingsStore::load(Some(&dir), vec!["claude".into()]);
+        store
+            .patch_session_override(
+                "amplifier:first",
+                &[
+                    ("titleOverride", Some(json!("Stale"))),
+                    ("titleSource", Some(json!("ai"))),
+                ],
+            )
+            .await;
+        let first = store.run_ai_title_shadow_cleanup_once(&["amplifier"]).await;
+        assert_eq!(first, vec!["amplifier:first".to_string()]);
+
+        // A shadow written AFTER the migration must NOT be retroactively
+        // cleaned -- legacy marks done and never looks again.
+        store
+            .patch_session_override(
+                "amplifier:second",
+                &[
+                    ("titleOverride", Some(json!("Later Stale"))),
+                    ("titleSource", Some(json!("ai"))),
+                ],
+            )
+            .await;
+        assert!(
+            store
+                .run_ai_title_shadow_cleanup_once(&["amplifier"])
+                .await
+                .is_empty(),
+            "already-marked migration returns immediately"
+        );
+        assert_eq!(
+            store
+                .session_overrides()
+                .get("amplifier:second")
+                .and_then(|o| o.get("titleOverride")),
+            Some(&json!("Later Stale"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `markMigrationDone` is idempotent and coexists with pre-existing
+    /// migration ids written by the legacy server (`completedMigrations`
+    /// carries prior entries; appending preserves them).
+    #[tokio::test]
+    async fn mark_migration_done_appends_once_and_preserves_prior_entries() {
+        let dir = std::env::temp_dir().join(format!("frs-store-migrations-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        std::fs::write(
+            dir.join(".freshell").join("config.json"),
+            r#"{"version":1,"completedMigrations":["legacy-theme-seed"]}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::load(Some(&dir), vec!["claude".into()]);
+
+        store.mark_migration_done("ai-title-shadow-cleanup");
+        store.mark_migration_done("ai-title-shadow-cleanup"); // idempotent
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["completedMigrations"],
+            json!(["legacy-theme-seed", "ai-title-shadow-cleanup"]),
+            "prior ids preserved, the new id appended exactly once"
+        );
+        assert!(store.is_migration_done("ai-title-shadow-cleanup"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
