@@ -26,29 +26,39 @@ ran them; a failing test = candidate defect, a passing test = false alarm.
 
 ### Defect clusters by lens-convergence (higher = more independent confirmation)
 
-| Lenses | Sev | Cluster |
-|--------|-----|---------|
-| 7 | high* | **Empty-string `allowedFilePaths` entry disables the whole sandbox** (`is_path_allowed` files.rs:733 — `[""]` passes the non-empty check, `""` prefix-matches every absolute path; Node `path.resolve("")` anchors to cwd). **ADJUDICATED REAL by reading code.** |
-| 7 | med | mkdir on a path with a file as intermediate component returns 500, not 409/ENOTDIR |
-| 6 | med | POSIX/native path lane never runs `sanitize_user_path_input` (quotes/padding survive) |
-| 5 | high | symlink + `..` sandbox escape (comparison collapses `..` but the kernel op follows the real path; dangling-leaf symlink re-attached by literal name) |
-| 5 | low | MIME/Content-Type table diverges from legacy `send` (.avif/.ico/.wav/unknown→octet) |
-| 4 | low | completion suggestions sort byte-wise, not Node `localeCompare` |
-| 4 | low | `~\` (backslash tilde) never expanded to `$HOME` |
-| 4 | low | dot-segments not collapsed in validate-dir/complete display + mkdir strays |
-| 3 | high | `/local-file` serves final-segment dotfiles (e.g. `.env`) with 200 |
-| 2 | low | strong vs weak ETag shape |
-| 1 | med | UNC not classified by `is_absolute_user_path` |
-| 1 | · | 3 more singletons (write non-string→400, dup query key, relative-completion cwd anchor) |
+**Ranking axis (REVISED):** this is a parity campaign, so clusters are ranked by
+**confirmed divergence from the Node reference × user/feature-visibility**, NOT by security
+severity. Security is explicitly not a primary consideration here; the three security-flavored
+clusters are demoted to a separate "config-edge" tier below and are fix-only-if a real Node
+divergence at low priority.
 
-\*severity shown is the modal agent label; the flagship is security-relevant regardless.
+### Tier 1 — parity defects (the fix list), ranked by impact × lens-convergence
 
-**Big caveat (honest):** a failing proof test is a *candidate* — it can also encode the
-reviewer's own wrong expectation. Convergence is the confidence signal: 7 independent lenses
-writing 7 independent failing tests for the same `""`-root behavior is very unlikely to be 7
-identical misunderstandings, and I confirmed that one by reading the code. Low-severity
-MIME/sort claims are more likely parity nitpicks of debatable validity and need per-item
-adjudication before fixing. Full adjudication of all 65 is the follow-up.
+| Lenses | Cluster (behavioral divergence from Node) |
+|--------|-------------------------------------------|
+| 7 | `mkdir` with a file as an intermediate component returns **500**, not **409/ENOTDIR** — API error-shape divergence |
+| 6 | POSIX/native path lane never runs `sanitize_user_path_input` — **quotes/padding survive** into resolved+display paths |
+| 5 | **MIME/Content-Type** table diverges from legacy `send` (`.avif`/`.ico`/`.wav`/unknown→octet) — wrong header users/tools see |
+| 4 | **dot-segments not collapsed** in the `resolvedPath` echoed to the client (validate-dir/complete) + mkdir strays |
+| 4 | completion suggestions **sort byte-wise**, not Node `localeCompare` — visible ordering divergence |
+| 4 | `~\` (backslash tilde) **never expanded** to `$HOME` |
+| 2 | **ETag shape**: strong (`"…"`) vs Node's weak form |
+| 1 | **UNC** not classified by `is_absolute_user_path` |
+| 1 | 3 singletons: write non-string content→400, duplicate `path` query key handling, relative-completion cwd anchor |
+
+### Tier 2 — config-edge / security-flavored (DEMOTED; verify vs Node, low priority)
+
+| Lenses | Cluster | Node-diff status |
+|--------|---------|------------------|
+| 3 | `/local-file` serves final-segment dotfiles (e.g. `.env`) with 200 | plausibly user-visible; keep, mid |
+| 7 | Empty-string `allowedFilePaths` entry disables the sandbox (`is_path_allowed` files.rs:733) | **VERIFIED real divergence** — Node `resolvePathForSandboxComparison("")`→cwd (path-utils.ts:308) vs Rust→`/`. But requires a literal `""` config; **low priority** |
+| 5 | symlink + `..` sandbox escape (comparison collapses `..`; kernel op follows real path) | likely real divergence; edge; low priority |
+
+**Adjudication note (reframed):** for a parity goal the gate is *"does it diverge from
+`server/*.ts`?"*, not *"is it exploitable?"*. I verified the empty-root cluster against
+Node's `isPathAllowed` (path-utils.ts:308): it IS a divergence, but a config-edge one — which
+is exactly why it drops from "fix first" to Tier 2. A failing proof test remains a *candidate*
+until its Node divergence is confirmed; convergence (≥2 lenses) is the confidence signal.
 
 ## What this says about instructions (the actual experiment goal)
 
