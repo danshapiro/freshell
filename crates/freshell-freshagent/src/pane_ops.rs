@@ -86,6 +86,17 @@ pub fn router(state: FreshAgentState) -> Router {
 /// bounded scope (reusing the create/send-keys/capture agent machinery for a
 /// split target is a separate, larger unit of work); browser/editor/terminal
 /// splits are fully implemented.
+///
+/// AUTO-05 `position`/`ratio` parity finding: NEITHER parameter exists
+/// anywhere in the legacy split path -- not in `router.ts`'s split route
+/// (reads only `agent`/`direction`/`browser`/`editor`/`mode`/`sessionRef`/
+/// `resumeSessionId`/`cwd`/`shell`/`model`/`effort`), not in
+/// `layout-store.ts::splitPane` (always mints `sizes: [50, 50]`, appends the
+/// new leaf second), and not in the frozen client reducer
+/// (`src/store/panesSlice.ts::splitPane`, same fixed `[50, 50]`). Split
+/// geometry is client-side-only at a fixed 50/50, so this route matches the
+/// reference exactly by accepting and ignoring any `position`/`ratio` body
+/// fields (pinned by a unit test below).
 pub(crate) async fn split_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -1049,6 +1060,75 @@ mod tests {
         )
     }
 
+    // ── AUTO-05 provider-params harness ─────────────────────────────────────
+
+    fn auto05_argv_file(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "freshell-auto05-argv-{label}-{}-{n}.txt",
+            std::process::id()
+        ))
+    }
+
+    /// The recorder-spec idiom from terminal_tabs.rs's `recording_cli_spec`
+    /// (same crate's sibling test module -- `create_opencode_tab_fresh_...`
+    /// and friends), with the provider-arg templates filled in to mirror the
+    /// shipped manifests (`cli_launch_goldens.rs:52-73`: `--model {{model}}`,
+    /// `--sandbox {{sandbox}}`, `--permission-mode {{permissionMode}}`) so the
+    /// split route's body params become visible in the captured child argv.
+    fn provider_recording_cli_spec(
+        name: &str,
+        argv_file: &std::path::Path,
+    ) -> freshell_platform::CliCommandSpec {
+        let script_path = std::env::temp_dir().join(format!(
+            "freshell-auto05-recorder-{name}-{}-{}.sh",
+            std::process::id(),
+            argv_file.file_name().unwrap().to_string_lossy()
+        ));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {} 2>/dev/null\nexec sleep 30\n",
+            argv_file.display()
+        );
+        std::fs::write(&script_path, script).expect("write recording script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        freshell_platform::CliCommandSpec {
+            name: name.to_string(),
+            label: format!("{name}-label"),
+            default_cmd: script_path.to_string_lossy().to_string(),
+            resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
+            model_args: Some(vec!["--model".to_string(), "{{model}}".to_string()]),
+            sandbox_args: Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]),
+            permission_mode_args: Some(vec![
+                "--permission-mode".to_string(),
+                "{{permissionMode}}".to_string(),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// Poll `path` (bounded) until it has content -- the recording script
+    /// writes its argv line asynchronously right after the PTY forks (same
+    /// idiom as terminal_tabs.rs's `read_argv_file_eventually`).
+    async fn read_argv_file_eventually(path: &std::path::Path) -> String {
+        for _ in 0..50 {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !content.is_empty() {
+                    return content;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
     // ── auth ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1193,6 +1273,271 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["data"]["terminalId"].is_null());
         assert_eq!(body["message"], json!("pane split (non-terminal)"));
+    }
+
+    /// AUTO-05: dedicated editor-split coverage (the audit noted only the
+    /// browser cheap-content kind was pinned). Asserts the exact legacy
+    /// editor content shape (`router.ts:1325`), the cheap-content
+    /// registration, and the `pane.split` broadcast with the DEFAULT
+    /// direction (`horizontal`, `router.ts:1286`).
+    #[tokio::test]
+    async fn split_editor_pane_registers_editor_content_and_broadcasts_default_direction() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+        let (tab_id, pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+        // Drain the tab.create broadcast so we only see this split's frame.
+        let _ = rx.recv().await;
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({ "editor": "/tmp/auto05-split-target.rs" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["message"], json!("pane split (non-terminal)"));
+        assert!(body["data"]["terminalId"].is_null());
+        let new_pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+        assert_ne!(new_pane_id, pane_id);
+
+        // Cheap content registered with the exact legacy editor shape
+        // (`router.ts:1325`), and the pane -> tab association recorded.
+        let content = state
+            .content_panes
+            .lock()
+            .unwrap()
+            .get(&new_pane_id)
+            .cloned()
+            .expect("editor content registered");
+        assert_eq!(
+            content,
+            json!({
+                "kind": "editor",
+                "filePath": "/tmp/auto05-split-target.rs",
+                "language": Value::Null,
+                "readOnly": false,
+                "content": "",
+                "viewMode": "source",
+                "wordWrap": true,
+            })
+        );
+        assert_eq!(
+            state.pane_tabs.lock().unwrap().get(&new_pane_id).cloned(),
+            Some(tab_id.clone())
+        );
+        // No terminal is claimed for the cheap editor path.
+        assert!(!state
+            .terminal_panes
+            .lock()
+            .unwrap()
+            .contains_key(&new_pane_id));
+
+        // Broadcast frame: default direction is `horizontal`.
+        let frame = rx.recv().await.expect("pane.split broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("pane.split"));
+        assert_eq!(msg["payload"]["tabId"], json!(tab_id));
+        assert_eq!(msg["payload"]["paneId"], json!(pane_id));
+        assert_eq!(msg["payload"]["direction"], json!("horizontal"));
+        assert_eq!(msg["payload"]["newPaneId"], json!(new_pane_id));
+        assert_eq!(msg["payload"]["newContent"], json!(content));
+
+        state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .kill(&first_terminal_id);
+    }
+
+    /// AUTO-05: provider parameters flow through the split route into the
+    /// spawned child's argv -- the split hands its WHOLE body to the shared
+    /// `spawn_terminal_pane` pipeline, so `model`/`sandbox`/`permissionMode`
+    /// (and `cwd`) behave exactly as on `POST /api/tabs`.
+    #[tokio::test]
+    async fn split_terminal_with_provider_params_reaches_spawned_argv() {
+        let argv_file = auto05_argv_file("provider-params");
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            provider_recording_cli_spec("mycli", &argv_file),
+        ]));
+        let router = app(state.clone());
+        let (_tab_id, pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({
+                "mode": "mycli",
+                "cwd": tmp.to_string_lossy(),
+                "model": "m-test",
+                "sandbox": "s-test",
+                "permissionMode": "p-test",
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let argv = read_argv_file_eventually(&argv_file).await;
+        let lines: Vec<&str> = argv.lines().collect();
+        for expected in [
+            "--model",
+            "m-test",
+            "--sandbox",
+            "s-test",
+            "--permission-mode",
+            "p-test",
+        ] {
+            assert!(lines.contains(&expected), "argv missing {expected}: {argv}");
+        }
+
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.kill(&new_terminal_id);
+        registry.kill(&first_terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// AUTO-05 rollback, spawn-failure rung: the CLI spec resolves fine but
+    /// its `default_cmd` points at a nonexistent path, so the PTY fork itself
+    /// fails mid-pipeline (the `state_with_broken_claude_spec` idiom in
+    /// terminal_tabs.rs's test module). The split must return an error and
+    /// leave the original pane AND every process/bookkeeping map untouched:
+    /// no `pane_tabs`/`content_panes`/`terminal_panes` insert, no registry
+    /// terminal, no `pane.split` broadcast -- rollback by construction,
+    /// asserted here explicitly rather than implied.
+    #[tokio::test]
+    async fn split_terminal_spawn_failure_rolls_back_without_mutating_any_map() {
+        let argv_file = auto05_argv_file("spawn-failure");
+        let mut spec = provider_recording_cli_spec("mycli", &argv_file);
+        spec.default_cmd = "/nonexistent/freshell-auto05-missing-cli".to_string();
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![spec]));
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+        // Drain the tab.create broadcast so any further frame is this split's.
+        let _ = rx.recv().await;
+
+        let panes_before = state.pane_tabs.lock().unwrap().len();
+        let terminals_before = state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .directory()
+            .len();
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({ "mode": "mycli", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert!(
+            status.is_client_error() || status.is_server_error(),
+            "spawn failure must not 2xx: {status} {body}"
+        );
+
+        // Original pane + process set unchanged.
+        assert_eq!(state.pane_tabs.lock().unwrap().len(), panes_before);
+        assert!(state.content_panes.lock().unwrap().is_empty());
+        assert!(state.terminal_panes.lock().unwrap().len() == 1); // the shell tab's own
+        let registry = state.terminal_registry.clone().unwrap();
+        assert_eq!(registry.directory().len(), terminals_before);
+        assert!(registry.is_running(&first_terminal_id));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed split must not broadcast pane.split"
+        );
+
+        registry.kill(&first_terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// AUTO-05 rollback, earliest rung: an unknown `mode` is rejected 400
+    /// BEFORE any claim/insert attempt (`mode_is_known`,
+    /// terminal_tabs.rs:841-851) -- the same no-mutation contract as the
+    /// spawn-failure rung above.
+    #[tokio::test]
+    async fn split_terminal_unknown_mode_is_400_and_mutates_nothing() {
+        let state = state_with_registry();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+
+        let panes_before = state.pane_tabs.lock().unwrap().len();
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({ "mode": "definitely-not-a-registered-mode" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("not a registered terminal launch target"), "{msg}");
+
+        assert_eq!(state.pane_tabs.lock().unwrap().len(), panes_before);
+        assert!(state.content_panes.lock().unwrap().is_empty());
+        assert!(state.terminal_panes.lock().unwrap().len() == 1);
+
+        state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .kill(&first_terminal_id);
+    }
+
+    /// AUTO-05 `position`/`ratio` parity pin: neither parameter exists
+    /// anywhere in the legacy split path (`router.ts`'s split route,
+    /// `layout-store.ts::splitPane`'s fixed `sizes: [50, 50]`, and the frozen
+    /// `panesSlice.ts::splitPane` reducer all lack them -- see `split_pane`'s
+    /// doc comment), so the parity-correct behavior is to accept and IGNORE
+    /// them: no new payload keys, same response shape.
+    #[tokio::test]
+    async fn split_ignores_position_and_ratio_body_fields_matching_legacy() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, first_terminal_id) = create_shell_tab(router.clone()).await;
+        // Drain the tab.create broadcast so we only see this split's frame.
+        let _ = rx.recv().await;
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({
+                "browser": "https://example.com",
+                "position": "before",
+                "ratio": 0.3,
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+
+        let frame = rx.recv().await.expect("pane.split broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        let payload = msg["payload"].as_object().unwrap();
+        assert!(
+            !payload.contains_key("position") && !payload.contains_key("ratio"),
+            "payload must not grow position/ratio keys: {payload:?}"
+        );
+
+        assert!(state
+            .content_panes
+            .lock()
+            .unwrap()
+            .contains_key(&new_pane_id));
+
+        state
+            .terminal_registry
+            .clone()
+            .unwrap()
+            .kill(&first_terminal_id);
     }
 
     // ── close ───────────────────────────────────────────────────────────────
