@@ -4279,6 +4279,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn astral_emoji_frames_evict_by_utf16_units_not_scalar_count() {
+        // U+1F600 is the decisive unit case: ONE scalar but TWO UTF-16 code
+        // units (a surrogate pair) and FOUR UTF-8 bytes. Legacy measures
+        // `chunk.length` == UTF-16 code units, so under an identical
+        // configured cap an emoji-heavy fill must behave EXACTLY like a
+        // 2-unit-per-glyph BMP fill -- a SCALAR-counted cap would retain
+        // twice the intended budget here, a byte-counted cap a quarter.
+        // (The BMP half of that pair of cases is the box-drawing test above.)
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(5); // 5 UTF-16 code units
+        reg.insert_headless("T", "S");
+
+        // Each frame: 2 emoji == 2 scalars == 4 UTF-16 units == 8 UTF-8 bytes.
+        reg.feed("T", frame(1, "\u{1F600}\u{1F600}", "S"));
+        reg.feed("T", frame(2, "\u{1F600}\u{1F600}", "S"));
+
+        let (sink, seen) = collector();
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let replayed = outputs(&seen);
+        // 4 + 4 UTF-16 units > 5 -> whole-frame FIFO evicts the FIRST frame.
+        // A scalar-counted cap (4 scalars <= 5) would have kept BOTH frames,
+        // so the single retained frame pins the unit to UTF-16 code units.
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq_start, 2, "eviction is FIFO, not LIFO");
+        // The surviving frame is byte-perfect: whole-frame eviction can never
+        // split a surrogate pair, so no U+FFFD corruption is even possible.
+        assert_eq!(replayed[0].data, "\u{1F600}\u{1F600}");
+        assert!(!replayed[0].data.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn two_configured_caps_change_retained_markers_and_search_snapshot_at_the_boundary() {
+        // The item's own acceptance shape at unit level (`PW-RUST` runs this
+        // through a browser): the SAME numbered, emoji-bearing content under
+        // TWO different configured caps must retain provably different spans
+        // after detach/reconnect -- and the `directory()` snapshot (the exact
+        // string `GET /api/terminals/{id}/search` scans, see
+        // `terminals.rs`'s `mirror_lines(&entry.snapshot)`) must lose the
+        // evicted needle while keeping the retained one byte-perfect, with no
+        // U+FFFD anywhere in either retained buffer.
+        let run = |cap: i64| -> (Vec<TerminalOutput>, String) {
+            let reg = TerminalRegistry::new();
+            reg.set_scrollback_max_bytes(cap);
+            reg.insert_headless("T", "S");
+            // "line{i:02}-\u{1F600}" == 9 UTF-16 units each (7 ASCII + the
+            // 2-unit pair); zero-padded so EVERY frame is exactly 9 units
+            // and the eviction boundary lands on a whole frame count.
+            for i in 1..=10 {
+                reg.feed("T", frame(i, &format!("line{i:02}-\u{1F600}"), "S"));
+            }
+            let (sink, seen) = collector();
+            let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+            let snapshot = reg
+                .directory()
+                .into_iter()
+                .find(|e| e.terminal_id == "T")
+                .map(|e| e.snapshot)
+                .unwrap_or_default();
+            (outputs(&seen), snapshot)
+        };
+
+        let (small_out, small_snapshot) = run(18); // 18 units == exactly two 9-unit lines
+        let (big_out, big_snapshot) = run(4 * 1024); // generous: retains the whole run
+
+        // Small cap: only the last TWO numbered lines survive the flood
+        // (90 units total; whole-frame FIFO drops "line01-".."line08-").
+        let small_text: String = small_out.iter().map(|f| f.data.as_str()).collect();
+        assert_eq!(small_text, "line09-\u{1F600}line10-\u{1F600}");
+        // Big cap: the FULL run survives -- the retained FIRST marker provably
+        // differs between the two settings.
+        let big_text: String = big_out.iter().map(|f| f.data.as_str()).collect();
+        assert!(big_text.starts_with("line01-\u{1F600}"));
+        assert!(big_text.ends_with("line10-\u{1F600}"));
+
+        // Boundary-scoped SEARCH substrate (Rust unifies search onto the SAME
+        // bounded structure that backs reattach-replay, per the documented
+        // legacy-mirror divergence): the evicted needle is genuinely absent
+        // from the snapshot the search route scans; the retained one is a
+        // real, byte-perfect span -- so search results change at EXACTLY the
+        // same boundary as the replay.
+        assert!(!small_snapshot.contains("line01-"));
+        assert_eq!(small_snapshot, small_text);
+        assert!(big_snapshot.contains("line01-\u{1F600}"));
+        assert_eq!(big_snapshot, big_text);
+
+        // No corrupted characters in either retained buffer.
+        for text in [&small_text, &big_text] {
+            assert!(!text.contains('\u{FFFD}'), "retained buffer corrupt: {text}");
+        }
+    }
+
     // ── TERM-15/TERM-16 activity observer ───────────────────────────────────
     //
     // The registry-level tap the activity hub (freshell-ws) subscribes to:

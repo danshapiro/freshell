@@ -193,6 +193,35 @@ mod tests {
     }
 
     #[test]
+    fn single_oversize_chunk_never_splits_a_surrogate_pair() {
+        // "ab😀cd" = 4 scalars, 8 UTF-8 bytes, 6 UTF-16 code units (😀 = 2).
+        // `slice_last_utf16` must keep the smallest whole-scalar suffix that
+        // fits the cap: a Rust `String` cannot hold a lone surrogate, so the
+        // pair is either kept ENTIRELY or dropped ENTIRELY -- never bisected
+        // (JS `.slice` could bisect it; see the fn's own doc comment).
+        // Cap 3 fits 'd'+'c' (2 units); the 😀 needs 2 more but only 1 unit
+        // remains, so it drops whole and retention dips UNDER the cap.
+        let mut b = ChunkRingBuffer::new(3);
+        b.append("ab\u{1F600}cd");
+        assert_eq!(b.snapshot(), "cd");
+        assert_eq!(b.size(), 2);
+
+        // Cap 4 fits 'd'+'c'+the whole pair (1+1+2) exactly.
+        let mut b = ChunkRingBuffer::new(4);
+        b.append("ab\u{1F600}cd");
+        assert_eq!(b.snapshot(), "\u{1F600}cd");
+        assert_eq!(b.size(), 4);
+        assert!(!b.snapshot().contains('\u{FFFD}'));
+
+        // An all-emoji chunk under an ODD-unit cap keeps one whole pair,
+        // never half of the second pair.
+        let mut b = ChunkRingBuffer::new(3);
+        b.append("\u{1F600}\u{1F600}"); // 4 units > 3, single chunk -> truncate
+        assert_eq!(b.snapshot(), "\u{1F600}");
+        assert_eq!(b.size(), 2);
+    }
+
+    #[test]
     fn set_max_chars_zero_clears() {
         let mut b = ChunkRingBuffer::new(100);
         b.append("hello");

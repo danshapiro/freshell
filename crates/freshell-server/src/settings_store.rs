@@ -1778,6 +1778,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The PATCH must not only move the live registry knob (previous test)
+    /// but also MERGE the value into the persisted tree: `SettingsStore::
+    /// patch` deep-merges the request into the live settings and writes
+    /// `<home>/.freshell/config.json` BEFORE committing the live tree, so a
+    /// configured scrollback survives a restart and is re-seeded into the
+    /// registry by `main.rs`'s boot wiring (`compute_scrollback_max_bytes`
+    /// -> `set_scrollback_max_bytes`) on the next launch.
+    #[tokio::test]
+    async fn patch_persists_terminal_scrollback_to_config_json() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "terminal": { "scrollback": 750 } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The ON-DISK config holds the patched value under the legacy
+        // camelCase `settings.terminal.scrollback` key.
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["settings"]["terminal"]["scrollback"], json!(750));
+
+        // A store RELOADED from that disk state boots with the patched value
+        // -- the next boot's registry seeding reads exactly this.
+        let reloaded = store_at(&dir);
+        assert_eq!(reloaded.get().await.terminal.scrollback, 750);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A patch touching an UNRELATED field must not disturb either live
     /// knob: absent fields are preserved as-is by `deep_merge`, so
     /// re-applying them to the registry is a same-value no-op, never a

@@ -528,6 +528,26 @@ mod tests {
     }
 
     #[test]
+    fn normalize_walks_forward_off_a_split_multibyte_char() {
+        // "😀AAAA" = 8 bytes (F0 9F 98 80 | 41 41 41 41). max_bytes 5 opens
+        // the last-5-byte window at byte 3 -- the emoji's FINAL continuation
+        // byte -- which is not a valid UTF-8 start. The fatal-decoder walk
+        // (`normalizeFrameData`, `replay-ring.ts:139-154`) must advance to
+        // byte 4 and keep "AAAA" (4 bytes, one byte SHY of the budget): the
+        // byte-bounded truncation stays codepoint-safe even when the budget
+        // cut lands INSIDE a multibyte char -- no U+FFFD, no panic.
+        let mut ring = ReplayRing::new(Some(5));
+        let f = ring.append("\u{1F600}AAAA", "s");
+        assert_eq!(f.data, "AAAA");
+        assert_eq!(f.bytes, 4);
+        assert!(!f.data.contains('\u{FFFD}'));
+        // The truncated frame is retained whole and replays byte-exact.
+        let frames = ring.replay_since(Some(0)).frames;
+        let reassembled: String = frames.iter().map(|fr| fr.data.as_str()).collect();
+        assert_eq!(reassembled, "AAAA");
+    }
+
+    #[test]
     fn reassembly_by_seq_start_concatenates_data_in_order() {
         // The T1 invariant at deque level: sort retained frames by seqStart, join
         // data -> the exact appended byte stream.
