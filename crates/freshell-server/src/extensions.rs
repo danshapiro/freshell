@@ -12,9 +12,14 @@
 //!   (`src/hooks/useEnsureExtensionsRegistry.ts`). The original's per-skip
 //!   `Extension scan: …` log diagnostics (:66-130) are mirrored as structured
 //!   `extension.scan.*` tracing events (EXT-02).
-//! * `server/extension-manifest.ts` (81-103) — the manifest schema subset used by
-//!   the registry + CLI detection (lenient: unknown keys ignored rather than the
-//!   original's strict reject, since the bundled manifests are trusted).
+//! * `server/extension-manifest.ts` — the FULL strict manifest schema
+//!   (:14-103): `z.strictObject` unknown-key rejection at every level, the
+//!   client/server/cli config blocks (with zod defaults materialized:
+//!   `args: []`, `readyTimeout: 10000`, `singleton: true`), min(1) identity
+//!   strings, the terminalBehavior enums, the contentSchema field schema +
+//!   default-matches-type refine, and the category↔config-block coupling
+//!   refine. The rules serde cannot express are applied by
+//!   `validate_manifest` after parsing.
 //! * `server/platform.ts` `detectAvailableClis()` (107-118),
 //!   `DEFAULT_CLI_DETECTION_SPECS` (97-103), `isCommandAvailable()` (84-91) — run
 //!   `which`/`where.exe` per CLI (env-var override) to populate the
@@ -36,15 +41,103 @@ use serde_json::{json, Map, Value};
 
 const MANIFEST_FILE: &str = "freshell.json";
 
-// ── Manifest schema (subset of server/extension-manifest.ts) ────────────────
+// ── Manifest schema (full strict port of server/extension-manifest.ts) ──────
 
-/// The terminal-behavior block (`extension-manifest.ts:45-48`).
+/// `preferredRenderer: z.enum(['canvas'])` (extension-manifest.ts:46).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum PreferredRenderer {
+    #[serde(rename = "canvas")]
+    Canvas,
+}
+
+impl PreferredRenderer {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Canvas => "canvas",
+        }
+    }
+}
+
+/// `scrollInputPolicy: z.enum(['native', 'fallbackToCursorKeysWhenAltScreenMouseCapture'])`
+/// (extension-manifest.ts:47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum ScrollInputPolicy {
+    #[serde(rename = "native")]
+    Native,
+    #[serde(rename = "fallbackToCursorKeysWhenAltScreenMouseCapture")]
+    FallbackToCursorKeysWhenAltScreenMouseCapture,
+}
+
+impl ScrollInputPolicy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::FallbackToCursorKeysWhenAltScreenMouseCapture => {
+                "fallbackToCursorKeysWhenAltScreenMouseCapture"
+            }
+        }
+    }
+}
+
+/// The terminal-behavior block (`extension-manifest.ts:45-48`) — strict like
+/// the original's `z.strictObject`: unknown keys and non-enum values reject
+/// the manifest.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminalBehavior {
     #[serde(rename = "preferredRenderer", skip_serializing_if = "Option::is_none")]
-    preferred_renderer: Option<String>,
+    preferred_renderer: Option<PreferredRenderer>,
     #[serde(rename = "scrollInputPolicy", skip_serializing_if = "Option::is_none")]
-    scroll_input_policy: Option<String>,
+    scroll_input_policy: Option<ScrollInputPolicy>,
+}
+
+/// The client config block (`extension-manifest.ts:31-33`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientConfig {
+    /// `entry: z.string().min(1)` (:32) — non-empty checked by validate_manifest.
+    entry: String,
+}
+
+/// The server config block (`extension-manifest.ts:35-43`) with the zod
+/// defaults materialized (:37 `args: []`, :40 `readyTimeout: 10000`,
+/// :42 `singleton: true`). This read-only port never spawns server extensions,
+/// so only the SCHEMA is parity-relevant here (the consuming `startServer`
+/// lifecycle, extension-manager.ts:218-309, is unported).
+#[allow(dead_code)] // parse/validate-only fields — see the doc comment above
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerConfig {
+    /// `command: z.string().min(1)` (:36) — non-empty checked by validate_manifest.
+    command: String,
+    /// `args: z.array(z.string()).optional().default([])` (:37).
+    #[serde(default)]
+    args: Vec<String>,
+    /// `env: z.record(z.string(), z.string()).optional()` (:38).
+    env: Option<BTreeMap<String, String>>,
+    #[serde(rename = "readyPattern")]
+    ready_pattern: Option<String>,
+    /// `readyTimeout: z.number().int().positive().optional().default(10000)`
+    /// (:40) — `u64` deserialization already rejects null/negative/fractional
+    /// input; zero is rejected by validate_manifest.
+    #[serde(rename = "readyTimeout", default = "default_ready_timeout")]
+    ready_timeout: u64,
+    #[serde(rename = "healthCheck")]
+    health_check: Option<String>,
+    /// `singleton: z.boolean().optional().default(true)` (:42).
+    #[serde(default = "default_singleton")]
+    singleton: bool,
+}
+
+/// The zod defaults (:37/:40/:42). Explicit `null` for any of these still
+/// fails — serde must materialize a concrete `Vec`/`u64`/`bool` — matching
+/// zod, where `.optional().default(v)` accepts `undefined` only.
+fn default_ready_timeout() -> u64 {
+    10_000
+}
+
+fn default_singleton() -> bool {
+    true
 }
 
 /// The CLI config block (`extension-manifest.ts:50-66`). The full arg-template
@@ -53,11 +146,15 @@ struct TerminalBehavior {
 /// command specs (`server/index.ts:231-255` compilation), per
 /// `port/machine/specs/cli-argv-fidelity.md` §3.1.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CliConfig {
+    /// `command: z.string().min(1)` (:51) — non-empty checked by validate_manifest.
     command: String,
     #[serde(rename = "envVar")]
     env_var: Option<String>,
-    args: Option<Vec<String>>,
+    /// `args: z.array(z.string()).optional().default([])` (:52).
+    #[serde(default)]
+    args: Vec<String>,
     env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(rename = "resumeArgs")]
     resume_args: Option<Vec<String>>,
@@ -69,6 +166,18 @@ struct CliConfig {
     sandbox_args: Option<Vec<String>>,
     #[serde(rename = "permissionModeArgs")]
     permission_mode_args: Option<Vec<String>>,
+    /// `permissionModeEnvVar: z.string().optional()` (:60). Parsed + validated
+    /// for schema parity; not plumbed into `CliCommandSpec` (documented at
+    /// freshell_platform::cli_launch:32 — the consuming branch,
+    /// terminal-registry.ts:367-373, is inert for the shipped manifests; EXT-05).
+    #[allow(dead_code)]
+    #[serde(rename = "permissionModeEnvVar")]
+    permission_mode_env_var: Option<String>,
+    /// `permissionModeValues: z.record(z.string(), z.string()).optional()` (:61)
+    /// — same parse-only status as `permissionModeEnvVar`.
+    #[allow(dead_code)]
+    #[serde(rename = "permissionModeValues")]
+    permission_mode_values: Option<BTreeMap<String, String>>,
     #[serde(rename = "supportsPermissionMode")]
     supports_permission_mode: Option<bool>,
     #[serde(rename = "supportsModel")]
@@ -81,6 +190,7 @@ struct CliConfig {
 
 /// The picker config block (`extension-manifest.ts:72-75`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PickerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     shortcut: Option<String>,
@@ -88,10 +198,14 @@ struct PickerConfig {
     group: Option<String>,
 }
 
-/// The top-level manifest (`extension-manifest.ts:81-103`). Lenient: unknown keys
-/// are ignored (the bundled manifests are trusted; the original's strict reject is
-/// a manifest-authoring guard, not a wire invariant).
+/// The top-level manifest (`extension-manifest.ts:81-103`) — STRICT port: like
+/// the original's `z.strictObject`, unknown keys reject the manifest (catches
+/// typos in manifest files, :5-6). `validate_manifest` then applies the rules
+/// serde cannot express: min(1) strings (:82-85), the category enum (:86), the
+/// contentSchema field schema + default-matches-type refine (:14-25), and the
+/// category↔config-block coupling refine (:96-103).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExtensionManifest {
     name: String,
     version: String,
@@ -103,11 +217,20 @@ struct ExtensionManifest {
     /// Tri-state: zod's `.optional()` accepts ABSENT (`undefined`) but REJECTS
     /// an explicit `null` (`contentSchema: z.record(...).optional()`,
     /// `extension-manifest.ts:90`); a bare `Option<Value>` would collapse the
-    /// two. `Present` values are shape-checked by [`content_schema_valid`] at
-    /// scan time (the original's `safeParse` gate, extension-manager.ts:104-110).
-    #[serde(rename = "contentSchema", default, deserialize_with = "de_content_schema")]
+    /// two (EXT-04). `Present` values are shape-checked against
+    /// ContentSchemaFieldSchema (:14-25) by `validate_manifest` (the original's
+    /// single `safeParse` gate, extension-manager.ts:104-110) and echoed
+    /// bit-for-bit by `toClientRegistry` (`ClientExtensionEntry.contentSchema`,
+    /// shared/extension-types.ts:30).
+    #[serde(
+        rename = "contentSchema",
+        default,
+        deserialize_with = "de_content_schema"
+    )]
     content_schema: ContentSchemaSlot,
     picker: Option<PickerConfig>,
+    client: Option<ClientConfig>,
+    server: Option<ServerConfig>,
     cli: Option<CliConfig>,
 }
 
@@ -133,59 +256,9 @@ fn de_content_schema<'de, D>(deserializer: D) -> Result<ContentSchemaSlot, D::Er
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(ContentSchemaSlot::Present(Value::deserialize(deserializer)?))
-}
-
-/// The `contentSchema` record validation (`ContentSchemaFieldSchema`,
-/// `extension-manifest.ts:14-28`): `z.record(z.string(), field)` where each
-/// field is `z.strictObject({ type: z.enum(['string','number','boolean']),
-/// label: z.string(), required: z.boolean().optional(), default:
-/// z.union([z.string(), z.number(), z.boolean()]).optional() }).refine(
-/// default matches the declared type)`. A failure rejects the WHOLE manifest
-/// at scan (the original's single `safeParse` gate) — so an extension whose
-/// declared settings fields are malformed is never served to the picker and
-/// its typed defaults never reach a launch env.
-fn content_schema_valid(slot: &ContentSchemaSlot) -> bool {
-    let ContentSchemaSlot::Present(value) = slot else {
-        return true;
-    };
-    let Value::Object(fields) = value else {
-        return false;
-    };
-    fields.values().all(content_schema_field_valid)
-}
-
-/// One `ContentSchemaFieldSchema` member (strict keys, typed fields, and the
-/// `default`-matches-`type` refinement).
-fn content_schema_field_valid(field: &Value) -> bool {
-    let Value::Object(map) = field else {
-        return false;
-    };
-    const KNOWN: &[&str] = &["type", "label", "required", "default"];
-    if map.keys().any(|k| !KNOWN.contains(&k.as_str())) {
-        return false;
-    }
-    let Some(ty) = map.get("type").and_then(Value::as_str) else {
-        return false;
-    };
-    if !matches!(ty, "string" | "number" | "boolean") {
-        return false;
-    }
-    if !map.get("label").is_some_and(Value::is_string) {
-        return false;
-    }
-    if let Some(required) = map.get("required") {
-        if !required.is_boolean() {
-            return false;
-        }
-    }
-    match map.get("default") {
-        None => true,
-        Some(default) => matches!(
-            (ty, default),
-            ("string", Value::String(_)) | ("number", Value::Number(_)) | ("boolean", Value::Bool(_))
-        ),
-    }
+    Ok(ContentSchemaSlot::Present(Value::deserialize(
+        deserializer,
+    )?))
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -297,27 +370,28 @@ impl ExtensionRegistry {
                                 "extension.scan.invalid_json_in_manifest"
                             );
                         } else {
+                            // Data errors (missing fields, wrong types, unknown
+                            // keys, bad enum variants) are the first half of the
+                            // legacy schema reject (:104-110, logged as
+                            // { manifestPath, errors }).
                             tracing::warn!(
                                 manifest_path = %manifest_path.display(),
-                                error = %err,
+                                errors = %err,
                                 "extension.scan.invalid_manifest"
                             );
                         }
                         continue;
                     }
                 };
-                if !is_valid_manifest(&manifest)
-                    || !content_schema_valid(&manifest.content_schema)
-                {
-                    // The refinement half of `invalid manifest` (:104-110): the
-                    // declared category must carry exactly its own config block
-                    // (extension-manifest.ts:96-103), and a present
-                    // `contentSchema` must satisfy the typed field schema
-                    // incl. the default-matches-type refinement (:14-28) — the
-                    // original's one `safeParse` covers both.
+                if let Err(errors) = validate_manifest(&manifest) {
+                    // The refinement half of `invalid manifest` (:104-110): schema
+                    // rules serde cannot express, including the typed
+                    // `contentSchema` scan gate (incl. the default-matches-type
+                    // refinement and the explicit-`null` reject, EXT-04) — the
+                    // original's one `safeParse` covers all of it.
                     tracing::warn!(
                         manifest_path = %manifest_path.display(),
-                        category = %manifest.category,
+                        errors = %errors,
                         "extension.scan.invalid_manifest"
                     );
                     continue;
@@ -405,7 +479,7 @@ impl ExtensionRegistry {
                 // empty is falsy, so model it as `None`.
                 env_var: cli.env_var.clone().filter(|v| !v.is_empty()),
                 default_cmd: cli.command.clone(),
-                base_args: cli.args.clone().unwrap_or_default(),
+                base_args: cli.args.clone(),
                 base_env: cli.env.clone().unwrap_or_default(),
                 resume_args: cli.resume_args.clone(),
                 create_session_args: cli.create_session_args.clone(),
@@ -431,16 +505,161 @@ impl ExtensionRegistry {
     }
 }
 
-/// The manifest refinement (`extension-manifest.ts:96-103`): the declared category
-/// must carry exactly its own config block. Only `cli` is modeled here; a `cli`
-/// manifest without a `cli` block (or vice-versa) is rejected. `client`/`server`
-/// manifests are accepted as-is (their blocks aren't modeled but aren't required
-/// for the registry/CLI surface).
-fn is_valid_manifest(m: &ExtensionManifest) -> bool {
-    match m.category.as_str() {
-        "cli" => m.cli.is_some(),
-        "client" | "server" => true,
-        _ => false,
+/// The manifest rules serde cannot express, mirroring the zod schema
+/// (`extension-manifest.ts`): min(1) top-level identity strings (:82-85), the
+/// category enum (:86), the category↔config-block coupling refine (:96-103,
+/// message verbatim), per-block min(1) command/entry strings (:32/:36/:51),
+/// readyTimeout positivity (:40), and the `contentSchema` record's field
+/// schema with its default-matches-type refine (:14-25). All violations are
+/// collected and joined into one diagnostic string — the legacy logs
+/// `result.error.format()` for the same purpose (extension-manager.ts:104-110).
+fn validate_manifest(m: &ExtensionManifest) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // `z.string().min(1)` on the four identity strings (:82-85).
+    for (field, value) in [
+        ("name", &m.name),
+        ("version", &m.version),
+        ("label", &m.label),
+        ("description", &m.description),
+    ] {
+        if value.is_empty() {
+            errors.push(format!("{field}: must contain at least 1 character(s)"));
+        }
+    }
+
+    // `category: z.enum(['client', 'server', 'cli'])` (:86).
+    let category_known = matches!(m.category.as_str(), "client" | "server" | "cli");
+    if !category_known {
+        errors.push(format!(
+            "category: unknown category `{}`; expected 'client', 'server', or 'cli'",
+            m.category
+        ));
+    }
+
+    // The coupling refine (:96-103): exactly the category's own block, no
+    // others. Zod effects skip the refine when the base parse fails, so an
+    // unknown category skips this check.
+    let present: Vec<&str> = [
+        ("client", m.client.is_some()),
+        ("server", m.server.is_some()),
+        ("cli", m.cli.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(block, is_present)| is_present.then_some(block))
+    .collect();
+    if category_known && (present.len() != 1 || present[0] != m.category.as_str()) {
+        errors.push("category must have exactly its own config block (no others)".to_string());
+    }
+
+    // Per-block min(1) strings (:32/:36/:51) + readyTimeout positivity (:40).
+    if let Some(client) = &m.client {
+        if client.entry.is_empty() {
+            errors.push("client.entry: must contain at least 1 character(s)".to_string());
+        }
+    }
+    if let Some(server) = &m.server {
+        if server.command.is_empty() {
+            errors.push("server.command: must contain at least 1 character(s)".to_string());
+        }
+        if server.ready_timeout == 0 {
+            errors.push("server.readyTimeout: must be a positive integer".to_string());
+        }
+    }
+    if let Some(cli) = &m.cli {
+        if cli.command.is_empty() {
+            errors.push("cli.command: must contain at least 1 character(s)".to_string());
+        }
+    }
+    // The typed `contentSchema` scan gate (EXT-04): a PRESENT value (including
+    // an explicit `null`) must satisfy the ContentSchemaFieldSchema; ABSENT
+    // passes, mirroring zod's `.optional()` undefined-only semantics (:90).
+    if let ContentSchemaSlot::Present(content_schema) = &m.content_schema {
+        validate_content_schema(content_schema, &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// `ContentSchemaFieldSchema` (extension-manifest.ts:14-25) applied to the raw
+/// `contentSchema` value: a record (:90) of strict objects (:14) with
+/// `type ∈ {string,number,boolean}`, a required string `label`, an optional
+/// boolean `required`, and an optional `default ∈ string|number|boolean` whose
+/// JS typeof must equal the declared `type` (:19-25 refine). The manifest keeps
+/// the raw Value so `toClientRegistry` echoes it bit-for-bit.
+fn validate_content_schema(v: &Value, errors: &mut Vec<String>) {
+    let Some(fields) = v.as_object() else {
+        errors.push("contentSchema: must be an object of field definitions".to_string());
+        return;
+    };
+    for (key, field) in fields {
+        let Some(obj) = field.as_object() else {
+            errors.push(format!("contentSchema.{key}: must be an object"));
+            continue;
+        };
+        // `z.strictObject` (:14): keys beyond these four reject.
+        for k in obj.keys() {
+            if !matches!(k.as_str(), "type" | "label" | "required" | "default") {
+                errors.push(format!(
+                    "contentSchema.{key}: unknown field `{k}`; expected 'type', 'label', 'required', or 'default'"
+                ));
+            }
+        }
+        let declared_type = match obj.get("type") {
+            Some(Value::String(t)) if matches!(t.as_str(), "string" | "number" | "boolean") => {
+                Some(t.as_str())
+            }
+            Some(Value::String(t)) => {
+                errors.push(format!(
+                    "contentSchema.{key}.type: unknown type `{t}`; expected 'string', 'number', or 'boolean'"
+                ));
+                None
+            }
+            Some(_) => {
+                errors.push(format!(
+                    "contentSchema.{key}.type: must be one of 'string', 'number', or 'boolean'"
+                ));
+                None
+            }
+            None => {
+                errors.push(format!("contentSchema.{key}.type: required"));
+                None
+            }
+        };
+        match obj.get("label") {
+            Some(Value::String(_)) => {}
+            Some(_) => errors.push(format!("contentSchema.{key}.label: must be a string")),
+            None => errors.push(format!("contentSchema.{key}.label: required")),
+        }
+        if let Some(required) = obj.get("required") {
+            if !required.is_boolean() {
+                errors.push(format!("contentSchema.{key}.required: must be a boolean"));
+            }
+        }
+        if let Some(default) = obj.get("default") {
+            // `z.union([z.string(), z.number(), z.boolean()])` (:18): null,
+            // arrays, and objects reject outright.
+            let js_type = match default {
+                Value::String(_) => Some("string"),
+                Value::Number(_) => Some("number"),
+                Value::Bool(_) => Some("boolean"),
+                _ => None,
+            };
+            match (js_type, declared_type) {
+                (None, _) => errors.push(format!(
+                    "contentSchema.{key}.default: must be a string, number, or boolean"
+                )),
+                // :19-25 refine — message verbatim.
+                (Some(js), Some(declared)) if js != declared => errors.push(format!(
+                    "contentSchema.{key}.default: default value must match the declared field type"
+                )),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -515,10 +734,10 @@ impl serde::Serialize for TerminalBehavior {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = Map::new();
         if let Some(v) = &self.preferred_renderer {
-            m.insert("preferredRenderer".into(), json!(v));
+            m.insert("preferredRenderer".into(), json!(v.as_str()));
         }
         if let Some(v) = &self.scroll_input_policy {
-            m.insert("scrollInputPolicy".into(), json!(v));
+            m.insert("scrollInputPolicy".into(), json!(v.as_str()));
         }
         Value::Object(m).serialize(s)
     }
@@ -772,7 +991,7 @@ mod tests {
     }"#;
 
     /// `category: "cli"` without a `cli` block — refinement reject
-    /// (`is_valid_manifest`, mirroring extension-manifest.ts:96-103).
+    /// (`validate_manifest`, mirroring extension-manifest.ts:96-103).
     const CLI_WITHOUT_BLOCK_MANIFEST: &str = r#"{
       "name": "cli-no-block", "version": "1.0.0", "label": "No Block",
       "description": "cli category but no cli block", "category": "cli"
@@ -782,6 +1001,432 @@ mod tests {
       "name": "weird-cat", "version": "1.0.0", "label": "Weird",
       "description": "unknown category", "category": "widget"
     }"#;
+
+    // ── EXT-01 strict-schema fixtures (mirror test/unit/server/extension-manifest.test.ts) ──
+
+    const VALID_SERVER_MANIFEST: &str = r#"{
+      "name": "test-server-ext", "version": "0.1.0", "label": "Test Server Extension",
+      "description": "A test server extension", "category": "server",
+      "server": { "command": "node", "args": ["dist/index.js"],
+        "readyPattern": "Listening on", "readyTimeout": 10000, "singleton": true }
+    }"#;
+
+    const VALID_CLIENT_MANIFEST: &str = r#"{
+      "name": "test-client-ext", "version": "1.0.0", "label": "Test Client Extension",
+      "description": "A test client extension", "category": "client",
+      "client": { "entry": "./dist/index.html" }
+    }"#;
+
+    /// Client extension with every optional field (icon/url/contentSchema/
+    /// picker), mirroring the legacy acceptance cases at
+    /// extension-manifest.test.ts:186-207 and :433-451.
+    const NOTES_CLIENT_MANIFEST: &str = r#"{
+      "name": "notes", "version": "2.0.0", "label": "Notes",
+      "description": "client pane with every optional field", "category": "client",
+      "icon": "icon.svg", "url": "/notes/{{runId}}",
+      "contentSchema": {
+        "runId": { "type": "string", "label": "Run ID", "required": true },
+        "count": { "type": "number", "label": "Count", "default": 5 },
+        "verbose": { "type": "boolean", "label": "Verbose", "default": false }
+      },
+      "picker": { "shortcut": "N", "group": "tools" },
+      "client": { "entry": "./dist/index.html" }
+    }"#;
+
+    /// Typo'd top-level key — `z.strictObject` reject (extension-manifest.ts:81-95).
+    const TYPO_KEY_MANIFEST: &str = r#"{
+      "name": "typo", "version": "1.0.0", "label": "Typo",
+      "description": "unknown top-level key", "descripton": "typo", "category": "cli",
+      "cli": { "command": "typo" }
+    }"#;
+
+    /// Empty required string — `z.string().min(1)` reject (:84).
+    const EMPTY_LABEL_MANIFEST: &str = r#"{
+      "name": "empty-label", "version": "1.0.0", "label": "",
+      "description": "empty label", "category": "cli",
+      "cli": { "command": "emptylabel" }
+    }"#;
+
+    /// `contentSchema` default whose JS typeof mismatches the declared type
+    /// (the refine at :19-25).
+    const BAD_CONTENT_DEFAULT_MANIFEST: &str = r#"{
+      "name": "bad-default", "version": "1.0.0", "label": "Bad Default",
+      "description": "contentSchema default mismatches declared type", "category": "client",
+      "contentSchema": { "count": { "type": "number", "label": "Count", "default": "five" } },
+      "client": { "entry": "./index.html" }
+    }"#;
+
+    /// Non-enum terminalBehavior value — `z.enum(['canvas'])` reject (:46).
+    const BAD_RENDERER_MANIFEST: &str = r#"{
+      "name": "bad-renderer", "version": "1.0.0", "label": "Bad Renderer",
+      "description": "unknown preferredRenderer", "category": "cli",
+      "cli": { "command": "webgl-app", "terminalBehavior": { "preferredRenderer": "webgl" } }
+    }"#;
+
+    /// `server` category without its `server` block (the refine at :96-103).
+    const SERVER_WITHOUT_BLOCK_MANIFEST: &str = r#"{
+      "name": "server-no-block", "version": "1.0.0", "label": "No Server Block",
+      "description": "server category but no server block", "category": "server"
+    }"#;
+
+    /// `ExtensionManifestSchema.safeParse` (extension-manifest.ts:81-103):
+    /// serde parse (shape + strictness) then the refine pass. Returns the
+    /// parsed manifest or the combined diagnostics string.
+    fn parse_manifest(json: &str) -> Result<ExtensionManifest, String> {
+        let m: ExtensionManifest = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        validate_manifest(&m)?;
+        Ok(m)
+    }
+
+    // ── EXT-01 strict-schema tests (mirror test/unit/server/extension-manifest.test.ts) ──
+
+    #[test]
+    fn valid_manifests_per_category_parse() {
+        // Acceptance cases (extension-manifest.test.ts:49-76).
+        let server = parse_manifest(VALID_SERVER_MANIFEST).unwrap();
+        let s = server.server.as_ref().unwrap();
+        assert_eq!(s.command, "node");
+        assert_eq!(s.args, vec!["dist/index.js"]);
+        assert_eq!(s.ready_pattern.as_deref(), Some("Listening on"));
+        assert_eq!(s.ready_timeout, 10_000);
+        assert!(s.singleton);
+
+        let client = parse_manifest(VALID_CLIENT_MANIFEST).unwrap();
+        assert_eq!(client.client.as_ref().unwrap().entry, "./dist/index.html");
+
+        // permissionModeEnvVar / permissionModeValues (:60-61) — the legacy
+        // acceptance case at extension-manifest.test.ts:77-101.
+        let perm = parse_manifest(
+            r#"{
+          "name": "perm-cli", "version": "1.0.0", "label": "Perm CLI",
+          "description": "cli manifest with the permission-mode env mapping", "category": "cli",
+          "cli": { "command": "opencode",
+            "resumeArgs": ["--session", "{{sessionId}}"],
+            "createSessionArgs": ["--session-id", "{{sessionId}}"],
+            "modelArgs": ["--model", "{{model}}"],
+            "sandboxArgs": ["--sandbox", "{{sandbox}}"],
+            "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
+            "permissionModeEnvVar": "AGENT_PERMISSION_MODE",
+            "permissionModeValues": { "plan": "{\"edit\":\"ask\",\"bash\":\"ask\"}" },
+            "supportsPermissionMode": true, "supportsModel": true, "supportsSandbox": true }
+        }"#,
+        )
+        .unwrap();
+        let cli = perm.cli.as_ref().unwrap();
+        assert_eq!(
+            cli.permission_mode_env_var.as_deref(),
+            Some("AGENT_PERMISSION_MODE")
+        );
+        assert_eq!(
+            cli.permission_mode_values.as_ref().unwrap()["plan"],
+            "{\"edit\":\"ask\",\"bash\":\"ask\"}"
+        );
+        let create_session_args = cli.create_session_args.as_ref().unwrap();
+        assert_eq!(create_session_args, &["--session-id", "{{sessionId}}"]);
+    }
+
+    #[test]
+    fn server_config_zod_defaults_materialize() {
+        // :37/:40/:42 (legacy defaults tests, extension-manifest.test.ts:275-335).
+        let m = parse_manifest(
+            r#"{
+          "name": "srv", "version": "1.0.0", "label": "Srv",
+          "description": "minimal server manifest", "category": "server",
+          "server": { "command": "node" }
+        }"#,
+        )
+        .unwrap();
+        let s = m.server.as_ref().unwrap();
+        assert!(s.args.is_empty(), "args defaults to [] (:37)");
+        assert_eq!(
+            s.ready_timeout, 10_000,
+            "readyTimeout defaults to 10000 (:40)"
+        );
+        assert!(s.singleton, "singleton defaults to true (:42)");
+        assert!(s.env.is_none());
+        assert!(s.ready_pattern.is_none());
+        assert!(s.health_check.is_none());
+
+        // Explicit values win; singleton may be explicitly false (:307-321).
+        let m = parse_manifest(
+            r#"{
+          "name": "srv2", "version": "1.0.0", "label": "Srv2",
+          "description": "server manifest with explicit overrides", "category": "server",
+          "server": { "command": "node", "readyTimeout": 2500, "singleton": false }
+        }"#,
+        )
+        .unwrap();
+        let s = m.server.as_ref().unwrap();
+        assert_eq!(s.ready_timeout, 2500);
+        assert!(!s.singleton);
+    }
+
+    #[test]
+    fn strict_objects_reject_unknown_keys_with_named_diagnostics() {
+        // `z.strictObject` at every level (:81/:31/:35/:45/:50/:72/:14). Every
+        // diagnostic NAMES the stray key (zod's `Unrecognized key(s) in object`).
+        let err = parse_manifest(TYPO_KEY_MANIFEST).unwrap_err();
+        assert!(
+            err.contains("descripton"),
+            "top-level typo named, got: {err}"
+        );
+
+        let cases: &[(&str, &str)] = &[
+            // (manifest JSON, stray key the diagnostic must name)
+            (
+                r#"{ "name": "a", "version": "1", "label": "A", "description": "d",
+                   "category": "client", "client": { "entry": "./i.html", "entery": "oops" } }"#,
+                "entery",
+            ),
+            (
+                r#"{ "name": "b", "version": "1", "label": "B", "description": "d",
+                   "category": "server", "server": { "command": "node", "comand": "oops" } }"#,
+                "comand",
+            ),
+            (
+                r#"{ "name": "c", "version": "1", "label": "C", "description": "d",
+                   "category": "cli", "cli": { "command": "x", "envVars": "X" } }"#,
+                "envVars",
+            ),
+            (
+                r#"{ "name": "d", "version": "1", "label": "D", "description": "d",
+                   "category": "cli", "cli": { "command": "x",
+                     "terminalBehavior": { "renderer": "canvas" } } }"#,
+                "renderer",
+            ),
+            (
+                r#"{ "name": "e", "version": "1", "label": "E", "description": "d",
+                   "category": "cli", "picker": { "shortcuts": "N" },
+                   "cli": { "command": "x" } }"#,
+                "shortcuts",
+            ),
+            (
+                r#"{ "name": "f", "version": "1", "label": "F", "description": "d",
+                   "category": "client", "client": { "entry": "./i.html" },
+                   "contentSchema": { "runId": { "type": "string", "label": "Run", "bgcolor": "red" } } }"#,
+                "bgcolor",
+            ),
+        ];
+        for &(json, key) in cases {
+            let err = parse_manifest(json)
+                .err()
+                .unwrap_or_else(|| panic!("stray key `{key}` must reject"));
+            assert!(err.contains(key), "stray key `{key}` named, got: {err}");
+        }
+    }
+
+    #[test]
+    fn min1_identity_and_block_strings_reject() {
+        // Top-level identity strings (:82-85).
+        let err = parse_manifest(EMPTY_LABEL_MANIFEST).unwrap_err();
+        assert!(err.contains("label"), "empty label diagnosed, got: {err}");
+        for &(field, json) in [
+            ("name", r#"{ "name": "", "version": "1", "label": "L", "description": "d", "category": "cli", "cli": { "command": "x" } }"#),
+            ("version", r#"{ "name": "n", "version": "", "label": "L", "description": "d", "category": "cli", "cli": { "command": "x" } }"#),
+            ("description", r#"{ "name": "n", "version": "1", "label": "L", "description": "", "category": "cli", "cli": { "command": "x" } }"#),
+        ]
+        .iter()
+        {
+            let err = parse_manifest(json).unwrap_err();
+            assert!(err.contains(field), "empty {field} diagnosed, got: {err}");
+        }
+        // Per-block min(1) strings (:32/:36/:51).
+        for &(field, json) in [
+            ("client.entry", r#"{ "name": "n", "version": "1", "label": "L", "description": "d", "category": "client", "client": { "entry": "" } }"#),
+            ("server.command", r#"{ "name": "n", "version": "1", "label": "L", "description": "d", "category": "server", "server": { "command": "" } }"#),
+            ("cli.command", r#"{ "name": "n", "version": "1", "label": "L", "description": "d", "category": "cli", "cli": { "command": "" } }"#),
+        ]
+        .iter()
+        {
+            let err = parse_manifest(json).unwrap_err();
+            assert!(err.contains(field), "empty {field} diagnosed, got: {err}");
+        }
+    }
+
+    #[test]
+    fn category_must_carry_exactly_its_own_config_block() {
+        // The coupling refine at :96-103 — message verbatim.
+        const MSG: &str = "category must have exactly its own config block (no others)";
+        for &json in [
+            CLI_WITHOUT_BLOCK_MANIFEST,
+            SERVER_WITHOUT_BLOCK_MANIFEST,
+            r#"{ "name": "cnb", "version": "1", "label": "CNB", "description": "d",
+               "category": "client" }"#,
+            r#"{ "name": "mismatch", "version": "1", "label": "MM", "description": "d",
+               "category": "cli", "client": { "entry": "./i.html" } }"#,
+        ]
+        .iter()
+        {
+            let err = parse_manifest(json).unwrap_err();
+            assert!(err.contains(MSG), "coupling refine fired, got: {err}");
+        }
+        // Unknown category: zod effects SKIP the refine when the base parse
+        // fails, so only the enum error appears — never the coupling message.
+        let err = parse_manifest(UNKNOWN_CATEGORY_MANIFEST).unwrap_err();
+        assert!(
+            err.contains("widget"),
+            "bad category value named, got: {err}"
+        );
+        assert!(
+            !err.contains(MSG),
+            "refine skipped on base-parse failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn content_schema_field_rules_and_default_type_refine() {
+        // Full acceptance case (extension-manifest.test.ts:433-451).
+        parse_manifest(NOTES_CLIENT_MANIFEST).unwrap();
+
+        // default-matches-type refine (:19-25) — message verbatim.
+        let err = parse_manifest(BAD_CONTENT_DEFAULT_MANIFEST).unwrap_err();
+        assert!(
+            err.contains("default value must match the declared field type"),
+            "got: {err}"
+        );
+
+        // Invalid field type (:15) and non-string label (:16).
+        let bad_type = parse_manifest(
+            r#"{ "name": "bt", "version": "1", "label": "BT",
+          "description": "bad contentSchema field type", "category": "client",
+          "contentSchema": { "n": { "type": "integer", "label": "N" } },
+          "client": { "entry": "./i.html" } }"#,
+        )
+        .unwrap_err();
+        assert!(bad_type.contains("contentSchema.n.type"), "got: {bad_type}");
+
+        let bad_label = parse_manifest(
+            r#"{ "name": "bl", "version": "1", "label": "BL",
+          "description": "non-string contentSchema label", "category": "client",
+          "contentSchema": { "n": { "type": "string", "label": 7 } },
+          "client": { "entry": "./i.html" } }"#,
+        )
+        .unwrap_err();
+        assert!(
+            bad_label.contains("contentSchema.n.label"),
+            "got: {bad_label}"
+        );
+    }
+
+    #[test]
+    fn enums_and_ready_timeout_bounds_reject() {
+        // Non-enum terminalBehavior values (:46-47) fail at the serde layer.
+        let err = parse_manifest(BAD_RENDERER_MANIFEST).unwrap_err();
+        assert!(err.contains("webgl"), "bad variant named, got: {err}");
+        let bad_scroll = r#"{ "name": "bs", "version": "1", "label": "BS",
+          "description": "bad scrollInputPolicy", "category": "cli",
+          "cli": { "command": "x", "terminalBehavior": { "scrollInputPolicy": "smooth" } } }"#;
+        assert!(
+            parse_manifest(bad_scroll).is_err(),
+            "non-enum scrollInputPolicy rejects"
+        );
+
+        // readyTimeout: zero hits the positivity rule (:40); negative and
+        // fractional values fail u64 deserialization.
+        let zero = parse_manifest(
+            r#"{ "name": "z", "version": "1", "label": "Z",
+          "description": "zero readyTimeout", "category": "server",
+          "server": { "command": "node", "readyTimeout": 0 } }"#,
+        )
+        .unwrap_err();
+        assert!(zero.contains("readyTimeout"), "got: {zero}");
+        assert!(
+            parse_manifest(
+                r#"{ "name": "n", "version": "1", "label": "N",
+              "description": "negative readyTimeout", "category": "server",
+              "server": { "command": "node", "readyTimeout": -5 } }"#
+            )
+            .is_err(),
+            "negative readyTimeout rejects"
+        );
+        assert!(
+            parse_manifest(
+                r#"{ "name": "f", "version": "1", "label": "F",
+              "description": "fractional readyTimeout", "category": "server",
+              "server": { "command": "node", "readyTimeout": 1.5 } }"#
+            )
+            .is_err(),
+            "fractional readyTimeout rejects"
+        );
+    }
+
+    #[test]
+    fn scan_registers_valid_per_category_and_diagnoses_every_invalid_class() {
+        // Unit mirror of the checklist's seeding contract: one valid manifest per
+        // category plus one specimen per invalid class. Only the valid ones
+        // register, registry fields match the fixture, and every invalid
+        // specimen is DIAGNOSED without crashing discovery.
+        let root = tmp();
+        write_manifest(&root, "mini", MINI_VALID_MANIFEST);
+        write_manifest(&root, "notes", NOTES_CLIENT_MANIFEST);
+        write_manifest(&root, "srv", VALID_SERVER_MANIFEST);
+        write_manifest(&root, "typo", TYPO_KEY_MANIFEST);
+        write_manifest(&root, "empty", EMPTY_LABEL_MANIFEST);
+        write_manifest(&root, "bad-default", BAD_CONTENT_DEFAULT_MANIFEST);
+        write_manifest(&root, "bad-renderer", BAD_RENDERER_MANIFEST);
+        write_manifest(&root, "no-block", SERVER_WITHOUT_BLOCK_MANIFEST);
+
+        let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
+        let names: Vec<&str> = reg
+            .entries
+            .iter()
+            .map(|e| e.manifest.name.as_str())
+            .collect();
+        // scan() sorts subdir names, so valid registration order is mini, notes, srv.
+        assert_eq!(
+            names,
+            ["mini-cli", "notes", "test-server-ext"],
+            "one valid manifest per category; every invalid class skipped"
+        );
+
+        // Every registry field matches the fixture (notes client entry).
+        let entries = reg.to_client_registry();
+        let notes = entries
+            .iter()
+            .find(|e| e["name"] == json!("notes"))
+            .unwrap();
+        assert_eq!(notes["version"], json!("2.0.0"));
+        assert_eq!(notes["label"], json!("Notes"));
+        assert_eq!(
+            notes["description"],
+            json!("client pane with every optional field")
+        );
+        assert_eq!(notes["category"], json!("client"));
+        assert_eq!(notes["serverRunning"], json!(false));
+        assert_eq!(notes["iconUrl"], json!("/api/extensions/notes/icon"));
+        assert_eq!(notes["url"], json!("/notes/{{runId}}"));
+        assert_eq!(
+            notes["picker"],
+            json!({ "shortcut": "N", "group": "tools" })
+        );
+        // contentSchema echoes bit-for-bit (client_entry keeps the raw Value).
+        assert_eq!(
+            notes["contentSchema"],
+            json!({
+              "runId": { "type": "string", "label": "Run ID", "required": true },
+              "count": { "type": "number", "label": "Count", "default": 5 },
+              "verbose": { "type": "boolean", "label": "Verbose", "default": false }
+            })
+        );
+
+        // Useful diagnostics for every invalid specimen; discovery completes.
+        assert_eq!(
+            logs.matches("extension.scan.invalid_manifest").count(),
+            5,
+            "typo + empty + bad-default + bad-renderer + no-block, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("descripton"),
+            "unknown-key diagnostic names the typo, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("default value must match the declared field type"),
+            "refine diagnostic carried to the log, got:\n{logs}"
+        );
+        assert!(logs.contains("extension.scan.complete"), "got:\n{logs}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn scan_discovers_cli_manifests_and_dedups_first_wins() {
@@ -814,7 +1459,10 @@ mod tests {
         let outside = tmp();
         write_manifest(&outside, "real-opencode", OPENCODE_MANIFEST);
         let root = tmp();
-        symlink_dir(&outside.join("real-opencode"), &root.join("linked-opencode"));
+        symlink_dir(
+            &outside.join("real-opencode"),
+            &root.join("linked-opencode"),
+        );
         // A dangling symlink is silently NOT an extension: `existsSync(manifestPath)`
         // follows links and fails (:86) — mirrored here by `manifest_path.exists()`.
         symlink_dir(&outside.join("no-such-target"), &root.join("dangling"));
@@ -842,11 +1490,13 @@ mod tests {
         let outside = tmp();
         write_manifest(&outside, "claude-elsewhere", CLAUDE_DUP_MANIFEST);
         let root2 = tmp();
-        symlink_dir(&outside.join("claude-elsewhere"), &root2.join("claude-dup-link"));
+        symlink_dir(
+            &outside.join("claude-elsewhere"),
+            &root2.join("claude-dup-link"),
+        );
 
-        let (logs, reg) = capture_tracing(|| {
-            ExtensionRegistry::scan(&[root1.clone(), root2.clone()])
-        });
+        let (logs, reg) =
+            capture_tracing(|| ExtensionRegistry::scan(&[root1.clone(), root2.clone()]));
         assert_eq!(reg.entries.len(), 1, "symlinked duplicate dropped");
         assert_eq!(
             reg.entries[0].manifest.label, "Claude CLI",
@@ -885,13 +1535,17 @@ mod tests {
         // so NO warning may fire for it here either.
         std::fs::create_dir_all(root.join("no-manifest")).unwrap();
 
-        let (logs, reg) =
-            capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
+        let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
 
-        let names: Vec<&str> = reg.entries.iter().map(|e| e.manifest.name.as_str()).collect();
+        let names: Vec<&str> = reg
+            .entries
+            .iter()
+            .map(|e| e.manifest.name.as_str())
+            .collect();
         assert_eq!(names, ["mini-cli"], "only the valid manifest registers");
         assert_eq!(
-            logs.matches("extension.scan.invalid_json_in_manifest").count(),
+            logs.matches("extension.scan.invalid_json_in_manifest")
+                .count(),
             1,
             "one JSON-parse warning (bad-json), got:\n{logs}"
         );
@@ -923,11 +1577,15 @@ mod tests {
         let icon_manifest = r#"{
           "name": "icon-ext", "version": "1.0.0", "label": "Icon Ext",
           "description": "client extension with an icon", "category": "client",
-          "icon": "assets/icon.svg"
+          "icon": "assets/icon.svg",
+          "client": { "entry": "./dist/index.html" }
         }"#;
         write_manifest(&outside, "icon-extension", icon_manifest);
         let root = tmp();
-        symlink_dir(&outside.join("icon-extension"), &root.join("linked-icon-ext"));
+        symlink_dir(
+            &outside.join("icon-extension"),
+            &root.join("linked-icon-ext"),
+        );
 
         let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
         assert_eq!(reg.entries.len(), 1);
@@ -1097,13 +1755,16 @@ mod tests {
     }
 
     /// Build a minimal `client`-category manifest with an optional raw
-    /// `contentSchema` snippet (each name distinct — scan dedups by name).
+    /// `contentSchema` snippet (each name distinct — scan dedups by name). The
+    /// `client` config block is included so these fixtures satisfy the
+    /// category↔config-block coupling refine (extension-manifest.ts:96-103)
+    /// and exercise ONLY the contentSchema gate.
     fn schema_manifest(name: &str, schema_json: Option<&str>) -> String {
         let schema = schema_json
             .map(|s| format!(r#", "contentSchema": {s}"#))
             .unwrap_or_default();
         format!(
-            r#"{{ "name": "{name}", "version": "1.0.0", "label": "{name}", "description": "d", "category": "client"{schema} }}"#
+            r#"{{ "name": "{name}", "version": "1.0.0", "label": "{name}", "description": "d", "category": "client", "client": {{ "entry": "./index.html" }}{schema} }}"#
         )
     }
 
@@ -1131,14 +1792,24 @@ mod tests {
         write_manifest(&root, "none", &schema_manifest("none", None));
 
         let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
-        assert_eq!(reg.entries.len(), 3, "all three manifests valid, got:\n{logs}");
+        assert_eq!(
+            reg.entries.len(),
+            3,
+            "all three manifests valid, got:\n{logs}"
+        );
         assert!(
             !logs.contains("extension.scan.invalid_manifest"),
             "no invalid manifest here, got:\n{logs}"
         );
 
         let entries = reg.to_client_registry();
-        let by_name = |n: &str| entries.iter().find(|e| e["name"] == json!(n)).unwrap().clone();
+        let by_name = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"] == json!(n))
+                .unwrap()
+                .clone()
+        };
         let expected: Value = serde_json::from_str(full_schema).unwrap();
         assert_eq!(
             by_name("notes")["contentSchema"],
@@ -1169,12 +1840,24 @@ mod tests {
             // Missing the required `label` string.
             ("bad-missing-label", r#"{"f": {"type": "string"}}"#),
             // `default` must match the declared type (the `.refine`).
-            ("bad-default-mismatch", r#"{"f": {"type": "string", "label": "F", "default": 42}}"#),
-            ("bad-default-null", r#"{"f": {"type": "number", "label": "F", "default": null}}"#),
+            (
+                "bad-default-mismatch",
+                r#"{"f": {"type": "string", "label": "F", "default": 42}}"#,
+            ),
+            (
+                "bad-default-null",
+                r#"{"f": {"type": "number", "label": "F", "default": null}}"#,
+            ),
             // `required` is boolean-or-absent.
-            ("bad-required", r#"{"f": {"type": "boolean", "label": "F", "required": "yes"}}"#),
+            (
+                "bad-required",
+                r#"{"f": {"type": "boolean", "label": "F", "required": "yes"}}"#,
+            ),
             // The field object is `.strictObject` — unknown keys reject.
-            ("bad-unknown-key", r#"{"f": {"type": "string", "label": "F", "bogus": 1}}"#),
+            (
+                "bad-unknown-key",
+                r#"{"f": {"type": "string", "label": "F", "bogus": 1}}"#,
+            ),
             // A field must be an object.
             ("bad-field-nonobject", r#"{"f": "string"}"#),
             // contentSchema itself must be a record.
@@ -1187,7 +1870,11 @@ mod tests {
         }
 
         let (logs, reg) = capture_tracing(|| ExtensionRegistry::scan(std::slice::from_ref(&root)));
-        let names: Vec<&str> = reg.entries.iter().map(|e| e.manifest.name.as_str()).collect();
+        let names: Vec<&str> = reg
+            .entries
+            .iter()
+            .map(|e| e.manifest.name.as_str())
+            .collect();
         assert_eq!(
             names,
             ["mini-cli"],
