@@ -630,7 +630,14 @@ fn expand_tilde(input: &str) -> String {
         .or_else(|| input.strip_prefix("~\\"))
     {
         if let Some(home) = home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
+            // Node's posix path.join(home, rest) (path-utils.ts:62) CONCATENATES
+            // then lexically normalizes: a rest starting with `/` (mixed
+            // separators like `~\/x` or `~//x`) folds onto home as
+            // `$HOME/rest` — never replaces it, unlike `Path::join`'s
+            // absolute-argument semantics which would root the result at `/`.
+            // Inner backslashes stay literal (`~\a\b` -> `$HOME/a\b`), and
+            // `.`/`..` collapse exactly like join's normalize.
+            return collapse_dot_segments(&format!("{}/{rest}", home.to_string_lossy()));
         }
     }
     input.to_string()
@@ -1360,6 +1367,21 @@ mod tests {
         // the bare `~\` form lands on home itself (Node path.join(home, '')).
         assert_eq!(expand_tilde("~\\proj"), "/home/tester/proj");
         assert_eq!(normalize_user_path("~\\"), "/home/tester");
+        // Review pin (boundary separator forms): a `~<sep>` rest that itself
+        // starts with `/` FOLDS onto home — Node's posix path.join(home,
+        // rest) concatenates then normalizes (path-utils.ts:62), so these
+        // yield `$HOME/x`; `Path::join`'s absolute-argument replacement
+        // would instead root-anchor them at `/x` (the bounced defect).
+        assert_eq!(expand_tilde("~\\/x"), "/home/tester/x");
+        assert_eq!(expand_tilde("~//x"), "/home/tester/x");
+        let r = resolve_user_path("~\\/x");
+        assert_eq!(r.display, "/home/tester/x");
+        assert_eq!(r.fs_path, Some("/home/tester/x".to_string()));
+        // Inner backslashes are NOT separators on the posix host: they stay
+        // literal, exactly like Node's join (`~\a\b` -> `$HOME/a\b`).
+        assert_eq!(expand_tilde("~\\a\\b"), "/home/tester/a\\b");
+        // …and `.`/`..` in the rest collapse like join's normalize.
+        assert_eq!(expand_tilde("~/../x"), "/home/x");
     }
 
     // ---- validate_dir (R-WIN2: Windows input on WSL resolves via the mount) ----
