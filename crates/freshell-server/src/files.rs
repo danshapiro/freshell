@@ -594,15 +594,15 @@ fn add_unique_directory(
 
 /// Normalize a user-supplied directory path: sanitize the raw input first
 /// (`sanitizeUserPathInput` runs on EVERY flavor at the top of Node's
-/// `normalizeUserPath`, `path-utils.ts:55` \u2192 `:24-30`: trim whitespace, strip
-/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~/\u2026` to
+/// `normalizeUserPath`, `path-utils.ts:55` → `:24-30`: trim whitespace, strip
+/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~/…`/`~\…` to
 /// `$HOME`, trim trailing separators, and collapse `.`/`..` segments LEXICALLY
-/// \u2014 Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
+/// — Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
 /// (path-utils.ts:69-70), so `<tmp>/nope/../real` reaches the filesystem (and is
 /// displayed) as `<tmp>/real` even when the `nope` intermediate does not exist;
 /// a raw stat on the verbatim spelling would ENOENT on that intermediate first
 /// (mirrors `path-utils.ts#normalizeUserPath` for the POSIX host the oracle runs
-/// on \u2014 the `\\wsl$\u2026` Windows flavor is a later step, handled in
+/// on — the `\\wsl$…` Windows flavor is a later step, handled in
 /// [`resolve_user_path`]). Non-absolute inputs are returned unchanged when they
 /// do not resolve (the collapse is absolute-only, fail-closed).
 pub(crate) fn normalize_user_path(input: &str) -> String {
@@ -611,9 +611,13 @@ pub(crate) fn normalize_user_path(input: &str) -> String {
     collapse_dot_segments(&trim_trailing_separators(&expanded))
 }
 
-/// Expand a leading `~` (bare or `~/rest`) to the process `$HOME`. Other `~user`
-/// forms are left untouched (the DirectoryPicker only ever sends `~` or absolute
-/// paths).
+/// Expand a leading `~` (bare, `~/rest`, or `~\rest`) to the process `$HOME`.
+/// Node expands BOTH separator spellings (`path-utils.ts:61`:
+/// `startsWith('~/') || startsWith('~\\')`) — the backslash form is what
+/// Windows users type into the DirectoryPicker targeting a WSL host, and
+/// `~\rest` is `native` flavor (not Windows: `~` matches none of the
+/// drive/UNC/rooted prefixes), so it reaches this seam. Other `~user` forms
+/// are left untouched.
 fn expand_tilde(input: &str) -> String {
     if input == "~" {
         if let Some(home) = home_dir() {
@@ -621,7 +625,10 @@ fn expand_tilde(input: &str) -> String {
         }
         return input.to_string();
     }
-    if let Some(rest) = input.strip_prefix("~/") {
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
         if let Some(home) = home_dir() {
             return home.join(rest).to_string_lossy().into_owned();
         }
@@ -1334,6 +1341,25 @@ mod tests {
         let r = resolve_user_path("~/proj");
         assert_eq!(r.display, "/home/tester/proj");
         assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
+    }
+
+    /// FILE-03: `normalizeUserPath` expands BOTH `~/rest` AND `~\rest` to the
+    /// home directory (path-utils.ts:61: `startsWith('~/') ||
+    /// startsWith('~\\')`) — the backslash form is what Windows users type
+    /// into the DirectoryPicker targeting a WSL host. `expand_tilde`
+    /// previously handled only `~` and `~/`, so `~\proj` stayed a literal
+    /// name that no endpoint could address (cluster tilde_expand regression).
+    #[test]
+    fn test_tilde_expand_backslash_form_expands_to_home() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let r = resolve_user_path("~\\proj");
+        assert_eq!(r.display, "/home/tester/proj");
+        assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
+        // The helper agrees (the `~\` prefix joins exactly like `~/`), and
+        // the bare `~\` form lands on home itself (Node path.join(home, '')).
+        assert_eq!(expand_tilde("~\\proj"), "/home/tester/proj");
+        assert_eq!(normalize_user_path("~\\"), "/home/tester");
     }
 
     // ---- validate_dir (R-WIN2: Windows input on WSL resolves via the mount) ----
