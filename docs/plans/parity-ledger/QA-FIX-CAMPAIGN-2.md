@@ -41,3 +41,23 @@ but wrote no intermediate output, so the timeout forfeited everything. Two compo
   a would-be fix.
 - Low-confidence single-detector candidates are expensive to adjudicate; consider a cheap
   pre-adjudication pass to drop the AUDIT_WRONG ones before spending a full fixer on them.
+
+## Correction: never kill sessions at the timeout (the real bug)
+
+Run 2's zero-commit result was not caused by slow fixers — it was caused by
+`timeout ... opencode` **killing sessions**, which destroys the most-complete work at the
+worst possible moment. Killing is never the right response to a time limit. The corrected model:
+
+1. **Scope work to fit the box.** Size each unit (and the batch) so it can plausibly finish
+   inside the window. Under-fill rather than over-fill.
+2. **Let running sessions run.** Do not wrap agents in a hard `timeout` that SIGKILLs them.
+   A generous ceiling is fine as a safety net; the orchestrator's clock is not a guillotine.
+3. **When the box expires, STOP and ASK — with a full status update.** Pause new work,
+   report exactly where every in-flight unit stands (adjudicating / fix-drafted / committed /
+   verified / reviewed), and let the human decide: extend, land what's ready, salvage-and-stop,
+   or abandon. The human owns the time/quality tradeoff at the boundary.
+4. **Preserve, never destroy, at the boundary.** Any in-flight work is committed as WIP to its
+   own branch (clearly marked unverified/unreviewed) so a later run can resume it. Nothing is
+   thrown away because a clock struck.
+
+This supersedes the "hard stop / timeout-kill" framing used in run 1 and run 2.
