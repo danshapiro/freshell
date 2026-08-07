@@ -966,13 +966,16 @@ fn js_hex(n: i64) -> String {
     }
 }
 
-/// send's `type()`: mime-db 1.52 (`mime-types` 2.1.35, the original's exact
-/// vendored versions) extension lookup, lowercased, plus `charsets.lookup`
+/// send's `type()`: send@0.19.2 vendors mime@1.6.0 (not mime-types/mime-db
+/// 1.52), whose baked-in `types.json` snapshot — taken from mime-db ~1.40 —
+/// predates the `image/vnd.microsoft.icon` alias and maps `ico` to
+/// `image/x-icon` only. Extension lookup, lowercased, plus `charsets.lookup`
 /// (db charset else `text/*` → `UTF-8`, uppercase). Unknown → `None` (no
 /// header, see [`send_file_response`]). Table values verified against
-/// `mime.lookup`/`mime.charsets.lookup` on the vendored packages. Note this
+/// `mime.lookup`/`mime.charsets.lookup` on the vendored package. Note this
 /// track's values differ from [`crate::serve_client`]'s SPA table where the
-/// original differs (e.g. ico is `image/vnd.microsoft.icon` here).
+/// original differs (e.g. the SPA's text-type charsets are lowercase `utf-8`;
+/// send's `charsets.lookup` yields uppercase `UTF-8`).
 fn local_file_content_type(path: &str) -> Option<&'static str> {
     let ext = Path::new(path)
         .extension()
@@ -996,7 +999,7 @@ fn local_file_content_type(path: &str) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
-        "ico" => Some("image/vnd.microsoft.icon"),
+        "ico" => Some("image/x-icon"),
         "bmp" => Some("image/bmp"),
         "avif" => Some("image/avif"),
         "pdf" => Some("application/pdf"),
@@ -2836,7 +2839,7 @@ mod tests {
             ("a.md", Some("text/markdown; charset=UTF-8")),
             ("a.json", Some("application/json; charset=UTF-8")),
             ("a.png", Some("image/png")),
-            ("a.ico", Some("image/vnd.microsoft.icon")),
+            ("a.ico", Some("image/x-icon")),
             ("a.xml", Some("application/xml")), // no charset in mime-db
             ("a.bin", Some("application/octet-stream")),
             ("a.woff2", Some("font/woff2")),
@@ -2846,6 +2849,19 @@ mod tests {
         for (path, expected) in cases {
             assert_eq!(local_file_content_type(path), *expected, "{path}");
         }
+    }
+
+    /// send@0.19.2's vendored mime@1.6.0 maps `.ico` to `image/x-icon`
+    /// (its baked-in types.json is a mime-db ~1.40 snapshot that predates the
+    /// `image/vnd.microsoft.icon` alias — `types.json` contains only
+    /// `image/x-icon` for `ico`), so the original /local-file sets
+    /// `Content-Type: image/x-icon` — not `image/vnd.microsoft.icon`.
+    #[test]
+    fn test_mime_content_type_ico_is_image_x_icon() {
+        assert_eq!(local_file_content_type("a.ico"), Some("image/x-icon"));
+        // send lowercases the extension before lookup (mime.lookup lowercases
+        // internally), so a `.ICO` spelling takes the same branch.
+        assert_eq!(local_file_content_type("A.ICO"), Some("image/x-icon"));
     }
 
     #[cfg(unix)]
