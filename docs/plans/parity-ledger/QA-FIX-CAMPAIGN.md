@@ -75,3 +75,27 @@ not forced in. Honest not-landed beats a wrong fix that claims parity.
 Success here is not "8 bugs fixed" — it is **coverage to a quality bar with evidence**: every
 landed fix carries a failing→passing regression test and an independent review PASS, and every
 not-landed item is surfaced with its reason.
+
+## Cleanup safety (learned the hard way)
+
+The highest-blast-radius commands in a campaign — `branch -D`, `worktree remove --force`,
+`reset --hard`, `rm -rf` — cluster at the END, exactly when attention flags. A greedy
+`git branch -D fix/*` in this run's cleanup swept up a pre-existing user branch that merely
+shared the generic `fix/` prefix (recovered from `origin`, but it was unrecoverable-by-luck).
+Rules for every future run:
+
+1. **Namespace your artifacts so they cannot collide.** Create all branches/worktrees under a
+   campaign-unique prefix — `fable/<campaign-id>/<item>` for branches,
+   `.worktrees/fable-<campaign-id>-<item>` for worktrees. Then even a glob is safe by
+   construction, because nothing else lives in that namespace. Never reuse a generic prefix
+   (`fix/`, `qa/`) the repo already uses.
+2. **Delete by explicit list, never by pattern.** Maintain the exact list of branches/worktrees
+   you created; delete precisely that list. A wildcard can only match things you didn't create.
+3. **Dry-run first, and read the output.** Before any bulk delete, run the read-only form
+   (`git branch --list`, `git worktree list`) and confirm every entry is yours. Unconditionally —
+   not only when you feel careful.
+4. **Prefer recoverable over forced.** Use `git branch -d` (refuses unmerged) over `-D`. Campaign
+   fix branches are cherry-picked/merged, so `-d` succeeds for them and *refuses* anything
+   unmerged — turning a silent destruction into a flagged error.
+5. **Cleanup gets more scrutiny, not less.** Treat the wind-down as the most dangerous phase.
+   This repo is self-hosted off worktrees; a wrong `--force` can hit something load-bearing.
