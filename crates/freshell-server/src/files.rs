@@ -914,8 +914,8 @@ fn resolve_for_local_file(input: &str) -> String {
 
 /// The `sendFile` 200 (send@0.19.2 `SendStream.prototype.setHeader`/`type`):
 /// the bytes plus `Accept-Ranges: bytes`, `Cache-Control: public, max-age=0`,
-/// `Last-Modified` (mtime.toUTCString shape), the strong
-/// `"<size-hex>-<mtimeMs-hex>"` ETag, and a mime-db content-type — unknown
+/// `Last-Modified` (mtime.toUTCString shape), the weak
+/// `W/"<size-hex>-<mtimeMs-hex>"` ETag, and a mime-db content-type — unknown
 /// extensions get NO Content-Type header at all (send's `if (!type) return`,
 /// deliberately matching the original rather than forcing octet-stream).
 /// Conditional-GET (304) / Range (206) revalidation from send is not ported:
@@ -945,11 +945,17 @@ fn send_file_response(resolved: &str, meta: &std::fs::Metadata, bytes: Vec<u8>) 
         {
             h.insert(header::LAST_MODIFIED, v);
         }
-        // etag package's stattag: '"' + size.toString(16) + '-' +
-        // mtime.getTime().toString(16) + '"' (strong — weak defaults false).
-        if let Ok(v) =
-            HeaderValue::from_str(&format!("\"{:x}-{}\"", meta.len(), js_hex(ts.timestamp_millis())))
-        {
+        // etag@1.8.1 stattag: '"' + size.toString(16) + '-' +
+        // mtime.getTime().toString(16) + '"', prefixed `W/` — send@0.19.2
+        // calls `etag(stat)` with NO options (send/index.js:879), and etag
+        // defaults `weak` to `isstats(entity)` = true for a fs.Stats
+        // (etag/index.js:76-79, 91-93). (`weak: false` is only the default
+        // for string/Buffer entities.)
+        if let Ok(v) = HeaderValue::from_str(&format!(
+            "W/\"{:x}-{}\"",
+            meta.len(),
+            js_hex(ts.timestamp_millis())
+        )) {
             h.insert(header::ETAG, v);
         }
     }
@@ -2721,14 +2727,48 @@ mod tests {
             .to_str()
             .unwrap()
             .ends_with(" GMT"));
-        // etag stattag: '"'<size hex>'-'<mtimeMs hex>'"' — strong.
+        // etag stattag: 'W/"'<size hex>'-'<mtimeMs hex>'"' — WEAK (send
+        // passes a fs.Stats to etag@1.8.1 with no options, so `weak`
+        // defaults to true).
         let etag = resp.headers().get(header::ETAG).unwrap().to_str().unwrap();
         let len = content.len();
-        let expected_prefix = format!("\"{len:x}-");
+        let expected_prefix = format!("W/\"{len:x}-");
         assert!(etag.starts_with(&expected_prefix), "etag {etag}");
         let ms_hex = etag[expected_prefix.len()..etag.len() - 1].to_string();
         assert!(!ms_hex.is_empty() && ms_hex.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(body_bytes(resp).await, content.as_bytes());
+    }
+
+    /// send@0.19.2 calls `etag(stat)` with NO options (send/index.js:879);
+    /// etag@1.8.1 then defaults `weak` to `isstats(entity)` = true
+    /// (etag/index.js:76-79) and prefixes `W/` (etag/index.js:91-93). The
+    /// original /local-file therefore sends `ETag: W/"<size-hex>-<mtime-hex>"`
+    /// — the WEAK stattag, never the strong form (`weak` only defaults false
+    /// for string/Buffer entities; a fs.Stats is weak by default).
+    #[tokio::test]
+    async fn test_etag_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"etag-me").unwrap();
+        let resp = local_file_resp(
+            &test_state(),
+            auth_headers(),
+            Some(&file.to_string_lossy()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .expect("sendFile always sets an ETag")
+            .to_str()
+            .unwrap();
+        let len = b"etag-me".len();
+        assert!(
+            etag.starts_with(&format!("W/\"{len:x}-")),
+            "original ETag is the WEAK stattag W/\"<size-hex>-<mtime-hex>\"; got {etag}"
+        );
+        assert!(etag.ends_with('"'));
     }
 
     #[tokio::test]
