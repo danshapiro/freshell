@@ -71,6 +71,9 @@
     "test:e2e:debug": "playwright test --config test/e2e-browser/playwright.config.ts --debug",
     "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts",
     "test:e2e:electron": "playwright test --config test/e2e-electron/playwright.electron.config.ts",
+    "test:e2e:service": "playwright test --config test/e2e-browser/playwright.service.config.ts",
+    "test:e2e:cloud": "cross-env PLAYWRIGHT_CLOUD=1 playwright test --config test/e2e-browser/playwright.service.config.ts --project=chromium --workers=1",
+    "test:e2e:cloud:parallel": "cross-env PLAYWRIGHT_CLOUD=1 playwright test --config test/e2e-browser/playwright.service.config.ts --project=chromium --workers=20",
     "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts",
     "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
@@ -125,6 +128,8 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@azure/identity": "^4.13.1",
+    "@azure/playwright": "^1.1.6",
     "@eslint/js": "^9.39.2",
     "@playwright/test": "^1.52.0",
     "@tailwindcss/container-queries": "^0.1.1",
