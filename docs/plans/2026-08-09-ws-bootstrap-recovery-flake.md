@@ -4,122 +4,177 @@
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
 
-**Goal:** Eliminate the load-dependent flakiness of `test/unit/client/components/App.ws-bootstrap.test.tsx > "App WS bootstrap recovery > recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s"`, proven by deterministic reproduction(s) that fail before the fix and pass after, plus 3 consecutive green full client-suite runs.
+**Goal:** Eliminate the load-dependent flakiness of `test/unit/client/components/App.ws-bootstrap.test.tsx > "App WS bootstrap recovery > recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s"`, proven by a deterministic reproduction of the observed failure signature that fails before the fix and passes after, plus the task's full verification bar.
 
-**Architecture:** The observed organic failure is a selector-title mismatch at test line 598 — `expected [ 'Manual Session' ], received [ 'Codex', 'Manual Session' ]` (raw evidence: `/tmp/freshell-baseline.log:1861-1877`, suite seed `1786259877991`). Static analysis proves no data flow inside the fixed test store can produce a sidebar row titled `Codex` (selector inputs: 2-session payload with titles 'Hidden Auto Session'/'Manual Session', single shell tab, empty panes, `terminals=[]`; see evidence reports below). Therefore the contaminating state enters through a test-side leak channel whose exact content path the instrumented organic reproduction (Task 1) must capture. Independently, one such channel is already identified, deterministically reproduced, and closable by the decision rule in Task 2: this file never resets the module-level per-surface thunk state in `src/store/sessionsThunks.ts`/`src/store/terminalDirectoryThunks.ts`, so fire-and-forget refresh chains from shuffled sibling tests can consume the target test's call-count-sequenced mocks or abort its in-flight fetches. The fix is test-side hermeticization at the file's lifecycle boundaries plus instrumentation-informed hardening from Task 1's forensic capture. No product (`src/`) behavior changes unless Task 1's captured state dump proves a product race — in which case STOP and re-plan.
+**Architecture:** Root cause (empirically established — see evidence base): the vitest jsdom environment injects Node's worker-global `BroadcastChannel` into every test file's window, so `persistMiddleware` layout broadcasts from OTHER test files can be delivered into a listener registered later by **this** file's mounted `App` (`installCrossTabSync`, App.tsx:312-315 → `handleIncomingRawDeduped` → `dispatchHydrateLayoutFromPersisted`, crossTabSync.ts:150-225/363-372). Delivery is intermittent (worker pairing + teardown timing — measured 2/6 with a two-file probe), which is the flake's load/shuffle dependence. When a broadcast layout containing a codex tab titled `Codex` lands during the target test's bootstrap window, `handleIncomingRaw` hydrates it into the test store's `tabs`/`panes`, the sidebar selector's tab/pane fallback path (`buildSessionItems`, sidebarSelectors.ts:374-469) emits a fallback row titled `Codex`, which activity-sorts ahead of the two payload sessions (timestamps 10/9 vs a real epoch) — producing the exact observed diff `expected [ 'Manual Session' ], received [ 'Codex', 'Manual Session' ]` at test line 598 with intact mock counters and no timeout (486 ms). In-file intransit copies are impossible (selector inputs carry no `Codex`-titled rows); the delivered layout is the only consistent explanation. Fix (test-side only, analogous to the file's existing ws-client mock): stub `BroadcastChannel` with an inert implementation for THIS test file's lifecycle so no cross-file layout can be hydrated mid-test, plus the repo-established thunk-state resets that close a second, independently proven in-file residue channel (queue-refresh stragglers consuming the test's sequenced mock quotas), plus one additive fence assertion.
 
 **Tech Stack:** Vitest 3.2.4 (threads pool, jsdom, `sequence.shuffle`), React Testing Library, Redux Toolkit, TypeScript.
 
 ## Global Constraints
 
-- Red-Green-Refactor TDD; the RED evidence for the fix is the by-construction probe failing against the unfixed boundary (mandatory) plus any organically captured instrumented failure (best-effort enrichment, NOT a commit gate — an 0-of-N organic result is a recorded outcome, not a deadlock).
-- NEVER weaken the target test: no deleted or loosened assertions, no retry wrappers, no skips, no blanket timeout inflation. All test changes are additive (reset calls at boundaries; one added fence assertion; forensic instrumentation is added and then REMOVED before the final commit).
-- Repo rules: broad test runs use repo-owned commands (`npm run test:vitest -- ...`, the repo-owned equivalent of the sanctioned baseline command `npx vitest run --config config/vitest/vitest.config.ts`; `test:vitest` runs under the shared coordinator). Set `FRESHELL_TEST_SUMMARY` for broad runs. Never run `pkill`/`kill` patterns against foreign test processes.
+- Red-Green-Refactor TDD. The RED evidence for the fix is the poison-transport probe (Task 1) failing with the EXACT observed signature against the unfixed file; the organic instrumented capture is best-effort enrichment, NOT a commit gate (an 0-of-N organic result is a recorded outcome, not a deadlock) — the root cause is already established by the channel experiments below.
+- NEVER weaken the target test: no deleted or loosened assertions, no retry wrappers, no skips, no timeout inflation. All changes are additive (a beforeEach environment stub; thunk-state reset calls matching six sibling files; one added fence assertion). Test-side environment isolation is the same legitimate move as the file's existing `@/lib/ws-client` and `@/lib/api` mocks; cross-tab layout sync is not what this file tests (its stores never install `persistMiddleware`, and nothing in it asserts cross-tab behavior).
+- Only `test/unit/client/components/App.ws-bootstrap.test.tsx` may be modified. Scratch probes are untracked and deleted before the final commit. No `src/` changes.
+- Broad runs: the task text pins `npx vitest run --config config/vitest/vitest.config.ts` as the gate command. `npm run test:vitest -- ...` is the repo-owned wrapper for that exact passthrough command; it does NOT acquire the shared coordinator gate, so before every broad run confirm `npm run test:status` shows no other holder and set `FRESHELL_TEST_SUMMARY`. Never run two broad runs concurrently; never kill foreign test processes. (`npm test`'s composite runner terminates the sibling suite on first failure, which undercuts "3 consecutive full client-suite runs" evidence, so the task-pinned per-config commands are used — with the coordinator spirit honored via the pre-run status check.)
 - Commits use the repo git identity; do not create a PR.
-- Absolute run values for this plan (no placeholders): worktree = `/home/dan/code/freshell/.worktrees/ws-bootstrap-recovery-flake`; logs_dir = `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/`; base_ref = `4c2297667f7c59758b4aeb8848cf7eddc1710cfc`; progress ledger = `<worktree git-dir>/usual-sdd/progress.md` (git-dir from `git rev-parse --git-dir`, currently `/home/dan/code/freshell/.git/worktrees/settings-proto-strict-reject`).
+- Absolute run values (no placeholders): worktree = `/home/dan/code/freshell/.worktrees/ws-bootstrap-recovery-flake`; logs_dir = `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/`; base_ref = `4c2297667f7c59758b4aeb8848cf7eddc1710cfc`; progress ledger = `<git-dir>/usual-sdd/progress.md` where git-dir comes from `git rev-parse --git-dir` (currently `/home/dan/code/freshell/.git/worktrees/settings-proto-strict-reject`).
 
 ## Verification bar (from the task specification)
 
-1. A deterministic reproduction fails before the fix and passes after.
+1. A deterministic reproduction fails before the fix and passes after (Task 1 probe RED → Task 2 probe GREEN).
 2. The target test passes in isolation (its file alone).
-3. The target test passes in 3 consecutive coordinator-gated full-suite runs (`npm test`, which includes the task-pinned client config), with any other-test failures reproduced at base_ref before being recorded as allowed pre-existing load-flaky failures.
+3. The target test passes in 3 consecutive full client-suite runs of `npx vitest run --config config/vitest/vitest.config.ts` (executed via the repo-owned passthrough `npm run test:vitest -- run --config config/vitest/vitest.config.ts`, same command semantics). Each of the three runs must let that client suite run to completion; a run counts only if the target test passed, and any other failure must carry a base_ref reproduction receipt recorded in the progress ledger before the run is allowed. The server config is also run once at final HEAD under the same receipt rule.
 
 ## Evidence base (already produced; absolute paths)
 
-- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/plan-bootstrap-code.md` — production-path trace.
-- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/plan-test-infra.md` — vitest mechanics (pool=threads, isolate=true, jsdom per file, shuffle covers file AND in-file order, no worker cap).
-- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/load-bearing-validator-B.md` — deterministic probe RED/GREEN (see Task 1 Step 2).
-- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/workspace-baseline.md` — orchestrator baseline.
-- `/tmp/freshell-baseline.log` (raw, base_ref full-suite run at 2026-08-09 00:16): the organic failure — `AssertionError: expected [ 'Codex', 'Manual Session' ] to deeply equal [ 'Manual Session' ]` at `App.ws-bootstrap.test.tsx:598:91` after 486 ms (no timeout), suite seed `1786259877991`.
-- In-file execution order of that failing run (deterministic replay of vitest's installed shuffle algorithm — `chunk-hooks.js:1721-1729` with `@vitest/utils` `shuffle()`; script run against the 36 collected titles): the target ran 10th, directly after `registers regenerated restart request ids for durable restore and explicit fresh recovery` (file line 914, injects `terminal.inventory` → starts BOTH fire-and-forget paths: `fetchTerminalDirectoryWindow` and `queueActiveSessionWindowRefresh`), `keeps the active non-sidebar session surface during websocket recovery when the sidebar window is already loaded` (file line 2179), and `dispatches wsCloseCode to lastErrorCode in Redux when connect rejects with close code`. So the failing run DID have queue-refresh-starting siblings before the target — the in-file residue hypothesis is positionally live on the failing order (the reporter's declaration-order listing that suggested otherwise was misleading). The observed signature (no timeout, intact final counts) still means its content channel is not fully explained by quota drift alone; Task 1 Step 1's instrumentation capture plus the seed-pinned replay (Task 2 Step 4) stand as the organic adjudicators.
-- Reviewer hypothesis and its analysis — cross-file `BroadcastChannel` contamination (Fresh Eyes round 1, major finding 1): investigated and falsified as a mechanism. `persistBroadcast.ts` posts only from `persistMiddleware`, which this test file's stores never install, so nothing in this file posts; vitest gives each file a fresh jsdom (per-file globals) and Node's `BroadcastChannel` never crosses worker threads nor retains a backlog for later-created instances, so neither cross-file nor in-file cross-test delivery into `installCrossTabSync`'s listener (App.tsx:312-315) can occur here. The observed content must therefore come from a channel that ships REAL content into the target test's OWN store — captured empirically in Task 1 Step 1.
+- `/tmp/freshell-baseline.log:1861-1877` — the raw organic failure at base_ref: `AssertionError: expected [ 'Codex', 'Manual Session' ] to deeply equal [ 'Manual Session' ]` at `App.ws-bootstrap.test.tsx:598:91`, 486 ms (no timeout), suite seed `1786259877991`, one failure / 4912 tests.
+- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/plan-bootstrap-code.md` — production-path trace (bootstrap/recovery legs, thunk module state, selector purity).
+- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/plan-test-infra.md` — vitest mechanics.
+- `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/load-bearing-validator-B.md` — in-file straggler-quota probe RED/GREEN (secondary channel).
+- Cross-file channel experiments (this investigation; logs under `/tmp/xshare-*` and summarized in the Task 1 evidence report):
+  1. The test env's `BroadcastChannel` is NOT jsdom-native: jsdom has no living implementation; vitest's jsdom env injects the worker's Node `globalThis.BroadcastChannel` (`node_modules/vitest/dist/chunks/index.CmSc2RE5.js:441-452`). So the channel sphere is shared beyond a single file's jsdom/registry.
+  2. Two-file probe (`__xshare-a` posts `{…note:'Codex'}` on `freshell.persist.v2`, keeps the channel open; `__xshare-b` registers later): the later file's listener RECEIVED the earlier file's message in 2/6 runs (and the enclosing file showed fresh globals/localStorage). Delivery is real and intermittent — the flake's statistical profile.
+  3. Hydration requires only a parseable layout with a `persistedAt` newer than the local one (undefined locally here → remote wins): `dispatchHydrateLayoutFromPersisted` merges remote tabs/panes into the mounted store (crossTabSync.ts:150-225).
+- In-file failing-order replay: vitest's installed shuffle algorithm with seed `1786259877991` places the target test 10th of 36, directly after siblings that start fire-and-forget queue refreshes (`terminal.inventory` at file line 973-977) — additional in-file residue exposure, addressed by the secondary fix items.
+- Falsified alternate hypothesis (recorded for the record): per-file isolation of globals/localStorage held (experiment measured nulls); the ONLY measured cross-file transport is the BroadcastChannel.
 
 ---
 
-### Task 1: Deterministic reproduction and forensic capture
+### Task 1: Deterministic reproduction of the observed signature (poison-transport probe)
 
 **Files:**
+- Create (scratch, untracked): `test/unit/client/components/__ws-bootstrap-broadcast-poison.probe.test.tsx`
 - Create (evidence, untracked): `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/flake-repro-evidence.md`
-- Create (harness, untracked scratch): `/tmp/flake-repro-loop.sh` (exists), `/tmp/flake-hammer.sh` (exists), `test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx` (probe, exists)
--Modify (TEMPORARY, reverted before Task 2's commit): `test/unit/client/components/App.ws-bootstrap.test.tsx` — forensic try/catch around the line-598 assertion dumping full state + built selector items + mock call counts as a `FLAKE-DEBUG` JSON line on failure.
+- No tracked repository files are added, modified, or deleted.
 
 **Interfaces:**
-- Produces: the evidence report, the organic `FLAKE-DEBUG` dump (or documented non-reproduction within the hammer budget), and the probe RED/GREEN logs.
-- Consumes: existing harnesses and probe from planning/Stage 2.
+- Consumes: nothing from other tasks.
+- Produces: the RED log `/tmp/probe-poison-nofix.log` showing the exact organic signature, and the evidence report.
 
-- [ ] **Step 1: Capture an organic failure with instrumentation**
+- [ ] **Step 1: Build the poison-transport probe**
 
-Run (as launched during planning; reuse its outputs if it already produced a reproduction): `bash /tmp/flake-hammer.sh` — up to 8 SEQUENTIAL full client-suite runs of `FRESHELL_TEST_SUMMARY='flake hammer run <i>' npm run test:vitest -- run --config config/vitest/vitest.config.ts --reporter=basic`, stopping at the first run containing a `FLAKE-DEBUG` line; the dump lands in `/tmp/flake-hammer/FLAKE-DEBUG.json`. `test:vitest` is a coordinator passthrough (no shared gate) — the hammer may only run when `npm run test:status` shows no other broad-run holder, and never concurrently with another broad run; the final gate in Task 3 uses the coordinator-owned `npm test`.
+The probe file replicates the target test's ENTIRE setup (copy the imports/mocks/`createStore`/`beforeEach`/`afterEach` from the unfixed `App.ws-bootstrap.test.tsx`) and contains ONE test that runs the target test's exact flow with ONE addition: while App is mounted and its `installCrossTabSync` BroadcastChannel listener is live, post the poison layout through a REAL `BroadcastChannel` on `freshell.persist.v2` (delivery to an already-registered listener in the same jsdom sphere is deterministic — no backlog dependence):
 
-Expected: either a captured dump (settle exactly which store field carries the `Codex` row: `sessions.projects` content, `windows.sidebar.projects`, `tabs`, item source flags `isFallback`/`liveTerminalOnly`, plus `bootstrapCalls`/`sidebarCalls`/snapshot mock call count), or 0 reproductions in 8 runs (documented; channel attribution then rests on the probe + static analysis and the fix is judged solely by Task 3's gate).
+1. Build the poison message exactly as `persistBroadcast.broadcastPersistedRaw` does (`{ type: 'persist', key: LAYOUT_STORAGE_KEY, raw, sourceId: 'poison-probe' }` posted via `new BroadcastChannel('freshell.persist.v2')`), where `raw` is a JSON layout `{ version: 4, persistedAt: Date.now(), tabs: { activeTabId: 'poison-codex-tab', tabs: [{ id: 'poison-codex-tab', mode: 'codex', status: 'running', title: 'Codex', createdAt: <now>, lastActivityAt: <now> }] }, panes: { version: 7, layouts: { 'poison-codex-tab': { type: 'leaf', id: 'poison-pane', content: { kind: 'terminal', createRequestId: 'poison-req', status: 'running', mode: 'codex', shell: 'system', terminalId: 'poison-term', sessionRef: { provider: 'codex', sessionId: 'poison-codex-session' } } } }, activePane: { 'poison-codex-tab': 'poison-pane' }, paneTitles: {}, paneTitleSetByUser: {} }, tombstones: [] }`.
+2. Injection timing: inside an `act()` immediately after the target flow's first `waitFor` (the posted message is delivered asynchronously on the channel; the flow's remaining `waitFor`s give it ample room to hydrate before the final selector assertion).
+3. Every other assertion of the target test remains UNCHANGED — including the final selector assertion `expect(…titles…).toEqual(['Manual Session'])`.
 
-- [ ] **Step 2: Probe RED/GREEN pair (already captured — re-run only if logs are missing)**
+Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/__ws-bootstrap-broadcast-poison.probe.test.tsx --reporter=basic` (log to `/tmp/probe-poison-nofix.log`)
 
-- RED (unfixed boundary): `PROBE_RESET=0 npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx` → FAILS deterministically at the replica of the target's first fence (`expect(sidebarCalls).toBe(1)` receives 2 within `waitFor`'s 1s timeout) — the sibling straggler consumed the sequenced 503 quota call. Existing log: `/tmp/probe-reset0.log`.
-- GREEN (fixed boundary: `_resetSessionWindowThunkState()` + `_resetTerminalDirectoryThunkControllers()` at the simulated boundary): same command with `PROBE_RESET=1` → PASSES. Existing log: `/tmp/probe-reset1.log`.
+Expected: FAIL deterministically at the replicated line-598 assertion, with received `[ 'Codex', 'Manual Session' ]` — byte-identical in shape to `/tmp/freshell-baseline.log:1861`. If the hydrolysis does not take (e.g. `hydrateTabs` declines without a local `persistedAt`), inject earlier/more visibly and/or craft `persistedAt`/`localStorage` seeding per the `installCrossTabSync` dedupe reading (crossTabSync.ts:303-311) until RED reproduces; the probe must DEMONSTRATE the channel, and the report must record what was needed. If no crafting makes it RED, STOP — the root cause story is wrong; report for re-planning.
 
-Scope note (honest epistemics): the probe demonstrates the in-file residue channel and that the boundary resets close it; it is mechanism evidence, not by itself proof that the organic `Codex` signature is fixed — that burden rests on Task 1 Step 1's captured dump and Task 3's gate.
+- [ ] **Step 2: Record the evidence**
 
-- [ ] **Step 3: Record the evidence**
+Write the evidence report containing: the root-cause narrative; the two-file channel experiment results (2/6 delivery, fresh globals/localStorage otherwise); the poison probe's RED excerpt; the secondary in-file channel summary (validator-B); the explicit conclusion that product code is behaving as designed and the defect is test-environment isolation (if the probe disagreed, stop and re-plan instead).
 
-Write the evidence report with: mechanism narrative; organic dump analysis (per Step 1 outcome); probe logs; and the explicit verdict whether product code is implicated (gate: only if the dump shows a state contradiction the product alone could produce — else NO).
-
-### Task 2: Fix — hermetic test-file isolation plus instrumentation-informed hardening
+### Task 2: Fix — hermetic test environment for this file
 
 **Files:**
-- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx` (imports near :18; `beforeEach` at :266-307; `afterEach` at :309-312; target-test fence at :559-563; forensic instrumentation REMOVED)
-- Test: same file (all 36 tests must pass in isolation and under adversarial in-file ordering).
+- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx` (imports near :18; `beforeEach` at :266-307; `afterEach` at :309-312; target-test fence at ~:559-563)
+- Test: same file (36 tests must pass in isolation and adversarial orderings).
 
 **Interfaces:**
-- Consumes: `_resetSessionWindowThunkState()` (`src/store/sessionsThunks.ts:59`), `_resetTerminalDirectoryThunkControllers()` (`src/store/terminalDirectoryThunks.ts:41`), and Task 1's dump.
+- Consumes: nothing beyond the file itself and the two reset helpers (`src/store/sessionsThunks.ts:59`, `src/store/terminalDirectoryThunks.ts:41`).
 - Produces: the fixed, hermetic test file.
 
-- [ ] **Step 1: Apply the fix**
+- [ ] **Step 1: Apply the fix (additive edits only)**
 
 1. Add imports after line 18:
 ```ts
 import { _resetSessionWindowThunkState } from '@/store/sessionsThunks'
 import { _resetTerminalDirectoryThunkControllers } from '@/store/terminalDirectoryThunks'
 ```
-2. `beforeEach`: immediately after `vi.resetAllMocks()`, call `_resetSessionWindowThunkState()` and `_resetTerminalDirectoryThunkControllers()`.
-3. `afterEach`: immediately after `cleanup()`, call the same two resets. (The generation bump kills any sibling run-loop before it can issue another shared-mock call; `controllers`/`inFlightRequests`/`invalidationRefreshState` are cleared, so no cross-test abort/coalesce survives a boundary in EITHER shuffled direction. Mirrors the established pattern in `test/e2e/sidebar-search-flow.test.tsx:157/172`, `test/e2e/sidebar-repo-filter-flow.test.tsx:140/155`, `test/e2e/sidebar-agent-filter-flow.test.tsx:140/155`, `test/e2e/sidebar-refresh-dom-stability.test.tsx:227/259`, `test/unit/client/store/sidebar-staleness.test.ts:74/77`, `test/unit/client/store/sessionsThunks.test.ts:76/80`.)
-4. Strengthen the target test's first fence (`waitFor` at ~:559-563) with ONE added assertion: `expect(wsMocks.connect).toHaveBeenCalledTimes(1)`. Rationale: `connect()` is the final awaited step of `bootstrap()` (App.tsx:1460), so the fence then proves the initial chain fully unwound before `ready` is injected; the preloaded `status==='disconnected'` check alone is vacuous. ADDITIVE — nothing else changes.
-5. REMOVE the temporary forensic try/catch instrumentation from the target test (restore the exact pre-instrumentation assertion block).
-6. ONLY IF Task 1 Step 1's organic dump demonstrates a contamination channel NOT closed by items 1-4 (e.g. a cross-test/mock-queue channel visible in the dump fields), add the minimal additional test-side closure for THAT channel and document it here. If the dump implicates product code instead, STOP and report for re-planning.
+2. Add near the other mock helpers:
+```ts
+// This environment's BroadcastChannel is the worker-global Node channel injected
+// into every jsdom by vitest, so persistMiddleware layout broadcasts from OTHER
+// test files can be delivered into installCrossTabSync's listener mid-test
+// (observed empirically). This file does not test cross-tab sync, so isolate it.
+class InertBroadcastChannel {
+  static readonly name = 'BroadcastChannel'
+  readonly name: string
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onmessageerror: ((event: MessageEvent) => void) | null = null
+  constructor(channelName: string) {
+    this.name = channelName
+  }
+  postMessage(_message: unknown): void {}
+  close(): void {}
+  addEventListener(): void {}
+  removeEventListener(): void {}
+  dispatchEvent(): boolean { return false }
+}
+```
+3. In `beforeEach`, after `vi.resetAllMocks()`: `vi.stubGlobal('BroadcastChannel', InertBroadcastChannel)` and then `_resetSessionWindowThunkState()` + `_resetTerminalDirectoryThunkControllers()`.
+4. In `afterEach`, after `cleanup()`: `_resetSessionWindowThunkState()` and `_resetTerminalDirectoryThunkControllers()`. (`vi.unstubAllGlobals()` already runs there and removes the stub.)
+5. In the target test's first `waitFor` (~:559-563) add ONE assertion: `expect(wsMocks.connect).toHaveBeenCalledTimes(1)` — `connect()` is bootstrap's final awaited step, so this proves the initial chain fully unwound before `ready` is injected; additive only.
+6. Ensure any temporary forensic instrumentation is absent (the tree must not contain it).
 
 - [ ] **Step 2: Focused GREEN**
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.ws-bootstrap.test.tsx`
 
-Expected: 36/36 PASS — identical behavior in the idle case.
+Expected: 36/36 PASS.
 
 - [ ] **Step 3: Deterministic repro passes after the fix**
 
-Run: `PROBE_RESET=1 npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx` → PASS (log to `/tmp/probe-reset1-postfix.log`); control `PROBE_RESET=0` → must STILL FAIL (log to `/tmp/probe-reset0-postfix.log`; if it passes too, the probe is broken — fix the probe, never pad it).
+Re-create the probe from the FIXED file (its `beforeEach` now stubs `BroadcastChannel`; note the probe's own poison post then ALSO uses the inert class, so nothing is delivered — which is precisely the fixed behavior). Run the same command as Task 1 Step 1 against the regenerated probe file (fresh copy of the fixed file), log to `/tmp/probe-poison-fixed.log`.
 
-Expected: PASS / FAIL respectively.
+Expected: PASS. Also regenerate+run the probe AGAINST THE UNFIXED copy once more as the control (`/tmp/probe-poison-nofix.log` must still show the RED). If the fixed-file probe still FAILS with the poisoned `Codex` row, a live hydration path remains — find it and close it in Step 1 before proceeding.
 
-- [ ] **Step 4: Adversarial sweep of the fixed file under saturation (strict accounting)**
+- [ ] **Step 4: Adversarial sweep under saturation (strict, self-contained)**
 
-Run: a strict sweep script at `/tmp/flake-sweep-fixed.sh` that (a) starts one `yes`-burner per core before the loop and kills them after; (b) FIRST replays the recorded failing in-file order with `--sequence.seed=1786259877991` five times; (c) then runs seeds 1..30 with `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.ws-bootstrap.test.tsx --sequence.seed=$i`; (d) ACCUMULATES failures, prints each failing seed, and exits NONZERO if any run failed. (Reference implementation of the burner/accumulator discipline: `/tmp/flake-seed-replay.sh`, already used pre-fix.)
+Create `/tmp/flake-sweep-fixed.sh` with EXACTLY this content (strict failure accounting, burner lifecycle, failing-seed replay included):
 
-Expected: exit 0, 35/35 PASS.
+```bash
+#!/usr/bin/env bash
+set -u
+SWEEP_OUT=/tmp/flake-sweep-fixed
+mkdir -p "$SWEEP_OUT"
+BURNERS=()
+for _ in $(seq 1 "$(nproc)"); do (yes > /dev/null 2>&1) & BURNERS+=($!); done
+cleanup() { kill "${BURNERS[@]}" 2>/dev/null || true; wait 2>/dev/null || true; }
+trap cleanup EXIT
+FAILS=0
+# Recorded organic failing in-file order first
+for rep in 1 2 3 4 5; do
+  npm run test:vitest -- run --config config/vitest/vitest.config.ts \
+    test/unit/client/components/App.ws-bootstrap.test.tsx \
+    --sequence.seed=1786259877991 --reporter=basic > "$SWEEP_OUT/replay-$rep.log" 2>&1 \
+    || { FAILS=$((FAILS+1)); echo "FAILING SEED REPLAY $rep FAILED"; }
+done
+for i in $(seq 1 30); do
+  npm run test:vitest -- run --config config/vitest/vitest.config.ts \
+    test/unit/client/components/App.ws-bootstrap.test.tsx \
+    --sequence.seed="$i" --reporter=basic > "$SWEEP_OUT/seed-$i.log" 2>&1 \
+    || { FAILS=$((FAILS+1)); echo "SEED $i FAILED"; }
+done
+echo "sweep failures: $FAILS"
+[ "$FAILS" -eq 0 ]
+```
+
+Run: `bash /tmp/flake-sweep-fixed.sh`
+
+Expected: `sweep failures: 0`, script exit status 0 (35/35).
 
 - [ ] **Step 5: Neighbor-impact verification**
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/store/sidebar-staleness.test.ts`
 
-Expected: PASS (helper semantics unchanged — only newly consumed by this file).
+Expected: PASS (helper semantics unchanged; cross-tab-sync tests in other files are untouched because the stub is scoped to this file's lifecycle hooks).
 
-- [ ] **Step 6: Delete the scratch probe and commit**
+- [ ] **Step 6: Delete scratch probes and commit**
 
 ```bash
-rm test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx
+rm -f test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx \
+      test/unit/client/components/__ws-bootstrap-broadcast-poison.probe.test.tsx \
+      test/unit/client/__xshare-a.probe.test.ts \
+      test/unit/client/__xshare-b.probe.test.ts
 git add test/unit/client/components/App.ws-bootstrap.test.tsx
-git commit -m "test(app): hermetic thunk-state isolation for WS bootstrap recovery suite (load-flake fix)"
+git commit -m "test(app): isolate WS bootstrap recovery suite from cross-file broadcasts and thunk residue (load-flake fix)"
 ```
 
-Expected: commit contains ONLY the test-file change; working tree otherwise clean.
+Expected: commit contains ONLY the target test file; working tree otherwise clean (scratch probes never committed).
 
 ### Task 3: Verification gate — 3 consecutive full client-suite runs + server suite
 
@@ -129,26 +184,31 @@ Expected: commit contains ONLY the test-file change; working tree otherwise clea
 
 **Interfaces:**
 - Consumes: the committed Task 2 fix at the final HEAD.
-- Produces: gate evidence satisfying the verification bar (3 consecutive client-suite passes with the target test passing) plus the executing-plans full-suite gate (both configs, coordinator-owned paths).
+- Produces: gate evidence satisfying the verification bar.
 
-- [ ] **Step 1: Three consecutive coordinator-gated full-suite runs at the final HEAD (no extra load)**
+- [ ] **Step 1: Three consecutive full client-suite runs at the final HEAD**
 
-Run three times, sequentially, with `FRESHELL_TEST_SUMMARY='ws-bootstrap flake fix gate <i>'` where `<i>` is 1, 2, 3:
+For each run `<i>` of 1, 2, 3, sequentially, with NO other load on the machine: first `npm run test:status` (if another broad run holds the coordinator, wait); then:
 
-`npm test`
+`FRESHELL_TEST_SUMMARY="ws-bootstrap flake fix gate <i>" npm run test:vitest -- run --config config/vitest/vitest.config.ts`
 
-`npm test` is the repository's coordinated full-suite command (default client config + server config under the shared test-coordinator gate — this is the coordinator-safe carrier for the task bar's `npx vitest run --config config/vitest/vitest.config.ts` client-config requirement, since the default config is the client config, with the server suite included as a bonus for the executing-plans gate). Before starting, confirm no other holder (`npm run test:status`); if held, wait.
+Expected per run: the suite runs to completion and the target test passes. Any other failure is recorded in the progress ledger as a bug; it may be carried past the gate only after it ALSO reproduces at base_ref (file-isolation run plus, if isolation is green, one full-suite run at base_ref) with the reproduction receipt recorded in the ledger. A run in which the target test fails can never count; all three runs must satisfy the criterion consecutively.
 
-Pass criterion (precise, no ambiguity): the RUN NEED NOT BE FULLY GREEN — the criterion is: the target test PASSES in all three runs; the default-config suite's only failures in any run are failures reproduced at base_ref with the reproduction receipt recorded in the progress ledger; the server suite likewise. Every failure is first recorded in the ledger as a bug with its raw output, then classified.
+- [ ] **Step 2: Server suite at the final HEAD**
+
+Same discipline, one run: `FRESHELL_TEST_SUMMARY="ws-bootstrap flake fix gate server" npm run test:vitest -- run --config config/vitest/vitest.server.config.ts`
+
+Expected: suite completes; failures only with base_ref reproduction receipts in the ledger.
 
 - [ ] **Step 3: Record the gate**
 
-Write the gate report (per-run totals, target-test result per run, receipts for any carried pre-existing failures) and append the gate entry (time, HEAD, exact commands, trigger reason, result) to the progress ledger at `<git-dir>/usual-sdd/progress.md`.
+Write the gate report (per-run totals, target-test result per run, receipts) and append the gate entry (time, HEAD, exact commands, trigger reason, result) to the progress ledger.
 
 ---
 
 ## Notes and explicit non-goals
 
-- **Production code is not changed** unless Task 1's captured dump forces it (STOP condition). The App.tsx recovery twin-guards (`bootstrapDataLoading` etc. returning `true` while a twin leg is in flight; one-deep rerun latch) remain a documented design smell (`plan-bootstrap-code.md` L2) for the recap/follow-up, not this change.
-- **The in-file straggler channel is closed even though the captured organic instance is not yet proven to use it** — the organic instance ran BEFORE the known queue-loop siblings in shuffle order, so the organic channel may differ (the instrumented hammer decides). The boundary resets close ALL residue channels of that class symmetrically; the added fence makes the target test fail honestly if any channel reopens.
-- The failure signature is taken from the raw baseline log (`/tmp/freshell-baseline.log:1861-1877`), not paraphrase: `App.ws-bootstrap.test.tsx:598:91`, duration 486 ms (not a timeout), suite seed `1786259877991`, machine `/home/dan/code/freshell/.worktrees/settings-proto-strict-reject` (same checkout path as this worktree's git metadata dir).
+- **Production code is not changed.** `installCrossTabSync` doing cross-tab layout hydration during bootstrap is intended product behavior; the defect is that the test environment lets OTHER FILES' broadcasts deliver into it. Repo-wide test-hygiene follow-up (out of scope, for the recap): consider namespacing or stubbing `BroadcastChannel` in `test/setup/dom.ts` for all jsdom tests, since any App-mounting test file is exposed to the same poisoning. Files whose tests DO exercise cross-tab sync/persist (e.g. crossTabSync/persist/tabRegistrySync suites) must keep a functional channel, which is why this plan stubs only the affected file.
+- **Secondary channel kept in scope:** the in-file thunk-residue channel (probe-proven quota drift) is closed by the boundary resets, mirroring six sibling files (`test/e2e/sidebar-search-flow.test.tsx:157/172`, `test/e2e/sidebar-repo-filter-flow.test.tsx:140/155`, `test/e2e/sidebar-agent-filter-flow.test.tsx:140/155`, `test/e2e/sidebar-refresh-dom-stability.test.tsx:227/259`, `test/unit/client/store/sidebar-staleness.test.ts:74/77`, `test/unit/client/store/sessionsThunks.test.ts:76/80`).
+- **The App.tsx recovery twin-guards** (`bootstrapDataLoading`/`platformDetailsLoading`/`sidebarWindowLoading` returning `true` while a twin leg is in flight; the one-deep recovery rerun latch) remain a documented design smell (`plan-bootstrap-code.md` L2) for the recap/follow-up, not this change.
+- Failing-run in-file order (replay of the installed shuffle with seed `1786259877991`): target 10th of 36. This informed the secondary-channel analysis; the primary channel is the cross-file broadcast poison established above.
