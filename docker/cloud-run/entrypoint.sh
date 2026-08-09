@@ -3,6 +3,13 @@
 #
 # Translates Cloud Run task indexing env vars into Playwright --shard flags,
 # then execs playwright test with the cloud config and any pass-through args.
+#
+# Args can be passed two ways:
+# 1. As container args (docker run ... --project=chromium auth.spec.ts)
+# 2. Via PLAYWRIGHT_ARGS env var (space-separated, for Cloud Run Jobs where
+#    --args uses comma separators that conflict with Playwright arg values)
+#
+# If both are present, container args take precedence.
 set -euo pipefail
 
 # Cloud Run sets CLOUD_RUN_TASK_INDEX (0-based) and CLOUD_RUN_TASK_COUNT
@@ -19,7 +26,17 @@ else
   echo "[e2e-entrypoint] Running all tests (single task)"
 fi
 
+# Build the args array: shard flags + PLAYWRIGHT_ARGS (if set) + container args
+PW_ARGS=()
+if [ -n "${PLAYWRIGHT_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  PW_ARGS=($PLAYWRIGHT_ARGS)
+fi
+
+echo "[e2e-entrypoint] Playwright args: ${PW_ARGS[*]} $*"
+
 exec npx playwright test \
   --config test/e2e-browser/playwright.cloud.config.ts \
   "${SHARD_ARGS[@]}" \
+  "${PW_ARGS[@]}" \
   "$@"

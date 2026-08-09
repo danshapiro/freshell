@@ -44,11 +44,23 @@ IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
+# Docker when pushing to Artifact Registry).
+GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
+if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
+  export PATH="$GCLOUD_BIN:$PATH"
+fi
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 gcloud_flags() {
   echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
+}
+
+# gcloud artifacts commands use --location, not --region
+gcloud_artifacts_flags() {
+  echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
 }
 
 usage() {
@@ -98,12 +110,17 @@ cmd_push() {
   echo "[e2e-cloud] Pushing to Artifact Registry..."
 
   # Ensure the Artifact Registry repo exists
-  if ! gcloud artifacts repositories describe $(gcloud_flags) "$GCP_REPO" &>/dev/null; then
+  if ! gcloud artifacts repositories describe $(gcloud_artifacts_flags) "$GCP_REPO" &>/dev/null; then
     echo "[e2e-cloud] Creating Artifact Registry repository: $GCP_REPO"
-    gcloud artifacts repositories create $(gcloud_flags) "$GCP_REPO" \
-      --repository-format=docker \
-      --location="$GCP_REGION" || true
+    gcloud artifacts repositories create $(gcloud_artifacts_flags) "$GCP_REPO" \
+      --repository-format=docker || true
   fi
+
+  # Authenticate Docker to Artifact Registry using an access token.
+  # We can't rely on the docker-credential-gcloud helper being on PATH.
+  gcloud auth print-access-token --account="$GCP_ACCOUNT" | \
+    docker login -u oauth2accesstoken --password-stdin \
+      "https://${GCP_REGION}-docker.pkg.dev"
 
   docker tag "$IMAGE_LOCAL" "$IMAGE_REMOTE"
   docker push "$IMAGE_REMOTE"
@@ -168,41 +185,44 @@ cmd_run() {
       "${pw_args[@]}"
   fi
 
+  # Recompute IMAGE_REMOTE with potentially overridden GCP settings
+  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
+
   # Cloud mode
   if $force_build; then
     cmd_build
   fi
 
   # Ensure image exists in remote registry
-  if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" $(gcloud_flags) &>/dev/null 2>&1; then
+  if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
+      --account="$GCP_ACCOUNT" --project="$GCP_PROJECT" &>/dev/null 2>&1; then
     echo "[e2e-cloud] Remote image not found, building and pushing..."
     cmd_build
   fi
-
-  # Update IMAGE_REMOTE with potentially overridden GCP settings
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/freshell-e2e:latest"
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
   echo "[e2e-cloud]   Image:  $IMAGE_REMOTE"
   echo "[e2e-cloud]   Shards: $shards"
   echo "[e2e-cloud]   Args:   ${pw_args[*]}"
 
-  # Create or update the Cloud Run Job
-  local task_env=""
+  # Build a YAML env-vars file for the Cloud Run Job.
+  # We use --env-vars-file (YAML) instead of --set-env-vars because
+  # --set-env-vars splits on spaces, breaking PLAYWRIGHT_ARGS.
+  local env_file
+  env_file=$(mktemp /tmp/e2e-env-vars.XXXXXX.yaml)
+  echo "PLAYWRIGHT_ARGS: \"${pw_args[*]}\"" > "$env_file"
   if [ "$shards" -gt 1 ]; then
-    task_env="--set-tasks-env-vars=CLOUD_RUN_TASK_COUNT=${shards}"
+    echo "CLOUD_RUN_TASK_COUNT: \"$shards\"" >> "$env_file"
   fi
 
-  # Convert pw_args array to a space-separated string for the container args
-  local container_args="${pw_args[*]}"
-
+  # Create or update the Cloud Run Job (create fails if it already exists,
+  # fall back to update).
   gcloud run jobs create $(gcloud_flags) "$GCP_JOB" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
     --task-timeout="60m" \
     --max-retries=0 \
-    $task_env \
-    --args="$container_args" \
+    --env-vars-file="$env_file" \
     --memory=2Gi \
     --cpu=2 \
     2>/dev/null || \
@@ -211,33 +231,44 @@ cmd_run() {
     --tasks="$shards" \
     --task-timeout="60m" \
     --max-retries=0 \
-    $task_env \
-    --args="$container_args" \
+    --env-vars-file="$env_file" \
     --memory=2Gi \
     --cpu=2
 
-  # Execute the job and wait for completion
-  local execution_id
-  execution_id=$(gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" \
-    --format="value(name)" \
-    --wait)
+  rm -f "$env_file"
 
-  # Fetch logs
+  # Execute the job and wait for completion
+  echo "[e2e-cloud] Executing Cloud Run Job..."
+  gcloud run jobs execute $(gcloud_flags) "$GCP_JOB" --wait
+
+  # Get the latest execution name
+  local execution_id
+  execution_id=$(gcloud run jobs executions list $(gcloud_flags) \
+    --job="$GCP_JOB" \
+    --sort-by="~metadata.creationTimestamp" \
+    --format="value(name)" \
+    --limit=1)
+
+  # Fetch logs (requires beta track for logs read)
   echo "[e2e-cloud] Fetching logs..."
-  gcloud run jobs execution logs fetch $(gcloud_flags) "$execution_id" 2>/dev/null || true
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
 
   # Check execution status
   local succeeded
   local failed
   succeeded=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.succeededTaskCount)" 2>/dev/null || echo "0")
+    --format="value(status.succeededCount)" 2>/dev/null || echo "0")
   failed=$(gcloud run jobs executions describe $(gcloud_flags) "$execution_id" \
-    --format="value(status.failedTaskCount)" 2>/dev/null || echo "0")
+    --format="value(status.failedCount)" 2>/dev/null || echo "0")
+
+  # Normalize empty/null to 0
+  succeeded="${succeeded:-0}"
+  failed="${failed:-0}"
 
   echo "[e2e-cloud] Succeeded tasks: $succeeded"
   echo "[e2e-cloud] Failed tasks: $failed"
 
-  if [ "$failed" -gt 0 ]; then
+  if [ "$failed" -gt 0 ] 2>/dev/null; then
     echo "[e2e-cloud] Some tasks failed."
     exit 1
   fi
@@ -249,7 +280,7 @@ cmd_run() {
 # Subcommand: logs
 # ---------------------------------------------------------------------------
 cmd_logs() {
-  gcloud run jobs executions logs fetch $(gcloud_flags) "$GCP_JOB" "$@"
+  gcloud beta run jobs executions logs read $(gcloud_flags) "$GCP_JOB" "$@"
 }
 
 # ---------------------------------------------------------------------------
