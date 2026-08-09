@@ -3,6 +3,9 @@
 > **For agentic workers:** Execute this plan task by task with a fresh
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
+>
+> **STATUS: EXECUTED.** All checkboxes are now checked as executed; in-flight corrections
+> recorded by delta review are annotated inline. Execution ledger: this worktree's git dir `usual-sdd/progress.md`. Addenda: gate remediations `6fd4e1ec1`/`54993c4f1`/`7d009f995` (server onceIdle, causally disjoint from the fix, receipted at base_ref afterwards) and committed regression guard `1b8f57e71` (delta-review round 4).
 
 **Goal:** Eliminate the load-dependent flakiness of `test/unit/client/components/App.ws-bootstrap.test.tsx > "App WS bootstrap recovery > recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s"`, proven by a deterministic reproduction of the observed failure signature that fails before the fix and passes after, plus the task's full verification bar.
 
@@ -51,7 +54,7 @@
 - Consumes: nothing from other tasks.
 - Produces: the RED log `/tmp/probe-poison-nofix.log` showing the exact organic signature, and the evidence report.
 
-- [ ] **Step 1: Build the poison-transport probe**
+- [x] **Step 1: Build the poison-transport probe**
 
 The probe file replicates the target test's ENTIRE setup (copy the imports/mocks/`createStore`/`beforeEach`/`afterEach` from the unfixed `App.ws-bootstrap.test.tsx`) and contains ONE test that runs the target test's exact flow with ONE addition: while App is mounted and its `installCrossTabSync` BroadcastChannel listener is live, post the poison layout through a REAL `BroadcastChannel` on `freshell.persist.v2` (delivery to an already-registered listener in the same jsdom sphere is deterministic — no backlog dependence):
 
@@ -63,7 +66,7 @@ Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/un
 
 Expected: FAIL deterministically at the replicated line-598 assertion, with received `[ 'Codex', 'Manual Session' ]` — byte-identical in shape to `/tmp/freshell-baseline.log:1861`. If the hydrolysis does not take (e.g. `hydrateTabs` declines without a local `persistedAt`), inject earlier/more visibly and/or craft `persistedAt`/`localStorage` seeding per the `installCrossTabSync` dedupe reading (crossTabSync.ts:303-311) until RED reproduces; the probe must DEMONSTRATE the channel, and the report must record what was needed. If no crafting makes it RED, STOP — the root cause story is wrong; report for re-planning.
 
-- [ ] **Step 2: Record the evidence**
+- [x] **Step 2: Record the evidence**
 
 Write the evidence report containing: the root-cause narrative; the two-file channel experiment results (2/6 delivery, fresh globals/localStorage otherwise); the poison probe's RED excerpt; the secondary in-file channel summary (validator-B); the explicit conclusion that product code is behaving as designed and the defect is test-environment isolation (if the probe disagreed, stop and re-plan instead).
 
@@ -77,7 +80,7 @@ Write the evidence report containing: the root-cause narrative; the two-file cha
 - Consumes: nothing beyond the file itself and the two reset helpers (`src/store/sessionsThunks.ts:59`, `src/store/terminalDirectoryThunks.ts:41`).
 - Produces: the fixed, hermetic test file.
 
-- [ ] **Step 1: Apply the fix (additive edits only)**
+- [x] **Step 1: Apply the fix (additive edits only)**
 
 1. Add imports after line 18:
 ```ts
@@ -110,7 +113,7 @@ class InertBroadcastChannel {
 5. In the target test's first `waitFor` (~:559-563) add ONE assertion: `expect(wsMocks.connect).toHaveBeenCalledTimes(1)` — `connect()` is bootstrap's final awaited step, so this proves the initial chain fully unwound before `ready` is injected; additive only.
 6. Ensure any temporary forensic instrumentation is absent (the tree must not contain it).
 
-- [ ] **Step 2: Focused GREEN**
+- [x] **Step 2: Focused GREEN**
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.ws-bootstrap.test.tsx`
 
@@ -122,7 +125,7 @@ The first probe revision was vacuous post-fix: its poison sender was built with 
 
 Evidence: unfixed variant → FAILS with the exact organic signature, 3/3 (`/tmp/probe-poison-v2-nofix.log`); fixed variant → PASSES 2/2 (`/tmp/probe-poison-v2-fixed.log`). A fixed-variant failure with the Codex row would have meant incomplete receiver isolation — it did not occur.
 
-- [ ] **Step 4: Adversarial sweep under saturation (strict, self-contained)**
+- [x] **Step 4: Adversarial sweep under saturation (strict, self-contained)**
 
 Create `/tmp/flake-sweep-fixed.sh` with EXACTLY this content (strict failure accounting, burner lifecycle, failing-seed replay included):
 
@@ -157,13 +160,13 @@ Run: `bash /tmp/flake-sweep-fixed.sh`
 
 Expected: `sweep failures: 0`, script exit status 0 (35/35).
 
-- [ ] **Step 5: Neighbor-impact verification**
+- [x] **Step 5: Neighbor-impact verification**
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/store/sidebar-staleness.test.ts`
 
 Expected: PASS (helper semantics unchanged; cross-tab-sync tests in other files are untouched because the stub is scoped to this file's lifecycle hooks).
 
-- [ ] **Step 6: Delete scratch probes and commit**
+- [x] **Step 6: Delete scratch probes and commit**
 
 ```bash
 rm -f test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx \
@@ -190,7 +193,7 @@ Expected: commit contains ONLY the target test file; working tree otherwise clea
 - Consumes: the committed Task 2 fix at the final HEAD.
 - Produces: gate evidence satisfying the verification bar.
 
-- [ ] **Step 1: Three consecutive full client-suite runs at the final HEAD**
+- [x] **Step 1: Three consecutive full client-suite runs at the final HEAD**
 
 For each run `<i>` of 1, 2, 3, sequentially, with NO other load on the machine: first `npm run test:status` (if another broad run holds the coordinator, wait); then:
 
@@ -198,13 +201,13 @@ For each run `<i>` of 1, 2, 3, sequentially, with NO other load on the machine: 
 
 Expected per run: the suite runs to completion and the target test passes. Any other failure is recorded in the progress ledger as a bug; it may be carried past the gate only after it ALSO reproduces at base_ref (file-isolation run plus, if isolation is green, one full-suite run at base_ref) with the reproduction receipt recorded in the ledger. A run in which the target test fails can never count; all three runs must satisfy the criterion consecutively.
 
-- [ ] **Step 2: Server suite at the final HEAD**
+- [x] **Step 2: Server suite at the final HEAD**
 
 Same discipline, one run: `FRESHELL_TEST_SUMMARY="ws-bootstrap flake fix gate server" npm run test:vitest -- run --config config/vitest/vitest.server.config.ts`
 
 Expected: suite completes; failures only with base_ref reproduction receipts in the ledger.
 
-- [ ] **Step 3: Record the gate**
+- [x] **Step 3: Record the gate**
 
 Write the gate report (per-run totals, target-test result per run, receipts) and append the gate entry (time, HEAD, exact commands, trigger reason, result) to the progress ledger.
 
