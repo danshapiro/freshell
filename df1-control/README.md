@@ -60,6 +60,22 @@ work — only the small status files in `~/.freshell/df1/status/` and ≤3-line 
 - **reaper** (periodic): mechanical kill criteria (stale heartbeat > 60m, phase
   timeouts, review over-budget) → KILLED event + requeue. Never deletes worktrees.
 
+### Operational lessons (append-only)
+
+- 2026-08-09 B001: a deferred item's authored-but-NEVER-RUN spec forfeited the gate's
+  ordering proof and got the merge rejected (SESSION-05). Deferred posture now requires
+  one executable probe run per relevant leg with per-leg outcome classification.
+- 2026-08-09 B001: `test.fail` annotations can silently mask MULTIPLE gaps; un-flipping
+  one gap exposed another (settings-persistence-split:87 → defaultCwd, owned by CFG-12).
+  Un-flips must re-validate every assertion the annotation was hiding.
+- 2026-08-09: subagent task_results can be PREMATURE mid-flight acknowledgments (agent
+  parks a long run and ends its turn). Truth = the ledger/status file + branch head;
+  verify those before acting on any task_result.
+- 2026-08-09 B002: environmental flakes under swarm load (terminal-lifecycle timeouts at
+  load1≈54, multi-client:217 known-both-servers flake, network/net_bind timing tests)
+  must reproduce at the PRE-MERGE tip under similar load before being attributed to a
+  merge. Gatekeepers did this correctly; keep the discipline.
+
 ## Deferred-Playwright policy (agreed 2026-08-08)
 
 Main-phase workers mostly skip Playwright; one mass close-out campaign at the end.
