@@ -93,5 +93,67 @@ CHROMIUM_OUTPUT=$(npm run test:e2e:chromium -- test/e2e-browser/specs/auth.spec.
 }
 echo "PASS: npm run test:e2e:chromium still works"
 
+# Check 8: help mentions --cloud and FRESHELL_E2E_BACKEND
+echo "Testing: help mentions --cloud flag"
+if ! echo "$HELP_OUTPUT" | grep -qi -- "--cloud"; then
+  echo "FAIL: help output does not contain '--cloud'"
+  echo "$HELP_OUTPUT"
+  exit 1
+fi
+echo "PASS: help contains '--cloud'"
+
+echo "Testing: help mentions FRESHELL_E2E_BACKEND"
+if ! echo "$HELP_OUTPUT" | grep -qi "FRESHELL_E2E_BACKEND"; then
+  echo "FAIL: help output does not contain 'FRESHELL_E2E_BACKEND'"
+  echo "$HELP_OUTPUT"
+  exit 1
+fi
+echo "PASS: help contains 'FRESHELL_E2E_BACKEND'"
+
+# Check 9: default backend (unset env var) runs locally
+echo "Testing: default backend (unset FRESHELL_E2E_BACKEND) runs locally"
+DEFAULT_OUTPUT=$(env -u FRESHELL_E2E_BACKEND "$SCRIPT" run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
+  echo "FAIL: default run failed"
+  echo "$DEFAULT_OUTPUT" | tail -20
+  exit 1
+}
+if ! echo "$DEFAULT_OUTPUT" | grep -q "Running locally"; then
+  echo "FAIL: expected 'Running locally' in default output"
+  echo "$DEFAULT_OUTPUT" | tail -20
+  exit 1
+fi
+if ! echo "$DEFAULT_OUTPUT" | grep -q "6 passed"; then
+  echo "FAIL: expected '6 passed' in default output"
+  echo "$DEFAULT_OUTPUT" | tail -20
+  exit 1
+fi
+echo "PASS: default backend (unset) runs locally"
+
+# Check 10: FRESHELL_E2E_BACKEND=local runs locally
+echo "Testing: FRESHELL_E2E_BACKEND=local runs locally"
+LOCAL_ENV_OUTPUT=$(FRESHELL_E2E_BACKEND=local "$SCRIPT" run --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
+  echo "FAIL: FRESHELL_E2E_BACKEND=local run failed"
+  echo "$LOCAL_ENV_OUTPUT" | tail -20
+  exit 1
+}
+if ! echo "$LOCAL_ENV_OUTPUT" | grep -q "Running locally"; then
+  echo "FAIL: expected 'Running locally' with FRESHELL_E2E_BACKEND=local"
+  echo "$LOCAL_ENV_OUTPUT" | tail -20
+  exit 1
+fi
+echo "PASS: FRESHELL_E2E_BACKEND=local runs locally"
+
+# Check 11: --cloud flag overrides FRESHELL_E2E_BACKEND=local
+echo "Testing: --cloud flag is rejected without gcloud (override works)"
+# We can't actually run cloud tests here, but we can verify the flag is
+# parsed by checking that it does NOT print "Running locally"
+CLOUD_FLAG_OUTPUT=$(FRESHELL_E2E_BACKEND=local "$SCRIPT" run --cloud --project=chromium test/e2e-browser/specs/auth.spec.ts 2>&1 || true)
+if echo "$CLOUD_FLAG_OUTPUT" | grep -q "Running locally"; then
+  echo "FAIL: --cloud flag was ignored (printed 'Running locally')"
+  echo "$CLOUD_FLAG_OUTPUT" | tail -20
+  exit 1
+fi
+echo "PASS: --cloud flag overrides FRESHELL_E2E_BACKEND=local"
+
 echo ""
 echo "=== All checks passed ==="

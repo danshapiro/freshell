@@ -11,8 +11,15 @@
 #   logs      Fetch logs from the latest Cloud Run Job execution
 #   help      Show this help message
 #
+# Backend selection:
+#   The FRESHELL_E2E_BACKEND env var controls where tests run by default:
+#     - "local"  (default if unset): run locally via Playwright
+#     - "cloud":                run on Google Cloud Run Jobs
+#   Override at invocation time with --local or --cloud.
+#
 # Flags:
-#   --local           Run locally (skip Cloud Run entirely)
+#   --local           Run locally (overrides FRESHELL_E2E_BACKEND)
+#   --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
 #   --build           Force image rebuild + push before running
 #   --shards=N        Number of parallel Cloud Run tasks (default: 1)
 #   --timeout=DURATION Cloud Run task timeout (default: 60m)
@@ -77,7 +84,8 @@ Subcommands:
   help      Show this help message
 
 Flags:
-  --local           Run locally (skip Cloud Run entirely)
+  --local           Run locally (overrides FRESHELL_E2E_BACKEND)
+  --cloud           Run on Cloud Run (overrides FRESHELL_E2E_BACKEND)
   --build           Force image rebuild + push before running
   --shards=N        Number of parallel Cloud Run tasks (default: 1)
   --timeout=DURATION Cloud Run task timeout (default: 60m)
@@ -87,11 +95,14 @@ Flags:
   --project-id=ID   GCP project (default: misc-puttering-project)
   --region=REGION   GCP region (default: us-west1)
 
+Environment:
+  FRESHELL_E2E_BACKEND  "local" (default) or "cloud"
+
 Examples:
   scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/auth.spec.ts
-  scripts/e2e-cloud.sh run --project=chromium --reporter=line
-  scripts/e2e-cloud.sh run --shards=4 --project=chromium
-  scripts/e2e-cloud.sh run --shards=4 --timeout=30m --project=chromium
+  scripts/e2e-cloud.sh run --cloud --project=chromium --reporter=line
+  scripts/e2e-cloud.sh run --cloud --shards=4 --project=chromium
+  scripts/e2e-cloud.sh run --cloud --shards=4 --timeout=30m --project=chromium
   scripts/e2e-cloud.sh build
   scripts/e2e-cloud.sh help
 EOF
@@ -136,6 +147,7 @@ cmd_push() {
 # ---------------------------------------------------------------------------
 cmd_run() {
   local local_mode=false
+  local cloud_mode=false
   local force_build=false
   local shards=1
   local timeout="60m"
@@ -145,6 +157,10 @@ cmd_run() {
     case "$1" in
       --local)
         local_mode=true
+        shift
+        ;;
+      --cloud)
+        cloud_mode=true
         shift
         ;;
       --build)
@@ -185,6 +201,17 @@ cmd_run() {
         ;;
     esac
   done
+
+  # Resolve backend: explicit flags override env var; env var defaults to local.
+  if $cloud_mode; then
+    local_mode=false
+  elif $local_mode; then
+    : # local_mode already true
+  elif [ "${FRESHELL_E2E_BACKEND:-local}" = "cloud" ]; then
+    cloud_mode=true
+  else
+    local_mode=true
+  fi
 
   if $local_mode; then
     echo "[e2e-cloud] Running locally..."
