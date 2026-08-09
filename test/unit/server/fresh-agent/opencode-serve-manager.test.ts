@@ -838,17 +838,21 @@ describe('OpencodeServeManager fan-out', () => {
     // change alters no semantics: the 15ms pending race, resolution-after-gate,
     // and statusCalls===5 are all inner-deadline-independent.
     const idle = manager.onceIdle('ses_a', 10_000)
+    // Attach the observation branch immediately: otherwise an inner-deadline
+    // rejection (or a lost-sidecar rejection) while we await fifthPollStarted
+    // would surface as an unhandled rejection and poison the whole worker run.
+    const idleObserved = idle.then(() => 'resolved' as const, () => 'rejected' as const)
     push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
 
     await fifthPollStarted
     const pending = await Promise.race([
-      idle.then(() => 'resolved', () => 'rejected'),
+      idleObserved,
       new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 15)),
     ])
     expect(pending).toBe('pending')
 
     allowFifthPoll()
-    await expect(idle).resolves.toBeUndefined()
+    expect(await idleObserved).toBe('resolved')
     expect(statusCalls).toBe(5)
     // Outer wall-clock budget: the 1000ms override asserted promptness, but under
     // full-suite parallel load the worker can be starved past 1000ms even with
