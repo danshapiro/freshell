@@ -34,7 +34,7 @@
 - Cross-file channel experiments (this investigation; logs under `/tmp/xshare-*` and summarized in the Task 1 evidence report):
   1. The test env's `BroadcastChannel` is NOT jsdom-native: jsdom has no living implementation; vitest's jsdom env injects the worker's Node `globalThis.BroadcastChannel` (`node_modules/vitest/dist/chunks/index.CmSc2RE5.js:441-452`). So the channel sphere is shared beyond a single file's jsdom/registry.
   2. Two-file probe (`__xshare-a` posts `{…note:'Codex'}` on `freshell.persist.v2`, keeps the channel open; `__xshare-b` registers later): the later file's listener RECEIVED the earlier file's message in 2/6 runs (and the enclosing file showed fresh globals/localStorage). Delivery is real and intermittent — the flake's statistical profile.
-  3. Hydration requires only a parseable layout with a `persistedAt` newer than the local one (undefined locally here → remote wins): `dispatchHydrateLayoutFromPersisted` merges remote tabs/panes into the mounted store (crossTabSync.ts:150-225).
+  3. Hydration accepts a parseable layout and merges it into the mounted store (`dispatchHydrateLayoutFromPersisted`, crossTabSync.ts:150-225); `persistedAt` arbitration only governs conflicts over tabs that exist locally — remote-only tabs/layouts are always merged in, so an empty local `persistedAt` never blocks the poison.
 - In-file failing-order replay: vitest's installed shuffle algorithm with seed `1786259877991` places the target test 10th of 36, directly after siblings that start fire-and-forget queue refreshes (`terminal.inventory` at file line 973-977) — additional in-file residue exposure, addressed by the secondary fix items.
 - Falsified alternate hypothesis (recorded for the record): per-file isolation of globals/localStorage held (experiment measured nulls); the ONLY measured cross-file transport is the BroadcastChannel.
 
@@ -168,11 +168,15 @@ Expected: PASS (helper semantics unchanged; cross-tab-sync tests in other files 
 ```bash
 rm -f test/unit/client/components/__ws-bootstrap-interlock.probe.test.tsx \
       test/unit/client/components/__ws-bootstrap-broadcast-poison.probe.test.tsx \
+      test/unit/client/components/__ws-bootstrap-poison-v2-fixed.probe.test.tsx \
+      test/unit/client/components/__ws-bootstrap-poison-v2-unfixed.probe.test.tsx \
       test/unit/client/__xshare-a.probe.test.ts \
       test/unit/client/__xshare-b.probe.test.ts
 git add test/unit/client/components/App.ws-bootstrap.test.tsx
 git commit -m "test(app): isolate WS bootstrap recovery suite from cross-file broadcasts and thunk residue (load-flake fix)"
 ```
+
+(Executed note: delta-review round 3 caught that the v2 probes — added after this command was first written — matched vitest's default `*.test.tsx` discovery and would have entered (and failed) subsequent full-suite gate runs. They were deleted before any further gate run. Every scratch probe is now listed here; the worktree must show zero untracked `*.probe.test.*` files before Task 3.)
 
 Expected: commit contains ONLY the target test file; working tree otherwise clean (scratch probes never committed).
 
