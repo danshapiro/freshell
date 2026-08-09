@@ -16,6 +16,8 @@ import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import { makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
+import { _resetSessionWindowThunkState } from '@/store/sessionsThunks'
+import { _resetTerminalDirectoryThunkControllers } from '@/store/terminalDirectoryThunks'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -63,6 +65,25 @@ function stubAudio(): void {
     currentTime: 0,
     src: '',
   }) as unknown as HTMLAudioElement))
+}
+
+// This environment's BroadcastChannel is the worker-global Node channel injected
+// into every jsdom by vitest, so persistMiddleware layout broadcasts from OTHER
+// test files can be delivered into installCrossTabSync's listener mid-test
+// (observed empirically). This file does not test cross-tab sync, so isolate it.
+class InertBroadcastChannel {
+  static readonly name = 'BroadcastChannel'
+  readonly name: string
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onmessageerror: ((event: MessageEvent) => void) | null = null
+  constructor(channelName: string) {
+    this.name = channelName
+  }
+  postMessage(_message: unknown): void {}
+  close(): void {}
+  addEventListener(): void {}
+  removeEventListener(): void {}
+  dispatchEvent(): boolean { return false }
 }
 
 function createSettingsState(options: {
@@ -266,6 +287,9 @@ describe('App WS bootstrap recovery', () => {
   beforeEach(() => {
     cleanup()
     vi.resetAllMocks()
+    vi.stubGlobal('BroadcastChannel', InertBroadcastChannel)
+    _resetSessionWindowThunkState()
+    _resetTerminalDirectoryThunkControllers()
     stubAudio()
     wsMocks.onReconnect.mockReturnValue(() => {})
     wsMocks.onDisconnect.mockImplementation((cb: () => void) => {
@@ -308,6 +332,8 @@ describe('App WS bootstrap recovery', () => {
 
   afterEach(() => {
     cleanup()
+    _resetSessionWindowThunkState()
+    _resetTerminalDirectoryThunkControllers()
     vi.unstubAllGlobals()
   })
 
@@ -560,6 +586,9 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.status).toBe('disconnected')
       expect(bootstrapCalls).toBe(2) // initial attempt + one transient-503 retry
       expect(sidebarCalls).toBe(1)
+      // Fence: connect() is bootstrap's final awaited step, so exactly one call
+      // here proves the initial chain fully unwound before 'ready' is injected.
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
     })
 
     act(() => {
