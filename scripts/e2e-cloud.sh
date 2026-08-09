@@ -15,6 +15,7 @@
 #   --local           Run locally (skip Cloud Run entirely)
 #   --build           Force image rebuild + push before running
 #   --shards=N        Number of parallel Cloud Run tasks (default: 1)
+#   --timeout=DURATION Cloud Run task timeout (default: 60m)
 #   --grep=PATTERN    Pass --grep=PATTERN to Playwright
 #   --project=NAME    Pass --project=NAME to Playwright
 #   --account=EMAIL   GCP account (default: FRESHELL_GCP_ACCOUNT env or dan@danshapiro.com)
@@ -25,6 +26,7 @@
 #   scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/auth.spec.ts
 #   scripts/e2e-cloud.sh run --project=chromium --reporter=line
 #   scripts/e2e-cloud.sh run --shards=4 --project=chromium
+#   scripts/e2e-cloud.sh run --shards=4 --timeout=30m --project=chromium
 #   scripts/e2e-cloud.sh build
 #   scripts/e2e-cloud.sh help
 set -euo pipefail
@@ -78,6 +80,7 @@ Flags:
   --local           Run locally (skip Cloud Run entirely)
   --build           Force image rebuild + push before running
   --shards=N        Number of parallel Cloud Run tasks (default: 1)
+  --timeout=DURATION Cloud Run task timeout (default: 60m)
   --grep=PATTERN    Pass --grep=PATTERN to Playwright
   --project=NAME    Pass --project=NAME to Playwright
   --account=EMAIL   GCP account (default: dan@danshapiro.com)
@@ -88,6 +91,7 @@ Examples:
   scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/auth.spec.ts
   scripts/e2e-cloud.sh run --project=chromium --reporter=line
   scripts/e2e-cloud.sh run --shards=4 --project=chromium
+  scripts/e2e-cloud.sh run --shards=4 --timeout=30m --project=chromium
   scripts/e2e-cloud.sh build
   scripts/e2e-cloud.sh help
 EOF
@@ -134,6 +138,7 @@ cmd_run() {
   local local_mode=false
   local force_build=false
   local shards=1
+  local timeout="60m"
   local -a pw_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -148,6 +153,10 @@ cmd_run() {
         ;;
       --shards=*)
         shards="${1#*=}"
+        shift
+        ;;
+      --timeout=*)
+        timeout="${1#*=}"
         shift
         ;;
       --account=*)
@@ -201,9 +210,10 @@ cmd_run() {
   fi
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
-  echo "[e2e-cloud]   Image:  $IMAGE_REMOTE"
-  echo "[e2e-cloud]   Shards: $shards"
-  echo "[e2e-cloud]   Args:   ${pw_args[*]}"
+  echo "[e2e-cloud]   Image:   $IMAGE_REMOTE"
+  echo "[e2e-cloud]   Shards:  $shards"
+  echo "[e2e-cloud]   Timeout: $timeout"
+  echo "[e2e-cloud]   Args:    ${pw_args[*]}"
 
   # Build a YAML env-vars file for the Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
@@ -219,7 +229,7 @@ cmd_run() {
   gcloud run jobs create $(gcloud_flags) "$GCP_JOB" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
-    --task-timeout="60m" \
+    --task-timeout="$timeout" \
     --max-retries=0 \
     --env-vars-file="$env_file" \
     --memory=2Gi \
@@ -228,7 +238,7 @@ cmd_run() {
   gcloud run jobs update $(gcloud_flags) "$GCP_JOB" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
-    --task-timeout="60m" \
+    --task-timeout="$timeout" \
     --max-retries=0 \
     --env-vars-file="$env_file" \
     --memory=2Gi \
@@ -248,9 +258,23 @@ cmd_run() {
     --format="value(name)" \
     --limit=1)
 
-  # Fetch logs (requires beta track for logs read)
+  # Fetch logs (requires beta track for logs read).
+  # Capture to a variable so we can print the full output AND extract a
+  # per-shard summary, even when some shards fail.
   echo "[e2e-cloud] Fetching logs..."
-  gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true
+  local log_output
+  log_output=$(gcloud beta run jobs executions logs read $(gcloud_flags) "$execution_id" 2>/dev/null || true)
+
+  # Print full log output from ALL shards.
+  echo "$log_output"
+
+  # Extract and display a per-shard summary from the Playwright output.
+  # Each shard's entrypoint prints "Shard X/Y assignment" and Playwright's
+  # line reporter prints a final "  N passed (duration)" or
+  # "  N failed, M passed (duration)" summary line.
+  echo ""
+  echo "[e2e-cloud] Per-shard summary:"
+  echo "$log_output" | grep -E '(\[e2e-entrypoint\] Shard [0-9]+/[0-9]+ assignment|^\s+[0-9]+ (passed|failed))' || true
 
   # Check execution status
   local succeeded
@@ -264,6 +288,7 @@ cmd_run() {
   succeeded="${succeeded:-0}"
   failed="${failed:-0}"
 
+  echo ""
   echo "[e2e-cloud] Succeeded tasks: $succeeded"
   echo "[e2e-cloud] Failed tasks: $failed"
 

@@ -1,0 +1,117 @@
+# Estimated durations for e2e spec files (seconds).
+#
+# These estimates reflect the TOTAL time each spec file takes when run under
+# the cloud config (test/e2e-browser/playwright.cloud.config.ts) with ALL
+# active projects (chromium + legacy-chromium + rust-chromium). Matrix specs
+# that run under 3 projects have proportionally higher estimates.
+#
+# The entrypoint reads this file to perform greedy duration-aware shard
+# assignment instead of Playwright's count-based --shard round-robin. Specs
+# not listed here default to 30s.
+#
+# Format: spec-file-name.spec.ts:estimated-seconds
+#
+# Values are calibrated from the local baseline (28.4m / 222 chromium tests)
+# and the known slow-test categories (server restart recovery, idle grace
+# periods, SIGKILL restore walls, MCP protocol, large scrollback, etc.).
+# They are intentionally rough — the greedy algorithm only needs relative
+# ordering to balance well.
+
+# --- Very slow (restart/recovery cascades, 120s+) ---
+opencode-restart-recovery.spec.ts:180
+server-restart-recovery.spec.ts:240
+restore-contract-wall-rust.spec.ts:300
+agent-crash-autoresume-rust.spec.ts:210
+restore-matrix.spec.ts:360
+truly-idle-alerting.spec.ts:180
+idle-gate-semantics-rust.spec.ts:150
+amplifier-lane-resilience-rust.spec.ts:120
+create-protection-restore-storm-rust.spec.ts:120
+reconcile-client-adoption-rust.spec.ts:120
+freshclaude-identity-persistence-rust.spec.ts:120
+freshagent-settings-resume-rust.spec.ts:120
+session-directory-matrix.spec.ts:200
+safe01-auth-matrix.spec.ts:200
+terminal-lifecycle.spec.ts:200
+
+# --- Slow (60-120s) ---
+multi-client.spec.ts:150
+safe03-origin-matrix.spec.ts:120
+browser-pane.spec.ts:120
+cfg03-backup-restore.spec.ts:120
+term13-scrollback-boundary.spec.ts:120
+restore-double-restart.spec.ts:120
+mcp-qa-smoke-rust.spec.ts:80
+mcp-bridge-rust.spec.ts:60
+ws-ping-pong-matrix.spec.ts:90
+rest-tab-persistence.spec.ts:60
+remote-tab-linkage-rust.spec.ts:60
+codex-terminal-bounce-rust.spec.ts:60
+opencode-terminal-restore-rust.spec.ts:60
+amplifier-restore-rust.spec.ts:60
+terminal-activity-rust.spec.ts:60
+pane-activity-indicator.spec.ts:45
+tabs-client-retire.spec.ts:30
+sidebar-registry-sync-rust.spec.ts:60
+pane-ledger-restart-rust.spec.ts:60
+freshclaude-restart-parity-rust.spec.ts:60
+hidden-pane-rebind-rust.spec.ts:60
+wavea-interactions-rust.spec.ts:60
+reconcile-completion-rust.spec.ts:60
+recover-my-panes-rust.spec.ts:90
+deploy-tab-diff-rust.spec.ts:60
+codex-status-completeness-rust.spec.ts:40
+compound-restart-rust.spec.ts:90
+restore-sync05.spec.ts:90
+resume-button.spec.ts:90
+agent-continuity-matrix.spec.ts:60
+sidebar-click-resume.spec.ts:60
+agent-checkpoint-rewind.spec.ts:45
+diag03-rotation-redaction-rust.spec.ts:60
+opencode-rebind-rust.spec.ts:30
+launch-retry-restart-rust.spec.ts:30
+double-restart-terminal-restore-rust.spec.ts:45
+create-protection-isolation-rust.spec.ts:45
+create-rate-limit-ladder-rust.spec.ts:30
+rest-spawn-gate-rust.spec.ts:30
+turn-complete-restart-resume-rust.spec.ts:30
+freshclaude-zero-turn-restart-rust.spec.ts:30
+silent-input-loss-rust.spec.ts:30
+freshopencode-restart-recovery.spec.ts:30
+createrequestid-stabilization-rust.spec.ts:30
+harness-01-rust-server.spec.ts:30
+harness-02-matrix-bite.spec.ts:30
+settings-live-reload.spec.ts:30
+settings-persistence-split.spec.ts:30
+
+# --- Medium (20-60s) ---
+fresh-agent.spec.ts:72
+pane-system.spec.ts:80
+tab-management.spec.ts:88
+settings.spec.ts:64
+sidebar.spec.ts:64
+mobile-viewport.spec.ts:30
+reconnection.spec.ts:48
+editor-pane.spec.ts:48
+multirow-tabs.spec.ts:48
+screenshot-baselines.spec.ts:48
+tab-bar-resize.spec.ts:40
+stress.spec.ts:40
+fresh-agent-centralization-smoke.spec.ts:32
+freshopencode-db-history.spec.ts:24
+term28-path-shadow-rust.spec.ts:40
+sidebar-opencode-rail.spec.ts:20
+codex-terminal-restore-rust.spec.ts:30
+reconcile-handshake-rust.spec.ts:24
+opencode-replay-write-progression.spec.ts:15
+terminal-background-freeze-catchup.spec.ts:15
+browser-pane-screenshot.spec.ts:20
+
+# --- Fast (<20s) ---
+auth.spec.ts:12
+fresh-agent-mobile.spec.ts:8
+freshopencode-first-send-reload-repro.spec.ts:15
+freshopencode-model-picker.spec.ts:8
+pane-picker-layout.spec.ts:8
+pane-picker.spec.ts:10
+tab-recency-sync.spec.ts:8

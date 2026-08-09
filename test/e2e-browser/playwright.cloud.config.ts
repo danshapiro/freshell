@@ -18,8 +18,46 @@ import baseConfig from './playwright.config.js'
 //   firefox/webkit when CI is unset (which it is in cloud), and
 //   continuity-smoke is opt-in via FRESHELL_SMOKE (also unset). We filter
 //   defensively to be safe.
-// - Sharding is handled by the entrypoint script which passes --shard=x/y
-//   based on CLOUD_RUN_TASK_INDEX/CLOUD_RUN_TASK_COUNT.
+// - Cloud-incompatible spec files excluded via testIgnore (see CLOUD_SKIP_SPECS).
+// - Screenshot comparison tests excluded via grepInvert (see CLOUD_SKIP_TITLES).
+// - Sharding is handled by the entrypoint script which assigns spec files to
+//   shards using duration-aware greedy bin-packing (not Playwright's --shard).
+
+// Spec files that cannot run in the Cloud Run Docker image because they
+// require external CLI binaries (opencode, codex, claude/amplifier) that
+// are not installed, or because they depend on environment-specific
+// rendering/timing that differs in cloud.
+const CLOUD_SKIP_SPECS = [
+  // Requires opencode binary
+  'freshopencode-db-history.spec.ts',
+  'freshopencode-model-picker.spec.ts',
+  'freshopencode-restart-recovery.spec.ts',
+  'freshopencode-first-send-reload-repro.spec.ts',
+  'opencode-restart-recovery.spec.ts',
+  'opencode-terminal-restore-rust.spec.ts',
+  // Requires codex binary
+  'codex-terminal-bounce-rust.spec.ts',
+  'codex-terminal-restore-rust.spec.ts',
+  // Requires amplifier/claude binary
+  'amplifier-restore-rust.spec.ts',
+  'remote-tab-linkage-rust.spec.ts',
+  // Requires fresh-agent binaries (claude/codex/opencode sidecars)
+  'fresh-agent-centralization-smoke.spec.ts',
+  // Environment-sensitive: viewport rendering differs in cloud
+  'mobile-viewport.spec.ts',
+  // Environment-sensitive: timing-sensitive status transitions
+  'pane-activity-indicator.spec.ts',
+  // Environment-sensitive: timing-sensitive localStorage persistence
+  'rest-tab-persistence.spec.ts',
+]
+
+// Test titles to exclude via grepInvert (keeps the spec file but skips
+// specific tests within it). Must be RegExp, not strings.
+const CLOUD_SKIP_TITLES = [
+  // Screenshot comparison fails due to font rendering differences in cloud
+  /loads a new JS asset after the click/,
+]
+
 export default defineConfig({
   ...baseConfig,
   globalSetup: undefined,
@@ -28,7 +66,16 @@ export default defineConfig({
   retries: 2,
   workers: 2,
   reporter: [['line'], ['html', { open: 'never' }]],
-  projects: (baseConfig.projects ?? []).filter(
-    (p) => !['firefox', 'webkit', 'continuity-smoke'].includes(p.name ?? ''),
-  ),
+  grepInvert: CLOUD_SKIP_TITLES,
+  projects: (baseConfig.projects ?? [])
+    .filter(
+      (p) => !['firefox', 'webkit', 'continuity-smoke'].includes(p.name ?? ''),
+    )
+    .map((p) => ({
+      ...p,
+      testIgnore: [
+        ...(p.testIgnore ?? []),
+        ...CLOUD_SKIP_SPECS.map((s) => `**/${s}`),
+      ],
+    })),
 })
