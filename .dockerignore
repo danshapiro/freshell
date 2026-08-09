@@ -1,0 +1,17 @@
+node_modules/
+dist/
+target/
+.git/
+.worktrees/
+.claude/
+.the-usual-logs/
+*.log
+.env
+test-results/
+playwright-report/
+docs/
+.vscode/
+.idea/
+*.md
+!package.json
+!package-lock.json
