@@ -831,7 +831,13 @@ describe('OpencodeServeManager fan-out', () => {
     })
     await manager.ensureStarted()
 
-    const idle = manager.onceIdle('ses_a', 100)
+    // Inner idle-wait deadline raised 100ms -> 10s: onceIdle's internal timer
+    // rejects and tears down the poll loop, so under full-suite parallel load a
+    // starved worker let it fire before the gated fifth poll, deadlocking the
+    // test on fifthPollStarted (observed as an outer timeout at 1008ms). The
+    // change alters no semantics: the 15ms pending race, resolution-after-gate,
+    // and statusCalls===5 are all inner-deadline-independent.
+    const idle = manager.onceIdle('ses_a', 10_000)
     push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
 
     await fifthPollStarted
@@ -844,10 +850,10 @@ describe('OpencodeServeManager fan-out', () => {
     allowFifthPoll()
     await expect(idle).resolves.toBeUndefined()
     expect(statusCalls).toBe(5)
-    // The tight 1s budget asserted promptness, but under full-suite parallel load the
-    // worker can be starved past 1000ms before the final poll cycle lands (observed
-    // 1008ms gate flake). 10s preserves the semantic checks (the 15ms pending race +
-    // resolution-after-gate) while tolerating scheduler stalls.
+    // Outer wall-clock budget: the 1000ms override asserted promptness, but under
+    // full-suite parallel load the worker can be starved past 1000ms even with
+    // healthy inner behavior (observed 1008ms gate flake). 10s preserves the
+    // semantic checks while tolerating scheduler stalls.
   }, 10000)
 
   it('onceIdle rejects on timeout', async () => {
