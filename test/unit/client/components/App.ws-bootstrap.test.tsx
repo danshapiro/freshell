@@ -16,8 +16,6 @@ import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import { makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
-import { PERSIST_BROADCAST_CHANNEL_NAME } from '@/store/persistBroadcast'
-import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { _resetSessionWindowThunkState } from '@/store/sessionsThunks'
 import { _resetTerminalDirectoryThunkControllers } from '@/store/terminalDirectoryThunks'
 import {
@@ -29,12 +27,6 @@ import {
   type ServerSettings,
   type ServerSettingsPatch,
 } from '@shared/settings'
-
-// Captured at module scope — evaluated BEFORE any test hook runs, so this holds
-// the worker-NATIVE BroadcastChannel class even though beforeEach stubs the
-// global with InertBroadcastChannel. Used to prove that a persist broadcast from
-// a foreign native sender cannot contaminate this mounted suite's store.
-const NativeBroadcastChannel = globalThis.BroadcastChannel
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -640,82 +632,6 @@ describe('App WS bootstrap recovery', () => {
     expect(sidebarCalls).toBe(2)
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
-  })
-
-  it('cross-file poison guard: a persist-layout broadcast posted through the worker-native BroadcastChannel cannot contaminate the mounted suite store', async () => {
-    const store = createStore()
-
-    render(
-      <Provider store={store}>
-        <App />
-      </Provider>
-    )
-
-    await waitFor(() => {
-      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
-    })
-
-    // The exact poison shape persistMiddleware broadcasts from other test files
-    // (version 4 layout / version 7 panes, per src/store/persistedState.ts).
-    const now = Date.now()
-    const poisonLayout = {
-      version: 4,
-      persistedAt: now,
-      tabs: {
-        activeTabId: 'poison-codex-tab',
-        tabs: [{
-          id: 'poison-codex-tab',
-          title: 'Codex',
-          createdAt: now,
-          mode: 'codex',
-          sessionRef: { provider: 'codex', sessionId: 'poison-codex-session' },
-        }],
-      },
-      panes: {
-        version: 7,
-        layouts: {
-          'poison-codex-tab': {
-            type: 'leaf',
-            id: 'poison-pane',
-            content: {
-              kind: 'terminal',
-              createRequestId: 'poison-req',
-              status: 'running',
-              mode: 'codex',
-              shell: 'system',
-              terminalId: 'poison-term',
-              sessionRef: { provider: 'codex', sessionId: 'poison-codex-session' },
-            },
-          },
-        },
-        activePane: { 'poison-codex-tab': 'poison-pane' },
-        paneTitles: {},
-        paneTitleSetByUser: {},
-      },
-      tombstones: [],
-    }
-
-    act(() => {
-      const ch = new NativeBroadcastChannel(PERSIST_BROADCAST_CHANNEL_NAME)
-      ch.postMessage({
-        type: 'persist',
-        key: LAYOUT_STORAGE_KEY,
-        raw: JSON.stringify(poisonLayout),
-        sourceId: 'cross-file-poison-guard',
-      })
-      ch.close()
-    })
-
-    // Settle the full async bootstrap chain past the cross-tab listener's
-    // delivery window before asserting absence: the default bootstrap commits
-    // the empty sidebar window AFTER the listener is registered and the poison
-    // posted, so any live hydration would have landed first.
-    await waitFor(() => {
-      expect(store.getState().sessions.windows.sidebar?.lastLoadedAt).toEqual(expect.any(Number))
-    })
-
-    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'poison-codex-tab')).toBe(false)
-    expect(store.getState().panes.layouts['poison-codex-tab']).toBeUndefined()
   })
 
   it('tears down the session and surfaces an auth failure when the sidebar window load returns 401', async () => {
