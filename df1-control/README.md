@@ -112,12 +112,14 @@ boundaries, then self-merge on green checks per repo norm.
   `latest-suite: default:test/unit failure exit=1`, `test=failure`, `test:server=failure`
   (but `check=success`, `verify=success`, `test:integration=success`). Provenance of
   those runs is ambiguous (other agents/worktrees share the box).
-- Definitive check: a coordinated `npm test` against this control worktree
-  (`origin/main` content) is launched in the background on 2026-08-08. Result:
-  **PENDING — see `~/.freshell/df1/events/preflight-npm-test.log` and the orchestrator's
-  session notes. KICKOFF REQUIRES THIS GREEN (or explicit user override).**
-- `cargo test --workspace` baseline: deferred to kickoff pre-flight unless time allows
-  overnight; same green requirement before spawning item worktrees.
+- Definitive check: coordinated `npm test` run in this control worktree (= `origin/main`
+  content, `4c2297667`) overnight 2026-08-08→09. **Result: GREEN (exit 0).**
+  437 passed / 3 skipped unit files (4904 + 8 tests), 314 passed / 5 skipped server
+  files (4889 + 29 tests), 34/34 electron files (350 tests). Coordinator now records
+  `full-suite success exit=0`. Log: `~/.freshell/df1/events/preflight-npm-test.log`.
+  The earlier red status was a foreign run, not the base. Base greenness: ESTABLISHED.
+- `cargo test --workspace` baseline: still pending; run as part of kickoff step 1
+  (green required before spawning item worktrees).
 
 ## Open decisions awaiting the user (from the 2026-08-08 proposal)
 
