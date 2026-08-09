@@ -64,6 +64,8 @@ const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
+  // Requires codex binary (creates mode:'codex' tabs via MCP)
+  'mcp-qa-smoke-rust.spec.ts',
 ]
 
 // Test titles to exclude via grepInvert (keeps the spec file but skips
