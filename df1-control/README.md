@@ -4,8 +4,8 @@ Created 2026-08-08. Branch `df1/control-plane` (infra only). Integration branch:
 `df1/integration` (starts at `origin/main` = `4c2297667`). State lives outside git at
 `~/.freshell/df1/` (survives worktree teardown).
 
-**Status: STAGED, NOT KICKED OFF.** The user gives the explicit go. Until then: no
-worker/gatekeeper agents, no item worktrees, no PRs.
+**Status: KICKED OFF 2026-08-09. War room: <https://github.com/danshapiro/freshell/issues/624>**
+Branches `df1/control-plane` and `df1/integration` are pushed on origin.
 
 ## Goal
 
@@ -121,24 +121,41 @@ boundaries, then self-merge on green checks per repo norm.
 - `cargo test --workspace` baseline: still pending; run as part of kickoff step 1
   (green required before spawning item worktrees).
 
-## Open decisions awaiting the user (from the 2026-08-08 proposal)
+## Decisions resolved at kickoff (2026-08-09, user: "Ignore the existing work. Kickoff: Go!")
 
-1. Existing `parity-campaign` (20260805) + `qa-campaign` (20260806) worktrees/branches:
-   superseded by df1, complementary, or ignore? (Collision risk on merge.)
-2. Plans-only pass for the 66 host-limited items: yes/no.
-3. Themed PRs (~15–25) vs other granularity at the end.
-4. Wave-0 enabler items: matrix auto-registration + evidence-file convention (this
-   README assumes evidence files already; auto-registration still unbuilt).
-5. Final `agent` lane cap (24 → 32 ramp) subject to observed machine health.
+1. Existing `parity-campaign`/`qa-campaign` work: IGNORED — df1 is sovereign over the
+   checklist; any content conflicts get resolved when df1 lands, not before.
+2. Host-limited 66: NO hands now (verdict reported to user + issue #624: ~52-item
+   Tauri/Windows desktop epic + 13 MIGRATE upgrade-path items → park for a future
+   dedicated Windows-desktop campaign; plans-only pass remains a user option).
+3. PR granularity: themed PRs per wave from `df1/integration` → `main` (~15–25 total),
+   per-wave user approval per repo rule.
+4. Wave-0 enablers: proceed WITHOUT the matrix auto-registration enabler for now —
+   additive one-line `MATRIX_SPECS` registration + gatekeeper unioning (cheap, known);
+   the enabler can be promoted later if conflicts prove hot. Workers already use
+   evidence files by rule.
+5. Ramp 8→16→24→32 as planned, subject to live machine health (MemAvailable/load guards
+   in acquire.sh) — the two smoke workers at kickoff double as the first health sample.
+
+## Incident note (2026-08-09): Aug-6 analysis docs lost; campaign unaffected
+
+Four NEVER-COMMITTED analysis drafts (`docs/plans/canonical/wip/20260806-*.md` —
+audit/followup/worktrees/e2e-parity) were deleted from the main checkout by foreign
+agent activity overnight (clean-style operation; the main checkout was also left on an
+unrelated branch). They carried campaign-DESIGN context only. Nothing operative was
+lost: the queue derives 100% from `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`,
+which is committed and intact on `origin/main` (verified 234/234 items + TERM-25 quirk).
+Lesson applied: df1 state lives in git or under `~/.freshell/df1/` — never as loose
+untracked files in a shared checkout.
 
 ## Kickoff checklist (orchestrator, on user "go")
 
-1. Confirm pre-flight `npm test` green (this section); if red, report the failing
-   suites to the user and STOP.
-2. `df1ctl.py init df1-control/queue/items.json` (already done at staging time —
-   verify) and `df1ctl.py report --states queued` to size the first wave.
-3. Wave 0: harness-enabler items first (HARNESS-03, 04, 05, 06-Linux-parts, 11, 12, 14
-   + stress-project enabler + the matrix auto-registration enabler, if approved).
+1. ✅ Pre-flight `npm test` green at base `4c2297667` (this section). `cargo test
+   --workspace` baseline RUNNING at kickoff (green required before item worktrees).
+2. ✅ Queue initialized (staging); branches pushed; war-room issue #624 created.
+3. Wave 0: harness-enabler items first (HARNESS-03, 04, 05, 06-Linux-doable scope, 11,
+   12, 14), gated on cargo baseline green. Smoke workers CFG-04 + SESSION-05 lead to
+   validate the worker→verifier→gatekeeper pipeline before the wave.
 4. Ramp waves 8→16→24→32; keep the reaper sweeping; gatekeeper batch per ~10 verified
    items; user approves PR creation per wave.
 5. After the last item wave: close-out campaign (full suite both kinds + the deferred
