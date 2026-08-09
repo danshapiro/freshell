@@ -10,7 +10,7 @@ import { defineConfig, devices } from '@playwright/test'
 // verified against the Rust target; run the full suite against Rust
 // explicitly via `--project=rust-chromium` with a broader `testMatch`
 // override when that verification work happens.
-const MATRIX_SPECS = [
+export const MATRIX_SPECS = [
   /server-restart-recovery\.spec\.ts$/,
   /settings-persistence-split\.spec\.ts$/,
   /harness-02-matrix-bite\.spec\.ts$/,
@@ -83,7 +83,7 @@ const MATRIX_SPECS = [
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
-const RUST_ONLY_SPECS = [
+export const RUST_ONLY_SPECS = [
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
