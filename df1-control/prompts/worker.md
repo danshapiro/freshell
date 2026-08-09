@@ -92,13 +92,22 @@ python3 /home/dan/code/freshell/.worktrees/df1-control/df1-control/scripts/df1ct
     "sha":"<head-sha>","note":"<≤120 chars>","tests":"<one-line last focused result>",
     "heartbeat":true,"decisions":["<one-line decisions you made>"]}'
 ```
-Completion: same call with `"state":"merged-unverified-e2e"` (behavior items, pw deferred)
-or `"state":"done"` (self-verify items with green evidence), plus `"terminal":"COMPLETED"`.
+Completion: same call with `"state":"review"` plus `"terminal":"COMPLETED"`. From there
+the orchestrator's verifier re-runs your claimed greens, then the gatekeeper merges and
+moves the item to `merged-unverified-e2e`. NEVER set `done` or any merged-* state
+yourself — those belong to the verifier/gatekeeper.
 Blocked: `"state":"blocked","blockedOn":"<ID-or-reason>","terminal":"BLOCKED"`.
 True user-level decision needed: `"state":"needs-human","note":"<the question>"`.
 
-Your final message to the orchestrator, ≤15 lines:
-`DF1 {{ITEM_ID}}: <verdict> | <what landed> | <focused tests> | <outstanding>`
+Your final message to the orchestrator, ≤15 lines, MUST have this shape (the verifier
+consumes it mechanically — list only commands you actually ran green at that SHA):
+```
+DF1 {{ITEM_ID}}: <verdict> | <what landed> | <outstanding>
+SHA: <final head sha>
+GREEN COMMANDS (verbatim, re-run green at that SHA):
+- <cmd 1>
+- <cmd 2>
+```
 
 ## Definition of done (yours)
 

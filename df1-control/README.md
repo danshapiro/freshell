@@ -118,8 +118,9 @@ boundaries, then self-merge on green checks per repo norm.
   files (4889 + 29 tests), 34/34 electron files (350 tests). Coordinator now records
   `full-suite success exit=0`. Log: `~/.freshell/df1/events/preflight-npm-test.log`.
   The earlier red status was a foreign run, not the base. Base greenness: ESTABLISHED.
-- `cargo test --workspace` baseline: still pending; run as part of kickoff step 1
-  (green required before spawning item worktrees).
+- `cargo test --workspace` baseline at base (control worktree, kickoff day): **GREEN —
+  2817 passed / 0 failed across 104 test binaries.** Base greenness ESTABLISHED on both
+  axes (npm + cargo). Log: `~/.freshell/df1/events/preflight-cargo.log`.
 
 ## Decisions resolved at kickoff (2026-08-09, user: "Ignore the existing work. Kickoff: Go!")
 
@@ -150,8 +151,8 @@ untracked files in a shared checkout.
 
 ## Kickoff checklist (orchestrator, on user "go")
 
-1. ✅ Pre-flight `npm test` green at base `4c2297667` (this section). `cargo test
-   --workspace` baseline RUNNING at kickoff (green required before item worktrees).
+1. ✅ Pre-flight green at base `4c2297667`: `npm test` GREEN + `cargo test --workspace`
+   GREEN (2817/0 fail, 104 binaries). Item worktrees may spawn.
 2. ✅ Queue initialized (staging); branches pushed; war-room issue #624 created.
 3. Wave 0: harness-enabler items first (HARNESS-03, 04, 05, 06-Linux-doable scope, 11,
    12, 14), gated on cargo baseline green. Smoke workers CFG-04 + SESSION-05 lead to
