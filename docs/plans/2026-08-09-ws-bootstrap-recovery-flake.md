@@ -116,11 +116,11 @@ Run: `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/un
 
 Expected: 36/36 PASS.
 
-- [ ] **Step 3: Deterministic repro passes after the fix**
+- [x] **Step 3: Deterministic repro passes after the fix — REVISED during execution (delta-review round 2, finding 1)**
 
-Re-create the probe from the FIXED file (its `beforeEach` now stubs `BroadcastChannel`; note the probe's own poison post then ALSO uses the inert class, so nothing is delivered — which is precisely the fixed behavior). Run the same command as Task 1 Step 1 against the regenerated probe file (fresh copy of the fixed file), log to `/tmp/probe-poison-fixed.log`.
+The first probe revision was vacuous post-fix: its poison sender was built with the stubbed inert class, so no message was ever attempted. The executed revision (Task 5) uses the real fixed topology: the probe captures the worker-native `BroadcastChannel` at module scope (`const NativeBroadcastChannel = globalThis.BroadcastChannel`) and posts the poison layout with the NATIVE class (exactly what a foreign test file's `persistMiddleware` does), while the mounted App's receiver is whatever the copied file's hooks installed. Two scratch variants: `__ws-bootstrap-poison-v2-unfixed.probe.test.tsx` (no stub in `beforeEach`) and `__ws-bootstrap-poison-v2-fixed.probe.test.tsx` (stub present — mirrors the fixed file).
 
-Expected: PASS. Also regenerate+run the probe AGAINST THE UNFIXED copy once more as the control (`/tmp/probe-poison-nofix.log` must still show the RED). If the fixed-file probe still FAILS with the poisoned `Codex` row, a live hydration path remains — find it and close it in Step 1 before proceeding.
+Evidence: unfixed variant → FAILS with the exact organic signature, 3/3 (`/tmp/probe-poison-v2-nofix.log`); fixed variant → PASSES 2/2 (`/tmp/probe-poison-v2-fixed.log`). A fixed-variant failure with the Codex row would have meant incomplete receiver isolation — it did not occur.
 
 - [ ] **Step 4: Adversarial sweep under saturation (strict, self-contained)**
 
