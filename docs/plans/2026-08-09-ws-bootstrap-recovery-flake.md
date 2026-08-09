@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Red-Green-Refactor TDD; the RED evidence for the fix is: (a) the by-construction probe failing against the unfixed boundary, and (b) any organically captured instrumented failure. Both artifacts must exist before Task 2 commits.
+- Red-Green-Refactor TDD; the RED evidence for the fix is the by-construction probe failing against the unfixed boundary (mandatory) plus any organically captured instrumented failure (best-effort enrichment, NOT a commit gate — an 0-of-N organic result is a recorded outcome, not a deadlock).
 - NEVER weaken the target test: no deleted or loosened assertions, no retry wrappers, no skips, no blanket timeout inflation. All test changes are additive (reset calls at boundaries; one added fence assertion; forensic instrumentation is added and then REMOVED before the final commit).
 - Repo rules: broad test runs use repo-owned commands (`npm run test:vitest -- ...`, the repo-owned equivalent of the sanctioned baseline command `npx vitest run --config config/vitest/vitest.config.ts`; `test:vitest` runs under the shared coordinator). Set `FRESHELL_TEST_SUMMARY` for broad runs. Never run `pkill`/`kill` patterns against foreign test processes.
 - Commits use the repo git identity; do not create a PR.
@@ -22,7 +22,7 @@
 
 1. A deterministic reproduction fails before the fix and passes after.
 2. The target test passes in isolation (its file alone).
-3. The target test passes in 3 consecutive full client-suite runs (`npm run test:vitest -- run --config config/vitest/vitest.config.ts`, the repo-owned path for the baseline's exact command), with any other-test failures reproduced at base_ref before being recorded as allowed pre-existing load-flaky failures.
+3. The target test passes in 3 consecutive coordinator-gated full-suite runs (`npm test`, which includes the task-pinned client config), with any other-test failures reproduced at base_ref before being recorded as allowed pre-existing load-flaky failures.
 
 ## Evidence base (already produced; absolute paths)
 
@@ -30,7 +30,8 @@
 - `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/plan-test-infra.md` — vitest mechanics (pool=threads, isolate=true, jsdom per file, shuffle covers file AND in-file order, no worker cap).
 - `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/load-bearing-validator-B.md` — deterministic probe RED/GREEN (see Task 1 Step 2).
 - `/home/dan/code/freshell/.worktrees/.the-usual-logs/ws-bootstrap-recovery-flake/reports/workspace-baseline.md` — orchestrator baseline.
-- `/tmp/freshell-baseline.log` (raw, base_ref full-suite run at 2026-08-09 00:16): the organic failure — `AssertionError: expected [ 'Codex', 'Manual Session' ] to deeply equal [ 'Manual Session' ]` at `App.ws-bootstrap.test.tsx:598:91` after 486 ms (no timeout); the target test ran 6th of 36 in-file (BEFORE the queue-loop sibling tests at file lines 1801/1884/1973), so this organic instance is NOT explained by those siblings' residue.
+- `/tmp/freshell-baseline.log` (raw, base_ref full-suite run at 2026-08-09 00:16): the organic failure — `AssertionError: expected [ 'Codex', 'Manual Session' ] to deeply equal [ 'Manual Session' ]` at `App.ws-bootstrap.test.tsx:598:91` after 486 ms (no timeout), suite seed `1786259877991`.
+- In-file execution order of that failing run (deterministic replay of vitest's installed shuffle algorithm — `chunk-hooks.js:1721-1729` with `@vitest/utils` `shuffle()`; script run against the 36 collected titles): the target ran 10th, directly after `registers regenerated restart request ids for durable restore and explicit fresh recovery` (file line 914, injects `terminal.inventory` → starts BOTH fire-and-forget paths: `fetchTerminalDirectoryWindow` and `queueActiveSessionWindowRefresh`), `keeps the active non-sidebar session surface during websocket recovery when the sidebar window is already loaded` (file line 2179), and `dispatches wsCloseCode to lastErrorCode in Redux when connect rejects with close code`. So the failing run DID have queue-refresh-starting siblings before the target — the in-file residue hypothesis is positionally live on the failing order (the reporter's declaration-order listing that suggested otherwise was misleading). The observed signature (no timeout, intact final counts) still means its content channel is not fully explained by quota drift alone; Task 1 Step 1's instrumentation capture plus the seed-pinned replay (Task 2 Step 4) stand as the organic adjudicators.
 - Reviewer hypothesis and its analysis — cross-file `BroadcastChannel` contamination (Fresh Eyes round 1, major finding 1): investigated and falsified as a mechanism. `persistBroadcast.ts` posts only from `persistMiddleware`, which this test file's stores never install, so nothing in this file posts; vitest gives each file a fresh jsdom (per-file globals) and Node's `BroadcastChannel` never crosses worker threads nor retains a backlog for later-created instances, so neither cross-file nor in-file cross-test delivery into `installCrossTabSync`'s listener (App.tsx:312-315) can occur here. The observed content must therefore come from a channel that ships REAL content into the target test's OWN store — captured empirically in Task 1 Step 1.
 
 ---
@@ -48,7 +49,7 @@
 
 - [ ] **Step 1: Capture an organic failure with instrumentation**
 
-Run (as launched during planning; reuse its outputs if it already produced a reproduction): `bash /tmp/flake-hammer.sh` — up to 8 full client-suite runs of `FRESHELL_TEST_SUMMARY='flake hammer run <i>' npm run test:vitest -- run --config config/vitest/vitest.config.ts --reporter=basic`, stopping at the first run containing a `FLAKE-DEBUG` line; the dump lands in `/tmp/flake-hammer/FLAKE-DEBUG.json`.
+Run (as launched during planning; reuse its outputs if it already produced a reproduction): `bash /tmp/flake-hammer.sh` — up to 8 SEQUENTIAL full client-suite runs of `FRESHELL_TEST_SUMMARY='flake hammer run <i>' npm run test:vitest -- run --config config/vitest/vitest.config.ts --reporter=basic`, stopping at the first run containing a `FLAKE-DEBUG` line; the dump lands in `/tmp/flake-hammer/FLAKE-DEBUG.json`. `test:vitest` is a coordinator passthrough (no shared gate) — the hammer may only run when `npm run test:status` shows no other broad-run holder, and never concurrently with another broad run; the final gate in Task 3 uses the coordinator-owned `npm test`.
 
 Expected: either a captured dump (settle exactly which store field carries the `Codex` row: `sessions.projects` content, `windows.sidebar.projects`, `tabs`, item source flags `isFallback`/`liveTerminalOnly`, plus `bootstrapCalls`/`sidebarCalls`/snapshot mock call count), or 0 reproductions in 8 runs (documented; channel attribution then rests on the probe + static analysis and the fix is judged solely by Task 3's gate).
 
@@ -100,9 +101,9 @@ Expected: PASS / FAIL respectively.
 
 - [ ] **Step 4: Adversarial sweep of the fixed file under saturation (strict accounting)**
 
-Run: a strict sweep script at `/tmp/flake-sweep-fixed.sh` that (a) starts one `yes`-burner per core before the loop and kills them after; (b) for seeds 1..30 runs `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.ws-bootstrap.test.tsx --sequence.seed=$i`; (c) ACCUMULATES failures, prints each failing seed, and exits NONZERO if any seed failed.
+Run: a strict sweep script at `/tmp/flake-sweep-fixed.sh` that (a) starts one `yes`-burner per core before the loop and kills them after; (b) FIRST replays the recorded failing in-file order with `--sequence.seed=1786259877991` five times; (c) then runs seeds 1..30 with `npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.ws-bootstrap.test.tsx --sequence.seed=$i`; (d) ACCUMULATES failures, prints each failing seed, and exits NONZERO if any run failed. (Reference implementation of the burner/accumulator discipline: `/tmp/flake-seed-replay.sh`, already used pre-fix.)
 
-Expected: exit 0, 30/30 PASS.
+Expected: exit 0, 35/35 PASS.
 
 - [ ] **Step 5: Neighbor-impact verification**
 
@@ -130,19 +131,15 @@ Expected: commit contains ONLY the test-file change; working tree otherwise clea
 - Consumes: the committed Task 2 fix at the final HEAD.
 - Produces: gate evidence satisfying the verification bar (3 consecutive client-suite passes with the target test passing) plus the executing-plans full-suite gate (both configs, coordinator-owned paths).
 
-- [ ] **Step 1: Three consecutive full client-suite runs at the final HEAD (no extra load)**
+- [ ] **Step 1: Three consecutive coordinator-gated full-suite runs at the final HEAD (no extra load)**
 
 Run three times, sequentially, with `FRESHELL_TEST_SUMMARY='ws-bootstrap flake fix gate <i>'` where `<i>` is 1, 2, 3:
 
-`npm run test:vitest -- run --config config/vitest/vitest.config.ts`
+`npm test`
 
-Expected: green in all three runs; the target test passes in every run. Any other-test failure is recorded in the progress ledger as a bug unless it ALSO reproduces at base_ref — for those, run file-isolation plus (if isolation is green) one full-suite run at base_ref and record the reproduction receipt; only then may it be carried as an allowed pre-existing load-flaky failure.
+`npm test` is the repository's coordinated full-suite command (default client config + server config under the shared test-coordinator gate — this is the coordinator-safe carrier for the task bar's `npx vitest run --config config/vitest/vitest.config.ts` client-config requirement, since the default config is the client config, with the server suite included as a bonus for the executing-plans gate). Before starting, confirm no other holder (`npm run test:status`); if held, wait.
 
-- [ ] **Step 2: Server suite at the final HEAD**
-
-Run: `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts`
-
-Expected: green except failures with base_ref reproduction receipts recorded in the progress ledger.
+Pass criterion (precise, no ambiguity): the RUN NEED NOT BE FULLY GREEN — the criterion is: the target test PASSES in all three runs; the default-config suite's only failures in any run are failures reproduced at base_ref with the reproduction receipt recorded in the progress ledger; the server suite likewise. Every failure is first recorded in the ledger as a bug with its raw output, then classified.
 
 - [ ] **Step 3: Record the gate**
 
