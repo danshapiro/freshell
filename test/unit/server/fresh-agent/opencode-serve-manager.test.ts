@@ -844,7 +844,11 @@ describe('OpencodeServeManager fan-out', () => {
     allowFifthPoll()
     await expect(idle).resolves.toBeUndefined()
     expect(statusCalls).toBe(5)
-  }, 1000)
+    // The tight 1s budget asserted promptness, but under full-suite parallel load the
+    // worker can be starved past 1000ms before the final poll cycle lands (observed
+    // 1008ms gate flake). 10s preserves the semantic checks (the 15ms pending race +
+    // resolution-after-gate) while tolerating scheduler stalls.
+  }, 10000)
 
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
