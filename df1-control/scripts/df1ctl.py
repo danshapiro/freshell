@@ -14,6 +14,7 @@ Commands:
   update <ID> <json-fields>  merge fields into status/<ID>.json (agents use this)
   requeue <ID> <reason>      claimed/in-progress -> queued (kill path); logs
   set-state <ID> <state>     force state (orchestrator use); logs
+  add <ID> <section> <title> [notes]   add a campaign-discovered follow-up item (queued)
   report [--states a,b]      compact table of all items with current status
   events [--last N]          tail the launch ledger
   item <ID>                  full queue record + latest status for one item
@@ -170,6 +171,23 @@ def main():
              "note": note[:160]})
         set_status(iid, {"note": note[:120]})
         print(f"{iid}: {prev} -> {state}")
+    elif cmd == "add":
+        # add <ID> <section> <title> [notes]
+        iid, section, title = sys.argv[2], sys.argv[3], sys.argv[4]
+        notes = sys.argv[5] if len(sys.argv) > 5 else ""
+        q = load_items()
+        if any(i["id"] == iid for i in q["items"]):
+            raise SystemExit(f"{iid} already exists")
+        rec = {"id": iid, "section": section, "title": title,
+               "checked": False, "hostLimited": False, "deps": [],
+               "hardGates": [], "state": "queued", "pwMode": None}
+        if notes:
+            rec["notes"] = notes
+        q["items"].append(rec)
+        save_items(q)
+        log({"event": "ADDED", "item": iid, "section": section,
+             "title": title[:80], "note": notes[:120]})
+        print(f"added {iid} (queued): {title[:80]}")
     elif cmd == "report":
         states = sys.argv[sys.argv.index("--states") + 1].split(",") \
             if "--states" in sys.argv else None

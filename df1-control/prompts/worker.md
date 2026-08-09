@@ -54,11 +54,15 @@ prior commits — assess and continue (or reset phase-local messes) instead of r
   prove RED on the base where the checklist demands it, then green ≥2 consecutive runs
   per required project (`--project=rust-chromium`, plus `--project=legacy-chromium`
   when a legacy control exists).
-- `deferred`: DO NOT run Playwright. Behavior + unit/integration/crate tests only.
-  Still AUTHOR the Playwright spec your evidence requires (so the close-out campaign
-  can run it), wire it per the matrix convention in
-  `.worktrees/df1-control/df1-control/README.md`, and mark `note` in your status with
-  `spec-authored-unrun: <path>`.
+- `deferred`: behavior + unit/integration/crate tests are your proof of the CHANGE; full
+  green of your authored spec is NOT required (gap legs may stay red until close-out —
+  BUT writing a spec nobody has executed forfeits the gate's ordering proof. Before
+  completing, run your spec ONCE per relevant leg (pw lease held) to prove it is
+  EXECUTABLE and to classify each leg's outcome as `expected-gap-red` (product behavior
+  genuinely absent — annotate) vs spec-defect (fix the spec, re-run). Record per-leg
+  observed outcomes in your status `note`. A spec nobody has ever run does not satisfy
+  the acceptance bar. (Learned at gate B001: SESSION-05's unrun spec worked on legacy
+  but timed out on rust — first execution at the gate, merge rejected.)
 Playwright runs require the pw lease: `acquire.sh pw df1-{{ITEM_SLUG}} --wait 3600`
 (release immediately after the run). Never run any Playwright command without holding it.
 
