@@ -1,5 +1,14 @@
 import { createElement } from 'react'
-import { ClipboardPaste, Copy, TextSelect } from 'lucide-react'
+import { ClipboardPaste, Copy, ExternalLink, TextSelect } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import {
+  findRecordByTabKey,
+  paneKindColorClass,
+  paneKindIcon,
+  paneKindLabel,
+  type TabsRegistryGroups,
+} from '@/lib/tab-registry-open'
+import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
@@ -74,6 +83,10 @@ export type MenuActions = {
   openUrlInTab: (url: string) => void
   openUrlInBrowser: (url: string) => void
   copyUrl: (url: string) => void
+  jumpToTabRecord: (record: RegistryTabRecord) => void
+  openTabRecordCopy: (record: RegistryTabRecord) => void
+  openTabRecordPaneInNewTab: (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => void
+  copyTabRecordName: (record: RegistryTabRecord) => void | Promise<void>
 }
 
 export type MenuBuildContext = {
@@ -90,6 +103,8 @@ export type MenuBuildContext = {
   platform: string | null
   extensions?: ClientExtensionEntry[]
   reopenActivityByPaneId?: Record<string, ReopenPaneActivity>
+  tabRegistryGroups?: TabsRegistryGroups
+  registryDeviceId?: string
 }
 
 function isWindowsLike(platform: string | null): boolean {
@@ -338,6 +353,62 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'move-left', label: 'Move tab left', onSelect: () => actions.moveTab(target.tabId, -1), disabled: isFirst },
       { type: 'item', id: 'move-right', label: 'Move tab right', onSelect: () => actions.moveTab(target.tabId, 1), disabled: isLast },
     ]
+  }
+
+  if (target.kind === 'tabs-card') {
+    const groups = ctx.tabRegistryGroups
+    if (!groups) return []
+    const record = findRecordByTabKey(groups, target.tabKey, target.status)
+    if (!record) return []
+
+    const isLocal = record.deviceId === ctx.registryDeviceId
+    const isOpen = record.status === 'open'
+    const items: MenuItem[] = []
+
+    if (isLocal && isOpen) {
+      items.push({
+        type: 'item',
+        id: 'jump',
+        label: 'Jump to tab',
+        icon: createElement(ExternalLink, { className: 'h-3.5 w-3.5' }),
+        onSelect: () => actions.jumpToTabRecord(record),
+      })
+    }
+
+    items.push({
+      type: 'item',
+      id: 'open-copy',
+      label: isLocal && isOpen ? 'Open copy' : record.status === 'closed' ? 'Reopen' : 'Pull to this device',
+      icon: createElement(Copy, { className: 'h-3.5 w-3.5' }),
+      onSelect: () => actions.openTabRecordCopy(record),
+    })
+
+    if (record.panes.length > 1) {
+      items.push({ type: 'separator', id: 'sep-panes' })
+      for (const pane of record.panes) {
+        const PaneIcon = paneKindIcon(pane.kind)
+        items.push({
+          type: 'item',
+          id: `pane-${pane.paneId}`,
+          label: `Open ${pane.title || paneKindLabel(pane.kind)} in new tab`,
+          icon: createElement(PaneIcon, {
+            className: cn('h-3.5 w-3.5', paneKindColorClass(pane.kind)),
+          }),
+          onSelect: () => actions.openTabRecordPaneInNewTab(record, pane),
+        })
+      }
+    }
+
+    items.push({ type: 'separator', id: 'sep-copy' })
+    items.push({
+      type: 'item',
+      id: 'copy-name',
+      label: 'Copy tab name',
+      icon: createElement(Copy, { className: 'h-3.5 w-3.5' }),
+      onSelect: () => actions.copyTabRecordName(record),
+    })
+
+    return items
   }
 
   if (target.kind === 'pane') {

@@ -1,6 +1,31 @@
 import { describe, it, expect, vi } from 'vitest'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
+import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
+import type { TabsRegistryGroups } from '@/lib/tab-registry-open'
+
+function makeRegistryRecord(overrides: Partial<RegistryTabRecord> = {}): RegistryTabRecord {
+  return {
+    tabKey: 'device-a:tab-9',
+    tabId: 'tab-9',
+    serverInstanceId: 'srv-1',
+    deviceId: 'device-a',
+    deviceLabel: 'Device A',
+    tabName: 'My Tab',
+    status: 'open',
+    revision: 1,
+    createdAt: 1,
+    updatedAt: 2,
+    paneCount: 1,
+    titleSetByUser: false,
+    panes: [],
+    ...overrides,
+  }
+}
+
+function makeRegistryGroups(overrides: Partial<TabsRegistryGroups> = {}): TabsRegistryGroups {
+  return { localOpen: [], sameDeviceOpen: [], remoteOpen: [], closed: [], ...overrides }
+}
 
 function createMockActions(): MenuActions {
   return {
@@ -61,6 +86,10 @@ function createMockActions(): MenuActions {
     openUrlInTab: vi.fn(),
     openUrlInBrowser: vi.fn(),
     copyUrl: vi.fn(),
+    jumpToTabRecord: vi.fn(),
+    openTabRecordCopy: vi.fn(),
+    openTabRecordPaneInNewTab: vi.fn(),
+    copyTabRecordName: vi.fn(),
   }
 }
 
@@ -400,5 +429,98 @@ describe('buildMenuItems — terminal context with hoveredUrl', () => {
     expect(ids).toContain('terminal-clear')
     expect(ids).toContain('terminal-reset')
     expect(ids).toContain('replace-pane')
+  })
+})
+
+describe('tabs-card menu', () => {
+  function buildFor(record: RegistryTabRecord, registryDeviceId: string) {
+    const actions = createMockActions()
+    const ctx = {
+      ...createMockContext(actions),
+      tabRegistryGroups: makeRegistryGroups({ remoteOpen: [record] }),
+      registryDeviceId,
+    }
+    const items = buildMenuItems({ kind: 'tabs-card', tabKey: record.tabKey, status: record.status }, ctx)
+    return { actions, items }
+  }
+
+  it('local open record: Jump to tab first, then Open copy', () => {
+    const record = makeRegistryRecord({ deviceId: 'this-device', tabKey: 'this-device:tab-9' })
+    const { actions, items } = buildFor(record, 'this-device')
+
+    expect(items[0]).toMatchObject({ type: 'item', id: 'jump', label: 'Jump to tab' })
+    const openCopy = items.find((i) => i.type === 'item' && i.id === 'open-copy')
+    expect(openCopy).toMatchObject({ label: 'Open copy' })
+    if (items[0].type === 'item') items[0].onSelect()
+    expect(actions.jumpToTabRecord).toHaveBeenCalledWith(record)
+  })
+
+  it('remote open record: no Jump item, Pull to this device', () => {
+    const record = makeRegistryRecord()
+    const { actions, items } = buildFor(record, 'this-device')
+
+    expect(items.find((i) => i.type === 'item' && i.id === 'jump')).toBeUndefined()
+    const openCopy = items.find((i) => i.type === 'item' && i.id === 'open-copy')
+    expect(openCopy).toMatchObject({ label: 'Pull to this device' })
+    if (openCopy?.type === 'item') openCopy.onSelect()
+    expect(actions.openTabRecordCopy).toHaveBeenCalledWith(record)
+  })
+
+  it('closed record: Reopen label', () => {
+    const record = makeRegistryRecord({ status: 'closed', closedAt: 3 })
+    const { items } = buildFor(record, 'this-device')
+    const openCopy = items.find((i) => i.type === 'item' && i.id === 'open-copy')
+    expect(openCopy).toMatchObject({ label: 'Reopen' })
+  })
+
+  it('multi-pane record: one open-in-new-tab item per pane', () => {
+    const record = makeRegistryRecord({
+      paneCount: 2,
+      panes: [
+        { paneId: 'p1', kind: 'terminal', title: 'my-shell', payload: {} },
+        { paneId: 'p2', kind: 'browser', title: 'docs', payload: {} },
+      ],
+    })
+    const { actions, items } = buildFor(record, 'this-device')
+
+    const paneItem = items.find((i) => i.type === 'item' && i.id === 'pane-p2')
+    expect(paneItem).toMatchObject({ label: 'Open docs in new tab' })
+    expect(items.find((i) => i.type === 'item' && i.id === 'pane-p1')).toMatchObject({
+      label: 'Open my-shell in new tab',
+    })
+    if (paneItem?.type === 'item') paneItem.onSelect()
+    expect(actions.openTabRecordPaneInNewTab).toHaveBeenCalledWith(record, record.panes[1])
+  })
+
+  it('single-pane record: no per-pane items', () => {
+    const record = makeRegistryRecord({
+      panes: [{ paneId: 'p1', kind: 'terminal', title: 'my-shell', payload: {} }],
+    })
+    const { items } = buildFor(record, 'this-device')
+    expect(items.find((i) => i.type === 'item' && i.id === 'pane-p1')).toBeUndefined()
+  })
+
+  it('copy-name delegates to copyTabRecordName', () => {
+    const record = makeRegistryRecord()
+    const { actions, items } = buildFor(record, 'this-device')
+    const copyName = items.find((i) => i.type === 'item' && i.id === 'copy-name')
+    expect(copyName).toMatchObject({ label: 'Copy tab name' })
+    if (copyName?.type === 'item') copyName.onSelect()
+    expect(actions.copyTabRecordName).toHaveBeenCalledWith(record)
+  })
+
+  it('returns no items when the record or groups are missing', () => {
+    const actions = createMockActions()
+    const noGroups = buildMenuItems(
+      { kind: 'tabs-card', tabKey: 'x:y', status: 'open' },
+      { ...createMockContext(actions) },
+    )
+    expect(noGroups).toEqual([])
+
+    const unknownKey = buildMenuItems(
+      { kind: 'tabs-card', tabKey: 'x:y', status: 'open' },
+      { ...createMockContext(actions), tabRegistryGroups: makeRegistryGroups(), registryDeviceId: 'd' },
+    )
+    expect(unknownKey).toEqual([])
   })
 })

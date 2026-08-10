@@ -42,6 +42,12 @@ import {
   type ReopenPaneSessionTarget,
 } from '@/lib/session-flavor-reopen'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import {
+  jumpToRecord as jumpToRecordAction,
+  openPaneInNewTab as openPaneInNewTabAction,
+  openRecordAsUnlinkedCopy as openRecordAsUnlinkedCopyAction,
+} from '@/lib/tab-registry-open'
+import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
@@ -149,6 +155,7 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
+  const localServerInstanceId = useAppSelector((s) => s.connection?.serverInstanceId)
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
@@ -1198,6 +1205,26 @@ export function ContextMenuProvider({
     await copyText(url)
   }, [])
 
+  const jumpToTabRecord = useCallback((record: RegistryTabRecord) => {
+    jumpToRecordAction(record, {
+      dispatch,
+      localServerInstanceId,
+      hasLocalTab: (tabId) => appStore.getState().tabs.tabs.some((tab) => tab.id === tabId),
+    })
+  }, [dispatch, localServerInstanceId, appStore])
+
+  const openTabRecordCopy = useCallback((record: RegistryTabRecord) => {
+    openRecordAsUnlinkedCopyAction(record, { dispatch, localServerInstanceId })
+  }, [dispatch, localServerInstanceId])
+
+  const openTabRecordPaneInNewTab = useCallback((record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
+    openPaneInNewTabAction(record, pane, { dispatch, localServerInstanceId })
+  }, [dispatch, localServerInstanceId])
+
+  const copyTabRecordName = useCallback(async (record: RegistryTabRecord) => {
+    await copyText(record.tabName)
+  }, [])
+
   const menuItems = useMemo(() => {
     if (!menuState) return []
     return buildMenuItems(menuState.target, {
@@ -1276,6 +1303,10 @@ export function ContextMenuProvider({
         openUrlInTab,
         openUrlInBrowser,
         copyUrl: copyUrlAction,
+        jumpToTabRecord,
+        openTabRecordCopy,
+        openTabRecordPaneInNewTab,
+        copyTabRecordName,
       },
     })
   }, [
@@ -1337,6 +1368,10 @@ export function ContextMenuProvider({
     openUrlInTab,
     openUrlInBrowser,
     copyUrlAction,
+    jumpToTabRecord,
+    openTabRecordCopy,
+    openTabRecordPaneInNewTab,
+    copyTabRecordName,
   ])
 
   return (
