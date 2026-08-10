@@ -563,5 +563,15 @@ describe('TabItem', () => {
       expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
       expect(screen.queryByText(/^\+\d+$/)).toBeNull()
     })
+
+    it('suppresses native text selection on the tab (mobile long-press target)', () => {
+      const { container } = render(<TabItem {...defaultProps} />)
+      const tabRoot = container.querySelector('[data-context]') as HTMLElement | null
+      expect(tabRoot).not.toBeNull()
+      // Android/iOS long-press must open OUR context menu, not the OS
+      // text-selection UI (selection handles competing with the menu).
+      expect(tabRoot!.className).toContain('select-none')
+      expect(tabRoot!.className).toContain('[-webkit-touch-callout:none]')
+    })
   })
 })

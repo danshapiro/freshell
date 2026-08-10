@@ -158,7 +158,7 @@ export default function TabItem({
   const tabContent = (
     <div
       className={cn(
-        'group relative flex w-full min-w-0 items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
+        'group relative flex w-full min-w-0 items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors select-none [-webkit-touch-callout:none]',
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",

@@ -848,4 +848,23 @@ describe('ContextMenuProvider long-press', () => {
       })
     }
   })
+
+  it('renders the menu itself with text selection suppressed', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    // A long-press release drifting onto the menu must not start selecting
+    // menu label text on mobile.
+    expect(screen.getByRole('menu').className).toContain('select-none')
+  })
 })

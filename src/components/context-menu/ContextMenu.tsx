@@ -74,7 +74,7 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
       tabIndex={-1}
       aria-orientation="vertical"
       className={cn(
-        'fixed min-w-[200px] rounded-md border border-border bg-card shadow-lg py-1',
+        'fixed min-w-[200px] rounded-md border border-border bg-card shadow-lg py-1 select-none',
         OVERLAY_Z.menu
       )}
       style={{
