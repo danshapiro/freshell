@@ -2515,6 +2515,276 @@ mod sessions_sweep_tests {
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 
+    /// SESSION-09 full-differ pins (acceptance "modified" leg): an in-place
+    /// content change that leaves BOTH the corpus size AND the corpus max
+    /// `lastActivityAt` unmoved must STILL move the signature. Legacy parity:
+    /// `hasSessionDirectorySnapshotChange` diffs the FULL comparable snapshot
+    /// (`server/session-directory/projection.ts:9-51`), so a title/summary/
+    /// first-user-message change broadcast there; the old `(len, max, identity)`
+    /// signature here was structurally blind to it.
+    #[test]
+    fn in_place_modification_below_corpus_max_moves_the_signature() {
+        let mut anchor = mk_indexed(500);
+        anchor.session_id = "anchor".to_string();
+        let mut item = mk_indexed(100);
+        item.session_id = "victim".to_string();
+        item.title = Some("before the edit".to_string());
+        let before = sessions_sweep_signature(&[anchor.clone(), item.clone()], &[]);
+
+        let mut edited = item.clone();
+        edited.title = Some("after the edit".to_string());
+        let after = sessions_sweep_signature(&[anchor, edited], &[]);
+
+        assert_ne!(
+            before, after,
+            "a same-count, same-max content change must move the signature"
+        );
+    }
+
+    /// Every sidebar-visible parse-layer field of `IndexedSession` (the exact
+    /// fields legacy's comparable differ inspects, minus the projection/
+    /// override-layer fields `archived`/`sessionType`/`checkoutPath` that the
+    /// index cannot produce) must individually move the signature. Written as
+    /// one table so a field accidentally dropped from the digest fails the
+    /// pin for THAT field by name.
+    #[test]
+    fn every_sidebar_visible_field_moves_the_signature() {
+        let base = mk_indexed(100);
+        let s0 = sessions_sweep_signature(&[base.clone()], &[]);
+
+        let cases: Vec<(&str, IndexedSession)> = vec![
+            ("provider", {
+                let mut v = base.clone();
+                v.provider = "codex".to_string();
+                v
+            }),
+            ("session_id", {
+                let mut v = base.clone();
+                v.session_id = "other-session".to_string();
+                v
+            }),
+            ("project_path", {
+                let mut v = base.clone();
+                v.project_path = "/other/project".to_string();
+                v
+            }),
+            ("title", {
+                let mut v = base.clone();
+                v.title = Some("a title".to_string());
+                v
+            }),
+            ("summary", {
+                let mut v = base.clone();
+                v.summary = Some("a summary".to_string());
+                v
+            }),
+            ("first_user_message", {
+                let mut v = base.clone();
+                v.first_user_message = Some("hello there".to_string());
+                v
+            }),
+            ("created_at", {
+                let mut v = base.clone();
+                v.created_at = Some(1);
+                v
+            }),
+            ("cwd", {
+                let mut v = base.clone();
+                v.cwd = Some("/elsewhere".to_string());
+                v
+            }),
+            ("is_subagent", {
+                let mut v = base.clone();
+                v.is_subagent = true;
+                v
+            }),
+            ("is_non_interactive", {
+                let mut v = base.clone();
+                v.is_non_interactive = true;
+                v
+            }),
+        ];
+        for (field, changed) in cases {
+            let s1 = sessions_sweep_signature(&[changed], &[]);
+            assert_ne!(
+                s0, s1,
+                "changing comparable field `{field}` must move the signature"
+            );
+        }
+
+        // And the unchanged baseline is stable (no spurious broadcast).
+        assert_eq!(
+            s0,
+            sessions_sweep_signature(&[mk_indexed(100)], &[]),
+            "identical content must hash identically"
+        );
+    }
+
+    /// Retained from the old shape: a change to `last_activity_at` (the one
+    /// field the old signature's max HALF could see, when it became the new
+    /// corpus max) must also move the digest.
+    #[test]
+    fn activity_change_without_count_change_moves_the_signature() {
+        let before = sessions_sweep_signature(&[mk_indexed(100)], &[]);
+        let after = sessions_sweep_signature(&[mk_indexed(500)], &[]);
+        assert_ne!(before, after);
+    }
+
+    /// SESSION-09 acceptance "moved" leg AND the old shape's documented
+    /// "gap 2" (delete+add in the same tick, count-neutral AND max-neutral):
+    /// swapping session A for DIFFERENT session C (same timestamps as A)
+    /// leaves `(len, max)` identical but must still be detected.
+    #[test]
+    fn delete_and_add_same_tick_matching_max_moves_the_signature() {
+        let mut a = mk_indexed(500);
+        a.session_id = "removed-session".to_string();
+        let b = mk_indexed(100);
+        let before = sessions_sweep_signature(&[a.clone(), b.clone()], &[]);
+
+        let mut c = mk_indexed(500);
+        c.session_id = "added-session".to_string();
+        let after = sessions_sweep_signature(&[c, b], &[]);
+
+        assert_ne!(
+            before, after,
+            "a same-tick delete+add with matching (len, max) must move the signature"
+        );
+    }
+
+    /// SESSION-16 § "Adjacent discovery" handoff, pinnned end-to-end over a
+    /// REAL index: a hidden non-interactive claude session (exactly ONE user
+    /// message -- `parse/claude.rs:469` `user_message_count <= 1`) gains its
+    /// SECOND user message with a BACK-DATED timestamp, so its own
+    /// `last_activity_at` (max-of-line-timestamps, `parse/claude.rs:282`)
+    /// does not advance and an anchor session pins the corpus max. Neither
+    /// `len` nor corpus max moves -- yet the session became sidebar-visible,
+    /// so legacy broadcasts and this sweep MUST too.
+    #[tokio::test]
+    async fn visibility_flip_is_detected_with_stale_corpus_max() {
+        let claude_home = unique_temp_dir("flip").join(".claude");
+        // The pins-corpus-max anchor.
+        write_claude_session(
+            &claude_home,
+            "66666666-6666-4666-8666-666666666666",
+            "/tmp/sweep-test/anchor",
+            "2030-01-01T00:00:00.000Z",
+        );
+        // The hidden seed: ONE user message => is_non_interactive => hidden.
+        write_claude_session(
+            &claude_home,
+            "77777777-7777-4777-8777-777777777777",
+            "/tmp/sweep-test/hidden",
+            "2025-01-01T00:00:00.000Z",
+        );
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+        );
+        let before = sessions_sweep_signature(&index.snapshot().await, &[]);
+
+        // The flip: a SECOND user message, BACK-DATED before the first one's
+        // timestamp (so last_activity_at cannot advance). The corpus
+        // (len, max) is provably unmoved.
+        let flip_path = claude_home
+            .join("projects")
+            .join("-p")
+            .join("77777777-7777-4777-8777-777777777777.jsonl");
+        let second_user = serde_json::json!({
+            "type": "user",
+            "sessionId": "77777777-7777-4777-8777-777777777777",
+            "cwd": "/tmp/sweep-test/hidden",
+            "message": { "role": "user", "content": "second user turn makes it interactive" },
+            "timestamp": "2024-12-31T00:00:00.000Z",
+        })
+        .to_string();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&flip_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{second_user}\n").as_bytes()))
+            .unwrap();
+
+        // Stale-while-revalidate: poll until the detached re-scan settles
+        // (same pattern as `new_session_file_changes_the_signature`).
+        let mut after = sessions_sweep_signature(&index.snapshot().await, &[]);
+        for _ in 0..50 {
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            after = sessions_sweep_signature(&index.snapshot().await, &[]);
+        }
+        assert_ne!(
+            after, before,
+            "the hidden->visible flip (second user message, back-dated) must move the \
+             signature even though (len, max) are unmoved (before={before:?}, after={after:?})"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    /// SESSION-09 acceptance "moved" leg over a real index: the session's
+    /// file is moved into a different claude project directory with its cwd
+    /// rewritten to the new project. The corpus (len, max) is unmoved (same
+    /// session, same timestamps) but `project_path`/`cwd` change, so the
+    /// signature must move.
+    #[tokio::test]
+    async fn moved_to_another_project_dir_is_detected() {
+        let claude_home = unique_temp_dir("moved").join(".claude");
+        let session_id = "88888888-8888-4888-8888-888888888888";
+        write_claude_session(
+            &claude_home,
+            session_id,
+            "/tmp/sweep-test/project-before",
+            "2025-01-01T00:00:00.000Z",
+        );
+        let index = SessionIndex::with_ttl(
+            vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
+            std::time::Duration::from_millis(0),
+        );
+        let before = sessions_sweep_signature(&index.snapshot().await, &[]);
+
+        // Same-tick delete+add at a NEW path with the cwd rewritten (the
+        // parse-derived identity the sidebar groups by). Physically a move.
+        let same_content_new_cwd = serde_json::json!({
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": "/tmp/sweep-test/project-after",
+            "message": { "role": "user", "content": "hello" },
+            "timestamp": "2025-01-01T00:00:00.000Z",
+        })
+        .to_string();
+        let new_project = claude_home.join("projects").join("-after");
+        std::fs::create_dir_all(&new_project).unwrap();
+        std::fs::write(
+            new_project.join(format!("{session_id}.jsonl")),
+            format!("{same_content_new_cwd}\n"),
+        )
+        .unwrap();
+        std::fs::remove_file(
+            claude_home
+                .join("projects")
+                .join("-p")
+                .join(format!("{session_id}.jsonl")),
+        )
+        .unwrap();
+
+        let mut after = sessions_sweep_signature(&index.snapshot().await, &[]);
+        for _ in 0..50 {
+            if after != before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            after = sessions_sweep_signature(&index.snapshot().await, &[]);
+        }
+        assert_ne!(
+            after, before,
+            "moving the file to another project (cwd rewritten) must move the signature \
+             even though (len, max) are unmoved (before={before:?}, after={after:?})"
+        );
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
     /// The counterpart: an UNCHANGED home (no writes between sweeps) must
     /// keep a stable signature -- the sweep must never broadcast spuriously.
     #[tokio::test]
