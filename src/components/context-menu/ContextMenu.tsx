@@ -1,4 +1,4 @@
-import React, { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import React, { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { clampToViewport } from './context-menu-utils'
 import type { MenuItem } from './context-menu-types'
@@ -35,6 +35,18 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
       .map(({ index }) => index)
   }, [items])
 
+  const focusItem = useCallback((index: number) => {
+    // preventScroll: focusing a menu item should never scroll it into view.
+    // The resulting native scroll event would reach the provider's
+    // capture-phase scroll listener and dismiss the menu the moment it
+    // opens (visible with the on-screen keyboard up, where the menu could
+    // mount outside the visual viewport). NOTE: preventScroll is a no-op
+    // on Chrome Android (crbug.com/41453122) — there the provider's
+    // post-open grace window absorbs the focus scroll; this option still
+    // helps on desktop and iOS Safari 15.5+.
+    itemRefs.current[index]?.focus({ preventScroll: true })
+  }, [])
+
   useLayoutEffect(() => {
     if (!open) return
     const node = innerRef.current
@@ -49,9 +61,9 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
     const first = enabledIndices[0]
     if (typeof first === 'number') {
       setActiveIndex(first)
-      requestAnimationFrame(() => itemRefs.current[first]?.focus())
+      requestAnimationFrame(() => focusItem(first))
     }
-  }, [open, enabledIndices])
+  }, [open, enabledIndices, focusItem])
 
   if (!open) return null
 
@@ -90,23 +102,23 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
           const nextPos = (currentPos + 1) % enabledIndices.length
           const nextIndex = enabledIndices[nextPos]
           setActiveIndex(nextIndex)
-          itemRefs.current[nextIndex]?.focus()
+          focusItem(nextIndex)
         } else if (e.key === 'ArrowUp') {
           e.preventDefault()
           const nextPos = (currentPos - 1 + enabledIndices.length) % enabledIndices.length
           const nextIndex = enabledIndices[nextPos]
           setActiveIndex(nextIndex)
-          itemRefs.current[nextIndex]?.focus()
+          focusItem(nextIndex)
         } else if (e.key === 'Home') {
           e.preventDefault()
           const nextIndex = enabledIndices[0]
           setActiveIndex(nextIndex)
-          itemRefs.current[nextIndex]?.focus()
+          focusItem(nextIndex)
         } else if (e.key === 'End') {
           e.preventDefault()
           const nextIndex = enabledIndices[enabledIndices.length - 1]
           setActiveIndex(nextIndex)
-          itemRefs.current[nextIndex]?.focus()
+          focusItem(nextIndex)
         } else if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           const item = items[currentIndex]

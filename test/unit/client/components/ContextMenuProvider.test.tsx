@@ -2533,4 +2533,28 @@ describe('ContextMenuProvider', () => {
     expect(store.getState().tabs.tabs.some((t) => t.title === 'remote open')).toBe(true)
     expect(onViewChange).toHaveBeenCalledWith('terminal')
   })
+
+  it('keyboard navigation focuses menu items with preventScroll', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+    const menu = screen.getByRole('menu')
+
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus')
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    fireEvent.keyDown(menu, { key: 'End' })
+    fireEvent.keyDown(menu, { key: 'Home' })
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+
+    expect(focusSpy).toHaveBeenCalled()
+    for (const call of focusSpy.mock.calls) {
+      expect(call[0]).toEqual({ preventScroll: true })
+    }
+    focusSpy.mockRestore()
+  })
 })

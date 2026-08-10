@@ -763,4 +763,42 @@ describe('ContextMenuProvider long-press', () => {
       expect(screen.queryByRole('menu')).toBeNull()
     })
   })
+
+  it('focuses the first menu item with preventScroll so opening never triggers scroll-into-view', () => {
+    // The auto-focus effect schedules via requestAnimationFrame; run the
+    // callback synchronously so the focus happens within this test.
+    const rafSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0)
+        return 1
+      })
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus')
+
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // The only .focus() calls in this flow are the menu's item auto-focus;
+    // every one of them must pass { preventScroll: true }.
+    expect(focusSpy).toHaveBeenCalled()
+    for (const call of focusSpy.mock.calls) {
+      expect(call[0]).toEqual({ preventScroll: true })
+    }
+
+    rafSpy.mockRestore()
+    focusSpy.mockRestore()
+  })
 })
