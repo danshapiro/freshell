@@ -972,7 +972,7 @@ describe('tabs-card menu', () => {
 ```bash
 npm run test:vitest -- run test/unit/client/components/context-menu/menu-defs.test.ts --config config/vitest/vitest.config.ts
 ```
-Expected: all new `tabs-card menu` tests FAIL (branch not implemented → `buildMenuItems` returns its default for the unknown kind); pre-existing tests still pass. (`createMockActions` gained extra keys — harmless at runtime; the `MenuActions` type gains the fields in Step 3.)
+Expected: 5 of the 7 new `tabs-card menu` tests FAIL (branch not implemented → `buildMenuItems` falls through to its `return []` default for the unknown kind, so every test asserting the presence of an item fails). The two negative-space tests — `'single-pane record: no per-pane items'` and `'returns no items when the record or groups are missing'` — already PASS against that pre-existing `return []` fallback; keep them as pinned invariants (they must still pass after Step 3, now exercising the implemented branch's early-return paths). Pre-existing tests still pass. (`createMockActions` gained extra keys — harmless at runtime; the `MenuActions` type gains the fields in Step 3.)
 
 - [ ] **Step 3: Implement the branch**
 
