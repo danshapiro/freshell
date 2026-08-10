@@ -976,6 +976,14 @@ export function ContextMenuProvider({
   }, [])
 
   useEffect(() => {
+    // --- Long-press (touch hold) state ---
+    // Shared by BOTH open paths: the custom 500ms timer below AND the native
+    // `contextmenu` event Android fires mid-gesture. Declared before the
+    // handlers so handleContextMenu can coordinate with the touch session.
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null
+    let touchStartPos: { x: number; y: number } | null = null
+    let suppressNextTouchEnd = false
+
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
       const contextEl = findContextElement(target)
@@ -983,12 +991,41 @@ export function ContextMenuProvider({
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
 
       e.preventDefault()
+
+      // Android race, case A: our long-press timer already opened the menu
+      // for this gesture (suppressNextTouchEnd is armed until touchend).
+      // Swallow the OS contextmenu -- re-opening would jump the menu and
+      // corrupt focus restoration.
+      if (suppressNextTouchEnd) return
+
+      // Android race, case B: a touch gesture is still in flight and the
+      // native contextmenu won the race. Cancel our timer so it cannot
+      // re-fire into the just-opened menu (its elementFromPoint probe would
+      // hit the menu and replace it with the Global fallback), and arm
+      // release suppression for engines that DO synthesize a click from
+      // this gesture (iOS-like; Chromium-Android does not). Prefer the
+      // touch-session start position over the event coords — identical on
+      // Chromium, and it hardens against engines reporting drifted or
+      // degenerate contextmenu coordinates.
+      let position = { x: e.clientX, y: e.clientY }
+      if (touchStartPos !== null || longPressTimer !== null) {
+        if (touchStartPos) {
+          position = { x: touchStartPos.x, y: touchStartPos.y }
+        }
+        if (longPressTimer) {
+          clearTimeout(longPressTimer)
+          longPressTimer = null
+        }
+        touchStartPos = null
+        suppressNextTouchEnd = true
+      }
+
       const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
       const parsed = parseContextTarget(contextId as any, dataset)
       const targetObj = parsed || { kind: 'global' as const }
 
       openMenu({
-        position: { x: e.clientX, y: e.clientY },
+        position,
         target: targetObj,
         contextElement: contextEl,
         clickTarget: target,
@@ -1019,11 +1056,6 @@ export function ContextMenuProvider({
         dataset,
       })
     }
-
-    // --- Long-press (touch hold) detection for mobile ---
-    let longPressTimer: ReturnType<typeof setTimeout> | null = null
-    let touchStartPos: { x: number; y: number } | null = null
-    let suppressNextTouchEnd = false
 
     const handleTouchStart = (e: TouchEvent) => {
       const touch = e.touches[0]
