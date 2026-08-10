@@ -128,9 +128,16 @@ fn real_corrupted_extracts_full_metadata_and_token_usage() {
         cwd: Some("D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell".to_string()),
         created_at: Some(1_769_753_756_713),
         last_activity_at: Some(1_769_753_759_234),
-        title: Some("Test session 1".to_string()),
+        // The title comes from the generated summary title (Test Session 1 from the summary record),
+        // not the first message (Test session 1), because generated_summary_title is in the priority chain.
+        title: Some("Test Session 1".to_string()),
         summary: Some("Test Session 1".to_string()),
         first_user_message: Some("Test session 1".to_string()),
+        // The fixture contains a type:'summary' record, which marks the title as provider-generated.
+        title_source: Some("provider-generated".to_string()),
+        // Both provenance surfaces agree (`claude.rs` computes them from the
+        // same predicate): the generated-summary title is provider-authored.
+        title_provider_generated: true,
         message_count: 6,
         is_non_interactive: Some(true),
         token_usage: Some(TokenSummary {
@@ -189,6 +196,21 @@ fn title_precedence_custom_title_then_agent_name_then_first_message() {
         "{\"type\":\"user\",\"role\":\"user\",\"content\":\"Fourth message content here\"}\n",
     ));
     assert_eq!(d.title, Some("Custom Wins".to_string()));
+}
+
+#[test]
+fn summary_title_last_record_wins() {
+    // Node parity: claude.ts:416-419 overwrites generatedSummaryTitle on EVERY
+    // `type:'summary'` record (no first-wins guard), and session-indexer.ts:150
+    // makes last-wins load-bearing. A transcript with two summary records must
+    // surface the LATER title, not freeze the stale first one.
+    let meta = parse_str(concat!(
+        "{\"type\":\"summary\",\"summary\":\"Stale Early Title\"}\n",
+        "{\"type\":\"user\",\"role\":\"user\",\"content\":\"hello there\"}\n",
+        "{\"type\":\"summary\",\"summary\":\"Fresh Later Title\"}\n",
+    ));
+    assert_eq!(meta.title.as_deref(), Some("Fresh Later Title"));
+    assert_eq!(meta.title_source.as_deref(), Some("provider-generated"));
 }
 
 #[test]

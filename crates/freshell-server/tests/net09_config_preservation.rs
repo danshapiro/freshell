@@ -85,7 +85,12 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
         "sessionOverrides": { "SENTINEL_SESSION": { "keep": "me" } },
         "terminalOverrides": { "SENTINEL_TERM": { "keep": "me" } },
         "serverSecrets": { "codexDisplayIdSecret": "constant-sentinel-secret-value", "SENTINEL_SECRET": "do-not-touch" },
-        "completedMigrations": ["m-001", "m-002"],
+        // `completedMigrations` is a MANAGED key now: the boot migration
+        // (`migrations::run_ai_title_shadow_cleanup`) appends its marker on a
+        // first boot. Seed the marker so the migration no-ops and this test
+        // keeps asserting the network mutation itself preserves the key
+        // byte-for-byte (unknown entries like m-001/m-002 must still survive).
+        "completedMigrations": ["m-001", "m-002", "ai-title-shadow-cleanup"],
         "recentDirectories": ["/tmp/a", "/tmp/b"],
         "projectColors": { "/tmp/a": "#123456" },
         "someUnknownFutureKey": { "arbitrary": [1, 2, 3] }

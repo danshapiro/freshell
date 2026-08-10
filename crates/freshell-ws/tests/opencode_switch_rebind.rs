@@ -210,6 +210,8 @@ async fn spawn_server_returning_state(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = freshell_ws::WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             ledger_root,
         ))),

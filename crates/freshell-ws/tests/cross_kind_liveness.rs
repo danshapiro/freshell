@@ -245,6 +245,8 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
     fresh_opencode.set_terminal_liveness(Arc::clone(&terminal_liveness));
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity,
         auth_token: Arc::clone(&auth_token),

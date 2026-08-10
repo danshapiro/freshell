@@ -66,6 +66,8 @@ async fn spawn_merged_server() -> Harness {
     let cli_commands = Arc::new(vec![common::sleeper_cli_spec("claude")]);
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&ledger),
         identity: identity.clone(),
         auth_token: Arc::clone(&auth_token),

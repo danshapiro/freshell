@@ -79,6 +79,12 @@ export const MATRIX_SPECS = [
   // checkpoint routes and the fresh-agent checkpoint UI are shared code
   // paths, not a Rust-only feature. See agent-checkpoint-rewind.spec.ts.
   /agent-checkpoint-rewind\.spec\.ts$/,
+  // Task 21 (naming-persistence sweep) -- cross-surface title convergence
+  // (pane header / sidebar / History / Overview / automation PATCH renames
+  // must converge on both surfaces). Pins EDEV-09; the client fixes are
+  // shared code, so legacy is a true regression control proving they didn't
+  // regress Node behavior. See title-sync-convergence.spec.ts.
+  /title-sync-convergence\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
@@ -165,6 +171,22 @@ export const RUST_ONLY_SPECS = [
   /freshclaude-identity-persistence-rust\.spec\.ts$/,
   // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
   /opencode-rebind-rust\.spec\.ts$/,
+  // Task 21 -- auto-title pipeline + settings split boot OWNED RustServers
+  // directly (per-test fake-Gemini seams / restart legs), so they only ever
+  // run under the rust-chromium project.
+  /auto-title-rust\.spec\.ts$/,
+  /settings-split-rust\.spec\.ts$/,
+  // Task 22 -- durable tabs registry (CFG-08/AUTO-15): raw-WS revision-guard
+  // journeys + restart survival + corruption self-heal against per-test owned
+  // RustServers (the durable `~/.freshell/tabs-registry/v1/` store is a
+  // Rust-only feature of this sweep; legacy has no durable tabs store).
+  /tabs-registry-persistence-rust\.spec\.ts$/,
+  // Task 23 -- automation tab/pane/layout REST parity + git branch/dirty
+  // badges: both boot OWNED per-test RustServers (isolated HOME, ephemeral
+  // port; automation-layout test 3 needs a server NO client ever synced a
+  // layout into), so they only ever run under the rust-chromium project.
+  /automation-layout-rust\.spec\.ts$/,
+  /git-badges-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -359,6 +381,40 @@ export default defineConfig({
         // Sidebar opencode rail fixes (Bug 1 + Bug 2): runs in BOTH matrix
         // projects — Node parity is part of the fix.
         /sidebar-opencode-rail\.spec\.ts$/,
+        // Task 21 -- auto-title pipeline (background sweep dir ->
+        // first-message -> Gemini AI ladder, generate-title route, terminal
+        // summary route) against per-test owned RustServers with a local
+        // fake Gemini on the Rust-only `FRESHELL_GEMINI_BASE_URL` seam
+        // (validator-A1 documented superset; no legacy equivalent).
+        /auto-title-rust\.spec\.ts$/,
+        // Task 21 -- settings split (CFG-12): browser-local appearance vs
+        // server-backed settings across two contexts + the RustServer
+        // restart durability leg. Rust-only: the matrix sibling
+        // (`settings-persistence-split.spec.ts`) depends on
+        // `legacyLocalSettingsSeed` (CFG-04/SESSION-13, unimplemented in
+        // Rust) and is `test.fail`-annotated on this project.
+        /settings-split-rust\.spec\.ts$/,
+        // Task 22 -- durable tabs registry across restart (CFG-08/AUTO-15):
+        // cross-device restart survival, idempotent-retry/content-conflict/
+        // stale/retire watermark semantics, and missing-object corruption
+        // self-heal (manifest.json.invalid-* archive => empty). Rust-only:
+        // the durable content-addressed store under
+        // `<home>/.freshell/tabs-registry/v1/` exists only in the Rust
+        // server on this branch.
+        /tabs-registry-persistence-rust\.spec\.ts$/,
+        // Task 23 -- automation tab/pane/layout REST parity over the shared
+        // LayoutStore (AUTO-03/AUTO-06 + the AUTO-01 snapshot/rename slice)
+        // against per-test owned RustServers, including the no-client
+        // `{message:'no layout snapshot'}` degradation leg (which needs a
+        // server NO page ever connected to). Rust-only: the LayoutStore-backed
+        // automation routes are this sweep's Rust work; the frozen legacy
+        // `server/` tree is not under test.
+        /automation-layout-rust\.spec\.ts$/,
+        // Task 23 -- git branch/dirty badges (TerminalMetaRegistry +
+        // create-time git enrichment + handshake `terminal_meta` reload
+        // persistence, Tasks 17-18). Covers git badge parity for
+        // REST-created terminals via FreshAgentState post-create seeding.
+        /git-badges-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

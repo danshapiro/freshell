@@ -1816,6 +1816,44 @@ impl TerminalRegistry {
         self.set_meta(terminal_id, Some(title.to_string()), None, None, None);
     }
 
+    /// Single-id read of a terminal's live title -- the SAME field the
+    /// directory listing serves as `DirectoryEntry.title` (see
+    /// [`directory`](Self::directory)), without cloning the whole directory.
+    /// `None` for an unknown terminal id. Added for the auto-title sweep's
+    /// out-of-sync comparison (`server/index.ts:885-905`'s per-terminal
+    /// `term.title` read).
+    pub fn title_of(&self, terminal_id: &str) -> Option<String> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|s| s.lock().expect("terminal lock").title.clone())
+    }
+
+    /// Single-id read of a terminal's live `mode` + resume/session id
+    /// (validator-A10): the provider/sessionId seam the Agent-API pane-rename
+    /// cascade resolves REGISTRY-FIRST (`persistSyncableTerminalRename`,
+    /// `router.ts:658-676` — terminal metadata before paneContent), because a
+    /// locator association writes the learned session id back HERE via
+    /// [`Self::set_meta`] with zero client involvement. Same single-id
+    /// pattern as [`Self::title_of`]; `None` for an unknown terminal id.
+    pub fn session_binding_of(&self, terminal_id: &str) -> Option<(String, Option<String>)> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|shared| {
+            let s = shared.lock().expect("terminal lock");
+            (s.mode.clone(), s.resume_session_id.clone())
+        })
+    }
+
     /// `registry.updateDescription()` — the PATCH write-through for
     /// `descriptionOverride` (`terminals-router.ts:304`).
     pub fn update_description(&self, terminal_id: &str, description: &str) {

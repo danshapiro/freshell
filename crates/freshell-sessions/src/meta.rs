@@ -66,6 +66,9 @@ pub struct ParsedSessionMeta {
     pub title_provider_generated: bool,
     pub summary: Option<String>,
     pub first_user_message: Option<String>,
+    /// Mirror of Node's ParsedSessionTitleSource for the parsed (pre-override) title.
+    /// The auto-title pipeline only compares against "provider-generated".
+    pub title_source: Option<String>,
     pub message_count: i64,
     pub is_subagent: Option<bool>,
     pub is_non_interactive: Option<bool>,

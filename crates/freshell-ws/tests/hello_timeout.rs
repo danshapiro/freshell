@@ -55,7 +55,9 @@ async fn spawn_server(hello_timeout_ms: u64) -> String {
 
     let state = WsState {
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),

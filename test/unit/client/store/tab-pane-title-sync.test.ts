@@ -5,10 +5,10 @@ import panesReducer, {
   initLayout,
   splitPane,
   updatePaneTitle,
+  updatePaneTitleByTerminalId,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode } from '../../../../src/store/paneTypes'
 import type { ClientExtensionEntry } from '../../../../shared/extension-types'
-import { syncPaneTitleByTerminalId } from '../../../../src/store/paneTitleSync'
 import { applyPaneRename, applyTabRename } from '../../../../src/store/titleSync'
 import { getTabDisplayTitle } from '../../../../src/lib/tab-title'
 
@@ -205,7 +205,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
       expect(rootNode.type).toBe('leaf')
 
       // Dispatch the thunk that syncs both pane title and tab title
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename', setByUser: false }))
 
       // Pane title should be updated
       const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
@@ -245,7 +245,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
       expect(store.getState().panes.layouts[tabId].type).toBe('split')
 
       // Dispatch the thunk
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename', setByUser: false }))
 
       // Pane title should be updated
       expect(store.getState().panes.paneTitles[tabId][firstPaneId]).toBe('Session Rename')
@@ -277,7 +277,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         content: { kind: 'terminal', mode: 'claude', terminalId: 'term-shared' },
       }))
 
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Shared Session' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Shared Session', setByUser: false }))
 
       // Both tabs keep their stored titles, but their display titles follow the only pane.
       expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
@@ -320,7 +320,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         newContent: { kind: 'terminal', mode: 'shell' },
       }))
 
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'New Name' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'New Name', setByUser: false }))
 
       // Single-pane tab: display title follows the only pane.
       expect(store.getState().tabs.tabs[0].title).toBe('Single Pane Tab')
@@ -348,7 +348,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         content: { kind: 'terminal', mode: 'shell', terminalId: 'term-99' },
       }))
 
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-nonexistent', title: 'Should Not Appear' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-nonexistent', title: 'Should Not Appear', setByUser: false }))
 
       expect(store.getState().tabs.tabs[0].title).toBe('Some Tab')
       expect(getTabDisplayTitle(

@@ -38,8 +38,9 @@ use crate::framing::{reassemble_stream, OutputFramer};
 /// `terminal.output` message as it is produced (seq-ordered, single producer).
 ///
 /// This is the streaming seam the WS transport layer (`freshell-ws`) uses to
-/// forward output frames to an attached client the moment they arrive, in
-/// addition to the crate's own in-memory capture (`captured_messages`). Kept as a
+/// forward output frames to an attached client the moment they arrive. Providing
+/// a sink DISABLES the crate's own in-memory capture (`captured_messages`), which
+/// is a harness-only seam active solely when no sink is wired. Kept as a
 /// bare `FnMut` callback so `freshell-terminal` stays transport-agnostic (no tokio
 /// dependency): the caller decides where each message goes (a channel, a buffer…).
 pub type MessageSink = Box<dyn FnMut(ServerMessage) + Send>;
@@ -82,7 +83,10 @@ pub fn build_child_env_from_process(spec: &SpawnSpec) -> BTreeMap<String, String
     build_child_env(&parent, spec)
 }
 
-/// Shared sink the reader thread appends captured wire messages to.
+/// Harness-only buffer the reader thread appends captured wire messages to
+/// — populated ONLY when the terminal was spawned without a live sink
+/// (`spawn`, or `spawn_with_sink` with `sink: None`). With a sink wired
+/// (production), this stays empty so it can never grow unboundedly.
 #[derive(Debug, Default)]
 struct Captured {
     messages: Vec<ServerMessage>,
@@ -125,9 +129,10 @@ impl PtyTerminal {
     /// Spawn `spec` with the given fully-resolved child `env`, at `spec.cols` x
     /// `spec.rows`. `terminal_id`/`stream_id` label the framed output.
     ///
-    /// The output is captured in-memory only (query via [`captured_messages`] /
-    /// [`reassemble`]). For live streaming to a WS client, use
-    /// [`spawn_with_sink`](Self::spawn_with_sink).
+    /// With no sink wired, the output is captured in-memory (query via
+    /// [`captured_messages`] / [`reassemble`]) — the harness/capture mode. For
+    /// live streaming to a WS client, use [`spawn_with_sink`](Self::spawn_with_sink),
+    /// which disables the in-memory capture.
     pub fn spawn(
         spec: &SpawnSpec,
         env: &BTreeMap<String, String>,
@@ -146,9 +151,11 @@ impl PtyTerminal {
         )
     }
 
-    /// As [`spawn`](Self::spawn), but the reader thread also forwards every framed
+    /// As [`spawn`](Self::spawn), but the reader thread forwards every framed
     /// `terminal.output` message to `sink` the moment it is produced (in seq order,
-    /// single producer), in addition to the in-memory capture. This is the seam the
+    /// single producer). Providing a sink DISABLES the in-memory capture
+    /// ([`captured_messages`](Self::captured_messages) stays empty): capture is a
+    /// harness seam, active only when `sink` is `None`. This is the seam the
     /// WS transport uses to stream output to an attached client.
     pub fn spawn_with_sink(
         spec: &SpawnSpec,
@@ -327,7 +334,9 @@ impl PtyTerminal {
         self.writer.flush()
     }
 
-    /// Snapshot of all captured `terminal.output` messages so far.
+    /// Snapshot of all captured `terminal.output` messages so far. Harness-only:
+    /// populated solely when the terminal was spawned WITHOUT a live sink; with a
+    /// sink wired (production) this is always empty.
     pub fn captured_messages(&self) -> Vec<ServerMessage> {
         self.captured
             .lock()
@@ -338,6 +347,8 @@ impl PtyTerminal {
 
     /// The seq-ordered, chunk-boundary-independent reassembly of this terminal's
     /// output stream (spec `§9.1`, the T1 thesis). Mirrors the capture harness.
+    /// Harness-only, like [`captured_messages`](Self::captured_messages): empty
+    /// when a live sink was provided at spawn.
     pub fn reassemble(&self) -> String {
         let messages = self.captured_messages();
         reassemble_stream(&messages, &self.stream_id)
@@ -454,8 +465,9 @@ impl Drop for PtyTerminal {
 }
 
 /// The `onData` loop: read raw bytes -> decode UTF-8 (holding partial scalars) ->
-/// frame into `terminal.output` messages -> append to the in-memory capture AND
-/// (when present) forward each message to the live streaming `sink`.
+/// frame into `terminal.output` messages -> forward each message to the live
+/// streaming `sink` when one is wired, OTHERWISE append to the in-memory capture
+/// (harness mode; never both, so the capture cannot leak in production).
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     mut framer: OutputFramer,
@@ -464,8 +476,12 @@ fn spawn_reader(
     on_exit: Option<ExitHook>,
     code_rx: std::sync::mpsc::Receiver<i64>,
 ) -> JoinHandle<()> {
-    // Capture in-memory and (if wired) forward each framed message to the live sink.
-    // The sink sees frames in the SAME seq order they are appended (single producer).
+    // With a live sink wired (production), forward each framed message to it in
+    // the SAME seq order it is produced (single producer). Without a sink
+    // (harness/capture mode), append to the in-memory capture instead. Never
+    // both: `captured` is unread in production and accumulating there was an
+    // unbounded write-only leak for the terminal's whole life.
+    let capture_enabled = sink.is_none();
     let mut emit = move |messages: Vec<ServerMessage>| {
         if messages.is_empty() {
             return;
@@ -475,11 +491,13 @@ fn spawn_reader(
                 sink(message.clone());
             }
         }
-        captured
-            .lock()
-            .expect("captured mutex")
-            .messages
-            .extend(messages);
+        if capture_enabled {
+            captured
+                .lock()
+                .expect("captured mutex")
+                .messages
+                .extend(messages);
+        }
     };
 
     std::thread::spawn(move || {
@@ -642,6 +660,73 @@ mod tests {
             "must never surface the raw portable-pty abort text: {output:?}"
         );
         terminal.kill();
+    }
+
+    /// The in-memory capture is a HARNESS seam, not a production buffer.
+    /// When a live `sink` is wired (the production path,
+    /// `TerminalRegistry::create`), NOTHING may accumulate in `captured`:
+    /// before the gate it grew unboundedly for the terminal's whole life
+    /// (a multi-GB write-only leak on long-lived terminals).
+    #[test]
+    fn spawn_with_sink_does_not_accumulate_captured_messages() {
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo SINK_ONLY_MARKER".into()],
+            env_overrides: BTreeMap::new(),
+            cwd: None,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        };
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        env.insert(
+            "HOME".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        );
+
+        let sink_messages: Arc<Mutex<Vec<ServerMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_clone = Arc::clone(&sink_messages);
+        let sink: MessageSink = Box::new(move |message| {
+            sink_clone.lock().expect("sink mutex").push(message);
+        });
+
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let on_exit: ExitHook = Box::new(move |code| {
+            let _ = exit_tx.send(code);
+        });
+
+        let terminal = PtyTerminal::spawn_with_sink(
+            &spec,
+            &env,
+            "t-sink-gate",
+            "s-sink-gate",
+            None,
+            Some(sink),
+            Some(on_exit),
+        )
+        .expect("spawn succeeds");
+
+        // The exit hook fires on the reader thread only after every produced
+        // byte has been framed and emitted, so once it fires both the sink and
+        // the capture buffer have reached their final state.
+        exit_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("child exits");
+
+        let streamed = sink_messages.lock().expect("sink mutex");
+        assert!(
+            streamed
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalOutput(_))),
+            "sink must receive the child's terminal.output frames"
+        );
+        let captured = terminal.captured_messages();
+        assert!(
+            captured.is_empty(),
+            "with a live sink wired, the in-memory capture must stay empty \
+             (unbounded write-only leak otherwise), got {} captured messages",
+            captured.len()
+        );
     }
 
     /// A bare command that resolves nowhere on `$PATH` must fail the spawn

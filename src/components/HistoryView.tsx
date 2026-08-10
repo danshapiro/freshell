@@ -5,7 +5,7 @@ import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessio
 import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
-import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
+import { applySessionRenameCascade } from '@/store/titleSync'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { useMobile } from '@/hooks/useMobile'
@@ -101,9 +101,15 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
-    const result = await api.patch<{ cascadedTerminalId?: string }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
-    if (result.cascadedTerminalId && titleOverride) {
-      dispatch(syncPaneTitleByTerminalId({ terminalId: result.cascadedTerminalId, title: titleOverride }))
+    const result = await api.patch<{ cascadedTerminalId?: string | null }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
+    if (titleOverride) {
+      applySessionRenameCascade({
+        dispatch,
+        provider: provider || 'claude',
+        sessionId,
+        title: titleOverride,
+        cascadedTerminalId: result.cascadedTerminalId,
+      })
     }
     await refresh()
   }

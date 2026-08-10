@@ -166,6 +166,20 @@ npm run test:cloud:build    # Build and push the Docker image to Artifact Regist
 
 **Note:** The electron suite always runs locally even in cloud mode (it needs a display and native modules not available in the container).
 
+### E2E Test Backend (Cloud Run Jobs)
+
+Playwright e2e tests can run locally or on Google Cloud Run Jobs. The `FRESHELL_E2E_BACKEND` environment variable controls the default:
+- **Unset or `"local"`**: run locally (the safe default for new clones)
+- **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~28 min local, ~$0.03/run)
+
+```bash
+npm run test:e2e            # Uses FRESHELL_E2E_BACKEND (default: local)
+npm run test:e2e:local      # Force local
+npm run test:e2e:cloud      # Force cloud
+```
+
+**If `FRESHELL_E2E_BACKEND` is not set, ask the user which way to set it** before running e2e tests. Explain that cloud is much faster (parallel shards, ~2-3 min vs ~28 min) but is a paid Google Cloud service (~$0.03/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
+
 ## Architecture
 
 ### Tech Stack

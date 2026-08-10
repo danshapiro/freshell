@@ -359,6 +359,26 @@ function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | un
     ?? findPaneIdByTerminalId(node.children[1], terminalId)
 }
 
+/**
+ * Recursively walk a pane tree to find the leaf pane ID bound to the given
+ * provider:sessionId — a fresh-agent pane owning that session, or a terminal
+ * pane whose sessionRef points at it. Returns undefined if no match.
+ */
+function findPaneIdBySessionRef(node: PaneNode, provider: string, sessionId: string): string | undefined {
+  if (node.type === 'leaf') {
+    const content = node.content
+    if (content.kind === 'fresh-agent' && content.provider === provider && content.sessionId === sessionId) {
+      return node.id
+    }
+    if (content.kind === 'terminal' && content.sessionRef?.provider === provider && content.sessionRef?.sessionId === sessionId) {
+      return node.id
+    }
+    return undefined
+  }
+  return findPaneIdBySessionRef(node.children[0], provider, sessionId)
+    ?? findPaneIdBySessionRef(node.children[1], provider, sessionId)
+}
+
 // Helper to find and replace a node (leaf or split) in the tree
 function findAndReplace(
   node: PaneNode,
@@ -1795,6 +1815,36 @@ export const panesSlice = createSlice({
       }
     },
 
+    /**
+     * Walk all tabs' pane trees and update the title for any pane bound to
+     * the given provider:sessionId — fresh-agent panes by provider/sessionId,
+     * terminal panes by sessionRef. Used when a session rename must mirror
+     * into pane titles even when no terminal cascade exists (SDK panes,
+     * exited coding-CLI terminals).
+     */
+    updatePaneTitleBySessionRef: (
+      state,
+      action: PayloadAction<{ provider: string; sessionId: string; title: string; setByUser?: boolean }>
+    ) => {
+      const { provider, sessionId, title, setByUser } = action.payload
+      for (const tabId of Object.keys(state.layouts)) {
+        const paneId = findPaneIdBySessionRef(state.layouts[tabId], provider, sessionId)
+        if (paneId) {
+          if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+            continue
+          }
+          if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
+          state.paneTitles[tabId][paneId] = title
+          if (setByUser !== false) {
+            // Mark as user-set so programmatic updates don't overwrite it
+            if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
+            if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
+            state.paneTitleSetByUser[tabId][paneId] = true
+          }
+        }
+      }
+    },
+
     reconcileTerminalSessionRefByTerminalId: (
       state,
       action: PayloadAction<{ terminalId: string; sessionRef: unknown }>
@@ -2247,6 +2297,7 @@ export const {
   hydratePanes,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
+  updatePaneTitleBySessionRef,
   reconcileTerminalSessionRefByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,

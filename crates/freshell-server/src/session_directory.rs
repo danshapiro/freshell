@@ -29,10 +29,13 @@
 //! * **all three search tiers.** The `title` metadata tier plus the SESSION-07
 //!   `userMessages`/`fullText` file-content tiers (`apply_file_search`, porting
 //!   `server/session-directory/file-search.ts`).
-//! * **live terminal join.** The sidebar join below (`join_live_terminals`)
-//!   fuses the live `TerminalIdentityRegistry` set into the parsed items:
-//!   a matched item gains `isRunning`/`runningTerminalId`, and each unmatched
-//!   live identity gets exactly one synthesized entry (with `sessionType`).
+//! * **live terminal join + metadata-store flavor.** The sidebar join below
+//!   ([`join_live_terminals`], Fix Spec: Session Naming Cluster) fuses the live
+//!   `TerminalIdentityRegistry` set into the parsed items: a matched item gains
+//!   `isRunning`/`runningTerminalId`, and each unmatched live identity gets
+//!   exactly one synthesized entry (with `sessionType`); `sessionType` is also
+//!   read-joined from the SESSION-06 metadata store
+//!   ([`apply_session_metadata`], Task 20).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,6 +85,12 @@ pub struct SessionDirectoryState {
     /// `buildLiveTerminalSessionItem`, `service.ts:77-151`). `O(terminals)` per
     /// request, no new I/O — reads the already-in-memory registry snapshot.
     pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// Task 20 (read-join): the SESSION-06 metadata store
+    /// (`session-metadata.json`, same `.freshell` home dir as the POST route)
+    /// whose `sessionType` tags [`apply_session_metadata`] overlays onto
+    /// matching items per request (`session-indexer.ts:1144-1148`, key =
+    /// `provider:sessionId`).
+    pub metadata: crate::session_metadata::SessionMetadataStore,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -117,12 +126,20 @@ struct DirItem {
     /// (`buildLiveTerminalSessionItem`, `service.ts:128`, `!meta.sessionId`) —
     /// never set on a real session-file item.
     live_terminal_only: bool,
-    /// `SessionDirectoryItem.sessionType` (`shared/read-models.ts:53`): only
-    /// populated on a synthesized live-terminal item (`service.ts:125`,
+    /// `SessionDirectoryItem.sessionType` (`shared/read-models.ts:53`): set on a
+    /// synthesized live-terminal item (`service.ts:125`,
     /// `sessionType: meta.provider`) — a real session-file item never sets this
     /// in this port (the original's parsed items don't set it either, see
     /// `toItems`/`joinRunningState`, `service.ts:132-151`).
     session_type: Option<String>,
+    /// The PARSED (pre-override) title source (`IndexedSession::title_source`,
+    /// Node's `ParsedSessionTitleSource`; `"provider-generated"` or absent) --
+    /// consulted by [`apply_session_overrides`]'s provider-generated
+    /// read-guard (`applyOverride`, `session-indexer.ts:204-220`). Internal
+    /// only: never serialized by [`DirItem::to_value`] (this port's directory
+    /// response has never carried `titleSource`; exposing it would be a
+    /// separate parity decision).
+    title_source: Option<String>,
     /// SESSION-07: the on-disk transcript to scan for the `userMessages`/
     /// `fullText` tiers (`IndexedSession::source_file`). Internal only --
     /// never serialized (`to_value` never reads it), mirroring
@@ -396,6 +413,15 @@ async fn session_directory(
         None => Vec::new(),
     };
     let items = apply_session_overrides(items, &state.settings.session_overrides());
+    // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
+    // ONE `get_all()` per request (a cached read; disk is touched at most
+    // once per store lifetime), mirroring the original indexer reading the
+    // store snapshot while building items (`session-indexer.ts:1109,
+    // :1144-1148`). Ordered after the overrides overlay (the original applies
+    // `applyOverride` first, then the metadata `sessionType`) and BEFORE the
+    // live-terminal join (the original's indexer output already carries
+    // `sessionType` when `toItems` runs).
+    let items = apply_session_metadata(items, &state.metadata.get_all().await);
     // Fix Spec: Session Naming Cluster (SYMPTOM 1) -- join the LIVE terminal
     // identity set against the parsed session items (`toItems`, `service.ts:132-151`).
     // `.list()` (live-only, excludes retired terminals): an exited terminal is not
@@ -537,6 +563,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        title_source: idx.title_source.clone(),
         source_file: idx.source_file.clone(),
     }
 }
@@ -687,6 +714,7 @@ fn item_from_meta(
         running_terminal_id: None,
         live_terminal_only: false,
         session_type: None,
+        title_source: meta.title_source.clone(),
         source_file,
     }
 }
@@ -708,7 +736,22 @@ fn apply_session_overrides(
                     return None;
                 }
                 if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
-                    item.title = Some(t.to_string());
+                    // Node's applyOverride guard (`session-indexer.ts:210-214`):
+                    // the override title applies iff it is NON-EMPTY (JS `!!`)
+                    // AND NOT (the PARSED source is 'provider-generated' AND
+                    // the row's `titleSource` is exactly 'dir'/'first-message',
+                    // strict `===` -- 'ai'/'user'/absent/any-other row source
+                    // still applies). Without this, the auto-title sweep's
+                    // dir/first-message row re-shadows a provider-generated
+                    // title within one 2s tick of the ai-title-shadow-cleanup
+                    // migration clearing it.
+                    let row_source = ov.get("titleSource").and_then(Value::as_str);
+                    let provider_generated_shadow = item.title_source.as_deref()
+                        == Some("provider-generated")
+                        && matches!(row_source, Some("dir") | Some("first-message"));
+                    if !t.is_empty() && !provider_generated_shadow {
+                        item.title = Some(t.to_string());
+                    }
                 }
                 if let Some(s) = ov.get("summaryOverride").and_then(Value::as_str) {
                     item.summary = Some(s.to_string());
@@ -716,6 +759,32 @@ fn apply_session_overrides(
                 item.archived = ov.get("archived").and_then(Value::as_bool).unwrap_or(false);
             }
             Some(item)
+        })
+        .collect()
+}
+
+/// Task 20 (read-join): overlay `sessionType` from the SESSION-06 metadata
+/// store onto matching items, keyed by `provider:sessionId` -- ports the
+/// original indexer's read-join (`session-indexer.ts:1144-1148`: `const meta
+/// = sessionMetadata[metaKey]; if (meta?.sessionType) merged.sessionType =
+/// meta.sessionType`). The JS truthiness gate means an absent, non-string, or
+/// EMPTY `sessionType` never applies.
+fn apply_session_metadata(
+    items: Vec<DirItem>,
+    metadata: &std::collections::HashMap<String, Value>,
+) -> Vec<DirItem> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(session_type) = metadata
+                .get(&item.key())
+                .and_then(|entry| entry.get("sessionType"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                item.session_type = Some(session_type.to_string());
+            }
+            item
         })
         .collect()
 }
@@ -817,6 +886,10 @@ fn build_live_terminal_session_item(
         running_terminal_id: Some(identity.terminal_id.clone()),
         live_terminal_only: identity.session_id.is_none(),
         session_type: Some(provider),
+        // A synthesized live-terminal item has no parsed transcript, hence no
+        // parsed title source (Node's `buildLiveTerminalSessionItem` sets no
+        // `titleSource` either, `service.ts:110-130`).
+        title_source: None,
         source_file: None,
     })
 }
@@ -875,6 +948,7 @@ mod join_tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         }
     }
@@ -1562,7 +1636,7 @@ mod tests {
             item.project_path,
             "D:\\Users\\Dan\\GoogleDrivePersonal\\code\\freshell"
         );
-        assert_eq!(item.title.as_deref(), Some("Test session 1"));
+        assert_eq!(item.title.as_deref(), Some("Test Session 1"));
         assert_eq!(item.last_activity_at, 1_769_753_759_234);
         assert!(item.is_non_interactive);
 
@@ -1663,7 +1737,7 @@ mod tests {
         // has a title → shown.
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["title"], json!("Test session 1"));
+        assert_eq!(arr[0]["title"], json!("Test Session 1"));
         assert_eq!(arr[0]["provider"], json!("claude"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1742,7 +1816,7 @@ mod tests {
         let arr = page["items"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["matchedIn"], json!("title"));
-        assert_eq!(arr[0]["snippet"], json!("Test session 1"));
+        assert_eq!(arr[0]["snippet"], json!("Test Session 1"));
 
         // A non-matching query → empty.
         let items2 = list_claude_sessions(&claude_home(&home));
@@ -1778,6 +1852,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
@@ -1991,6 +2066,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let items = vec![mk("keep"), mk("gone")];
@@ -2034,6 +2110,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
@@ -2041,6 +2118,143 @@ mod tests {
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
         assert_eq!(v["title"], json!("t"));
+    }
+
+    // -- Task 5b: the provider-generated read-guard (`applyOverride`,
+    // `session-indexer.ts:204-220`) ------------------------------------------
+    //
+    // The auto-title sweep re-writes a qualifying `dir`/`first-message`
+    // override row for any live amplifier session within one 2s tick of the
+    // ai-title-shadow-cleanup migration clearing it (write parity with Node,
+    // `auto-title.ts:24-46`). Node stays correct because its READ model hides
+    // such rows; this matrix pins that suppression, ported here.
+
+    /// One parsed item whose PARSED title source is configurable; the parsed
+    /// title is always "Provider Title" so tests can assert whether the
+    /// override or the parsed title won.
+    fn guard_item(sid: &str, title_source: Option<&str>) -> DirItem {
+        DirItem {
+            session_id: sid.into(),
+            provider: "amplifier".into(),
+            project_path: "/p".into(),
+            title: Some("Provider Title".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: title_source.map(str::to_string),
+            source_file: None,
+        }
+    }
+
+    /// Overlay ONE override row onto ONE item; returns the resulting title.
+    fn overlaid_title(item: DirItem, row: Value) -> Option<String> {
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(item.key(), row);
+        let out = apply_session_overrides(vec![item], &overrides);
+        out[0].title.clone()
+    }
+
+    #[test]
+    fn provider_generated_session_suppresses_dir_override_row() {
+        // The load-bearing case: a provider-generated session with a
+        // sweep-written dir row must serve the PARSED provider title.
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        assert_eq!(title.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_suppresses_first_message_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "Fix the flux", "titleSource": "first-message" }),
+        );
+        assert_eq!(title.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_ai_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "AI Title", "titleSource": "ai" }),
+        );
+        assert_eq!(title.as_deref(), Some("AI Title"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_user_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "My Rename", "titleSource": "user" }),
+        );
+        assert_eq!(title.as_deref(), Some("My Rename"));
+    }
+
+    #[test]
+    fn provider_generated_session_still_applies_absent_source_override_row() {
+        // Node compares strict `===` against exactly 'dir'/'first-message':
+        // an ABSENT (or legacy/other) row source fails both comparisons and
+        // the override still applies.
+        let title = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "Legacy Rename" }),
+        );
+        assert_eq!(title.as_deref(), Some("Legacy Rename"));
+    }
+
+    #[test]
+    fn empty_string_title_override_never_applies() {
+        // Node `!!ov?.titleOverride`: '' is falsy, for ANY session.
+        let provider_generated = overlaid_title(
+            guard_item("s1", Some("provider-generated")),
+            json!({ "titleOverride": "", "titleSource": "user" }),
+        );
+        assert_eq!(provider_generated.as_deref(), Some("Provider Title"));
+        let plain = overlaid_title(guard_item("s2", None), json!({ "titleOverride": "" }));
+        assert_eq!(plain.as_deref(), Some("Provider Title"));
+    }
+
+    #[test]
+    fn non_provider_generated_session_still_applies_dir_override_row() {
+        let title = overlaid_title(
+            guard_item("s1", None),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        assert_eq!(title.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn suppressed_title_row_still_overlays_summary_and_archived() {
+        // applyOverride suppresses ONLY the title clause; summary/archived
+        // overlay regardless (session-indexer.ts:215-217).
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "amplifier:s1".into(),
+            json!({
+                "titleOverride": "proj", "titleSource": "dir",
+                "summaryOverride": "sum", "archived": true
+            }),
+        );
+        let out = apply_session_overrides(
+            vec![guard_item("s1", Some("provider-generated"))],
+            &overrides,
+        );
+        assert_eq!(out[0].title.as_deref(), Some("Provider Title"));
+        assert_eq!(out[0].summary.as_deref(), Some("sum"));
+        assert!(out[0].archived);
     }
 
     // -- Batch B: the `SessionIndex`-backed production path --
@@ -2154,6 +2368,7 @@ mod tests {
             settings,
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
         let resp = app
@@ -2174,11 +2389,88 @@ mod tests {
         let page: Value = serde_json::from_slice(&bytes).unwrap();
         let items = page["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["title"], json!("Test session 1"));
+        assert_eq!(items[0]["title"], json!("Test Session 1"));
         // Oracle-compat: archived always present.
         assert_eq!(items[0]["archived"], json!(false));
         assert_eq!(page["nextCursor"], Value::Null);
         assert_eq!(page["revision"], json!(1_769_753_759_234i64));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Task 20 (read-join): a `sessionType` tag persisted through the
+    /// SESSION-06 `SessionMetadataStore` (`session-metadata.json`) is
+    /// overlaid onto the matching served `/api/session-directory` item,
+    /// keyed `provider:sessionId` -- mirroring the original indexer's
+    /// read-join (`session-indexer.ts:1144-1148`, `const meta =
+    /// sessionMetadata[metaKey]; if (meta?.sessionType) merged.sessionType
+    /// = meta.sessionType`). Mirrors the harness of
+    /// `patch_override_is_visible_through_session_directory_overlay`
+    /// (`sessions_tests.rs`): write through the REAL store, assert on the
+    /// REAL served JSON.
+    #[tokio::test]
+    async fn session_metadata_session_type_is_joined_onto_directory_items() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let home = claude_home_with(&["real-corrupted.jsonl"]);
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        // Same `.freshell` dir the POST /api/session-metadata route persists
+        // to -- the read side must discover the SAME file.
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set(
+                "claude",
+                "b7936c10-4935-441c-837c-c1f33cafec2d",
+                "kilroy",
+                Some("explicit"),
+            )
+            .await
+            .unwrap();
+
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
+        let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
+        let session_index =
+            std::sync::Arc::new(SessionIndex::new(vec![
+                std::sync::Arc::new(ClaudeSource::new(claude_home(&home)))
+                    as std::sync::Arc<dyn SessionSource>,
+            ]));
+        let state = SessionDirectoryState {
+            auth_token: std::sync::Arc::clone(&auth_token),
+            settings,
+            session_index: Some(session_index),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            // A FRESH store instance over the same dir (not the writer above):
+            // proves the join reads the persisted file, not shared memory.
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+        };
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        let item = items
+            .iter()
+            .find(|i| i["sessionId"] == json!("b7936c10-4935-441c-837c-c1f33cafec2d"))
+            .expect("tagged session present in directory");
+        assert_eq!(
+            item["sessionType"],
+            json!("kilroy"),
+            "sessionType from the metadata store must be joined onto the served item"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -2197,6 +2489,9 @@ mod tests {
             settings,
             session_index: None,
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            // No home: a unique, nonexistent dir -- the store tolerates a
+            // missing file (empty metadata), matching the no-home page.
+            metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
         };
         let app = router(state);
         let resp = app
@@ -2278,6 +2573,7 @@ mod tests {
             settings: settings.clone(),
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2382,6 +2678,7 @@ mod tests {
             settings,
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2478,6 +2775,7 @@ mod tests {
             settings: settings.clone(),
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2571,6 +2869,7 @@ mod tests {
             settings,
             session_index: Some(session_index),
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         };
         let app = router(state);
 
@@ -2890,6 +3189,7 @@ mod tests {
             running_terminal_id: None,
             live_terminal_only: false,
             session_type: None,
+            title_source: None,
             source_file: None,
         };
         let mut overrides = serde_json::Map::new();

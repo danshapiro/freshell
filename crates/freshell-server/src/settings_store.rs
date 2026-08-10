@@ -691,6 +691,93 @@ impl SettingsStore {
             .clone()
     }
 
+    /// `configStore.isMigrationDone(id)` (`config-store.ts:565-568`): true
+    /// when the optional top-level `completedMigrations` string array in
+    /// `config.json` contains `id`. Reads disk directly -- the key stays an
+    /// UNMANAGED copy-forward key (see `persist`), so a side-by-side Node
+    /// append is never clobbered by in-memory state. A homeless store
+    /// reports `true`: nothing can persist, so a marker-gated migration must
+    /// never run.
+    pub fn is_migration_done(&self, id: &str) -> bool {
+        let Some(home) = &self.home else {
+            return true;
+        };
+        let path = home.join(".freshell").join("config.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+            return false;
+        };
+        doc.get("completedMigrations")
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(id)))
+    }
+
+    /// `configStore.markMigrationDone(id)` (`config-store.ts:570-580`):
+    /// append-only + idempotent. Whole read-modify-write under [`ConfigLock`]
+    /// with the same atomic tmp+rename as `persist`, so no reader ever sees
+    /// a torn document and other top-level keys round-trip untouched.
+    /// HONEST LIMIT (mirrors [`ConfigLock`]'s own doc): this protects
+    /// against a legacy Node that wrote FIRST and is now quiescent. A
+    /// still-RUNNING legacy Node never re-reads config.json (cache-for-life,
+    /// config-store.ts:401-412) and rewrites the WHOLE document from its
+    /// stale cache on its next write, clobbering this marker (and any
+    /// cleared rows). Bounded: the cleanup is idempotent and simply re-runs
+    /// on the next Rust boot; `titleSource:"user"` rows are never touched.
+    pub fn mark_migration_done(&self, id: &str) -> std::io::Result<()> {
+        let Some(home) = &self.home else {
+            return Ok(());
+        };
+        let dir = home.join(".freshell");
+        std::fs::create_dir_all(&dir)?;
+        let _lock = ConfigLock::acquire(&dir);
+        let path = dir.join("config.json");
+        let mut doc = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let map = doc
+            .as_object_mut()
+            .expect("filtered to an object above, or defaulted to one");
+        let list = map
+            .entry("completedMigrations")
+            .or_insert_with(|| serde_json::json!([]));
+        match list.as_array_mut() {
+            Some(items) => {
+                if items.iter().any(|v| v.as_str() == Some(id)) {
+                    return Ok(());
+                }
+                items.push(serde_json::json!(id));
+            }
+            None => {
+                // Non-array garbage: coalesce like Node's `?? []`.
+                *list = serde_json::json!([id]);
+            }
+        }
+        let text = serde_json::to_string_pretty(&doc)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = dir.join(format!("config.json.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Re-attempts a full settings persist and SURFACES the result.
+    /// `patch_session_override` deliberately swallows persist errors
+    /// (best-effort, `let _ = self.persist(..)`, :758-767); a marker-gated
+    /// one-shot migration must not record completion on unknown persistence
+    /// state, so it calls this once after its clears and aborts (retrying
+    /// next boot) on failure -- matching Node, where a failed override write
+    /// THROWS and the chain's .catch aborts before `markMigrationDone`
+    /// (config-store.ts:195-210, :424-432; index.ts:1039-1058). Safe to call
+    /// repeatedly: `persist` re-reads disk and overlays only dirty keys.
+    pub async fn flush_to_disk(&self) -> std::io::Result<()> {
+        let settings = self.get().await;
+        self.persist(&settings)
+    }
+
     /// `configStore.patchSessionOverride(key, patch)` (`config-store.ts:492-514`):
     /// JS-spread merge `next = {...existing, ...patch}` (`Some(v)` sets, `None`
     /// clears a key), THEN the title-source ladder: a `(titleOverride, titleSource)`
@@ -1607,6 +1694,11 @@ pub struct SettingsRouterState {
     /// boot (`main.rs`'s TERM-11/TERM-13 seeding). Mirrors the legacy
     /// `registry.setSettings(updated)` call, `server/settings-router.ts:138`.
     pub registry: freshell_terminal::TerminalRegistry,
+    /// Task 2 (AI key cell): every successful settings save re-applies
+    /// `settings.ai.geminiApiKey` with FORCE — the Rust mirror of Node's
+    /// `AI_CONFIG.applySettingsKey(key, { force: true })` on the settings
+    /// save path (`ai-prompts.ts:17-23`). A blank/absent key never clears.
+    pub ai_key: crate::ai_title::AiKeyCell,
 }
 
 /// `GET`/`PATCH`/`PUT` `/api/settings` (R1: PUT === PATCH, matching
@@ -1639,6 +1731,12 @@ async fn patch_settings(
         Ok(merged) => {
             state.fresh_codex.set_enabled(merged.fresh_agent.enabled);
             apply_live_registry_settings(&state.registry, &merged);
+            // Task 2: force-re-apply the settings key on EVERY successful save
+            // (Node's `AI_CONFIG.applySettingsKey(key, { force: true })`,
+            // `ai-prompts.ts:17-23`); blank/absent never clears the cell.
+            state
+                .ai_key
+                .apply_settings_key_forced(merged.ai.gemini_api_key.as_deref());
             if let Ok(frame) =
                 serde_json::to_string(&json!({ "type": "settings.updated", "settings": &merged }))
             {
@@ -1708,6 +1806,7 @@ mod tests {
             broadcast_tx,
             fresh_codex,
             registry: freshell_terminal::TerminalRegistry::new(),
+            ai_key: crate::ai_title::AiKeyCell::default(),
         }
     }
 
@@ -1743,6 +1842,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert_eq!(state.registry.auto_kill_idle_minutes(), 42);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 2 (AI key cell): a successful PATCH re-applies `ai.geminiApiKey`
+    /// to the shared [`crate::ai_title::AiKeyCell`] with FORCE — the Rust
+    /// mirror of Node's `AI_CONFIG.applySettingsKey(key, { force: true })`
+    /// on every settings save (`ai-prompts.ts:17-23`).
+    #[tokio::test]
+    async fn patch_applies_gemini_api_key_forced_to_cell() {
+        let dir = std::env::temp_dir().join(format!("frs-live-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = router_state_at(&dir);
+        assert!(state.ai_key.get().is_none()); // pre-patch: no key anywhere
+
+        let resp = patch_settings(
+            State(state.clone()),
+            authed_headers(),
+            Json(json!({ "ai": { "geminiApiKey": "k2" } })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.ai_key.get().as_deref(), Some("k2"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

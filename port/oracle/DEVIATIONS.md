@@ -652,7 +652,24 @@ path itself is intact).
   (recorded as blocked-by-purity + moot). Options (b) partial port and (c) full port now: REJECT
   unanimous. Implementer: restart #16 orchestrator (distinct from adjudicating panel).
 - closure_progress (2026-07-30, DEV-0006 S5, commit 473a337e): CORRECTION + closure. The record's "rust emits NO terminal.meta.updated frames" text (:605-606, restated in the client_behavior_verification scenarios and the user_facing_disclosure) has been stale since 2026-07-16/07-26: the rust server emits terminal.meta.updated at create time (terminal.rs, b9e0c1a3) and at association/rebind time (codex_identity.rs / opencode_association.rs / codex_association.rs), in the pinned associated-then-meta order. The remaining gap is ONLY the git/tokenUsage enrichment (terminal-metadata-service.ts's git probes, retire-TTL, commit-if-changed dedupe), which the adjudicated closure condition (:644-649) does not require. With DEV-0006 S5 landing the coding-CLI session-association subsystem's proxy-fed consumer wiring and the flag flip, the closure condition ("port … terminal.meta.updated WHEN the coding-CLI controllers/session-association subsystem is ported") is met. Updated disclosure: sidebar badges carry provider/session identity from the association push; git branch/dirty and token usage stay absent (enrichment unported, separately adjudicable).
-- status: closed (2026-07-30, commit 473a337e — closed with DEV-0006 per :644-649; git/tokenUsage enrichment remains out of scope)
+- closure_update (2026-08-09, naming-persistence-sweep Task 18, commit ed1bd71a6): the
+  `terminal.meta.updated` producer + `TerminalMetadataService` equivalent is now PORTED —
+  `crates/freshell-ws/src/terminal_meta.rs` (`TerminalMetaRegistry`: commit-if-changed with
+  updatedAt-ignoring equality, retire with git-field strip + 1h retired TTL, list/get;
+  `enrich_from_cwd` over the Task 17 `freshell_platform::git_meta` helpers) — and wired into
+  every producer: the `terminal.create` path (seedFromTerminal parity for EVERY terminal,
+  enrichment run async after `terminal.created`), the amplifier/opencode association drains
+  (enrich + commit through the shared registry), PTY exit + `terminal.kill` (retire →
+  `{remove:[terminalId]}`), the connect handshake (`terminal.inventory.terminalMeta` now ships
+  `list()` instead of the hardcoded `[]`), and the auto-title sweep's per-session metadata
+  refresh (Node's `applySessionMetadata` analog; its TRIGGER is a KEPT divergence — see
+  DEV-0020). The user_facing_disclosure sentence above NO LONGER APPLIES: git branch/dirty
+  badges populate live on the Rust server. Pinning coverage:
+  `crates/freshell-ws/src/terminal_meta.rs` inline tests +
+  `crates/freshell-ws/tests/session_identity_frames.rs` (inventory `terminalMeta` row
+  assertions) + the Task 23 Playwright git-badge spec.
+  Surfaced internal-contract divergence (Task 18, recorded 2026-08-09 / Task 24): `TerminalMetaRegistry::retire()` returns `false` for an ALREADY-retired entry (Node re-stamps `retiredAt` and returns `true`) — internal API contract only, wire behavior stays Node-equivalent (exactly one `{remove:[terminalId]}` per terminal lifetime); documented in the method's rustdoc (`terminal_meta.rs:82-93`) + inline test.
+- status: closed (2026-07-30, commit 473a337e — closed with DEV-0006 per :644-649; the git/tokenUsage enrichment noted there as out of scope was subsequently ported by the naming-persistence-sweep — see closure_update 2026-08-09)
 
 ### DEV-0009 — idle auto-kill reap clock ignores self-generated repaint noise (original never reaps an animated detached TUI)
 
@@ -793,6 +810,51 @@ cold-index, and sub-root permission tests;
 - adjudicated_by: pending antagonist review (entry filed by the implementer per the
   resume-validation plan, Task 9).
 - status: proposed.
+
+
+### DEV-0020 — terminal-metadata git enrichment runs on a throttled per-unique-cwd poll (Node: indexer-event-driven, per-terminal, uncached)
+<!-- Renumbered from the sweep branch's DEV-0009 at merge: main's DEV-0009 is the idle reap-clock entry. -->
+
+- objective_defect: none — KEPT port-side TRIGGER divergence (naming-persistence-sweep Task 18,
+  commit ed1bd71a6), the one redesigned piece of the DEV-0008 closure above. Node runs its
+  terminal-metadata pass ONLY on indexer update events (`server/index.ts:873` onUpdate; debounce
+  2 s, `session-indexer.ts:436`) — an idle Node spawns ZERO git processes — and its pass is
+  per-terminal and uncached (`server/coding-cli/utils.ts:93-116`, with only repo roots cached
+  `:24-26`). The Rust port has no indexer event bus (the session index is poll-based,
+  `freshell_sessions::directory_index`), so per-tick trigger equivalence was FALSIFIED at
+  planning time (validator-A7): a naive per-tick, per-terminal port would spawn unthrottled git
+  processes forever on an idle server.
+- original_behavior: indexer `onUpdate` (2 s debounce) → per matched terminal,
+  `applySessionMetadata` → `enrichFromCwd` runs three PLAIN git probes (`symbolic-ref`,
+  `rev-parse` fallback, `status --porcelain`) with no optional-locks suppression and no
+  branch/dirty caching; zero git activity between indexer events.
+- port_behavior: the refresh rides the auto-title sweep tick
+  (`crates/freshell-server/src/auto_title_sweep.rs`, `GitMetaCache` + `refresh_terminal_meta`),
+  gated per UNIQUE resolved cwd (NOT per terminal): git runs for a cwd only when (a) that cwd's
+  terminal-set signature changed since its last run, or (b) the last run is >=
+  `GIT_ENRICH_MIN_INTERVAL_MS` (30 s) old — throttled refresh so dirty-status drift still
+  surfaces. EVERY spawned git suppresses optional locks (`GIT_OPTIONAL_LOCKS=0` env on every
+  `freshell_platform::git_meta` invocation, equivalent to `--no-optional-locks`): a 0.5 Hz poll
+  without it would continually rewrite `.git/index`.
+- fingerprint: trigger schedule + git invocation shape only — the port spawns throttled
+  `GIT_OPTIONAL_LOCKS=0` git probes on the sweep cadence where Node spawns plain-git probes only
+  on indexer updates; the `terminal.meta.updated` wire VALUES are unaffected (same record
+  fields, same commit-if-changed change gate, so an unchanged repo produces zero frames on both
+  backends).
+- cost_and_residual: measured local cost 0.01 s per `git --no-optional-locks status --porcelain`
+  on this repo (validator-A7). Residual: /mnt/c DrvFs cwds are 10-100x slower; the >= 30 s
+  throttle bounds the worst case to delayed badges (never a git storm).
+- pinning_test: Task 18 —
+  `auto_title_sweep::tests::sweep_refreshes_terminal_meta_change_gated_and_broadcasts_once`
+  (change-gated commit, single upsert batch per pass, unchanged pass fully suppressed) plus the
+  `crates/freshell-ws/src/terminal_meta.rs` inline tests (enrichment field derivation); Task 23's
+  Playwright git-badge spec pins the user-visible badge behavior end-to-end.
+- adjudicated_by: validator-A7 (antagonist), planning-stage adjudication for the
+  naming-persistence-sweep — it falsified per-tick trigger equivalence and produced the 0.01 s
+  measurement and the /mnt/c DrvFs residual; the throttled per-unique-cwd + optional-locks
+  design implemented here is that adjudication's remedy (implementer distinct from adjudicator;
+  NOT self-approved). Task 24 references this entry.
+- status: accepted (KEPT divergence)
 
 ## E2E-discovered intentional divergences (EDEV-xx)
 
@@ -1040,6 +1102,100 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   through reload/restore — the precondition for reconciliation-phase dedupe/adoption —
   instead of a fresh client-minted key per hydrate; snapshot-restored panes are re-created
   under their captured key.
+
+### EDEV-09 — client title-convergence fixes (sidebar/history/terminal-menu/Overview renames now mirror into pane titles; exited-terminal renames persist)
+- what_differs: `src/store/titleSync.ts` gains `applySessionRenameCascade` and replaces the
+  exited-terminal bail (titleSync.ts:35) with a `sessionRef` fallback PATCH; `src/store/panesSlice.ts`
+  gains `updatePaneTitleBySessionRef`; `ContextMenuProvider.renameSession`/`renameTerminal` and
+  `HistoryView.renameSession` dispatch pane mirrors with `setByUser: true`;
+  `src/components/OverviewView.tsx` TerminalCard inline rename is re-routed through the shared
+  rename helper so `paneTitles` updates too. Applies identically to BOTH backends (shared client).
+- why_intentional: explicit user directive in the naming-persistence-sweep task: "for the same
+  underlying session/terminal, the sidebar item title and the pane title must never disagree";
+  the pre-fix client dropped `cascadedTerminalId` (ContextMenuProvider.tsx:483-487), never
+  mirrored session renames into SDK panes, silently dropped pane renames on exited coding-CLI
+  terminals (titleSync.ts:35 / TerminalView.tsx:3841), and left Overview renames invisible to
+  paneTitles while the sweep is structurally blind post-PATCH — defects on the original too
+  (desync paths D3/D4/D7 audit: .the-usual-logs report client-title-sync.md; D8 + Overview:
+  validator-A5).
+- evidence: test/e2e-browser/specs/title-sync-convergence.spec.ts (both projects, incl. the
+  Overview rename journey) + test/unit/client/store/paneSessionTitleSync.test.ts; commit 7db308811.
+- user_impact: renaming a session from the sidebar/history/terminal menus or the Overview page
+  now updates the open pane header immediately on both servers, and renaming a pane whose
+  coding-CLI terminal already exited still persists; previously the pane kept the stale name
+  until a sidebar click (or the rename was silently lost).
+
+### EDEV-10 — Pane-rename cascade finalizes `titleSource:'user'` on the session override (Node writes a plain `{titleOverride}` the sweep can steal)
+- what_differs: `PATCH /api/panes/:id`'s syncable-terminal cascade persists the
+  session override as `{titleOverride, titleSource:'user'}`
+  (`crates/freshell-server/src/main.rs::SettingsRenamePersistence::patch_session_override_title`).
+  Node's `persistSyncableTerminalRename` writes a plain `{titleOverride}` with
+  NO `titleSource` (`server/agent-api/router.ts:679-681`), leaving the
+  title-source ladder rung unfinalized.
+- why_intentional: Rust is the better side. A pane rename is a USER rename.
+  When the rename lands BEFORE the auto-title sweep finalizes the session
+  (dir/absent rung), the unfinalized row makes the next sweep pass compute the
+  first-message patch and permanently steal the rename — override, registry
+  title, and a stale `terminal.title.updated` push; every later pass then sees
+  registry == override and never heals (Node's per-session fresh override read
+  does NOT close this window: a fresh read of an unfinalized row clobbers just
+  the same, `server/auto-title.ts` first-message-wins). The `user` rung matches
+  what BOTH servers already write on the terminals-route rename cascade
+  (`crates/freshell-server/src/terminals.rs:1000-1004`; Node
+  `rename-cascade.ts:26` default `titleSource='user'`) — Node's panes route is
+  internally inconsistent with its own terminals route. Surfaced by the final
+  full-suite gate: title-sync-convergence Test 3 under parallel load.
+- evidence: RED-first regression
+  `crates/freshell-server/src/auto_title_sweep.rs::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`
+  (RED: sweep rewrote the override to
+  `{"titleOverride":"convergence gamma automation rename journey","titleSource":"first-message"}`;
+  GREEN with the `'user'` write). Ladder interaction: a later sweep
+  `{first-message}` patch is rejected against the `user` rung
+  (`settings_store.rs::can_upgrade_title`), and an in-flight pass that
+  snapshotted overrides before the rename has its stale override write
+  ladder-rejected at the store, so any stale registry push self-corrects on
+  the next tick.
+- user_impact: renaming a coding-CLI pane via the automation surface (REST/MCP)
+  right after opening a session no longer loses the new name to the background
+  auto-title sweep; the sidebar, registry, and session directory keep the
+  user's title.
+
+
+### EDEV-11 — Pane-rename cascade reads `paneContent.sessionRef` as an EXPLICIT session-resolution superset (Node never reads it)
+<!-- Renumbered from the sweep branch's EDEV-08 at merge: main's EDEV-08 is the REST createRequestId-mint entry. -->
+- what_differs: `PATCH /api/panes/:id`'s syncable-terminal rename cascade
+  (`crates/freshell-freshagent/src/rename_persistence.rs`,
+  `persist_syncable_terminal_rename`) resolves the session-override target as
+  (1) the terminal registry's session binding — the post-association metadata
+  a locator writes back server-side via `set_meta`, mirroring Node's
+  terminal-metadata-first preference (`server/agent-api/router.ts:658-676`) —
+  then (2) `paneContent.resumeSessionId` (Node's fallback, `:676`), then
+  (3) **`paneContent.sessionRef` — a source Node NEVER consults**
+  (`router.ts:655`/`:676` read only `meta.sessionId`/`resumeSessionId`). The
+  superset read is LAST, so it can only ADD a cascade where Node's resolution
+  found nothing — it can never change the target Node would have picked.
+- why_intentional: Rust is the better side. The SPA reconcile CLEARS
+  `resumeSessionId` and writes the canonical identity into `sessionRef`
+  instead (`src/store/panesSlice.ts:1705-1708`, 200 ms debounced) — so for a
+  long-lived SPA-reconciled pane whose terminal metadata was never populated,
+  Node's own resolution silently no-ops and the rename never reaches the
+  session override. Reading the canonical `sessionRef` closes that hole.
+  (A10.1: while the Rust server lacks a client-independent association path,
+  registry-first + sessionRef covers both directions the identity can
+  arrive from; the seam lands NOW so the gap does not silently reopen when
+  association parity lands.)
+- evidence: RED-first unit coverage in
+  `crates/freshell-freshagent/src/rename_cascade_tests.rs`
+  (`rename_pane_cascades_to_syncable_terminal_via_injected_persistence` —
+  sessionRef-only pane cascades to `claude:sess-ref-1`;
+  `rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields`
+  — registry-first resolution, validator-A10;
+  `rename_pane_shell_pane_never_cascades` — non-syncable modes untouched).
+  Node reference: `persistSyncableTerminalRename`, `router.ts:649-693`.
+- user_impact: Renaming a coding-CLI pane whose session identity lives only in
+  the client-written `sessionRef` now persists the new title onto the session
+  directory entry too (survives restart/reindex), instead of silently updating
+  only the terminal override.
 
 
 ### DEV-0011 — Transactional rebind with bind-new-before-persist and SO_REUSEPORT

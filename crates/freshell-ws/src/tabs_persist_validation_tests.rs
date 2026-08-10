@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 
 fn open_record(tab_key: &str, tab_name: &str, updated_at: i64) -> Value {
     json!({ "tabKey": tab_key, "tabId": tab_key, "tabName": tab_name, "status": "open",
-            "revision": updated_at, "updatedAt": updated_at, "paneCount": 0, "panes": [] })
+            "revision": updated_at, "updatedAt": updated_at, "createdAt": updated_at,
+            "titleSetByUser": false, "paneCount": 0, "panes": [] })
 }
 
 /// Direct deterministic write (explicit captured_at + revision) — bypasses the

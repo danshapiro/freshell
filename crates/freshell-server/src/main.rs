@@ -16,6 +16,10 @@
 //! * `FRESHELL_HOME` / `HOME` — the isolated home whose `.freshell/config.json`
 //!   supplies the persisted `network` overlay for `settings.updated`.
 
+mod ai_router;
+mod ai_title;
+mod auto_title;
+mod auto_title_sweep;
 mod boot;
 mod checkpoints;
 mod diag;
@@ -27,6 +31,7 @@ mod identity_sink;
 mod instance_id;
 mod logging;
 mod managed_ports;
+mod migrations;
 mod net_bind;
 mod network;
 mod proxy;
@@ -58,6 +63,7 @@ use freshell_freshagent::FreshAgentState;
 use freshell_platform::detect::{
     detect_platform_proc, host_os_live, is_wsl_proc, read_proc_version,
 };
+use freshell_platform::Env as _;
 use freshell_ws::WsState;
 use uuid::Uuid;
 
@@ -77,6 +83,61 @@ const APP_VERSION: &str = "0.7.0";
 /// matching `dotenv/config`'s own silent-missing-file behavior.
 fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
+}
+
+/// Task 16 (`PATCH /api/panes/:id` cascade): the production
+/// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
+/// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
+/// live settings store. The terminal write is a plain `{titleOverride}`
+/// patch (terminal overrides have no source ladder). The session write
+/// carries `titleSource:'user'` — a DELIBERATE divergence from Node's plain
+/// `{titleOverride}` patch (`persistSyncableTerminalRename`,
+/// `router.ts:679-681`), ledgered as EDEV-10 in `port/oracle/DEVIATIONS.md`:
+/// a pane rename is a USER rename, and leaving the ladder rung unfinalized
+/// lets the auto-title sweep's first-message pass permanently steal a rename
+/// that lands before the session finalizes (pinned RED-first by
+/// `auto_title_sweep::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`).
+/// This matches the `user` rung both servers already write on the
+/// terminals-route cascade (`terminals.rs:1000-1004`; Node
+/// `rename-cascade.ts:26`).
+struct SettingsRenamePersistence(settings_store::SettingsStore);
+
+impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
+    fn patch_terminal_override_title(
+        &self,
+        terminal_id: &str,
+        title: &str,
+    ) -> freshell_freshagent::BoxFuture<()> {
+        let store = self.0.clone();
+        let terminal_id = terminal_id.to_string();
+        let title = serde_json::json!(title);
+        Box::pin(async move {
+            let _ = store
+                .patch_terminal_override(&terminal_id, &[("titleOverride", Some(title))])
+                .await;
+        })
+    }
+
+    fn patch_session_override_title(
+        &self,
+        key: &str,
+        title: &str,
+    ) -> freshell_freshagent::BoxFuture<()> {
+        let store = self.0.clone();
+        let key = key.to_string();
+        let title = serde_json::json!(title);
+        Box::pin(async move {
+            let _ = store
+                .patch_session_override(
+                    &key,
+                    &[
+                        ("titleOverride", Some(title)),
+                        ("titleSource", Some(serde_json::json!("user"))),
+                    ],
+                )
+                .await;
+        })
+    }
 }
 
 #[tokio::main]
@@ -211,6 +272,28 @@ async fn main() -> ExitCode {
     // per-connection `configFallback` (`server/index.ts:372-380`).
     let config_fallback = settings_store.config_fallback();
 
+    // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`
+    // (`server/ai-prompts.ts:13-23`). Boot semantics = `server/index.ts:251`:
+    // env `GOOGLE_GENERATIVE_AI_API_KEY` wins over `settings.ai.geminiApiKey`
+    // (non-forcing); every successful settings save re-applies the settings
+    // key with force via `SettingsRouterState.ai_key` (blank never clears).
+    let ai_key = ai_title::AiKeyCell::init(
+        freshell_platform::RealEnv
+            .get("GOOGLE_GENERATIVE_AI_API_KEY")
+            .filter(|v| !v.is_empty()),
+        settings.ai.gemini_api_key.clone(),
+    );
+    // `FRESHELL_GEMINI_BASE_URL` is a Rust-only test seam for the e2e
+    // fake-Gemini server (Task 21) — Node has NO env base-URL override (its
+    // default is hardcoded), a deliberate documented superset (validator-A1).
+    let gemini_base_url = freshell_platform::RealEnv
+        .get("FRESHELL_GEMINI_BASE_URL")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ai_title::GEMINI_DEFAULT_BASE_URL.to_string());
+    let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
+        ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
+    );
+
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
     // socket — the original `WsHandler.broadcast`. Capacity is generous so a paced
@@ -259,9 +342,17 @@ async fn main() -> ExitCode {
     // instance -- one `opencode serve` sidecar shared by both surfaces (Batch D PR-2).
     // `with_shared_sessions_revision` unifies its `sessions.changed` emission onto the
     // SAME sequence as `ws_state.sessions_revision` below (SESSION-09 fix-forward).
+    // AUTO-01 spine (Task 13): ONE shared server-side layout store. The WS
+    // `ui.layout.sync` ingestion (`ws_state.layout`, below) REPLACES its
+    // snapshot; the REST automation surface (Tasks 14-16) reads/mutates the
+    // SAME instance via `fresh_agent_state.layout`. Constructed BEFORE
+    // `fresh_agent_state` and wired at `new()`-time so the
+    // `fresh_opencode_state` clone (taken immediately below) shares it too.
+    let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
-            .with_shared_sessions_revision(Arc::clone(&sessions_revision));
+            .with_shared_sessions_revision(Arc::clone(&sessions_revision))
+            .with_layout(layout_store.clone());
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
@@ -403,20 +494,55 @@ async fn main() -> ExitCode {
     let fresh_claude_state = fresh_claude_state;
     let fresh_codex_state = fresh_codex_state;
     let fresh_opencode_state = fresh_opencode_state;
-    // The shared in-memory tabs registry — cloned into both the WS handler
+    // Task 18 (DEV-0008 closure): the shared terminal-metadata registry (the
+    // port of `server/terminal-metadata-service.ts`, `freshell_ws::terminal_meta`).
+    // Written by the WS create/kill/exit paths and the association drains
+    // (`ws_state`, below); ALSO written by the auto-title sweep's per-session
+    // meta refresh (`AutoTitleSweepState.terminal_meta`, below); read by every
+    // connection's handshake (`terminal.inventory.terminalMeta`).
+    let terminal_meta = freshell_ws::terminal_meta::TerminalMetaRegistry::default();
+    // The shared tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.
     //
-    // Tabs registry now persists rolling snapshot generations under
-    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per (device,
-    // client) -- MAX_SNAPSHOT_GENERATIONS -- capped at 40 files per device
-    // across all clients -- MAX_SNAPSHOT_FILES_PER_DEVICE) so a
+    // Task 11 (CFG-08/AUTO-15): the registry is now backed by the DURABLE
+    // Node-parity store under `<home>/.freshell/tabs-registry` (manifest +
+    // content-addressed objects, `server/tabs-registry/store.ts`). Opening is
+    // blocking, which is fine at boot (Node blocks too); a corrupt store
+    // REFUSES boot with the error message (Node parity: `open()` throws out
+    // of server startup rather than silently discarding user data). No home →
+    // memory-only registry exactly as before.
+    //
+    // The registry additionally persists rolling snapshot generations under
+    // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
     // device's tabs can be rebuilt after client-state loss (continuity trio,
     // docs/plans/2026-07-22-continuity-safety-trio.md).
     let tabs = match &home {
-        Some(home) => freshell_ws::tabs::TabsRegistry::with_persist_dir(
-            home.join(".freshell").join("tabs-snapshots"),
-        ),
+        Some(home) => {
+            let store_root = home.join(".freshell").join("tabs-registry");
+            let boot_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let store = match freshell_ws::tabs_store::DurableTabsStore::open(
+                &store_root,
+                freshell_ws::tabs_store_model::default_caps(),
+                boot_now,
+            ) {
+                Ok(store) => store,
+                Err(err) => {
+                    eprintln!(
+                        "Failed to open tabs registry store at {}: {err}",
+                        store_root.display()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            freshell_ws::tabs::TabsRegistry::with_durable_store(
+                store,
+                Some(home.join(".freshell").join("tabs-snapshots")),
+            )
+        }
         None => freshell_ws::tabs::TabsRegistry::new(),
     };
 
@@ -463,7 +589,35 @@ async fn main() -> ExitCode {
     let fresh_agent_state = fresh_agent_state
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_opencode_locator(opencode_locator.clone())
-        .with_codex_locator(codex_locator.clone());
+        .with_codex_locator(codex_locator.clone())
+        // Task 16 (`PATCH /api/panes/:id` cascade): the configStore seam over
+        // the live settings store, plus the SAME handler-scoped
+        // `terminals.changed` revision counter the WS lifecycle and REST
+        // `/api/terminals` broadcasts stamp — one monotonic sequence.
+        .with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))
+        .with_shared_terminals_revision(Arc::clone(&terminals_revision))
+        // Fix round 1 (Task 23 gap): REST-pipeline creates (`POST /api/tabs`,
+        // pane split, restore) get the SAME create-time meta seed -> async git
+        // enrich -> `terminal.meta.updated` broadcast the WS `terminal.create`
+        // path runs (Node seeds off the registry's 'terminal.created' event
+        // for EVERY terminal, `server/index.ts:647-655` -> `seedFromTerminal`).
+        // Wired HERE because only this crate sees both sides: freshagent (the
+        // hook seam) and freshell-ws (the meta registry). WS creates never
+        // fire this hook, so no terminal is double-seeded.
+        .with_terminal_created_hook({
+            let terminal_meta = terminal_meta.clone();
+            let broadcast_tx = Arc::clone(&broadcast_tx);
+            Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
+                freshell_ws::terminal_meta::seed_from_terminal(
+                    &terminal_meta,
+                    &broadcast_tx,
+                    &event.terminal_id,
+                    &event.mode,
+                    event.resume_session_id.as_deref(),
+                    event.cwd.as_deref(),
+                );
+            })
+        });
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
     // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
@@ -765,6 +919,7 @@ async fn main() -> ExitCode {
         auto_resume_cancels: Default::default(),
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
+        terminal_meta: terminal_meta.clone(),
         opencode_locator: opencode_locator.clone(),
         codex_locator: codex_locator.clone(),
         session_existence: session_existence.clone(),
@@ -786,6 +941,8 @@ async fn main() -> ExitCode {
         fresh_opencode: fresh_opencode_state.clone(),
         registry: registry.clone(),
         tabs: tabs.clone(),
+        // The SAME store `fresh_agent_state.layout` holds (AUTO-01 spine).
+        layout: layout_store.clone(),
         screenshots: screenshots.clone(),
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
@@ -914,10 +1071,7 @@ async fn main() -> ExitCode {
     let boot_state = BootState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
-        platform: Arc::new(build_platform_payload(
-            available_clis,
-            &freshell_platform::RealEnv,
-        )),
+        platform: Arc::new(build_platform_payload(available_clis, ai_key.enabled())),
         // The SAME resolved version `GET /api/health` reports (shared above), so
         // `/api/version` `currentVersion` and health `version` never diverge.
         app_version: Arc::clone(&app_version),
@@ -999,6 +1153,40 @@ async fn main() -> ExitCode {
             terminal_identity.clone(),
             SESSIONS_SWEEP_INTERVAL,
         );
+        // Task 5: the background auto-name pass (dir -> first-message ->
+        // Gemini AI) -- `server/index.ts:868-950`. Same cadence + index
+        // accessor as the sessions sweep above; see `auto_title_sweep`'s
+        // module doc for the full semantics (only THIS sweep honors
+        // `settings.sidebar.autoGenerateTitles`).
+        auto_title_sweep::spawn_auto_title_sweep(
+            auto_title_sweep::AutoTitleSweepState {
+                settings: settings_store.clone(),
+                identity: terminal_identity.clone(),
+                registry: registry.clone(),
+                broadcast_tx: Arc::clone(&broadcast_tx),
+                sessions_revision: Arc::clone(&sessions_revision),
+                ai_key: ai_key.clone(),
+                gemini: gemini.clone(),
+                pending_ai_titles: Default::default(),
+                // Task 18: the SAME registry `ws_state.terminal_meta` holds,
+                // so the sweep's meta refresh feeds the handshake + broadcasts.
+                terminal_meta: terminal_meta.clone(),
+                git_meta_cache: Default::default(),
+            },
+            Arc::clone(index),
+            SESSIONS_SWEEP_INTERVAL,
+        );
+    }
+    // One-time boot migration (Node chains it onto the coding-CLI indexer's
+    // first full index, `server/index.ts:1039-1054`, fire-and-forget). The
+    // cleanup condition reads ONLY `sessionOverrides` -- never the index or
+    // live enrichment (Node's comment says exactly this) -- so a detached
+    // task here is observationally equivalent to Node's post-index timing.
+    {
+        let migration_settings = settings_store.clone();
+        tokio::spawn(async move {
+            migrations::run_ai_title_shadow_cleanup(&migration_settings).await;
+        });
     }
     // Identity invariant alarm — its own sweep, unconditional (kata qmpk:
     // previously rode the amplifier locator sweep and died silently when
@@ -1086,11 +1274,29 @@ async fn main() -> ExitCode {
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
+    // Task 6: the sessions router's provider-generated short-circuit reads
+    // the SAME session index (another clone before the move below).
+    let sessions_state_index = session_index.clone();
+    // SESSION-06 store (`session-metadata.json`), created here (before the
+    // directory state) because BOTH the `POST /api/session-metadata` write
+    // route below and Task 20's session-directory read-join share it. Same
+    // isolated-home `.freshell` directory the settings store resolves
+    // (`settings_store.rs:246`), so a real deployment's existing
+    // `session-metadata.json` is discovered exactly like the legacy server
+    // discovers it.
+    let session_metadata_dir = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .unwrap_or_else(|| PathBuf::from(".freshell"));
+    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
         session_index,
         identity: terminal_identity.clone(),
+        // Task 20: the SAME store the POST route writes through -- the
+        // directory read-join must see every persisted `sessionType` tag.
+        metadata: session_metadata_store.clone(),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -1157,14 +1363,8 @@ async fn main() -> ExitCode {
 
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
-    // `<home>/.freshell/session-metadata.json`. Same isolated-home directory the settings
-    // store resolves (`settings_store.rs:246`), so a real deployment's existing
-    // `session-metadata.json` is discovered exactly like the legacy server discovers it.
-    let session_metadata_dir = home
-        .as_deref()
-        .map(|h| h.join(".freshell"))
-        .unwrap_or_else(|| PathBuf::from(".freshell"));
-    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+    // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
+    // session-directory read-join reads (created above, before the directory state).
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
         store: session_metadata_store.clone(),
@@ -1230,6 +1430,9 @@ async fn main() -> ExitCode {
                 // (TERM-11/TERM-13, above) so a successful PATCH also pushes
                 // `safety.autoKillIdleMinutes`/`terminal.scrollback` live.
                 registry: registry.clone(),
+                // Task 2: the SAME process-local AI key cell constructed at
+                // boot, so every settings save force-re-applies the key.
+                ai_key: ai_key.clone(),
             },
         ))
         .merge(boot::router(boot_state))
@@ -1259,6 +1462,15 @@ async fn main() -> ExitCode {
         ))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
+        // Task 7: `POST /api/ai/terminals/:terminalId/summary` — the SAME key
+        // cell / Gemini transport the sweep and generate-title use, plus the
+        // shared terminal registry for the scrollback snapshot.
+        .merge(ai_router::router(ai_router::AiRouterState {
+            auth_token: Arc::clone(&auth_token),
+            registry: registry.clone(),
+            ai_key: ai_key.clone(),
+            gemini: gemini.clone(),
+        }))
         .merge(sessions::router(sessions::SessionsState {
             auth_token: Arc::clone(&auth_token),
             settings: settings_store.clone(),
@@ -1273,6 +1485,14 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
+            // Task 6: the SAME key cell / Gemini transport the auto-title
+            // sweep uses (generate-title's AI branch gates on key presence
+            // ONLY -- never on `settings.sidebar.autoGenerateTitles`), plus
+            // the shared session index for the provider-generated
+            // short-circuit.
+            ai_key: ai_key.clone(),
+            gemini: gemini.clone(),
+            index: sessions_state_index,
         }))
         .merge(resolve::router(resolve::ResolveState {
             auth_token: Arc::clone(&auth_token),
@@ -1951,7 +2171,9 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
 /// is the extension-driven `which`/`where.exe` detection result (Follow-up 3.19,
 /// so the PanePicker surfaces the real coding-CLI agents); `featureFlags.kilroy`
 /// defaults off (no `KILROY_ENABLED` wiring yet); `featureFlags.aiEnabled`
-/// mirrors `AI_CONFIG.enabled()` (see [`ai_enabled`]).
+/// mirrors `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`) — since Task 2
+/// backed by [`ai_title::AiKeyCell::enabled`] (env boot precedence + settings
+/// key fallback), not the raw env var alone.
 /// `featureFlags.sessionResolve` is the unconditional literal both servers
 /// declare now that the hardened resolve response surface
 /// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
@@ -1959,23 +2181,15 @@ fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bo
 /// Tasks 2-6 (SYNC-06).
 fn build_platform_payload(
     available_clis: serde_json::Value,
-    env: &dyn freshell_platform::Env,
+    ai_enabled: bool,
 ) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled(env), "sessionResolve": true },
+        "featureFlags": { "kilroy": false, "aiEnabled": ai_enabled, "sessionResolve": true },
     })
-}
-
-/// `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
-/// `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`. JS
-/// `Boolean(str | undefined)` is true iff the var is set AND non-empty, which
-/// is exactly [`freshell_platform::Env::truthy`]'s semantics.
-fn ai_enabled(env: &dyn freshell_platform::Env) -> bool {
-    env.truthy("GOOGLE_GENERATIVE_AI_API_KEY")
 }
 
 /// The OS hostname (mirrors `detectHostName`). `/proc/sys/kernel/hostname` →
@@ -2258,9 +2472,11 @@ mod sessions_sweep_tests {
             title_provider_generated: false,
             summary: None,
             first_user_message: None,
+            title_source: None,
             last_activity_at,
             created_at: None,
             cwd: Some("/tmp".to_string()),
+            git_branch: None,
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
@@ -2463,7 +2679,6 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_platform::MapEnv;
 
     /// Save-and-restore guard for one env var (tests below mutate real
     /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them
@@ -2778,40 +2993,47 @@ mod tests {
         assert!(!transcript_definitively_absent(home.path(), "no-such", "s"));
     }
 
-    // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
-    // `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`.
-    // These use an injected `MapEnv` (not real process env), so they need no
-    // env-isolation guard: each test constructs its own independent view.
+    // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`) — since Task 2
+    // backed by the process-local [`ai_title::AiKeyCell`] (boot: env key wins
+    // over settings key, non-forcing). Each test constructs its own cell, so
+    // no env-isolation guard is needed.
 
     #[test]
-    fn ai_enabled_true_when_key_set_non_empty() {
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
-        assert!(ai_enabled(&env));
+    fn ai_enabled_true_when_env_key_set_non_empty() {
+        let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
+        assert!(cell.enabled());
     }
 
     #[test]
-    fn ai_enabled_false_when_key_unset() {
-        let env = MapEnv::new();
-        assert!(!ai_enabled(&env));
+    fn ai_enabled_true_when_settings_key_present_without_env() {
+        // The settings-key case: env absent + settings.ai.geminiApiKey present
+        // → the feature flag is on (Node: applySettingsKey at boot, index.ts:251).
+        let cell = ai_title::AiKeyCell::init(None, Some("settings-key".into()));
+        assert!(cell.enabled());
     }
 
     #[test]
-    fn ai_enabled_false_when_key_set_empty() {
-        // JS `Boolean("")` is `false` — an explicitly-empty var is still falsy.
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "");
-        assert!(!ai_enabled(&env));
+    fn ai_enabled_false_when_no_key_anywhere() {
+        assert!(!ai_title::AiKeyCell::init(None, None).enabled());
+    }
+
+    #[test]
+    fn ai_enabled_false_when_keys_explicitly_empty() {
+        // JS `Boolean("")` is `false` — explicitly-empty values are still falsy.
+        let cell = ai_title::AiKeyCell::init(Some(String::new()), Some(String::new()));
+        assert!(!cell.enabled());
     }
 
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
         // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
-        // Rust payload. `sessionResolve` is TRUE again: the hardened resolve
+        // Rust payload. `sessionResolve` is TRUE: the hardened resolve
         // response surface (degraded/providerErrors/unsearchedProviders/
         // homeDir, warming default) landed via the hardened plan Tasks 2-6
-        // (SYNC-06), so the flag is now genuinely earned.
-        let env = MapEnv::new().with("GOOGLE_GENERATIVE_AI_API_KEY", "sk-live-abc123");
-        let payload = build_platform_payload(serde_json::json!({}), &env);
+        // (SYNC-06), so the flag is genuinely earned.
+        let cell = ai_title::AiKeyCell::init(Some("sk-live-abc123".into()), None);
+        let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
             serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
@@ -2820,8 +3042,8 @@ mod tests {
 
     #[test]
     fn platform_payload_ai_enabled_false_without_key() {
-        let env = MapEnv::new();
-        let payload = build_platform_payload(serde_json::json!({}), &env);
+        let cell = ai_title::AiKeyCell::init(None, None);
+        let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
             serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })

@@ -123,6 +123,8 @@ async fn spawn_server_with_probe(
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
 
     let mut state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: identity.clone(),
         auth_token: Arc::clone(&auth_token),

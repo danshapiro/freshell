@@ -1,24 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
 import { validatePaneTree } from '@/store/paneTreeValidation'
 
 describe('fresh-agent pane migration', () => {
   it('keeps legacy agent-chat pane types out of live pane store boundaries', () => {
-    const result = spawnSync('rg', [
-      '-n',
-      'AgentChatPaneContent|AgentChatPaneInput',
+    const files = [
       'src/store/paneTypes.ts',
       'src/lib/pane-activity.ts',
       'src/store/persistControl.ts',
-    ], {
-      cwd: process.cwd(),
-      encoding: 'utf8',
-    })
+    ]
+    const pattern = /AgentChatPaneContent|AgentChatPaneInput/
 
-    expect(result.status).toBe(1)
-    expect(result.stdout).toBe('')
+    for (const file of files) {
+      const content = readFileSync(resolve(process.cwd(), file), 'utf8')
+      expect(content, `Expected ${file} to not contain legacy agent-chat pane types`).not.toMatch(pattern)
+    }
   })
 
   it('converts legacy agent-chat pane content to fresh-agent before render', () => {

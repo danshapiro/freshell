@@ -19,10 +19,13 @@
 //! { "version": 1, "sessions": { "<provider>": { "<sessionId>": { "sessionType": "...", "sessionTypeSource": "explicit" } } } }
 //! ```
 //!
-//! `get_all()` is a production read (resolve endpoint's sessionType overlay, SYNC-06); `get()` remains test-gated until a production caller lands (the sidebar directory listing
-//! embeds `sessionType` inline via `codingCliIndexer` server-side in the reference; this
-//! port's `crates/freshell-sessions` directory index is a SEPARATE crate this module does
-//! not reach into — wiring metadata into the directory listing is out of THIS module's
+//! `get_all()` is a production read with TWO consumers: the resolve endpoint's
+//! `sessionType` overlay (SYNC-06) and `session_directory`'s per-request `sessionType`
+//! overlay (`apply_session_metadata`, Task 20, mirroring the reference embedding
+//! `sessionType` inline via `codingCliIndexer`, `session-indexer.ts:1144-1148`);
+//! `get()` remains for future read-surfaces. (This port's `crates/freshell-sessions`
+//! directory index is a SEPARATE crate this module does not reach into — wiring
+//! metadata into the directory listing is out of THIS module's
 //! scope and tracked separately) but are not (yet) exposed over HTTP: the reference has no
 //! `GET /api/session-metadata` route either (confirmed by exhaustive grep of
 //! `server/sessions-router.ts` and `server/index.ts` — only the `POST` exists).

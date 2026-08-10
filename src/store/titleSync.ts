@@ -1,5 +1,5 @@
 import type { AppDispatch, RootState } from './store'
-import { updatePaneTitle } from './panesSlice'
+import { updatePaneTitle, updatePaneTitleByTerminalId, updatePaneTitleBySessionRef } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import { api } from '@/lib/api'
 import { isCodingAgentContent } from '@/lib/coding-agent-detection'
@@ -34,6 +34,17 @@ function syncRenameToServer(content: PaneContent | null, title: string): void {
     // CLIs, cascades via the terminals API to its session override.
     if (content.terminalId) {
       void api.patch(`/api/terminals/${encodeURIComponent(content.terminalId)}`, { titleOverride: title }).catch(() => {})
+      return
+    }
+    // Exited coding-CLI terminals have no live terminalId (TerminalView clears
+    // it on exit), so the terminals-API cascade is unavailable and the server
+    // sweep only sees live terminals. Fall back to the pane's durable
+    // sessionRef so the user's rename intent still persists on the session
+    // override (D8).
+    const ref = content.sessionRef
+    if (ref?.provider && ref.sessionId) {
+      const compositeKey = `${ref.provider}:${ref.sessionId}`
+      void api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: title }).catch(() => {})
     }
     return
   }
@@ -43,6 +54,29 @@ function syncRenameToServer(content: PaneContent | null, title: string): void {
       void api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: title }).catch(() => {})
     }
   }
+}
+
+/**
+ * Mirror a server-side session rename into any open pane bound to that
+ * session. The terminal cascade (cascadedTerminalId, returned by the sessions
+ * PATCH) covers live coding-CLI terminal panes; the sessionRef pass covers
+ * SDK/fresh-agent panes that can never cascade server-side (D4) plus terminal
+ * panes matched by sessionRef (D3). These are user renames, so
+ * setByUser: true — they land even on previously user-renamed panes and stay
+ * sticky (Scope Decision 3).
+ */
+export function applySessionRenameCascade(input: {
+  dispatch: AppDispatch
+  provider: string
+  sessionId: string
+  title: string
+  cascadedTerminalId?: string | null
+}): void {
+  const { dispatch, provider, sessionId, title, cascadedTerminalId } = input
+  if (cascadedTerminalId) {
+    dispatch(updatePaneTitleByTerminalId({ terminalId: cascadedTerminalId, title, setByUser: true }))
+  }
+  dispatch(updatePaneTitleBySessionRef({ provider, sessionId, title, setByUser: true }))
 }
 
 export function applyPaneRename(input: {

@@ -3,7 +3,8 @@ import { nanoid } from 'nanoid'
 import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { initLayout } from '@/store/panesSlice'
+import { initLayout, updatePaneTitleByTerminalId } from '@/store/panesSlice'
+import type { AppDispatch } from '@/store/store'
 import { getWsClient } from '@/lib/ws-client'
 import { collectTerminalIds } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
@@ -33,6 +34,30 @@ function formatTime(ts: number) {
   if (hours < 24) return `${hours}h ago`
   if (days < 7) return `${days}d ago`
   return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/**
+ * Shared TerminalCard rename handler: PATCH the terminal metadata (the server
+ * cascades a coding-CLI title to its session override) AND mirror the new
+ * title into any open pane. The server sweep is structurally blind post-PATCH
+ * (registry == override → no mismatch → no terminal.title.updated push), so
+ * the client must do the pane mirroring itself. This is a user rename →
+ * setByUser: true (Scope Decision 3).
+ */
+export async function renameOverviewTerminal(input: {
+  dispatch: AppDispatch
+  terminalId: string
+  title: string
+  description: string
+}): Promise<void> {
+  const { dispatch, terminalId, title, description } = input
+  await api.patch(`/api/terminals/${encodeURIComponent(terminalId)}`, {
+    titleOverride: title || undefined,
+    descriptionOverride: description || undefined,
+  })
+  if (title) {
+    dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: true }))
+  }
 }
 
 function formatDuration(ms: number): string {
@@ -165,10 +190,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
-                        await api.patch(`/api/terminals/${encodeURIComponent(t.terminalId)}`, {
-                          titleOverride: title || undefined,
-                          descriptionOverride: description || undefined,
-                        })
+                        await renameOverviewTerminal({ dispatch, terminalId: t.terminalId, title, description })
                         const existing = findTabByTerminalId(t.terminalId)
                         if (existing && title) {
                           dispatch(updateTab({ id: existing.id, updates: { title } }))
@@ -222,10 +244,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
-                        await api.patch(`/api/terminals/${encodeURIComponent(t.terminalId)}`, {
-                          titleOverride: title || undefined,
-                          descriptionOverride: description || undefined,
-                        })
+                        await renameOverviewTerminal({ dispatch, terminalId: t.terminalId, title, description })
                         await refresh()
                       }}
                       onDelete={async () => {

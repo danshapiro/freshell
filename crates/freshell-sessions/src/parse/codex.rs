@@ -507,6 +507,9 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
         title_provider_generated: false,
         summary,
         first_user_message,
+        // Codex has no provider-authored titles in its transcripts (no custom-title,
+        // agent-name, or summary records) -- always None. Mirrors Node's codex.ts.
+        title_source: None,
         message_count: lines.len() as i64,
         is_subagent,
         is_non_interactive,

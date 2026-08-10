@@ -259,6 +259,7 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let mut title: Option<String> = None;
     let mut custom_title: Option<String> = None;
     let mut agent_name: Option<String> = None;
+    let mut generated_summary_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
     let mut git_branch: Option<String> = None;
@@ -363,6 +364,20 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         if obj.get("type").and_then(Value::as_str) == Some("agent-name") {
             if let Some(an) = obj.get("agentName").and_then(as_trimmed_nonempty) {
                 agent_name = Some(slice_chars(an, 200));
+            }
+        }
+        // Extract generated summary title from `type:'summary'` records (additive work item 1).
+        // Node's claude-title.ts:3-9 extracts the title from summary records, and
+        // claude.ts:416-419 overwrites on EVERY summary record (last-wins; no guard) --
+        // session-indexer.ts:150 makes last-wins load-bearing.
+        if obj.get("type").and_then(Value::as_str) == Some("summary") {
+            if let Some(t) = obj
+                .get("summary")
+                .and_then(as_trimmed_nonempty)
+                .map(|s| extract_title_from_message(s, 200))
+                .filter(|t| !t.is_empty())
+            {
+                generated_summary_title = Some(t);
             }
         }
 
@@ -504,21 +519,34 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     });
 
     // Node's parse-layer title provenance (`providers/claude.ts:505`):
-    // `titleSource = 'provider-generated'` iff a custom-title / agent-name /
-    // generated-summary-title record was seen. Node's third input
-    // (`extractClaudeGeneratedTitleFromJsonlObject`) has no ported extraction
-    // here, so no Rust-parsed title can originate from it.
-    let title_provider_generated = custom_title.is_some() || agent_name.is_some();
+    // "provider-generated" iff a custom-title / agent-name /
+    // generated-summary-title record was seen; None otherwise (derived from
+    // first user message). The sweep branch ported the third input
+    // (`extractClaudeGeneratedTitleFromJsonlObject` -> generated_summary_title),
+    // so all three Node inputs participate. `title_provider_generated` (bool,
+    // read by the resolve endpoint's suppression check) and `title_source`
+    // (string rung, read by the auto-title ladder) express the SAME predicate.
+    let title_provider_generated =
+        custom_title.is_some() || agent_name.is_some() || generated_summary_title.is_some();
+    let title_source = if title_provider_generated {
+        Some("provider-generated".to_string())
+    } else {
+        None
+    };
 
     ParsedSessionMeta {
         session_id,
         cwd,
         created_at,
         last_activity_at,
-        title: custom_title.or(agent_name).or(title),
+        title: custom_title
+            .or(agent_name)
+            .or(generated_summary_title)
+            .or(title),
         title_provider_generated,
         summary,
         first_user_message,
+        title_source,
         message_count: lines.len() as i64,
         is_subagent: None,
         is_non_interactive,

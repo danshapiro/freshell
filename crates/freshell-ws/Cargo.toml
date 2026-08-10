@@ -46,6 +46,9 @@ notify = "6"
 freshell-freshagent = { path = "../freshell-freshagent" }
 # Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
 axum = { version = "0.8", features = ["ws"] }
+# tabs_store_model's ClientOpenSnapshot/ClientRevisionWatermark/
+# RegistryDeviceEntry derive Serialize/Deserialize (camelCase wire shape,
+# store.ts:69-103). Workspace-pinned; already in the tree via serde_json.
 serde = { workspace = true }
 serde_json = { workspace = true }
 # ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).

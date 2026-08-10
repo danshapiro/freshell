@@ -22,8 +22,7 @@
 //! and this draining tick.
 
 use freshell_protocol::{
-    ServerMessage, SessionLocator, TerminalMetaRecord, TerminalMetaUpdated, TerminalRunStatus,
-    TerminalSessionAssociated,
+    ServerMessage, SessionLocator, TerminalMetaRecord, TerminalRunStatus, TerminalSessionAssociated,
 };
 
 use crate::terminal::now_ms;
@@ -173,7 +172,8 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             &located.terminal_id,
             &located.session_id,
             entry.cwd.clone(),
-        );
+        )
+        .await;
         // Task 10: feed the identity proof into the activity hub — the
         // opencode tracker's deferred (awaitingAssociation) completions
         // release on this bind (channel-deferred, safe off the sweep task;
@@ -324,10 +324,14 @@ async fn opencode_claim_refused(state: &WsState, terminal_id: &str, session_id: 
 
 /// Fan `terminal.session.associated` (the sessionRef the client's
 /// `reconcileTerminalSessionAssociation` persists) AND a `terminal.meta.updated`
-/// upsert (the same shape `terminal.rs`'s `broadcast_terminal_meta_created`
-/// emits at create time for every other provider) to every connection.
+/// upsert to every connection. Task 18 (DEV-0008 closure): the upsert now
+/// routes through the shared [`crate::terminal_meta::TerminalMetaRegistry`] --
+/// base the record on the registry's current entry (the original's
+/// `associateSession`: `{...current, provider, sessionId}`,
+/// `terminal-metadata-service.ts:148-163`), git-enrich it, `commit_if_changed`,
+/// and broadcast only when content actually changed.
 /// Mirrors the deleted `amplifier_association`'s identical broadcast (kata qmpk).
-fn broadcast_terminal_session_associated(
+async fn broadcast_terminal_session_associated(
     state: &WsState,
     terminal_id: &str,
     session_id: &str,
@@ -345,24 +349,34 @@ fn broadcast_terminal_session_associated(
         let _ = state.broadcast_tx.send(frame);
     }
 
-    let meta = ServerMessage::TerminalMetaUpdated(TerminalMetaUpdated {
-        remove: Vec::new(),
-        upsert: vec![TerminalMetaRecord {
+    let mut record = state
+        .terminal_meta
+        .get(terminal_id)
+        .unwrap_or_else(|| TerminalMetaRecord {
             terminal_id: terminal_id.to_string(),
             updated_at: now_ms(),
             branch: None,
             checkout_root: None,
-            cwd,
+            cwd: None,
             display_subdir: None,
             is_dirty: None,
-            provider: Some("opencode".to_string()),
+            provider: None,
             repo_root: None,
-            session_id: Some(session_id.to_string()),
+            session_id: None,
             token_usage: None,
-        }],
-    });
-    if let Ok(frame) = serde_json::to_string(&meta) {
-        let _ = state.broadcast_tx.send(frame);
+        });
+    record.provider = Some("opencode".to_string());
+    record.session_id = Some(session_id.to_string());
+    if record.cwd.is_none() {
+        record.cwd = cwd;
+    }
+    crate::terminal_meta::enrich_from_cwd(&mut record).await;
+    if let Some(record) = state.terminal_meta.commit_if_changed(record, now_ms()) {
+        crate::terminal_meta::broadcast_terminal_meta_updated(
+            &state.broadcast_tx,
+            vec![record],
+            vec![],
+        );
     }
 }
 
@@ -393,7 +407,9 @@ mod tests {
         let rx = broadcast_tx.subscribe();
         let state = WsState {
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
             auth_token: StdArc::clone(&auth_token),
             server_instance_id: StdArc::new("srv-1111".to_string()),
             boot_id: StdArc::new("boot-2222".to_string()),

@@ -655,10 +655,16 @@ async fn tabs_sync_client_retire(
         )
             .into_response();
     }
-    let accepted =
-        state
-            .tabs
-            .retire_client_snapshot(device_id, client_instance_id, snapshot_revision);
+    // A durable-backed retire commits to disk — never run it on a Tokio
+    // worker thread (same treatment as the WS `tabs.sync.client.retire`).
+    let tabs = state.tabs.clone();
+    let device_id = device_id.to_string();
+    let client_instance_id = client_instance_id.to_string();
+    let accepted = tokio::task::spawn_blocking(move || {
+        tabs.retire_client_snapshot(&device_id, &client_instance_id, snapshot_revision)
+    })
+    .await
+    .unwrap_or(false);
     Json(json!({ "ok": true, "accepted": accepted })).into_response()
 }
 

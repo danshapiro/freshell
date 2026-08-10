@@ -40,11 +40,16 @@ pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
 pub mod identity_sink;
+pub mod layout_store;
+pub mod layout_tree;
 pub mod opencode_ws;
 pub mod pane_ops;
+mod pane_resize;
+pub mod rename_persistence;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
+pub mod target_resolver;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
@@ -63,6 +68,7 @@ pub use identity_sink::{
     SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
+pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
 
@@ -188,8 +194,9 @@ pub struct FreshAgentState {
     /// kinds -- no process, just the content the client folds via
     /// `ui.command{tab.create}`).
     pub(crate) content_panes: Arc<Mutex<HashMap<String, Value>>>,
-    /// tabId -> tab record, for `GET /api/tabs` (Slice 1). Populated by EVERY
-    /// tab-creating path (fresh-agent, terminal, browser, editor).
+    /// tabId -> legacy shadow record. `GET /api/tabs` reads the LayoutStore
+    /// (AUTO-03), not this map; it remains only as `delete_tab`'s cleanup
+    /// gate and `rename_tab`'s title mirror.
     pub(crate) tabs: Arc<Mutex<HashMap<String, TabRecord>>>,
     /// Slice 3b-1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`
     /// \u00a72.2 pane routes): paneId -> owning tabId, the reverse index
@@ -265,7 +272,68 @@ pub struct FreshAgentState {
     /// Door 3: arm 2 of the in-gate liveness precondition (see
     /// [`SidecarLivenessProbe`]). `None` = arm contributes false.
     pub(crate) sidecar_liveness: Option<SidecarLivenessProbe>,
+    /// The shared server-side layout snapshot (AUTO-01 spine, Task 13): the
+    /// WS `ui.layout.sync` ingestion (`freshell_ws::terminal`'s
+    /// `ClientMessage::UiLayoutSync` arm) REPLACES it, and the REST
+    /// automation surface (Tasks 14-16) reads/mutates the SAME store.
+    /// `freshell-server`'s `main.rs` constructs ONE instance and wires it
+    /// into both this state (via [`Self::with_layout`]) and
+    /// `freshell_ws::WsState::layout`. A fresh `Default` store (empty, no
+    /// snapshot) everywhere it isn't wired, matching the other Slice-1/3a
+    /// fields' "unwired == degrades honestly" convention.
+    pub layout: layout_store::LayoutStore,
+    /// Task 16 (`PATCH /api/panes/:id` cascade): the injected `configStore`
+    /// seam (`persistSyncableTerminalRename`'s terminal/session override
+    /// writes, `router.ts:681-683`) — `freshell-server`'s `main.rs` wires its
+    /// `SettingsRenamePersistence` here via [`Self::with_rename_persistence`].
+    /// `None` until wired (the `amplifier_locator` Option-until-wired
+    /// convention): the rename still lands in the layout store, only the
+    /// persistence cascade is skipped (Node's own `!configStore` guard,
+    /// `router.ts:668`).
+    pub(crate) rename_persistence: Option<Arc<dyn rename_persistence::RenamePersistence>>,
+    /// Task 16: the SAME handler-scoped `terminals.changed` revision counter
+    /// the WS lifecycle + REST `/api/terminals` broadcasts stamp (`main.rs`),
+    /// wired via [`Self::with_shared_terminals_revision`] so the rename
+    /// cascade's broadcast draws from the ONE monotonic sequence. `None`
+    /// until wired — the cascade then skips the broadcast honestly.
+    pub(crate) terminals_revision: Option<Arc<AtomicI64>>,
+    /// Fix round 1 (Task 23 gap): the injectable post-create seam Node covers
+    /// with the registry's `'terminal.created'` EVENT (`server/index.ts:647-655`
+    /// -> `seedFromTerminal` for EVERY terminal, REST creates included). The
+    /// Rust registry has no such event mechanism, and the meta store
+    /// (`freshell_ws::terminal_meta::TerminalMetaRegistry`) is unreachable
+    /// from this crate (`freshell-ws` depends on THIS crate, not vice versa
+    /// -- the same constraint `spawn_terminal_pane`'s exit hook documents for
+    /// `identity.retire`). So `freshell-server`'s `main.rs` -- where both
+    /// crates are visible -- wires a closure here (via
+    /// [`Self::with_terminal_created_hook`]) that runs the SAME create-time
+    /// meta seed -> async git enrich -> `terminal.meta.updated` broadcast the
+    /// WS `terminal.create` path gets. Fired by
+    /// [`terminal_tabs::spawn_terminal_pane`] after every successful
+    /// REST-pipeline create (tab create, pane split, restore). `None` until
+    /// wired (the `rename_persistence` convention): creates proceed, only the
+    /// meta seeding is skipped.
+    pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
 }
+
+/// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
+/// terminal-created hook: the create-time identity Node's `seedFromTerminal`
+/// reads off the registry record (`terminal-metadata-service.ts:138-146`).
+/// `cwd` is the RESOLVED spawn cwd (what the registry record carries), not
+/// the raw request field.
+#[derive(Clone, Debug)]
+pub struct TerminalCreatedEvent {
+    pub terminal_id: String,
+    pub mode: String,
+    pub resume_session_id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// The injectable post-create hook (see
+/// [`FreshAgentState::with_terminal_created_hook`]). Must be cheap and
+/// non-blocking on the create path -- the production wiring only builds a
+/// meta record and `tokio::spawn`s the git enrichment.
+pub type TerminalCreatedHook = Arc<dyn Fn(TerminalCreatedEvent) + Send + Sync>;
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
 #[derive(Clone)]
@@ -298,14 +366,13 @@ pub struct RestoreKeyEntry {
     pub delivered_to: HashSet<u64>,
 }
 
-/// A `GET /api/tabs` row (Slice 1's reduced shape -- see `terminal_tabs::list_tabs`
-/// doc comment for the deviation from legacy's full layout-tree row).
+/// Legacy per-tab shadow record. NOT the `GET /api/tabs` row -- that reads
+/// the shared LayoutStore (AUTO-03). Load-bearing only for `pane_ops`:
+/// `rename_tab` mirrors the title here, and `delete_tab` gates its legacy
+/// shadow-map cleanup on this record's presence.
 #[derive(Clone)]
 pub(crate) struct TabRecord {
-    pub(crate) id: String,
     pub(crate) title: Option<String>,
-    pub(crate) pane_id: String,
-    pub(crate) kind: String,
 }
 
 impl FreshAgentState {
@@ -336,6 +403,10 @@ impl FreshAgentState {
             resume_probe: None,
             on_stale_resume: None,
             sidecar_liveness: None,
+            layout: layout_store::LayoutStore::default(),
+            rename_persistence: None,
+            terminals_revision: None,
+            terminal_created_hook: None,
         }
     }
 
@@ -483,6 +554,47 @@ impl FreshAgentState {
         locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
     ) -> Self {
         self.codex_locator = locator;
+        self
+    }
+
+    /// AUTO-01 spine (Task 13): wire in the SAME
+    /// [`layout_store::LayoutStore`] `freshell_ws::WsState::layout` holds,
+    /// so the WS `ui.layout.sync` ingestion and this crate's REST
+    /// automation surface (Tasks 14-16) share ONE snapshot.
+    /// `freshell-server`'s `main.rs` calls this once at boot. Mirrors the
+    /// established `with_terminal_registry` builder pattern.
+    pub fn with_layout(mut self, layout: layout_store::LayoutStore) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Task 16 (`PATCH /api/panes/:id` cascade): wire in the production
+    /// [`RenamePersistence`] (`freshell-server`'s `SettingsRenamePersistence`
+    /// over the live settings store). Unwired == the rename route still
+    /// renames the store and broadcasts `ui.command{pane.rename}`, it just
+    /// skips the syncable-terminal persistence cascade.
+    pub fn with_rename_persistence(mut self, persistence: Arc<dyn RenamePersistence>) -> Self {
+        self.rename_persistence = Some(persistence);
+        self
+    }
+
+    /// Fix round 1 (Task 23 gap): wire the post-create hook `freshell-server`
+    /// uses to run the WS-parity meta seed -> async git enrich ->
+    /// `terminal.meta.updated` broadcast for every REST-pipeline create (see
+    /// the field doc for why this seam exists). Unwired == creates proceed,
+    /// meta seeding skipped. Mirrors [`Self::with_rename_persistence`].
+    pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
+        self.terminal_created_hook = Some(hook);
+        self
+    }
+
+    /// Task 16: share the ONE handler-scoped `terminals.changed` revision
+    /// counter (`main.rs`'s `terminals_revision`, also stamped by the WS
+    /// lifecycle and REST `/api/terminals` broadcasts) so the rename
+    /// cascade's `terminals.changed` never regresses the client's
+    /// revision watermark. Mirrors [`Self::with_shared_sessions_revision`].
+    pub fn with_shared_terminals_revision(mut self, revision: Arc<AtomicI64>) -> Self {
+        self.terminals_revision = Some(revision);
         self
     }
 
@@ -1514,8 +1626,13 @@ async fn create_tab(
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
-    let tab_id = Uuid::new_v4().to_string();
-    let pane_id = Uuid::new_v4().to_string();
+    // A1 (naming-sweep ledger deferral): the shared LayoutStore mints
+    // {tabId, paneId} -- Node does the same for fresh-agent tabs
+    // (`layoutStore.createTab`, router.ts:701) -- so REST/MCP-created
+    // fresh-agent tabs are visible to GET /api/tabs + GET /api/panes and
+    // renamable via PATCH /api/panes/:id, exactly like the
+    // terminal/browser/editor paths (`terminal_tabs::create_content_tab`).
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     // `makePlaceholderSessionId(requestId)` = `freshopencode-<requestId>` (adapter.ts:75).
     let request_id = Uuid::new_v4().simple().to_string();
     let placeholder = format!("freshopencode-{request_id}");
@@ -1539,18 +1656,15 @@ async fn create_tab(
         pane_content["effort"] = json!(effort);
     }
 
-    // Broadcast ui.command{tab.create} (broadcastUiCommand → broadcast to ALL clients,
-    // router.ts:704) so the capture socket records the `ui.command` wire type.
-    state.broadcast(&ServerMessage::UiCommand(UiCommand {
-        command: "tab.create".to_string(),
-        payload: Some(json!({
-            "id": tab_id,
-            "title": name,
-            "paneId": pane_id,
-            "paneContent": pane_content,
-        })),
-    }));
-
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
+    state.tabs.lock().expect("tabs mutex").insert(
+        tab_id.clone(),
+        TabRecord {
+            title: name.clone(),
+        },
+    );
     state.panes.lock().expect("panes mutex").insert(
         pane_id.clone(),
         PaneEntry {
@@ -1561,17 +1675,35 @@ async fn create_tab(
             durable_id: None,
         },
     );
-    // Slice 3b-1: every pane-minting path records its owning tab in the
-    // shared `pane_tabs` reverse index (see the field's doc comment) so
-    // `pane_ops`'s split/close/select handlers can resolve this pane's tab
-    // even though this crate keeps no fresh-agent `TabRecord` (the
-    // fresh-agent path never touches `state.tabs` -- see `terminal_tabs`'s
-    // module doc for why that's an intentional, separately-scoped gap).
+    // Every pane-minting path records its owning tab in the shared
+    // `pane_tabs` reverse index so `pane_ops`'s split/close/select handlers
+    // can resolve this pane's tab.
     state
         .pane_tabs
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+
+    // Broadcast AFTER registration -- Node's order is createTab -> runtime
+    // create -> attachPaneContent -> broadcast -> respond (router.ts:546-589),
+    // and `create_content_tab` likewise inserts before broadcasting.
+    // Shape note (validated): Node OMITS the `title` key when no name was
+    // provided (JSON.stringify drops undefined, router.ts:704). Serialize
+    // the same shape instead of `"title": null` -- the shared client
+    // tolerates both (`payload.title ||`, tabsSlice.ts:306), but keep the
+    // broadcast Node-shaped.
+    let mut create_payload = json!({
+        "id": tab_id,
+        "paneId": pane_id,
+        "paneContent": pane_content,
+    });
+    if let Some(name) = &name {
+        create_payload["title"] = json!(name);
+    }
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "tab.create".to_string(),
+        payload: Some(create_payload),
+    }));
 
     ok_json(
         json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
@@ -1595,35 +1727,20 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane. Fixes the
-/// user-visible 'not found' this route previously produced by falling through
-/// to the SPA-fallback 404 (the route did not exist).
+/// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane in the
+/// SHARED server-side layout store (Task 16 — kills D10's fake acknowledgement,
+/// which answered `{paneId, tabRenamed:false}` for ANY id without touching any
+/// state). Node behavior, clause for clause:
 ///
-/// This port carries no server-side pane layout store (`layoutStore` -- see the
-/// TASK 3 sidebar-join module doc for why that's an explicit non-goal), so
-/// `tabId` is unknowable here: `resolvePaneTarget`/`renamePane`/`tabRenamed`
-/// (`router.ts:1404-1415`) and the `ui.command{pane.rename}` broadcast
-/// (`router.ts:1417-1420`) are not reproduced -- documented deviation, single-client
-/// acceptable. Actual title persistence is Option A (client-driven cascade): the
-/// frozen client's `applyPaneRename` thunk (`src/store/titleSync.ts:30-46`)
-/// separately PATCHes `/api/terminals/:id` or `/api/sessions/:id` right after this
-/// call succeeds, which is what the client has always done for the terminal/
-/// fresh-agent cascade -- this route only needs to validate the name and
-/// acknowledge with the shape `PaneContainer.tsx:311` asserts
-/// (`response.data.paneId === paneId`), so the client can safely apply the
-/// Redux-side rename.
-///
-/// **Disclosed deviation (Minor, spec review of commit d5cf534a):** the legacy
-/// route resolves `paneId` against a server-side pane registry and answers
-/// `404`/`409` for an unresolvable or already-target-mismatched id
-/// (`resolvePaneTarget`, `agent-api/router.ts:530-541`). This port keeps no
-/// such registry (see the `tabId`-unknowable note above), so `rename_pane`
-/// returns `200` for ANY `pane_id` that passes name validation, whether or not
-/// a pane by that id actually exists. Accepted because the frozen client only
-/// ever calls this with a `paneId` it already holds and asserts solely
-/// `data.paneId === paneId` on the response (`PaneContainer.tsx:311`) -- it
-/// never inspects the status code for a 404/409 branch, so the missing
-/// resolution check is unobservable from the single supported client.
+/// 1. name validation (blank → 400 `name required`; >500 → 400 length message);
+/// 2. `getPaneSnapshot` BEFORE the rename (the cascade reads PRE-rename content);
+/// 3. `renamePane` outcome — a miss answers 200 `ok({message})`
+///    (`'pane not found'` / `'no layout snapshot'`, `router.ts:1411`+`:1423`);
+/// 4. on success, the best-effort syncable-terminal cascade
+///    ([`rename_persistence::persist_syncable_terminal_rename`]);
+/// 5. `tabRenamed` = the tab has exactly one pane; broadcast
+///    `ui.command{pane.rename,{tabId,paneId,title}}`; respond
+///    `ok({tabId, paneId, tabRenamed}, 'pane renamed')`.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -1644,8 +1761,39 @@ async fn rename_pane(
         );
     }
 
+    // Snapshot BEFORE the rename (`router.ts:1407`) so the cascade sees the
+    // pane's pre-rename content (terminalId/mode/session fields).
+    let pane_snapshot = state.layout.get_pane_snapshot(&pane_id);
+    let outcome = state.layout.rename_pane(&pane_id, &name);
+
+    let Some(tab_id) = outcome.tab_id else {
+        // Node's `{message:'pane not found'|'no layout snapshot'}` at 200
+        // (`renamePane` miss, `router.ts:1411`+`:1423`).
+        let message = outcome.message.unwrap_or("pane renamed");
+        return ok_json(json!({ "message": message }), message);
+    };
+    // `result.paneId || paneId` (`router.ts:1420`).
+    let pane_id = outcome.pane_id.unwrap_or(pane_id);
+
+    if let Some(snapshot) = pane_snapshot.as_ref() {
+        rename_persistence::persist_syncable_terminal_rename(&state, snapshot, &name).await;
+    }
+
+    // `tabRenamed` = single-pane tab (`router.ts:1414-1415`; a listPanes
+    // failure counts as `[]`, exactly like Node's `|| []`).
+    let tab_renamed = state
+        .layout
+        .list_panes(Some(&tab_id))
+        .map(|rows| rows.len() == 1)
+        .unwrap_or(false);
+
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "pane.rename".to_string(),
+        payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "title": name })),
+    }));
+
     ok_json(
-        json!({ "paneId": pane_id, "tabRenamed": false }),
+        json!({ "tabId": tab_id, "paneId": pane_id, "tabRenamed": tab_renamed }),
         "pane renamed",
     )
 }
@@ -3103,6 +3251,10 @@ mod tests {
 // ── PATCH /api/panes/:id (rename pane) ───────────────────────────────────
 
 #[cfg(test)]
+#[path = "rename_cascade_tests.rs"]
+mod rename_cascade_tests;
+
+#[cfg(test)]
 mod rename_pane_tests {
     use super::*;
     use axum::body::Body;
@@ -3144,18 +3296,18 @@ mod rename_pane_tests {
         (status, body_json(resp).await)
     }
 
-    /// Highest-severity fix (SYMPTOM 3, fix-spec): a manual pane rename must
-    /// succeed, not fall through to the SPA-fallback 404. Success shape mirrors
-    /// `router.ts:1396-1423`: `ok({paneId, tabRenamed}, 'pane renamed')`. The
-    /// client asserts `data.paneId === paneId` (`PaneContainer.tsx:311`).
+    /// Task 16 (kills D10's fake ack): with NO layout snapshot ingested yet,
+    /// the route answers Node's `renamePane` miss shape at 200 —
+    /// `ok({message:'no layout snapshot'})` (`layout-store.ts:559` via
+    /// `router.ts:1411`+`:1423`) — never the old unconditional
+    /// `{paneId, tabRenamed:false}` acknowledgement.
     #[tokio::test]
-    async fn renames_pane_and_returns_paneid_and_tab_renamed_false() {
+    async fn rename_without_layout_snapshot_is_200_with_message() {
         let (status, body) = patch_pane(Some("My New Title"), true).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], json!("ok"));
-        assert_eq!(body["data"]["paneId"], json!("pane-123"));
-        assert_eq!(body["data"]["tabRenamed"], json!(false));
-        assert_eq!(body["message"], json!("pane renamed"));
+        assert_eq!(body["data"], json!({ "message": "no layout snapshot" }));
+        assert_eq!(body["message"], json!("no layout snapshot"));
     }
 
     /// `parseRequiredName(undefined) -> undefined` -> 400 `'name required'`

@@ -981,6 +981,43 @@ Address         Port        Address         Port
     // ---- runner-backed reads via fakes ------------------------------------
 
     #[test]
+    fn existing_port_proxy_rules_exit_zero_parses_rules() {
+        // Transcribed live `netsh interface portproxy show v4tov4` output
+        // (same fixture as parse_portproxy_keeps_only_0000_listen).
+        let out = "\r\nListen on ipv4:             Connect to ipv4:\r\n\r\nAddress         Port        Address         Port\r\n--------------- ----------  --------------- ----------\r\n127.0.0.1       8081        172.30.149.249  8081\r\n0.0.0.0         3001        172.30.149.249  3001\r\n";
+        let runner = FakeCommandRunner::new().on(
+            NETSH_PATH,
+            &["portproxy", "show", "v4tov4"],
+            CommandOutput::success(out),
+        );
+        let rules = get_existing_port_proxy_rules(&runner).expect("exit-0 show parses");
+        assert_eq!(rules.len(), 1);
+        assert!(rules.contains_key(&3001), "{rules:?}");
+    }
+
+    #[test]
+    fn existing_port_proxy_rules_nonzero_exit_is_none() {
+        let runner = FakeCommandRunner::new().on(
+            NETSH_PATH,
+            &["portproxy", "show", "v4tov4"],
+            CommandOutput::failure(1, "", "The system cannot find the file specified.\r\n"),
+        );
+        assert_eq!(get_existing_port_proxy_rules(&runner), None);
+    }
+
+    #[test]
+    fn existing_port_proxy_rules_timeout_or_spawn_failure_is_none() {
+        // exit_code None is the timeout/kill/spawn-failure channel
+        // (CommandOutput doc, lib.rs:224-233).
+        let runner = FakeCommandRunner::new().on(
+            NETSH_PATH,
+            &["portproxy", "show", "v4tov4"],
+            CommandOutput::spawn_failure("timed out"),
+        );
+        assert_eq!(get_existing_port_proxy_rules(&runner), None);
+    }
+
+    #[test]
     fn existing_firewall_ports_missing_rule_is_empty_not_none() {
         let runner = FakeCommandRunner::new().on(
             NETSH_PATH,
@@ -1079,17 +1116,51 @@ Address         Port        Address         Port
         }
     }
 
-    /// P19 (`LV? = yes`): the real `portproxy show v4tov4` + firewall `show rule`
-    /// reads. READ-ONLY; asserts parse-shape only, never mutates.
+    /// Two-part interop probe (cf.
+    /// crates/freshell-terminal/tests/wsl_interop_live.rs:18-21): the /mnt/c
+    /// mount alone does not imply the Win32 interop subsystem is up.
+    fn wsl_interop_available() -> bool {
+        std::path::Path::new(NETSH_PATH).exists()
+            && std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+    }
+
+    /// P19 (`LV? = yes`): the real `portproxy show v4tov4` + firewall `show
+    /// rule` reads. READ-ONLY; asserts parse-shape only, never mutates.
+    ///
+    /// OPT-IN (deflake, 2026-08): live netsh from WSL is environment-
+    /// dependent -- interop cold-start vs the runner's 5s kill-on-timeout,
+    /// portproxy-subkey/elevation state -- and failed intermittently in
+    /// default runs (`get_existing_port_proxy_rules` maps any non-zero exit
+    /// or timeout to `None`). Hermetic FakeCommandRunner coverage of the
+    /// same read lives above; this live leg runs only when explicitly
+    /// requested, mirroring the repo's opt-in live-test convention
+    /// (FRESHELL_RUN_REAL_PROVIDER_CONTRACTS):
+    ///
+    ///   FRESHELL_RUN_LIVE_WINDOWS_INTEROP=1 cargo test -p freshell-platform live_portproxy
     #[test]
     fn live_portproxy_and_firewall_show_readonly() {
-        if !std::path::Path::new(NETSH_PATH).exists() {
-            eprintln!("SKIP live_portproxy_and_firewall_show_readonly: {NETSH_PATH} absent");
+        if std::env::var("FRESHELL_RUN_LIVE_WINDOWS_INTEROP").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIP live_portproxy_and_firewall_show_readonly: set \
+FRESHELL_RUN_LIVE_WINDOWS_INTEROP=1 to run live netsh interop"
+            );
+            return;
+        }
+        if !wsl_interop_available() {
+            eprintln!("SKIP live_portproxy_and_firewall_show_readonly: WSL interop unavailable");
             return;
         }
         let runner = crate::StdCommandRunner::default();
 
-        let rules = get_existing_port_proxy_rules(&runner).expect("portproxy show should succeed");
+        let rules = get_existing_port_proxy_rules(&runner).unwrap_or_else(|| {
+            // Surface WHAT failed: the production read discards
+            // exit_code/stderr, so re-run the raw command for diagnostics.
+            let out = runner.run(NETSH_PATH, &["interface", "portproxy", "show", "v4tov4"]);
+            panic!(
+                "portproxy show should succeed; retry exit={:?} stderr={:?} stdout={:?}",
+                out.exit_code, out.stderr, out.stdout
+            );
+        });
         for (listen, r) in &rules {
             assert!(*listen >= 1);
             assert!(
@@ -1099,7 +1170,7 @@ Address         Port        Address         Port
         }
         eprintln!("LIVE portproxy rules (read-only): {} rule(s)", rules.len());
 
-        // `name=FreshellLANAccess` is a READ-ONLY show; the live host has the rule.
+        // READ-ONLY show; tolerates the missing-rule signature.
         let ports = get_existing_firewall_ports(&runner).expect("firewall show should resolve");
         eprintln!("LIVE FreshellLANAccess ports (read-only): {ports:?}");
     }

@@ -916,6 +916,7 @@ mod tests {
             project_path: "/repo/alpha".to_string(),
             title: Some("Fix the parser".to_string()),
             title_provider_generated: false,
+            title_source: None,
             summary: None,
             first_user_message: Some("fix the parser".to_string()),
             last_activity_at: 400,
@@ -923,6 +924,7 @@ mod tests {
             cwd: Some("/repo/alpha".to_string()),
             is_subagent: false,
             is_non_interactive: false,
+            git_branch: None,
             source_file: None,
         }
     }

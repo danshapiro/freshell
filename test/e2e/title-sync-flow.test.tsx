@@ -5,7 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '@/components/TabBar'
 import PaneContainer from '@/components/panes/PaneContainer'
 import tabsReducer, { addTab, openSessionTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, updatePaneContent } from '@/store/panesSlice'
+import panesReducer, { initLayout, updatePaneContent, updatePaneTitleByTerminalId } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -13,7 +13,6 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
-import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -160,7 +159,7 @@ describe('title sync flow', () => {
     expect(screen.getAllByText('Shell').length).toBeGreaterThanOrEqual(1)
 
     await act(async () => {
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep', setByUser: false }))
     })
 
     expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
@@ -197,7 +196,7 @@ describe('title sync flow', () => {
     expect(screen.queryByText('Opencode')).not.toBeInTheDocument()
 
     await act(async () => {
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep' }))
+      store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep', setByUser: false }))
     })
 
     expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)

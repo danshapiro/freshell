@@ -13,7 +13,9 @@ import {
   splitPane as splitPaneAction,
   swapSplit,
   updatePaneContent,
+  updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
+import { applySessionRenameCascade } from '@/store/titleSync'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { sendTerminalKill } from '@/lib/terminal-kill'
@@ -494,11 +496,21 @@ export function ContextMenuProvider({
       summary = nextSummary || undefined
     }
     try {
-      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
-      await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
+      const resolvedProvider = provider || info.session.provider || 'claude'
+      const compositeKey = `${resolvedProvider}:${sessionId}`
+      const result = await api.patch<{ cascadedTerminalId?: string | null }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
         titleOverride: title || undefined,
         summaryOverride: summary,
       })
+      if (title) {
+        applySessionRenameCascade({
+          dispatch,
+          provider: resolvedProvider,
+          sessionId,
+          title,
+          cascadedTerminalId: result.cascadedTerminalId,
+        })
+      }
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
@@ -741,6 +753,11 @@ export function ContextMenuProvider({
       const existing = findTabByTerminalId(terminalId)
       if (existing && title) {
         dispatch(updateTab({ id: existing.id, updates: { title } }))
+      }
+      if (title) {
+        // D7: mirror into the pane title so the pane header and
+        // getTabDisplayTitle's pane-title preference both converge.
+        dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: true }))
       }
     } catch {
       // ignore

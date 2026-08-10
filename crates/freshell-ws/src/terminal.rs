@@ -62,7 +62,7 @@ use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentEvent, Pong, ServerMessage,
     SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate,
     TerminalCreated, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason,
-    TerminalKill, TerminalMetaRecord, TerminalMetaUpdated, TerminalResize,
+    TerminalKill, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -514,7 +514,7 @@ async fn handle_client_text(
             "tabs.sync.push" => return handle_tabs_push(&value, ws_tx, state).await,
             "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
             "tabs.sync.client.retire" => {
-                handle_tabs_retire(&value, state);
+                handle_tabs_retire(&value, state).await;
                 return true;
             }
             _ => {}
@@ -848,6 +848,17 @@ async fn handle_client_text(
                     error: result.error,
                 },
             );
+            true
+        }
+        // `ui.layout.sync` (AUTO-01 spine, Task 13): the client's layout mirror
+        // REPLACES the shared server-side `LayoutStore` snapshot -- the port of
+        // the dedicated arm's `this.layoutStore.updateFromUi(m, ws.connectionId
+        // || 'unknown')` (`server/ws-handler.ts:1966-1969`). No reply frame
+        // (Node sends none). The Node arm's second half (the
+        // sidebar-open-session-keys recompute, `ws:1970-1979`) is a separate
+        // session-directory concern, out of this task's scope.
+        ClientMessage::UiLayoutSync(sync) => {
+            state.layout.update_from_ui(&sync, &conn_id.to_string());
             true
         }
         // Application-level liveness ping (legacy parity: `ws-handler.ts:1832-1835`
@@ -1379,6 +1390,15 @@ pub(crate) struct ExitHookDeps {
     /// only when the create/respawn pre-wrote the stub itself (see
     /// [`AmplifierStubGc`]).
     pub amplifier_stub_gc: Option<AmplifierStubGc>,
+    /// DEV-0008 closure (Task 18): retire the META record + broadcast the
+    /// removal on NATURAL exit, mirroring `registry.on('terminal.exit', ...)`
+    /// -> `terminalMetadata.retire` -> `broadcastTerminalMetaRemoval`
+    /// (`server/index.ts:657-665`). The kill path retires eagerly in
+    /// `kill_and_broadcast`; `retire`'s already-retired no-op keeps this
+    /// hook from double-broadcasting there.
+    pub terminal_meta: crate::terminal_meta::TerminalMetaRegistry,
+    /// Fan-out bus for the meta-removal broadcast above.
+    pub broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
 }
 
 /// Exit hook (`tr:1479-1510` finishTerminalPtyExit): fires once when the PTY
@@ -1408,6 +1428,15 @@ pub(crate) fn build_pty_exit_hook(
         freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .notify_terminal_exit(&terminal_id);
         deps.identity.retire(&terminal_id);
+        // DEV-0008 closure (Task 18): retire the META record + broadcast the
+        // removal on NATURAL exit (see ExitHookDeps::terminal_meta).
+        if deps.terminal_meta.retire(&terminal_id, now_ms()) {
+            crate::terminal_meta::broadcast_terminal_meta_updated(
+                &deps.broadcast_tx,
+                vec![],
+                vec![terminal_id.clone()],
+            );
+        }
         // P1.8: an observed PTY exit in this epoch ends any
         // identity-in-flight window — the marker's job (distinguishing
         // fresh-by-race from fresh-by-intent across a SERVER death) is
@@ -2599,6 +2628,8 @@ pub(crate) async fn handle_create(
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
+            terminal_meta: state.terminal_meta.clone(),
+            broadcast_tx: std::sync::Arc::clone(&state.broadcast_tx),
             // Task 10: only a stub THIS create wrote (`created == true`) is
             // ours to GC; found/existing sessions are never touched.
             amplifier_stub_gc: amplifier_stub
@@ -2928,18 +2959,23 @@ pub(crate) async fn handle_create(
         spec.cwd.as_deref(),
         now_ms(),
     );
-    if let Some(record) = &create_meta_record {
+    if create_meta_record.provider.is_some() && create_meta_record.session_id.is_some() {
         // Fix Spec: Session Naming Cluster (SYMPTOM 2/1) -- populate the shared
         // identity registry alongside the broadcast, the SAME fields, so the
         // `freshell-server` rename cascades (`terminals.rs`/`sessions.rs`) and the
         // session-directory live-terminal join (`session_directory.rs`) can find
         // this terminal's provider/sessionId without a second source of truth.
+        // Task 18 note: every create now seeds a META record (Node
+        // `seedFromTerminal` parity), but IDENTITY seeding keeps its original
+        // full-identity gate -- shell/provider-only records never enter the
+        // identity registry (`crate::identity` module doc: "shell terminals
+        // never get an entry here").
         state.identity.upsert(
-            &record.terminal_id,
-            record.provider.as_deref(),
-            record.session_id.as_deref(),
-            record.cwd.as_deref(),
-            record.updated_at,
+            &create_meta_record.terminal_id,
+            create_meta_record.provider.as_deref(),
+            create_meta_record.session_id.as_deref(),
+            create_meta_record.cwd.as_deref(),
+            create_meta_record.updated_at,
         );
     }
 
@@ -2951,9 +2987,12 @@ pub(crate) async fn handle_create(
     // (V1.md), 2-3 orders past tokio's async-worker budget — the same
     // reasoning as the PTY spawn_blocking above. A failure never blocks
     // the create but is surfaced LIVE (surface_write_failure).
-    if let Some(record) = &create_meta_record {
-        // Identity known at spawn: claude pre-allocation (trigger a) and
-        // every resume/restore create (all providers) — a binding row.
+    // Identity known at spawn: claude pre-allocation (trigger a) and
+    // every resume/restore create (all providers) — a binding row.
+    // (Task 18: `record_for_create` now returns a record for EVERY terminal;
+    // main's Option-Some condition ≡ provider AND session_id present.)
+    {
+        let record = &create_meta_record;
         if let (Some(provider), Some(session_id)) =
             (record.provider.as_deref(), record.session_id.as_deref())
         {
@@ -2980,7 +3019,10 @@ pub(crate) async fn handle_create(
             .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
             crate::pane_ledger::surface_write_failure(state, &record.terminal_id, result);
         }
-    } else if MARKER_MODES.contains(&mode.as_str()) {
+    }
+    if (create_meta_record.provider.is_none() || create_meta_record.session_id.is_none())
+        && MARKER_MODES.contains(&mode.as_str())
+    {
         // Identity-bearing pane whose identity is still in flight (fresh
         // codex/opencode/amplifier — trigger d): a durable pending marker
         // from spawn until resolution deletes it (binding-first order).
@@ -3085,9 +3127,18 @@ pub(crate) async fn handle_create(
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
     // `terminal.created` then `terminals.changed`.
     broadcast_terminals_changed(state);
-    if let Some(record) = create_meta_record {
-        broadcast_terminal_meta_created(state, record);
-    }
+    // DEV-0008 closure (Task 18): git-enrich + commit + broadcast OFF the create
+    // path, exactly like Node's async `seedFromTerminal` fan-out
+    // (`server/index.ts:647-655`) -- the git probes must never add latency to
+    // `terminal.created`. Fix round 1: routed through the SHARED helper the
+    // REST pipeline's terminal-created hook also uses (see
+    // `crate::terminal_meta::seed_from_terminal`'s doc for why this path calls
+    // the halves separately: the record must exist BEFORE the created frame).
+    crate::terminal_meta::spawn_enrich_commit_broadcast(
+        &state.terminal_meta,
+        &state.broadcast_tx,
+        create_meta_record,
+    );
     sent
 }
 
@@ -3434,6 +3485,8 @@ pub async fn respawn_agent_terminal(
             codex_locator: state.codex_locator.clone(),
             auto_resume_tx: state.auto_resume_tx.clone(),
             amplifier_stub_gc: respawn_amplifier_stub_gc,
+            terminal_meta: state.terminal_meta.clone(),
+            broadcast_tx: std::sync::Arc::clone(&state.broadcast_tx),
         },
         terminal_id.clone(),
         mode.clone(),
@@ -3597,7 +3650,8 @@ pub async fn respawn_agent_terminal(
         spec.cwd.as_deref(),
         now_ms(),
     );
-    if let Some(record) = &create_meta_record {
+    {
+        let record = &create_meta_record;
         state.identity.upsert(
             &record.terminal_id,
             record.provider.as_deref(),
@@ -3636,9 +3690,13 @@ pub async fn respawn_agent_terminal(
     // "Notify all clients that list changed" so sidebars refresh, then the
     // meta slice — the same closing pair as `handle_create`.
     broadcast_terminals_changed(state);
-    if let Some(record) = create_meta_record {
-        broadcast_terminal_meta_created(state, record);
-    }
+    // DEV-0008 closure (Task 18): git-enrich + commit + broadcast OFF the
+    // respawn path, same shared helper as `handle_create`.
+    crate::terminal_meta::spawn_enrich_commit_broadcast(
+        &state.terminal_meta,
+        &state.broadcast_tx,
+        create_meta_record,
+    );
     Ok(terminal_id)
 }
 
@@ -3754,79 +3812,11 @@ fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -
     Some(row.session_id)
 }
 
-/// Build the create-time `TerminalMetaRecord` for the port-side closure of
-/// DEV-0008 (`terminal.meta.updated` push subsystem, `port/oracle/DEVIATIONS.md`).
-///
-/// The original's `TerminalMetadataService.seedFromTerminal`
-/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
-/// `'terminal.created'` event (`server/index.ts:516-524`) for every terminal,
-/// deriving `provider`/`sessionId` from `record.resumeSessionId` when the mode
-/// supports resume (`isTerminalProvider`, `terminal-metadata-service.ts:39-41`) --
-/// which is set for a fresh server-preallocated id (e.g. claude) just as much as
-/// for a genuine resume (`terminal-registry.ts:176-195` `TerminalSessionRefSource`;
-/// this fn's `resume_session_id` is the same value, `terminal.rs:507-536`).
-///
-/// Ported here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` -- the
-/// fields known at create time with zero extra I/O. NOT ported (deferred,
-/// tracked under DEV-0008 as association-time follow-up, `do not build
-/// output-scanning now`):
-/// - git enrichment (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
-///   `enrichFromCwd`, `terminal-metadata-service.ts:260-286`) -- requires git
-///   process calls not wired into this crate. The client's
-///   `formatPaneRuntimeLabel` (`format-terminal-title-meta.ts:26`) already falls
-///   back to `safeBasename(meta.cwd)` when `displaySubdir`/`checkoutRoot` are
-///   absent, so sending bare `cwd` is a legacy-compatible degraded label, not a
-///   wire-shape violation.
-/// - session-association enrichment after start (indexer/codex-durability/
-///   opencode-controller sources, `session-association-broadcast.ts`) -- requires
-///   output/event scanning wiring this slice deliberately excludes.
-///
-/// Returns `None` for shell terminals (no provider, matching the original: a
-/// shell's seeded record never carries `provider`/`sessionId`, and this slice
-/// only concerns itself with the resume-identity fields) and for non-shell
-/// creates with no session identity yet at create time (e.g. a fresh `codex`
-/// create with an empty `resumeSessionId` -- identity arrives later via
-/// `terminal.session.bound`, which is the deferred association-time slice).
-fn terminal_meta_record_for_create(
-    terminal_id: &str,
-    mode: &str,
-    resume_session_id: Option<&str>,
-    cwd: Option<&str>,
-    updated_at: i64,
-) -> Option<TerminalMetaRecord> {
-    if mode == "shell" {
-        return None;
-    }
-    let session_id = resume_session_id?;
-    Some(TerminalMetaRecord {
-        terminal_id: terminal_id.to_string(),
-        updated_at,
-        branch: None,
-        checkout_root: None,
-        cwd: cwd.map(str::to_string),
-        display_subdir: None,
-        is_dirty: None,
-        provider: Some(mode.to_string()),
-        repo_root: None,
-        session_id: Some(session_id.to_string()),
-        token_usage: None,
-    })
-}
-
-/// `wsHandler.broadcastTerminalMetaUpdated({upsert, remove: []})`
-/// (`ws-handler.ts:3682-3695`): fan `{type:'terminal.meta.updated', upsert:[record],
-/// remove:[]}` to EVERY connection. Matches the original's plain `this.broadcast(...)`
-/// (`ws-handler.ts:3694`) -- unlike `terminals.changed`, this is NOT
-/// `broadcastAuthenticated`.
-fn broadcast_terminal_meta_created(state: &WsState, record: TerminalMetaRecord) {
-    let msg = ServerMessage::TerminalMetaUpdated(TerminalMetaUpdated {
-        remove: Vec::new(),
-        upsert: vec![record],
-    });
-    if let Ok(frame) = serde_json::to_string(&msg) {
-        let _ = state.broadcast_tx.send(frame);
-    }
-}
+/// Fix round 1: the create-time record builder moved to
+/// [`crate::terminal_meta::record_for_create`] so the REST pipeline's
+/// terminal-created hook shares it; this alias keeps every existing call
+/// site (and the Task 18 tests below) reading at its historical name.
+use crate::terminal_meta::record_for_create as terminal_meta_record_for_create;
 
 /// `wsHandler.broadcastTerminalsChanged()` (`ws-handler.ts:3670-3679`) from the WS
 /// terminal lifecycle paths: bump the handler-scoped revision (SHARED with the REST
@@ -4600,6 +4590,20 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
             .lock()
             .expect("auto_resume_cancels lock")
             .remove(terminal_id);
+        // DEV-0008 closure (Task 18): retire the META record + broadcast the
+        // removal BEFORE `terminals.changed` -- Node's kill emits
+        // `terminal.exit` synchronously (retire + remove broadcast,
+        // `server/index.ts:657-665`) and only then reaches
+        // `broadcastTerminalsChanged()` (`ws-handler.ts:2988`). The PTY exit
+        // hook fires for kills too; `retire`'s already-retired no-op keeps
+        // the frame single per terminal lifetime.
+        if state.terminal_meta.retire(terminal_id, now_ms()) {
+            crate::terminal_meta::broadcast_terminal_meta_updated(
+                &state.broadcast_tx,
+                vec![],
+                vec![terminal_id.to_string()],
+            );
+        }
         broadcast_terminals_changed(state);
         return true;
     }
@@ -4856,7 +4860,8 @@ mod tabs_push_validation_tests {
             "rejected push must not create a persisted generation"
         );
         assert_eq!(
-            tabs.query("dev-1", "client-1")["localOpen"],
+            tabs.query("dev-1", "client-1", 30, crate::tabs::now_ms())
+                .unwrap()["localOpen"],
             serde_json::json!([]),
             "rejected push must not mutate the in-memory registry"
         );
@@ -4916,6 +4921,8 @@ mod tabs_push_validation_tests {
                 "status": "open",
                 "revision": 1,
                 "updatedAt": 1,
+                "createdAt": 1,
+                "titleSetByUser": false,
                 "paneCount": 1,
                 "panes": [{
                     "paneId": "pane-1",
@@ -4953,18 +4960,28 @@ mod tabs_push_validation_tests {
             "acme-custom-cli"
         );
         assert_eq!(
-            tabs.query("dev-1", "client-1")["localOpen"][0]["tabKey"],
+            tabs.query("dev-1", "client-1", 30, crate::tabs::now_ms())
+                .unwrap()["localOpen"][0]["tabKey"],
             "dev-1:tab-1",
             "accepted push must update the in-memory registry"
         );
     }
 
     #[tokio::test]
-    async fn oversize_push_acks_persisted_false_with_reason() {
+    async fn oversize_push_is_rejected_loudly_and_never_persisted() {
+        // Merge reconciliation: the durable tabs registry (CFG-08/AUTO-15)
+        // ports Node's push caps (`store.ts` payload cap, `tabs.rs`
+        // `prepare_push`), so a >1MiB push is REJECTED with INVALID_MESSAGE
+        // before persistence -- Node parity. The pre-durable-store behavior
+        // this test used to pin (accept + `persisted:false` with reason
+        // `oversize`) is now unreachable via the WS door; the honest-persist
+        // ack machinery itself stays pinned at the tabs_persist level
+        // (`oversize_drop_returns_skipped_and_fires_invariant_alarm`,
+        // `successful_persist_returns_persisted`).
         let snapshots = tempfile::tempdir().unwrap();
         let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
         // Inflate via tabName (a plain validated string field) so the frame
-        // stays schema-valid while the persisted document exceeds the cap.
+        // stays schema-valid while the payload exceeds the push cap.
         let big = "x".repeat(crate::tabs_persist::MAX_SNAPSHOT_BYTES + 10);
         let frame = serde_json::json!({
             "type": "tabs.sync.push",
@@ -4979,6 +4996,8 @@ mod tabs_push_validation_tests {
                 "status": "open",
                 "revision": 1,
                 "updatedAt": 1,
+                "createdAt": 1,
+                "titleSetByUser": false,
                 "paneCount": 1,
                 "panes": [{
                     "paneId": "pane-1",
@@ -4996,16 +5015,14 @@ mod tabs_push_validation_tests {
         });
 
         match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
-            TabsPushResponse::Ack(message) => match *message {
-                ServerMessage::TabsSyncAck(ack) => {
-                    assert!(ack.accepted, "accepted semantics must not change");
-                    assert_eq!(ack.persisted, Some(false), "the ack must stop lying");
-                    assert_eq!(ack.persist_reason.as_deref(), Some("oversize"));
-                }
-                other => panic!("unexpected acknowledgement frame: {other:?}"),
-            },
             TabsPushResponse::Error(error) => {
-                panic!("oversize push must still be accepted: {error}")
+                assert!(
+                    error.to_string().contains("exceeds"),
+                    "rejection must name the payload cap: {error}"
+                );
+            }
+            TabsPushResponse::Ack(message) => {
+                panic!("oversize push must be rejected (Node store.ts cap parity): {message:?}")
             }
         }
         assert!(
@@ -5036,6 +5053,8 @@ mod tabs_push_validation_tests {
                 "status": "open",
                 "revision": 1,
                 "updatedAt": 1,
+                "createdAt": 1,
+                "titleSetByUser": false,
                 "paneCount": 1,
                 "panes": [{
                     "paneId": "pane-1",
@@ -5089,6 +5108,8 @@ mod tabs_push_validation_tests {
                 "status": "open",
                 "revision": 1,
                 "updatedAt": 1,
+                "createdAt": 1,
+                "titleSetByUser": false,
                 "paneCount": 2,
                 "panes": [{
                     "paneId": "pane-term",
@@ -5149,7 +5170,28 @@ async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state:
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let data = state.tabs.query(device_id, client_instance_id);
+    // `TabsSyncQuerySchema` (server/ws-handler.ts:452): `closedTabRetentionDays`
+    // is REQUIRED — an integer 1..=30. Missing or invalid → INVALID_MESSAGE.
+    let Some(retention_days) = value
+        .get("closedTabRetentionDays")
+        .and_then(|v| v.as_i64())
+        .filter(|days| (1..=30).contains(days))
+    else {
+        let frame = tabs_error_frame(
+            "tabs.sync.query `closedTabRetentionDays` must be an integer from 1 to 30",
+        );
+        return send_raw(ws_tx, &frame).await;
+    };
+
+    let data = match state.tabs.query(
+        device_id,
+        client_instance_id,
+        retention_days,
+        crate::tabs::now_ms(),
+    ) {
+        Ok(data) => data,
+        Err(message) => return send_raw(ws_tx, &tabs_error_frame(&message)).await,
+    };
     let frame = serde_json::json!({
         "type": "tabs.sync.snapshot",
         "requestId": request_id,
@@ -5161,19 +5203,32 @@ async fn handle_tabs_query(value: &serde_json::Value, ws_tx: &mut WsSink, state:
 /// `tabs.sync.client.retire` — drop this client's open snapshot (background retire;
 /// no reply). The unload beacon also hits `POST /api/tabs-sync/client-retire`, which
 /// routes to the same [`crate::tabs::TabsRegistry`], so the retire is idempotent.
-fn handle_tabs_retire(value: &serde_json::Value, state: &WsState) {
-    let device_id = value.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+async fn handle_tabs_retire(value: &serde_json::Value, state: &WsState) {
+    let device_id = value
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let client_instance_id = value
         .get("clientInstanceId")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let snapshot_revision = value
         .get("snapshotRevision")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    state
-        .tabs
-        .retire_client_snapshot(device_id, client_instance_id, snapshot_revision);
+    // A durable-backed retire commits to disk, so it must NOT run on a Tokio
+    // worker: route through `spawn_blocking` exactly like `process_tabs_push`.
+    let reg = state.tabs.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        reg.retire_client_snapshot(&device_id, &client_instance_id, snapshot_revision)
+    })
+    .await;
+    if let Err(join_err) = joined {
+        tracing::warn!(target: "freshell_ws::tabs", error = %join_err,
+            "tabs_retire_task_panicked");
+    }
 }
 
 /// Send a raw JSON value as a text frame. Returns `false` if the socket is closed.
@@ -5456,7 +5511,9 @@ mod terminals_changed_tests {
         let rx = broadcast_tx.subscribe();
         let state = WsState {
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
             boot_id: Arc::new("boot-2222".to_string()),
@@ -5604,44 +5661,57 @@ mod terminals_changed_tests {
     }
 }
 
-/// DEV-0008 create-time slice (`port/oracle/DEVIATIONS.md`): `terminal.meta.updated`
-/// pushed on `terminal.create` when a session identity is established at create
-/// time. Tests exercise the pure `terminal_meta_record_for_create` builder and the
-/// `broadcast_terminal_meta_created` wire-shape directly, without spawning a PTY.
+/// DEV-0008 create-time slice (`port/oracle/DEVIATIONS.md`, closed by Task 18):
+/// every `terminal.create` seeds a `TerminalMetaRecord`. Tests exercise the pure
+/// `terminal_meta_record_for_create` builder and the
+/// `crate::terminal_meta::broadcast_terminal_meta_updated` wire-shape directly,
+/// without spawning a PTY.
 #[cfg(test)]
 mod terminal_meta_created_tests {
     use super::*;
 
-    /// Plain shells never carry a provider/session identity — the original's
-    /// seeded record for a shell terminal has `provider`/`sessionId` undefined
-    /// (`terminal-metadata-service.ts:39-41` `isTerminalProvider`), and this slice
-    /// only concerns the resume-identity fields, so a shell create emits nothing.
+    /// Task 18: Node's `seedFromTerminal` seeds EVERY terminal
+    /// (`terminal-metadata-service.ts:138-146`) — a shell terminal gets a
+    /// record too, just with `provider`/`sessionId` undefined
+    /// (`isTerminalProvider`, `:39-41`). The old shell → `None` early return
+    /// was the DEV-0008 reduced-scope shape; this pins its removal.
     #[test]
-    fn shell_mode_emits_no_record_even_with_a_session_id() {
-        assert!(terminal_meta_record_for_create(
+    fn shell_terminals_now_get_a_meta_record_without_provider() {
+        let record = terminal_meta_record_for_create(
             "term-1",
             "shell",
             Some("some-id"),
             Some("/home/dan/project"),
             1_000,
-        )
-        .is_none());
+        );
+        assert_eq!(record.terminal_id, "term-1");
+        assert_eq!(record.cwd.as_deref(), Some("/home/dan/project"));
+        assert_eq!(record.provider, None, "shells carry no provider");
+        assert_eq!(
+            record.session_id, None,
+            "sessionId only rides along with a provider (`:140`)"
+        );
+        assert_eq!(record.updated_at, 1_000);
     }
 
-    /// A non-shell create with no session identity yet (e.g. a fresh `codex`
-    /// create with an empty `resumeSessionId`, `terminal.rs:524-527`) has nothing
-    /// to seed at create time — identity arrives later via
-    /// `terminal.session.bound` (deferred association-time slice).
+    /// Task 18: a non-shell create with no session identity yet (e.g. a fresh
+    /// `codex` create with an empty `resumeSessionId`) still seeds a record —
+    /// `provider` present, `sessionId` absent, exactly Node's
+    /// `seedFromTerminal` output (`terminal-metadata-service.ts:138-146`).
+    /// The identity arrives later via the association producers.
     #[test]
-    fn non_shell_mode_with_no_session_id_emits_no_record() {
-        assert!(terminal_meta_record_for_create(
+    fn coding_cli_record_without_resume_session_still_gets_a_record() {
+        let record = terminal_meta_record_for_create(
             "term-1",
             "codex",
             None,
             Some("/home/dan/project"),
             1_000,
-        )
-        .is_none());
+        );
+        assert_eq!(record.terminal_id, "term-1");
+        assert_eq!(record.provider.as_deref(), Some("codex"));
+        assert_eq!(record.session_id, None);
+        assert_eq!(record.cwd.as_deref(), Some("/home/dan/project"));
     }
 
     /// A resume (or server-preallocated fresh id) create carries `cwd`,
@@ -5657,8 +5727,7 @@ mod terminal_meta_created_tests {
             Some("session-abc"),
             Some("/home/dan/project"),
             1_000,
-        )
-        .expect("resume create should build a record");
+        );
 
         assert_eq!(record.terminal_id, "term-1");
         assert_eq!(record.updated_at, 1_000);
@@ -5680,8 +5749,7 @@ mod terminal_meta_created_tests {
     #[test]
     fn resume_create_without_cwd_still_builds_a_record() {
         let record =
-            terminal_meta_record_for_create("term-1", "claude", Some("session-abc"), None, 1_000)
-                .expect("resume create should build a record even without cwd");
+            terminal_meta_record_for_create("term-1", "claude", Some("session-abc"), None, 1_000);
         assert_eq!(record.cwd, None);
     }
 
@@ -5691,7 +5759,9 @@ mod terminal_meta_created_tests {
         let rx = broadcast_tx.subscribe();
         let state = WsState {
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
             boot_id: std::sync::Arc::new("boot-2222".to_string()),
@@ -5762,7 +5832,9 @@ mod terminal_meta_created_tests {
     /// `wsHandler.broadcastTerminalMetaUpdated({upsert, remove: []})`
     /// (`ws-handler.ts:3682-3695`) wire shape: `{type, upsert:[record], remove:[]}`,
     /// broadcast to every connection (not gated on auth — matches the original's
-    /// plain `this.broadcast(...)`, `ws-handler.ts:3694`).
+    /// plain `this.broadcast(...)`, `ws-handler.ts:3694`). Task 18: routed
+    /// through the generic `crate::terminal_meta::broadcast_terminal_meta_updated`
+    /// (which replaced the create-only `broadcast_terminal_meta_created`).
     #[test]
     fn broadcast_emits_legacy_wire_shape() {
         let (state, mut rx) = state_with_bus();
@@ -5772,10 +5844,13 @@ mod terminal_meta_created_tests {
             Some("session-abc"),
             Some("/home/dan/project"),
             1_000,
-        )
-        .unwrap();
+        );
 
-        broadcast_terminal_meta_created(&state, record);
+        crate::terminal_meta::broadcast_terminal_meta_updated(
+            &state.broadcast_tx,
+            vec![record],
+            vec![],
+        );
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(

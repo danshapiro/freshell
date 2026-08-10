@@ -122,7 +122,9 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
 
     let state = WsState {
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-e2e".to_string()),
         boot_id: Arc::new("boot-e2e".to_string()),

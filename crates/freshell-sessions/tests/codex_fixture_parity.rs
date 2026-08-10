@@ -44,6 +44,9 @@ fn task_events_stream_matches_reference() {
         }),
         ..Default::default()
     };
+    // Codex sessions never carry a provider-authored title -> title_source stays
+    // None (explicit, beyond the full-struct equality below; validator-A4-A3).
+    assert_eq!(meta.title_source, None);
     assert_eq!(meta, expected);
 }
 

@@ -33,6 +33,7 @@ fn session(provider: &str, id: &str, last: i64) -> IndexedSession {
         project_path: format!("/repo/{provider}"),
         title: Some(format!("{provider} title")),
         title_provider_generated: false,
+        title_source: None,
         summary: None,
         first_user_message: Some("hello".to_string()),
         last_activity_at: last,
@@ -40,6 +41,7 @@ fn session(provider: &str, id: &str, last: i64) -> IndexedSession {
         cwd: Some(format!("/repo/{provider}")),
         is_subagent: false,
         is_non_interactive: false,
+        git_branch: None,
         source_file: None,
     }
 }
@@ -517,6 +519,7 @@ fn session_in(provider: &str, id: &str, project: &str, last_activity_at: i64) ->
         project_path: project.to_string(),
         title: None,
         title_provider_generated: false,
+        title_source: None,
         summary: None,
         first_user_message: None,
         last_activity_at,
@@ -524,6 +527,7 @@ fn session_in(provider: &str, id: &str, project: &str, last_activity_at: i64) ->
         cwd: Some(project.to_string()),
         is_subagent: false,
         is_non_interactive: false,
+        git_branch: None,
         source_file: None,
     }
 }

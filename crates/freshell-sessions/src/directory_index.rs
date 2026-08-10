@@ -71,9 +71,29 @@ pub struct IndexedSession {
     pub title_provider_generated: bool,
     pub summary: Option<String>,
     pub first_user_message: Option<String>,
+    /// Mirror of Node's ParsedSessionTitleSource for the parsed (pre-override) title.
+    /// The auto-title pipeline only compares against "provider-generated"
+    /// (server/auto-title.ts:88). Mapping per provider:
+    /// - **claude**: `"provider-generated"` if the title came from a provider-authored
+    ///   record (custom-title, agent-name, or generated summary record with `type:'summary'`).
+    ///   `None` otherwise (title derived from first user message).
+    /// - **codex**: `None` (no provider-authored titles in codex transcripts).
+    /// - **amplifier**: `"provider-generated"` if the session has an AI-generated name
+    ///   (Amplifier's own session title). `None` if unnamed.
+    /// - **opencode**: Always `None` (opencode has no concept of provider-generated titles).
+    pub title_source: Option<String>,
     pub last_activity_at: i64,
     pub created_at: Option<i64>,
     pub cwd: Option<String>,
+    /// Task 18: the transcript-parsed git branch (`ParsedSessionMeta::git_branch`,
+    /// `meta.rs` -- claude/codex record it; opencode's direct lister does not).
+    /// Consumed by `freshell-server`'s auto-title sweep as the FALLBACK under
+    /// the live-git branch when refreshing terminal metadata (Node's
+    /// `applySessionMetadata`: `session.gitBranch ?? current.branch`,
+    /// `terminal-metadata-service.ts:195`). `#[serde(default)]` so any
+    /// pre-Task-18 serialized snapshot still deserializes.
+    #[serde(default)]
+    pub git_branch: Option<String>,
     pub is_subagent: bool,
     pub is_non_interactive: bool,
     /// SESSION-07: the on-disk transcript this session was parsed from, when
@@ -403,9 +423,11 @@ fn item_from_meta(
         title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
         first_user_message: meta.first_user_message.clone(),
+        title_source: meta.title_source.clone(),
         last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
+        git_branch: meta.git_branch.clone(),
         is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
         is_non_interactive: meta.is_non_interactive.unwrap_or(false),
         source_file,
@@ -667,11 +689,16 @@ fn opencode_session_to_indexed(s: crate::parse::OpencodeSession) -> IndexedSessi
         // `message`/`part` content for these fields) — faithful, not a gap.
         summary: None,
         first_user_message: None,
+        // OpenCode has no concept of provider-generated titles -- always None.
+        title_source: None,
         last_activity_at: s.last_activity_at,
         created_at: s.created_at,
         // `OpencodeSession::cwd` is always present (`list_sessions` already
         // skips rows without one) — R10b is a structural non-issue here.
         cwd: Some(s.cwd),
+        // The opencode direct-lister reads no git facts from the db -- None,
+        // faithful to `listSessionsDirect`.
+        git_branch: None,
         is_subagent: s.is_subagent.unwrap_or(false),
         is_non_interactive: s.is_non_interactive.unwrap_or(false),
         // SESSION-07: opencode is direct-listed from one sqlite db, not a
@@ -1713,9 +1740,11 @@ mod tests {
             title_provider_generated: false,
             summary: None,
             first_user_message: None,
+            title_source: None,
             last_activity_at,
             created_at: None,
             cwd: Some("/p".to_string()),
+            git_branch: None,
             is_subagent: false,
             is_non_interactive: false,
             source_file: None,
@@ -2529,6 +2558,27 @@ mod tests {
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
     }
 
+    // Task 4 additive requirement (a): claude fixture with type:'summary' record
+    // must have title_source == Some("provider-generated").
+    #[test]
+    fn indexed_session_carries_first_user_message_and_provider_generated_title_source() {
+        let claude_home = claude_home_with("claudesrc-title-source", &["real-corrupted.jsonl"]);
+        let sessions = ClaudeSource::new(claude_home.clone()).scan();
+        let s = sessions
+            .iter()
+            .find(|s| s.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d")
+            .expect("fixture session must be found");
+        // Fixture has first user message.
+        assert!(s
+            .first_user_message
+            .as_deref()
+            .is_some_and(|m| !m.is_empty()));
+        // Fixture has type:'summary' record, marking title as provider-generated.
+        assert_eq!(s.title_source.as_deref(), Some("provider-generated"));
+        // Verify first_user_message is capped at 4000 chars.
+        assert!(s.first_user_message.as_ref().unwrap().chars().count() <= 4000);
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
     // ── Batch C: CodexSource ─────────────────────────────────────────────
 
     fn codex_fixture() -> String {
@@ -2681,6 +2731,22 @@ mod tests {
         assert_eq!(item.first_user_message, None);
         assert!(!item.is_subagent);
         assert!(!item.is_non_interactive);
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    #[test]
+    fn opencode_source_preserves_none_first_user_message_parity() {
+        // validator-A4-A3: Node's opencode provider has no firstUserMessage
+        // (opencode.ts:184-195) -- Rust must preserve None for opencode
+        // sessions (parity, not a gap): they can never hit the
+        // first-message/AI-title rungs.
+        let data_home = opencode_data_home_with_sessions(
+            "opencodesrc-no-fum",
+            &[("ses_fum", "/repo/f", "Titled Session", 1000, 5000)],
+        );
+        let items = OpencodeSource::new(data_home.clone()).scan();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].first_user_message.is_none());
         std::fs::remove_dir_all(&data_home).ok();
     }
 

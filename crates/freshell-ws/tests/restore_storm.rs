@@ -105,6 +105,8 @@ async fn spawn_server(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),

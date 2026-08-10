@@ -53,6 +53,7 @@
 
 pub mod cli_launch;
 pub mod detect;
+pub mod git_meta;
 pub mod mcp_inject;
 pub mod opencode_plugin;
 pub mod path;

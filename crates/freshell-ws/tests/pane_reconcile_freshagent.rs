@@ -197,6 +197,8 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
     let respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>> = Arc::default();
 
     let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&pane_ledger),
         identity: identity.clone(),
         auth_token: Arc::clone(&auth_token),

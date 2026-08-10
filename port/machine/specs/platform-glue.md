@@ -441,7 +441,7 @@ detector branches (§5.1); macOS ALF app-level rule (§5.2, fixture); loopback/c
 | P16 | `isRemoteAccessEnabled` (wsl2→false-unless-0.0.0.0-configured) | unit truth table | `network-access:6-19` | **yes** |
 | P17 | Hot-rebind close→listen(newHost) with rollback; WSL never rebinds | integration on loopback | `network-manager:400-534` | **partial** (loopback live) |
 | P18 | WSL IP detect `ip eth0` → `hostname -I` fallback (skip 172.17) | live compare | `wsl-port-forward:141-171` | **yes** (`172.30.149.249`) |
-| P19 | Parse `portproxy show` / firewall `show rule` (missing-rule = exit1+empty) | golden vs live netsh | `wsl-port-forward:106-139,238-270` | **yes** (read) |
+| P19 | Parse `portproxy show` / firewall `show rule` (missing-rule = exit1+empty) | golden vs live netsh | `wsl-port-forward:106-139,238-270` | **yes** (read; live leg opt-in via FRESHELL_RUN_LIVE_WINDOWS_INTEROP=1) |
 | P20 | Port-forward **plan** logic (needs-update, stale, full vs firewall-only, noop) | unit over rule/port sets | `wsl-port-forward:278-475` | **yes** (pure) |
 | P21 | Script builders byte-exact incl. `2>\$null`→`$null` normalize, delete-then-add, spaceless rule | golden strings | `wsl-port-forward:289-398` | **yes** (pure) |
 | P22 | Managed-ports persistence (WSL json / Windows per-instance sha256, atomic) | round-trip | `wsl-port-forward:59-219`, `network-manager:66-137` | **yes** |

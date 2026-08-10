@@ -21,6 +21,33 @@ use common::*;
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use std::time::Duration;
+
+/// Task 18 (DEV-0008 closure): poll fresh connections until the handshake
+/// inventory's `terminalMeta` carries a row for `terminal_id`, then return the
+/// row. Polling (bounded) because the create path commits its record through
+/// an ASYNC enrichment task — `terminal.created` deliberately does not wait
+/// for the git probes.
+async fn wait_for_inventory_meta_row(url: &str, terminal_id: &str) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_ws, inventory) = connect_and_capture_inventory(url).await;
+        let row = inventory["terminalMeta"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|m| m["terminalId"] == serde_json::json!(terminal_id))
+                .cloned()
+        });
+        if let Some(row) = row {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no terminal.inventory terminalMeta row for {terminal_id} within 5s: {inventory}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// **RED for increment 2(a)**: a RESUME-created coding-CLI terminal's
 /// `terminal.created`, `terminal.attach.ready`, and (reconnect-time)
 /// `terminal.inventory` frames must all carry the canonical
@@ -98,6 +125,15 @@ async fn resume_created_terminal_frames_carry_session_ref() {
         "terminal.inventory row must carry the identity: {row}"
     );
 
+    // Task 18 (DEV-0008 closure): the handshake's `terminalMeta` ships the
+    // registry's live records — the created terminal's row must be present
+    // and carry a cwd (previously hardcoded `[]`).
+    let meta_row = wait_for_inventory_meta_row(&url, &terminal_id).await;
+    assert!(
+        meta_row["cwd"].as_str().is_some_and(|c| !c.is_empty()),
+        "terminalMeta row must carry the terminal's cwd: {meta_row}"
+    );
+
     registry.kill(&terminal_id);
 }
 
@@ -170,6 +206,15 @@ async fn fresh_claude_create_frames_carry_preallocated_session_ref() {
         session_ref_of(&row),
         Some(serde_json::json!({ "provider": "claude", "sessionId": session_id })),
         "terminal.inventory row must carry the preallocated identity: {row}"
+    );
+
+    // Task 18 (DEV-0008 closure): the handshake's `terminalMeta` ships the
+    // registry's live records — the created terminal's row must be present
+    // and carry a cwd (previously hardcoded `[]`).
+    let meta_row = wait_for_inventory_meta_row(&url, &terminal_id).await;
+    assert!(
+        meta_row["cwd"].as_str().is_some_and(|c| !c.is_empty()),
+        "terminalMeta row must carry the terminal's cwd: {meta_row}"
     );
 
     registry.kill(&terminal_id);
