@@ -541,7 +541,7 @@ git commit -m "fix: focus context menu items with preventScroll to avoid self-di
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In `test/unit/client/components/context-menu/context-menu-utils.test.ts`, add a new top-level describe (reuse the file's existing import of `clampToViewport` if present; otherwise add `clampToViewport` to the existing import from `@/components/context-menu/context-menu-utils`):
+In `test/unit/client/components/context-menu/context-menu-utils.test.ts`, add a new top-level describe. Two import edits are required first (the vitest config does NOT enable `globals`, so nothing is auto-injected): (1) add `afterEach` to the file's existing vitest import — it currently reads `import { describe, it, expect } from 'vitest'` and must become `import { afterEach, describe, it, expect } from 'vitest'`; (2) reuse the file's existing import of `clampToViewport` if present, otherwise add `clampToViewport` to the existing import from `@/components/context-menu/context-menu-utils`:
 
 ```ts
 describe('clampToViewport with visualViewport (mobile keyboard awareness)', () => {
