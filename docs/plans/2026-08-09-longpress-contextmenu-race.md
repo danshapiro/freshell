@@ -9,11 +9,14 @@
 
 **Architecture:** Two unsynchronized paths open the shared context menu on touch long-press: the provider's own 500 ms JS timer (which arms `suppressNextTouchEnd`) and the native `contextmenu` DOM event Android fires mid-gesture (which does NOT arm it). Fix 1 unifies both open paths inside `ContextMenuProvider` so whichever path opens the menu, the touch release is suppressed and the loser path is cancelled. Fix 2 removes TabsView's duplicate, unguarded menu entirely by routing its card menu through the shared provider (new `tabs-card` context id), so cards get long-press, release suppression, keyboard access, and outside-click dismissal from the one guarded mechanism. Shared tab-open logic moves to a lib module so the provider, `menu-defs.ts`, and TabsView all reuse it without duplication or import cycles.
 
+**Validated failure mechanism (load-bearing pass, 2026-08-09):** Chromium-Android source shows a recognized long-press forecloses tap-click synthesis (`GestureLongTap` is a no-op on Android), so the primary Android killer is NOT a browser-synthesized click landing on the menu. It is the un-cancelled 500 ms timer firing after the native `contextmenu` already opened the menu: the timer's `document.elementFromPoint` probe hits the just-opened menu, the `data-context` walk fails, and the `Global` fallback menu replaces the correct menu directly under the user's finger. Fix 1's timer cancellation cures exactly this. Release suppression stays load-bearing for the timer-first ordering (release before the browser's own long-press threshold — the already-shipped iOS-path contract, which Fix 1 must not regress) and for non-Chromium engines. A post-open finger-drift scroll can still close the menu via the provider's capture-scroll listener — a plausible co-cause only a real-device trace can size; see the residual-risks addendum in the Self-Review section. Full evidence ledger: `../../../.the-usual-logs/longpress-contextmenu-race/load-bearing-ledger.md`.
+
 **Tech Stack:** React 18 + Redux Toolkit, TypeScript, Vitest + jsdom + React Testing Library (`test/setup/dom.ts`), lucide-react icons.
 
 ## Global Constraints
 
 - Worktree root (all paths below are relative to it): `/home/dan/code/freshell/.worktrees/longpress-contextmenu-race` — run every command from this directory.
+- **Line-number anchors are pre-plan.** Every `file:line` in this plan was verified against plan-authoring HEAD and is a hint, not an address: earlier tasks shift later anchors in the same files (Task 1 grows `ContextMenuProvider.tsx` ~+20 lines above the spans Task 5 cites; Task 3 removes ~250 lines from `TabsView.tsx` above everything Task 6 cites). Locate code by the named symbols and quoted snippets; treat line numbers as approximate once any earlier task has touched the file.
 - TDD is mandatory (repo AGENTS.md): Red → Green → Refactor for every task; write the failing test first and run it to see it fail before implementing.
 - Focused single-file test command (the ONLY sanctioned focused path):
   `npm run test:vitest -- run <test-file> --config config/vitest/vitest.config.ts`
@@ -58,7 +61,7 @@ Scope check: both fixes serve one user story (touch long-press context menus wor
 
 **Interfaces:**
 - Consumes: nothing new — internal to the provider's listener effect.
-- Produces: behavioral guarantee later tasks rely on: *any* `contextmenu` event that arrives during an active touch gesture arms `suppressNextTouchEnd = true` and cancels the pending long-press timer; a `contextmenu` arriving after the timer already opened the menu is swallowed (no second `openMenu`).
+- Produces: behavioral guarantee later tasks rely on: *any* `contextmenu` event that arrives during an active touch gesture arms `suppressNextTouchEnd = true` and cancels the pending long-press timer; a `contextmenu` arriving after the timer already opened the menu is swallowed (no second `openMenu`); the race branch opens the menu at the touch-session start position (event coordinates only as fallback).
 
 Background (verified file:line facts):
 - `handleContextMenu` is at lines 979-997; it early-returns only on `shouldUseNativeMenu` (line 983) and never touches the long-press state.
@@ -66,6 +69,8 @@ Background (verified file:line facts):
 - `handleTouchStart` (1028-1067) arms `suppressNextTouchEnd = true` at line 1057 only inside its 500 ms timer callback.
 - `handleTouchEnd` (1083-1094) calls `e.preventDefault()` only when `suppressNextTouchEnd && e.type === 'touchend'`.
 - Listener registration at 1096-1101: `contextmenu` capture; `touchstart`/`touchmove` passive; `touchend`/`touchcancel` non-passive.
+
+Mechanism note (validated 2026-08-09): on Chromium-Android an un-suppressed release after a native `contextmenu` does NOT synthesize a click (`GestureLongTap` is a no-op there) — the click-suppression tests below still matter because that contract protects the timer-first ordering (release before the browser's long-press threshold) and non-Chromium engines. The decisive Android cure in this task is cancelling the pending timer (test 2) and swallowing the duplicate open (test 3). `handleTouchStart`'s own arming at line 1057 must stay untouched. Post-open `touchmove` cannot disarm the flag on either path: the clear at line 1079 is gated on `touchStartPos && longPressTimer`, and both open paths null `touchStartPos` (verified — parity with the shipped iOS path).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -112,8 +117,10 @@ Then add these three tests inside the existing `describe('ContextMenuProvider lo
 
     expect(screen.getByRole('menu')).toBeInTheDocument()
 
-    // Finger lifts. Without suppression the browser synthesizes a click at
-    // (100,100) -- exactly where the menu's top-left (first item) now sits.
+    // Finger lifts. On click-synthesizing engines (iOS-like; Chromium-Android
+    // does not synthesize one after a native contextmenu) an unsuppressed
+    // release becomes a click at (100,100) -- exactly where the menu's
+    // top-left (first item) now sits.
     const firstItem = screen.getAllByRole('menuitem')[0]
     act(() => {
       const release = simulateTouch('touchend', firstItem, 100, 100)
@@ -190,6 +197,33 @@ Then add these three tests inside the existing `describe('ContextMenuProvider lo
     expect(menuAfter).toBeInTheDocument()
     expect(menuAfter.style.left).toBe('100px')
   })
+
+  it('opens the menu at the touch-session position when the native contextmenu reports drifted coords', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+        Tab One
+      </div>
+    )
+
+    const target = screen.getByText('Tab One')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    // Mid-gesture native contextmenu with coordinates that drifted away from
+    // the touch start (some engines report offset/degenerate coords). The
+    // unified handler must prefer the live touch-session position.
+    act(() => {
+      simulateNativeContextMenu(target, 300, 300)
+    })
+
+    const menu = screen.getByRole('menu')
+    expect(menu.style.left).toBe('100px')
+  })
 ```
 
 Note: `renderWithProvider` already returns `{ store, ...utils }` in this file — destructure `store` only where used.
@@ -200,10 +234,11 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx --config config/vitest/vitest.config.ts
 ```
-Expected: the 11 pre-existing tests PASS; the 3 new tests FAIL:
+Expected: the 11 pre-existing tests PASS; the 4 new tests FAIL:
 - test 1 fails at the final `getByRole('menu')` (menu was closed by the synthesized click),
 - test 2 fails at `expect(elementFromPointMock).not.toHaveBeenCalled()`,
-- test 3 fails at `expect(menuAfter.style.left).toBe('100px')` (it will be `300px`).
+- test 3 fails at `expect(menuAfter.style.left).toBe('100px')` (it will be `300px`),
+- test 4 fails at `expect(menu.style.left).toBe('100px')` (the un-unified handler opens at the event coords, `300px`).
 
 - [ ] **Step 3: Implement the unified open path**
 
@@ -239,10 +274,19 @@ In `src/components/context-menu/ContextMenuProvider.tsx`, inside the `useEffect`
       if (suppressNextTouchEnd) return
 
       // Android race, case B: a touch gesture is still in flight and the
-      // native contextmenu won the race. Cancel our timer so the paths
-      // don't both open, and arm release suppression so the browser's
-      // synthetic click can't land on the just-opened menu.
+      // native contextmenu won the race. Cancel our timer so it cannot
+      // re-fire into the just-opened menu (its elementFromPoint probe would
+      // hit the menu and replace it with the Global fallback), and arm
+      // release suppression for engines that DO synthesize a click from
+      // this gesture (iOS-like; Chromium-Android does not). Prefer the
+      // touch-session start position over the event coords — identical on
+      // Chromium, and it hardens against engines reporting drifted or
+      // degenerate contextmenu coordinates.
+      let position = { x: e.clientX, y: e.clientY }
       if (touchStartPos !== null || longPressTimer !== null) {
+        if (touchStartPos) {
+          position = { x: touchStartPos.x, y: touchStartPos.y }
+        }
         if (longPressTimer) {
           clearTimeout(longPressTimer)
           longPressTimer = null
@@ -256,7 +300,7 @@ In `src/components/context-menu/ContextMenuProvider.tsx`, inside the `useEffect`
       const targetObj = parsed || { kind: 'global' as const }
 
       openMenu({
-        position: { x: e.clientX, y: e.clientY },
+        position,
         target: targetObj,
         contextElement: contextEl,
         clickTarget: target,
@@ -272,7 +316,7 @@ Nothing else in the effect changes: `handleTouchStart`/`handleTouchMove`/`handle
 ```bash
 npm run test:vitest -- run test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx --config config/vitest/vitest.config.ts
 ```
-Expected: 14/14 PASS.
+Expected: 15/15 PASS.
 
 Regression sweep for the sibling suites:
 ```bash
@@ -300,20 +344,25 @@ git commit --author="Dan Shapiro <3732858+danshapiro@users.noreply.github.com>" 
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: `ContextIds.TabsCard === 'tabs-card'`; `ContextTarget` variant `{ kind: 'tabs-card'; tabKey: string }`; `parseContextTarget(ContextIds.TabsCard, { tabKey }) → { kind: 'tabs-card', tabKey }` (or `null` when `tabKey` missing). `tabKey` is `${deviceId}:${tabId}` and globally unique (see `src/lib/tab-registry-snapshot.ts:111`).
+- Produces: `ContextIds.TabsCard === 'tabs-card'`; `ContextTarget` variant `{ kind: 'tabs-card'; tabKey: string; status: 'open' | 'closed' }`; `parseContextTarget(ContextIds.TabsCard, { tabKey, tabStatus }) → { kind: 'tabs-card', tabKey, status }` with `status` defaulting to `'open'` unless `tabStatus === 'closed'` (or `null` when `tabKey` missing). `tabKey` is `${deviceId}:${tabId}` (`src/lib/tab-registry-snapshot.ts:111`) but is NOT unique across the four registry groups — validated 2026-08-09: `localOpen` is rebuilt live from `state.tabs` while `closed`/`remoteOpen` come from sync snapshots, so a same-device second window can put one `tabKey` in both `localOpen` and `closed` (no cross-group dedup exists in `selectTabsRegistryGroups` or TabsView). The `status` discriminator keeps a "Recently closed" card's menu resolving to the closed record it rendered.
 
 - [ ] **Step 1: Write the failing tests**
 
 In `test/unit/client/components/context-menu/context-menu-utils.test.ts`, append inside the single `describe('parseContextTarget', ...)` block (before the closing `})` at line 102):
 
 ```ts
-  it('parseContextTarget for TabsCard returns tabs-card target with tabKey', () => {
+  it('parseContextTarget for TabsCard returns tabs-card target with tabKey and status', () => {
+    const result = parseContextTarget(ContextIds.TabsCard, { tabKey: 'device-a:tab-1', tabStatus: 'closed' })
+    expect(result).toEqual({ kind: 'tabs-card', tabKey: 'device-a:tab-1', status: 'closed' })
+  })
+
+  it('parseContextTarget for TabsCard defaults status to open', () => {
     const result = parseContextTarget(ContextIds.TabsCard, { tabKey: 'device-a:tab-1' })
-    expect(result).toEqual({ kind: 'tabs-card', tabKey: 'device-a:tab-1' })
+    expect(result).toEqual({ kind: 'tabs-card', tabKey: 'device-a:tab-1', status: 'open' })
   })
 
   it('parseContextTarget for TabsCard returns null without tabKey', () => {
-    const result = parseContextTarget(ContextIds.TabsCard, {})
+    const result = parseContextTarget(ContextIds.TabsCard, { tabStatus: 'closed' })
     expect(result).toBeNull()
   })
 ```
@@ -323,7 +372,7 @@ In `test/unit/client/components/context-menu/context-menu-utils.test.ts`, append
 ```bash
 npm run test:vitest -- run test/unit/client/components/context-menu/context-menu-utils.test.ts --config config/vitest/vitest.config.ts
 ```
-Expected: the first new test FAILS (`ContextIds.TabsCard` is `undefined`, so `parseContextTarget` hits the `default:` branch and returns `null`). Existing tests pass.
+Expected: the first two new tests FAIL (`ContextIds.TabsCard` is `undefined`, so `parseContextTarget` hits the `default:` branch and returns `null`). Existing tests pass.
 
 - [ ] **Step 3: Implement**
 
@@ -336,14 +385,16 @@ Expected: the first new test FAILS (`ContextIds.TabsCard` is `undefined`, so `pa
 3b. `src/components/context-menu/context-menu-types.ts` — add one variant at the end of the `ContextTarget` union (after the `fresh-agent` member that ends at line 26):
 
 ```ts
-  | { kind: 'tabs-card'; tabKey: string }
+  | { kind: 'tabs-card'; tabKey: string; status: 'open' | 'closed' }
 ```
 
 3c. `src/components/context-menu/context-menu-utils.ts` — add a case to `parseContextTarget`, after the `ContextIds.FreshAgent` case (before `default:` at line 98):
 
 ```ts
     case ContextIds.TabsCard:
-      return data.tabKey ? { kind: 'tabs-card', tabKey: data.tabKey } : null
+      return data.tabKey
+        ? { kind: 'tabs-card', tabKey: data.tabKey, status: data.tabStatus === 'closed' ? 'closed' : 'open' }
+        : null
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -381,7 +432,7 @@ export type TabsRegistryGroups = {
   remoteOpen: RegistryTabRecord[]
   closed: RegistryTabRecord[]
 }
-export function findRecordByTabKey(groups: TabsRegistryGroups, tabKey: string): RegistryTabRecord | undefined
+export function findRecordByTabKey(groups: TabsRegistryGroups, tabKey: string, status?: RegistryTabRecord['status']): RegistryTabRecord | undefined
 export type OpenTabRecordDeps = {
   dispatch: AppDispatch
   localServerInstanceId?: string
@@ -449,6 +500,18 @@ describe('findRecordByTabKey', () => {
 
   it('returns undefined for an unknown tabKey', () => {
     expect(findRecordByTabKey(makeGroups(), 'nope')).toBeUndefined()
+  })
+
+  it('prefers the record whose status matches when a tabKey exists in two groups', () => {
+    // Same-device multi-window can put one tabKey in localOpen AND closed
+    // (live-rebuilt localOpen vs. retained closed tombstone) — validated
+    // 2026-08-09; the status discriminator resolves the card's own record.
+    const open = makeRecord()
+    const closed = makeRecord({ status: 'closed', closedAt: 3 })
+    const groups = makeGroups({ localOpen: [open], closed: [closed] })
+    expect(findRecordByTabKey(groups, 'device-a:tab-9', 'closed')).toBe(closed)
+    expect(findRecordByTabKey(groups, 'device-a:tab-9', 'open')).toBe(open)
+    expect(findRecordByTabKey(groups, 'device-a:tab-9')).toBe(open)
   })
 })
 
@@ -591,8 +654,16 @@ export type TabsRegistryGroups = {
 export function findRecordByTabKey(
   groups: TabsRegistryGroups,
   tabKey: string,
+  status?: RegistryTabRecord['status'],
 ): RegistryTabRecord | undefined {
-  for (const list of [groups.localOpen, groups.sameDeviceOpen, groups.remoteOpen, groups.closed]) {
+  const lists = [groups.localOpen, groups.sameDeviceOpen, groups.remoteOpen, groups.closed]
+  if (status) {
+    for (const list of lists) {
+      const match = list.find((record) => record.tabKey === tabKey && record.status === status)
+      if (match) return match
+    }
+  }
+  for (const list of lists) {
     const match = list.find((record) => record.tabKey === tabKey)
     if (match) return match
   }
@@ -810,7 +881,7 @@ describe('tabs-card menu', () => {
       tabRegistryGroups: makeRegistryGroups({ remoteOpen: [record] }),
       registryDeviceId,
     }
-    const items = buildMenuItems({ kind: 'tabs-card', tabKey: record.tabKey }, ctx)
+    const items = buildMenuItems({ kind: 'tabs-card', tabKey: record.tabKey, status: record.status }, ctx)
     return { actions, items }
   }
 
@@ -882,13 +953,13 @@ describe('tabs-card menu', () => {
   it('returns no items when the record or groups are missing', () => {
     const actions = createMockActions()
     const noGroups = buildMenuItems(
-      { kind: 'tabs-card', tabKey: 'x:y' },
+      { kind: 'tabs-card', tabKey: 'x:y', status: 'open' },
       { ...createMockContext(actions) },
     )
     expect(noGroups).toEqual([])
 
     const unknownKey = buildMenuItems(
-      { kind: 'tabs-card', tabKey: 'x:y' },
+      { kind: 'tabs-card', tabKey: 'x:y', status: 'open' },
       { ...createMockContext(actions), tabRegistryGroups: makeRegistryGroups(), registryDeviceId: 'd' },
     )
     expect(unknownKey).toEqual([])
@@ -944,7 +1015,7 @@ import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistr
   if (target.kind === 'tabs-card') {
     const groups = ctx.tabRegistryGroups
     if (!groups) return []
-    const record = findRecordByTabKey(groups, target.tabKey)
+    const record = findRecordByTabKey(groups, target.tabKey, target.status)
     if (!record) return []
 
     const isLocal = record.deviceId === ctx.registryDeviceId
@@ -1154,7 +1225,7 @@ In `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`:
 ```tsx
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 ```
-and add `tabRegistry: tabRegistryReducer,` to the `reducer` map (no preloadedState entry needed — slice initial state is fine, and the existing 14 tests are unaffected).
+and add `tabRegistry: tabRegistryReducer,` to the `reducer` map (no preloadedState entry needed — slice initial state is fine, and the existing 15 tests are unaffected). CAUTION (validated 2026-08-09): once `state.tabRegistry` exists the provider runs `selectTabsRegistryGroups`, whose input selectors read `state.tabs.tabs`, `state.panes.layouts`, `state.panes.paneTitles`, and `state.connection.serverInstanceId` UNGUARDED (`tabsRegistrySelectors.ts:31-37`) — verify `createTestStore` also provides the `tabs`, `panes`, and `connection` reducers (add any that are missing) or the selector throws.
 
 2b. Add a fixture helper near `simulateTouch`:
 
@@ -1376,7 +1447,7 @@ npm run test:vitest -- run test/unit/client/components/context-menu/ContextMenu.
 npm run test:vitest -- run test/unit/client/components/context-menu/menu-defs.test.ts --config config/vitest/vitest.config.ts
 npm run typecheck:client
 ```
-Expected: all PASS (longpress file now 16 tests).
+Expected: all PASS (longpress file now 17 tests).
 
 - [ ] **Step 6: Commit**
 
@@ -1396,7 +1467,7 @@ git commit --author="Dan Shapiro <3732858+danshapiro@users.noreply.github.com>" 
 
 **Interfaces:**
 - Consumes: `ContextIds.TabsCard` (Task 2); provider wiring (Task 5) — TabsView is always rendered inside `ContextMenuProvider` (`App.tsx:1648-1653` within `:1680-1685`).
-- Produces: cards carry `data-context="tabs-card"` + `data-tab-key`; TabsView renders NO menu of its own; `ContextMenu` becomes provider-private (its only remaining `src/` importer is `ContextMenuProvider.tsx`).
+- Produces: cards carry `data-context="tabs-card"` + `data-tab-key` + `data-tab-status`; TabsView renders NO menu of its own; `ContextMenu` becomes provider-private (its only remaining `src/` importer is `ContextMenuProvider.tsx`).
 
 - [ ] **Step 1: Rewrite the two TabsView menu tests to go through the real provider (they must FAIL first)**
 
@@ -1528,6 +1599,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
       )}
       data-context={ContextIds.TabsCard}
       data-tab-key={record.tabKey}
+      data-tab-status={record.status}
       aria-label={`${record.displayDeviceLabel}: ${record.tabName}`}
       onClick={onAction}
     >
@@ -1548,30 +1620,32 @@ Expected: PASS, including the `getAllByRole('menu')).toHaveLength(1)` single-men
 
 - [ ] **Step 5: Fix the memo-test probe**
 
-`test/unit/client/components/TabsView.memo.test.tsx` counted `TabsView` renders by mocking `@/components/context-menu/ContextMenu` (lines 32-41) — TabsView no longer renders it, so both tests would fail at `expect(initialRenderCount).toBeGreaterThan(0)`. Replace the probe with a counting wrapper around the registry selector, which runs exactly once per `TabsView` render via `useAppSelector`:
+`test/unit/client/components/TabsView.memo.test.tsx` counted `TabsView` renders by mocking `@/components/context-menu/ContextMenu` (lines 32-41) — TabsView no longer renders it, so both tests would fail at `expect(initialRenderCount).toBeGreaterThan(0)`.
+
+Do NOT count selector invocations: it was proven by execution (load-bearing pass, 2026-08-09; probe in `.worktrees/.the-usual-logs/longpress-contextmenu-race/reports/validator-P-memo-probe.md`) that react-redux 9 SKIPS the `useSelector` selector when a re-render happens with no dispatch (store snapshot reference-equal — the with-selector shim returns the cached selection), so a counting wrapper around `selectTabsRegistryGroups` never sees the inline-prop re-render and the `toBeGreaterThan` assertion fails. Count RENDERS instead, via `paneKindLabel`: the fixture's local card (1 terminal pane) calls it during every real `TabsView` render (card body, plain non-memo `TabCard`/`DeviceSection` components), so the count strictly increases exactly when TabsView actually re-renders.
 
 Replace lines 12-14 and 32-41 with:
 
 ```tsx
 const renderCounters = vi.hoisted(() => ({
-  groupsSelectorCalls: 0,
+  paneKindLabelCalls: 0,
 }))
 ```
 
 ```tsx
-vi.mock('@/store/selectors/tabsRegistrySelectors', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/store/selectors/tabsRegistrySelectors')>()
+vi.mock('@/lib/tab-registry-open', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/tab-registry-open')>()
   return {
     ...actual,
-    selectTabsRegistryGroups: (state: unknown) => {
-      renderCounters.groupsSelectorCalls += 1
-      return actual.selectTabsRegistryGroups(state as never)
+    paneKindLabel: (...args: Parameters<typeof actual.paneKindLabel>) => {
+      renderCounters.paneKindLabelCalls += 1
+      return actual.paneKindLabel(...args)
     },
   }
 })
 ```
 
-Then in both tests replace every `renderCounters.contextMenuCalls` with `renderCounters.groupsSelectorCalls`. Also reset the counter between tests — add inside the existing `afterEach` (or a `beforeEach`): `renderCounters.groupsSelectorCalls = 0`. The two assertions keep their exact semantics: stable `onOpenTab` → parent rerender does NOT re-run the selector (memo blocked the re-render); inline `onOpenTab` → it does.
+Then in both tests replace every `renderCounters.contextMenuCalls` with `renderCounters.paneKindLabelCalls`. Also reset the counter between tests — add inside the existing `afterEach` (or a `beforeEach`): `renderCounters.paneKindLabelCalls = 0`. The two assertions keep their exact semantics: stable `onOpenTab` → parent rerender does NOT re-render TabsView (memo blocked it) → count unchanged (`toBe(initialRenderCount)`); inline `onOpenTab` → TabsView re-renders → the local card re-renders → count increases (`toBeGreaterThan(initialRenderCount)`). Fixture dependency (keep it true): the memo test's store must continue to render at least one LOCAL card with at least one pane (`addTab` + `initLayout` seeding at lines 53-57) — the remote card has `panes: []` and contributes no calls.
 
 Run:
 ```bash
@@ -1632,7 +1706,7 @@ Confirm each is covered by a passing test and note the test name:
 - Move-tolerance cancellation → ('does NOT open context menu if touch moves >10px during hold', '...vertically', 'allows small touch movement (<=10px)...')
 - touchcancel → ('cancels long-press on touchcancel')
 - Native-menu passthrough for inputs/links → ('does NOT open custom menu on text inputs...', '...on links...', '...data-native-context')
-- Android race (both orders) → the three Task 1 tests + two Task 5 tabs-card touch tests
+- Android race (both orders, incl. drifted-coords position source) → the four Task 1 tests + two Task 5 tabs-card touch tests
 
 - [ ] **Step 4: Commit any residual fixes**
 
@@ -1652,3 +1726,15 @@ git add -A && git commit --author="Dan Shapiro <3732858+danshapiro@users.noreply
 - **No silent deferrals:** no stubs or mocks stand in for production behavior; the provider tests dispatch real Redux actions through the real reducers (Task 5 Step 1 test 2 asserts an actual tab is created). The only mocks are the repo's established infrastructure mocks (ws-client/api/clipboard) and jsdom gap-fills (`elementFromPoint`).
 - **Type consistency check:** `MenuActions` names (`jumpToTabRecord`, `openTabRecordCopy`, `openTabRecordPaneInNewTab`, `copyTabRecordName`) are identical in Task 4 (type + branch), Task 5 (provider callbacks + actions bag + dep array), and the menu-defs tests. Lib exports (`openRecordAsUnlinkedCopy(record, deps)`, `openPaneInNewTab(record, pane, deps)`, `jumpToRecord(record, deps)`, `findRecordByTabKey(groups, tabKey)`, `TabsRegistryGroups`, `OpenTabRecordDeps`) match across Task 3 (definition + tests), Task 4 (menu-defs imports), Task 5 (provider imports), Task 6 (TabsView wrappers). `ContextIds.TabsCard = 'tabs-card'` and `{ kind: 'tabs-card'; tabKey }` are consistent across Tasks 2, 4, 5, 6.
 - **Known coupling:** Task 4 makes `MenuActions` fields required, which can force the provider's actions-bag additions into Task 4's commit to keep typecheck green — Task 4 Step 4 documents the resolution explicitly.
+
+### Load-bearing validation addendum (2026-08-09)
+
+A load-bearing assumption pass (ledger: `../../../.the-usual-logs/longpress-contextmenu-race/load-bearing-ledger.md`) verified 4 assumptions, falsified 3, and accepted 1 residual. Plan changes applied:
+
+- **Mechanism reframed (A1 inconclusive/acceptable):** Chromium-Android synthesizes no click after a native `contextmenu` (`GestureLongTap` no-op); the best source-supported killer is the un-cancelled timer's `elementFromPoint` double-open replacing the menu with the `Global` fallback. Fix 1 (timer cancellation + duplicate-open swallow) cures it; suppression retained for timer-first ordering and non-Chromium engines. Architecture note + Task 1 mechanism note added.
+- **Position source hardened (A7):** race branch prefers `touchStartPos` over event coords; Task 1 gained test 4 (drifted-coords). Test counts updated (Task 1: 15, longpress file after Task 5: 17).
+- **`status` discriminator added (A5 falsified):** `tabKey` is NOT unique across registry groups (same-device multi-window puts one key in `localOpen` + `closed`). `ContextTarget` gained `status: 'open' | 'closed'`; cards emit `data-tab-status`; `findRecordByTabKey` gained a status-preference parameter. Consistency re-checked across Task 2 (type + parser + tests), Task 3 (signature + impl + test), Task 4 (`target.status` pass-through + test targets), Task 6 (card attribute).
+- **Memo probe redesigned (A3 falsified by execution):** react-redux 9 skips selectors on no-dispatch re-renders; Task 6 Step 5 now counts `paneKindLabel` calls (renders), not selector invocations.
+- **Anchors (A4 falsified):** line numbers are pre-plan hints; symbols authoritative (Global Constraints note).
+- **Verified (relied on without change):** prevented mid-gesture `contextmenu` → cancelable `touchend` whose `preventDefault()` suppresses the synthetic click (spec + Chromium source); post-open `touchmove` cannot disarm suppression (parity with iOS path); continuous provider subscription to `selectTabsRegistryGroups` is memoized, bounded (60 s recency buckets, doubly gated) and warning-free — lazy `getState()` not required.
+- **Residual risks (accepted, need a real-device trace):** post-open drift-scroll dismissal via the provider's capture-scroll listener is NOT addressed by Fix 1 (Chromium allows scroll after long-press); long-press on selectable `TabItem` labels (no `select-none`, unlike cards) can start text selection → `touchcancel`-shaped orderings. Optional hardening if devices confirm: `select-none` on `data-context` touch targets and/or a short post-open dismissal-immunity window. Samsung Internet/WebView behavior is source-inferred, not device-verified.
