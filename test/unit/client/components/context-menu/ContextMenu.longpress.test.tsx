@@ -652,4 +652,115 @@ describe('ContextMenuProvider long-press', () => {
     expect(onCardClick).not.toHaveBeenCalled()
     expect(screen.getByRole('menu')).toBeInTheDocument()
   })
+
+  describe('dismissal policy (scroll / resize / blur)', () => {
+    // NOTE: the outer suite's beforeEach already installs vi.useFakeTimers().
+    // Vitest's default toFake includes Date (verified by probe against this
+    // repo's vitest 3.2.4), so vi.advanceTimersByTime() advances Date.now(),
+    // which the grace-window implementation reads. Do NOT add a nested
+    // vi.useFakeTimers({ toFake: [...] }) here: re-calling it while fake
+    // timers are already installed is a verified silent no-op (the new
+    // config is ignored). If Date faking ever regressed, these tests would
+    // fail loudly rather than silently.
+
+    function openMenuByLongPress() {
+      renderWithProvider(
+        <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+          Tab One
+        </div>
+      )
+      const target = screen.getByText('Tab One')
+      elementFromPointMock.mockReturnValue(target)
+      act(() => {
+        simulateTouch('touchstart', target, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    }
+
+    it('ignores scroll events during the post-open grace window, then closes on a later scroll', () => {
+      openMenuByLongPress()
+
+      // Mechanical scroll immediately after open (focus scroll-into-view,
+      // xterm refit, keyboard viewport settling) must NOT dismiss.
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // Still inside the 500ms grace window.
+      act(() => {
+        vi.advanceTimersByTime(100)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // 600ms after open — past the 500ms grace window: a genuine user
+      // scroll dismisses the menu (correct UX).
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('never closes on scrolls that originate inside the menu itself', () => {
+      openMenuByLongPress()
+
+      // Get past the grace window so this test proves the target-origin
+      // exclusion specifically, not the grace window.
+      act(() => {
+        vi.advanceTimersByTime(600)
+      })
+
+      // scroll does not bubble, but the provider's listener is registered
+      // on window with capture: true, so it still sees this event during
+      // the capture phase with e.target === the menu element.
+      const menu = screen.getByRole('menu')
+      act(() => {
+        menu.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      // Sanity: a window-level scroll at the same moment DOES close.
+      act(() => {
+        window.dispatchEvent(new Event('scroll'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('ignores resize during the grace window but closes on a later resize', () => {
+      openMenuByLongPress()
+
+      // Keyboard show/hide can resize the window (older Android WebViews)
+      // right as the menu opens — must not dismiss.
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      act(() => {
+        vi.advanceTimersByTime(600)
+      })
+      act(() => {
+        window.dispatchEvent(new Event('resize'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+
+    it('closes on window blur immediately, even during the grace window', () => {
+      openMenuByLongPress()
+
+      act(() => {
+        window.dispatchEvent(new Event('blur'))
+      })
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+  })
 })

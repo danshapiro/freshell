@@ -74,6 +74,16 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
+// How long after the menu opens we ignore scroll/resize events. Opening the
+// menu on mobile has mechanical side effects that fire native scroll/resize
+// shortly after open: focus scroll-into-view (next frame) and the on-screen
+// keyboard hiding as focus moves into the menu, whose scroll/resize burst
+// lands ~250-350ms after open on measured platforms — 500ms covers it with
+// margin. These are not user dismissal intent. Genuine user scrolls still
+// close the menu: on touch devices a real scroll begins with a pointerdown
+// outside the menu (which closes it instantly, grace or no grace); on
+// desktop, wheel scrolls close it once the grace window has passed.
+const MENU_OPEN_GRACE_MS = 500
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
@@ -184,6 +194,7 @@ export function ContextMenuProvider({
   const menuRef = useRef<HTMLDivElement | null>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
   const suppressNextFocusRestoreRef = useRef(false)
+  const menuOpenedAtRef = useRef(0)
 
   const ws = useMemo(() => getWsClient(), [])
 
@@ -207,6 +218,10 @@ export function ContextMenuProvider({
 
   const openMenu = useCallback((state: MenuState) => {
     previousFocusRef.current = document.activeElement as HTMLElement | null
+    // Kept in a ref (NOT in menuState): the view-change effect below runs
+    // closeMenu() in its cleanup whenever menuState identity changes, so
+    // writing a timestamp into state would self-dismiss the menu.
+    menuOpenedAtRef.current = Date.now()
     setMenuState(state)
   }, [])
 
@@ -1171,8 +1186,21 @@ export function ContextMenuProvider({
       closeMenu()
     }
 
-    const handleScroll = () => closeMenu()
-    const handleResize = () => closeMenu()
+    const handleScroll = (e: Event) => {
+      // Scrolls that originate inside the menu (e.g. an overflowing item
+      // list) are interactions with the menu, not dismissal intent.
+      if (e.target instanceof Node && menuRef.current?.contains(e.target)) return
+      // Mechanical scrolls right after open are side effects of opening
+      // (see MENU_OPEN_GRACE_MS). Genuine user scrolls still dismiss.
+      if (Date.now() - menuOpenedAtRef.current < MENU_OPEN_GRACE_MS) return
+      closeMenu()
+    }
+    const handleResize = () => {
+      // Keyboard show/hide can resize the window (older Android WebViews)
+      // right as the menu opens; give resize the same post-open grace.
+      if (Date.now() - menuOpenedAtRef.current < MENU_OPEN_GRACE_MS) return
+      closeMenu()
+    }
     const handleBlur = () => closeMenu()
 
     document.addEventListener('pointerdown', handlePointerDown, true)
