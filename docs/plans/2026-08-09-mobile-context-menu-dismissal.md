@@ -18,7 +18,7 @@
 - Any `console.error` during a test FAILS the test (trap in `test/setup/dom.ts`).
 - Vitest runs with `sequence.shuffle: true` — tests must be order-independent; restore every overridden `window` property (`visualViewport`, spies) in `afterEach`/`finally`.
 - jsdom defaults: `window.innerWidth = 1024`, `window.innerHeight = 768`; `document.elementFromPoint` does NOT exist (the long-press suite stubs it); `window.visualViewport` does NOT exist (tests must `Object.defineProperty` it and restore).
-- Post-open grace window constant: `MENU_OPEN_GRACE_MS = 300` (milliseconds) — private module constant in `ContextMenuProvider.tsx`.
+- Post-open grace window constant: `MENU_OPEN_GRACE_MS = 500` (milliseconds) — private module constant in `ContextMenuProvider.tsx`. (Validated: the keyboard-hide scroll/resize burst lands ~250–350ms after open on measured platforms, so 300ms would straddle the edge; genuine touch scrolls on mobile still dismiss instantly via the pointerdown-outside handler regardless of grace, so the only cost is slightly delayed wheel-scroll dismissal on desktop.)
 - Do NOT store an open-timestamp inside `menuState`: the effect at `ContextMenuProvider.tsx:1191-1195` runs `closeMenu()` in its cleanup on every `menuState` identity change. Use a ref (`menuOpenedAtRef`), as this plan specifies.
 - Preserve all PR #629 long-press behavior in `ContextMenuProvider.tsx` lines 997–1163 (suppressNextTouchEnd, 500ms timer, 10px move tolerance, touchcancel handling) — do not modify that effect.
 - No new end-user markdown docs (README.md is the only end-user doc; this plan under `docs/plans/` is a working doc).
@@ -45,9 +45,9 @@ All changes are edits to existing files — the codebase's context-menu system i
 | File | Added coverage |
 |---|---|
 | `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx` (655 lines, 17 tests, fake timers) | Dismissal policy (grace/scroll/resize/blur), preventScroll auto-focus, keyboard-aware clamping integration, menu-container select-none. |
-| `test/unit/client/components/ContextMenuProvider.test.tsx` (2515 lines, 43 tests, real timers + userEvent) | Desktop right-click regression: genuine scroll still dismisses; keyboard-nav focus uses preventScroll. |
+| `test/unit/client/components/ContextMenuProvider.test.tsx` (2515 lines, 41 tests at run time, real timers + userEvent) | Desktop right-click regression: genuine scroll still dismisses; keyboard-nav focus uses preventScroll. |
 | `test/unit/client/components/context-menu/context-menu-utils.test.ts` | `clampToViewport` visualViewport unit tests. |
-| `test/unit/client/components/TabItem.test.tsx` (567 lines, 40 tests, no providers needed) | select-none / touch-callout class assertions. |
+| `test/unit/client/components/TabItem.test.tsx` (567 lines, 39 tests at run time, no providers needed) | select-none / touch-callout class assertions. |
 
 ---
 
@@ -83,7 +83,12 @@ All changes are edits to existing files — the codebase's context-menu system i
   }, [menuState, closeMenu])
 ```
 
-With the Android keyboard up: the menu clamps to the LAYOUT viewport (`window.innerHeight`) so it can open under the keyboard; one frame later `ContextMenu.tsx:52` focuses the first item WITHOUT `preventScroll`; the browser scrolls the focused item into view; the native scroll event hits the capture-phase listener; `closeMenu()` — "opens then instantly dismisses". Secondary mechanical scrolls (xterm refit after keyboard-driven container resize, finger drift/overscroll, tab-strip rubber-banding) funnel into the same zero-tolerance close.
+With the Android keyboard up: the menu clamps to the LAYOUT viewport (`window.innerHeight`) so it can open under the keyboard; one frame later `ContextMenu.tsx:52` focuses the first item WITHOUT `preventScroll`; the browser scrolls the focused item into view; the native scroll event hits the capture-phase listener; `closeMenu()` — "opens then instantly dismisses". Secondary mechanical events funnel into the same zero-tolerance close: the keyboard hiding as focus moves into the menu produces a scroll/resize burst ~250–350ms after open, plus finger drift/overscroll and tab-strip rubber-banding. (Correction from validation: xterm 6.0.0 uses synthetic scrolling — it registers no native scroll listeners and its refit produces NO native scroll events, so the terminal is not one of the producers; and modern Chrome ≥108 / iOS Safari never fire window `resize` for the keyboard — only legacy Android WebViews do.)
+
+**Validated platform facts implementers must know:**
+- `focus({ preventScroll: true })` is a NO-OP on Chrome Android / Android WebView (crbug.com/41453122); it works on desktop and iOS Safari 15.5+. Task 1's grace window is therefore the PRIMARY fix on Android; Task 2 is defense-in-depth.
+- Known limitation (out of scope, pre-existing): the agent transcript's streaming auto-scroll (`FreshAgentTranscript.tsx:738-747`) fires native scrolls at arbitrary times and will still dismiss an open menu after the grace window — it does so on desktop today too.
+- Known landmine (mitigated by Task 4; do not "fix" ad hoc): on Android WebView, long-press text selection fires `touchcancel`, which clears `suppressNextTouchEnd`; a late native `contextmenu` then double-opens the menu, and a double-open nets to CLOSED via the view-change effect's cleanup (lines 1191–1195; verified by jsdom repro). `select-none` (Task 4) removes the text-selection trigger at the root.
 
 **Test harness facts** (see the two suites for the full patterns):
 - `ContextMenu.longpress.test.tsx` uses `vi.useFakeTimers()` in `beforeEach`, stubs `document.elementFromPoint` into `elementFromPointMock`, opens menus via a local `simulateTouch()` helper + `act(() => vi.advanceTimersByTime(500))`, and asserts open/closed via `screen.getByRole('menu')` / `screen.queryByRole('menu')`. It deliberately does NOT use `userEvent`.
@@ -100,7 +105,7 @@ With the Android keyboard up: the menu clamps to the LAYOUT viewport (`window.in
 
 **Interfaces:**
 - Consumes: existing `menuRef: React.RefObject<HTMLDivElement | null>` (line 184), `openMenu(state: MenuState): void` (lines 208–211), `closeMenu(): void` (lines 190–206). All unchanged in signature.
-- Produces: private module constant `MENU_OPEN_GRACE_MS = 300` and private ref `menuOpenedAtRef: React.MutableRefObject<number>`. Behavior contract relied on by later tasks/tests: scroll or resize events within 300ms of `openMenu` do NOT close the menu; scroll events whose `target` is inside `menuRef.current` NEVER close the menu; scroll/resize after 300ms DO close it; window `blur` closes immediately (unchanged).
+- Produces: private module constant `MENU_OPEN_GRACE_MS = 500` and private ref `menuOpenedAtRef: React.MutableRefObject<number>`. Behavior contract relied on by later tasks/tests: scroll or resize events within 500ms of `openMenu` do NOT close the menu; scroll events whose `target` is inside `menuRef.current` NEVER close the menu; scroll/resize after 500ms DO close it; window `blur` closes immediately (unchanged).
 
 - [ ] **Step 1: Write the failing dismissal-policy tests**
 
@@ -108,16 +113,14 @@ Open `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`. 
 
 ```tsx
   describe('dismissal policy (scroll / resize / blur)', () => {
-    beforeEach(() => {
-      // Re-configure fake timers to explicitly fake Date as well as the
-      // timer functions: the grace window is measured with Date.now(), so
-      // vi.advanceTimersByTime() must advance the clock the implementation
-      // reads. (Vitest's default toFake list includes Date, but we pin it
-      // explicitly so this suite cannot be broken by config drift.)
-      vi.useFakeTimers({
-        toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
-      })
-    })
+    // NOTE: the outer suite's beforeEach already installs vi.useFakeTimers().
+    // Vitest's default toFake includes Date (verified by probe against this
+    // repo's vitest 3.2.4), so vi.advanceTimersByTime() advances Date.now(),
+    // which the grace-window implementation reads. Do NOT add a nested
+    // vi.useFakeTimers({ toFake: [...] }) here: re-calling it while fake
+    // timers are already installed is a verified silent no-op (the new
+    // config is ignored). If Date faking ever regressed, these tests would
+    // fail loudly rather than silently.
 
     function openMenuByLongPress() {
       renderWithProvider(
@@ -146,7 +149,7 @@ Open `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`. 
       })
       expect(screen.getByRole('menu')).toBeInTheDocument()
 
-      // Still inside the 300ms grace window.
+      // Still inside the 500ms grace window.
       act(() => {
         vi.advanceTimersByTime(100)
       })
@@ -155,10 +158,10 @@ Open `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`. 
       })
       expect(screen.getByRole('menu')).toBeInTheDocument()
 
-      // 400ms after open — past the grace window: a genuine user scroll
-      // dismisses the menu (correct UX).
+      // 600ms after open — past the 500ms grace window: a genuine user
+      // scroll dismisses the menu (correct UX).
       act(() => {
-        vi.advanceTimersByTime(300)
+        vi.advanceTimersByTime(500)
       })
       act(() => {
         window.dispatchEvent(new Event('scroll'))
@@ -172,7 +175,7 @@ Open `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`. 
       // Get past the grace window so this test proves the target-origin
       // exclusion specifically, not the grace window.
       act(() => {
-        vi.advanceTimersByTime(400)
+        vi.advanceTimersByTime(600)
       })
 
       // scroll does not bubble, but the provider's listener is registered
@@ -202,7 +205,7 @@ Open `test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx`. 
       expect(screen.getByRole('menu')).toBeInTheDocument()
 
       act(() => {
-        vi.advanceTimersByTime(400)
+        vi.advanceTimersByTime(600)
       })
       act(() => {
         window.dispatchEvent(new Event('resize'))
@@ -239,11 +242,14 @@ In `src/components/context-menu/ContextMenuProvider.tsx`:
 ```tsx
 // How long after the menu opens we ignore scroll/resize events. Opening the
 // menu on mobile has mechanical side effects that fire native scroll/resize
-// within a frame or two (focus scroll-into-view, xterm refit after a
-// keyboard-driven container resize, visualViewport settling). Those are not
-// user dismissal intent. Genuine user scrolls arrive later and still close
-// the menu.
-const MENU_OPEN_GRACE_MS = 300
+// shortly after open: focus scroll-into-view (next frame) and the on-screen
+// keyboard hiding as focus moves into the menu, whose scroll/resize burst
+// lands ~250-350ms after open on measured platforms — 500ms covers it with
+// margin. These are not user dismissal intent. Genuine user scrolls still
+// close the menu: on touch devices a real scroll begins with a pointerdown
+// outside the menu (which closes it instantly, grace or no grace); on
+// desktop, wheel scrolls close it once the grace window has passed.
+const MENU_OPEN_GRACE_MS = 500
 ```
 
 3b. Add the ref next to the existing refs (after `const suppressNextFocusRestoreRef = useRef(false)` at line 186):
@@ -329,9 +335,9 @@ Open `test/unit/client/components/ContextMenuProvider.test.tsx`. Inside the top-
     await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
     expect(screen.getByRole('menu')).toBeInTheDocument()
 
-    // Wait out the 300ms post-open grace window (this suite uses real
+    // Wait out the 500ms post-open grace window (this suite uses real
     // timers by design — do not add fake timers to this file).
-    await new Promise((resolve) => setTimeout(resolve, 350))
+    await new Promise((resolve) => setTimeout(resolve, 550))
 
     act(() => {
       window.dispatchEvent(new Event('scroll'))
@@ -348,7 +354,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/ContextMenuProvider.test.tsx
 ```
-Expected: PASS — all 43 pre-existing tests plus the new one (44 total).
+Expected: PASS — all 41 pre-existing tests plus the new one (42 total). (41 is the RUN-TIME baseline count, verified by executing the suite; static reading over-counts because of `it.each` expansion elsewhere in the repo's suites.)
 
 - [ ] **Step 7: Commit**
 
@@ -370,6 +376,7 @@ git commit -m "fix: add post-open grace and menu-origin exclusion to context men
 **Interfaces:**
 - Consumes: existing `itemRefs: React.MutableRefObject<Array<HTMLButtonElement | null>>` (line 29). `ContextMenuProps` unchanged.
 - Produces: private `focusItem(index: number): void` inside the `ContextMenu` component — every menu-item focus goes through it with `{ preventScroll: true }`. No exported API changes. (The focus-restore in the provider's `closeMenu` at `ContextMenuProvider.tsx:204` intentionally keeps plain `.focus()` — it runs after the menu is closed, when scroll-into-view of the user's previous focus target is desirable and harmless.)
+- Platform reality (validated): `preventScroll` is a NO-OP on Chrome Android / Android WebView (unsupported — crbug.com/41453122); it works on desktop browsers and iOS Safari 15.5+ (with open WebKit bug 238093 affecting freshly-mounted elements). This task is defense-in-depth: Task 1's grace window is the primary mechanism stopping focus-scroll self-dismissal on Android; this task removes the mechanical scroll at its source where the platform allows.
 
 - [ ] **Step 1: Write the failing auto-focus test (mobile open path)**
 
@@ -470,11 +477,14 @@ import React, { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, us
 
 ```tsx
   const focusItem = useCallback((index: number) => {
-    // preventScroll: focusing a menu item must never scroll it into view.
-    // On mobile the resulting native scroll event would reach the
-    // provider's capture-phase scroll listener and dismiss the menu the
-    // moment it opens (visible with the on-screen keyboard up, where the
-    // menu could mount outside the visual viewport).
+    // preventScroll: focusing a menu item should never scroll it into view.
+    // The resulting native scroll event would reach the provider's
+    // capture-phase scroll listener and dismiss the menu the moment it
+    // opens (visible with the on-screen keyboard up, where the menu could
+    // mount outside the visual viewport). NOTE: preventScroll is a no-op
+    // on Chrome Android (crbug.com/41453122) — there the provider's
+    // post-open grace window absorbs the focus scroll; this option still
+    // helps on desktop and iOS Safari 15.5+.
     itemRefs.current[index]?.focus({ preventScroll: true })
   }, [])
 ```
@@ -506,7 +516,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx
 ```
-Expected: PASS — longpress suite 22 tests, provider suite 45 tests (all pre-existing plus Tasks 1–2 additions).
+Expected: PASS — longpress suite 22 tests, provider suite 43 tests (the verified run-time baselines of 17 and 41, plus Tasks 1–2 additions).
 
 - [ ] **Step 6: Commit**
 
@@ -527,6 +537,7 @@ git commit -m "fix: focus context menu items with preventScroll to avoid self-di
 **Interfaces:**
 - Consumes: `window.visualViewport` (`VisualViewport | null` in lib.dom: `width`, `height`, `offsetLeft`, `offsetTop` — all numbers).
 - Produces: exported `getVisibleViewportRect(): { left: number; top: number; width: number; height: number }` and `clampToViewport(x: number, y: number, menuW: number, menuH: number, padding = 8): { x: number; y: number }` — SIGNATURE UNCHANGED, so the caller in `ContextMenu.tsx:43` needs no edits. Fallback behavior (no visualViewport, e.g. jsdom or older browsers) is byte-for-byte equivalent to today's math, so all existing callers and tests stay green.
+- Platform caveats (validated, accepted as residual risk — no extra code): Android WebView may not shrink `visualViewport` when the keyboard shows (Chrome's `resizes-visual` default explicitly does not apply to WebView) — there the clamp degrades to today's layout-viewport behavior and Task 1's grace window still prevents the instant dismissal. iOS 26 has a known quirk where vv values can briefly stay stale after keyboard dismissal (the menu may clamp against a slightly stale rect).
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -733,10 +744,11 @@ git commit -m "fix: clamp context menu position to the visual viewport (keyboard
 **Interfaces:**
 - Consumes: `cn()` composition already in both files; `TabItem`'s root `<div>` carries both the class list (line 161) and `data-context={ContextIds.Tab}` (line 188), so one edit covers the whole long-press target including children.
 - Produces: class contract asserted by tests — `TabItem` root contains `select-none` and `[-webkit-touch-callout:none]`; the `role="menu"` container contains `select-none`. (`TabsView.tsx:159` TabCard already has `select-none` — this brings `TabItem` and the menu itself to parity.)
+- Side benefit (validated): on Android WebView, long-press text selection fires `touchcancel`, which clears `suppressNextTouchEnd` in the PR #629 handlers — after which a late native `contextmenu` can double-open the menu, and a double-open nets to CLOSED via the view-change effect's cleanup (`ContextMenuProvider.tsx:1191-1195`, verified by jsdom repro). `select-none` removes the text-selection trigger at the root, so this task also mitigates that secondary self-dismissal path. (Chrome Android itself fires touchstart→contextmenu→touchend with no touchcancel on long-press, and Tailwind's `select-none` emits `-webkit-user-select: none` too — verified against this repo's Tailwind build.)
 
 - [ ] **Step 1: Write the failing TabItem test**
 
-In `test/unit/client/components/TabItem.test.tsx`, inside the existing describe block, add a test that renders exactly the way the file's existing 40 tests do — `render(<TabItem {...defaultProps} />)` with the props object already defined near the top of the file (no store/context providers are needed; if the file's shared props object has a different name, use that name and pattern):
+In `test/unit/client/components/TabItem.test.tsx`, inside the existing describe block, add a test that renders exactly the way the file's existing tests do (39 at run time) — `render(<TabItem {...defaultProps} />)` with the props object already defined near the top of the file (no store/context providers are needed; if the file's shared props object has a different name, use that name and pattern):
 
 ```tsx
   it('suppresses native text selection on the tab (mobile long-press target)', () => {
@@ -818,7 +830,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx test/unit/client/components/context-menu/ContextMenu.mobile.test.tsx
 ```
-Expected: PASS — TabItem suite 41 tests, longpress suite 24 tests, and `ContextMenu.mobile.test.tsx` (item padding assertions) unaffected.
+Expected: PASS — TabItem suite 40 tests (verified run-time baseline 39 + 1), longpress suite 24 tests, and `ContextMenu.mobile.test.tsx` (item padding assertions) unaffected.
 
 - [ ] **Step 6: Commit**
 
@@ -854,7 +866,7 @@ npm run test:vitest -- run \
   test/e2e/refresh-context-menu-flow.test.tsx \
   test/e2e/pane-context-menu-stability.test.tsx
 ```
-Expected: all files PASS, 0 failures. If any pre-existing test fails, the fix belongs in the code Tasks 1–4 changed (most likely candidate: a test that relied on immediate scroll-close — adapt the PRODUCTION-preserving way: advance/wait past the 300ms grace in the test rather than weakening the policy).
+Expected: all files PASS, 0 failures. If any pre-existing test fails, the fix belongs in the code Tasks 1–4 changed (most likely candidate: a test that relied on immediate scroll-close — adapt the PRODUCTION-preserving way: advance/wait past the 500ms grace in the test rather than weakening the policy).
 
 - [ ] **Step 2: Typecheck and scoped lint**
 
@@ -890,7 +902,7 @@ If nothing changed, do not create an empty commit.
 |---|---|---|
 | 1. `focus({ preventScroll: true })` at all 5 `ContextMenu.tsx` focus sites | Task 2 | Focus spy tests on both open paths assert every menu-item focus call passes `{ preventScroll: true }` against the real components. |
 | 2. Keyboard-aware positioning via `window.visualViewport` with layout fallback | Task 3 | Unit tests on `clampToViewport` + integration test asserting the real rendered menu's `style.top` respects a shrunken visual viewport. |
-| 3. Replace zero-tolerance close-on-any-scroll (residual risk a): grace window + menu-origin exclusion; genuine scrolls still dismiss; `resize` gets the same grace | Task 1 | Fake-timer timeline tests (ignore at 0ms/100ms, close at 400ms; menu-origin scroll never closes; resize graced; blur immediate) + real-timer desktop right-click regression test. |
+| 3. Replace zero-tolerance close-on-any-scroll (residual risk a): grace window + menu-origin exclusion; genuine scrolls still dismiss; `resize` gets the same grace | Task 1 | Fake-timer timeline tests (ignore at 0ms/100ms, close at 600ms; menu-origin scroll never closes; resize graced; blur immediate) + real-timer desktop right-click regression test. |
 | 4. Residual risk (b): `select-none` (+ touch-callout) on `TabItem`, consistent with TabCard | Task 4 | Class assertions on the rendered `TabItem` root (`data-context` element) and on the `role="menu"` container. |
 | 5. TDD with the spec's named test cases (a)–(d), extending the two named suites | Tasks 1–4 | (a)=Task 1 Step 1, (b)=Task 2 Steps 1–2, (c)=Task 3 Steps 1–2, (d)=Task 4 Step 1 — each written first with an explicit expected-FAIL step. |
-| 6. Keep all existing behaviors green (desktop right-click, outside-pointerdown, Escape/Tab, item selection, PR #629 long-press paths, move tolerance, touchcancel, native-menu passthrough, view-change close) | Task 5 (+ every task's full-suite runs) | The 17 longpress + 43 provider pre-existing tests cover these paths and are re-run in every task; Task 5 sweeps all adjacent suites, typecheck, lint, and the full client suite. |
+| 6. Keep all existing behaviors green (desktop right-click, outside-pointerdown, Escape/Tab, item selection, PR #629 long-press paths, move tolerance, touchcancel, native-menu passthrough, view-change close) | Task 5 (+ every task's full-suite runs) | The 17 longpress + 41 provider pre-existing tests cover these paths and are re-run in every task; Task 5 sweeps all adjacent suites, typecheck, lint, and the full client suite. |
