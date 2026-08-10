@@ -1,9 +1,8 @@
-import { createElement, memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import {
   Archive,
   ChevronDown,
   ChevronRight,
-  Copy,
   ExternalLink,
   Globe,
   Monitor,
@@ -11,17 +10,14 @@ import {
 } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
-import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
+import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
-import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
-import { ContextMenu } from '@/components/context-menu/ContextMenu'
-import type { MenuItem } from '@/components/context-menu/context-menu-types'
+import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import {
   jumpToRecord as jumpToRecordAction,
-  openPaneInNewTab as openPaneInNewTabAction,
   openRecordAsUnlinkedCopy as openRecordAsUnlinkedCopyAction,
   paneKindColorClass,
   paneKindIcon,
@@ -144,13 +140,11 @@ function TabCard({
   isLocal,
   showDevice,
   onAction,
-  onContextMenu,
 }: {
   record: DisplayRecord
   isLocal: boolean
   showDevice?: boolean
   onAction: () => void
-  onContextMenu: (e: React.MouseEvent) => void
 }) {
   const now = Date.now()
   const isOpen = record.status === 'open'
@@ -168,7 +162,9 @@ function TabCard({
           ? 'border-border/60 border-l-2 border-l-emerald-500/70 hover:border-border hover:bg-muted/40'
           : 'border-border/40 border-l-2 border-l-muted-foreground/20 opacity-70 hover:opacity-90 hover:bg-muted/30',
       )}
-      onContextMenu={onContextMenu}
+      data-context={ContextIds.TabsCard}
+      data-tab-key={record.tabKey}
+      data-tab-status={record.status}
       aria-label={`${record.displayDeviceLabel}: ${record.tabName}`}
       onClick={onAction}
     >
@@ -246,7 +242,6 @@ function DeviceSection({
   onPullAll,
   onJump,
   onOpenCopy,
-  onCardContextMenu,
 }: {
   label: string
   icon: LucideIcon
@@ -259,7 +254,6 @@ function DeviceSection({
   onPullAll?: () => void
   onJump: (record: RegistryTabRecord) => void
   onOpenCopy: (record: RegistryTabRecord) => void
-  onCardContextMenu: (e: React.MouseEvent, record: DisplayRecord) => void
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded ?? true)
 
@@ -314,7 +308,6 @@ function DeviceSection({
                   ? onJump(record)
                   : onOpenCopy(record)
               }
-              onContextMenu={(e) => onCardContextMenu(e, record)}
             />
           ))}
         </div>
@@ -342,10 +335,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const [query, setQuery] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('all')
   const [scopeMode, setScopeMode] = useState<ScopeMode>('all')
-  const [contextMenuState, setContextMenuState] = useState<{
-    position: { x: number; y: number }
-    items: MenuItem[]
-  } | null>(null)
 
   /* -- device label resolver ---------------------------------------- */
 
@@ -408,11 +397,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     openRecordAsUnlinkedCopyAction(record, { dispatch, localServerInstanceId, onOpened: onOpenTab })
   }
 
-  // Still used by openCardContextMenu until Task 6 removes the local menu.
-  const openPaneInNewTab = (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
-    openPaneInNewTabAction(record, pane, { dispatch, localServerInstanceId, onOpened: onOpenTab })
-  }
-
   const jumpToRecord = (record: RegistryTabRecord) => {
     jumpToRecordAction(record, {
       dispatch,
@@ -426,64 +410,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     for (const record of tabs) {
       openRecordAsUnlinkedCopy(record)
     }
-  }
-
-  /* -- context menu ------------------------------------------------- */
-
-  const openCardContextMenu = (e: React.MouseEvent, record: DisplayRecord) => {
-    e.preventDefault()
-    e.stopPropagation()
-
-    const isLocal = record.deviceId === deviceId
-    const isOpen = record.status === 'open'
-    const items: MenuItem[] = []
-
-    if (isLocal && isOpen) {
-      items.push({
-        type: 'item',
-        id: 'jump',
-        label: 'Jump to tab',
-        icon: createElement(ExternalLink, { className: 'h-3.5 w-3.5' }),
-        onSelect: () => jumpToRecord(record),
-      })
-    }
-
-    items.push({
-      type: 'item',
-      id: 'open-copy',
-      label: isLocal && isOpen ? 'Open copy' : record.status === 'closed' ? 'Reopen' : 'Pull to this device',
-      icon: createElement(Copy, { className: 'h-3.5 w-3.5' }),
-      onSelect: () => openRecordAsUnlinkedCopy(record),
-    })
-
-    if (record.panes.length > 1) {
-      items.push({ type: 'separator', id: 'sep-panes' })
-      for (const pane of record.panes) {
-        const PaneIcon = paneKindIcon(pane.kind)
-        items.push({
-          type: 'item',
-          id: `pane-${pane.paneId}`,
-          label: `Open ${pane.title || paneKindLabel(pane.kind)} in new tab`,
-          icon: createElement(PaneIcon, {
-            className: cn('h-3.5 w-3.5', paneKindColorClass(pane.kind)),
-          }),
-          onSelect: () => openPaneInNewTab(record, pane),
-        })
-      }
-    }
-
-    items.push({ type: 'separator', id: 'sep-copy' })
-    items.push({
-      type: 'item',
-      id: 'copy-name',
-      label: 'Copy tab name',
-      icon: createElement(Copy, { className: 'h-3.5 w-3.5' }),
-      onSelect() {
-        void copyText(record.tabName)
-      },
-    })
-
-    setContextMenuState({ position: { x: e.clientX, y: e.clientY }, items })
   }
 
   /* -- render ------------------------------------------------------- */
@@ -572,7 +498,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
             isLocal
             onJump={jumpToRecord}
             onOpenCopy={openRecordAsUnlinkedCopy}
-            onCardContextMenu={openCardContextMenu}
           />
         )}
 
@@ -595,7 +520,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
                 onPullAll={() => pullAllFromDevice(group.tabs)}
                 onJump={jumpToRecord}
                 onOpenCopy={openRecordAsUnlinkedCopy}
-                onCardContextMenu={openCardContextMenu}
               />
             ))}
           </div>
@@ -614,18 +538,9 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
             showDeviceOnCards
             onJump={jumpToRecord}
             onOpenCopy={openRecordAsUnlinkedCopy}
-            onCardContextMenu={openCardContextMenu}
           />
         )}
       </div>
-
-      {/* Context menu (portal) */}
-      <ContextMenu
-        open={!!contextMenuState}
-        items={contextMenuState?.items ?? []}
-        position={contextMenuState?.position ?? { x: 0, y: 0 }}
-        onClose={() => setContextMenuState(null)}
-      />
     </div>
   )
 }

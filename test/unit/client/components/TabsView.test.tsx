@@ -6,10 +6,16 @@ import tabsReducer, { addTab } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '../../../../src/store/tabRegistrySlice'
 import connectionReducer, { setServerInstanceId } from '../../../../src/store/connectionSlice'
+import sessionsReducer from '../../../../src/store/sessionsSlice'
+import settingsReducer from '../../../../src/store/settingsSlice'
+import { ContextMenuProvider } from '../../../../src/components/context-menu/ContextMenuProvider'
 import TabsView from '../../../../src/components/TabsView'
 
 const wsMock = {
   state: 'ready',
+  send: vi.fn(),
+  connect: vi.fn().mockResolvedValue(undefined),
+  setHelloExtensionProvider: vi.fn(),
   sendTabsSyncQuery: vi.fn(),
   sendTabsSyncPush: vi.fn(),
   onMessage: vi.fn(() => () => {}),
@@ -24,6 +30,17 @@ vi.mock('@/lib/clipboard', () => ({
   copyText: vi.fn(() => Promise.resolve(true)),
 }))
 
+vi.mock('@/lib/api', () => ({
+  api: {
+    get: vi.fn().mockResolvedValue([]),
+    post: vi.fn().mockResolvedValue({}),
+    patch: vi.fn().mockResolvedValue({}),
+    put: vi.fn().mockResolvedValue({}),
+    delete: vi.fn().mockResolvedValue({}),
+  },
+  setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+}))
+
 function createStore() {
   const store = configureStore({
     reducer: {
@@ -31,7 +48,10 @@ function createStore() {
       panes: panesReducer,
       tabRegistry: tabRegistryReducer,
       connection: connectionReducer,
+      sessions: sessionsReducer,
+      settings: settingsReducer,
     },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware({ serializableCheck: false }),
   })
 
   store.dispatch(addTab({ id: 'local-tab', title: 'local tab', mode: 'shell' }))
@@ -76,6 +96,21 @@ function createStore() {
   }))
 
   return store
+}
+
+function renderWithMenuProvider(store: ReturnType<typeof createStore>) {
+  return render(
+    <Provider store={store}>
+      <ContextMenuProvider
+        view="tabs"
+        onViewChange={() => {}}
+        onToggleSidebar={() => {}}
+        sidebarCollapsed={false}
+      >
+        <TabsView />
+      </ContextMenuProvider>
+    </Provider>,
+  )
 }
 
 describe('TabsView', () => {
@@ -280,11 +315,7 @@ describe('TabsView', () => {
 
   it('shows context menu on right-click with appropriate items', () => {
     const store = createStore()
-    render(
-      <Provider store={store}>
-        <TabsView />
-      </Provider>,
-    )
+    renderWithMenuProvider(store)
 
     const remoteCard = screen.getByLabelText('remote-device: remote open')
     fireEvent.contextMenu(remoteCard)
@@ -292,6 +323,7 @@ describe('TabsView', () => {
     // Context menu should appear with "Pull to this device" and "Copy tab name"
     expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: /Copy tab name/i })).toBeInTheDocument()
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
   })
 
   it('groups remote tabs by device', () => {
@@ -494,7 +526,10 @@ describe('TabsView', () => {
         panes: panesReducer,
         tabRegistry: tabRegistryReducer,
         connection: connectionReducer,
+        sessions: sessionsReducer,
+        settings: settingsReducer,
       },
+      middleware: (getDefaultMiddleware) => getDefaultMiddleware({ serializableCheck: false }),
     })
     store.dispatch(setTabRegistrySnapshot({
       localOpen: [],
@@ -519,11 +554,7 @@ describe('TabsView', () => {
       closed: [],
     }))
 
-    render(
-      <Provider store={store}>
-        <TabsView />
-      </Provider>,
-    )
+    renderWithMenuProvider(store)
 
     const card = screen.getByLabelText('remote-device: ctx tab')
     fireEvent.contextMenu(card)

@@ -10,7 +10,7 @@ import connectionReducer from '@/store/connectionSlice'
 import TabsView from '@/components/TabsView'
 
 const renderCounters = vi.hoisted(() => ({
-  contextMenuCalls: 0,
+  paneKindLabelCalls: 0,
 }))
 
 const wsMock = {
@@ -29,13 +29,13 @@ vi.mock('@/lib/clipboard', () => ({
   copyText: vi.fn(() => Promise.resolve(true)),
 }))
 
-vi.mock('@/components/context-menu/ContextMenu', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/components/context-menu/ContextMenu')>()
+vi.mock('@/lib/tab-registry-open', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/tab-registry-open')>()
   return {
     ...actual,
-    ContextMenu: ({ children }: { children: any }) => {
-      renderCounters.contextMenuCalls += 1
-      return <>{children}</>
+    paneKindLabel: (...args: Parameters<typeof actual.paneKindLabel>) => {
+      renderCounters.paneKindLabelCalls += 1
+      return actual.paneKindLabel(...args)
     },
   }
 })
@@ -109,7 +109,7 @@ function InlineTabsViewHarness() {
 describe('TabsView memo behavior', () => {
   beforeEach(() => {
     wsMock.sendTabsSyncQuery.mockClear()
-    renderCounters.contextMenuCalls = 0
+    renderCounters.paneKindLabelCalls = 0
   })
 
   afterEach(() => {
@@ -125,12 +125,12 @@ describe('TabsView memo behavior', () => {
       </Provider>,
     )
 
-    const initialRenderCount = renderCounters.contextMenuCalls
+    const initialRenderCount = renderCounters.paneKindLabelCalls
     expect(initialRenderCount).toBeGreaterThan(0)
 
     fireEvent.click(screen.getByRole('button', { name: /parent rerender/i }))
 
-    expect(renderCounters.contextMenuCalls).toBe(initialRenderCount)
+    expect(renderCounters.paneKindLabelCalls).toBe(initialRenderCount)
   })
 
   it('rerenders when a parent rerender passes a fresh inline onOpenTab callback', () => {
@@ -142,11 +142,11 @@ describe('TabsView memo behavior', () => {
       </Provider>,
     )
 
-    const initialRenderCount = renderCounters.contextMenuCalls
+    const initialRenderCount = renderCounters.paneKindLabelCalls
     expect(initialRenderCount).toBeGreaterThan(0)
 
     fireEvent.click(screen.getByRole('button', { name: /parent rerender/i }))
 
-    expect(renderCounters.contextMenuCalls).toBeGreaterThan(initialRenderCount)
+    expect(renderCounters.paneKindLabelCalls).toBeGreaterThan(initialRenderCount)
   })
 })
