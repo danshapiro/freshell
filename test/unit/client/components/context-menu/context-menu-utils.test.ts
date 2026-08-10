@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { parseContextTarget } from '@/components/context-menu/context-menu-utils'
+import { afterEach, describe, it, expect } from 'vitest'
+import { parseContextTarget, clampToViewport } from '@/components/context-menu/context-menu-utils'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 describe('parseContextTarget', () => {
@@ -113,5 +113,58 @@ describe('parseContextTarget', () => {
   it('parseContextTarget for TabsCard returns null without tabKey', () => {
     const result = parseContextTarget(ContextIds.TabsCard, { tabStatus: 'closed' })
     expect(result).toBeNull()
+  })
+})
+
+describe('clampToViewport with visualViewport (mobile keyboard awareness)', () => {
+  const originalVisualViewport = window.visualViewport
+
+  afterEach(() => {
+    Object.defineProperty(window, 'visualViewport', {
+      value: originalVisualViewport,
+      configurable: true,
+    })
+  })
+
+  function installVisualViewport(rect: {
+    width: number
+    height: number
+    offsetLeft?: number
+    offsetTop?: number
+  }) {
+    Object.defineProperty(window, 'visualViewport', {
+      value: {
+        width: rect.width,
+        height: rect.height,
+        offsetLeft: rect.offsetLeft ?? 0,
+        offsetTop: rect.offsetTop ?? 0,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
+      configurable: true,
+    })
+  }
+
+  it('clamps to the visual viewport when the keyboard shrinks it below window.innerHeight', () => {
+    // jsdom layout viewport is 1024x768; simulate a keyboard leaving 400px visible.
+    installVisualViewport({ width: 1024, height: 400 })
+    const result = clampToViewport(100, 700, 200, 150, 8)
+    // maxY = 0 + 400 - 150 - 8 = 242 -- NOT the layout-viewport 768-150-8=610.
+    expect(result).toEqual({ x: 100, y: 242 })
+  })
+
+  it('respects visualViewport offsets (pinch-zoom / scrolled visual viewport)', () => {
+    installVisualViewport({ width: 500, height: 400, offsetLeft: 50, offsetTop: 100 })
+    const result = clampToViewport(0, 0, 200, 150, 8)
+    // minX = 50 + 8 = 58, minY = 100 + 8 = 108.
+    expect(result).toEqual({ x: 58, y: 108 })
+  })
+
+  it('falls back to the layout viewport when visualViewport is unavailable', () => {
+    Object.defineProperty(window, 'visualViewport', { value: undefined, configurable: true })
+    // jsdom: innerWidth=1024, innerHeight=768.
+    // maxX = 1024-200-8 = 816; maxY = 768-150-8 = 610 -- identical to the old math.
+    const result = clampToViewport(2000, 2000, 200, 150, 8)
+    expect(result).toEqual({ x: 816, y: 610 })
   })
 })

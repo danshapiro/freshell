@@ -11,12 +11,39 @@ export function copyDataset(dataset: DOMStringMap): ContextDataset {
   return result
 }
 
+/**
+ * The rectangle of the viewport actually visible to the user, in
+ * layout-viewport (position: fixed) coordinates.
+ *
+ * On mobile, the on-screen keyboard shrinks `window.visualViewport` while
+ * `window.innerHeight` (the layout viewport) usually stays unchanged, so
+ * clamping against the layout viewport can place a fixed-position menu
+ * underneath the keyboard. Prefer the visual viewport when the browser
+ * provides it; fall back to the layout viewport otherwise (older browsers,
+ * jsdom).
+ */
+export function getVisibleViewportRect(): {
+  left: number
+  top: number
+  width: number
+  height: number
+} {
+  const vv = typeof window !== 'undefined' ? window.visualViewport : null
+  if (vv) {
+    return { left: vv.offsetLeft, top: vv.offsetTop, width: vv.width, height: vv.height }
+  }
+  return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }
+}
+
 export function clampToViewport(x: number, y: number, menuW: number, menuH: number, padding = 8) {
-  const maxX = Math.max(padding, window.innerWidth - menuW - padding)
-  const maxY = Math.max(padding, window.innerHeight - menuH - padding)
+  const viewport = getVisibleViewportRect()
+  const minX = viewport.left + padding
+  const minY = viewport.top + padding
+  const maxX = Math.max(minX, viewport.left + viewport.width - menuW - padding)
+  const maxY = Math.max(minY, viewport.top + viewport.height - menuH - padding)
   return {
-    x: Math.min(Math.max(x, padding), maxX),
-    y: Math.min(Math.max(y, padding), maxY),
+    x: Math.min(Math.max(x, minX), maxX),
+    y: Math.min(Math.max(y, minY), maxY),
   }
 }
 

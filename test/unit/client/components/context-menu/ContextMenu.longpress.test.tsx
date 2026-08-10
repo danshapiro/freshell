@@ -801,4 +801,51 @@ describe('ContextMenuProvider long-press', () => {
     rafSpy.mockRestore()
     focusSpy.mockRestore()
   })
+
+  it('positions the menu inside the visual viewport when the on-screen keyboard is showing', () => {
+    const originalVisualViewport = window.visualViewport
+    // Keyboard visible: visual viewport is 400px tall while the layout
+    // viewport (jsdom window.innerHeight) stays 768px.
+    Object.defineProperty(window, 'visualViewport', {
+      value: {
+        width: 1024,
+        height: 400,
+        offsetLeft: 0,
+        offsetTop: 0,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
+      configurable: true,
+    })
+
+    try {
+      renderWithProvider(
+        <div data-context={ContextIds.Tab} data-tab-id="tab-1">
+          Tab One
+        </div>
+      )
+      const target = screen.getByText('Tab One')
+      elementFromPointMock.mockReturnValue(target)
+
+      // Long-press at y=600 -- inside the keyboard-occluded region.
+      act(() => {
+        simulateTouch('touchstart', target, 100, 600)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      const menu = screen.getByRole('menu')
+      // jsdom reports a zero-size menu rect, so the clamp ceiling is
+      // maxY = 400 - 0 - 8 = 392. The menu must NOT stay at y=600 (under
+      // the keyboard, where focus-driven scroll would then dismiss it).
+      expect(menu.style.top).toBe('392px')
+      expect(menu.style.left).toBe('100px')
+    } finally {
+      Object.defineProperty(window, 'visualViewport', {
+        value: originalVisualViewport,
+        configurable: true,
+      })
+    }
+  })
 })
