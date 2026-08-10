@@ -2108,101 +2108,124 @@ const IDENTITY_INVARIANT_SWEEP_INTERVAL: std::time::Duration = std::time::Durati
 
 /// SESSION-09 (live sidebar updates): the signature a sessions-sweep tick
 /// compares against the previous tick's signature to decide whether a
-/// `sessions.changed` broadcast is warranted: `(corpus size, max
-/// lastActivityAt)`. Cheap -- one pass over the already-parsed
-/// `IndexedSession`s the sweep's `snapshot()` call already produced, no
-/// extra I/O.
+/// `sessions.changed` broadcast is warranted. Opaque equality token --
+/// callers/tests only ever compare two signatures for (in)equality.
 ///
-/// BOTH halves matter; max-`lastActivityAt` ALONE is not sufficient. A real
-/// session-directory corpus routinely has some provider already sitting at
-/// a later `lastActivityAt` than a session that just landed (e.g. a
-/// restored/imported claude session appearing alongside codex/opencode
-/// sessions dated further ahead -- exactly the shape
-/// `session-directory-matrix.spec.ts`'s seeded corpus has). In that case the
-/// max never moves, so a max-only token would silently swallow a real
-/// corpus change (caught by `new_older_session_file_is_still_detected_as_a_change`
-/// below -- this is not a hypothetical). Including the item COUNT catches
-/// any add/remove regardless of the new item's own timestamp; the max
-/// half still catches same-count changes (a new turn appended to an
-/// existing session, bumping ITS `lastActivityAt` without changing corpus
-/// size).
+/// Full-comparable digest (legacy parity: `hasSessionDirectorySnapshotChange`,
+/// `server/session-directory/projection.ts:9-51`, re-run on every watcher/-
+/// route-driven `codingCliIndexer.refresh()`): ONE pass over the
+/// already-parsed `IndexedSession`s the sweep's `snapshot()` call already
+/// produced (no extra I/O, O(N log N) sort + O(total bytes) hash), covering
+/// EVERY parse-layer, sidebar-visible field of every session -- provider,
+/// session_id, project_path, title, summary, first_user_message,
+/// last_activity_at, created_at, cwd, is_subagent, is_non_interactive --
+/// hashed as a sorted multiset (order-independent, multiset-faithful).
 ///
-/// KNOWN GAPS (this sweep's signature ALONE is blind to all three; see the
-/// per-item notes below for what closes or accepts each one):
+/// Deliberately NOT in the digest (each with its parity reason):
+/// - `archived` / user overrides (`title`/`summary` override fields legacy
+///   folds into its projected comparable items): the override LAYER is
+///   closed at the write site instead -- `sessions::patch_session`
+///   broadcasts `sessions.changed` on every successful override write,
+///   sharing the SAME `sessions_revision` counter
+///   (`patch_rename_broadcasts_sessions_changed_with_increased_revision`,
+///   `patch_archive_broadcasts_sessions_changed_and_revision_is_monotonic`
+///   in `sessions.rs`). `IndexedSession` carries no override fields, so the
+///   sweep cannot and need not see them.
+/// - `sessionType` (SESSION-06's separate metadata store) and
+///   `checkoutPath` (SESSION-08's repo grouping): projection-layer data the
+///   parse layer cannot produce; same write-site-broadcast discipline.
+/// - `source_file`: legacy's comparable snapshot is projection-derived
+///   (cwd grouping), so a pure file move with unchanged CONTENT moves no
+///   legacy-comparable field and broadcast nothing there either. Including
+///   the path here would make this differ STRICTER than legacy and emit
+///   spurious broadcasts for invisible moves.
 ///
-/// 1. **Override-only changes (title/summary/archived/deleted overrides) --
-///    CLOSED at the write site, not here.** `IndexedSession` carries no
-///    override fields at all, so a rename/archive/delete PATCH never moves
-///    this signature. Reviewer finding (Important): legacy broadcasts
-///    `sessions.changed` on ANY sidebar-visible change (its differ,
-///    `hasSessionDirectorySnapshotChange` / `projection.ts:23`, diffs the
-///    FULL comparable snapshot including `archived`/`title`, re-run on
-///    every `codingCliIndexer.refresh()` the legacy PATCH route triggers).
-///    This port closes the gap at the SOURCE instead of widening the
-///    sweep's signature: `sessions::patch_session` broadcasts
-///    `sessions.changed` directly on a successful override write, sharing
-///    this SAME `sessions_revision` counter (see
-///    `sessions::SessionsState::sessions_revision`'s doc comment). Proven
-///    by `patch_rename_broadcasts_sessions_changed_with_increased_revision`
-///    and `patch_archive_broadcasts_sessions_changed_and_revision_is_monotonic`
-///    in `sessions.rs`.
+/// Because the digest covers every comparable field (not just count + max
+/// activity), the classes that motivated the old `(len, max, identity)`
+/// tuple are subsumed: new/deleted files regardless of timestamps
+/// (`new_older_session_file_is_still_detected_as_a_change`), in-place
+/// modifications that leave count and corpus max unmoved
+/// (`in_place_modification_below_corpus_max_moves_the_signature`), same-tick
+/// delete+add with matching `(len, max)` -- the old shape's documented
+/// "gap 2" (`delete_and_add_same_tick_matching_max_moves_the_signature`),
+/// file moves with rewritten cwd
+/// (`moved_to_another_project_dir_is_detected`), and the SESSION-16
+/// handoff's visibility flip (a hidden non-interactive session gaining its
+/// second user message with back-dated timestamps --
+/// `visibility_flip_is_detected_with_stale_corpus_max`).
 ///
-/// 2. **Delete+add in the SAME tick, count-neutral AND max-neutral --
-///    ACCEPTED, exotic.** If one session is deleted and a different one
-///    added within the same ~2s sweep window, and the composition happens
-///    to leave both `len()` and the max `lastActivityAt` unchanged, this
-///    signature cannot distinguish the pre/post corpus. This requires a
-///    coincidental timestamp match across two unrelated sessions landing in
-///    the same tick -- accepted as out of scope for a v1 poll-based sweep;
-///    a filesystem watcher (not introduced here, see the FENCE note below)
-///    would not have this gap either.
+/// The digest also folds in the terminal-IDENTITY registry as a second
+/// sorted multiset behind a domain separator (terminal_id / provider /
+/// session_id triples -- NOT updated_at or cwd, which would turn the sweep
+/// into a heartbeat firehose;
+/// `identity_updated_at_alone_does_not_move_the_sweep_signature`): locator
+/// adoptions / terminal open / close change the session-directory join
+/// result without touching the disk corpus
+/// (`identity_registry_changes_move_the_sweep_signature`).
 ///
-/// 3. **External-process override edits (bake-in with the legacy Node
-///    server writing the SAME `config.json`) -- ACCEPTED for bake-in.** The
-///    `SettingsStore`'s mtime-checked freshness reload
-///    (`maybe_reload_overrides`, `settings_store.rs`) adopts an
-///    externally-written override into THIS process's in-memory settings
-///    on the next override READ, but that reload is READ-path-triggered
-///    and does not itself broadcast -- so a bake-in-partner write to
-///    `config.json` (not routed through THIS process's `patch_session`)
-///    updates what the next request sees without pushing a
-///    `sessions.changed` frame to already-connected WS clients. Only
-///    writes that go through `sessions::patch_session` on THIS process
-///    close gap 1 above; a foreign process's direct file write does not.
-///    Accepted: bake-in is a transitional deployment mode, not the target
-///    single-process architecture.
-///
-/// 4. **Terminal identity-registry changes (locator adoption, terminal open/close) --
-///    CLOSED by folding terminal identity into the digest.** The identity
-///    registry tracks live coding-CLI panes; when a new pane opens, a locator
-///    session-id is adopted (recorded on the terminal), or a pane exits, the
-///    registry changes but the disk corpus does NOT. This signature now
-///    includes a (terminal_id, provider, session_id) digest (NOT updated_at or
-///    cwd; see identity_updated_at_alone_does_not_move_the_sweep_signature and
-///    the test comments) so locator adoptions and terminal state changes push
-///    sessions.changed within one 2s tick.
-///
-/// No committed provider parser currently allows a title-only rename with
-/// no new turn to ALSO leave the sweep signature blind at the source-file
-/// level (a title is always derived from message content that also carries
-/// its own timestamp) -- gap 1 above is about the OVERRIDE layer
-/// (`sessionOverrides` in `config.json`), which is orthogonal to the
-/// parsed-file layer this signature covers. Legacy's fuller comparison
-/// (`hasSessionDirectorySnapshotChange`,
-/// `server/sessions-sync/service.ts`) additionally hashes file
-/// content/mtime to catch this class of edit; that fuller comparison is
-/// intentionally NOT ported here.
-/// Signature of the session-directory view as the sidebar sees it:
-/// disk corpus (count + max activity) PLUS a digest of the live identity
-/// registry (terminal_id, provider, session_id triples -- NOT updated_at,
-/// see identity_updated_at_alone_does_not_move_the_sweep_signature).
+/// Remaining ACCEPTED gaps (unchanged by this rewrite):
+/// 1. **External-process override edits (bake-in with the legacy Node
+///    server writing the SAME `config.json`).** The `SettingsStore`'s
+///    mtime-checked freshness reload (`maybe_reload_overrides`,
+///    `settings_store.rs`) adopts an externally-written override on the next
+///    override READ, without broadcasting. Accepted: bake-in is a
+///    transitional deployment mode, not the target single-process
+///    architecture.
+/// 2. **A file moved with byte-identical content** (same parsed view,
+///    different path): silent by parity -- see the `source_file` note above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SweepSignature(u64);
+
+/// One row of [`sessions_sweep_signature`]'s session multiset: every
+/// parse-layer, sidebar-visible comparable field of one `IndexedSession`
+/// (see that fn's doc comment for the parity contract and exclusions).
+type ComparableSessionRef<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+    i64,
+    Option<i64>,
+    Option<&'a str>,
+    bool,
+    bool,
+);
+
 fn sessions_sweep_signature(
     items: &[freshell_sessions::directory_index::IndexedSession],
     identities: &[freshell_ws::identity::TerminalIdentity],
-) -> (usize, i64, u64) {
+) -> SweepSignature {
     use std::hash::{Hash, Hasher};
-    let max_last_activity_at = items.iter().map(|s| s.last_activity_at).max().unwrap_or(0);
-    let mut refs: Vec<(&str, &str, &str)> = identities
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Domain separator: this hasher's stream mixes the session-corpus
+    // multiset and the identity-registry multiset; the constant keeps an
+    // empty-corpus digest from aliasing any bare `DefaultHasher` product.
+    0x5e55_10ae_d166_e537_u64.hash(&mut hasher);
+
+    let mut session_refs: Vec<ComparableSessionRef<'_>> = items
+        .iter()
+        .map(|s| {
+            (
+                s.provider.as_str(),
+                s.session_id.as_str(),
+                s.project_path.as_str(),
+                s.title.as_deref(),
+                s.summary.as_deref(),
+                s.first_user_message.as_deref(),
+                s.last_activity_at,
+                s.created_at,
+                s.cwd.as_deref(),
+                s.is_subagent,
+                s.is_non_interactive,
+            )
+        })
+        .collect();
+    session_refs.sort_unstable();
+    session_refs.hash(&mut hasher);
+
+    let mut identity_refs: Vec<(&str, &str, &str)> = identities
         .iter()
         .map(|i| {
             (
@@ -2212,10 +2235,9 @@ fn sessions_sweep_signature(
             )
         })
         .collect();
-    refs.sort_unstable();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    refs.hash(&mut hasher);
-    (items.len(), max_last_activity_at, hasher.finish())
+    identity_refs.sort_unstable();
+    identity_refs.hash(&mut hasher);
+    SweepSignature(hasher.finish())
 }
 
 /// SESSION-09: periodic sweep that detects session-directory changes and
@@ -2388,22 +2410,29 @@ mod sessions_sweep_tests {
         assert_eq!(a, b);
     }
 
+    /// The digest is a full multiset hash, so iteration order of the
+    /// snapshot vec must never affect the signature (snapshot order is an
+    /// implementation detail, not sidebar-visible).
     #[test]
-    fn empty_snapshot_signature_is_zero_count_zero_activity() {
-        // Hash of an empty identity list is consistent but non-zero (it's the hash
-        // of an empty vec). The important assertion is that count and activity are zero.
-        let sig = sessions_sweep_signature(&[], &[]);
-        assert_eq!(sig.0, 0);
-        assert_eq!(sig.1, 0);
+    fn item_order_does_not_change_the_signature() {
+        let mut a = mk_indexed(100);
+        a.session_id = "session-a".to_string();
+        let mut b = mk_indexed(500);
+        b.session_id = "session-b".to_string();
+        b.title = Some("b title".to_string());
+        let fwd = sessions_sweep_signature(&[a.clone(), b.clone()], &[]);
+        let rev = sessions_sweep_signature(&[b, a], &[]);
+        assert_eq!(fwd, rev);
     }
 
+    /// An empty corpus must produce a signature DISTINCT from any seeded
+    /// one (a corpus landing/emptying is the plain create/delete class the
+    /// sweep exists to broadcast).
     #[test]
-    fn signature_pairs_count_with_the_max_last_activity_at() {
-        let items = vec![mk_indexed(100), mk_indexed(500), mk_indexed(200)];
-        let sig = sessions_sweep_signature(&items, &[]);
-        assert_eq!(sig.0, 3);
-        assert_eq!(sig.1, 500);
-        // Hash component is stable but implementation-dependent; not asserted here
+    fn empty_snapshot_differs_from_a_seeded_one() {
+        let empty = sessions_sweep_signature(&[], &[]);
+        let seeded = sessions_sweep_signature(&[mk_indexed(100)], &[]);
+        assert_ne!(empty, seeded);
     }
 
     /// The scenario the sweep task depends on: writing a NEW session file
@@ -2427,9 +2456,9 @@ mod sessions_sweep_tests {
         );
         let before = sessions_sweep_signature(&index.snapshot().await, &[]);
         assert_ne!(
-            (before.0, before.1),
-            (0, 0),
-            "seed session should produce a nonzero signature"
+            before,
+            sessions_sweep_signature(&[], &[]),
+            "seed session should produce a signature distinct from the empty corpus"
         );
 
         // A second, distinct session with a LATER timestamp lands in the
@@ -2550,7 +2579,7 @@ mod sessions_sweep_tests {
     #[test]
     fn every_sidebar_visible_field_moves_the_signature() {
         let base = mk_indexed(100);
-        let s0 = sessions_sweep_signature(&[base.clone()], &[]);
+        let s0 = sessions_sweep_signature(std::slice::from_ref(&base), &[]);
 
         let cases: Vec<(&str, IndexedSession)> = vec![
             ("provider", {
@@ -2651,14 +2680,20 @@ mod sessions_sweep_tests {
         );
     }
 
-    /// SESSION-16 § "Adjacent discovery" handoff, pinnned end-to-end over a
+    /// SESSION-16 § "Adjacent discovery" handoff, pinned end-to-end over a
     /// REAL index: a hidden non-interactive claude session (exactly ONE user
     /// message -- `parse/claude.rs:469` `user_message_count <= 1`) gains its
-    /// SECOND user message with a BACK-DATED timestamp, so its own
+    /// SECOND user message with the SAME timestamp as the first, so its own
     /// `last_activity_at` (max-of-line-timestamps, `parse/claude.rs:282`)
-    /// does not advance and an anchor session pins the corpus max. Neither
-    /// `len` nor corpus max moves -- yet the session became sidebar-visible,
-    /// so legacy broadcasts and this sweep MUST too.
+    /// AND its `created_at` (min-of-timestamps) do not move, and an anchor
+    /// session pins the corpus max. Neither `len` nor corpus max moves and
+    /// NO timestamp digest field moves either -- `is_non_interactive` is the
+    /// ONLY comparable field that changes -- yet the session became
+    /// sidebar-visible, so legacy broadcasts and this sweep MUST too.
+    /// (A back-dated append would additionally move `created_at`, which the
+    /// digest also covers; the same-timestamp shape here keeps the flip
+    /// isolated onto the exact field the handoff named, which the mutation
+    /// spot-check relies on.)
     #[tokio::test]
     async fn visibility_flip_is_detected_with_stale_corpus_max() {
         let claude_home = unique_temp_dir("flip").join(".claude");
@@ -2682,9 +2717,10 @@ mod sessions_sweep_tests {
         );
         let before = sessions_sweep_signature(&index.snapshot().await, &[]);
 
-        // The flip: a SECOND user message, BACK-DATED before the first one's
-        // timestamp (so last_activity_at cannot advance). The corpus
-        // (len, max) is provably unmoved.
+        // The flip: a SECOND user message with the SAME timestamp as the
+        // first, so neither `last_activity_at` (max) nor `created_at` (min)
+        // moves; the corpus (len, max) is provably unmoved too (anchor at
+        // 2030). `is_non_interactive` is the ONLY digest field that changes.
         let flip_path = claude_home
             .join("projects")
             .join("-p")
@@ -2694,13 +2730,15 @@ mod sessions_sweep_tests {
             "sessionId": "77777777-7777-4777-8777-777777777777",
             "cwd": "/tmp/sweep-test/hidden",
             "message": { "role": "user", "content": "second user turn makes it interactive" },
-            "timestamp": "2024-12-31T00:00:00.000Z",
+            "timestamp": "2025-01-01T00:00:00.000Z",
         })
         .to_string();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&flip_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{second_user}\n").as_bytes()))
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, format!("{second_user}\n").as_bytes())
+            })
             .unwrap();
 
         // Stale-while-revalidate: poll until the detached re-scan settles
@@ -2715,7 +2753,7 @@ mod sessions_sweep_tests {
         }
         assert_ne!(
             after, before,
-            "the hidden->visible flip (second user message, back-dated) must move the \
+            "the hidden->visible flip (second user message, same timestamp) must move the \
              signature even though (len, max) are unmoved (before={before:?}, after={after:?})"
         );
 
