@@ -24,6 +24,7 @@ export type ContextTarget =
       provider?: string
       sessionType?: string
     }
+  | { kind: 'tabs-card'; tabKey: string; status: 'open' | 'closed' }
 
 export type ParsedContext = {
   id: ContextId

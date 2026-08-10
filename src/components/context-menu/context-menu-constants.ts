@@ -14,6 +14,7 @@ export const ContextIds = {
   OverviewTerminal: 'overview-terminal',
   ClaudeMessage: 'claude-message',
   FreshAgent: 'fresh-agent',
+  TabsCard: 'tabs-card',
 } as const
 
 export type ContextId = typeof ContextIds[keyof typeof ContextIds]

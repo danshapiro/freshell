@@ -95,6 +95,10 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
             sessionType: data.sessionType,
           }
         : null
+    case ContextIds.TabsCard:
+      return data.tabKey
+        ? { kind: 'tabs-card', tabKey: data.tabKey, status: data.tabStatus === 'closed' ? 'closed' : 'open' }
+        : null
     default:
       return null
   }

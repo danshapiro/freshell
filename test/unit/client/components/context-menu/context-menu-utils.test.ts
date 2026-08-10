@@ -99,4 +99,19 @@ describe('parseContextTarget', () => {
 
     expect(result).toBeNull()
   })
+
+  it('parseContextTarget for TabsCard returns tabs-card target with tabKey and status', () => {
+    const result = parseContextTarget(ContextIds.TabsCard, { tabKey: 'device-a:tab-1', tabStatus: 'closed' })
+    expect(result).toEqual({ kind: 'tabs-card', tabKey: 'device-a:tab-1', status: 'closed' })
+  })
+
+  it('parseContextTarget for TabsCard defaults status to open', () => {
+    const result = parseContextTarget(ContextIds.TabsCard, { tabKey: 'device-a:tab-1' })
+    expect(result).toEqual({ kind: 'tabs-card', tabKey: 'device-a:tab-1', status: 'open' })
+  })
+
+  it('parseContextTarget for TabsCard returns null without tabKey', () => {
+    const result = parseContextTarget(ContextIds.TabsCard, { tabStatus: 'closed' })
+    expect(result).toBeNull()
+  })
 })
