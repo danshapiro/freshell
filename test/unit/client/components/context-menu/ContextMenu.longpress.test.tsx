@@ -8,6 +8,7 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
+import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -43,6 +44,7 @@ function createTestStore() {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      tabRegistry: tabRegistryReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -120,6 +122,28 @@ function simulateTouch(
   })
   target.dispatchEvent(touchEvent)
   return touchEvent
+}
+
+function seedRemoteCardRecord(store: ReturnType<typeof createTestStore>) {
+  store.dispatch(setTabRegistrySnapshot({
+    localOpen: [],
+    remoteOpen: [{
+      tabKey: 'remote:open-1',
+      tabId: 'open-1',
+      serverInstanceId: 'srv-remote',
+      deviceId: 'remote-device',
+      deviceLabel: 'Remote Device',
+      tabName: 'remote open',
+      status: 'open',
+      revision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [],
+    }],
+    closed: [],
+  }))
 }
 
 function simulateNativeContextMenu(target: Element, clientX = 100, clientY = 100) {
@@ -553,5 +577,79 @@ describe('ContextMenuProvider long-press', () => {
 
     const menu = screen.getByRole('menu')
     expect(menu.style.left).toBe('100px')
+  })
+
+  it('long-press opens the tabs-card menu and suppresses the card click', () => {
+    const onCardClick = vi.fn()
+    const { store } = renderWithProvider(
+      <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1" onClick={onCardClick}>
+        remote card
+      </button>
+    )
+    act(() => {
+      seedRemoteCardRecord(store)
+    })
+
+    const target = screen.getByText('remote card')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /Pull to this device/i })).toBeInTheDocument()
+
+    act(() => {
+      const release = simulateTouch('touchend', target, 100, 100)
+      if (!release.defaultPrevented) {
+        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+    })
+
+    // The card is a <button> with onClick -- suppression must prevent the
+    // synthetic click from both closing the menu AND pulling the tab.
+    expect(onCardClick).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('keeps the tabs-card menu open when a native contextmenu wins the race (Android)', () => {
+    const onCardClick = vi.fn()
+    const { store } = renderWithProvider(
+      <button type="button" data-context={ContextIds.TabsCard} data-tab-key="remote:open-1" onClick={onCardClick}>
+        remote card
+      </button>
+    )
+    act(() => {
+      seedRemoteCardRecord(store)
+    })
+
+    const target = screen.getByText('remote card')
+    elementFromPointMock.mockReturnValue(target)
+
+    act(() => {
+      simulateTouch('touchstart', target, 100, 100)
+    })
+    act(() => {
+      vi.advanceTimersByTime(100)
+    })
+    act(() => {
+      simulateNativeContextMenu(target, 100, 100)
+    })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    const firstItem = screen.getAllByRole('menuitem')[0]
+    act(() => {
+      const release = simulateTouch('touchend', firstItem, 100, 100)
+      if (!release.defaultPrevented) {
+        firstItem.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      }
+    })
+
+    expect(onCardClick).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 })

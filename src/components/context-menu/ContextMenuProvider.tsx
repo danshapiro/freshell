@@ -42,10 +42,12 @@ import {
   type ReopenPaneSessionTarget,
 } from '@/lib/session-flavor-reopen'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import {
   jumpToRecord as jumpToRecordAction,
   openPaneInNewTab as openPaneInNewTabAction,
   openRecordAsUnlinkedCopy as openRecordAsUnlinkedCopyAction,
+  type TabsRegistryGroups,
 } from '@/lib/tab-registry-open'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { createLogger } from '@/lib/client-logger'
@@ -81,6 +83,12 @@ const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+const EMPTY_TAB_REGISTRY_GROUPS: TabsRegistryGroups = {
+  localOpen: [],
+  sameDeviceOpen: [],
+  remoteOpen: [],
+  closed: [],
+}
 
 const log = createLogger('ContextMenuProvider')
 const KNOWN_CONTEXT_IDS = new Set(Object.values(ContextIds) as ContextId[])
@@ -166,6 +174,10 @@ export function ContextMenuProvider({
   const amplifierActivityByTerminalId = useAppSelector((s) => s.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
   const paneRuntimeActivityByPaneId = useAppSelector((s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID)
+  const tabRegistryGroups = useAppSelector((s) =>
+    s.tabRegistry ? selectTabsRegistryGroups(s) : EMPTY_TAB_REGISTRY_GROUPS
+  )
+  const registryDeviceId = useAppSelector((s) => s.tabRegistry?.deviceId ?? '')
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
@@ -1209,17 +1221,26 @@ export function ContextMenuProvider({
     jumpToRecordAction(record, {
       dispatch,
       localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
       hasLocalTab: (tabId) => appStore.getState().tabs.tabs.some((tab) => tab.id === tabId),
     })
-  }, [dispatch, localServerInstanceId, appStore])
+  }, [dispatch, localServerInstanceId, onViewChange, appStore])
 
   const openTabRecordCopy = useCallback((record: RegistryTabRecord) => {
-    openRecordAsUnlinkedCopyAction(record, { dispatch, localServerInstanceId })
-  }, [dispatch, localServerInstanceId])
+    openRecordAsUnlinkedCopyAction(record, {
+      dispatch,
+      localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
+    })
+  }, [dispatch, localServerInstanceId, onViewChange])
 
   const openTabRecordPaneInNewTab = useCallback((record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
-    openPaneInNewTabAction(record, pane, { dispatch, localServerInstanceId })
-  }, [dispatch, localServerInstanceId])
+    openPaneInNewTabAction(record, pane, {
+      dispatch,
+      localServerInstanceId,
+      onOpened: () => onViewChange('terminal'),
+    })
+  }, [dispatch, localServerInstanceId, onViewChange])
 
   const copyTabRecordName = useCallback(async (record: RegistryTabRecord) => {
     await copyText(record.tabName)
@@ -1240,6 +1261,8 @@ export function ContextMenuProvider({
       platform,
       extensions: extensionEntries,
       reopenActivityByPaneId,
+      tabRegistryGroups,
+      registryDeviceId,
       actions: {
         newDefaultTab,
         newTabWithPane,
@@ -1368,6 +1391,8 @@ export function ContextMenuProvider({
     openUrlInTab,
     openUrlInBrowser,
     copyUrlAction,
+    tabRegistryGroups,
+    registryDeviceId,
     jumpToTabRecord,
     openTabRecordCopy,
     openTabRecordPaneInNewTab,
