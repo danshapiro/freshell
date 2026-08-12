@@ -13,20 +13,33 @@ stages on exactly the returned indexed/synthesized rows
 the corrected Fast strategy before completion. This plan makes no numeric
 production-latency claim.
 
-**Architecture:** Task 0 first records an ownership-safe, no-process authority
-from exact pinned-parent source/fixture blobs, then proves its behavior-neutral
-seams through deterministic in-process owner/full-layer raw fixtures and freezes
-an independently reviewable pre-extraction
-parent authority while the handler derivation is still inline. Task 1 proves that
-authority unchanged, extracts the Materialized strategy, and freezes that second
-authority in a separate commit. Fast selection keeps indexed rows and live
+**Architecture:** Task 0 establishes this one-way authority chain before any
+production edit or structural split:
+
+```text
+Pinned parent commit/tree
+  + exact append-only cfg(test) recorder
+  + exact canonical 22-case manifest
+  -> offline, network-namespace, in-process parent completed-response artifact
+  -> mechanically embedded byte-identical artifact
+  -> direct current-owner/FrozenOld/ExtractedMaterialized/final-route equality gates
+```
+
+Source/fixture blob hashes are provenance and reproducibility inputs, not
+response bytes or response authority by themselves. Task 0 captures the artifact
+from the unchanged pinned parent plus the exact recorder, then performs a
+behavior-neutral focused module/test split, moves the recorder byte-for-byte,
+mechanically installs the already captured artifact, and freezes the
+artifact/recorder/current comparisons in the same Task-0 commit. Task 1 proves
+that authority unchanged, extracts the Materialized strategy, and freezes that
+second authority separately. Fast selection keeps indexed rows and live
 identities as borrowed/lightweight descriptors through dedupe, filtering,
 ordering, cursor handling, title matching, and a descriptor-only `limit + 1`;
 only returned rows pass through mechanically inventoried and instrumented
 full-row constructors. Nonempty `userMessages` and `fullText` queries remain
 Materialized. G1 compatibility, compile-valid mutation sensitivity, exact debug
 G2 work accounting, and finite instrumentation-free release G3 precede isolated
-no-query and title selector commits. Task 0A is the one additional
+no-query and title selector commits. Task 0A remains the one additional
 comment/API-documentation-only task required by the shared contract decision.
 
 **Tech Stack:** Rust 1.96 workspace MSRV, Axum, existing
@@ -67,6 +80,19 @@ No dependency or Cargo-feature addition.
   `(IndexCapture::{NoIndex, Snapshot(rows)}, overrides, metadata,
   ordered_identities)`, FrozenOld, ExtractedMaterialized, and Fast must produce
   the same Rust status, normalized `content-type`, and raw JSON body bytes.
+- The stronger parent operands are direct, never merely transitive:
+
+  ```text
+  current owner-backed full-app exchange sequences == embedded pinned-parent artifact
+  FrozenOld completed exchange sequences           == embedded pinned-parent artifact
+  ExtractedMaterialized exchange sequences          == embedded pinned-parent artifact
+  final production route exchange sequences         == embedded pinned-parent artifact
+  ```
+
+  Each artifact case owns a nonempty ordered `exchanges` array. Ordinary cases
+  contain one exchange; the existing cursor-page cases contain both ordered
+  requests/responses and the cursor handoff. Raw bodies are base64-encoded only
+  to preserve exact bytes and are decoded before comparison.
 - `NoIndex` and `Snapshot(&[])` are distinct captures. Identity vector order is
   observable: current joins choose the first exact identity and synth dedupe
   chooses the first full-key winner.
@@ -223,20 +249,58 @@ hidden blocker nor deferred completion work here.
 
 Allowed implementation files are exactly:
 
-| File | Allowed change |
+| File | Exact responsibility / permission |
 |---|---|
-| `shared/read-models.ts` | Task 0A's exact comment immediately above `SessionDirectoryPageSchema`; no executable/schema edit. This is the only shared/client-area change. |
-| `crates/freshell-server/src/session_directory.rs` | Authorities, captures, response renderer, accessor trace, manual instrumented `DirItem::Clone`, legacy fixtures, borrowed candidate, ledgers, G1/G2/G3, mutation anchors/tests, selectors. |
-| `crates/freshell-server/src/main.rs` | Exactly one behavior-neutral `with_full_application_layers` assembler and replacement of the existing inline production layer chain by one call. No route/state/policy movement. |
+| `shared/read-models.ts` | Task 0A's exact comment only. |
+| `crates/freshell-server/src/main.rs` | Only `with_full_application_layers` and replacement of the inline production layer chain by one call. |
+| `crates/freshell-server/src/session_directory.rs` | Stable facade: child declarations/private imports, `SessionDirectoryState`, validation/router/handler, provider-home helpers, and only small shared `#[cfg(test)]` helpers used by more than one existing-test child. Preserve externally consumed `session_directory::*` paths here. |
+| `crates/freshell-server/src/session_directory_materialized.rs` | `DirItem`, `Tier`, `DirQuery`, manual Clone/producer markers, indexed construction, override/metadata/running/live decoration, cursor codec, legacy title/file query, and Task-1 Materialized implementation. |
+| `crates/freshell-server/src/session_directory_tests.rs` | Existing join tests plus existing core/home/query-validation tests; declared as `mod tests` so the historical `session_directory::tests::invalid_utf8_transcript_is_indexed_lossily_like_node` path remains. |
+| `crates/freshell-server/src/session_directory_route_tests.rs` | Existing override/index/metadata/colors/no-index/cache route tests. |
+| `crates/freshell-server/src/session_directory_search_tests.rs` | Existing Codex/OpenCode and `userMessages`/`fullText` tests. |
+| `crates/freshell-server/src/session_directory_inputs.rs` | `IndexCapture`/owned captures, accessor trace, response renderer, strategy seam/dispatch, and request-local work ledger. |
+| `crates/freshell-server/src/session_directory_fast.rs` | Borrowed matching, descriptors, Fast selection/materialization, selector, exact Fast markers, and all 17 mutation anchors. |
+| `crates/freshell-server/src/session_directory_page_bound_support.rs` | Shared deterministic capture/case builders and completed-response test harness; test-only. |
+| `crates/freshell-server/src/session_directory_page_bound_authority_fixtures.rs` | Byte-stable pinned-parent recorder, canonical 22-case manifest/builders, embedded parent artifact, and FrozenOld authority; test-only and frozen by Task 0. No hand-copied raw-body table. |
+| `crates/freshell-server/src/session_directory_page_bound_source_audit.rs` | Fail-closed Rust lexical/call-graph scanner; `cfg(all(test, debug_assertions))`. |
+| `crates/freshell-server/src/session_directory_page_bound_authority_tests.rs` | Task-0 and Task-1 authority/capture/completed-response tests. |
+| `crates/freshell-server/src/session_directory_page_bound_legacy_tests.rs` | Exact 33-test legacy inventory. |
+| `crates/freshell-server/src/session_directory_page_bound_g1_tests.rs` | Exact 21-test G1 inventory, dispatch contract tests, and Task-9/10 selector tests. |
+| `crates/freshell-server/src/session_directory_page_bound_g2_tests.rs` | Task-3 helper tests and exact 18-test G2 inventory; `cfg(all(test, debug_assertions))`. |
+| `crates/freshell-server/src/session_directory_page_bound_g3_tests.rs` | Explicit release A/B manifest and ignored `adverse_release_ab_non_regression`. |
+| `crates/freshell-sessions/src/search.rs` | Read/freeze only; never modify. |
 
-No new tracked file. Task 0's uniquely owned detached pinned-parent worktree and
-Task 7's detached mutation worktree are validation scratch only. Task 0 runs no
-binary/build/provider scan, reads only committed blobs, tracks ownership with an
-explicit post-add flag, and removes the worktree non-forcibly only after exact
-path/HEAD/registration/clean checks. Both scratch worktrees must remain
-source-clean and be removed non-forcibly after their evidence is recorded. Do not change any `Cargo.toml`, dependency,
-feature, owner/index/TTL or sweep API, polling, persistence, cursor/wire schema,
-Node implementation,
+These are ordinary sibling modules under the existing `mod session_directory;`;
+no Cargo target or manifest edit is permitted.
+
+The binding <=1,000-physical-UTF-8-line gate introduced by this plan applies
+only to the session-directory facade
+`crates/freshell-server/src/session_directory.rs` and the fourteen
+responsibility-named `crates/freshell-server/src/session_directory_*.rs`
+siblings listed above, after each file exists. The phased `SD_TASK*_FILES`
+arrays are the complete mechanical enforcement set.
+
+This task does not apply that new gate to the pre-existing
+`crates/freshell-server/src/main.rs` or to the read-only external
+`crates/freshell-sessions/src/search.rs`. Their existing sizes are unrelated to
+Fresh Eyes blocker 5. Task 0 may still make only the already-authorized narrow
+assembler/call edit in `main.rs`; it must not refactor that file for size.
+
+If any facade/focused-sibling target in the applicable phase exceeds 1,000
+lines, stop and amend the plan with one additional responsibility-named split;
+never create a numbered spill file or waive the limit.
+
+Task 0's uniquely owned detached pinned-parent worktree and Task 7's detached
+mutation worktree are validation scratch only. The pinned parent's historical
+monolith is named `PARENT_SESSION_MONOLITH` in preflight/provenance; future
+siblings do not exist at the parent and are never added to its seven-blob list.
+Task 0 never launches the production server binary, binds a listener, scans an
+ambient provider root, reads live home/config, or has network access. Its one
+exact ignored test harness executes `Router::oneshot` inside a new network
+namespace to capture the immutable parent response artifact. Both scratch
+families are removed non-forcibly only after their exact ownership and state are
+revalidated. Do not change any `Cargo.toml`, dependency, feature, owner/index/TTL
+or sweep API, polling, persistence, cursor/wire schema, Node implementation,
 client logic, fixture/script/benchmark file, `.kata.toml`, or another document.
 Do not create a PR or restart the live port-3001 server. Both final selector
 commits are required and reversible; an undispatched candidate is incomplete.
@@ -249,21 +313,17 @@ returns to its owning behavior task and commit boundary.
 
 ## Current Pipeline and Structural Correctness Argument
 
-Current source at parent `fc8646477dd34d92dc5647d158106431aa2e0380`:
+Current source at parent `fc8646477dd34d92dc5647d158106431aa2e0380`
+is the historical monolith. After Task 0's behavior-neutral split, cite the
+pipeline by stable symbol/path:
 
-1. `crates/freshell-server/src/session_directory.rs:381-455` validates, snapshots
-   the already sorted index, and converts every indexed row.
-2. `apply_session_overrides` (`:740-778`) removes typed `deleted:true` rows and
-   overlays title/summary/archive; `apply_session_metadata` (`:786-804`) joins
-   `sessionType`.
-3. `join_running_state`, `build_live_terminal_session_item`, and
-   `join_live_terminals` (`:844-938`) join the first ordered identity, construct
-   live-only rows, first-winner dedupe by full key, and append synth rows.
-4. `apply_query` (`:1175-1294`) computes revision, stable-sorts timestamp DESC
-   then full key DESC, applies flags/cursor/search, and pages.
-5. `apply_title_search` (`:1374-1391`) selects title/summary/first message and
-   truncates the chosen field to 140 Unicode scalars. File tiers use
-   `apply_file_search` (`:1317-1368`) and
+1. facade validation/owner route:
+   `session_directory.rs::{validate_query,router,session_directory}`;
+2. materialized model/decorations:
+   `session_directory_materialized.rs::{dir_item_from_indexed,apply_session_overrides,apply_session_metadata,join_running_state,build_live_terminal_session_item,join_live_terminals}`;
+3. materialized ordering/search:
+   `session_directory_materialized.rs::{apply_query,apply_title_search,apply_file_search}`;
+4. external transcript search remains
    `crates/freshell-sessions/src/search.rs`.
 
 The Fast architecture is valid only under one immutable capture whose index is
@@ -273,8 +333,10 @@ limit is `1..=50`:
 - Decoration cannot change existing-row sort keys. Stable filtering preserves
   exact duplicate source ordinals.
 - Synth descriptors contain every membership/order datum, preserve identity
-  vector first-winner order, suppress against nondeleted indexed full keys,
-  stable-sort, and choose indexed on exact merge equality.
+  vector first-winner order, suppress against every nondeleted indexed full key,
+  stable-sort, and choose indexed on exact merge equality. Typed deletion is
+  Indexed-only: a same-key live Synth is created after legacy indexed deletion,
+  survives that deletion override, and receives no override decoration.
 - The strict cursor predicate is a suffix of the descending stream, including
   arbitrary valid cursors and duplicate-tuple legacy gaps.
 - Visibility and title match are row-local when they use override-effective
@@ -293,27 +355,29 @@ universal proof.
 
 ## Compatibility Proof Taxonomy
 
-1. **Task-0 parent authority:** ownership-safe pinned-parent source/fixture blob
-   authority with a mandatory no-process/no-network fallback, deterministic
-   order-insensitive/single-identity in-process owner/full-layer raw literals
-   plus a same-unchanged-registry relational owner-acquisition assertion,
-   immutable case manifest/builders, actual owner-backed route executor, capture
-   types, FrozenOld page, response renderer, all local transitive legacy
-   constants/types/helpers/ledger sites, whole external file search, and the
-   full-layer assembler/production call.
+1. **Task-0 parent authority:** the canonical completed-response artifact
+   captured from the pre-edit pinned commit/tree using the exact append-only
+   recorder and canonical manifest. It records the seven critical blob IDs,
+   recorder/manifest/input hashes, and exact ordered raw exchanges. Source and
+   fixture hashes are provenance, not response authority. Task 0 also freezes
+   the recorder, manifest/builders, actual owner executor, capture types,
+   FrozenOld page, renderer, transitive legacy regions, whole external search,
+   and full-layer assembler/production call.
 2. **Task-1 extracted authority:** only `materialized_page` and
-   `materialized_dispatch`, committed after unchanged Task-0 evidence.
+   `materialized_dispatch`, committed after ExtractedMaterialized compares
+   directly with the embedded parent artifact.
 3. **Exhaustive finite evidence:** FrozenOld/ExtractedMaterialized/Fast values
    and direct renderer bytes; no full middleware per exhaustive capture.
 4. **Targeted completed evidence:** explicit fixed-capture strategy applications,
-   including both A/B winner permutations, plus deterministic actual
-   owner-backed routes through real full-application layers. Requested owner
-   iteration order is not part of the raw authority.
+   including both A/B winner permutations, plus all 22 current owner exchanges
+   through real full-application layers compared directly with the artifact.
+   Requested owner iteration order is not part of the raw authority.
 5. **G2:** exact successful-Fast work equations plus clone/constructor audits.
 6. **Mutation evidence:** exact compile-valid source edits whose declared
    Fast/selector killer fails.
 7. **Declared Node/Rust parity:** unchanged full normalized comparator; never a
-   substitute for Rust raw bytes.
+   substitute for direct current-owner/FrozenOld/ExtractedMaterialized/final-route
+   equality with the parent artifact.
 
 ---
 
@@ -538,6 +602,10 @@ fn synthesized_descriptors<'identity>(
 ) -> Vec<SynthDescriptor<'identity>>;
 
 fn candidate_full_key(candidate: CandidateRef<'_, '_>) -> String;
+fn candidate_is_deleted(
+    candidate: CandidateRef<'_, '_>,
+    overrides: &Map<String, Value>,
+) -> bool;
 fn candidate_last_activity(candidate: CandidateRef<'_, '_>) -> i64;
 fn candidate_order(
     left: CandidateRef<'_, '_>,
@@ -626,8 +694,12 @@ Ownership and algorithm rules:
   Synth only for Greater under the canonical comparator.
 - Decode the cursor before descriptor construction/selection. In
   `merge_page_descriptors`, bind `let overrides = inputs.overrides;` and
-  `let identities = inputs.identities;`, reject typed deletion first, then call
+  `let identities = inputs.identities;`, call
+  `candidate_is_deleted(candidate, overrides)` first, then call
   `candidate_is_visible(candidate, q, overrides, identities)`. For Indexed,
+  deletion consults `is_deleted(overrides, &indexed.key())`; for Synth it is
+  always false because legacy deletion precedes live synthesis. A same-key Synth
+  therefore survives and is never override-decorated. For Indexed,
   `candidate_is_nonempty` looks up the exact full-key override object and uses
   `effective_title(indexed, override_row)` plus exact-component running
   membership; for Synth it returns true because every synth descriptor denotes
@@ -853,48 +925,174 @@ ledger itself.
 
 ---
 
+## Focused Rust Module Boundary
+
+Use direct `#[path]` children, never `include!`. Add each declaration only in the
+task that creates the corresponding nonempty file. The final facade declarations
+are:
+
+```rust
+#[path = "session_directory_materialized.rs"]
+mod materialized;
+#[path = "session_directory_inputs.rs"]
+mod inputs;
+#[path = "session_directory_fast.rs"]
+mod fast;
+
+#[cfg(test)]
+#[path = "session_directory_tests.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "session_directory_route_tests.rs"]
+mod route_tests;
+#[cfg(test)]
+#[path = "session_directory_search_tests.rs"]
+mod search_tests;
+#[cfg(test)]
+#[path = "session_directory_page_bound_support.rs"]
+mod page_bound_support;
+#[cfg(test)]
+#[path = "session_directory_page_bound_authority_fixtures.rs"]
+mod page_bound_authority_fixtures;
+#[cfg(test)]
+#[path = "session_directory_page_bound_authority_tests.rs"]
+mod page_bound_authority_tests;
+#[cfg(test)]
+#[path = "session_directory_page_bound_legacy_tests.rs"]
+mod page_bound_legacy_tests;
+#[cfg(test)]
+#[path = "session_directory_page_bound_g1_tests.rs"]
+mod page_bound_g1_tests;
+#[cfg(all(test, debug_assertions))]
+#[path = "session_directory_page_bound_source_audit.rs"]
+mod page_bound_source_audit;
+#[cfg(all(test, debug_assertions))]
+#[path = "session_directory_page_bound_g2_tests.rs"]
+mod page_bound_g2_tests;
+#[cfg(test)]
+#[path = "session_directory_page_bound_g3_tests.rs"]
+mod page_bound_g3_tests;
+```
+
+Keep `SessionDirectoryState`, `router`, `provider_home`, `claude_home`,
+`codex_home`, and `HOME_ENV_TEST_LOCK` physically in the facade. Moved internals
+needed by sibling children use `pub(super)`, not public API; privately import
+them into the facade where needed so existing crate-visible
+`session_directory::*` paths remain stable. Put a test helper in the facade only
+when at least two test children need it.
+
+Task 0 performs the split after parent capture and before authority tests:
+
+1. Move the model/materialized pipeline to
+   `session_directory_materialized.rs`.
+2. Move current `join_tests` and main tests through query validation (ending
+   immediately before `// Task 2: sessionOverrides overlay`) to
+   `session_directory_tests.rs`.
+3. Move tests from that Task-2 anchor through the test immediately before
+   `codex_exec_session_hidden_by_default_surfaced_with_flag` to
+   `session_directory_route_tests.rs`.
+4. Move that Codex test through the end of the current main test module to
+   `session_directory_search_tests.rs`.
+5. Create nonempty `inputs`, page-bound support, authority-fixtures, and
+   authority-tests siblings. Move the recorder byte-for-byte into
+   authority-fixtures.
+6. Normalize only imports and `pub(super)` visibility. Run existing server tests,
+   formatter, Clippy, and the line gate. This behavior-neutral refactor has the
+   pre-split baseline as its before evidence and no manufactured RED.
+7. Only after this GREEN add/freeze Task-0 markers and behavior tests.
+
+Whole-file test children plus explicit declarations replace the former
+monolithic page-bound test wrapper.
+
+---
+
 ## Two Immutable Authorities and Rebaseline Rule
+
+### Canonical pinned-parent completed-response authority
+
+`PARENT_COMPLETED_RESPONSE_AUTHORITY_V1` is canonical sorted-key,
+compact-separator UTF-8 JSON with exactly one trailing LF:
+
+```text
+schema:        freshell.session-directory.parent-responses.v1
+parent_commit: fc8646477dd34d92dc5647d158106431aa2e0380
+parent_tree:   b4ff70f7ff0d3aab312b61bad0a3a074d1bebf58
+critical blobs:
+  crates/freshell-server/src/session_directory.rs             843f98c896d30650c2fc8c3ccb77f4635272d984
+  crates/freshell-server/src/main.rs                          346e7d96432f61c6699461d2c58f97406ae36bbe
+  crates/freshell-sessions/src/search.rs                      8da06ea083e1ae651c61fea186f67dcef906d5a8
+  crates/freshell-sessions/src/parse/opencode.rs              684003ab22ba10d6154e5fd11c95b5a885bfd1ce
+  crates/freshell-sessions/src/amplifier.rs                   313ecf588daef15530e2048d66c5dbce1cf627ef
+  test/fixtures/sessions/real-corrupted.jsonl                 c3ae6eb134e66303f2cf901bdbc895fc85d71b52
+  test/fixtures/sessions/healthy.jsonl                        1e67a84c5acdf949c8953481280362a96bfbc453
+```
+
+Its logical schema is:
+
+```text
+{
+  schema, parent_commit, parent_tree, source_blobs,
+  recorder_sha256, manifest_sha256,
+  cases: [{
+    name, strategy_comparable, owner_input_sha256,
+    exchanges: [{
+      request: { method, uri, ordered_headers },
+      status, content_type, body_base64
+    }]
+  }]
+}
+```
+
+Case order is exactly `EXPECTED_PARENT_CASE_NAMES`; names are unique; total is
+22. `strategy_comparable` is false only for
+`invalid_priority_limit_and_tier`, so the comparable projection is exactly 21.
+`owner_input_sha256` covers tagged `NoIndex` versus `Snapshot([])`, ordered
+request/exchange sequence, indexed rows/source bytes, ordered
+override/metadata/identity/color inputs, and all other owner state, and is unique
+across the 22 cases. Bodies are captured as raw bytes before base64 encoding.
+There is one artifact and no second manually maintained raw-body table.
 
 ### Task-0 frozen inventory
 
-Use unique
-`/* SESSION_DIRECTORY_AUTHORITY_BEGIN:<name> */` / `END` markers around:
+Use unique `/* SESSION_DIRECTORY_AUTHORITY_BEGIN:<name> */` / `END` markers
+mapped after the split as follows:
 
-- `legacy-max-directory-page-items`;
-- `legacy-session-directory-state-type`;
-- `legacy-dir-item-type-and-impl` (including manual instrumented Clone);
-- `legacy-tier-and-dir-query-types`;
-- `legacy-query-validation` (`validate_query`, `js_number`, `validate_limit`);
-- `legacy-session-directory-router` (not the handler derivation Task 1 extracts);
-- `legacy-indexed-constructor`;
-- `legacy-overrides`;
-- `legacy-metadata`;
-- `legacy-provider-display`;
-- `legacy-running-join`;
-- `legacy-synth-constructor`;
-- `legacy-live-join`;
-- `legacy-cursor-codec`;
-- `legacy-apply-query`;
-- `legacy-file-search-outcome-type`;
-- `legacy-file-search`;
-- `legacy-title-search`;
-- `parent-authority-capture-types`;
-- `parent-authority-case-manifest-builders`;
-- `parent-authority-owner-route-executor`;
-- `parent-authority-response-fixtures` (including the exact pinned source/fixture authority JSON and its deterministic raw literals);
-- `parent-authority-frozen-old-page`;
-- `parent-authority-response-renderer`;
-- `parent-authority-work-ledger`.
+- facade: `legacy-max-directory-page-items`,
+  `legacy-session-directory-state-type`, `legacy-query-validation`, and
+  `legacy-session-directory-router`;
+- materialized: `legacy-dir-item-type-and-impl`,
+  `legacy-tier-and-dir-query-types`, `legacy-indexed-constructor`,
+  `legacy-overrides`, `legacy-metadata`, `legacy-provider-display`,
+  `legacy-running-join`, `legacy-synth-constructor`, `legacy-live-join`,
+  `legacy-cursor-codec`, `legacy-apply-query`,
+  `legacy-file-search-outcome-type`, `legacy-file-search`, and
+  `legacy-title-search`;
+- inputs: `parent-authority-capture-types`,
+  `parent-authority-response-renderer`, `parent-authority-accessor-trace`, and
+  `parent-authority-work-ledger`;
+- authority-fixtures: `parent-authority-pinned-recorder`,
+  `parent-authority-case-manifest-builders`,
+  `parent-authority-owner-route-executor`,
+  `parent-authority-response-fixtures`, and
+  `parent-authority-frozen-old-page`;
+- main: `full-application-layer-assembler` and
+  `full-application-layer-production-call`.
 
-All legacy bump calls are inside their frozen function regions. Freeze the whole
-UTF-8 file `crates/freshell-sessions/src/search.rs`, including constants, parser,
-search helpers, types, and tests. In `main.rs`, freeze
-`full-application-layer-assembler` and
-`full-application-layer-production-call`.
+All legacy bumps remain within their frozen functions. Freeze the whole UTF-8
+`crates/freshell-sessions/src/search.rs`. The pinned-parent monolith remains a
+provenance blob only; freeze current sibling paths only after the split.
+
+Task 0 wraps the complete accessor-trace type/state/reset/read/bump
+implementation in exactly one region:
+
+```rust
+/* SESSION_DIRECTORY_AUTHORITY_BEGIN:parent-authority-accessor-trace */
+/* complete accessor-trace implementation */
+/* SESSION_DIRECTORY_AUTHORITY_END:parent-authority-accessor-trace */
+```
 
 The immutable Task-0 owner-backed/full-application case manifest is this exact
-ordered list; the manifest test compares exact names and derives its count from
-this list rather than trusting a generator count:
+ordered list:
 
 ```text
 no_index_no_query_empty_colors
@@ -921,14 +1119,12 @@ project_color_order_on_user_messages_route
 project_color_order_on_full_text_route
 ```
 
-Each row records request URI/headers, owner state, expected status, exact
-normalized `content-type`, and a reviewed raw body literal that is independent
-of `TerminalIdentityRegistry::list()` iteration order. Any raw row whose winner
-is serialized contains exactly one matching identity. The manifest defines
-`EXPECTED_PARENT_CASE_NAMES` as the explicit slice above and asserts ordered-name
-equality plus `parent_cases.len() == EXPECTED_PARENT_CASE_NAMES.len()`. Its
-current derived length is 22; no independent numeric constant or assertion can
-drift from the slice.
+Each row records canonical owner input and one or more ordered exchanges.
+Ordinary rows have one exchange; `user_messages_cursor_page` and
+`full_text_cursor_page` have two. Any row whose winner is serialized contains
+exactly one matching identity. Generated, embedded, and expected names compare
+to the explicit slice; its derived length is 22 with no independent drifting
+count.
 
 `user_messages_cursor_page` and `full_text_cursor_page` each own three matching
 source rows, issue `limit=1`, record the first raw response and emitted cursor,
@@ -958,31 +1154,83 @@ Task 1 adds only:
 Do not mark `build_directory_page`, owner capture, selector, comparison apps, or
 Fast code as extracted authority.
 
+### Parent-compatible recorder and embedded artifact
+
+The Task-0 authority-fixtures file contains this byte-stable region:
+
+```rust
+/* SESSION_DIRECTORY_AUTHORITY_BEGIN:parent-authority-pinned-recorder */
+/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_BEGIN */
+#[cfg(test)]
+mod pinned_parent_recorder {
+    // Exact 22-case specs/builders, owned-temp-root owner executor, canonical
+    // artifact records, and copied pinned-main full-layer assembler.
+    pub(in crate::session_directory) async fn write_pinned_parent_completed_responses_from_env(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_END */
+/* SESSION_DIRECTORY_AUTHORITY_END:parent-authority-pinned-recorder */
+```
+
+The recorder is location-independent (`crate::session_directory::...`) and uses
+only narrow `pub(in crate::session_directory)` visibility where sibling tests
+must consume it. It has no dependency on `CapturedDirectoryInputs`, FrozenOld,
+`directory_result_response`, or `with_full_application_layers`. It defines the
+22-name sequence/digests, drives the real route through `Router::oneshot` under
+owned roots, accepts an assembler callback, collects status/content-type/body
+before parsing, and rejects ambient homes/config/provider paths, sockets,
+non-owned files, duplicate/missing names, and raw winner cases with multiple
+matching identities.
+
+The exact inner marker region plus one LF is hashed as `recorder_sha256`. Before
+capture it is the only active-source delta and is appended byte-for-byte to
+`PARENT_SESSION_MONOLITH`; during the split the same bytes move to the final
+sibling. A static verifier removes exactly this region and requires the remainder
+to equal the pinned monolith, requires active `main.rs`, `search.rs`, and both
+transcript fixtures to equal parent blobs, and normalizes/compares the recorder's
+three `.layer(...)` calls with pinned `main.rs`.
+
+The same fixture region embeds:
+
+```rust
+/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_BEGIN */
+#[cfg(test)]
+const PINNED_PARENT_COMPLETED_RESPONSE_AUTHORITY_B64: &str =
+    "__SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_B64_PLACEHOLDER__";
+#[cfg(test)]
+const PINNED_PARENT_COMPLETED_RESPONSE_AUTHORITY_SHA256: &str =
+    "__SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_SHA256_PLACEHOLDER__";
+/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_END */
+```
+
+The installer validates canonical bytes and every fixed field, replaces one
+explicit placeholder exactly once, wraps base64 at one fixed width, decodes the
+new embedded constant to a second file, and `cmp`s it byte-for-byte with the
+captured artifact. Review output never feeds expected bytes.
+
+### Static and runtime authority guards
+
+`run_task0_static_guard` combines the shared comment guard, path-aware Task-0
+marker guard, and static embedded-artifact verifier.
+`run_both_static_guards` does the same for both Task-0 and Task-1 markers.
+`run_parent_authority_equality` runs the exact authority manifest, all-current-
+owner, and FrozenOld direct artifact comparisons. `run_task0_guard` is static
+plus parent equality. `run_both_guards` adds the direct
+ExtractedMaterialized-artifact comparison. Every later guard call therefore
+checks real parent equality, not only marker bytes. Task 10 additionally calls
+`replay_pinned_parent_authority`.
+
 ### Rebaseline lifecycle (exceptional, fail closed)
 
-Ordinary execution never edits either authority. If a deliberate behavior
-contract change is approved later:
-
-1. Stop candidate/selector work with a clean active worktree and passing current
-   guards. Retain previous authority commits in history for audit.
-2. Open a separately reviewed compatibility/rebaseline task. Give the contract
-   delta an explicit ID and rationale; the failing Fast output cannot define the
-   new expected behavior.
-3. Generate replacement owner-backed full-app literals from the unchanged
-   approved old/Materialized behavior for the same revised manifest. Review the
-   per-case status/header/raw-body diff before accepting it.
-4. In one dedicated rebaseline commit with a unique subject/hash, update the
-   Task-0 manifest/builders/raw literals/FrozenOld authority and the Task-1
-   ExtractedMaterialized authority for **the same delta**. Update affected
-   transitive inventory/guards and shared comment only if the approved contract
-   delta requires it. Include no candidate repair or selector change.
-5. Re-anchor both guard maps to that reviewed commit, run owner-backed and fixed
-   capture old/materialized/Fast completed matrices, both authority guards,
-   relevant mutation killers, G2, and G3. Fast work resumes only after all are
-   green.
-6. A candidate fix, extraction edit, selector edit, or rollback may never modify
-   an authority in the same commit. If the two authorities or manifest do not
-   describe the identical deliberate delta, stop; do not weaken a guard.
+Ordinary execution never edits either authority. Manifest expansion with
+unchanged behavior replays the recorder against the previously approved
+immutable baseline before production edits. A deliberate behavior change
+requires a dedicated authority/test-only commit with the independently authored
+and approved artifact diff, old/new hashes, delta ID, and review evidence before
+production changes. Later FrozenOld/Materialized/Fast changes make the already
+failing authority tests green. Changed owner, Materialized, or Fast code may
+never emit its own expectation, and authority/candidate/selector changes never
+share a commit.
 
 ---
 
@@ -998,62 +1246,146 @@ Every copied multi-command block starts with `set -euo pipefail`.
 set -euo pipefail
 WT=/home/dan/code/freshell/.worktrees/session-directory-page-bound
 MANIFEST="$WT/Cargo.toml"
-TEST_MOD='session_directory::page_bound_tests'
+TEST_AUTH='session_directory::page_bound_authority_tests'
+TEST_LEGACY='session_directory::page_bound_legacy_tests'
+TEST_G1='session_directory::page_bound_g1_tests'
+TEST_G2='session_directory::page_bound_g2_tests'
+TEST_G3='session_directory::page_bound_g3_tests'
 
-list_tests() {
-  local mode="$1" output line
-  if test "$mode" = debug; then
-    output="$(cargo test --manifest-path "$MANIFEST" -p freshell-server -- --list)" || return 1
-  elif test "$mode" = release; then
-    output="$(cargo test --manifest-path "$MANIFEST" -p freshell-server --release -- --list)" || return 1
-  else
-    printf 'invalid test mode: %s\n' "$mode" >&2
-    return 1
-  fi
+cargo_server_test() {
+  local mode="$1"
+  shift
+  local -a cargo_args=(
+    --manifest-path "$MANIFEST"
+    -p freshell-server
+    --bin freshell-server
+  )
+  case "$mode" in
+    debug) ;;
+    release) cargo_args+=(--release) ;;
+    *) printf 'invalid test mode: %s\n' "$mode" >&2; return 1 ;;
+  esac
+  CARGO_TERM_COLOR=never cargo test "${cargo_args[@]}" "$@"
+}
+
+list_selected_tests() {
+  local mode="$1" selection="$2" match="$3" filter="$4" output line
+  local -a harness_args=(--list --color=never)
+  case "$selection" in
+    all) harness_args+=(--include-ignored) ;;
+    ignored) harness_args+=(--ignored) ;;
+    *) printf 'invalid list selection: %s\n' "$selection" >&2; return 1 ;;
+  esac
+  case "$match" in
+    exact) harness_args+=(--exact) ;;
+    prefix) ;;
+    *) printf 'invalid test match: %s\n' "$match" >&2; return 1 ;;
+  esac
+  output="$(cargo_server_test "$mode" "$filter" -- "${harness_args[@]}")" || return 1
   while IFS= read -r line; do
-    case "$line" in
-      *': test') printf '%s\n' "${line%: test}" || return 1 ;;
-    esac
+    case "$line" in *': test') printf '%s\n' "${line%: test}" || return 1 ;; esac
   done <<<"$output"
 }
 
-assert_one_named_test() {
-  local mode="$1" name="$2" names line count=0
-  names="$(list_tests "$mode")" || return 1
-  while IFS= read -r line; do
-    if test "$line" = "$name"; then count=$((count + 1)); fi
-  done <<<"$names"
-  if test "$count" -ne 1; then
-    printf 'expected exactly one %s test %s; found %s\n' "$mode" "$name" "$count" >&2
+assert_one_selected_named_test() {
+  local mode="$1" selection="$2" name="$3" all_names ignored_names
+  all_names="$(list_selected_tests "$mode" all exact "$name")" || return 1
+  ignored_names="$(list_selected_tests "$mode" ignored exact "$name")" || return 1
+  python3 - "$mode" "$selection" "$name" "$all_names" "$ignored_names" <<'PY'
+import sys
+mode, selection, name, all_text, ignored_text = sys.argv[1:]
+all_names = [line for line in all_text.splitlines() if line]
+ignored_names = [line for line in ignored_text.splitlines() if line]
+if all_names != [name]:
+    raise SystemExit(
+        f"expected exactly one {mode} declaration {name!r}; found {all_names!r}"
+    )
+expected_ignored = (
+    [] if selection == "normal"
+    else [name] if selection == "ignored"
+    else None
+)
+if expected_ignored is None or ignored_names != expected_ignored:
+    raise SystemExit(
+        f"expected {name!r} to be {selection} in {mode}; "
+        f"ignored selection found {ignored_names!r}"
+    )
+PY
+}
+
+assert_one_named_test() { assert_one_selected_named_test "$1" normal "$2"; }
+assert_one_ignored_named_test() {
+  assert_one_selected_named_test "$1" ignored "$2"
+}
+
+run_cargo_test_success() {
+  local expected_count="$1" log
+  shift
+  log="$(mktemp)" || return 1
+  if ! "$@" >"$log" 2>&1; then
+    cat "$log" >&2 || true
+    rm -f "$log"
     return 1
   fi
+  if ! python3 - "$log" "$expected_count" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+expected = int(sys.argv[2])
+if expected <= 0:
+    raise SystemExit(f"expected execution count must be positive; got {expected}")
+pattern = re.compile(
+    r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+    r"(\d+) measured; (\d+) filtered out; finished in [^\r\n]+$",
+    re.MULTILINE,
+)
+summaries = [tuple(map(int, match)) for match in pattern.findall(text)]
+if len(summaries) != 1:
+    raise SystemExit(
+        f"expected exactly one libtest success summary; found {summaries!r}"
+    )
+passed, failed, ignored, measured, _filtered = summaries[0]
+if (passed, failed, ignored, measured) != (expected, 0, 0, 0):
+    raise SystemExit(
+        "unexpected execution cardinality: "
+        f"passed={passed} failed={failed} ignored={ignored} measured={measured}; "
+        f"expected passed={expected} and all other counts zero"
+    )
+PY
+  then
+    cat "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  cat "$log" || { rm -f "$log"; return 1; }
+  rm -f "$log"
 }
 
 run_exact_debug() {
   local name="$1"
   assert_one_named_test debug "$name" || return 1
-  cargo test --manifest-path "$MANIFEST" -p freshell-server \
-    "$name" -- --exact --test-threads=1 || return 1
+  run_cargo_test_success 1 cargo_server_test debug \
+    "$name" -- --exact --color=never --test-threads=1
 }
 
 run_exact_debug_ignored() {
   local name="$1"
-  assert_one_named_test debug "$name" || return 1
-  cargo test --manifest-path "$MANIFEST" -p freshell-server \
-    "$name" -- --exact --ignored --nocapture --test-threads=1 || return 1
+  assert_one_ignored_named_test debug "$name" || return 1
+  run_cargo_test_success 1 cargo_server_test debug \
+    "$name" -- --exact --ignored --nocapture --color=never --test-threads=1
 }
 
 run_exact_release_ignored() {
   local name="$1"
-  assert_one_named_test release "$name" || return 1
-  cargo test --manifest-path "$MANIFEST" -p freshell-server --release \
-    "$name" -- --exact --ignored --nocapture --test-threads=1 || return 1
+  assert_one_ignored_named_test release "$name" || return 1
+  run_cargo_test_success 1 cargo_server_test release \
+    "$name" -- --exact --ignored --nocapture --color=never --test-threads=1
 }
 
 expect_debug_compile_failure() {
   local label="$1" diagnostic="$2" log
   log="$(mktemp)" || return 1
-  if cargo test --manifest-path "$MANIFEST" -p freshell-server --no-run >"$log" 2>&1; then
+  if cargo test --manifest-path "$MANIFEST" -p freshell-server \
+      --bin freshell-server --no-run >"$log" 2>&1; then
     printf 'RED unexpectedly compiled: %s\n' "$label" >&2
     cat "$log" >&2 || true
     rm -f "$log"
@@ -1074,8 +1406,8 @@ expect_exact_debug_failure() {
   local name="$1" marker="$2" log
   assert_one_named_test debug "$name" || return 1
   log="$(mktemp)" || return 1
-  if cargo test --manifest-path "$MANIFEST" -p freshell-server \
-      "$name" -- --exact --test-threads=1 >"$log" 2>&1; then
+  if cargo_server_test debug "$name" -- \
+      --exact --color=never --test-threads=1 >"$log" 2>&1; then
     printf 'RED unexpectedly passed: %s\n' "$name" >&2
     cat "$log" >&2 || true
     rm -f "$log"
@@ -1093,25 +1425,99 @@ PY
 }
 
 run_audited_debug_prefix() {
-  local prefix="$1" expected_count="$2" tmp names
+  local prefix="$1" expected_count="$2" tmp all_names ignored_names
   tmp="$(mktemp -d)" || return 1
   cat >"$tmp/expected" || { rm -rf "$tmp"; return 1; }
-  names="$(list_tests debug)" || { rm -rf "$tmp"; return 1; }
-  printf '%s\n' "$names" >"$tmp/all" || { rm -rf "$tmp"; return 1; }
-  python3 - "$prefix" "$expected_count" "$tmp/expected" "$tmp/all" <<'PY' || { rm -rf "$tmp"; return 1; }
+  all_names="$(list_selected_tests debug all prefix "$prefix")" || {
+    rm -rf "$tmp"; return 1;
+  }
+  ignored_names="$(list_selected_tests debug ignored prefix "$prefix")" || {
+    rm -rf "$tmp"; return 1;
+  }
+  printf '%s\n' "$all_names" >"$tmp/all" || { rm -rf "$tmp"; return 1; }
+  printf '%s\n' "$ignored_names" >"$tmp/ignored" || { rm -rf "$tmp"; return 1; }
+  if ! python3 - "$expected_count" "$tmp/expected" "$tmp/all" "$tmp/ignored" <<'PY'
 import pathlib, sys
-prefix, expected_count = sys.argv[1], int(sys.argv[2])
-expected = sorted(line for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines() if line)
-actual = sorted(line for line in pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").splitlines() if line.startswith(prefix))
+expected_count = int(sys.argv[1])
+expected = sorted(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
+actual = sorted(
+    line
+    for line in pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").splitlines()
+    if line
+)
+ignored = sorted(
+    line
+    for line in pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").splitlines()
+    if line
+)
+if not expected or any(not line for line in expected):
+    raise SystemExit("expected inventory contains a blank line")
 if len(expected) != expected_count or len(set(expected)) != expected_count:
     raise SystemExit(f"bad expected inventory: {len(expected)} lines/{len(set(expected))} unique")
 if actual != expected:
     raise SystemExit(f"prefix inventory mismatch\nexpected={expected!r}\nactual={actual!r}")
+if ignored:
+    raise SystemExit(f"prefix inventory must be non-ignored; ignored={ignored!r}")
 PY
+  then
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! run_cargo_test_success "$expected_count" cargo_server_test debug \
+      "$prefix" -- --color=never --test-threads=1; then
+    rm -rf "$tmp"
+    return 1
+  fi
   rm -rf "$tmp"
-  cargo test --manifest-path "$MANIFEST" -p freshell-server \
-    "$prefix" -- --test-threads=1 || return 1
 }
+
+assert_max_1000_lines() {
+  python3 - "$WT" "$@" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+paths = sys.argv[2:]
+if not paths or len(paths) != len(set(paths)):
+    raise SystemExit("line-limit check requires a nonempty unique path list")
+for rel in paths:
+    path = root / rel
+    if not path.is_file():
+        raise SystemExit(f"missing line-limit target: {rel}")
+    count = len(path.read_text(encoding="utf-8").splitlines())
+    print(f"{count:4d} {rel}")
+    if count > 1000:
+        raise SystemExit(f"file exceeds 1000 lines: {rel} ({count})")
+PY
+}
+
+SD_TASK0_FILES=(
+  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_materialized.rs
+  crates/freshell-server/src/session_directory_tests.rs
+  crates/freshell-server/src/session_directory_route_tests.rs
+  crates/freshell-server/src/session_directory_search_tests.rs
+  crates/freshell-server/src/session_directory_inputs.rs
+  crates/freshell-server/src/session_directory_page_bound_support.rs
+  crates/freshell-server/src/session_directory_page_bound_authority_fixtures.rs
+  crates/freshell-server/src/session_directory_page_bound_authority_tests.rs
+)
+SD_TASK2_FILES=(
+  "${SD_TASK0_FILES[@]}"
+  crates/freshell-server/src/session_directory_page_bound_legacy_tests.rs
+)
+SD_TASK3_FILES=(
+  "${SD_TASK2_FILES[@]}"
+  crates/freshell-server/src/session_directory_fast.rs
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
+)
+SD_TASK4_FILES=(
+  "${SD_TASK3_FILES[@]}"
+  crates/freshell-server/src/session_directory_page_bound_source_audit.rs
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
+)
+SD_TASK8_FILES=(
+  "${SD_TASK4_FILES[@]}"
+  crates/freshell-server/src/session_directory_page_bound_g3_tests.rs
+)
 
 run_server_all_targets() {
   cargo test --manifest-path "$MANIFEST" -p freshell-server --all-targets || return 1
@@ -1138,6 +1544,15 @@ Compile-fail RED is the sole test-list exception because a noncompiling crate
 cannot list tests. Its diagnostic must occur exactly once; the same test must
 later pass through `run_exact_debug`. Runtime REDs are listed first and require
 an exact marker.
+
+Before relying on the successful filtered-test helpers in implementation, run
+shell-level negative acceptance probes (without adding Rust inventory names):
+an ignored exact test passed to the normal runner fails annotation discovery; an
+ordinary exact test passed to an ignored runner fails; any ignored prefix member
+fails; an exit-zero `0 passed` transcript fails; an extra/malformed libtest
+summary fails; and any nonzero failed/ignored/measured count fails closed while
+printing captured output. Discovery and execution must use the same
+profile/filter/exactness/ignored selection.
 
 ### NUL-safe exact Git scope and commit helper
 
@@ -1301,30 +1716,47 @@ from __future__ import annotations
 import difflib, pathlib, subprocess, sys
 wt = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
-if mode not in {"task0", "both"}:
+if mode not in {"working", "task0", "both"}:
     raise SystemExit(f"invalid mode: {mode}")
 TASK0_SUBJECT = "test(session-directory): freeze parent response authority"
 TASK1_SUBJECT = "refactor(session-directory): extract frozen materialized strategy"
-SESSION = "crates/freshell-server/src/session_directory.rs"
+FACADE = "crates/freshell-server/src/session_directory.rs"
+MATERIALIZED = "crates/freshell-server/src/session_directory_materialized.rs"
+INPUTS = "crates/freshell-server/src/session_directory_inputs.rs"
+AUTHORITY_FIXTURES = (
+    "crates/freshell-server/src/"
+    "session_directory_page_bound_authority_fixtures.rs"
+)
 MAIN = "crates/freshell-server/src/main.rs"
 SEARCH = "crates/freshell-sessions/src/search.rs"
 TASK0 = {
-    SESSION: [
+    FACADE: [
         "legacy-max-directory-page-items", "legacy-session-directory-state-type",
-        "legacy-dir-item-type-and-impl", "legacy-tier-and-dir-query-types",
         "legacy-query-validation", "legacy-session-directory-router",
+    ],
+    MATERIALIZED: [
+        "legacy-dir-item-type-and-impl", "legacy-tier-and-dir-query-types",
         "legacy-indexed-constructor", "legacy-overrides", "legacy-metadata",
         "legacy-provider-display", "legacy-running-join", "legacy-synth-constructor",
         "legacy-live-join", "legacy-cursor-codec", "legacy-apply-query",
         "legacy-file-search-outcome-type", "legacy-file-search", "legacy-title-search",
-        "parent-authority-capture-types", "parent-authority-case-manifest-builders",
-        "parent-authority-owner-route-executor", "parent-authority-response-fixtures",
-        "parent-authority-frozen-old-page", "parent-authority-response-renderer",
+    ],
+    INPUTS: [
+        "parent-authority-capture-types", "parent-authority-response-renderer",
+        "parent-authority-accessor-trace",
         "parent-authority-work-ledger",
+    ],
+    AUTHORITY_FIXTURES: [
+        "parent-authority-pinned-recorder", "parent-authority-case-manifest-builders",
+        "parent-authority-owner-route-executor", "parent-authority-response-fixtures",
+        "parent-authority-frozen-old-page",
     ],
     MAIN: ["full-application-layer-assembler", "full-application-layer-production-call"],
 }
-TASK1 = {SESSION: ["extracted-materialized-page", "extracted-materialized-dispatch"]}
+TASK1 = {
+    MATERIALIZED: ["extracted-materialized-page"],
+    INPUTS: ["extracted-materialized-dispatch"],
+}
 
 def git_bytes(*args: str) -> bytes:
     return subprocess.check_output(["git", "-C", str(wt), *args])
@@ -1363,6 +1795,16 @@ def check(commit: str, mapping: dict[str, list[str]], label: str) -> None:
     if failed:
         raise SystemExit(f"{label} authority changed")
 
+if mode == "working":
+    for path, names in TASK0.items():
+        text = current(path)
+        for name in names:
+            region(text, name)
+    parent = "fc8646477dd34d92dc5647d158106431aa2e0380"
+    if text_at(parent, SEARCH) != current(SEARCH):
+        raise SystemExit("working external search authority changed")
+    raise SystemExit(0)
+
 task0 = exact_ancestor(TASK0_SUBJECT)
 check(task0, TASK0, "task0")
 if text_at(task0, SEARCH) != current(SEARCH):
@@ -1372,101 +1814,1648 @@ if mode == "both":
     check(task1, TASK1, "task1")
 PY
 }
-run_task0_guard() { run_shared_comment_guard && run_authority_guard task0; }
-run_both_guards() { run_shared_comment_guard && run_authority_guard both; }
+verify_embedded_parent_authority_static() {
+  python3 - "$WT" <<'PY'
+import base64, hashlib, pathlib, re, sys
+path = pathlib.Path(sys.argv[1]) / (
+    "crates/freshell-server/src/"
+    "session_directory_page_bound_authority_fixtures.rs"
+)
+text = path.read_text(encoding="utf-8")
+begin = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_BEGIN */"
+end = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_END */"
+if text.count(begin) != 1 or text.count(end) != 1:
+    raise SystemExit("embedded parent artifact marker count differs")
+region = text.split(begin, 1)[1].split(end, 1)[0]
+b64_region = region.split(
+    "const PINNED_PARENT_COMPLETED_RESPONSE_AUTHORITY_B64", 1
+)[1].split(");", 1)[0]
+parts = re.findall(r'"([A-Za-z0-9+/=]+)"', b64_region)
+hashes = re.findall(r'[0-9a-f]{64}', region)
+if not parts or len(hashes) != 1:
+    raise SystemExit("embedded parent artifact or SHA-256 is absent/ambiguous")
+raw = base64.b64decode("".join(parts), validate=True)
+if hashlib.sha256(raw).hexdigest() != hashes[0]:
+    raise SystemExit("embedded parent artifact SHA-256 mismatch")
+if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+    raise SystemExit("parent artifact must have exactly one trailing LF")
+PY
+}
+
+run_task0_static_guard() {
+  run_shared_comment_guard &&
+    run_authority_guard task0 &&
+    verify_embedded_parent_authority_static
+}
+run_both_static_guards() {
+  run_shared_comment_guard &&
+    run_authority_guard both &&
+    verify_embedded_parent_authority_static
+}
+run_parent_authority_equality() {
+  run_exact_debug \
+    "$TEST_AUTH::parent_authority_case_manifest_has_expected_names_and_count" &&
+  run_exact_debug \
+    "$TEST_AUTH::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens" &&
+  run_exact_debug \
+    "$TEST_AUTH::frozen_old_reference_matches_parent_completed_responses"
+}
+run_task0_precommit_guard() {
+  run_shared_comment_guard &&
+    run_authority_guard working &&
+    verify_embedded_parent_authority_static &&
+    run_parent_authority_equality
+}
+run_task0_guard() {
+  run_task0_static_guard && run_parent_authority_equality
+}
+run_both_guards() {
+  run_both_static_guards &&
+    run_parent_authority_equality &&
+    run_exact_debug \
+      "$TEST_AUTH::extracted_materialized_completed_responses_match_frozen_parent"
+}
 ```
+
+The authority operands are mechanically linked as follows:
+
+| Direct operand | Exact gate | Phase |
+|---|---|---|
+| Embedded artifact schema/hash/name/input/exchange integrity | `parent_authority_case_manifest_has_expected_names_and_count` | Task-0 precommit and every later authority equality gate |
+| Current owner-backed full-app 22-case exchange sequences == embedded artifact | `parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens` | Task-0 precommit/postcommit and every later `run_both_guards` |
+| FrozenOld 21 comparable exchange sequences == embedded artifact | `frozen_old_reference_matches_parent_completed_responses` | Task-0 precommit/postcommit and every later `run_both_guards` |
+| ExtractedMaterialized 21 comparable exchange sequences == embedded artifact | `extracted_materialized_completed_responses_match_frozen_parent` | Task 1 and every later `run_both_guards`; historical test name only, no transitive comparison |
+| Final production owner route == embedded artifact | `g1_completed_full_app_route_matrix_matches_parent` plus `run_both_guards` | Tasks 6, 9, and 10 after the applicable selector state |
+| Recorder reproducibility == decoded embedded artifact | `replay_pinned_parent_authority` | immediately after Task 0 and after Task 10 |
+
+The three tests in `run_parent_authority_equality` perform the direct comparisons
+above. No direct artifact operand may be replaced by equality to another
+strategy.
 
 The exceptional rebaseline protocol replaces these initial subject anchors with
 its reviewed unique hash/subject; normal candidate work never edits this guard.
+
+### Task-0 evidence, pinned-parent capture, and replay helpers
+
+Load this fence in the execution harness before Task 0A. Every function is
+defined before Task 0 begins; definitions may name future files, but no function
+is called before its phase permits those files.
+
+```bash
+set -euo pipefail
+PARENT=fc8646477dd34d92dc5647d158106431aa2e0380
+PARENT_TREE=b4ff70f7ff0d3aab312b61bad0a3a074d1bebf58
+PARENT_SESSION_MONOLITH=crates/freshell-server/src/session_directory.rs
+PARENT_AUTHORITY_FIXTURE=crates/freshell-server/src/session_directory_page_bound_authority_fixtures.rs
+PARENT_TEST='session_directory::pinned_parent_recorder_entrypoint::emit_pinned_parent_completed_responses'
+TOOL_CARGO_HOME="${CARGO_HOME:-${HOME:?HOME is required}/.cargo}"
+TOOL_RUSTUP_HOME="${RUSTUP_HOME:-${HOME:?HOME is required}/.rustup}"
+
+canonical_path() {
+  python3 - "$1" <<'PY'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+path_identity() {
+  python3 - "$1" <<'PY'
+import os, sys
+st = os.stat(sys.argv[1], follow_symlinks=True)
+print(f"{st.st_dev}:{st.st_ino}")
+PY
+}
+
+path_mode() {
+  python3 - "$1" <<'PY'
+import os, stat, sys
+print(f"{stat.S_IMODE(os.stat(sys.argv[1], follow_symlinks=True).st_mode):03o}")
+PY
+}
+
+TASK0_EVIDENCE_OWNED=0
+TASK0_EVIDENCE_ROOT=
+TASK0_EVIDENCE_ID=
+PARENT_RECORDER_BYTES=
+PARENT_ENTRYPOINT_BYTES=
+PARENT_AUTHORITY_OUT=
+PARENT_EMBEDDED_DECODED=
+PRESPLIT_SERVER_TESTS=
+PRESPLIT_TEST_MAP=
+POSTSPLIT_SERVER_TESTS=
+
+PARENT_WORKTREE_TMP=
+PARENT_WORKTREE_TMP_ID=
+PARENT_WORKTREE_TMP_OWNED=0
+PARENT_WT=
+PARENT_WT_EXPECTED=
+PARENT_WT_ID=
+PARENT_WT_GITDIR=
+PARENT_WT_GITDIR_ID=
+PARENT_WT_OWNED=0
+PARENT_BUILD_TMP=
+PARENT_BUILD_TMP_EXPECTED=
+PARENT_BUILD_TMP_ID=
+PARENT_BUILD_TMP_OWNED=0
+
+assert_task0_evidence_owned() {
+  test "${TASK0_EVIDENCE_OWNED:-0}" = 1 || return 1
+  test -n "${TASK0_EVIDENCE_ROOT:-}" &&
+    test -n "${TASK0_EVIDENCE_ID:-}" || return 1
+  test "$(canonical_path "$TASK0_EVIDENCE_ROOT")" = "$TASK0_EVIDENCE_ROOT" ||
+    return 1
+  test "$(path_mode "$TASK0_EVIDENCE_ROOT")" = 700 || return 1
+  test "$(path_identity "$TASK0_EVIDENCE_ROOT")" = "$TASK0_EVIDENCE_ID"
+}
+
+init_task0_evidence_root() {
+  test "${TASK0_EVIDENCE_OWNED:-0}" = 0 || return 1
+  TASK0_EVIDENCE_ROOT="$(
+    mktemp -d /tmp/session-directory-task0-evidence.XXXXXXXX
+  )" || return 1
+  test "$(path_mode "$TASK0_EVIDENCE_ROOT")" = 700 || return 1
+  TASK0_EVIDENCE_ROOT="$(canonical_path "$TASK0_EVIDENCE_ROOT")" || return 1
+  TASK0_EVIDENCE_ID="$(path_identity "$TASK0_EVIDENCE_ROOT")" || return 1
+  PARENT_RECORDER_BYTES="$TASK0_EVIDENCE_ROOT/pinned-parent-recorder.rs"
+  PARENT_ENTRYPOINT_BYTES="$TASK0_EVIDENCE_ROOT/pinned-parent-entrypoint.rs"
+  PARENT_AUTHORITY_OUT="$TASK0_EVIDENCE_ROOT/parent-completed-responses.json"
+  PARENT_EMBEDDED_DECODED="$TASK0_EVIDENCE_ROOT/embedded-parent-completed-responses.json"
+  PRESPLIT_SERVER_TESTS="$TASK0_EVIDENCE_ROOT/pre-split-server-tests.txt"
+  PRESPLIT_TEST_MAP="$TASK0_EVIDENCE_ROOT/pre-split-test-map.json"
+  POSTSPLIT_SERVER_TESTS="$TASK0_EVIDENCE_ROOT/post-split-server-tests.txt"
+  local child
+  for child in \
+    "$PARENT_RECORDER_BYTES" "$PARENT_ENTRYPOINT_BYTES" \
+    "$PARENT_AUTHORITY_OUT" "$PARENT_EMBEDDED_DECODED" \
+    "$PRESPLIT_SERVER_TESTS" "$PRESPLIT_TEST_MAP" "$POSTSPLIT_SERVER_TESTS"
+  do
+    test ! -e "$child" || return 1
+  done
+  TASK0_EVIDENCE_OWNED=1
+  assert_task0_evidence_owned
+}
+
+extract_active_parent_recorder() {
+  assert_task0_evidence_owned || return 1
+  test ! -e "$PARENT_RECORDER_BYTES" || return 1
+  python3 - "$WT" "$PARENT" "$PARENT_SESSION_MONOLITH" \
+    "$PARENT_RECORDER_BYTES" <<'PY'
+import hashlib, pathlib, subprocess, sys
+wt, parent, rel, output = sys.argv[1:]
+path = pathlib.Path(wt) / rel
+data = path.read_bytes()
+outer_begin = (
+    b"/* SESSION_DIRECTORY_AUTHORITY_BEGIN:"
+    b"parent-authority-pinned-recorder */"
+)
+outer_end = (
+    b"/* SESSION_DIRECTORY_AUTHORITY_END:"
+    b"parent-authority-pinned-recorder */"
+)
+inner_begin = b"/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_BEGIN */"
+inner_end = b"/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_END */"
+for marker in (outer_begin, outer_end, inner_begin, inner_end):
+    if data.count(marker) != 1:
+        raise SystemExit(f"recorder marker count differs: {marker!r}")
+start = data.index(outer_begin)
+stop = data.index(outer_end, start) + len(outer_end)
+if data[stop:stop + 1] != b"\n":
+    raise SystemExit("outer recorder region lacks exactly one terminating LF")
+stop += 1
+region = data[start:stop]
+pinned = subprocess.check_output(["git", "-C", wt, "show", f"{parent}:{rel}"])
+if data[:start] + data[stop:] != pinned:
+    raise SystemExit("removing active recorder does not yield pinned monolith")
+for unchanged in (
+    "crates/freshell-server/src/main.rs",
+    "crates/freshell-sessions/src/search.rs",
+    "test/fixtures/sessions/real-corrupted.jsonl",
+    "test/fixtures/sessions/healthy.jsonl",
+):
+    active = (pathlib.Path(wt) / unchanged).read_bytes()
+    expected = subprocess.check_output(
+        ["git", "-C", wt, "show", f"{parent}:{unchanged}"]
+    )
+    if active != expected:
+        raise SystemExit(f"active parent input changed: {unchanged}")
+
+def rust_tokens(source: str, label: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    while i < len(source):
+        if source[i].isspace():
+            i += 1
+            continue
+        if source.startswith("//", i):
+            newline = source.find("\n", i + 2)
+            i = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", i):
+            depth = 1
+            i += 2
+            while i < len(source) and depth:
+                if source.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                elif source.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                raise SystemExit(f"{label}: unterminated block comment")
+            continue
+
+        raw_end = None
+        for prefix in ("br", "rb", "r"):
+            if not source.startswith(prefix, i):
+                continue
+            cursor = i + len(prefix)
+            hashes = 0
+            while cursor < len(source) and source[cursor] == "#":
+                hashes += 1
+                cursor += 1
+            if cursor < len(source) and source[cursor] == '"':
+                closing = '"' + ("#" * hashes)
+                stop = source.find(closing, cursor + 1)
+                if stop < 0:
+                    raise SystemExit(f"{label}: unterminated raw string")
+                raw_end = stop + len(closing)
+                break
+        if raw_end is not None:
+            tokens.append(source[i:raw_end])
+            i = raw_end
+            continue
+
+        token_start = i
+        quote_index = None
+        if source.startswith('b"', i) or source.startswith("b'", i):
+            quote_index = i + 1
+        elif source[i] in {'"', "'"}:
+            quote_index = i
+        if quote_index is not None and source[quote_index] == "'":
+            next_index = quote_index + 1
+            if next_index < len(source) and (
+                source[next_index].isalpha() or source[next_index] == "_"
+            ):
+                lifetime_end = next_index + 1
+                while lifetime_end < len(source) and (
+                    source[lifetime_end].isalnum() or source[lifetime_end] == "_"
+                ):
+                    lifetime_end += 1
+                if lifetime_end >= len(source) or source[lifetime_end] != "'":
+                    tokens.append(source[token_start:lifetime_end])
+                    i = lifetime_end
+                    continue
+        if quote_index is not None:
+            quote = source[quote_index]
+            cursor = quote_index + 1
+            while cursor < len(source):
+                if source[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if source[cursor] == quote:
+                    cursor += 1
+                    tokens.append(source[token_start:cursor])
+                    i = cursor
+                    break
+                cursor += 1
+            else:
+                raise SystemExit(f"{label}: unterminated quoted literal")
+            continue
+
+        if source[i].isalpha() or source[i] == "_":
+            cursor = i + 1
+            while cursor < len(source) and (
+                source[cursor].isalnum() or source[cursor] == "_"
+            ):
+                cursor += 1
+            tokens.append(source[i:cursor])
+            i = cursor
+            continue
+        if source[i].isdigit():
+            cursor = i + 1
+            while cursor < len(source) and (
+                source[cursor].isalnum() or source[cursor] in "_."
+            ):
+                cursor += 1
+            tokens.append(source[i:cursor])
+            i = cursor
+            continue
+        tokens.append(source[i])
+        i += 1
+    return tokens
+
+
+def normalized_layer_calls(source: str, label: str) -> list[tuple[str, ...]]:
+    tokens = rust_tokens(source, label)
+    calls: list[tuple[str, ...]] = []
+    i = 0
+    while i + 2 < len(tokens):
+        if tokens[i : i + 3] != [".", "layer", "("]:
+            i += 1
+            continue
+        depth = 0
+        for stop in range(i + 2, len(tokens)):
+            if tokens[stop] == "(":
+                depth += 1
+            elif tokens[stop] == ")":
+                depth -= 1
+                if depth == 0:
+                    calls.append(tuple(tokens[i : stop + 1]))
+                    i = stop + 1
+                    break
+                if depth < 0:
+                    raise SystemExit(f"{label}: malformed layer call")
+        else:
+            raise SystemExit(f"{label}: unterminated layer call")
+    if len(calls) != 3:
+        raise SystemExit(
+            f"{label}: expected exactly three layer calls, found {len(calls)}"
+        )
+    return calls
+
+pinned_main = subprocess.check_output(
+    ["git", "-C", wt, "show", f"{parent}:crates/freshell-server/src/main.rs"]
+).decode("utf-8")
+recorder_layers = normalized_layer_calls(region.decode("utf-8"), "recorder")
+main_layers = normalized_layer_calls(pinned_main, "pinned main.rs")
+if recorder_layers != main_layers:
+    raise SystemExit(
+        "recorder full-application layer chain differs from pinned main.rs"
+    )
+
+inner_start = region.index(inner_begin)
+inner_stop = region.index(inner_end, inner_start) + len(inner_end)
+if region[inner_stop:inner_stop + 1] != b"\n":
+    raise SystemExit("inner recorder hash region lacks one LF")
+print("recorder_sha256=" + hashlib.sha256(
+    region[inner_start:inner_stop + 1]
+).hexdigest())
+pathlib.Path(output).open("xb").write(region)
+PY
+  assert_task0_evidence_owned
+}
+
+validate_parent_provenance() {
+  python3 - "$WT" "$PARENT" "$PARENT_TREE" <<'PY'
+import json, subprocess, sys
+wt, parent, tree = sys.argv[1:]
+actual_tree = subprocess.check_output(
+    ["git", "-C", wt, "show", "-s", "--format=%T", parent], text=True
+).strip()
+if actual_tree != tree:
+    raise SystemExit(f"parent tree mismatch: {actual_tree} != {tree}")
+expected = {
+    "crates/freshell-server/src/session_directory.rs": "843f98c896d30650c2fc8c3ccb77f4635272d984",
+    "crates/freshell-server/src/main.rs": "346e7d96432f61c6699461d2c58f97406ae36bbe",
+    "crates/freshell-sessions/src/search.rs": "8da06ea083e1ae651c61fea186f67dcef906d5a8",
+    "crates/freshell-sessions/src/parse/opencode.rs": "684003ab22ba10d6154e5fd11c95b5a885bfd1ce",
+    "crates/freshell-sessions/src/amplifier.rs": "313ecf588daef15530e2048d66c5dbce1cf627ef",
+    "test/fixtures/sessions/real-corrupted.jsonl": "c3ae6eb134e66303f2cf901bdbc895fc85d71b52",
+    "test/fixtures/sessions/healthy.jsonl": "1e67a84c5acdf949c8953481280362a96bfbc453",
+}
+actual = {
+    path: subprocess.check_output(
+        ["git", "-C", wt, "rev-parse", f"{parent}:{path}"], text=True
+    ).strip()
+    for path in expected
+}
+if actual != expected:
+    raise SystemExit(
+        "pinned provenance mismatch: "
+        + json.dumps({"expected": expected, "actual": actual}, sort_keys=True)
+    )
+def json_lines(path):
+    raw = subprocess.check_output(["git", "-C", wt, "show", f"{parent}:{path}"])
+    return [
+        json.loads(line)
+        for line in raw.decode("utf-8").splitlines()
+        if line.strip()
+    ]
+corrupt = json_lines("test/fixtures/sessions/real-corrupted.jsonl")
+healthy = json_lines("test/fixtures/sessions/healthy.jsonl")
+visible_ids = sorted({
+    row["sessionId"] for row in corrupt
+    if isinstance(row, dict) and isinstance(row.get("sessionId"), str)
+})
+excluded_ids = sorted({
+    row["session_id"] for row in healthy
+    if isinstance(row, dict) and isinstance(row.get("session_id"), str)
+})
+if visible_ids != ["b7936c10-4935-441c-837c-c1f33cafec2d"]:
+    raise SystemExit(f"unexpected visible fixture IDs: {visible_ids!r}")
+if excluded_ids != ["healthy-session-id"]:
+    raise SystemExit(f"unexpected cwd-less fixture IDs: {excluded_ids!r}")
+PY
+}
+
+assert_parent_worktree_record() {
+  local mode="$1"
+  python3 - "$WT" "$PARENT_WT_EXPECTED" "$PARENT" "$mode" <<'PY'
+import os, subprocess, sys
+wt, expected, parent, mode = sys.argv[1:]
+raw = subprocess.check_output(
+    ["git", "-C", wt, "worktree", "list", "--porcelain", "-z"]
+)
+records = []
+for block in raw.split(b"\0\0"):
+    if not block:
+        continue
+    record, flags = {}, set()
+    for field in block.split(b"\0"):
+        if not field:
+            continue
+        if b" " in field:
+            key, value = field.split(b" ", 1)
+            record[key.decode()] = os.fsdecode(value)
+        else:
+            flags.add(field.decode())
+    record["flags"] = flags
+    records.append(record)
+matches = [
+    record for record in records
+    if os.path.realpath(record.get("worktree", "")) == expected
+]
+if mode == "absent":
+    if matches:
+        raise SystemExit(f"parent path already registered: {matches!r}")
+elif mode == "owned":
+    if len(matches) != 1:
+        raise SystemExit(f"expected one parent registration: {matches!r}")
+    record = matches[0]
+    if record.get("HEAD") != parent or "detached" not in record["flags"]:
+        raise SystemExit(f"parent registration identity changed: {record!r}")
+    if {"locked", "prunable"} & (set(record) | record["flags"]):
+        raise SystemExit(f"parent registration locked/prunable: {record!r}")
+else:
+    raise SystemExit(f"invalid parent registration mode: {mode}")
+PY
+}
+
+assert_parent_build_root_owned() {
+  test "${PARENT_BUILD_TMP_OWNED:-0}" = 1 || return 1
+  test "$(canonical_path "$PARENT_BUILD_TMP")" = "$PARENT_BUILD_TMP_EXPECTED" ||
+    return 1
+  test "$(path_mode "$PARENT_BUILD_TMP")" = 700 || return 1
+  test "$(path_identity "$PARENT_BUILD_TMP")" = "$PARENT_BUILD_TMP_ID" ||
+    return 1
+  local child
+  for child in home tmp target; do
+    test -d "$PARENT_BUILD_TMP/$child" &&
+      test ! -L "$PARENT_BUILD_TMP/$child" || return 1
+  done
+}
+
+assert_parent_worktree_identity() {
+  test "${PARENT_WORKTREE_TMP_OWNED:-0}" = 1 || return 1
+  test -n "${PARENT_WORKTREE_TMP:-}" &&
+    test -n "${PARENT_WORKTREE_TMP_ID:-}" &&
+    test -n "${PARENT_WT:-}" &&
+    test -n "${PARENT_WT_EXPECTED:-}" &&
+    test -n "${PARENT_WT_ID:-}" &&
+    test -n "${PARENT_WT_GITDIR:-}" &&
+    test -n "${PARENT_WT_GITDIR_ID:-}" || return 1
+  test -d "$PARENT_WORKTREE_TMP" &&
+    test ! -L "$PARENT_WORKTREE_TMP" || return 1
+  test "$(canonical_path "$PARENT_WORKTREE_TMP")" = \
+    "$PARENT_WORKTREE_TMP" || return 1
+  test "$(path_mode "$PARENT_WORKTREE_TMP")" = 700 || return 1
+  test "$(path_identity "$PARENT_WORKTREE_TMP")" = \
+    "$PARENT_WORKTREE_TMP_ID" || return 1
+  assert_parent_worktree_record owned || return 1
+  test -d "$PARENT_WT" && test ! -L "$PARENT_WT" || return 1
+  test "$(canonical_path "$PARENT_WT")" = "$PARENT_WT_EXPECTED" ||
+    return 1
+  test "$(path_identity "$PARENT_WT")" = "$PARENT_WT_ID" || return 1
+  test "$(canonical_path \
+    "$(git -C "$PARENT_WT" rev-parse --show-toplevel)")" = \
+    "$PARENT_WT_EXPECTED" || return 1
+  test "$(git -C "$PARENT_WT" rev-parse HEAD)" = "$PARENT" || return 1
+  test "$(canonical_path \
+    "$(git -C "$PARENT_WT" rev-parse --absolute-git-dir)")" = \
+    "$PARENT_WT_GITDIR" || return 1
+  test "$(path_identity "$PARENT_WT_GITDIR")" = \
+    "$PARENT_WT_GITDIR_ID" || return 1
+}
+
+assert_parent_capture_identity() {
+  assert_parent_worktree_identity || return 1
+  assert_parent_build_root_owned
+}
+
+assert_parent_capture_owned() {
+  test "${PARENT_WT_OWNED:-0}" = 1 || return 1
+  assert_parent_capture_identity
+}
+
+create_parent_capture_scratch() {
+  local clean_status
+  test "${PARENT_WT_OWNED:-0}" = 0 || return 1
+  test "${PARENT_BUILD_TMP_OWNED:-0}" = 0 || return 1
+  PARENT_WORKTREE_TMP="$(
+    mktemp -d /tmp/session-directory-parent-worktree.XXXXXXXX
+  )" || return 1
+  test "$(path_mode "$PARENT_WORKTREE_TMP")" = 700 || return 1
+  PARENT_WORKTREE_TMP="$(canonical_path "$PARENT_WORKTREE_TMP")" || return 1
+  PARENT_WORKTREE_TMP_ID="$(path_identity "$PARENT_WORKTREE_TMP")" || return 1
+  PARENT_WORKTREE_TMP_OWNED=1
+  PARENT_WT="$PARENT_WORKTREE_TMP/worktree"
+  PARENT_WT_EXPECTED="$(canonical_path "$PARENT_WT")" || return 1
+  test ! -e "$PARENT_WT" || return 1
+  assert_parent_worktree_record absent || return 1
+  if git -C "$WT" cat-file -e "$PARENT:.gitattributes" 2>/dev/null; then
+    printf 'pinned parent has .gitattributes; refusing filtered checkout\n' >&2
+    return 1
+  fi
+  local common_attributes
+  common_attributes="$(git -C "$WT" rev-parse --git-path info/attributes)" ||
+    return 1
+  test ! -s "$common_attributes" || return 1
+
+  PARENT_BUILD_TMP="$(
+    mktemp -d /tmp/session-directory-parent-build.XXXXXXXX
+  )" || return 1
+  test "$(path_mode "$PARENT_BUILD_TMP")" = 700 || return 1
+  PARENT_BUILD_TMP="$(canonical_path "$PARENT_BUILD_TMP")" || return 1
+  PARENT_BUILD_TMP_EXPECTED="$PARENT_BUILD_TMP"
+  PARENT_BUILD_TMP_ID="$(path_identity "$PARENT_BUILD_TMP")" || return 1
+  mkdir "$PARENT_BUILD_TMP/home" "$PARENT_BUILD_TMP/tmp" \
+    "$PARENT_BUILD_TMP/target" || return 1
+  PARENT_BUILD_TMP_OWNED=1
+  test -d "$TOOL_CARGO_HOME" && test "${TOOL_CARGO_HOME#/}" != \
+    "$TOOL_CARGO_HOME" || return 1
+  test -d "$TOOL_RUSTUP_HOME" && test "${TOOL_RUSTUP_HOME#/}" != \
+    "$TOOL_RUSTUP_HOME" || return 1
+
+  export GIT_CONFIG_GLOBAL=/dev/null
+  export GIT_CONFIG_SYSTEM=/dev/null
+  trap cleanup_parent_capture_scratch EXIT
+  git -C "$WT" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c core.untrackedCache=false -c core.attributesFile=/dev/null \
+    worktree add --detach "$PARENT_WT" "$PARENT" || return 1
+  assert_parent_worktree_record owned || return 1
+  test "$(canonical_path "$PARENT_WT")" = "$PARENT_WT_EXPECTED" ||
+    return 1
+  test "$(git -C "$PARENT_WT" rev-parse HEAD)" = "$PARENT" || return 1
+  PARENT_WT_ID="$(path_identity "$PARENT_WT")" || return 1
+  PARENT_WT_GITDIR="$(canonical_path \
+    "$(git -C "$PARENT_WT" rev-parse --absolute-git-dir)")" || return 1
+  PARENT_WT_GITDIR_ID="$(path_identity "$PARENT_WT_GITDIR")" || return 1
+
+  # Ownership is still false. Verify every captured root/worktree/gitdir/build
+  # identity once, read clean status with its exit status preserved, then repeat
+  # the same complete identity predicate before setting ownership.
+  assert_parent_capture_identity || return 1
+  clean_status="$(git -C "$PARENT_WT" -c core.fsmonitor=false \
+    -c core.untrackedCache=false status --porcelain=v1 \
+    --untracked-files=all)" || return 1
+  test -z "$clean_status" || return 1
+  assert_parent_capture_identity || return 1
+  PARENT_WT_OWNED=1
+  assert_parent_capture_owned
+}
+
+write_exact_parent_entrypoint() {
+  local root="$1" root_id="$2" path="$3"
+  test "$(canonical_path "$root")" = "$root" || return 1
+  test "$(path_mode "$root")" = 700 || return 1
+  test "$(path_identity "$root")" = "$root_id" || return 1
+  test "$(canonical_path "${path%/*}")" = "$root" || return 1
+  test ! -e "$path" || return 1
+  (umask 077; set -o noclobber; cat >"$path" <<'RS'
+#[cfg(test)]
+mod pinned_parent_recorder_entrypoint {
+    #[tokio::test]
+    #[ignore = "pinned-parent response recorder; run explicitly"]
+    async fn emit_pinned_parent_completed_responses() {
+        crate::session_directory::pinned_parent_recorder::
+            write_pinned_parent_completed_responses_from_env()
+            .await
+            .expect("write canonical pinned-parent completed responses");
+    }
+}
+RS
+  )
+}
+
+assert_parent_append_only_delta() {
+  local recorder="$1" entrypoint="$2"
+  assert_parent_capture_owned || return 1
+  python3 - "$PARENT_WT" "$PARENT" "$PARENT_SESSION_MONOLITH" \
+    "$recorder" "$entrypoint" <<'PY'
+import pathlib, subprocess, sys
+wt, parent, rel, recorder, entrypoint = sys.argv[1:]
+base = subprocess.check_output(["git", "-C", wt, "show", f"{parent}:{rel}"])
+expected = base + pathlib.Path(recorder).read_bytes() + pathlib.Path(entrypoint).read_bytes()
+if (pathlib.Path(wt) / rel).read_bytes() != expected:
+    raise SystemExit("parent scratch is not exact append-only bytes")
+status = subprocess.check_output([
+    "git", "-C", wt, "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false", "status", "--porcelain=v1",
+    "-z", "--untracked-files=all",
+])
+expected_status = b" M " + rel.encode() + b"\0"
+if status != expected_status:
+    raise SystemExit(f"parent scratch delta differs: {status!r}")
+PY
+  assert_parent_capture_owned
+}
+
+append_parent_recorder_suffix() {
+  local recorder="$1" entrypoint="$2"
+  assert_parent_capture_owned || return 1
+  test -f "$recorder" && test ! -L "$recorder" || return 1
+  test -f "$entrypoint" && test ! -L "$entrypoint" || return 1
+  python3 - "$PARENT_WT" "$PARENT" "$PARENT_SESSION_MONOLITH" \
+    "$recorder" "$entrypoint" <<'PY'
+import pathlib, subprocess, sys
+wt, parent, rel, recorder, entrypoint = sys.argv[1:]
+path = pathlib.Path(wt) / rel
+base = subprocess.check_output(["git", "-C", wt, "show", f"{parent}:{rel}"])
+if path.read_bytes() != base:
+    raise SystemExit("parent monolith changed before append")
+path.write_bytes(base + pathlib.Path(recorder).read_bytes() + pathlib.Path(entrypoint).read_bytes())
+PY
+  assert_parent_append_only_delta "$recorder" "$entrypoint"
+}
+
+validate_parent_completed_response_artifact() {
+  local artifact="$1" recorder="$2"
+  python3 - "$artifact" "$recorder" "$PARENT" "$PARENT_TREE" <<'PY'
+import base64, hashlib, json, pathlib, re, sys
+artifact_path, recorder_path, parent, tree = sys.argv[1:]
+raw = pathlib.Path(artifact_path).read_bytes()
+if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+    raise SystemExit("artifact must have exactly one trailing LF")
+value = json.loads(raw)
+canonical = json.dumps(
+    value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+).encode("utf-8") + b"\n"
+if raw != canonical:
+    raise SystemExit("artifact is not canonical JSON")
+expected_names = [
+    "no_index_no_query_empty_colors", "empty_snapshot_no_query_empty_colors",
+    "no_query_composed_without_colors", "no_query_composed_with_ordered_colors",
+    "title_annotation_cursor_with_ordered_colors", "title_snippet_139_scalars",
+    "title_snippet_140_scalars", "title_snippet_141_scalars",
+    "user_messages_success", "user_messages_cursor_page",
+    "user_messages_budget_partial", "user_messages_io_partial",
+    "full_text_success", "full_text_cursor_page", "full_text_budget_partial",
+    "invalid_priority_limit_and_tier",
+    "invalid_cursor_derivation_error_no_colors", "request_revision_is_ignored",
+    "single_identity_running_join", "project_color_order_on_title_route",
+    "project_color_order_on_user_messages_route",
+    "project_color_order_on_full_text_route",
+]
+if value.get("schema") != "freshell.session-directory.parent-responses.v1":
+    raise SystemExit("artifact schema mismatch")
+if value.get("parent_commit") != parent or value.get("parent_tree") != tree:
+    raise SystemExit("artifact parent identity mismatch")
+if set(value) != {
+    "schema", "parent_commit", "parent_tree", "source_blobs",
+    "recorder_sha256", "manifest_sha256", "cases",
+}:
+    raise SystemExit("artifact top-level keys mismatch")
+expected_blobs = {
+    "crates/freshell-server/src/session_directory.rs": "843f98c896d30650c2fc8c3ccb77f4635272d984",
+    "crates/freshell-server/src/main.rs": "346e7d96432f61c6699461d2c58f97406ae36bbe",
+    "crates/freshell-sessions/src/search.rs": "8da06ea083e1ae651c61fea186f67dcef906d5a8",
+    "crates/freshell-sessions/src/parse/opencode.rs": "684003ab22ba10d6154e5fd11c95b5a885bfd1ce",
+    "crates/freshell-sessions/src/amplifier.rs": "313ecf588daef15530e2048d66c5dbce1cf627ef",
+    "test/fixtures/sessions/real-corrupted.jsonl": "c3ae6eb134e66303f2cf901bdbc895fc85d71b52",
+    "test/fixtures/sessions/healthy.jsonl": "1e67a84c5acdf949c8953481280362a96bfbc453",
+}
+if value.get("source_blobs") != expected_blobs:
+    raise SystemExit("artifact source blob map mismatch")
+cases = value.get("cases")
+if not isinstance(cases, list) or [case.get("name") for case in cases] != expected_names:
+    raise SystemExit("artifact case names/order mismatch")
+comparable = [case["name"] for case in cases if case.get("strategy_comparable")]
+if len(comparable) != 21 or "invalid_priority_limit_and_tier" in comparable:
+    raise SystemExit("artifact comparable projection mismatch")
+digests = [case.get("owner_input_sha256") for case in cases]
+if len(set(digests)) != 22 or any(
+    not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+    for item in digests
+):
+    raise SystemExit("owner input digests invalid/nonunique")
+for case in cases:
+    if set(case) != {
+        "name", "strategy_comparable", "owner_input_sha256", "exchanges"
+    }:
+        raise SystemExit(f"case keys mismatch: {case.get('name')}")
+    exchanges = case.get("exchanges")
+    expected_count = 2 if case["name"] in {
+        "user_messages_cursor_page", "full_text_cursor_page"
+    } else 1
+    if not isinstance(exchanges, list) or len(exchanges) != expected_count:
+        raise SystemExit(f"exchange count mismatch: {case['name']}")
+    for exchange in exchanges:
+        if set(exchange) != {"request", "status", "content_type", "body_base64"}:
+            raise SystemExit("exchange keys mismatch")
+        request = exchange.get("request")
+        if set(request or {}) != {"method", "uri", "ordered_headers"}:
+            raise SystemExit("request shape mismatch")
+        if request["method"] != "GET" or not isinstance(request["ordered_headers"], list):
+            raise SystemExit("request method/header order mismatch")
+        expected_status = 400 if case["name"] in {
+            "invalid_priority_limit_and_tier",
+            "invalid_cursor_derivation_error_no_colors",
+        } else 200
+        if exchange.get("status") != expected_status:
+            raise SystemExit(f"status mismatch: {case['name']}")
+        if exchange.get("content_type") != "application/json; charset=utf-8":
+            raise SystemExit("content type mismatch")
+        body = base64.b64decode(exchange.get("body_base64", ""), validate=True)
+        if not body:
+            raise SystemExit("empty response body")
+recorder = pathlib.Path(recorder_path).read_bytes()
+inner_begin = b"/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_BEGIN */"
+inner_end = b"/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_END */"
+start = recorder.index(inner_begin)
+stop = recorder.index(inner_end, start) + len(inner_end) + 1
+if value.get("recorder_sha256") != hashlib.sha256(recorder[start:stop]).hexdigest():
+    raise SystemExit("recorder hash mismatch")
+projection = [
+    {
+        "name": case["name"],
+        "strategy_comparable": case["strategy_comparable"],
+        "owner_input_sha256": case["owner_input_sha256"],
+        "requests": [exchange["request"] for exchange in case["exchanges"]],
+    }
+    for case in cases
+]
+manifest = json.dumps(
+    projection, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+).encode("utf-8")
+if value.get("manifest_sha256") != hashlib.sha256(manifest).hexdigest():
+    raise SystemExit("manifest hash mismatch")
+print("artifact_sha256=" + hashlib.sha256(raw).hexdigest())
+PY
+}
+
+run_parent_recorder_exact() {
+  local output="$1" recorder="$2"
+  assert_parent_capture_owned || return 1
+  assert_parent_append_only_delta "$recorder" "$PARENT_ENTRYPOINT_BYTES" ||
+    return 1
+  assert_parent_build_root_owned || return 1
+  test ! -e "$output" || return 1
+  command -v unshare >/dev/null || return 1
+  command -v timeout >/dev/null || return 1
+  run_cargo_test_success 1 \
+    timeout --signal=TERM --kill-after=10s 20m \
+    unshare --user --map-root-user --net \
+    env -i \
+      PATH="$PATH" \
+      HOME="$PARENT_BUILD_TMP/home" \
+      TMPDIR="$PARENT_BUILD_TMP/tmp" \
+      CARGO_HOME="$TOOL_CARGO_HOME" \
+      RUSTUP_HOME="$TOOL_RUSTUP_HOME" \
+      CARGO_TARGET_DIR="$PARENT_BUILD_TMP/target" \
+      CARGO_TERM_COLOR=never \
+      CARGO_NET_OFFLINE=true \
+      CLAUDE_HOME="$PARENT_BUILD_TMP/home/no-claude" \
+      CODEX_HOME="$PARENT_BUILD_TMP/home/no-codex" \
+      XDG_DATA_HOME="$PARENT_BUILD_TMP/home/no-xdg" \
+      LOCALAPPDATA="$PARENT_BUILD_TMP/home/no-localappdata" \
+      FRESHELL_AMPLIFIER_HOME="$PARENT_BUILD_TMP/home/no-amplifier" \
+      FRESHELL_HOME="$PARENT_BUILD_TMP/home/freshell" \
+      FRESHELL_PARENT_AUTHORITY_OUT="$output" \
+      cargo test --offline --color=never \
+        --manifest-path "$PARENT_WT/Cargo.toml" \
+        -p freshell-server --bin freshell-server "$PARENT_TEST" -- \
+        --exact --ignored --nocapture --color=never --test-threads=1
+  assert_parent_capture_owned || return 1
+  assert_parent_append_only_delta "$recorder" "$PARENT_ENTRYPOINT_BYTES" ||
+    return 1
+  assert_parent_build_root_owned || return 1
+  test -s "$output" || return 1
+  validate_parent_completed_response_artifact "$output" "$recorder"
+}
+
+restore_parent_append_only_suffix() {
+  local recorder="$1" entrypoint="$2"
+  assert_parent_append_only_delta "$recorder" "$entrypoint" || return 1
+  python3 - "$PARENT_WT" "$PARENT" "$PARENT_SESSION_MONOLITH" \
+    "$recorder" "$entrypoint" <<'PY'
+import pathlib, subprocess, sys
+wt, parent, rel, recorder, entrypoint = sys.argv[1:]
+path = pathlib.Path(wt) / rel
+base = subprocess.check_output(["git", "-C", wt, "show", f"{parent}:{rel}"])
+suffix = pathlib.Path(recorder).read_bytes() + pathlib.Path(entrypoint).read_bytes()
+data = path.read_bytes()
+if data != base + suffix:
+    raise SystemExit("refusing non-exact parent suffix removal")
+path.write_bytes(base)
+PY
+  assert_parent_capture_owned || return 1
+  test -z "$(git -C "$PARENT_WT" -c core.fsmonitor=false \
+    -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all)"
+}
+
+assert_parent_build_root_after_clean() {
+  test "${PARENT_BUILD_TMP_OWNED:-0}" = 1 || return 1
+  test -d "$PARENT_BUILD_TMP" && test ! -L "$PARENT_BUILD_TMP" ||
+    return 1
+  test "$(canonical_path "$PARENT_BUILD_TMP")" = \
+    "$PARENT_BUILD_TMP_EXPECTED" || return 1
+  test "$(path_mode "$PARENT_BUILD_TMP")" = 700 || return 1
+  test "$(path_identity "$PARENT_BUILD_TMP")" = \
+    "$PARENT_BUILD_TMP_ID" || return 1
+  test ! -e "$PARENT_BUILD_TMP/target" || return 1
+  python3 - "$PARENT_BUILD_TMP" <<'PY'
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+entries = list(os.scandir(root))
+if {entry.name for entry in entries} != {"home", "tmp"}:
+    raise SystemExit("post-clean build root has unexpected entries")
+for entry in entries:
+    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+        raise SystemExit(f"post-clean child type changed: {entry.name}")
+    with os.scandir(entry.path) as children:
+        if next(children, None) is not None:
+            raise SystemExit(f"post-clean child is not empty: {entry.name}")
+PY
+}
+
+cleanup_parent_capture_scratch() {
+  local original_status="$?" cleanup_status=0 status
+  trap - EXIT
+
+  if test "${PARENT_WT_OWNED:-0}" != 1 ||
+     test "${PARENT_WORKTREE_TMP_OWNED:-0}" != 1 ||
+     test "${PARENT_BUILD_TMP_OWNED:-0}" != 1; then
+    printf 'partial/unowned parent capture state preserved\n' >&2
+    test "$original_status" -ne 0 && return "$original_status"
+    return 1
+  fi
+
+  # No destructive transition is reachable unless full ownership, a successful
+  # clean-status command, an empty status, and a second full ownership check pass.
+  if ! assert_parent_capture_owned; then
+    cleanup_status=1
+  elif ! status="$(git -C "$PARENT_WT" -c core.fsmonitor=false \
+      -c core.untrackedCache=false status --porcelain=v1 \
+      --untracked-files=all)"; then
+    cleanup_status=1
+  elif test -n "$status"; then
+    cleanup_status=1
+  elif ! assert_parent_capture_owned; then
+    cleanup_status=1
+  fi
+
+  if test "$cleanup_status" = 0; then
+    assert_parent_build_root_owned || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    cargo clean --manifest-path "$PARENT_WT/Cargo.toml" \
+      --target-dir "$PARENT_BUILD_TMP/target" || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    # No-package cargo clean removes the complete target directory. Prove that
+    # transition and exact emptiness of the two remaining known children.
+    assert_parent_build_root_after_clean || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    rmdir "$PARENT_BUILD_TMP/tmp" || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    rmdir "$PARENT_BUILD_TMP/home" || cleanup_status=1
+  fi
+
+  # Build children are now gone, so use the worktree-only identity predicate.
+  # Recheck it around a fresh clean-status read immediately before removal.
+  if test "$cleanup_status" = 0; then
+    assert_parent_worktree_identity || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    if ! status="$(git -C "$PARENT_WT" -c core.fsmonitor=false \
+        -c core.untrackedCache=false status --porcelain=v1 \
+        --untracked-files=all)"; then
+      cleanup_status=1
+    elif test -n "$status"; then
+      cleanup_status=1
+    fi
+  fi
+  if test "$cleanup_status" = 0; then
+    assert_parent_worktree_identity || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    git -C "$WT" worktree remove "$PARENT_WT" || cleanup_status=1
+  fi
+  if test "$cleanup_status" = 0; then
+    if test ! -e "$PARENT_WT" &&
+       assert_parent_worktree_record absent &&
+       test ! -e "$PARENT_WT_GITDIR"; then
+      PARENT_WT_OWNED=0
+    else
+      cleanup_status=1
+    fi
+  fi
+
+  # Clear each root flag only after that exact captured root was revalidated,
+  # removed with rmdir, and proven absent. Every later removal remains gated on
+  # all earlier checks/transitions succeeding.
+  if test "$cleanup_status" = 0; then
+    if test -d "$PARENT_WORKTREE_TMP" &&
+       test ! -L "$PARENT_WORKTREE_TMP" &&
+       test "$(canonical_path "$PARENT_WORKTREE_TMP")" = \
+         "$PARENT_WORKTREE_TMP" &&
+       test "$(path_mode "$PARENT_WORKTREE_TMP")" = 700 &&
+       test "$(path_identity "$PARENT_WORKTREE_TMP")" = \
+         "$PARENT_WORKTREE_TMP_ID" &&
+       rmdir "$PARENT_WORKTREE_TMP" &&
+       test ! -e "$PARENT_WORKTREE_TMP"; then
+      PARENT_WORKTREE_TMP_OWNED=0
+    else
+      cleanup_status=1
+    fi
+  fi
+  if test "$cleanup_status" = 0; then
+    if test -d "$PARENT_BUILD_TMP" &&
+       test ! -L "$PARENT_BUILD_TMP" &&
+       test "$(canonical_path "$PARENT_BUILD_TMP")" = \
+         "$PARENT_BUILD_TMP_EXPECTED" &&
+       test "$(path_mode "$PARENT_BUILD_TMP")" = 700 &&
+       test "$(path_identity "$PARENT_BUILD_TMP")" = \
+         "$PARENT_BUILD_TMP_ID" &&
+       rmdir "$PARENT_BUILD_TMP" &&
+       test ! -e "$PARENT_BUILD_TMP"; then
+      PARENT_BUILD_TMP_OWNED=0
+    else
+      cleanup_status=1
+    fi
+  fi
+
+  if test "$cleanup_status" != 0; then
+    printf 'parent capture cleanup stopped; ambiguous state preserved\n' >&2
+  fi
+  test "$original_status" -eq 0 || return "$original_status"
+  return "$cleanup_status"
+}
+
+capture_parent_artifact_from_recorder() {
+  local recorder="$1" output="$2" entrypoint="$3"
+  local evidence_root="$4" evidence_root_id="$5" run_status=0
+  test "$(canonical_path "$evidence_root")" = "$evidence_root" || return 1
+  test "$(path_mode "$evidence_root")" = 700 || return 1
+  test "$(path_identity "$evidence_root")" = "$evidence_root_id" || return 1
+  test "$(canonical_path "${recorder%/*}")" = "$evidence_root" || return 1
+  test "$(canonical_path "${output%/*}")" = "$evidence_root" || return 1
+  test "$(canonical_path "${entrypoint%/*}")" = "$evidence_root" || return 1
+  test -f "$recorder" && test ! -L "$recorder" || return 1
+  test ! -e "$output" && test ! -e "$entrypoint" || return 1
+  PARENT_ENTRYPOINT_BYTES="$entrypoint"
+  write_exact_parent_entrypoint \
+    "$evidence_root" "$evidence_root_id" "$entrypoint" || return 1
+  create_parent_capture_scratch || return 1
+  append_parent_recorder_suffix "$recorder" "$entrypoint" || return 1
+  assert_parent_append_only_delta "$recorder" "$entrypoint" || return 1
+  run_parent_recorder_exact "$output" "$recorder" || run_status=$?
+  restore_parent_append_only_suffix "$recorder" "$entrypoint" || return 1
+  cleanup_parent_capture_scratch || return 1
+  test -f "$entrypoint" && test ! -L "$entrypoint" || return 1
+  rm -- "$entrypoint" || return 1
+  test "$run_status" -eq 0 || return "$run_status"
+  validate_parent_completed_response_artifact "$output" "$recorder"
+}
+
+capture_pinned_parent_authority() {
+  assert_task0_evidence_owned || return 1
+  validate_parent_provenance || return 1
+  capture_parent_artifact_from_recorder \
+    "$PARENT_RECORDER_BYTES" \
+    "$PARENT_AUTHORITY_OUT" \
+    "$PARENT_ENTRYPOINT_BYTES" \
+    "$TASK0_EVIDENCE_ROOT" \
+    "$TASK0_EVIDENCE_ID"
+}
+
+install_captured_parent_authority() {
+  assert_task0_evidence_owned || return 1
+  validate_parent_completed_response_artifact \
+    "$PARENT_AUTHORITY_OUT" "$PARENT_RECORDER_BYTES" || return 1
+  python3 - "$WT/$PARENT_AUTHORITY_FIXTURE" "$PARENT_AUTHORITY_OUT" \
+    "$PARENT_EMBEDDED_DECODED" <<'PY'
+import base64, hashlib, pathlib, re, sys, textwrap
+source_path, artifact_path, decoded_path = map(pathlib.Path, sys.argv[1:])
+source = source_path.read_text(encoding="utf-8")
+artifact = artifact_path.read_bytes()
+begin = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_BEGIN */"
+end = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_END */"
+if source.count(begin) != 1 or source.count(end) != 1:
+    raise SystemExit("artifact placeholder marker count differs")
+old = source[source.index(begin):source.index(end) + len(end)]
+if old.count("__SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_B64_PLACEHOLDER__") != 1:
+    raise SystemExit("base64 placeholder count differs")
+if old.count("__SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_SHA256_PLACEHOLDER__") != 1:
+    raise SystemExit("hash placeholder count differs")
+chunks = textwrap.wrap(base64.b64encode(artifact).decode("ascii"), 76)
+sha = hashlib.sha256(artifact).hexdigest()
+lines = "\n".join(f'    "{chunk}",' for chunk in chunks)
+new = f'''{begin}
+#[cfg(test)]
+const PINNED_PARENT_COMPLETED_RESPONSE_AUTHORITY_B64: &str = concat!(
+{lines}
+);
+#[cfg(test)]
+const PINNED_PARENT_COMPLETED_RESPONSE_AUTHORITY_SHA256: &str = "{sha}";
+{end}'''
+source_path.write_text(source.replace(old, new, 1), encoding="utf-8")
+written = source_path.read_text(encoding="utf-8")
+region = written.split(begin, 1)[1].split(end, 1)[0]
+b64_region = region.split("concat!(", 1)[1].split(");", 1)[0]
+parts = re.findall(r'"([A-Za-z0-9+/=]+)"', b64_region)
+decoded = base64.b64decode("".join(parts), validate=True)
+if hashlib.sha256(decoded).hexdigest() != sha:
+    raise SystemExit("embedded artifact hash mismatch")
+pathlib.Path(decoded_path).open("xb").write(decoded)
+PY
+  cmp -- "$PARENT_AUTHORITY_OUT" "$PARENT_EMBEDDED_DECODED" || return 1
+  verify_embedded_parent_authority_static
+}
+
+extract_task0_frozen_recorder_and_artifact() {
+  local recorder_output="$1" artifact_output="$2"
+  python3 - "$WT" "$PARENT_AUTHORITY_FIXTURE" \
+    "$recorder_output" "$artifact_output" <<'PY'
+import base64, hashlib, json, pathlib, re, subprocess, sys
+wt, rel, recorder_output, artifact_output = sys.argv[1:]
+subject = "test(session-directory): freeze parent response authority"
+fields = subprocess.check_output(
+    ["git", "-C", wt, "log", "-z", "HEAD", "--format=%H%x00%s"]
+).decode().split("\0")
+matches = [h for h, s in zip(fields[0::2], fields[1::2]) if s == subject]
+if len(matches) != 1:
+    raise SystemExit(f"expected one Task-0 ancestor: {matches!r}")
+text = subprocess.check_output(
+    ["git", "-C", wt, "show", f"{matches[0]}:{rel}"], text=True
+)
+rb = "/* SESSION_DIRECTORY_AUTHORITY_BEGIN:parent-authority-pinned-recorder */"
+re_ = "/* SESSION_DIRECTORY_AUTHORITY_END:parent-authority-pinned-recorder */"
+ab = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_BEGIN */"
+ae = "/* SESSION_DIRECTORY_PINNED_PARENT_ARTIFACT_END */"
+for marker in (rb, re_, ab, ae):
+    if text.count(marker) != 1:
+        raise SystemExit(f"frozen marker count differs: {marker}")
+recorder = text[text.index(rb):text.index(re_) + len(re_)] + "\n"
+artifact_region = text[text.index(ab):text.index(ae) + len(ae)]
+b64_region = artifact_region.split("concat!(", 1)[1].split(");", 1)[0]
+parts = re.findall(r'"([A-Za-z0-9+/=]+)"', b64_region)
+artifact = base64.b64decode("".join(parts), validate=True)
+hashes = re.findall(r'"([0-9a-f]{64})"', artifact_region)
+if len(hashes) != 1 or hashlib.sha256(artifact).hexdigest() != hashes[0]:
+    raise SystemExit("frozen embedded artifact hash mismatch")
+artifact_value = json.loads(artifact)
+inner_begin = "/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_BEGIN */"
+inner_end = "/* SESSION_DIRECTORY_PINNED_PARENT_RECORDER_END */"
+inner = recorder[
+    recorder.index(inner_begin):recorder.index(inner_end) + len(inner_end)
+] + "\n"
+if artifact_value.get("recorder_sha256") != hashlib.sha256(
+    inner.encode()
+).hexdigest():
+    raise SystemExit("frozen recorder/artifact hash mismatch")
+pathlib.Path(recorder_output).open("xb").write(recorder.encode())
+pathlib.Path(artifact_output).open("xb").write(artifact)
+PY
+}
+
+replay_pinned_parent_authority() {
+  local replay_root replay_root_id replay_recorder replay_entrypoint
+  local replay_expected replay_actual
+  replay_root="$(mktemp -d /tmp/session-directory-parent-replay.XXXXXXXX)" ||
+    return 1
+  test "$(path_mode "$replay_root")" = 700 || return 1
+  replay_root="$(canonical_path "$replay_root")" || return 1
+  replay_root_id="$(path_identity "$replay_root")" || return 1
+  replay_recorder="$replay_root/pinned-parent-recorder.rs"
+  replay_entrypoint="$replay_root/pinned-parent-entrypoint.rs"
+  replay_expected="$replay_root/embedded-parent-completed-responses.json"
+  replay_actual="$replay_root/replayed-parent-completed-responses.json"
+  extract_task0_frozen_recorder_and_artifact \
+    "$replay_recorder" "$replay_expected" || return 1
+  validate_parent_completed_response_artifact \
+    "$replay_expected" "$replay_recorder" || return 1
+  capture_parent_artifact_from_recorder \
+    "$replay_recorder" "$replay_actual" "$replay_entrypoint" \
+    "$replay_root" "$replay_root_id" || return 1
+  cmp -- "$replay_expected" "$replay_actual" || return 1
+  test "$(canonical_path "$replay_root")" = "$replay_root" || return 1
+  test "$(path_identity "$replay_root")" = "$replay_root_id" || return 1
+  test ! -e "$replay_entrypoint" || return 1
+  rm -- "$replay_actual" "$replay_expected" "$replay_recorder" || return 1
+  rmdir "$replay_root"
+}
+
+finalize_task0_evidence_after_replay() {
+  assert_task0_evidence_owned || return 1
+  python3 - "$TASK0_EVIDENCE_ROOT" \
+    "$PARENT_RECORDER_BYTES" "$PARENT_AUTHORITY_OUT" \
+    "$PARENT_EMBEDDED_DECODED" "$PRESPLIT_SERVER_TESTS" \
+    "$POSTSPLIT_SERVER_TESTS" "$PRESPLIT_TEST_MAP" <<'PY'
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected = [pathlib.Path(value) for value in sys.argv[2:]]
+if len(expected) != 6 or len(set(expected)) != 6:
+    raise SystemExit("final evidence allowlist must contain six unique paths")
+if any(path.parent != root for path in expected):
+    raise SystemExit("final evidence path escaped the owned root")
+entries = list(os.scandir(root))
+actual_names = [entry.name for entry in entries]
+expected_names = [path.name for path in expected]
+if len(actual_names) != 6 or set(actual_names) != set(expected_names):
+    raise SystemExit(
+        f"final evidence root differs: actual={sorted(actual_names)!r} "
+        f"expected={sorted(expected_names)!r}"
+    )
+for entry in entries:
+    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+        raise SystemExit(
+            f"final evidence entry is not a regular file: {entry.name}"
+        )
+PY
+  assert_task0_evidence_owned || return 1
+  rm -- \
+    "$PARENT_RECORDER_BYTES" "$PARENT_AUTHORITY_OUT" \
+    "$PARENT_EMBEDDED_DECODED" "$PRESPLIT_SERVER_TESTS" \
+    "$POSTSPLIT_SERVER_TESTS" "$PRESPLIT_TEST_MAP" || return 1
+  rmdir "$TASK0_EVIDENCE_ROOT" || return 1
+  test ! -e "$TASK0_EVIDENCE_ROOT" || return 1
+  TASK0_EVIDENCE_OWNED=0
+}
+```
+
+`extract_active_parent_recorder` additionally requires active `main.rs`,
+external `search.rs`, and both transcript fixtures to equal pinned bytes and
+normalizes the recorder's three `.layer(...)` calls against pinned `main.rs`.
+`validate_parent_provenance` retains the committed-fixture semantic checks.
+`create_parent_capture_scratch` also rejects repository/common attributes and
+disables hooks, fsmonitor, untracked cache, system/global config, and checkout
+filters. These checks are mandatory additions to the shown executable bodies,
+not alternative prose-only helpers.
+
+### Complete pre/post-split server-test inventory helpers
+
+The split proves complete compiled binary declaration retention and static
+retention of all 68 donor tests, including cfg-gated tests absent on the
+implementation host. The exact map is:
+
+```text
+session_directory::join_tests::<name> -> session_directory::tests::<name>
+session_directory::tests::<core name> -> session_directory::tests::<core name>
+session_directory::tests::<route name> -> session_directory::route_tests::<name>
+session_directory::tests::<search name> -> session_directory::search_tests::<name>
+every non-session-directory binary test -> unchanged
+```
+
+The harness definitions are:
+
+```bash
+list_all_server_binary_test_declarations() {
+  local output line name count=0
+  output="$(cargo_server_test debug -- \
+    --list --include-ignored --color=never)" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      *': test')
+        name="${line%: test}"
+        test -n "$name" || return 1
+        printf '%s\n' "$name" || return 1
+        count=$((count + 1))
+        ;;
+    esac
+  done <<<"$output"
+  test "$count" -gt 0
+}
+
+capture_presplit_server_test_inventory() {
+  assert_task0_evidence_owned || return 1
+  test ! -e "$PRESPLIT_SERVER_TESTS" &&
+    test ! -e "$PRESPLIT_TEST_MAP" || return 1
+  local declarations
+  declarations="$(list_all_server_binary_test_declarations)" || return 1
+  printf '%s\n' "$declarations" >"$PRESPLIT_SERVER_TESTS" || return 1
+  python3 - "$WT" "$PARENT_SESSION_MONOLITH" \
+    "$PRESPLIT_SERVER_TESTS" "$PRESPLIT_TEST_MAP" <<'PY'
+import hashlib, json, pathlib, re, sys
+wt, monolith_rel, inventory_path, map_path = sys.argv[1:]
+monolith = (pathlib.Path(wt) / monolith_rel).read_text(encoding="utf-8")
+if monolith.count("mod join_tests") != 1 or monolith.count("mod tests") != 1:
+    raise SystemExit("pre-split test modules are absent/ambiguous")
+join = [
+    "provider_display_name_matches_known_providers_and_falls_back_to_raw",
+    "join_running_state_matches_live_terminal_and_sets_running_fields",
+    "join_running_state_no_match_leaves_not_running",
+    "build_live_terminal_session_item_none_without_a_provider",
+    "build_live_terminal_session_item_with_session_id_is_not_live_terminal_only",
+    "live_terminal_item_mirrors_identity_subagent_flag",
+    "build_live_terminal_session_item_without_session_id_is_live_terminal_only",
+    "join_live_terminals_matched_session_yields_one_running_item",
+    "join_live_terminals_unmatched_terminal_synthesizes_one_live_only_item",
+    "join_live_terminals_matched_terminal_is_never_double_emitted",
+    "codex_fresh_terminal_pre_adoption_duplicate_is_transient_pending_locator_adoption",
+]
+core = [
+    "provider_home_ignores_freshell_home_uses_real_home",
+    "provider_home_unix_uses_passwd_entry_when_home_and_userprofile_unset",
+    "provider_home_unix_ignores_userprofile_when_home_unset",
+    "provider_home_unix_treats_empty_home_as_unset_using_passwd_entry",
+    "provider_home_unix_prefers_home_and_never_consults_userprofile",
+    "provider_home_windows_uses_userprofile_never_home",
+    "item_from_meta_maps_fields_and_fallback_session_id",
+    "no_uuid_item_falls_back_to_file_basename",
+    "invalid_utf8_transcript_is_indexed_lossily_like_node",
+    "default_query_hides_non_interactive_fixtures",
+    "include_non_interactive_surfaces_titled_session",
+    "include_empty_surfaces_untitled_sessions_sorted_desc",
+    "r10b_cwdless_repair_fixture_never_surfaces_under_any_flags",
+    "title_search_matches_and_annotates",
+    "cursor_paging_splits_and_round_trips",
+    "invalid_cursor_is_rejected",
+    "missing_home_projects_yields_empty_list",
+    "missing_priority_is_400_invalid_value",
+    "bogus_priority_is_400_same_shape_as_missing",
+    "valid_priorities_are_accepted",
+    "non_numeric_limit_is_400_invalid_type_nan",
+    "empty_limit_string_js_coerces_to_zero_then_too_small",
+    "zero_and_negative_limit_are_too_small",
+    "oversize_limit_is_too_big",
+    "fractional_limit_is_invalid_int",
+    "boundary_limit_values_are_accepted",
+    "multiple_violations_collect_into_one_details_array_priority_then_limit",
+    "badcursor_still_400s_with_original_message_r9_parity_untouched",
+]
+route = [
+    "overrides_overlay_applies_title_summary_archived_and_filters_deleted",
+    "overlay_shape_unchanged_when_no_overrides_archived_always_present",
+    "provider_generated_session_suppresses_dir_override_row",
+    "provider_generated_session_suppresses_first_message_override_row",
+    "provider_generated_session_still_applies_ai_override_row",
+    "provider_generated_session_still_applies_user_override_row",
+    "provider_generated_session_still_applies_absent_source_override_row",
+    "empty_string_title_override_never_applies",
+    "non_provider_generated_session_still_applies_dir_override_row",
+    "suppressed_title_row_still_overlays_summary_and_archived",
+    "b_t1_claude_source_matches_list_claude_sessions_reference_scan",
+    "b_t7_router_get_session_directory_is_backed_by_the_session_index",
+    "session_metadata_session_type_is_joined_onto_directory_items",
+    "session_directory_page_embeds_config_project_colors",
+    "session_directory_page_omits_project_colors_key_when_empty",
+    "b_t8_no_session_index_yields_empty_page",
+    "override_no_rebuild",
+]
+search = [
+    "codex_exec_session_hidden_by_default_surfaced_with_flag",
+    "session_override_applies_to_codex_and_opencode_keys",
+    "global_project_session_reports_real_directory_as_project_path",
+    "tier_user_messages_matches_only_the_user_turn",
+    "tier_full_text_matches_assistant_turn_too",
+    "tier_search_is_case_insensitive",
+    "tier_search_empty_no_match_returns_empty_items_without_partial",
+    "tier_search_combined_with_cursor_pagination",
+    "tier_search_reports_partial_budget_when_scan_budget_exceeded",
+    "invalid_tier_value_is_rejected_with_zod_like_400_shape",
+    "absent_tier_defaults_to_title",
+    "title_tier_search_matches_a_renamed_sessions_override_title",
+]
+sets = {"join": join, "core": core, "route": route, "search": search}
+if [len(join), len(core), len(route), len(search)] != [11, 28, 17, 12]:
+    raise SystemExit("static donor set counts differ")
+flat = [name for values in sets.values() for name in values]
+if len(flat) != 68 or len(set(flat)) != 68:
+    raise SystemExit("static donor sets are not disjoint/complete")
+def unique_anchor(source: str, anchor: str, label: str) -> int:
+    if source.count(anchor) != 1:
+        raise SystemExit(f"{label} anchor count differs")
+    return source.index(anchor)
+
+
+join_start = unique_anchor(
+    monolith, "#[cfg(test)]\nmod join_tests {", "join start"
+)
+join_end = unique_anchor(
+    monolith,
+    "// ── Cursor (base64url of `{lastActivityAt, key}`)",
+    "join end",
+)
+tests_start = unique_anchor(
+    monolith, "#[cfg(test)]\nmod tests {", "tests start"
+)
+overlay_start = unique_anchor(
+    monolith, "// ── Task 2: sessionOverrides overlay", "route start"
+)
+search_start = unique_anchor(
+    monolith,
+    "// -- Batch C: CodexSource + OpencodeSource wired into the same",
+    "search start",
+)
+if not (join_start < join_end < tests_start < overlay_start < search_start):
+    raise SystemExit("pre-split donor anchors are out of order")
+
+donor_ranges = {
+    "join": monolith[join_start:join_end],
+    "core": monolith[tests_start:overlay_start],
+    "route": monolith[overlay_start:search_start],
+    "search": monolith[search_start:],
+}
+pattern = re.compile(
+    r"#\s*\[\s*(?:tokio\s*::\s*)?test\s*\]"
+    r"(?:\s*#\s*\[[^\]\n]+\]\s*)*\s*"
+    r"(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+attribute_pattern = re.compile(
+    r"#\s*\[\s*([A-Za-z_][A-Za-z0-9_:]*)"
+)
+top_level_macro_pattern = re.compile(
+    r"(?m)^    (?:[A-Za-z_][A-Za-z0-9_]*::)*"
+    r"[A-Za-z_][A-Za-z0-9_]*!\s*[({\[]"
+)
+for label, source in donor_ranges.items():
+    allowed_attributes = {"cfg", "derive", "test", "tokio::test"}
+    unsupported_attributes = [
+        name
+        for name in attribute_pattern.findall(source)
+        if name not in allowed_attributes
+    ]
+    if unsupported_attributes:
+        raise SystemExit(
+            f"{label}: unsupported test attributes: {unsupported_attributes!r}"
+        )
+    top_level_macros = top_level_macro_pattern.findall(source)
+    if top_level_macros:
+        raise SystemExit(
+            f"{label}: unsupported top-level test/macro invocation"
+        )
+    recognized = pattern.findall(source)
+    if recognized != sets[label]:
+        raise SystemExit(
+            f"{label}: donor inventory differs: "
+            f"actual={recognized!r} expected={sets[label]!r}"
+        )
+raw_declarations = pathlib.Path(inventory_path).read_text(
+    encoding="utf-8"
+).splitlines()
+if (
+    not raw_declarations
+    or any(not name for name in raw_declarations)
+    or len(raw_declarations) != len(set(raw_declarations))
+):
+    raise SystemExit("compiled pre-split inventory empty/blank/duplicate")
+declarations = sorted(raw_declarations)
+pathlib.Path(inventory_path).write_text(
+    "\n".join(declarations) + "\n", encoding="utf-8"
+)
+route_set, search_set = set(route), set(search)
+mapping = {}
+for name in declarations:
+    expected = name
+    if name.startswith("session_directory::join_tests::"):
+        expected = name.replace(
+            "session_directory::join_tests::",
+            "session_directory::tests::", 1
+        )
+    elif name.startswith("session_directory::tests::"):
+        leaf = name.rsplit("::", 1)[1]
+        if leaf in route_set:
+            expected = f"session_directory::route_tests::{leaf}"
+        elif leaf in search_set:
+            expected = f"session_directory::search_tests::{leaf}"
+    mapping[name] = expected
+if len(set(mapping.values())) != len(mapping):
+    raise SystemExit("post-split declaration map has duplicate destinations")
+payload = {
+    "mapping": mapping,
+    "source_sets": sets,
+    "pre_count": len(declarations),
+    "pre_sha256": hashlib.sha256(
+        ("\n".join(declarations) + "\n").encode()
+    ).hexdigest(),
+}
+pathlib.Path(map_path).open("x", encoding="utf-8").write(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+)
+print(f"pre_count={len(declarations)} pre_sha256={payload['pre_sha256']}")
+PY
+  assert_task0_evidence_owned
+}
+
+verify_postsplit_server_test_inventory() {
+  local mode="$1" declarations
+  case "$mode" in split-only|task0) ;; *) return 1 ;; esac
+  assert_task0_evidence_owned || return 1
+  test ! -e "$POSTSPLIT_SERVER_TESTS.next" || return 1
+  if test -e "$POSTSPLIT_SERVER_TESTS"; then
+    test -f "$POSTSPLIT_SERVER_TESTS" &&
+      test ! -L "$POSTSPLIT_SERVER_TESTS" || return 1
+  fi
+  declarations="$(list_all_server_binary_test_declarations)" || return 1
+  printf '%s\n' "$declarations" >"$POSTSPLIT_SERVER_TESTS.next" || return 1
+  python3 - "$WT" "$mode" "$PRESPLIT_TEST_MAP" \
+    "$POSTSPLIT_SERVER_TESTS.next" <<'PY'
+import hashlib, json, pathlib, re, sys
+wt, mode, map_path, actual_path = sys.argv[1:]
+root = pathlib.Path(wt)
+files = {
+    "tests": root / "crates/freshell-server/src/session_directory_tests.rs",
+    "route": root / "crates/freshell-server/src/session_directory_route_tests.rs",
+    "search": root / "crates/freshell-server/src/session_directory_search_tests.rs",
+}
+if any(not path.is_file() for path in files.values()):
+    raise SystemExit("post-split test child missing")
+facade = (root / "crates/freshell-server/src/session_directory.rs").read_text()
+if "mod join_tests" in facade:
+    raise SystemExit("pre-split join wrapper remains")
+payload = json.loads(pathlib.Path(map_path).read_text(encoding="utf-8"))
+pattern = re.compile(
+    r"#\s*\[\s*(?:tokio\s*::\s*)?test\s*\]"
+    r"(?:\s*#\s*\[[^\]\n]+\]\s*)*\s*"
+    r"(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+attribute_pattern = re.compile(
+    r"#\s*\[\s*([A-Za-z_][A-Za-z0-9_:]*)"
+)
+top_level_macro_pattern = re.compile(
+    r"(?m)^(?:[A-Za-z_][A-Za-z0-9_]*::)*"
+    r"[A-Za-z_][A-Za-z0-9_]*!\s*[({\[]"
+)
+
+
+def child_test_names(path: pathlib.Path, label: str) -> list[str]:
+    source = path.read_text(encoding="utf-8")
+    allowed_attributes = {"cfg", "derive", "test", "tokio::test"}
+    unsupported_attributes = [
+        name
+        for name in attribute_pattern.findall(source)
+        if name not in allowed_attributes
+    ]
+    if unsupported_attributes:
+        raise SystemExit(
+            f"{label}: unsupported test attributes: {unsupported_attributes!r}"
+        )
+    if top_level_macro_pattern.search(source):
+        raise SystemExit(
+            f"{label}: unsupported top-level test/macro invocation"
+        )
+    return pattern.findall(source)
+
+
+actual_static = {
+    key: child_test_names(path, key)
+    for key, path in files.items()
+}
+expected_static = {
+    "tests": payload["source_sets"]["join"] + payload["source_sets"]["core"],
+    "route": payload["source_sets"]["route"],
+    "search": payload["source_sets"]["search"],
+}
+for key in expected_static:
+    if sorted(actual_static[key]) != sorted(expected_static[key]):
+        raise SystemExit(f"post-split static inventory differs: {key}")
+if [len(actual_static[k]) for k in ("tests", "route", "search")] != [39, 17, 12]:
+    raise SystemExit("post-split static counts differ")
+expected = sorted(payload["mapping"].values())
+task0 = [
+    "session_directory::page_bound_authority_tests::parent_full_application_layers_are_shared_with_production",
+    "session_directory::page_bound_authority_tests::parent_authority_case_manifest_has_expected_names_and_count",
+    "session_directory::page_bound_authority_tests::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens",
+    "session_directory::page_bound_authority_tests::task0_owner_full_app_matches_pinned_parent_fixture_authority",
+    "session_directory::page_bound_authority_tests::frozen_old_reference_matches_parent_completed_responses",
+    "session_directory::page_bound_authority_tests::parent_fixture_models_no_index_and_empty_snapshot_separately",
+    "session_directory::page_bound_authority_tests::parent_success_reads_colors_after_derivation_and_error_reads_zero_colors",
+    "session_directory::page_bound_authority_tests::parent_owner_identity_acquisition_matches_same_registry_list_first_winner",
+    "session_directory::page_bound_authority_tests::task0_legacy_work_ledger_smoke",
+]
+if mode == "task0":
+    expected = sorted(expected + task0)
+raw_actual = pathlib.Path(actual_path).read_text(encoding="utf-8").splitlines()
+if (
+    not raw_actual
+    or any(not name for name in raw_actual)
+    or len(raw_actual) != len(set(raw_actual))
+):
+    raise SystemExit("compiled post-split inventory empty/blank/duplicate")
+actual = sorted(raw_actual)
+pathlib.Path(actual_path).write_text(
+    "\n".join(actual) + "\n", encoding="utf-8"
+)
+if actual != expected:
+    raise SystemExit("complete compiled post-split inventory differs")
+expected_count = payload["pre_count"] + (9 if mode == "task0" else 0)
+if len(actual) != expected_count:
+    raise SystemExit("compiled post-split count differs")
+print(
+    f"post_count={len(actual)} post_sha256="
+    + hashlib.sha256(("\n".join(actual) + "\n").encode()).hexdigest()
+)
+PY
+  mv -- "$POSTSPLIT_SERVER_TESTS.next" "$POSTSPLIT_SERVER_TESTS"
+  assert_task0_evidence_owned
+}
+```
+
+The static parser recognizes only ordinary `#[test]` and `#[tokio::test]`
+functions and fails on any unrecognized test attribute/macro in the donor
+ranges. The Windows-only core test remains in the 68-name static set even when
+absent from a Linux Cargo list. A broad green suite never substitutes for this
+complete declaration proof.
 
 ### Exact audited test inventories
 
 ```bash
 set -euo pipefail
 run_legacy_aggregate() {
-  run_audited_debug_prefix "$TEST_MOD::legacy_" 33 <<'EOF'
-session_directory::page_bound_tests::legacy_all_eight_visibility_flag_combinations
-session_directory::page_bound_tests::legacy_all_limits_and_cardinality_boundaries
-session_directory::page_bound_tests::legacy_archived_and_metadata_serialization
-session_directory::page_bound_tests::legacy_arbitrary_cursor_position_table
-session_directory::page_bound_tests::legacy_broad_unicode_title_table
-session_directory::page_bound_tests::legacy_cursor_chain_paginates_decorated_corpus
-session_directory::page_bound_tests::legacy_deep_limit_one_chain_and_duplicate_tuple_gaps
-session_directory::page_bound_tests::legacy_default_visibility_filters
-session_directory::page_bound_tests::legacy_deleted_index_and_synth_equal_ties
-session_directory::page_bound_tests::legacy_deleted_session_with_live_terminal_synthesizes
-session_directory::page_bound_tests::legacy_duplicate_equal_tuples_preserve_source_order
-session_directory::page_bound_tests::legacy_duplicate_rows_straddling_page_boundary
-session_directory::page_bound_tests::legacy_empty_filter_precedes_search
-session_directory::page_bound_tests::legacy_full_string_colon_collision_composes_all_joins
-session_directory::page_bound_tests::legacy_identity_missing_components_terminal_fallback_and_collisions
-session_directory::page_bound_tests::legacy_large_live_and_filtered_live_set_table
-session_directory::page_bound_tests::legacy_long_deleted_and_filtered_prefixes
-session_directory::page_bound_tests::legacy_malformed_cursor_table
-session_directory::page_bound_tests::legacy_malformed_metadata_value_table
-session_directory::page_bound_tests::legacy_malformed_override_value_table
-session_directory::page_bound_tests::legacy_negative_and_i64_revision_boundaries
-session_directory::page_bound_tests::legacy_no_index_empty_snapshot_and_color_read_table
-session_directory::page_bound_tests::legacy_ordered_identity_permutations_choose_first_winner
-session_directory::page_bound_tests::legacy_project_color_map_order_composes_with_all_tiers
-session_directory::page_bound_tests::legacy_provider_generated_shadow_guard
-session_directory::page_bound_tests::legacy_query_absent_blank_tier_without_query_and_invalid_request_table
-session_directory::page_bound_tests::legacy_revision_empty_deleted_and_identity_sources
-session_directory::page_bound_tests::legacy_search_override_replacement_and_precedence
-session_directory::page_bound_tests::legacy_title_snippet_scalar_boundaries_139_140_141
-session_directory::page_bound_tests::legacy_trap1_deleted_override_backfills_page
-session_directory::page_bound_tests::legacy_trap1_live_join_rescues_and_merges_synth
-session_directory::page_bound_tests::legacy_trap1_title_override_rescues_boundary_row
-session_directory::page_bound_tests::legacy_whitespace_title_and_query_semantics
+  run_audited_debug_prefix "$TEST_LEGACY::legacy_" 33 <<'EOF'
+session_directory::page_bound_legacy_tests::legacy_all_eight_visibility_flag_combinations
+session_directory::page_bound_legacy_tests::legacy_all_limits_and_cardinality_boundaries
+session_directory::page_bound_legacy_tests::legacy_archived_and_metadata_serialization
+session_directory::page_bound_legacy_tests::legacy_arbitrary_cursor_position_table
+session_directory::page_bound_legacy_tests::legacy_broad_unicode_title_table
+session_directory::page_bound_legacy_tests::legacy_cursor_chain_paginates_decorated_corpus
+session_directory::page_bound_legacy_tests::legacy_deep_limit_one_chain_and_duplicate_tuple_gaps
+session_directory::page_bound_legacy_tests::legacy_default_visibility_filters
+session_directory::page_bound_legacy_tests::legacy_deleted_index_and_synth_equal_ties
+session_directory::page_bound_legacy_tests::legacy_deleted_session_with_live_terminal_synthesizes
+session_directory::page_bound_legacy_tests::legacy_duplicate_equal_tuples_preserve_source_order
+session_directory::page_bound_legacy_tests::legacy_duplicate_rows_straddling_page_boundary
+session_directory::page_bound_legacy_tests::legacy_empty_filter_precedes_search
+session_directory::page_bound_legacy_tests::legacy_full_string_colon_collision_composes_all_joins
+session_directory::page_bound_legacy_tests::legacy_identity_missing_components_terminal_fallback_and_collisions
+session_directory::page_bound_legacy_tests::legacy_large_live_and_filtered_live_set_table
+session_directory::page_bound_legacy_tests::legacy_long_deleted_and_filtered_prefixes
+session_directory::page_bound_legacy_tests::legacy_malformed_cursor_table
+session_directory::page_bound_legacy_tests::legacy_malformed_metadata_value_table
+session_directory::page_bound_legacy_tests::legacy_malformed_override_value_table
+session_directory::page_bound_legacy_tests::legacy_negative_and_i64_revision_boundaries
+session_directory::page_bound_legacy_tests::legacy_no_index_empty_snapshot_and_color_read_table
+session_directory::page_bound_legacy_tests::legacy_ordered_identity_permutations_choose_first_winner
+session_directory::page_bound_legacy_tests::legacy_project_color_map_order_composes_with_all_tiers
+session_directory::page_bound_legacy_tests::legacy_provider_generated_shadow_guard
+session_directory::page_bound_legacy_tests::legacy_query_absent_blank_tier_without_query_and_invalid_request_table
+session_directory::page_bound_legacy_tests::legacy_revision_empty_deleted_and_identity_sources
+session_directory::page_bound_legacy_tests::legacy_search_override_replacement_and_precedence
+session_directory::page_bound_legacy_tests::legacy_title_snippet_scalar_boundaries_139_140_141
+session_directory::page_bound_legacy_tests::legacy_trap1_deleted_override_backfills_page
+session_directory::page_bound_legacy_tests::legacy_trap1_live_join_rescues_and_merges_synth
+session_directory::page_bound_legacy_tests::legacy_trap1_title_override_rescues_boundary_row
+session_directory::page_bound_legacy_tests::legacy_whitespace_title_and_query_semantics
 EOF
 }
 
 run_g1_aggregate() {
-  run_audited_debug_prefix "$TEST_MOD::g1_" 21 <<'EOF'
-session_directory::page_bound_tests::g1_all_eight_flags_old_materialized_fast
-session_directory::page_bound_tests::g1_all_limits_and_cardinalities_old_materialized_fast
-session_directory::page_bound_tests::g1_arbitrary_and_malformed_cursors_old_materialized_fast
-session_directory::page_bound_tests::g1_broad_unicode_and_long_text_old_materialized_fast
-session_directory::page_bound_tests::g1_completed_full_app_route_matrix_matches_parent
-session_directory::page_bound_tests::g1_completed_strategy_matrix_old_extracted_fast
-session_directory::page_bound_tests::g1_deep_limit_one_chain_old_materialized_fast
-session_directory::page_bound_tests::g1_deleted_synth_ties_old_materialized_fast
-session_directory::page_bound_tests::g1_duplicate_equal_and_colon_collision_old_materialized_fast
-session_directory::page_bound_tests::g1_exhaustive_small_state_old_materialized_fast
-session_directory::page_bound_tests::g1_fast_deleted_override_backfills_page_old_materialized_fast
-session_directory::page_bound_tests::g1_i64_revision_boundaries_old_materialized_fast
-session_directory::page_bound_tests::g1_identity_missing_components_terminal_fallback_old_materialized_fast
-session_directory::page_bound_tests::g1_large_live_sets_old_materialized_fast
-session_directory::page_bound_tests::g1_long_prefixes_old_materialized_fast
-session_directory::page_bound_tests::g1_malformed_override_metadata_old_materialized_fast
-session_directory::page_bound_tests::g1_noindex_empty_success_error_colors_old_materialized_fast
-session_directory::page_bound_tests::g1_ordered_identity_permutations_old_materialized_fast
-session_directory::page_bound_tests::g1_project_color_map_order_completed_routes
-session_directory::page_bound_tests::g1_query_absent_blank_and_tier_without_query_old_materialized_fast
-session_directory::page_bound_tests::g1_title_snippet_scalar_boundaries_old_materialized_fast
+  run_audited_debug_prefix "$TEST_G1::g1_" 21 <<'EOF'
+session_directory::page_bound_g1_tests::g1_all_eight_flags_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_all_limits_and_cardinalities_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_arbitrary_and_malformed_cursors_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_broad_unicode_and_long_text_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_completed_full_app_route_matrix_matches_parent
+session_directory::page_bound_g1_tests::g1_completed_strategy_matrix_old_extracted_fast
+session_directory::page_bound_g1_tests::g1_deep_limit_one_chain_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_deleted_synth_ties_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_duplicate_equal_and_colon_collision_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_exhaustive_small_state_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_fast_deleted_override_backfills_page_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_i64_revision_boundaries_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_identity_missing_components_terminal_fallback_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_large_live_sets_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_long_prefixes_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_malformed_override_metadata_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_noindex_empty_success_error_colors_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_ordered_identity_permutations_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_project_color_map_order_completed_routes
+session_directory::page_bound_g1_tests::g1_query_absent_blank_and_tier_without_query_old_materialized_fast
+session_directory::page_bound_g1_tests::g1_title_snippet_scalar_boundaries_old_materialized_fast
 EOF
 }
 
 run_g2_aggregate() {
-  run_audited_debug_prefix "$TEST_MOD::g2_" 18 <<'EOF'
-session_directory::page_bound_tests::g2_candidate_source_has_no_direct_dir_item_literal
-session_directory::page_bound_tests::g2_fast_region_has_no_clone_or_indirect_full_row_construction
-session_directory::page_bound_tests::g2_full_row_constructor_inventory_is_exact_and_instrumented
-session_directory::page_bound_tests::g2_no_query_all_filtered_large_live_set_builds_zero_items
-session_directory::page_bound_tests::g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows
-session_directory::page_bound_tests::g2_no_query_indexed_work_table_is_exact
-session_directory::page_bound_tests::g2_no_query_lookahead_descriptor_is_never_constructed
-session_directory::page_bound_tests::g2_no_query_mixed_indexed_and_synth_work_is_exact
-session_directory::page_bound_tests::g2_no_query_synth_work_table_is_exact
-session_directory::page_bound_tests::g2_one_returned_row_with_500_identities_has_zero_full_row_clones
-session_directory::page_bound_tests::g2_title_early_dense_matches_build_only_returned_rows
-session_directory::page_bound_tests::g2_title_late_sparse_matches_scan_but_build_only_returned_rows
-session_directory::page_bound_tests::g2_title_long_ascii_fields_are_exact
-session_directory::page_bound_tests::g2_title_mixed_indexed_and_synth_work_is_exact
-session_directory::page_bound_tests::g2_title_no_match_builds_zero_rows
-session_directory::page_bound_tests::g2_title_non_ascii_expansion_table_is_exact
-session_directory::page_bound_tests::g2_title_post_selection_has_no_rejection_path
-session_directory::page_bound_tests::g2_title_synth_matches_build_only_selected_rows
+  run_audited_debug_prefix "$TEST_G2::g2_" 18 <<'EOF'
+session_directory::page_bound_g2_tests::g2_candidate_source_has_no_direct_dir_item_literal
+session_directory::page_bound_g2_tests::g2_fast_region_has_no_clone_or_indirect_full_row_construction
+session_directory::page_bound_g2_tests::g2_full_row_constructor_inventory_is_exact_and_instrumented
+session_directory::page_bound_g2_tests::g2_no_query_all_filtered_large_live_set_builds_zero_items
+session_directory::page_bound_g2_tests::g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows
+session_directory::page_bound_g2_tests::g2_no_query_indexed_work_table_is_exact
+session_directory::page_bound_g2_tests::g2_no_query_lookahead_descriptor_is_never_constructed
+session_directory::page_bound_g2_tests::g2_no_query_mixed_indexed_and_synth_work_is_exact
+session_directory::page_bound_g2_tests::g2_no_query_synth_work_table_is_exact
+session_directory::page_bound_g2_tests::g2_one_returned_row_with_500_identities_has_zero_full_row_clones
+session_directory::page_bound_g2_tests::g2_title_early_dense_matches_build_only_returned_rows
+session_directory::page_bound_g2_tests::g2_title_late_sparse_matches_scan_but_build_only_returned_rows
+session_directory::page_bound_g2_tests::g2_title_long_ascii_fields_are_exact
+session_directory::page_bound_g2_tests::g2_title_mixed_indexed_and_synth_work_is_exact
+session_directory::page_bound_g2_tests::g2_title_no_match_builds_zero_rows
+session_directory::page_bound_g2_tests::g2_title_non_ascii_expansion_table_is_exact
+session_directory::page_bound_g2_tests::g2_title_post_selection_has_no_rejection_path
+session_directory::page_bound_g2_tests::g2_title_synth_matches_build_only_selected_rows
 EOF
 }
 ```
@@ -1548,336 +3537,164 @@ run_shared_comment_guard
 ### Task 0: Pin, record, and freeze the pre-extraction parent authority
 
 **Files:**
-- Modify: `crates/freshell-server/src/session_directory.rs`.
+- Modify/split: `crates/freshell-server/src/session_directory.rs`,
+  `session_directory_materialized.rs`, `session_directory_tests.rs`,
+  `session_directory_route_tests.rs`, `session_directory_search_tests.rs`,
+  `session_directory_inputs.rs`, `session_directory_page_bound_support.rs`,
+  `session_directory_page_bound_authority_fixtures.rs`, and
+  `session_directory_page_bound_authority_tests.rs`.
 - Modify only the assembler/call: `crates/freshell-server/src/main.rs`.
 - Read/freeze unchanged: `crates/freshell-sessions/src/search.rs`.
 
-**Forbidden:** extracting the handler derivation, changing capture order,
-adding Fast code/selector behavior, or changing shared source.
+**Forbidden:** changing behavior while splitting, extracting the handler
+derivation, changing capture order, adding Fast code/selector behavior, changing
+shared source, or allowing changed code to generate expected parent bytes.
 
-**Interfaces produced:** Task-0 capture/renderer/completed-response interfaces,
-manual instrumented `DirItem::Clone`, the immutable explicit manifest whose
-count is derived from `EXPECTED_PARENT_CASE_NAMES`, authority markers, and
-`with_full_application_layers` exactly as defined above.
+**Interfaces produced:** the pinned-parent recorder and canonical embedded
+artifact; Task-0 capture/renderer/completed-response interfaces; manual
+instrumented `DirItem::Clone`; immutable explicit manifest whose count derives
+from `EXPECTED_PARENT_CASE_NAMES`; focused child modules; authority markers; and
+`with_full_application_layers`.
+
+The following ordering is load-bearing and supersedes any narrower wording in
+the detailed substeps:
+
+1. Run the pinned baseline.
+2. Add only the exact append-only `#[cfg(test)]` recorder region to the active
+   parent-compatible monolith; statically prove append-only compatibility and
+   record recorder SHA-256, parent tree, and seven blob IDs.
+3. In a fresh uniquely owned detached parent worktree, append that exact recorder
+   and only the ignored
+   `emit_pinned_parent_completed_responses` entrypoint. Prove no other tracked
+   delta, then execute exactly one ignored binary test under `timeout`,
+   `unshare --user --map-root-user --net`, `env -i`, `CARGO_NET_OFFLINE=true`,
+   owned empty home/provider roots, and an owned target directory. The invocation
+   must pass through `run_cargo_test_success 1`.
+4. Canonicalize and validate
+   `PARENT_COMPLETED_RESPONSE_AUTHORITY_V1`: exact schema, commit/tree/seven
+   blobs, recorder/manifest hashes, 22 ordered names, exact 21-name comparable
+   projection, unique input hashes, exchange arrays, statuses, exact normalized
+   content type, base64 bodies, canonical bytes, and one trailing LF.
+5. Remove the exact appended suffix by byte assertion, require the parent
+   scratch clean, remove it non-forcibly, and retain the artifact/recorder under
+   the owned evidence root until post-commit replay.
+6. Perform the behavior-neutral module/test split in **Focused Rust Module
+   Boundary**, moving recorder bytes without reformatting; run the existing
+   server tests, formatter, Clippy, and
+   `assert_max_1000_lines "${SD_TASK0_FILES[@]}"`.
+7. Mechanically install the captured artifact in
+   `session_directory_page_bound_authority_fixtures.rs`; decode the embedded
+   constant and `cmp` it byte-for-byte with the capture.
+8. Write the existing nine Task-0 tests against that artifact. Exactly one shared
+   support wrapper references absent `crate::with_full_application_layers`, so
+   the missing-assembler compile RED occurs exactly once.
+9. Run that RED, then implement only the minimal
+   assembler/renderer/FrozenOld/ledger machinery with handler derivation inline.
+10. Run the nine-test GREEN, broader checks, path-aware static/runtime authority
+    guards, and line gate.
+11. Commit the exact ten-path Task-0 set plus `main.rs`.
+12. Replay the frozen recorder from a fresh owned parent worktree, compare replay
+    byte-for-byte with the decoded embedded artifact, record evidence, then
+    remove only exact named evidence files and empty owned directories.
+
+The complete binary-scoped recorder command, build-root lifecycle, validator,
+suffix restoration, guarded cleanup, installation, and replay are defined once
+in the pre-Task-0 execution harness. The task steps below invoke those helpers;
+no free-standing command owns undefined state.
 
 - [ ] **Step 1: Pin provenance and establish the scoped baseline**
 
 ```bash
 set -euo pipefail
 PARENT=fc8646477dd34d92dc5647d158106431aa2e0380
+PARENT_SESSION_MONOLITH=crates/freshell-server/src/session_directory.rs
+
 test "$(git -C "$WT" merge-base HEAD "$PARENT")" = "$PARENT"
 git -C "$WT" diff --exit-code "$PARENT" -- \
-  crates/freshell-server/src/session_directory.rs \
+  "$PARENT_SESSION_MONOLITH" \
   crates/freshell-server/src/main.rs \
   crates/freshell-sessions/src/search.rs
+run_shared_comment_guard
 run_server_all_targets
 run_sessions_sanity
 run_fmt_check
 run_clippy
-run_shared_comment_guard
+init_task0_evidence_root
+capture_presplit_server_test_inventory
 ```
 
-Expected GREEN: source equals the pinned parent and every command returns zero.
-If the baseline is not green, stop before changing Rust and report the exact
-failing command/output; do not redefine the baseline.
+Expected GREEN: pinned source equality, shared-comment immutability, the
+existing broad baseline, and pre-split test-inventory capture return zero. No
+future sibling is read and no Task-0 ancestor is looked up. If the baseline is
+not green, stop before changing Rust and report the exact failing command/output;
+do not redefine the baseline.
 
-- [ ] **Step 2: Record the ownership-safe pinned-parent source/fixture authority before any Rust edit**
-
-The pinned production binary constructs network-capable `reqwest` clients,
-an update checker, and an OpenCode lane, and the pinned source exposes no
-audited switch that guarantees all outbound I/O is disabled. Therefore this
-plan **forbids launching that binary as the parent oracle**. Sanitizing provider
-variables alone would not prove no network, and inheriting even one provider
-root could read live sessions. The exact safe fallback authority is instead:
-
-1. the pinned Git commit and exact blobs for the handler, layer chain, file
-   search, provider-root resolvers, and two committed transcript fixtures;
-2. the committed fixture semantics
-   (`claude:b7936c10-4935-441c-837c-c1f33cafec2d` is visible;
-   `healthy-session-id` is excluded because it has no `cwd`); and
-3. Task 0's deterministic, in-process owner-backed/full-layer raw responses over
-   those committed fixture bytes plus explicit synthetic owner maps.
-
-No Cargo/npm command, server process, provider scan, external service, socket,
-live config, real home, or ambient environment value participates in this
-step. The detached worktree is only a read-only view of committed blobs.
+- [ ] **Step 2: Capture the canonical pinned-parent responses before any production edit or split**
 
 ```bash
 set -euo pipefail
-PARENT_TMP="$(mktemp -d /tmp/session-directory-parent-authority.XXXXXXXX)"
-PARENT_TMP_OWNED=1
-PARENT_WT="$PARENT_TMP/worktree"
-PARENT_WT_CREATED=0
-PARENT_WT_GITDIR=
-# Ignore ambient system/global Git config. Repository-local object/worktree
-# metadata remains available; hooks and fsmonitor are disabled at add time.
-export GIT_CONFIG_GLOBAL=/dev/null
-export GIT_CONFIG_SYSTEM=/dev/null
+test "${TASK0_EVIDENCE_OWNED:-0}" = 1
+assert_task0_evidence_owned
 
-assert_parent_worktree_record() {
-  local mode="$1"
-  python3 - "$WT" "$PARENT_WT" "$PARENT" "$mode" <<'PY'
-import os, subprocess, sys
-wt, expected_path, expected_head, mode = sys.argv[1:]
-expected_path = os.path.realpath(expected_path)
-raw = subprocess.check_output(
-    ["git", "-C", wt, "worktree", "list", "--porcelain", "-z"]
-)
-records = []
-for block in raw.split(b"\0\0"):
-    if not block:
-        continue
-    fields = block.split(b"\0")
-    record = {}
-    flags = set()
-    for field in fields:
-        if not field:
-            continue
-        if b" " in field:
-            key, value = field.split(b" ", 1)
-            record[key.decode()] = os.fsdecode(value)
-        else:
-            flags.add(field.decode())
-    record["flags"] = flags
-    records.append(record)
-matches = [
-    record
-    for record in records
-    if os.path.realpath(record.get("worktree", "")) == expected_path
-]
-if mode == "absent":
-    if matches:
-        raise SystemExit(f"path already registered; preserving it: {matches!r}")
-elif mode == "owned":
-    if len(matches) != 1:
-        raise SystemExit(f"expected one owned registration, found {matches!r}")
-    record = matches[0]
-    if record.get("HEAD") != expected_head or "detached" not in record["flags"]:
-        raise SystemExit(f"owned registration identity changed: {record!r}")
-else:
-    raise SystemExit(f"unknown worktree-check mode: {mode}")
-PY
-}
+# Author only the exact append-only cfg(test) recorder region in the active
+# parent-compatible monolith. No production/split/ledger/Clone/authority-test edit.
+_assert_git_scope preflight "$PARENT_SESSION_MONOLITH"
+extract_active_parent_recorder
+capture_pinned_parent_authority
 
-cleanup_parent_fixture_authority() {
-  local original_status="$?" cleanup_status=0 status
-  trap - EXIT
-  if test "${PARENT_WT_CREATED:-0}" = 1; then
-    if ! assert_parent_worktree_record owned; then
-      printf 'owned parent worktree identity changed; preserving it\n' >&2
-      cleanup_status=1
-    elif test "$(realpath "$PARENT_WT")" != \
-        "$(git -C "$PARENT_WT" rev-parse --show-toplevel)"; then
-      printf 'owned parent worktree top level changed; preserving it\n' >&2
-      cleanup_status=1
-    elif test "$(git -C "$PARENT_WT" rev-parse HEAD)" != "$PARENT"; then
-      printf 'owned parent worktree HEAD changed; preserving it\n' >&2
-      cleanup_status=1
-    elif test -z "${PARENT_WT_GITDIR:-}" \
-        || test "$(git -C "$PARENT_WT" rev-parse --absolute-git-dir)" != \
-          "$PARENT_WT_GITDIR"; then
-      printf 'owned parent worktree gitdir identity changed; preserving it\n' >&2
-      cleanup_status=1
-    else
-      status="$(git -C "$PARENT_WT" -c core.fsmonitor=false \
-        -c core.untrackedCache=false status --porcelain=v1 \
-        --untracked-files=all)" || cleanup_status=1
-      if test "$cleanup_status" = 0 && test -n "$status"; then
-        printf 'owned parent worktree became dirty; preserving it\n' >&2
-        cleanup_status=1
-      elif test "$cleanup_status" = 0; then
-        if git -C "$WT" -c core.fsmonitor=false \
-            -c core.untrackedCache=false worktree remove "$PARENT_WT"; then
-          PARENT_WT_CREATED=0
-        else
-          cleanup_status=1
-        fi
-      fi
-    fi
-  fi
-  if test "${PARENT_TMP_OWNED:-0}" = 1; then
-    if test "${PARENT_WT_CREATED:-0}" = 0 \
-        && test ! -e "$PARENT_WT" \
-        && assert_parent_worktree_record absent; then
-      if rmdir "$PARENT_TMP"; then
-        PARENT_TMP_OWNED=0
-      else
-        cleanup_status=1
-      fi
-    else
-      printf 'parent authority temp root retained; ownership not removable\n' >&2
-      cleanup_status=1
-    fi
-  fi
-  if test "$original_status" -ne 0; then
-    return "$original_status"
-  fi
-  return "$cleanup_status"
-}
-
-# These collision checks intentionally precede trap installation. A path or
-# registration owned by another run is never handed to cleanup.
-if test -e "$PARENT_WT"; then
-  printf 'parent authority path already exists; leaving it untouched\n' >&2
-  rmdir "$PARENT_TMP"
-  exit 1
-fi
-if ! assert_parent_worktree_record absent; then
-  rmdir "$PARENT_TMP"
-  exit 1
-fi
-# A checkout may not invoke repository/global hooks or content filters.
-if git -C "$WT" cat-file -e "$PARENT:.gitattributes" 2>/dev/null; then
-  printf 'pinned parent has .gitattributes; static fallback needs re-review\n' >&2
-  rmdir "$PARENT_TMP"
-  exit 1
-fi
-COMMON_ATTRIBUTES="$(git -C "$WT" rev-parse --git-path info/attributes)"
-if test -s "$COMMON_ATTRIBUTES"; then
-  printf 'common Git info/attributes is nonempty; refusing filtered checkout\n' >&2
-  rmdir "$PARENT_TMP"
-  exit 1
-fi
-trap cleanup_parent_fixture_authority EXIT
-
-if ! git -C "$WT" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-    -c core.untrackedCache=false -c core.attributesFile=/dev/null \
-    worktree add --detach "$PARENT_WT" "$PARENT"; then
-  # A partial failed add is preserved: ownership remains false, so the trap may
-  # retain the unique temp root but may not remove a path or registration.
-  exit 1
-fi
-assert_parent_worktree_record owned
-test "$(realpath "$PARENT_WT")" = \
-  "$(git -C "$PARENT_WT" rev-parse --show-toplevel)"
-test "$(git -C "$PARENT_WT" rev-parse HEAD)" = "$PARENT"
-test -z "$(git -C "$PARENT_WT" -c core.fsmonitor=false \
-  -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all)"
-PARENT_WT_GITDIR="$(git -C "$PARENT_WT" rev-parse --absolute-git-dir)"
-test -n "$PARENT_WT_GITDIR"
-# Positive ownership exists only after add plus path/registration/HEAD/clean/
-# gitdir verification. Cleanup cannot remove anything before this assignment.
-PARENT_WT_CREATED=1
-
-PARENT_AUTHORITY_JSON="$(python3 - "$PARENT_WT" "$PARENT" <<'PY'
-import json, pathlib, subprocess, sys
-root, parent = pathlib.Path(sys.argv[1]), sys.argv[2]
-paths = [
-    "crates/freshell-server/src/session_directory.rs",
-    "crates/freshell-server/src/main.rs",
-    "crates/freshell-sessions/src/search.rs",
-    "crates/freshell-sessions/src/parse/opencode.rs",
-    "crates/freshell-sessions/src/amplifier.rs",
-    "test/fixtures/sessions/real-corrupted.jsonl",
-    "test/fixtures/sessions/healthy.jsonl",
-]
-blobs = {}
-for relative in paths:
-    expected = subprocess.check_output(
-        ["git", "-C", str(root), "rev-parse", f"{parent}:{relative}"],
-        text=True,
-    ).strip()
-    actual = subprocess.check_output(
-        ["git", "-C", str(root), "hash-object", relative],
-        text=True,
-    ).strip()
-    if actual != expected:
-        raise SystemExit(f"committed blob mismatch for {relative}")
-    blobs[relative] = expected
-
-session_source = (root / paths[0]).read_text(encoding="utf-8")
-main_source = (root / paths[1]).read_text(encoding="utf-8")
-opencode_source = (root / paths[3]).read_text(encoding="utf-8")
-amplifier_source = (root / paths[4]).read_text(encoding="utf-8")
-for token, source in {
-    "CLAUDE_HOME": session_source,
-    "CODEX_HOME": session_source,
-    "XDG_DATA_HOME": opencode_source,
-    "LOCALAPPDATA": opencode_source,
-    "FRESHELL_AMPLIFIER_HOME": amplifier_source,
-    "reqwest::Client::new": main_source,
-    "UpdateChecker::new": main_source,
-    "ReqwestLaneHttp::new": main_source,
-}.items():
-    if token not in source:
-        raise SystemExit(f"pinned-source safety token missing: {token}")
-
-def json_lines(relative):
-    return [
-        json.loads(line)
-        for line in (root / relative).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-corrupt = json_lines(paths[5])
-healthy = json_lines(paths[6])
-visible_ids = sorted({
-    row["sessionId"]
-    for row in corrupt
-    if isinstance(row, dict) and isinstance(row.get("sessionId"), str)
-})
-excluded_ids = sorted({
-    row["session_id"]
-    for row in healthy
-    if isinstance(row, dict) and isinstance(row.get("session_id"), str)
-})
-if visible_ids != ["b7936c10-4935-441c-837c-c1f33cafec2d"]:
-    raise SystemExit(f"unexpected visible fixture IDs: {visible_ids!r}")
-if excluded_ids != ["healthy-session-id"]:
-    raise SystemExit(f"unexpected cwd-less fixture IDs: {excluded_ids!r}")
-
-print(json.dumps({
-    "mode": "pinned-source-fixture-fallback-no-process",
-    "parent": parent,
-    "blobs": blobs,
-    "expected_visible_keys": [
-        "claude:b7936c10-4935-441c-837c-c1f33cafec2d"
-    ],
-    "expected_cwdless_exclusions": ["claude:healthy-session-id"],
-}, sort_keys=True, separators=(",", ":")))
-PY
-)"
-printf '%s\n' "$PARENT_AUTHORITY_JSON"
-python3 -c '
-import json, sys
-authority = json.loads(sys.stdin.read())
-assert authority["mode"] == "pinned-source-fixture-fallback-no-process"
-assert len(authority["blobs"]) == 7
-' <<<"$PARENT_AUTHORITY_JSON"
-test -z "$(git -C "$PARENT_WT" -c core.fsmonitor=false \
-  -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all)"
-cleanup_parent_fixture_authority
-trap - EXIT
+test -s "$PARENT_RECORDER_BYTES"
+test -s "$PARENT_AUTHORITY_OUT"
+validate_parent_completed_response_artifact \
+  "$PARENT_AUTHORITY_OUT" "$PARENT_RECORDER_BYTES"
 ```
 
-Review and retain the printed authority JSON in execution evidence. Task 0
-copies it verbatim into `PINNED_PARENT_SOURCE_FIXTURE_AUTHORITY`. Its deterministic
-fixture test parses only the two committed transcript byte strings, asserts the
-one visible key and one cwd-less exclusion above, supplies explicit in-memory
-overrides/metadata/identities/colors, and traverses the actual owner-backed route
-plus `with_full_application_layers`. It then freezes reviewed status,
-content-type, and raw-body literals for no-query, Title, pre-seam validation
-error, and derivation error. The source/fixture blobs and mechanically copied
-FrozenOld body—not an ambient production process—are the independent
-pre-extraction authority. If any pinned safety token/blob/fixture expectation
-changes, stop for re-review; never fall back to launching the network-capable
-binary.
+Expected GREEN: the active source differs from the pinned parent only by the
+exact recorder region; a fresh parent scratch runs exactly one ignored test
+offline in a new network namespace; `$PARENT_AUTHORITY_OUT` is the canonical
+22-case/21-comparable raw-response artifact; the exact suffix is removed; the
+parent scratch returns clean and is removed non-forcibly; and recorder/artifact
+evidence remains owned for split, installation, replay, and finalization.
+
+The exact Git blobs and committed fixture bytes are provenance and
+reproducibility inputs only. The response authority is the canonical raw
+completed-response artifact emitted by the one ignored in-process
+`Router::oneshot` parent test in an offline network namespace. If any
+provenance/fixture expectation changes, stop for re-review; never fall back to
+launching the network-capable production binary.
 
 Every reviewed owner raw result must be independent of registry iteration order;
 where the selected winner is serialized, the fixture uses exactly one matching
 identity. The A/B and B/A vectors belong only to fixed captures.
 
-- [ ] **Step 3: Write all Task-0 tests before production edits**
+- [ ] **Step 3: Split mechanically, install the artifact, then write Task-0 tests**
 
-Create the final test boundary:
+Perform the exact focused split before adding Task-0 behavior. Move the recorder
+bytes unchanged, run the structural GREEN and line gate, mechanically embed and
+decode the already captured artifact, and require `cmp` equality. Whole-file
+test children and direct `#[path]` declarations are the test boundary.
 
-```rust
-/* SESSION_DIRECTORY_PAGE_BOUND_TESTS_BEGIN */
-#[cfg(test)]
-mod page_bound_tests {
-    // All tests introduced by this plan live here.
-}
-/* SESSION_DIRECTORY_PAGE_BOUND_TESTS_END */
+Immediately after imports/visibility normalization, before artifact
+installation or new Task-0 tests, run:
+
+```bash
+set -euo pipefail
+verify_postsplit_server_test_inventory split-only
+run_exact_debug \
+  'session_directory::tests::invalid_utf8_transcript_is_indexed_lossily_like_node'
+run_server_all_targets
+run_fmt_check
+run_clippy
+assert_max_1000_lines "${SD_TASK0_FILES[@]}"
+```
+
+This checkpoint is GREEN-only and is the first applicable line gate. It proves
+complete declaration retention, the historical exact command path, broad
+behavior, formatting/linting, and line compliance before new behavior machinery.
+Then install only the already captured bytes:
+
+```bash
+install_captured_parent_authority
+cmp -- "$PARENT_AUTHORITY_OUT" "$PARENT_EMBEDDED_DECODED"
 ```
 
 Write these exact tests:
@@ -1894,7 +3711,9 @@ parent_owner_identity_acquisition_matches_same_registry_list_first_winner
 task0_legacy_work_ledger_smoke
 ```
 
-The first test calls `crate::with_full_application_layers` exactly once. The
+One shared authority support wrapper calls
+`crate::with_full_application_layers` exactly once, and all Task-0 tests call
+that wrapper. The
 manifest test compares exact ordered names and derives its count from
 `EXPECTED_PARENT_CASE_NAMES`. Owner-backed tests invoke the
 actual router and real layer assembler. Fixture builders may use synthetic
@@ -1943,36 +3762,14 @@ starts at ZERO. This proves every constructor, decoration, annotation,
 serialization, and manual clone bump is individually observable without
 cross-request residue.
 
-Copy the reviewed Step-2 authority JSON verbatim into
-`PINNED_PARENT_SOURCE_FIXTURE_AUTHORITY`. Implement
-`task0_owner_full_app_matches_pinned_parent_fixture_authority` so it first
-rechecks the embedded parent/blob IDs and parses the two committed fixture byte
-strings with the unchanged parsers. Assert exactly visible key
-`claude:b7936c10-4935-441c-837c-c1f33cafec2d` and cwd-less exclusion
-`claude:healthy-session-id`; then inject that parsed snapshot and explicit empty,
-single-identity, or otherwise output-order-insensitive in-memory owner state into
-four cases (no-query, Title, pre-seam validation error, derivation error).
-Traverse `with_full_application_layers` and compare exact status, normalized
-content-type, and raw body bytes to a reviewed deterministic four-entry table.
-The test may not call
-`provider_home`, read an environment variable/config path, instantiate a live
-provider source, open a socket, or use a network client. The authority/table/test
-live inside `parent-authority-response-fixtures` and freeze with Task 0.
-
-Add temporary ignored test `parent_authority_emit_raw_literals`. Run it through
-the exact owner-backed full-app executor, review every status/content-type/body,
-copy the exact bytes into the frozen table, then delete the emitter:
-
-```bash
-set -euo pipefail
-run_exact_debug_ignored "$TEST_MOD::parent_authority_emit_raw_literals"
-```
-
-No generated literal is accepted without reviewing its request/state manifest
-row. Do not parse JSON before capturing the body. The emitter must reject any
-proposed fixed raw golden whose bytes select among multiple same-key identities
-according to registry iteration order. The separate relational owner test is
-intentionally not copied into the raw-literal table.
+`task0_owner_full_app_matches_pinned_parent_fixture_authority` verifies the
+embedded artifact's commit/tree/blob/recorder/manifest/artifact hashes and
+fixture semantics and locates the four fixture-derived cases in that same
+artifact. `parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens`
+retains its historical name, but `goldens` means the embedded pre-edit artifact:
+execute all 22 current-owner cases through production layers and compare every
+ordered exchange directly. FrozenOld executes the exact 21 comparable cases and
+compares directly. No separate raw table or post-change response emitter exists.
 
 - [ ] **Step 6: Run the same attested minimal GREEN**
 
@@ -1991,7 +3788,7 @@ run_task0_focused() {
     parent_owner_identity_acquisition_matches_same_registry_list_first_winner \
     task0_legacy_work_ledger_smoke
   do
-    run_exact_debug "$TEST_MOD::$name" || return 1
+    run_exact_debug "$TEST_AUTH::$name" || return 1
   done
 }
 run_task0_focused
@@ -2017,9 +3814,18 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_shared_comment_guard
+verify_postsplit_server_test_inventory task0
+run_exact_debug \
+  'session_directory::tests::invalid_utf8_transcript_is_indexed_lossily_like_node'
+assert_max_1000_lines "${SD_TASK0_FILES[@]}"
+run_task0_precommit_guard
 ```
 
-Expected GREEN: the same focused tests and every broader command return zero.
+Expected GREEN: all nine focused tests pass; the complete old-test declaration
+map still matches; the retained historical exact test executes once; all broad
+checks pass; all phase-0 files exist and meet the line gate; the embedded
+artifact is structurally valid; and current owner plus FrozenOld compare
+directly to it. No subject-anchored Task-0 freeze check runs before commit.
 
 - [ ] **Step 8: Commit and freeze**
 
@@ -2028,14 +3834,31 @@ set -euo pipefail
 commit_exact_scope \
   'test(session-directory): freeze parent response authority' \
   crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_materialized.rs \
+  crates/freshell-server/src/session_directory_tests.rs \
+  crates/freshell-server/src/session_directory_route_tests.rs \
+  crates/freshell-server/src/session_directory_search_tests.rs \
+  crates/freshell-server/src/session_directory_inputs.rs \
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_authority_fixtures.rs \
+  crates/freshell-server/src/session_directory_page_bound_authority_tests.rs \
   crates/freshell-server/src/main.rs
 run_task0_guard
+replay_pinned_parent_authority
+finalize_task0_evidence_after_replay
 ```
+
+The replay uses a fresh owned parent worktree/build root, the frozen recorder
+bytes, the same ignored entrypoint and isolated command, and the same canonical
+validator. It must byte-compare replay with the decoded embedded artifact before
+exact evidence cleanup.
 
 ### Task 1: Extract and separately freeze the Materialized strategy
 
 **Files:**
-- Modify: `crates/freshell-server/src/session_directory.rs` only.
+- Modify: facade, `session_directory_inputs.rs`,
+  `session_directory_materialized.rs`, and
+  `session_directory_page_bound_authority_tests.rs`.
 
 **Precondition:** clean worktree; `run_task0_guard` passes.
 
@@ -2044,6 +3867,11 @@ run_task0_guard
 `materialized_dispatch`, and `build_directory_page` as declared above.
 
 - [ ] **Step 1: Write the exact extraction/capture tests first**
+
+Run full `run_task0_guard` before writing the compile-failing test. Once the
+unresolved `materialized_page` reference exists, use only
+`run_task0_static_guard` until the declared compile RED; full runtime guards
+resume at GREEN/commit boundaries.
 
 ```text
 extracted_materialized_completed_responses_match_frozen_parent
@@ -2060,7 +3888,7 @@ The primary helper contains exactly one call to absent `materialized_page`.
 
 ```bash
 set -euo pipefail
-run_task0_guard
+run_task0_static_guard
 expect_debug_compile_failure \
   task1-materialized-extraction \
   'error[E0425]: cannot find function `materialized_page` in this scope'
@@ -2089,7 +3917,7 @@ run_task1_focused() {
     revision_can_decrease_when_the_max_activity_source_disappears \
     request_revision_does_not_pin_the_index_capture
   do
-    run_exact_debug "$TEST_MOD::$name" || return 1
+    run_exact_debug "$TEST_AUTH::$name" || return 1
   done
 }
 run_task1_focused
@@ -2105,13 +3933,14 @@ read no colors.
 ```bash
 set -euo pipefail
 run_task1_focused
-run_exact_debug "$TEST_MOD::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens"
-run_exact_debug "$TEST_MOD::task0_owner_full_app_matches_pinned_parent_fixture_authority"
+run_exact_debug "$TEST_AUTH::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens"
+run_exact_debug "$TEST_AUTH::task0_owner_full_app_matches_pinned_parent_fixture_authority"
 run_server_all_targets
 run_sessions_sanity
 run_fmt_check
 run_clippy
 run_task0_guard
+assert_max_1000_lines "${SD_TASK0_FILES[@]}"
 ```
 
 Expected GREEN: the same focused tests, parent raw fixture, and all broader
@@ -2123,14 +3952,17 @@ commands return zero without changing Task-0 regions.
 set -euo pipefail
 commit_exact_scope \
   'refactor(session-directory): extract frozen materialized strategy' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_inputs.rs \
+  crates/freshell-server/src/session_directory_materialized.rs \
+  crates/freshell-server/src/session_directory_page_bound_authority_tests.rs
 run_both_guards
 ```
 
 ### Task 2: Characterize every reusable legacy equivalence fixture
 
-**Files:** test boundary only in
-`crates/freshell-server/src/session_directory.rs`.
+**Files:** facade, page-bound support, and
+`session_directory_page_bound_legacy_tests.rs`.
 
 **Interfaces produced:** deterministic fixture constructors reused by G1/G2/G3;
 no production symbol.
@@ -2138,7 +3970,7 @@ no production symbol.
 This is evidence-only: add each `legacy_` test before changing its fixture
 helper and run it exactly. If current behavior differs from an expectation,
 record actual frozen legacy behavior; never change production or either
-authority here.
+authority or artifact bytes here. Any discrepancy is a hard rebaseline stop.
 
 Required fixtures explicitly cover exact duplicate tuples/rows and boundary
 straddles; full-key/colon collisions; deletion/synth ties; ordered identity
@@ -2179,16 +4011,19 @@ and any internal completed-strategy case count is derived from its explicit tabl
 ```bash
 set -euo pipefail
 run_legacy_aggregate
-run_exact_debug "$TEST_MOD::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens"
-run_exact_debug "$TEST_MOD::task0_owner_full_app_matches_pinned_parent_fixture_authority"
+run_exact_debug "$TEST_AUTH::parent_raw_owner_backed_full_app_baseline_matches_reviewed_goldens"
+run_exact_debug "$TEST_AUTH::task0_owner_full_app_matches_pinned_parent_fixture_authority"
 run_server_all_targets
 run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
+assert_max_1000_lines "${SD_TASK2_FILES[@]}"
 commit_exact_scope \
   'test(session-directory): characterize reusable legacy equivalence cases' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_legacy_tests.rs
 ```
 
 GREEN criteria: exact 33-test inventory passes and authorities are unchanged.
@@ -2196,8 +4031,8 @@ GREEN criteria: exact 33-test inventory passes and authorities are unchanged.
 ### Task 3: Add borrowed matching and carried title decisions
 
 **Files:**
-- Modify production/test regions outside authorities in
-  `crates/freshell-server/src/session_directory.rs`.
+- Modify facade, `session_directory_fast.rs`, and
+  `session_directory_page_bound_g2_tests.rs`.
 
 **Interfaces produced:** `contains_ci`, `key_cmp`, `canonical_identity_key`,
 `is_deleted`, effective field helpers, borrowed provider display,
@@ -2247,7 +4082,7 @@ run_task3_focused() {
     selected_title_annotation_uses_the_carried_field_without_retesting \
     post_selection_title_field_drift_fails_closed
   do
-    run_exact_debug "$TEST_MOD::$name" || return 1
+    run_exact_debug "$TEST_G2::$name" || return 1
   done
 }
 run_task3_focused
@@ -2266,17 +4101,22 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
+assert_max_1000_lines "${SD_TASK3_FILES[@]}"
 commit_exact_scope \
   'feat(session-directory): add borrowed matching decisions' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_fast.rs \
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
 ```
 
 ### Task 4: Add the no-query Fast candidate, still undispatched
 
-**Files:** `crates/freshell-server/src/session_directory.rs` outside authorities.
+**Files:** facade, inputs, fast, page-bound support, source-audit, G2-tests, and
+G1-tests, all outside authorities.
 
 **Interfaces produced:** descriptor/merge/materialization/forced-strategy
-interfaces and the all-Materialized selector exactly as declared.
+interfaces, `candidate_is_deleted`, and the all-Materialized selector exactly as
+declared.
 
 - [ ] **Step 1: Write all no-query G2 tests first**
 
@@ -2296,9 +4136,9 @@ successful-Fast equations and `full_row_clone == 0`.
 | `g2_no_query_mixed_indexed_and_synth_work_is_exact` | N=49 visible indexed `claude:idx-{timestamp}` rows, one for every even `last_activity_at` in the inclusive range 104..=200; two unsuppressed, provider-bearing, otherwise noncolliding synths `claude:synth-mid` at 151 and `claude:synth-tail` at 1; no query or cursor; T=2, limit 50, flags 111. Independently expect the descending indexed timestamps 200 through 152, then `claude:synth-mid` at ordinal 26, then descending indexed timestamps 150 through 104. Assert exact key order, the exact legacy cursor encoding of `(104, "claude:idx-104")`, revision 200, and `claude:synth-tail` as descriptor 51/lookahead only. Assert 49 indexed + 1 synth returned, 49 of each indexed stage, one synth constructor, 50 serializations, zero title/clones. |
 | `g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows` | N=2, ordered T=51 containing same-full-key first-winner duplicates, colon-colliding tuples, synths before/on/after an arbitrary cursor; limit 2. Assert exact two post-cursor winner keys/terminal IDs and construct only their independently known provenance; all duplicate/prefix/lookahead descriptors remain unconstructed. |
 | `g2_no_query_lookahead_descriptor_is_never_constructed` | N=51 visible indexed rows, T=0, limit 50. Assert 50 returned, nonnull cursor from row 50, and exactly 50 indexed constructions/decorations/serializations—not 51. |
-| `g2_candidate_source_has_no_direct_dir_item_literal` | Call the shared `audit_fast_dir_item_production_contract(include_str!("session_directory.rs"))`; require exact producer/helper sets and no violations. Specifically assert its tokenized Fast region reports zero direct construction tokens outside the two marked producer bodies reached through `materialize_selected_descriptor`. Ordinary `DirItem` references and the two allowed helper return declarations do not count as construction. |
-| `g2_fast_region_has_no_clone_or_indirect_full_row_construction` | Call the same audit helper and require no clone token anywhere in the Fast/helper regions, no producer call outside `materialize_selected_descriptor`, no unknown `DirItem`-returning declaration/call, and a recursively closed helper graph of `materialize -> {indexed,synth}` and `annotate -> {}`. This is the sole interpretation of “indirect”; no adjacent broader return-type ban exists. |
-| `g2_full_row_constructor_inventory_is_exact_and_instrumented` | Call the same audit helper; assert exactly the three producer markers, exactly the two helper markers, exactly one manual `impl Clone for DirItem`, and the matching bump helper in each producer. Require the audit's complete violation list to be empty. The compile-valid unmarked `uninstrumented_full_row_copy` mutation returns `DirItem` and clones, so it necessarily appears as both an unknown returning helper and a clone violation and this exact test kills it. |
+| `g2_candidate_source_has_no_direct_dir_item_literal` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; require exact producer/helper sets and no violations. Specifically assert its tokenized Fast region reports zero direct construction tokens outside the two marked producer bodies reached through `materialize_selected_descriptor`. Ordinary `DirItem` references and the two allowed helper return declarations do not count as construction. |
+| `g2_fast_region_has_no_clone_or_indirect_full_row_construction` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; require no clone token anywhere in the Fast/helper regions, no producer call outside `materialize_selected_descriptor`, no unknown `DirItem`-returning declaration/call, and a recursively closed helper graph of `materialize -> {indexed,synth}` and `annotate -> {}`. This is the sole interpretation of “indirect”; no adjacent broader return-type ban exists. |
+| `g2_full_row_constructor_inventory_is_exact_and_instrumented` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; assert exactly the three producer markers, exactly the two helper markers, exactly one manual `impl Clone for DirItem`, and the matching bump helper in each producer. Require the audit's complete violation list to be empty. The compile-valid unmarked `uninstrumented_full_row_copy` mutation returns `DirItem` and clones, so it necessarily appears as both an unknown returning helper and a clone violation and this exact test kills it. |
 | `g2_one_returned_row_with_500_identities_has_zero_full_row_clones` | N=1 indexed row; T=500 ordered identities all exact-component-match that row; limit 50, flags 111. Assert one indexed row/first terminal winner, no synth, one of each indexed stage/serialization, and zero clones. The compile-valid mutation must leave response bytes unchanged while making `full_row_clone == 500`. |
 
 Implement the one shared audit interface exactly once in the test boundary:
@@ -2314,10 +4154,23 @@ struct FastDirItemProductionAudit {
 }
 
 #[cfg(all(test, debug_assertions))]
-fn audit_fast_dir_item_production_contract(source: &str) -> FastDirItemProductionAudit;
+pub(super) const FAST_AUDIT_SOURCES: &[(&str, &str)] = &[
+    (
+        "materialized",
+        include_str!("session_directory_materialized.rs"),
+    ),
+    ("fast", include_str!("session_directory_fast.rs")),
+];
+
+#[cfg(all(test, debug_assertions))]
+pub(super) fn audit_fast_dir_item_production_contract(
+    sources: &[(&str, &str)],
+) -> FastDirItemProductionAudit;
 ```
 
-The implementation uses the lexical/marker rules in the named-work contract,
+The implementation includes source names in every violation and requires marker
+uniqueness across the bundle. It uses the
+lexical/marker rules in the named-work contract,
 not three independent regex interpretations. Its exact accepted sets are
 `{indexed,synth,clone}`, `{materialize,annotate}`, and
 `{(materialize,indexed),(materialize,synth)}`. It sorts/deduplicates findings,
@@ -2334,6 +4187,20 @@ The two effective-title rows above are mandatory call-site evidence that
 `candidate_is_visible(candidate, q, overrides, identities)` and
 `candidate_is_nonempty(candidate, overrides, identities)` receive the captured
 override view; a raw-title-only implementation cannot pass.
+
+Strengthen existing fixtures without adding/renaming tests:
+
+- `legacy_deleted_session_with_live_terminal_synthesizes` uses indexed key `K`,
+  typed deletion plus sentinel decorations, and a same-key live identity; it
+  expects exactly one Synth-provenance running row with identity
+  terminal/time/cwd, provider-display/default fields, and no override sentinels.
+- `legacy_deleted_index_and_synth_equal_ties` deletes every duplicate exact-tuple
+  indexed row and supplies a same-key equal-timestamp identity; it expects no
+  Indexed rows and exactly one first-winner Synth.
+- `g1_deleted_synth_ties_old_materialized_fast` reuses both fixtures, asserts
+  independent item/provenance expectations and
+  FrozenOld == ExtractedMaterialized == Fast values plus direct renderer bytes,
+  for no-query and matching nonempty Title subcases in the same top-level test.
 
 - [ ] **Step 2: Verify RED**
 
@@ -2367,10 +4234,17 @@ only.
 Keep these canonical mutation anchors exactly through Task 7:
 
 ```rust
-if is_deleted(overrides, &candidate_full_key(candidate)) {
+if candidate_is_deleted(candidate, overrides) {
     continue;
 }
 ```
+
+Implement `candidate_is_deleted` exactly once in
+`session_directory_fast.rs`: Indexed delegates to
+`is_deleted(overrides, &indexed.key())`; Synth returns false. FrozenOld deletes
+indexed rows before live synthesis, so a same-key live Synth survives and
+receives no override decoration. Suppression still uses every nondeleted
+indexed full key.
 
 ```rust
 fn materialize_selected_descriptor(
@@ -2403,16 +4277,16 @@ construct exactly returned rows; lookahead remains unconstructed.
 ```bash
 set -euo pipefail
 run_task4_focused() {
-  run_exact_debug "$TEST_MOD::g2_no_query_indexed_work_table_is_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_no_query_synth_work_table_is_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_no_query_all_filtered_large_live_set_builds_zero_items" || return 1
-  run_exact_debug "$TEST_MOD::g2_no_query_mixed_indexed_and_synth_work_is_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows" || return 1
-  run_exact_debug "$TEST_MOD::g2_no_query_lookahead_descriptor_is_never_constructed" || return 1
-  run_exact_debug "$TEST_MOD::g2_candidate_source_has_no_direct_dir_item_literal" || return 1
-  run_exact_debug "$TEST_MOD::g2_fast_region_has_no_clone_or_indirect_full_row_construction" || return 1
-  run_exact_debug "$TEST_MOD::g2_full_row_constructor_inventory_is_exact_and_instrumented" || return 1
-  run_exact_debug "$TEST_MOD::g2_one_returned_row_with_500_identities_has_zero_full_row_clones" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_indexed_work_table_is_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_synth_work_table_is_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_all_filtered_large_live_set_builds_zero_items" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_mixed_indexed_and_synth_work_is_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows" || return 1
+  run_exact_debug "$TEST_G2::g2_no_query_lookahead_descriptor_is_never_constructed" || return 1
+  run_exact_debug "$TEST_G2::g2_candidate_source_has_no_direct_dir_item_literal" || return 1
+  run_exact_debug "$TEST_G2::g2_fast_region_has_no_clone_or_indirect_full_row_construction" || return 1
+  run_exact_debug "$TEST_G2::g2_full_row_constructor_inventory_is_exact_and_instrumented" || return 1
+  run_exact_debug "$TEST_G2::g2_one_returned_row_with_500_identities_has_zero_full_row_clones" || return 1
 }
 run_task4_focused
 ```
@@ -2433,10 +4307,17 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
-run_exact_debug "$TEST_MOD::dispatch_all_shapes_are_materialized_before_gates"
+run_exact_debug "$TEST_G1::dispatch_all_shapes_are_materialized_before_gates"
+assert_max_1000_lines "${SD_TASK4_FILES[@]}"
 commit_exact_scope \
   'perf(session-directory): add page-bounded no-query candidate' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_inputs.rs \
+  crates/freshell-server/src/session_directory_fast.rs \
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_source_audit.rs \
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs \
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
 ```
 
 Expected GREEN: the same focused and broader checks pass and production remains
@@ -2444,7 +4325,7 @@ all Materialized.
 
 ### Task 5: Add the title Fast candidate, still undispatched
 
-**Files:** `crates/freshell-server/src/session_directory.rs` outside authorities.
+**Files:** fast, page-bound support, source-audit, and G2-tests.
 
 **Interfaces consumed:** Task 3's carried title decision and Task 4 descriptors.
 No new selector state.
@@ -2477,7 +4358,7 @@ nonempty visibility cases.
 ```bash
 set -euo pipefail
 expect_exact_debug_failure \
-  "$TEST_MOD::g2_title_post_selection_has_no_rejection_path" \
+  "$TEST_G2::g2_title_post_selection_has_no_rejection_path" \
   RED_TITLE_FAST_PATH_MUST_USE_CARRIED_DECISION
 ```
 
@@ -2497,15 +4378,15 @@ queries may scan the corpus; full-row work remains exact returned-page work.
 ```bash
 set -euo pipefail
 run_task5_focused() {
-  run_exact_debug "$TEST_MOD::g2_title_post_selection_has_no_rejection_path" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_early_dense_matches_build_only_returned_rows" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_late_sparse_matches_scan_but_build_only_returned_rows" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_no_match_builds_zero_rows" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_long_ascii_fields_are_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_non_ascii_expansion_table_is_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_mixed_indexed_and_synth_work_is_exact" || return 1
-  run_exact_debug "$TEST_MOD::g2_title_synth_matches_build_only_selected_rows" || return 1
-  run_exact_debug "$TEST_MOD::post_selection_title_field_drift_fails_closed" || return 1
+  run_exact_debug "$TEST_G2::g2_title_post_selection_has_no_rejection_path" || return 1
+  run_exact_debug "$TEST_G2::g2_title_early_dense_matches_build_only_returned_rows" || return 1
+  run_exact_debug "$TEST_G2::g2_title_late_sparse_matches_scan_but_build_only_returned_rows" || return 1
+  run_exact_debug "$TEST_G2::g2_title_no_match_builds_zero_rows" || return 1
+  run_exact_debug "$TEST_G2::g2_title_long_ascii_fields_are_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_title_non_ascii_expansion_table_is_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_title_mixed_indexed_and_synth_work_is_exact" || return 1
+  run_exact_debug "$TEST_G2::g2_title_synth_matches_build_only_selected_rows" || return 1
+  run_exact_debug "$TEST_G2::post_selection_title_field_drift_fails_closed" || return 1
 }
 run_task5_focused
 ```
@@ -2525,15 +4406,19 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
-run_exact_debug "$TEST_MOD::dispatch_all_shapes_are_materialized_before_gates"
+run_exact_debug "$TEST_G1::dispatch_all_shapes_are_materialized_before_gates"
+assert_max_1000_lines "${SD_TASK4_FILES[@]}"
 commit_exact_scope \
   'perf(session-directory): add page-bounded title candidate' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_fast.rs \
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_source_audit.rs \
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
 ```
 
 ### Task 6: Commit complete G1 and compile-valid mutation killers
 
-**Files:** test boundary only in `session_directory.rs`.
+**Files:** page-bound support and G1-tests only.
 
 **Interfaces produced:** `ComparisonStrategy`, `completed_strategy_app`, complete
 G1 generators/tables, and mutation-addressable exact tests. No production
@@ -2562,7 +4447,8 @@ strategy and actual owner route matrices traverse full layers.
 `EXPECTED_PARENT_CASE_NAMES` slice—including `single_identity_running_join`, both
 retained-tier cursor rows, fullText partial, and all three color-route rows—and
 asserts its executed raw-name sequence and length equal that slice before
-comparing status/content-type/raw body. The fixed A/B and B/A subcases are not in
+comparing every current-owner exchange sequence directly with the embedded
+artifact. The fixed A/B and B/A subcases are not in
 that raw sequence. After the raw loop, the test reuses the frozen
 same-unchanged-registry relational owner assertion; that assertion has no
 raw-manifest name and does not contribute to the derived raw sequence length of
@@ -2582,17 +4468,19 @@ dispatch_blank_query_is_no_query_branch
 set -euo pipefail
 run_g1_aggregate
 run_legacy_aggregate
-run_exact_debug "$TEST_MOD::dispatch_nonempty_user_messages_and_full_text_are_materialized"
-run_exact_debug "$TEST_MOD::dispatch_tier_without_query_is_no_query_branch"
-run_exact_debug "$TEST_MOD::dispatch_blank_query_is_no_query_branch"
+run_exact_debug "$TEST_G1::dispatch_nonempty_user_messages_and_full_text_are_materialized"
+run_exact_debug "$TEST_G1::dispatch_tier_without_query_is_no_query_branch"
+run_exact_debug "$TEST_G1::dispatch_blank_query_is_no_query_branch"
 run_server_all_targets
 run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
+assert_max_1000_lines "${SD_TASK4_FILES[@]}"
 commit_exact_scope \
   'test(session-directory): commit complete compatibility and mutation-killer gates' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
 TASK6_COMMIT="$(git -C "$WT" rev-parse HEAD)"
 export TASK6_COMMIT
 ```
@@ -2613,17 +4501,37 @@ must (1) change each declared old snippet exactly once, (2) compile successfully
 (5) restore only the disposable scratch file to the committed scratch base.
 Compilation failure is invalid setup, never a kill.
 
+Each scratch lives under a fresh private mode-`0700` temp root. Ownership becomes
+true only after exact NUL-safe registration/path/detached-HEAD/clean/root/
+worktree/gitdir identity checks. Mutation, Cargo, every status read and restore,
+and non-forced removal revalidate that captured identity. Partial, dirty,
+replaced, reused, locked/prunable, or otherwise ambiguous state is preserved and
+fails closed; HEAD equality alone never proves ownership.
+
 A surviving mutation permits a test-only Task-6 amendment through the exact
 amend guard below, followed by recreation and a full mutation rerun. A real
 candidate defect returns to Task 4/5 and replays subsequent commits.
 
 ### Task 8: Audit G2 and run finite release G3 before routing
 
-**Files:** test boundary only in `session_directory.rs`.
+**Files:** facade, page-bound support, and G3-tests.
 
 The 18 G2 tests already exist from Tasks 4/5. Add only the explicit G3 manifest
 and `adverse_release_ab_non_regression`; do not change production. A G2/G3
 production defect returns to Task 4/5.
+
+The G3 declaration is exactly:
+
+```rust
+#[test]
+#[ignore = "finite full-app release A/B gate; run explicitly in release"]
+fn adverse_release_ab_non_regression() {
+    // explicit 30-row manifest and finite protocol
+}
+```
+
+The ignore is load-bearing: broad debug compiles but skips G3; explicit release
+calls use `--ignored` and require exactly one passed Rust test.
 
 ```bash
 set -euo pipefail
@@ -2634,17 +4542,20 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
-run_exact_release_ignored "$TEST_MOD::adverse_release_ab_non_regression"
+run_exact_release_ignored "$TEST_G3::adverse_release_ab_non_regression"
+assert_max_1000_lines "${SD_TASK8_FILES[@]}"
 commit_exact_scope \
   'test(session-directory): add exact work and finite adverse release gates' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory.rs \
+  crates/freshell-server/src/session_directory_page_bound_support.rs \
+  crates/freshell-server/src/session_directory_page_bound_g3_tests.rs
 ```
 
 This is the only pre-switch full G3. Its exact manifest/statistics are below.
 
 ### Task 9: Switch no-query in one selector-only commit
 
-**Files:** selector and its test only in `session_directory.rs`.
+**Files:** selector only in fast and its dedicated test only in G1-tests.
 
 - [ ] **Step 1: Write the production selector test first**
 
@@ -2654,7 +4565,7 @@ This is the only pre-switch full G3. Its exact manifest/statistics are below.
 ```bash
 set -euo pipefail
 expect_exact_debug_failure \
-  "$TEST_MOD::production_dispatch_routes_no_query_fast" \
+  "$TEST_G1::production_dispatch_routes_no_query_fast" \
   RED_NO_QUERY_SELECTOR_STILL_MATERIALIZED
 ```
 
@@ -2665,16 +4576,16 @@ Materialized.
 
 ```bash
 set -euo pipefail
-run_exact_debug "$TEST_MOD::production_dispatch_routes_no_query_fast"
+run_exact_debug "$TEST_G1::production_dispatch_routes_no_query_fast"
 ```
 
 - [ ] **Step 3: Refactor selector expression only, rerun, and commit**
 
 ```bash
 set -euo pipefail
-run_exact_debug "$TEST_MOD::production_dispatch_routes_no_query_fast"
-run_exact_debug "$TEST_MOD::g1_completed_full_app_route_matrix_matches_parent"
-run_exact_debug "$TEST_MOD::dispatch_nonempty_user_messages_and_full_text_are_materialized"
+run_exact_debug "$TEST_G1::production_dispatch_routes_no_query_fast"
+run_exact_debug "$TEST_G1::g1_completed_full_app_route_matrix_matches_parent"
+run_exact_debug "$TEST_G1::dispatch_nonempty_user_messages_and_full_text_are_materialized"
 run_g1_aggregate
 run_g2_aggregate
 run_server_all_targets
@@ -2682,9 +4593,11 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
+assert_max_1000_lines "${SD_TASK8_FILES[@]}"
 commit_exact_scope \
   'perf(session-directory): route no-query requests through the fast path' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_fast.rs \
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
 ```
 
 Do not rerun G3 here: it forces both strategies and Task 8 just ran the full
@@ -2692,14 +4605,14 @@ manifest. This commit contains only selector/test changes.
 
 ### Task 10: Switch nonempty Title in the second selector-only commit
 
-**Files:** selector and its test only in `session_directory.rs`.
+**Files:** selector only in fast and its dedicated test only in G1-tests.
 
 - [ ] **Step 1: Write the final selector test first**
 
 ```bash
 set -euo pipefail
 expect_exact_debug_failure \
-  "$TEST_MOD::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers" \
+  "$TEST_G1::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers" \
   RED_TITLE_SELECTOR_STILL_MATERIALIZED
 ```
 
@@ -2715,16 +4628,16 @@ nonempty query + UserMessages or FullText -> Materialized
 
 ```bash
 set -euo pipefail
-run_exact_debug "$TEST_MOD::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers"
+run_exact_debug "$TEST_G1::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers"
 ```
 
 - [ ] **Step 3: Refactor selector only, perform final checks, and commit**
 
 ```bash
 set -euo pipefail
-run_exact_debug "$TEST_MOD::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers"
-run_exact_debug "$TEST_MOD::g1_completed_full_app_route_matrix_matches_parent"
-run_exact_debug "$TEST_MOD::dispatch_nonempty_user_messages_and_full_text_are_materialized"
+run_exact_debug "$TEST_G1::production_dispatch_routes_nonempty_title_fast_and_retains_file_tiers"
+run_exact_debug "$TEST_G1::g1_completed_full_app_route_matrix_matches_parent"
+run_exact_debug "$TEST_G1::dispatch_nonempty_user_messages_and_full_text_are_materialized"
 run_g1_aggregate
 run_g2_aggregate
 run_server_all_targets
@@ -2733,10 +4646,13 @@ run_fmt_check
 run_clippy
 run_shared_typecheck
 run_both_guards
-run_exact_release_ignored "$TEST_MOD::adverse_release_ab_non_regression"
+run_exact_release_ignored "$TEST_G3::adverse_release_ab_non_regression"
+assert_max_1000_lines "${SD_TASK8_FILES[@]}"
 commit_exact_scope \
   'perf(session-directory): route title search through the fast path' \
-  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_fast.rs \
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
+replay_pinned_parent_authority
 ```
 
 This is the sole post-switch whole G3. Completion requires both Fast selectors,
@@ -2757,15 +4673,203 @@ test "$(git -C "$WT" rev-parse HEAD)" = "$TASK6_COMMIT"
 MUTATION_BASE="$TASK6_COMMIT"
 test "$(git -C "$WT" show -s --format=%s "$MUTATION_BASE")" = \
   'test(session-directory): commit complete compatibility and mutation-killer gates'
-MUT_WT=/home/dan/code/freshell/.worktrees/session-directory-page-bound-mutation-scratch
-test ! -e "$MUT_WT"
-git -C "$WT" worktree add --detach "$MUT_WT" "$MUTATION_BASE"
-test "$(git -C "$MUT_WT" rev-parse HEAD)" = "$MUTATION_BASE"
-test -z "$(git -C "$MUT_WT" status --short)"
+assert_mutation_worktree_record() {
+  local mode="$1"
+  python3 - "$WT" "$MUT_WT_EXPECTED" "$MUT_WT_HEAD" "$mode" <<'PY'
+import os, subprocess, sys
+wt, expected_path, expected_head, mode = sys.argv[1:]
+expected_path = os.path.normpath(os.path.abspath(expected_path))
+raw = subprocess.check_output(
+    ["git", "-C", wt, "worktree", "list", "--porcelain", "-z"]
+)
+records = []
+for block in raw.split(b"\0\0"):
+    if not block:
+        continue
+    record, flags = {}, set()
+    for field in block.split(b"\0"):
+        if not field:
+            continue
+        if b" " in field:
+            key, value = field.split(b" ", 1)
+            record[key.decode()] = os.fsdecode(value)
+        else:
+            flags.add(field.decode())
+    record["flags"] = flags
+    records.append(record)
+def lexical(path):
+    return os.path.normpath(os.path.abspath(path))
+matches = [
+    record for record in records
+    if lexical(record.get("worktree", "")) == expected_path
+    or os.path.realpath(record.get("worktree", "")) == expected_path
+]
+if mode == "absent":
+    if matches:
+        raise SystemExit(f"scratch path already registered; preserving it: {matches!r}")
+elif mode in {"owned", "locked", "prunable"}:
+    if len(matches) != 1:
+        raise SystemExit(f"expected one scratch registration, found {matches!r}")
+    record = matches[0]
+    flags = record["flags"]
+    if record.get("HEAD") != expected_head or "detached" not in flags:
+        raise SystemExit(f"scratch registration identity changed: {record!r}")
+    markers = set(record) | flags
+    if mode == "owned" and {"locked", "prunable"} & markers:
+        raise SystemExit(f"scratch registration is locked/prunable: {record!r}")
+    if mode == "locked" and (
+        "locked" not in markers or "prunable" in markers
+    ):
+        raise SystemExit(f"scratch registration is not exactly locked: {record!r}")
+    if mode == "prunable" and "prunable" not in markers:
+        raise SystemExit(f"scratch registration is not prunable: {record!r}")
+else:
+    raise SystemExit(f"unknown scratch worktree-check mode: {mode}")
+PY
+}
+
+assert_mutation_worktree_identity() {
+  local actual actual_top actual_head actual_gitdir
+  test -n "${MUT_TMP_ID:-}" &&
+    test -n "${MUT_WT_ID:-}" &&
+    test -n "${MUT_WT_GITDIR:-}" &&
+    test -n "${MUT_WT_GITDIR_ID:-}" || return 1
+  actual="$(path_identity "$MUT_TMP")" || return 1
+  test "$actual" = "$MUT_TMP_ID" || return 1
+  assert_mutation_worktree_record owned || return 1
+  test "$(canonical_path "$MUT_WT")" = "$MUT_WT_EXPECTED" || return 1
+  test "$(path_identity "$MUT_WT")" = "$MUT_WT_ID" || return 1
+  actual_top="$(git -C "$MUT_WT" rev-parse --show-toplevel)" || return 1
+  test "$(canonical_path "$actual_top")" = "$MUT_WT_EXPECTED" || return 1
+  actual_head="$(git -C "$MUT_WT" rev-parse HEAD)" || return 1
+  test "$actual_head" = "$MUT_WT_HEAD" || return 1
+  actual_gitdir="$(git -C "$MUT_WT" rev-parse --absolute-git-dir)" || return 1
+  actual_gitdir="$(canonical_path "$actual_gitdir")" || return 1
+  test "$actual_gitdir" = "$MUT_WT_GITDIR" || return 1
+  test "$(path_identity "$actual_gitdir")" = "$MUT_WT_GITDIR_ID" || return 1
+}
+
+assert_mutation_worktree_owned() {
+  test "${MUT_WT_OWNED:-0}" = 1 || {
+    printf 'mutation worktree ownership was never established\n' >&2
+    return 1
+  }
+  assert_mutation_worktree_identity
+}
+
+scratch_status() {
+  local status
+  assert_mutation_worktree_owned || return 1
+  status="$(git -C "$MUT_WT" -c core.fsmonitor=false \
+    -c core.untrackedCache=false status --porcelain=v1 \
+    --untracked-files=all)" || return 1
+  assert_mutation_worktree_owned || return 1
+  printf '%s' "$status"
+}
+
+scratch_assert_clean() {
+  local status
+  status="$(scratch_status)" || return 1
+  test -z "$status" || {
+    printf 'owned mutation worktree is dirty; preserving it:\n%s\n' "$status" >&2
+    return 1
+  }
+}
+
+cleanup_mutation_scratch() {
+  local original_status="$?" cleanup_status=0 status actual
+  trap - EXIT
+  if test "${MUT_WT_OWNED:-0}" = 1; then
+    if ! assert_mutation_worktree_owned ||
+       ! status="$(scratch_status)" ||
+       test -n "$status" ||
+       ! assert_mutation_worktree_owned; then
+      printf 'mutation scratch is ambiguous; preserving it\n' >&2
+      cleanup_status=1
+    elif git -C "$WT" -c core.fsmonitor=false -c core.untrackedCache=false \
+        worktree remove "$MUT_WT"; then
+      MUT_WT_OWNED=0
+      test ! -e "$MUT_WT" || cleanup_status=1
+      assert_mutation_worktree_record absent || cleanup_status=1
+      test ! -e "$MUT_WT_GITDIR" || cleanup_status=1
+    else
+      printf 'non-forced mutation removal failed; preserving it\n' >&2
+      cleanup_status=1
+    fi
+  fi
+  if test "${MUT_TMP_OWNED:-0}" = 1; then
+    actual="$(path_identity "$MUT_TMP")" || cleanup_status=1
+    if test "$cleanup_status" = 0 &&
+       test "$actual" = "$MUT_TMP_ID" &&
+       test "${MUT_WT_OWNED:-0}" = 0 &&
+       test ! -e "$MUT_WT" &&
+       assert_mutation_worktree_record absent &&
+       rmdir "$MUT_TMP"; then
+      MUT_TMP_OWNED=0
+    else
+      printf 'mutation temp root retained; ownership is ambiguous\n' >&2
+      cleanup_status=1
+    fi
+  fi
+  test "$original_status" -eq 0 || return "$original_status"
+  return "$cleanup_status"
+}
+
+create_mutation_scratch() {
+  local expected_head="$1"
+  test "${MUT_WT_OWNED:-0}" = 0 || return 1
+  test "${MUT_TMP_OWNED:-0}" = 0 || return 1
+  MUT_WT_HEAD="$expected_head"
+  MUT_TMP="$(mktemp -d \
+    /home/dan/code/freshell/.worktrees/.session-directory-page-bound-mutation.XXXXXXXX)" ||
+    return 1
+  MUT_TMP_OWNED=0
+  test "$(path_mode "$MUT_TMP")" = 700 || return 1
+  MUT_TMP_ID="$(path_identity "$MUT_TMP")" || return 1
+  MUT_TMP_OWNED=1
+  MUT_RUN_ID="${MUT_TMP##*.}"
+  MUT_WT="$MUT_TMP/worktree-$MUT_RUN_ID"
+  MUT_WT_EXPECTED="$(canonical_path "$MUT_WT")" || return 1
+  MUT_WT_OWNED=0
+  MUT_WT_ID=
+  MUT_WT_GITDIR=
+  MUT_WT_GITDIR_ID=
+  test ! -e "$MUT_WT" || return 1
+  assert_mutation_worktree_record absent || return 1
+  trap cleanup_mutation_scratch EXIT
+  git -C "$WT" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c core.untrackedCache=false worktree add --detach \
+    "$MUT_WT" "$MUT_WT_HEAD" || return 1
+  assert_mutation_worktree_record owned
+  test "$(canonical_path "$MUT_WT")" = "$MUT_WT_EXPECTED"
+  test "$(canonical_path "$(git -C "$MUT_WT" rev-parse --show-toplevel)")" = \
+    "$MUT_WT_EXPECTED"
+  test "$(git -C "$MUT_WT" rev-parse HEAD)" = "$MUT_WT_HEAD"
+  MUT_WT_ID="$(path_identity "$MUT_WT")"
+  MUT_WT_GITDIR="$(canonical_path \
+    "$(git -C "$MUT_WT" rev-parse --absolute-git-dir)")"
+  MUT_WT_GITDIR_ID="$(path_identity "$MUT_WT_GITDIR")"
+  assert_mutation_worktree_identity
+  test -z "$(git -C "$MUT_WT" -c core.fsmonitor=false \
+    -c core.untrackedCache=false status --porcelain=v1 --untracked-files=all)"
+  assert_mutation_worktree_identity
+  MUT_WT_OWNED=1
+  assert_mutation_worktree_owned
+  scratch_assert_clean
+}
 
 scratch_list_tests() {
-  local output line
-  output="$(cargo test --manifest-path "$MUT_WT/Cargo.toml" -p freshell-server -- --list)" || return 1
+  local output line cargo_status
+  assert_mutation_worktree_owned || return 1
+  if output="$(CARGO_TERM_COLOR=never cargo test \
+      --manifest-path "$MUT_WT/Cargo.toml" \
+      -p freshell-server --bin freshell-server -- --list --color=never)"; then
+    cargo_status=0
+  else
+    cargo_status=$?
+  fi
+  assert_mutation_worktree_owned || return 1
+  test "$cargo_status" -eq 0 || return "$cargo_status"
   while IFS= read -r line; do
     case "$line" in *': test') printf '%s\n' "${line%: test}" || return 1 ;; esac
   done <<<"$output"
@@ -2781,18 +4885,41 @@ scratch_assert_one() {
 }
 
 scratch_compile_mutation() {
-  cargo test --manifest-path "$MUT_WT/Cargo.toml" -p freshell-server --no-run || {
+  local cargo_status
+  assert_mutation_worktree_owned || return 1
+  if CARGO_TERM_COLOR=never cargo test \
+      --manifest-path "$MUT_WT/Cargo.toml" \
+      -p freshell-server --bin freshell-server --no-run --color=never; then
+    cargo_status=0
+  else
+    cargo_status=$?
+  fi
+  assert_mutation_worktree_owned || return 1
+  test "$cargo_status" -eq 0 || {
     printf 'INVALID MUTATION SETUP: mutated tree does not compile\n' >&2
     return 1
   }
 }
 
 scratch_require_killed() {
-  local name="$1" log expected
+  local name="$1" log expected cargo_status
   scratch_assert_one "$name" || return 1
   log="$(mktemp)" || return 1
-  if cargo test --manifest-path "$MUT_WT/Cargo.toml" -p freshell-server \
-      "$name" -- --exact --test-threads=1 >"$log" 2>&1; then
+  assert_mutation_worktree_owned || { rm -f "$log"; return 1; }
+  if CARGO_TERM_COLOR=never cargo test \
+      --manifest-path "$MUT_WT/Cargo.toml" \
+      -p freshell-server --bin freshell-server \
+      "$name" -- --exact --color=never --test-threads=1 >"$log" 2>&1; then
+    cargo_status=0
+  else
+    cargo_status=$?
+  fi
+  if ! assert_mutation_worktree_owned; then
+    cat "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  if test "$cargo_status" -eq 0; then
     printf 'SURVIVED: %s\n' "$name" >&2
     cat "$log" >&2 || true
     rm -f "$log"
@@ -2810,14 +4937,286 @@ PY
 }
 
 scratch_restore() {
-  git -C "$MUT_WT" restore --source="$MUTATION_BASE" --staged --worktree -- \
-    crates/freshell-server/src/session_directory.rs || return 1
-  test -z "$(git -C "$MUT_WT" status --short)" || return 1
+  local file=crates/freshell-server/src/session_directory_fast.rs status
+  assert_mutation_worktree_owned || return 1
+  status="$(scratch_status)" || return 1
+  case "$status" in
+    ''|" M $file") ;;
+    *) printf 'unexpected mutation scratch state; refusing restore:\n%s\n' \
+         "$status" >&2; return 1 ;;
+  esac
+  assert_mutation_worktree_owned || return 1
+  git -C "$MUT_WT" restore --source="$MUT_WT_HEAD" --worktree -- \
+    "$file" || return 1
+  assert_mutation_worktree_owned || return 1
+  scratch_assert_clean
 }
 ```
 
 The restore targets only the disposable scratch file. It is never run in the
 active or foreign worktree.
+
+### Deterministic mutation-ownership negative probes
+
+Run these shell-level probes before creating the real mutation scratch. Each
+probe receives a fresh random root/identities, proves that the guarded action
+marker is never reached, restores only known probe state, and completes ordinary
+guarded cleanup before the next probe.
+
+```bash
+guarded_mutation_probe_action() {
+  assert_mutation_worktree_owned || return 1
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+  printf 'reached\n' >"$MUT_PROBE_REACHED" || return 1
+  assert_mutation_worktree_owned || return 1
+}
+
+expect_mutation_probe_blocked() {
+  local label="$1"
+  if guarded_mutation_probe_action; then
+    printf 'ownership probe unexpectedly reached action: %s\n' "$label" >&2
+    return 1
+  fi
+  test ! -e "$MUT_PROBE_REACHED" || {
+    printf 'ownership probe action marker exists: %s\n' "$label" >&2
+    return 1
+  }
+}
+
+assert_exact_probe_line() {
+  local path="$1" expected="$2"
+  python3 - "$path" "$expected" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2].encode("utf-8") + b"\n"
+if path.read_bytes() != expected:
+    raise SystemExit(f"probe bytes differ: {path}")
+PY
+}
+
+begin_mutation_ownership_probe() {
+  MUT_TMP_OWNED=0
+  MUT_WT_OWNED=0
+  create_mutation_scratch "$MUTATION_BASE" || return 1
+  MUT_PROBE_REACHED="$MUT_TMP/probe-action-reached"
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+}
+
+finish_mutation_ownership_probe() {
+  scratch_assert_clean || return 1
+  cleanup_mutation_scratch || return 1
+  trap - EXIT
+  test "${MUT_WT_OWNED:-0}" = 0 || return 1
+  test "${MUT_TMP_OWNED:-0}" = 0 || return 1
+  test ! -e "$MUT_WT" || return 1
+  assert_mutation_worktree_record absent
+}
+
+probe_a_ownership_flag_absent() {
+  local saved_owned
+  begin_mutation_ownership_probe || return 1
+  saved_owned="$MUT_WT_OWNED"
+  MUT_WT_OWNED=0
+  expect_mutation_probe_blocked ownership-flag-absent || return 1
+  assert_mutation_worktree_identity || return 1
+  MUT_WT_OWNED="$saved_owned"
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_b_identity_token_mismatches() {
+  local token saved
+  for token in MUT_TMP_ID MUT_WT_ID MUT_WT_GITDIR_ID; do
+    begin_mutation_ownership_probe || return 1
+    saved="${!token}"
+    printf -v "$token" '%s.mismatch' "$saved"
+    expect_mutation_probe_blocked "$token" || return 1
+    printf -v "$token" '%s' "$saved"
+    assert_mutation_worktree_owned || return 1
+    finish_mutation_ownership_probe || return 1
+  done
+}
+
+probe_c_locked_registration() {
+  begin_mutation_ownership_probe || return 1
+  assert_mutation_worktree_owned || return 1
+  git -C "$WT" worktree lock \
+    --reason session-directory-ownership-negative-probe "$MUT_WT" || return 1
+  assert_mutation_worktree_record locked || return 1
+  expect_mutation_probe_blocked locked-registration || return 1
+  assert_mutation_worktree_record locked || return 1
+  git -C "$WT" worktree unlock "$MUT_WT" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_d_prunable_registration() {
+  local moved
+  begin_mutation_ownership_probe || return 1
+  moved="$MUT_TMP/prunable-$MUT_RUN_ID"
+  assert_mutation_worktree_owned || return 1
+  test ! -e "$moved" || return 1
+  mv -- "$MUT_WT" "$moved" || return 1
+  test "$(path_identity "$moved")" = "$MUT_WT_ID" || return 1
+  assert_mutation_worktree_record prunable || return 1
+  expect_mutation_probe_blocked prunable-registration || return 1
+  assert_mutation_worktree_record prunable || return 1
+  mv -- "$moved" "$MUT_WT" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_e_untracked_restore_refusal() {
+  local probe
+  begin_mutation_ownership_probe || return 1
+  probe="$MUT_WT/mutation-untracked-probe"
+  assert_mutation_worktree_owned || return 1
+  printf 'untracked-probe\n' >"$probe" || return 1
+  assert_mutation_worktree_owned || return 1
+  if scratch_restore; then
+    printf 'restore accepted untracked probe\n' >&2
+    return 1
+  fi
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+  assert_mutation_worktree_owned || return 1
+  assert_exact_probe_line "$probe" untracked-probe || return 1
+  assert_mutation_worktree_owned || return 1
+  rm -- "$probe" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_f_staged_restore_refusal() {
+  local probe_rel=mutation-staged-probe probe
+  begin_mutation_ownership_probe || return 1
+  probe="$MUT_WT/$probe_rel"
+  assert_mutation_worktree_owned || return 1
+  printf 'staged-probe\n' >"$probe" || return 1
+  git -C "$MUT_WT" add -- "$probe_rel" || return 1
+  test "$(git -C "$MUT_WT" diff --cached --name-only)" = "$probe_rel" ||
+    return 1
+  assert_mutation_worktree_owned || return 1
+  if scratch_restore; then
+    printf 'restore accepted staged probe\n' >&2
+    return 1
+  fi
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+  assert_mutation_worktree_owned || return 1
+  test -f "$probe" || return 1
+  assert_exact_probe_line "$probe" staged-probe || return 1
+  test "$(git -C "$MUT_WT" diff --cached --name-only)" = "$probe_rel" ||
+    return 1
+  assert_mutation_worktree_owned || return 1
+  git -C "$MUT_WT" rm --cached -- "$probe_rel" || return 1
+  rm -- "$probe" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_g_extra_tracked_restore_refusal() {
+  local rel=crates/freshell-server/Cargo.toml path saved expected suffix
+  begin_mutation_ownership_probe || return 1
+  path="$MUT_WT/$rel"
+  saved="$MUT_TMP/Cargo.toml.base"
+  expected="$MUT_TMP/Cargo.toml.expected"
+  suffix="# session-directory mutation ownership probe $MUT_RUN_ID"
+  assert_mutation_worktree_owned || return 1
+  test ! -e "$saved" && test ! -e "$expected" || return 1
+  cp -- "$path" "$saved" || return 1
+  python3 - "$path" "$saved" "$expected" "$suffix" <<'PY'
+import pathlib
+import sys
+
+path, saved, expected = map(pathlib.Path, sys.argv[1:4])
+suffix = b"\n" + sys.argv[4].encode("utf-8") + b"\n"
+base = saved.read_bytes()
+if path.read_bytes() != base:
+    raise SystemExit("Probe G base changed before append")
+expected.open("xb").write(base + suffix)
+path.write_bytes(base + suffix)
+if path.read_bytes() != expected.read_bytes():
+    raise SystemExit("Probe G append is not exact")
+PY
+  assert_mutation_worktree_owned || return 1
+  cmp -- "$path" "$expected" || return 1
+  test "$(scratch_status)" = " M $rel" || return 1
+  if scratch_restore; then
+    printf 'restore accepted extra tracked modification\n' >&2
+    return 1
+  fi
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+  assert_mutation_worktree_owned || return 1
+  cmp -- "$path" "$expected" || return 1
+
+  # Restore only after one process proves exact length, exact base prefix, and
+  # exact approved suffix. Any interior/extra/raced byte preserves the probe.
+  python3 - "$path" "$saved" "$suffix" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+saved = pathlib.Path(sys.argv[2])
+base = saved.read_bytes()
+suffix = b"\n" + sys.argv[3].encode("utf-8") + b"\n"
+current = path.read_bytes()
+if len(current) != len(base) + len(suffix):
+    raise SystemExit("Probe G modified length differs")
+if current[: len(base)] != base or current[len(base) :] != suffix:
+    raise SystemExit("Probe G is not exact base plus approved suffix")
+path.write_bytes(base)
+PY
+  cmp -- "$path" "$saved" || return 1
+  rm -- "$expected" "$saved" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+probe_h_dirty_cleanup_preservation() {
+  local probe
+  begin_mutation_ownership_probe || return 1
+  probe="$MUT_WT/mutation-dirty-cleanup-probe"
+  assert_mutation_worktree_owned || return 1
+  printf 'dirty-cleanup-probe\n' >"$probe" || return 1
+  if cleanup_mutation_scratch; then
+    printf 'cleanup accepted dirty scratch\n' >&2
+    return 1
+  fi
+  trap cleanup_mutation_scratch EXIT
+  test "$MUT_WT_OWNED" = 1 && test "$MUT_TMP_OWNED" = 1 || return 1
+  assert_mutation_worktree_owned || return 1
+  assert_mutation_worktree_record owned || return 1
+  test -d "$MUT_WT" &&
+    assert_exact_probe_line "$probe" dirty-cleanup-probe ||
+    return 1
+  test ! -e "$MUT_PROBE_REACHED" || return 1
+  rm -- "$probe" || return 1
+  assert_mutation_worktree_owned || return 1
+  finish_mutation_ownership_probe
+}
+
+run_mutation_ownership_probes() {
+  probe_a_ownership_flag_absent &&
+    probe_b_identity_token_mismatches &&
+    probe_c_locked_registration &&
+    probe_d_prunable_registration &&
+    probe_e_untracked_restore_refusal &&
+    probe_f_staged_restore_refusal &&
+    probe_g_extra_tracked_restore_refusal &&
+    probe_h_dirty_cleanup_preservation
+}
+
+run_mutation_ownership_probes
+MUT_TMP_OWNED=0
+MUT_WT_OWNED=0
+create_mutation_scratch "$MUTATION_BASE"
+```
+
+If an expected failure reaches `MUT_PROBE_REACHED`, stop and preserve the
+scratch. Never run `git worktree prune`. Each refusal preserves exact
+path/registration/state; only the known probe token or bytes are restored.
+These probes add no Rust test or mutation ID.
 
 ### Exact mutation engine
 
@@ -2828,8 +5227,11 @@ zero/new one.
 ```bash
 set -euo pipefail
 apply_exact_mutation() {
-  local mutation="$1" file="$MUT_WT/crates/freshell-server/src/session_directory.rs"
-  python3 - "$file" "$mutation" <<'PY'
+  local mutation="$1"
+  local file="$MUT_WT/crates/freshell-server/src/session_directory_fast.rs"
+  local mutation_status
+  assert_mutation_worktree_owned || return 1
+  if python3 - "$file" "$mutation" <<'PY'
 from __future__ import annotations
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -2839,8 +5241,8 @@ M = {
 "defer-synth-on-greater": [("Ordering::Greater => MergeSide::Synth,", "Ordering::Greater => MergeSide::Indexed,")],
 "cursor-inclusive": [("last_activity_at < cursor_last", "last_activity_at <= cursor_last")],
 "deletion-after-selection": [
-    ("if is_deleted(overrides, &candidate_full_key(candidate)) {\n            continue;\n        }", "if false && is_deleted(overrides, &candidate_full_key(candidate)) {\n            continue;\n        }"),
-    ("let mut item = materialize_selected_descriptor(selected, inputs);", "if is_deleted(inputs.overrides, &candidate_full_key(selected.candidate)) {\n            continue;\n        }\n        let mut item = {\n            materialize_selected_descriptor(selected, inputs)\n        };")
+    ("if candidate_is_deleted(candidate, overrides) {\n            continue;\n        }", "if false && candidate_is_deleted(candidate, overrides) {\n            continue;\n        }"),
+    ("let mut item = materialize_selected_descriptor(selected, inputs);", "if candidate_is_deleted(selected.candidate, inputs.overrides) {\n            continue;\n        }\n        let mut item = {\n            materialize_selected_descriptor(selected, inputs)\n        };")
 ],
 "choose-last-identity": [("fn matching_identity<'a>(\n    identities: &'a [freshell_ws::identity::TerminalIdentity],\n    provider: &str,\n    session_id: &str,\n) -> Option<&'a freshell_ws::identity::TerminalIdentity> {\n    identities.iter().find(|identity| {", "fn matching_identity<'a>(\n    identities: &'a [freshell_ws::identity::TerminalIdentity],\n    provider: &str,\n    session_id: &str,\n) -> Option<&'a freshell_ws::identity::TerminalIdentity> {\n    identities.iter().rev().find(|identity| {")],
 "tuple-dedupe": [("fn canonical_identity_key(provider: &str, session_id: &str) -> String {\n    format!(\"{provider}:{session_id}\")\n}", "fn canonical_identity_key(provider: &str, session_id: &str) -> String {\n    serde_json::to_string(&(provider, session_id)).expect(\"tuple serializes\")\n}")],
@@ -2893,6 +5295,13 @@ for old, new in M[name]:
         raise SystemExit(f"{name}: post-edit old/new counts {text.count(old)}/{text.count(new)}")
 path.write_text(text, encoding="utf-8")
 PY
+  then
+    mutation_status=0
+  else
+    mutation_status=$?
+  fi
+  assert_mutation_worktree_owned || return 1
+  return "$mutation_status"
 }
 ```
 
@@ -2959,23 +5368,23 @@ run_one_mutation() {
   scratch_require_killed "$killer" || { scratch_restore; return 1; }
   scratch_restore || return 1
 }
-run_one_mutation reverse-full-key-order "$TEST_MOD::g1_duplicate_equal_and_colon_collision_old_materialized_fast"
-run_one_mutation defer-synth-on-greater "$TEST_MOD::g2_no_query_mixed_indexed_and_synth_work_is_exact"
-run_one_mutation cursor-inclusive "$TEST_MOD::g1_arbitrary_and_malformed_cursors_old_materialized_fast"
-run_one_mutation deletion-after-selection "$TEST_MOD::g1_fast_deleted_override_backfills_page_old_materialized_fast"
-run_one_mutation choose-last-identity "$TEST_MOD::g1_ordered_identity_permutations_old_materialized_fast"
-run_one_mutation tuple-dedupe "$TEST_MOD::g1_duplicate_equal_and_colon_collision_old_materialized_fast"
-run_one_mutation omit-identity-revision "$TEST_MOD::g1_i64_revision_boundaries_old_materialized_fast"
-run_one_mutation use-deleted-index-head-revision "$TEST_MOD::g1_i64_revision_boundaries_old_materialized_fast"
-run_one_mutation invert-subagent-filter "$TEST_MOD::g1_all_eight_flags_old_materialized_fast"
-run_one_mutation invert-noninteractive-filter "$TEST_MOD::g1_all_eight_flags_old_materialized_fast"
-run_one_mutation invert-empty-filter "$TEST_MOD::g1_all_eight_flags_old_materialized_fast"
-run_one_mutation construct-lookahead "$TEST_MOD::g2_no_query_lookahead_descriptor_is_never_constructed"
-run_one_mutation direct-dir-item-literal "$TEST_MOD::g2_candidate_source_has_no_direct_dir_item_literal"
-run_one_mutation clone-per-identity "$TEST_MOD::g2_one_returned_row_with_500_identities_has_zero_full_row_clones"
-run_one_mutation indirect-full-row-constructor "$TEST_MOD::g2_full_row_constructor_inventory_is_exact_and_instrumented"
-run_one_mutation recompute-title-and-skip "$TEST_MOD::g2_title_post_selection_has_no_rejection_path"
-run_one_mutation route-file-tier-fast "$TEST_MOD::dispatch_nonempty_user_messages_and_full_text_are_materialized"
+run_one_mutation reverse-full-key-order "$TEST_G1::g1_duplicate_equal_and_colon_collision_old_materialized_fast"
+run_one_mutation defer-synth-on-greater "$TEST_G2::g2_no_query_mixed_indexed_and_synth_work_is_exact"
+run_one_mutation cursor-inclusive "$TEST_G1::g1_arbitrary_and_malformed_cursors_old_materialized_fast"
+run_one_mutation deletion-after-selection "$TEST_G1::g1_fast_deleted_override_backfills_page_old_materialized_fast"
+run_one_mutation choose-last-identity "$TEST_G1::g1_ordered_identity_permutations_old_materialized_fast"
+run_one_mutation tuple-dedupe "$TEST_G1::g1_duplicate_equal_and_colon_collision_old_materialized_fast"
+run_one_mutation omit-identity-revision "$TEST_G1::g1_i64_revision_boundaries_old_materialized_fast"
+run_one_mutation use-deleted-index-head-revision "$TEST_G1::g1_i64_revision_boundaries_old_materialized_fast"
+run_one_mutation invert-subagent-filter "$TEST_G1::g1_all_eight_flags_old_materialized_fast"
+run_one_mutation invert-noninteractive-filter "$TEST_G1::g1_all_eight_flags_old_materialized_fast"
+run_one_mutation invert-empty-filter "$TEST_G1::g1_all_eight_flags_old_materialized_fast"
+run_one_mutation construct-lookahead "$TEST_G2::g2_no_query_lookahead_descriptor_is_never_constructed"
+run_one_mutation direct-dir-item-literal "$TEST_G2::g2_candidate_source_has_no_direct_dir_item_literal"
+run_one_mutation clone-per-identity "$TEST_G2::g2_one_returned_row_with_500_identities_has_zero_full_row_clones"
+run_one_mutation indirect-full-row-constructor "$TEST_G2::g2_full_row_constructor_inventory_is_exact_and_instrumented"
+run_one_mutation recompute-title-and-skip "$TEST_G2::g2_title_post_selection_has_no_rejection_path"
+run_one_mutation route-file-tier-fast "$TEST_G1::dispatch_nonempty_user_messages_and_full_text_are_materialized"
 ```
 
 Run the whole literal sequence serially. Prior kills do not count after any
@@ -2987,43 +5396,96 @@ No such candidate compilation or kill has happened at plan-edit time.
 
 ### Surviving mutation and cleanup rules
 
-A test-only amendment must prove only the marked test boundary changed, preserve
-Task-6 subject/parent, exact one-file scope, and clean state. Use the complete
-helpers below; neither performs destructive recovery on failure:
+A test-only amendment accepts an explicit nonempty unique changed-path list,
+proves every path is in the amendment-eligible test set, preserves Task-6
+subject/parent and exact baseline-union scope, and keeps all production files
+byte-identical. Neither helper performs destructive recovery:
 
 ```bash
 set -euo pipefail
+TASK6_TEST_FILES=(
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
+  crates/freshell-server/src/session_directory_page_bound_support.rs
+  crates/freshell-server/src/session_directory_page_bound_source_audit.rs
+)
+TASK6_PRODUCTION_FILES=(
+  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_materialized.rs
+  crates/freshell-server/src/session_directory_inputs.rs
+  crates/freshell-server/src/session_directory_fast.rs
+)
+
 assert_task6_amend_is_test_only() {
-  local baseline="$1" file=crates/freshell-server/src/session_directory.rs
-  python3 - "$WT" "$baseline" "$file" <<'PY'
-import pathlib, subprocess, sys
-wt, commit, rel = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-before = subprocess.check_output(
-    ["git", "-C", str(wt), "show", f"{commit}:{rel}"]
-).decode("utf-8")
-after = (wt / rel).read_text(encoding="utf-8")
-begin = "/* SESSION_DIRECTORY_PAGE_BOUND_TESTS_BEGIN */"
-end = "/* SESSION_DIRECTORY_PAGE_BOUND_TESTS_END */"
-def outside(text: str) -> tuple[str, str]:
-    if text.count(begin) != 1 or text.count(end) != 1:
-        raise SystemExit("expected exactly one page-bound test boundary")
-    left, rest = text.split(begin, 1)
-    _, right = rest.split(end, 1)
-    return left, right
-if outside(before) != outside(after):
-    raise SystemExit("Task-6 amendment changed non-test source")
+  local baseline="$1"
+  shift
+  python3 - "$WT" "$baseline" \
+    --tests "${TASK6_TEST_FILES[@]}" \
+    --production "${TASK6_PRODUCTION_FILES[@]}" \
+    --changed "$@" <<'PY'
+import json, os, pathlib, subprocess, sys
+wt, baseline, *args = sys.argv[1:]
+def split(flag, next_flag=None):
+    start = args.index(flag) + 1
+    stop = args.index(next_flag) if next_flag else len(args)
+    return args[start:stop]
+tests = split("--tests", "--production")
+production = split("--production", "--changed")
+changed = split("--changed")
+if not changed or len(changed) != len(set(changed)):
+    raise SystemExit("changed amendment paths must be nonempty and unique")
+if not set(changed) <= set(tests):
+    raise SystemExit(f"non-test amendment path: {set(changed) - set(tests)}")
+def git(*items):
+    return subprocess.check_output(["git", "-C", wt, *items])
+def nul(raw, label):
+    if raw and not raw.endswith(b"\0"):
+        raise SystemExit(f"{label} is not NUL terminated")
+    return [] if not raw else [os.fsdecode(p) for p in raw[:-1].split(b"\0")]
+status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+status_paths = []
+offset = 0
+while offset < len(status):
+    end = status.index(b"\0", offset)
+    entry = status[offset:end]
+    offset = end + 1
+    if len(entry) < 4:
+        raise SystemExit("malformed status record")
+    status_paths.append(os.fsdecode(entry[3:]))
+    if b"R" in entry[:2] or b"C" in entry[:2]:
+        end = status.index(b"\0", offset)
+        status_paths.append(os.fsdecode(status[offset:end]))
+        offset = end + 1
+if set(status_paths) != set(changed):
+    raise SystemExit(f"status paths differ: {status_paths!r} != {changed!r}")
+cached = nul(git("diff", "--cached", "--name-only", "-z", "HEAD", "--"), "cached")
+if cached:
+    raise SystemExit(f"pre-existing cached paths: {cached!r}")
+baseline_paths = nul(
+    git("diff-tree", "--root", "--no-commit-id", "--name-only", "-z",
+        "-r", "--no-renames", baseline),
+    "baseline paths",
+)
+if not set(baseline_paths) <= set(tests):
+    raise SystemExit(f"baseline contains non-test paths: {baseline_paths!r}")
+for rel in production:
+    if git("show", f"{baseline}:{rel}") != (pathlib.Path(wt) / rel).read_bytes():
+        raise SystemExit(f"production path changed: {rel}")
+print(json.dumps(sorted(set(baseline_paths) | set(changed)), separators=(",", ":")))
 PY
 }
 
 amend_task6_tests_exact_scope() {
-  local baseline current_head current_subject old_parent new_head new_parent
-  local file=crates/freshell-server/src/session_directory.rs
+  local baseline current_head current_subject old_parent new_head new_parent expected
+  local -a changed
   local subject='test(session-directory): commit complete compatibility and mutation-killer gates'
-  if test "$#" -ne 1; then
-    printf 'usage: amend_task6_tests_exact_scope MUTATION_BASE\n' >&2
+  if test "$#" -lt 2; then
+    printf 'usage: amend_task6_tests_exact_scope MUTATION_BASE PATH...\n' >&2
     return 1
   fi
   baseline="$1"
+  shift
+  changed=("$@")
   current_head="$(git -C "$WT" rev-parse HEAD)" || return 1
   if test "$current_head" != "$baseline"; then
     printf 'Task-6 amend requires HEAD == MUTATION_BASE\n' >&2
@@ -3035,12 +5497,14 @@ amend_task6_tests_exact_scope() {
     return 1
   fi
   old_parent="$(git -C "$WT" rev-parse "${baseline}^")" || return 1
-  assert_task6_amend_is_test_only "$baseline" || return 1
-  _assert_git_scope preflight "$file" || return 1
-  git -C "$WT" add -- "$file" || return 1
-  _assert_git_scope cached "$file" || return 1
+  expected="$(assert_task6_amend_is_test_only "$baseline" "${changed[@]}")" ||
+    return 1
+  _assert_git_scope preflight "${changed[@]}" || return 1
+  assert_max_1000_lines "${SD_TASK4_FILES[@]}" || return 1
+  git -C "$WT" add -- "${changed[@]}" || return 1
+  _assert_git_scope cached "${changed[@]}" || return 1
   git -C "$WT" diff --cached --check || return 1
-  git -C "$WT" commit --amend --only --no-edit -- "$file" || return 1
+  git -C "$WT" commit --amend --only --no-edit -- "${changed[@]}" || return 1
   new_head="$(git -C "$WT" rev-parse HEAD)" || return 1
   if test "$new_head" = "$baseline"; then
     printf 'Task-6 amend did not replace the commit\n' >&2
@@ -3051,7 +5515,23 @@ amend_task6_tests_exact_scope() {
     printf 'Task-6 amend changed the commit parent\n' >&2
     return 1
   fi
-  _assert_git_scope committed "$subject" "$file" || return 1
+  python3 - "$WT" "$expected" <<'PY'
+import json, os, subprocess, sys
+wt, expected_raw = sys.argv[1:]
+expected = json.loads(expected_raw)
+if not isinstance(expected, list) or not expected or any(
+    not isinstance(path, str) or not path for path in expected
+):
+    raise SystemExit("invalid expected amended path union")
+raw = subprocess.check_output([
+    "git", "-C", wt, "diff-tree", "--root", "--no-commit-id",
+    "--name-only", "-z", "-r", "--no-renames", "HEAD",
+])
+actual = sorted(os.fsdecode(p) for p in raw[:-1].split(b"\0")) if raw else []
+if actual != expected:
+    raise SystemExit(f"amended path union differs: {actual!r} != {expected!r}")
+PY
+  test -z "$(git -C "$WT" status --porcelain=v1 --untracked-files=all)"
 }
 ```
 
@@ -3059,38 +5539,66 @@ If a compiling mutation survives:
 
 1. Stop the table, restore only the scratch file, prove scratch clean, and use
    the non-forced cleanup below.
-2. Strengthen tests only inside the marked active Task-6 test boundary.
+2. Strengthen only an explicit nonempty subset of `TASK6_TEST_FILES`; authority
+   fixtures and every production path are ineligible.
 3. Run `run_g1_aggregate`, `run_legacy_aggregate`, all three exact dispatch
    tests from Task 6, `run_server_all_targets`, `run_sessions_sanity`,
    `run_fmt_check`, `run_clippy`, and `run_both_guards`.
-4. Run `amend_task6_tests_exact_scope "$MUTATION_BASE"`; then set and export
+4. Run `amend_task6_tests_exact_scope "$MUTATION_BASE" "${changed_paths[@]}"`;
+   then set and export
    `TASK6_COMMIT="$(git -C "$WT" rev-parse HEAD)"`, set
-   `MUTATION_BASE="$TASK6_COMMIT"`, recreate scratch only after proving active
-   `HEAD == TASK6_COMMIT`, and rerun the entire mutation sequence from the first
-   row. Prior kills do not count.
+   `MUTATION_BASE="$TASK6_COMMIT"`, prove active `HEAD == TASK6_COMMIT`, call
+   `create_mutation_scratch "$MUTATION_BASE"` to obtain a new random root and new
+   root/worktree/gitdir identities, and rerun the entire mutation sequence from
+   the first row. Never reuse the old path or identity tokens; prior kills do not
+   count.
 
 If investigation finds a production defect, never amend Task 6. Remove scratch
 safely, return to Task 4 or 5, add an exact RED regression, repair/refactor/run
 that task's GREEN and broader checks, rebuild the owning candidate commit, replay
 all later tasks/commits, create a fresh Task-6 hash, and rerun every mutation.
 
-Clean removal is non-forced so races surface:
+Clean removal is non-forced and delegated only to the ownership-aware cleanup:
 
 ```bash
-set -euo pipefail
-test -z "$(git -C "$MUT_WT" status --short)"
-git -C "$WT" worktree remove "$MUT_WT"
+scratch_assert_clean
+cleanup_mutation_scratch
+trap - EXIT
+test "${MUT_WT_OWNED:-0}" = 0
+test "${MUT_TMP_OWNED:-0}" = 0
 test ! -e "$MUT_WT"
-if git -C "$WT" worktree list --porcelain | grep -Fq "$MUT_WT"; then exit 1; fi
+assert_mutation_worktree_record absent
 test -z "$(git -C "$WT" status --short)"
 run_both_guards
 ```
 
-Never use reset, clean, forced removal, or restore on active/foreign work.
+Every mutation write, Cargo command, status read, restore, and removal rechecks
+the captured identity before and after as applicable. Partial, dirty, replaced,
+reused, locked/prunable, or otherwise ambiguous state is preserved and returns
+nonzero. Never use pathname grep, reset, clean, forced removal, recursive
+scratch deletion, or restore on active/foreign work.
 
 ---
 
 ## G3: Explicit Finite Full-App Release A/B Manifest
+
+The sole G3 Rust test is declared exactly as follows in
+`session_directory_page_bound_g3_tests.rs`:
+
+```rust
+#[test]
+#[ignore = "finite full-app release A/B gate; run explicitly in release"]
+fn adverse_release_ab_non_regression() {
+    // existing explicit 30-row manifest and finite protocol
+}
+```
+
+The ignore is load-bearing. Broad debug tests compile but skip this test. Both
+explicit G3 invocations use `run_exact_release_ignored`, which positively
+discovers this exact ignored declaration and requires exactly one passed Rust
+test. The test itself requires the existing exact ordered 30-row manifest. No
+debug substitute or second G3 test is permitted. This repeated contract is not
+a second source declaration.
 
 `adverse_release_ab_non_regression` forces Materialized and Fast through
 `completed_strategy_app` with identical immutable captures and full application
@@ -3193,8 +5701,8 @@ counted exhaustive domain.
 | 4 | Duplicate indexed rows, including page-boundary straddle and later cursor gap | boundary/deep-chain legacy + G1 |
 | 5 | `("a","b:c")` vs `("a:b","c")`, arbitrary Unicode/full-string collisions; component-exact running match | colon-composition legacy; G1; key/tuple mutations |
 | 6 | Typed deletion at head/middle/tail | legacy deletion tables; dedicated Fast backfill G1; deletion mutation |
-| 7 | Deleted indexed row plus same-key live synth replacement | legacy synth replacement; G1 ties |
-| 8 | Deleted/synth equal timestamp/key tie and duplicate deleted rows | legacy deleted-ties; G1 response equivalence; equal-side preference is output-inert after synth suppression/deletion |
+| 7 | Deleted indexed row plus same-key live Synth replacement | typed deletion applies only to Indexed; same-key Synth survives with no override decoration; exact legacy replacement plus no-query/Title G1 ties |
+| 8 | Deleted/Synth equal timestamp/key tie and duplicate deleted rows | every duplicate/equal Indexed candidate is skipped while exactly one first-winner Synth survives; equal-side preference is output-inert because only Indexed is deleted |
 | 9 | Synth before/between/after indexed stream | live-merge legacy; G1 large live sets; exact mixed G2 interleave/order/cursor; `defer-synth-on-greater` mutation |
 | 10 | Multiple exact identities for indexed row; both explicit winner permutations | fixed `CapturedDirectoryInputs` A/B+B/A legacy/G1 value and completed-strategy bytes; same-unchanged-registry relational owner acquisition; `choose-last-identity` mutation |
 | 11 | Multiple synth identities with equal/colliding full key/payload; every permutation | identity permutation/collision fixtures and G1 |
@@ -3214,7 +5722,7 @@ counted exhaustive domain.
 | 25 | Borrowed predicate vs annotation drift | fail-closed helper + mandatory post-selection mutation killer |
 | 26 | Long deleted/filtered prefixes; early dense, late sparse, no-match title | G1/G2/G3 targeted cases |
 | 27 | T=0/1/50/51/500, matched/duplicate/synth-heavy/all-filtered | legacy/G1; exact G2 equations; G3 |
-| 28 | Item/page key presence, insertion order, escaping, bytes | fixed-capture completed strategy bytes (including A/B+B/A); deterministic single-identity/order-insensitive frozen owner raw goldens |
+| 28 | Item/page key presence, insertion order, escaping, bytes | embedded pre-edit parent artifact plus direct current-owner/FrozenOld/ExtractedMaterialized equality; fixed-capture completed strategy bytes include A/B+B/A |
 | 29 | Colors absent/nonempty, map insertion order, success/errors, title and both retained tiers | Task-0 `project_color_order_on_{title,user_messages,full_text}_route` raw cases; explicit G1 raw color tests |
 | 30 | No-query production dispatch with actual owner acquisition | Task 9 selector RED/GREEN plus revised owner-backed raw matrix and same-registry-list relational assertion |
 | 31 | Title production dispatch and annotations | Task 10 selector RED/GREEN plus owner-backed raw matrix |
@@ -3234,20 +5742,28 @@ attested before every filtered run.
 1. Task 0A — `docs(api): clarify session-directory snapshot consistency`
    (`shared/read-models.ts` comment only).
 2. Task 0 — `test(session-directory): freeze parent response authority`
-   (`session_directory.rs`, narrow `main.rs`).
-3. Task 1 — `refactor(session-directory): extract frozen materialized strategy`.
-4. Task 2 — `test(session-directory): characterize reusable legacy equivalence cases`.
-5. Task 3 — `feat(session-directory): add borrowed matching decisions`.
-6. Task 4 — `perf(session-directory): add page-bounded no-query candidate`.
-7. Task 5 — `perf(session-directory): add page-bounded title candidate`.
-8. Task 6 — `test(session-directory): commit complete compatibility and mutation-killer gates`.
+   (facade, materialized, three existing-test children, inputs, page-bound
+   support, authority-fixtures, authority-tests, and narrow `main.rs`).
+3. Task 1 — `refactor(session-directory): extract frozen materialized strategy`
+   (facade, inputs, materialized, authority-tests).
+4. Task 2 — `test(session-directory): characterize reusable legacy equivalence cases`
+   (facade, page-bound support, legacy-tests).
+5. Task 3 — `feat(session-directory): add borrowed matching decisions`
+   (facade, fast, G2-tests).
+6. Task 4 — `perf(session-directory): add page-bounded no-query candidate`
+   (facade, inputs, fast, page-bound support, source-audit, G2-tests, G1-tests).
+7. Task 5 — `perf(session-directory): add page-bounded title candidate`
+   (fast, page-bound support, source-audit, G2-tests).
+8. Task 6 — `test(session-directory): commit complete compatibility and mutation-killer gates`
+   (page-bound support, G1-tests).
 9. Task 7 — no new commit; only mechanically test-only strengthening may replace
    Task 6. Production defects rebuild Task 4/5 and replay.
-10. Task 8 — `test(session-directory): add exact work and finite adverse release gates`.
+10. Task 8 — `test(session-directory): add exact work and finite adverse release gates`
+    (facade, page-bound support, G3-tests).
 11. Task 9 — `perf(session-directory): route no-query requests through the fast path`
-    (selector/test only).
+    (fast selector and G1 test only).
 12. Task 10 — `perf(session-directory): route title search through the fast path`
-    (selector/test only).
+    (fast selector and G1 test only).
 
 There are eleven implementation commits because Task 7 is no-commit and Task 0A
 is the independently required shared comment task. Materialized code remains
@@ -3259,13 +5775,27 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
 
 ## Done Criteria
 
+- Task 0 captures the canonical completed-response artifact from the unchanged
+  pinned parent plus exact append-only recorder before any production edit or
+  split; mechanically embeds/decodes/compares it; and replays from a fresh
+  parent worktree after Task-0 commit and again at Task 10. Current owner,
+  FrozenOld, ExtractedMaterialized, and final production route compare directly
+  with that artifact. Changed code never emits expected parent bytes.
+- The facade plus fourteen focused siblings stay at most 1,000 physical UTF-8
+  lines after they exist. Pre-existing `main.rs` and read-only external
+  `search.rs` are outside this blocker's new line gate. Every task scope, commit allowlist, authority
+  map, audit source, test namespace, mutation target/amendment set, ledger entry,
+  and line phase list uses the focused paths. `main.rs` still declares only
+  `mod session_directory;`; Cargo and public API remain unchanged.
 - Task 0A is the exact schema-adjacent comment and the sole shared/client-area
   change; its execution block runs the exact `git -C "$WT"` shared-file
   `diff --check` command and typecheck before commit. It introduces no Node
   behavior or wire-schema change.
-- Task 0 pins `fc8646477dd34d92dc5647d158106431aa2e0380`, records exact source and
-  committed-fixture blobs through a uniquely owned read-only worktree, and never
-  launches the network-capable parent binary. Collision checks precede trap
+- Task 0 pins `fc8646477dd34d92dc5647d158106431aa2e0380`, treats exact
+  source/committed-fixture blobs only as provenance, and captures canonical raw
+  completed responses through one ignored `Router::oneshot` parent test in a
+  uniquely owned offline/network-isolated worktree. It never launches the
+  network-capable production binary. Collision checks precede trap
   installation; the ownership flag is set only after add plus exact
   registration/path/HEAD/clean/gitdir verification, and cleanup rechecks every
   identity before non-forced removal. It then proves the behavior-neutral
@@ -3287,7 +5817,10 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
   `TitleMatchField`, descriptor-only lookahead, and no post-selection rejection
   are implemented. Every nonempty visibility and Title decision receives the
   captured override view; override-rescued and override-hidden boundary rows are
-  exact G2/G1 evidence.
+  exact G2/G1 evidence. Typed deletion is Indexed-only:
+  `candidate_is_deleted` returns false for Synth, both strengthened legacy
+  fixtures preserve exactly one same-key first-winner Synth without override
+  decoration, and G1 compares no-query plus Title across all three strategies.
 - Every successful Fast page satisfies all exact equations inside a synchronous
   non-Send thread-local `DirectoryWorkScope`; reset/read/eight bump helpers are
   named, nested scopes fail closed, Drop clears panic state, and parallel broad
@@ -3314,15 +5847,27 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
   `choose-last-identity` is observed by fixed A/B+B/A captures, never an owner
   iteration-order assumption. Scratch base equals exported `TASK6_COMMIT`,
   including after a test-only amendment. Scratch operations never alter foreign
-  work.
-- G3 uses the explicit manifest, limits 2/25/49, first-cursor pages, T=1/T=50,
+  work. Each mutation run uses a fresh private temp root and gains ownership only
+  after exact NUL-safe registration/path/detached-HEAD/clean/root/worktree/gitdir
+  identity checks. Mutation, Cargo, status, Fast-file-only restore, and
+  non-forced removal revalidate that identity; ambiguous state is preserved.
+  Before the real 17-mutation run, dedicated fresh-scratch probes A-H prove
+  fail-closed absent ownership; root/worktree/gitdir token mismatch;
+  locked/prunable registration; staged/untracked/extra restore refusal; and
+  dirty-cleanup path/registration preservation without adding Rust tests.
+- G3 is explicitly ignored in source and each explicit release invocation
+  discovers that ignored declaration and requires exactly one passed Rust test.
+  It uses the explicit manifest, limits 2/25/49, first-cursor pages, T=1/T=50,
   finite calibration/warmup/measurement, checked integer median/p95 arithmetic,
   and at most one whole-manifest rerun. It remains synthetic/non-production.
 - Tasks 9/10 each show exact test-first RED, minimal GREEN, refactor/rerun,
   broader checks, and isolated selector-only commits. Nonempty file tiers remain
   Materialized and rollback-ready.
-- Exact/list/prefix/debug/release/scratch wrappers propagate failures and reject
-  zero/multiple matches. NUL-safe Git helpers reject foreign staged/unstaged/
+- Exact/list/prefix/debug/release/scratch wrappers propagate failures, verify
+  annotation mode and binary-scoped discovery, and require exactly one libtest
+  summary with the expected positive passed count and zero
+  failed/ignored/measured. Zero executed tests cannot pass. NUL-safe Git helpers
+  reject foreign staged/unstaged/
   untracked work and never destructively recover it.
 - Completion requires actual recorded successful future output from exact tests,
   `run_server_all_targets`, `run_sessions_sanity`, `run_fmt_check`,
@@ -3343,7 +5888,7 @@ build, test, mutation, selector, or release-gate results.
 | Requirement | Corrected tasks/sections |
 |---|---|
 | LB-01 three scopes, schema-adjacent shared wording, NoIndex, observable fixed-capture identity order, owner acquisition without requested registry order, success-only colors, completed full-app bytes, accessor semantics | Global Constraints; Task 0A; Tasks 0–2/6; deterministic single-identity owner raw manifest; same-unchanged-registry owner assertion; fixed A/B+B/A completed evidence |
-| LB-02 independent pre-extraction provenance, transitive Task-0 freeze, separate Task-1 freeze, same-delta rebaseline | Task 0's ownership-safe pinned source/fixture authority, order-insensitive/single-identity owner/full-layer manifest, and relational same-registry acquisition; Two Authorities; Task 1; Rebaseline lifecycle |
+| LB-02 independent pre-extraction provenance, transitive Task-0 freeze, separate Task-1 freeze, same-delta rebaseline | Task 0's independently captured pinned-parent completed-response artifact, with source/fixture blobs retained only as provenance, plus order-insensitive/single-identity owner/full-layer manifest and relational same-registry acquisition; Two Authorities; Task 1; Rebaseline lifecycle |
 | LB-03 borrowed stable merge, override-effective visibility/title, `TitleMatchField`, descriptor lookahead, no post-selection rejection | Exact candidate signatures/rules; Task 4 override and exact 200..104/151/1 interleave; Task 5 override-only title cases; G1; behavior-affecting merge mutation |
 | LB-04 borrowed synths, exact successful-Fast equations, deterministic isolated ledger, unified producer/helper call-graph closure, 500-identity witness | Named-work contract's single lexical audit; complete ledger interfaces; Tasks 0/4/5/8; corrected mutations |
 | LB-05 narrowed claim, complete residual work, finite full-app release A/B, mandatory reversible selectors | Honest performance scope; explicit G3; Tasks 8–10 |
@@ -3372,21 +5917,20 @@ Fresh-eyes blocker cross-check:
 - The parent authority uses a unique temp-root worktree. Collision checks precede
   cleanup ownership; removal rechecks path, HEAD, registration, cleanliness, and
   gitdir. Failed, partial, or raced ownership is preserved rather than removed.
-- Because the pinned production binary has network-capable components and no
-  audited no-network switch, the plan never launches it. Exact Git blobs and
-  committed fixture bytes form the safe fallback authority; deterministic owner
-  cases read no environment, config, provider root, socket, or external service.
+- The plan never launches the network-capable production parent binary. Exact
+  Git blobs and committed fixture bytes are provenance and reproducibility
+  inputs only. The response authority is the canonical raw completed-response
+  artifact emitted by the one ignored, in-process `Router::oneshot` parent test
+  inside an offline network namespace, then mechanically embedded and replayed.
 - One lexical/call-graph helper defines the exact three producer and two
   non-producing helper sets for all static G2 tests and rejects every uncounted
   direct, clone, or recursively indirect Fast production path.
 
-Gaps found and corrected in this review: the behavior-inert merge mutation and
-nondeterministic ordered-owner raw promises above. Remaining gaps in the two
-correction specifications: none at plan-design level. LB-01's Stage-2 acceptable
-decision is the completed normative adjudication for the prospective
-A-triple-prime contract. No duplicate owner-approval/authorization gate remains,
-future executors must not stop to seek one, and Task 0A still must implement the
-exact prospective wording and planned static/compile/test evidence; no future implementation result is claimed now.
+Gaps found and corrected in this historical review were the behavior-inert merge
+mutation and nondeterministic ordered-owner raw promises above. The earlier
+two-correction review did not adjudicate the later five-blocker Fresh Eyes round.
+Its conclusions are historical only; five-blocker closure is determined solely
+by the dated corrective round-2 rerun below.
 
 ### 1b. No silent deferrals: no test stand-in replaces required production evidence; no hidden unresolved gap; future implementation/runtime proof remains honestly future.
 
@@ -3421,9 +5965,9 @@ exact prospective wording and planned static/compile/test evidence; no future im
 - No stub, unfinished marker, mock handler, hidden profile, coherent snapshot,
   canonical cross-server raw bytes, or numeric SLA stands in for required behavior.
   Optional production profiling remains genuinely out of scope.
-- Unresolved correction-plan-definition coverage gaps: none. LB-01's completed
-  Stage-2 normative adjudication leaves no duplicate Task-0A owner-approval or
-  authorization gate; future executors must not stop to seek one.
+- The earlier two-correction review did not adjudicate the later five-blocker
+  Fresh Eyes round. Its conclusions are historical only; the corrective round-2
+  rerun below determines scoped closure.
 
 ### 2. Placeholder and stale-instruction scan, including behavior-inert mandatory mutations and stale ordered-owner promises.
 
@@ -3521,10 +6065,380 @@ exact prospective wording and planned static/compile/test evidence; no future im
 - Every Git command uses `git -C`; every Cargo command uses an absolute manifest.
   Task 0A's whitespace command, Task 0's pre-trap collision checks/post-add
   ownership flag/exact removal identity, `TASK6_COMMIT`, exact-scope helpers, and
-  scratch cleanup are fail closed and non-destructive to foreign work. Task 0's
-  fallback executes no Cargo/npm/server/provider/network command and reads only
-  seven exact committed blobs.
+  scratch cleanup are fail closed and non-destructive to foreign work. Exact
+  parent blobs are provenance; one ignored parent test executes in an offline
+  network namespace through the positive-cardinality parser.
 
-This Self-Review found and corrected both requested plan gaps. No future build,
-test, raw golden, mutation compile/kill, G1, G2, G3, selector, or release result is
-claimed; those remain future implementation/runtime evidence.
+The earlier review remains historical context for its two corrections. The
+bounded Fresh Eyes iteration 1 rerun below is authoritative for the five newly
+authorized blockers. No future build, test, parent capture/replay, mutation
+compile/kill, G1, G2, G3, selector, line-count, or release result is claimed.
+
+### Fresh Eyes iteration 1 five-blocker rerun — 2026-08-12
+
+Scope: only edited tasks and every transitive consumer of changed paths,
+namespaces, artifact definitions, mutation identities, counts, and commands.
+This rerun was skill-free and static; no Cargo/npm test, compilation, worktree
+operation, recorder, mutation, G3, server, or runtime gate was executed.
+
+#### Pass 1 — requirement coverage and scope
+
+**Result: FAIL — superseded by corrective round 2.**
+
+Concrete misses in this first-round render:
+
+- Task-0 Step 1 invoked future-file and subject-anchored post-commit gates;
+- detailed Step 2 emitted provenance only instead of canonical raw responses;
+- parent build/output/tool-home lifecycle and replay implementation were
+  undefined, and the exact parent-recorder declaration was absent;
+- accessor trace was missing from the frozen marker map;
+- one source-audit call still read the monolith and no exact source constant
+  connected all three consumers;
+- mutation ownership lacked the second post-clean identity check and had no
+  deterministic negative probes;
+- the split had no complete 68-source/pre-post-binary inventory proof or
+  retained historical exact-command execution;
+- line-limit wording accidentally included pre-existing `main.rs`;
+- the G3 section lacked the repeated exact ignored declaration; and
+- stale source/fixture-authority and global-gap wording remained.
+
+- Task 7 now uses a fresh mode-`0700` root per run; exact NUL-safe registration,
+  canonical path, detached HEAD, clean state, root/worktree/gitdir filesystem
+  identities, ownership pre/post checks, Fast-file-only unstaged restore, and
+  one non-forced removal. Ambiguous state is retained. Amendment recreation
+  captures entirely new identities.
+- Task 4 defines Indexed-only `candidate_is_deleted`; Synth is false, remains
+  undecorated, and reappears for a deleted same-key indexed row. Both legacy
+  fixtures and the no-query/Title G1 comparison preserve the existing 33/21/18
+  inventories and 17-mutation set.
+- Exact/prefix/release runners use the `freshell-server` binary, identical
+  discovery/execution selection, annotation checks, one libtest summary, and
+  positive passed cardinality. The release G3 source declaration is explicitly
+  ignored and each explicit invocation requires one passed test.
+- The parent artifact is captured before the split/production edits from the
+  pinned parent plus exact recorder/manifest in an offline network namespace,
+  embedded mechanically, decoded/compared, consumed directly by current owner,
+  FrozenOld, ExtractedMaterialized, and final route, and replayed from fresh
+  parent worktrees after Task 0 and Task 10.
+- The focused facade plus 14 responsibility-named siblings obey the binding
+  `<=1000` physical-line rule. Module declarations, phased line lists, task
+  scopes, commit path sets, authority map, source audit, test namespaces,
+  mutation target, amendment allowlists, ledger, matrix, and Done Criteria use
+  those paths.
+
+Static scope evidence: Git status/diff named only
+`docs/plans/2026-08-11-session-directory-page-bound.md`; diff-check returned
+zero. Counts remained parent `22/21`, Task-0 `9`, Task-1 `6`, legacy/G1/G2
+`33/21/18`, G3 `30`, mutations `17`, matrix `35`, exhaustive
+`37,120/111,360`, and implementation commits `11` (12 ledger rows including
+no-commit Task 7).
+
+#### Pass 2 — placeholder, stale-token, and lifecycle scan
+
+**Result: FAIL — superseded by corrective round 2.**
+
+- The stale-token scan returned zero for the old combined test namespace,
+  predictable mutation path, post-change parent emitter, source/fixture response
+  authority constant, generic Fast candidate deletion, staged restore,
+  pathname-grep cleanup, and old no-new-file claim.
+- All 14 future sibling paths occur in exactly one responsibility row; each is
+  introduced only by the task that creates a nonempty file. Five phased line
+  arrays are uniquely defined. Current donor paths and all seven pinned-parent
+  blobs exist.
+- Artifact flow is producer-before-consumer:
+  recorder -> parent capture -> clean parent removal -> split -> mechanical
+  embed/decode/cmp -> Task-0 commit -> fresh replay -> exact evidence cleanup.
+  Changed code cannot emit expected parent bytes.
+- Mutation flow is producer-before-consumer and fail closed:
+  Task-6 commit -> fresh ownership capture -> mutation/Cargo/kill -> Fast-only
+  restore -> guarded cleanup; amendment requires explicit test-only paths and
+  creates a fresh scratch identity before all 17 rerun.
+
+The pre-existing `TASK6_COMMIT` fresh-shell persistence question is unchanged and
+out of scope. Broad-test coordinator and e2e disposition are likewise not
+adjudicated. This rerun does not claim whole-plan variable-lifecycle PASS beyond
+the five authorized edits.
+
+#### Pass 3 — names, types, paths, inventories, and semantic observability
+
+**Result: FAIL — superseded by corrective round 2.**
+
+- Five test namespace constants align all exact/prefix calls and the exact
+  33/21/18 inventories; normal prefixes require no ignored members.
+- Mutation dictionary, `EXPECTED_MUTATIONS`, killer table (including expanded
+  three `invert-*` IDs), and literal run sequence are the same 17 unique IDs.
+  `deletion-after-selection` uses `candidate_is_deleted` before and after
+  selection, preserving Synth exemption and exact `1/0 -> 0/1` anchor checks.
+- The explicit parent names remain 22 with exactly 21 strategy-comparable cases;
+  cursor cases retain ordered two-exchange evidence. Tree, seven blobs,
+  recorder/manifest/input hashes, base64 raw bodies, and direct four-operand
+  equality are all required.
+- The explicit G3 table remains 30 rows, behavior matrix remains 35 rows, and
+  selector state remains all Materialized through Task 8, no-query Fast in Task
+  9, Title Fast in Task 10, and nonempty file tiers Materialized.
+- TOML inspection confirmed `crates/freshell-server/Cargo.toml` declares the
+  `freshell-server` binary required by `--bin freshell-server`.
+
+#### Pass 4 — command executability, RED/GREEN order, and downstream gates
+
+**Result: FAIL — superseded by corrective round 2; runtime evidence remains
+future.**
+
+- `bash -n` passed all 40 Bash fences. Python `compile()` passed all 18 Python
+  heredocs. Every Bash Git command uses `git -C`; every Cargo command has an
+  absolute manifest directly or through `cargo_server_test`.
+- Parent capture precedes the behavior-neutral split; that split uses baseline
+  and broader GREEN rather than a fake RED. Task-0 missing-assembler RED and
+  Task-1 missing-Materialized RED retain exactly one unresolved reference at the
+  declared point. Deletion expectations precede Fast implementation.
+- Identical focused tests rerun for GREEN/refactor. All-Materialized-through-
+  Task-8 and Task-9/10 selector RED/GREEN ordering are unchanged.
+- Successful exact tests require one pass, prefixes require exactly 33/21/18
+  passes, and parent-recorder/G3 ignored runs require exactly one pass. Exit-zero
+  with zero executed tests, wrong annotation mode, ignored prefix members,
+  malformed/extra summaries, or nonzero failed/ignored/measured counts fail
+  closed.
+- Diff inspection confirmed only the authorized plan changed; no implementation,
+  support, Cargo, dependency, `.kata.toml`, client, Node, oracle, fixture,
+  benchmark, PR, or live-server action occurred.
+
+**Round-1 conclusion: FAIL.** The first edit closed substantial parts of the five
+authorized blockers but did not produce an executable Task-0 authority/split
+sequence and missed the transitive checks listed above. This record is retained
+for audit history and is superseded only by a passing corrective round-2 static
+rerun. No implementation/runtime result is claimed.
+
+### Fresh Eyes iteration 1 corrective round 2 rerun — 2026-08-12
+
+This is the full static Self-Review over both edit rounds. It reviews plan text,
+not future implementation. No Cargo/npm test, Rust compilation, worktree
+creation/removal, parent recorder, mutation, G3, server, or runtime feature
+command was executed.
+
+#### 1. Scope, syntax, and command executability
+
+**Result: PASS.**
+
+- Path-prefixed Git status/diff named only
+  `docs/plans/2026-08-11-session-directory-page-bound.md`; `diff --check`
+  returned zero.
+- Static parsing passed all 44 Bash fences with `bash -n` and all 27 Python
+  heredocs with `compile()`; there are zero standalone Python fences.
+- Every Bash-fence Git command uses `git -C`. Every Cargo command carries an
+  absolute manifest directly or through the defined `cargo_server_test` wrapper.
+- Five current donor/manifest paths and all seven pinned-parent blobs exist.
+  TOML inspection confirms the `freshell-server` binary target.
+
+#### 2. Definitions, lifecycle, and Task-0 phase ordering
+
+**Result: FAIL — superseded by the final corrective addendum.** Parent ownership
+preceded a complete second identity check, and cleanup was not fully fail closed.
+
+- Definition/call counts are exact:
+  `capture_pinned_parent_authority=1/1`,
+  `install_captured_parent_authority=1/1`,
+  `replay_pinned_parent_authority=1/2`,
+  `init_task0_evidence_root=1/1`,
+  `capture_presplit_server_test_inventory=1/1`, and
+  `verify_postsplit_server_test_inventory=1/2`.
+- `canonical_path`, `path_identity`, and `path_mode` each have one shared
+  definition before Task-0 and mutation use.
+  `assert_parent_build_root_owned` and
+  `capture_parent_artifact_from_recorder` each have one definition and at least
+  two consumers.
+- Task-0 ordering statically resolves as:
+  preflight/shared guard/pre-split inventory -> canonical parent capture ->
+  mechanical split/complete inventory/historical exact path/first line gate ->
+  one-way artifact installation -> focused RED/GREEN ->
+  complete precommit inventory/line/working authority guard ->
+  exact commit -> subject-anchored guard -> fresh replay -> evidence finalization.
+- Step 1 contains no future-file line gate and no `run_task0_guard`; the first
+  subject-anchored Task-0 guard is after `commit_exact_scope`.
+
+#### 3. Independent parent authority and direct operands
+
+**Result: FAIL — superseded by the final corrective addendum.** The three-layer
+comparison and exact evidence-root enumeration were prose-only, and no-package
+`cargo clean` made the unconditional target `rmdir` fail.
+
+- The harness defines every required capture/install/replay/cleanup API and all
+  parent/evidence/build/worktree variables before use.
+- The exact temporary recorder API and ignored entrypoint annotation are
+  present. The command passes `FRESHELL_PARENT_AUTHORITY_OUT`, uses offline
+  `env -i` plus a network namespace, and passes through
+  `run_cargo_test_success 1`.
+- The validator requires canonical JSON, exact parent/tree/seven blobs,
+  recorder/manifest hashes, ordered 22/21 cases, unique owner-input hashes,
+  exact one/two-exchange shapes, statuses/content type, and strict raw-body
+  base64.
+- Installation is captured bytes -> fixed-width base64 -> embedded strict
+  decode -> SHA-256 -> `cmp`. Task-0 and Task-10 replay each allocate a fresh
+  root and compare against the frozen Task-0 artifact.
+- `parent-authority-accessor-trace` occurs once in the prose inventory and once
+  in the executable map. Working/precommit and subject-anchored guards link the
+  exact current-owner, FrozenOld, ExtractedMaterialized, final-route, and replay
+  operands directly to the artifact.
+
+#### 4. Module split, inventories, audit, and line scope
+
+**Result: FAIL — superseded by the final corrective addendum.** Blank inventory
+and unsupported test forms could be omitted.
+
+- The static donor manifest is exactly join/core/route/search
+  `11/28/17/12 = 68` unique names; every name occurs exactly once in the pinned
+  parent source.
+- Complete pre/post compiled binary inventory functions are defined and called
+  in `split-only` and `task0` modes. The historical
+  `session_directory::tests::invalid_utf8_transcript_is_indexed_lossily_like_node`
+  path is explicitly executed both after the split and precommit.
+- `FAST_AUDIT_SOURCES` has one definition, one materialized include, one Fast
+  include, exactly three consumers, and zero old-monolith consumers.
+- The phased arrays contain exactly the facade plus fourteen focused siblings
+  (15 unique paths). `main.rs` and external `search.rs` occur zero times in
+  those arrays and are explicitly outside this blocker's new line gate.
+
+#### 5. Mutation ownership and Indexed-only deletion
+
+**Result: FAIL only for Probe G's unsafe restoration — superseded by the final
+corrective addendum. Indexed-only deletion remains PASS.**
+
+- Acquisition order is identity -> clean read -> identity -> `MUT_WT_OWNED=1`.
+- Fresh-scratch probes A-H cover absent ownership; each root/worktree/gitdir
+  identity-token mismatch; locked/prunable registration; untracked/staged/extra
+  restore refusal; and dirty-cleanup path/registration preservation. The real
+  mutation scratch is created only after all probes.
+- No force/reset/Git-clean/recursive deletion/pathname-grep recovery was added.
+- Dictionary, expected set, killer table, and literal sequence remain the same
+  17 IDs. `candidate_is_deleted` and the corrected
+  `deletion-after-selection` anchor preserve Indexed-only deletion and Synth
+  reappearance.
+
+#### 6. G3, stale claims, and preserved counts
+
+**Result: PASS.**
+
+- The exact G3 ignore annotation occurs twice in plan contracts—Task 8 and the
+  G3 section—while the source contract remains one test and both invocations
+  require one passed ignored release test.
+- Round 1 is marked FAIL/superseded. Stale provenance-only response authority,
+  old monolith audit, post-change emitter, and global remaining-gaps-none claims
+  have zero active occurrences.
+- Preserved counts are exact: parent `22/21`, Task-0 `9`, Task-1 `6`,
+  legacy/G1/G2 `33/21/18`, G3 rows `30`, mutations `17`, matrix rows `35`,
+  exhaustive `37,120/111,360`, and 11 implementation commits (12 ledger rows
+  including no-commit Task 7).
+
+**Corrective round-2 conclusion: FAIL — superseded by the final corrective
+addendum.** The edit closed the earlier sequencing/path/count gaps but left the
+four executable failures above. Implementation/runtime evidence remains future;
+unrelated pre-existing conditions were not adjudicated.
+
+### Fresh Eyes iteration 1 final corrective addendum rerun — 2026-08-12
+
+This bounded writing-plans Self-Review covers all three edit rounds. Round 1 and
+corrective round 2 remain historical FAIL records above. This final rerun is
+static only: no Cargo/npm test, Rust compilation, worktree operation, parent
+capture/replay, mutation, G3, server, or runtime feature command was executed.
+
+#### 1. Parent pre-ownership identity ordering
+
+**Result: PASS.**
+
+- `assert_parent_worktree_identity`,
+  `assert_parent_capture_identity`, and `assert_parent_capture_owned` each have
+  exactly one definition before use.
+- The acquisition checker found exact order:
+  captured tokens -> complete capture identity -> successful clean-status
+  assignment/empty check -> complete capture identity ->
+  `PARENT_WT_OWNED=1` -> owned assertion.
+- The complete predicate covers temp-root canonical path/mode/inode,
+  registration, worktree path/inode/top-level/HEAD, gitdir path/inode, and the
+  owned build root. The ownership flag is false through both checks.
+
+#### 2. Parent cleanup gating, Cargo target transition, and flag clearing
+
+**Result: PASS.**
+
+- Static command-order validation found one guarded `cargo clean`, zero
+  `rmdir "$PARENT_BUILD_TMP/target"`, one explicit target-absence check, and one
+  non-forced worktree removal.
+- Every destructive command is dominated by `cleanup_status == 0`; negative
+  early-ownership, restored-target-rmdir, and removed-gate fixtures all failed
+  the checker.
+- The post-clean predicate requires target absence plus exactly empty `home` and
+  `tmp`. Worktree removal has identity -> successful empty status -> identity
+  ordering.
+- Worktree/build/temp ownership flags clear only after the corresponding path,
+  registration/gitdir where applicable, `rmdir`, and absence proof.
+
+#### 3. Executable three-layer comparison
+
+**Result: PASS.**
+
+- `extract_active_parent_recorder` contains one
+  `normalized_layer_calls` definition, exactly one recorder invocation, exactly
+  one pinned-main invocation, an exact-three check, and hard inequality failure.
+- Unit-level copied-normalizer samples passed comment/whitespace equivalence and
+  rejected reordered, changed, two-call, four-call, unterminated-comment, and
+  unterminated-literal inputs.
+
+#### 4. Exact six-file evidence enumeration before deletion
+
+**Result: PASS.**
+
+- Finalization requires a six-path unique direct-child allowlist, enumerates the
+  root with `os.scandir` before `rm --`, rejects symlink/non-regular entries, and
+  requires actual names equal expected names.
+- `TASK0_EVIDENCE_OWNED=0` follows root `rmdir` and absence proof.
+- Temporary-directory samples accepted exactly six regular files and rejected an
+  extra file, missing file, symlink, and directory before deletion.
+
+#### 5. Nonblank, exact-range, unsupported-form inventory enforcement
+
+**Result: PASS.**
+
+- The shell declaration lister ends with `count > 0`; pre/post readers reject
+  empty, blank, and duplicate declarations.
+- All five stable range anchors occur once and in order. The pinned donor source
+  matches exact ordered `11/28/17/12` lists (68 unique names).
+- Unsupported test-like attributes and module-level macros fail closed.
+  Temporary copied-source samples rejected blank inventory, an extra test,
+  `#[rstest]`, `generate_tests!()`, and a renamed expected donor.
+- Complete compiled mapping/count/SHA checks, split-only equality, Task-0
+  `pre_count + 9`, and the historical exact-path execution remain present.
+
+#### 6. Probe E/F/G/H byte-exact preservation and restoration
+
+**Result: PASS.**
+
+- `assert_exact_probe_line` has one definition before use. Probes E, F, and H
+  use it before removing their known files, preserving trailing LF.
+- Probe G constructs complete expected bytes from base plus the unique suffix,
+  compares failed-restore bytes to that expected file, checks exact total length,
+  base prefix, and suffix, rewrites only after all checks, and compares the
+  result with the saved base.
+- Old tail-only, inequality-only, and unconditional `cat` restoration paths have
+  zero occurrences. A temporary same-final-line/interior-byte mutation failed
+  the copied exact restoration predicate.
+
+#### 7. Syntax, scope, preserved counts, and stale-token closure
+
+**Result: PASS.**
+
+- `bash -n` passed all 44 Bash fences; `compile()` passed all 32 Python
+  heredocs; there are zero standalone Python fences.
+- Git status/diff names only
+  `docs/plans/2026-08-11-session-directory-page-bound.md`; `diff --check`
+  returned zero. Every Bash Git command uses `git -C`, and Cargo commands retain
+  absolute manifests directly or through defined wrappers.
+- Preserved counts remain parent `22/21`, Task-0/Task-1 `9/6`,
+  legacy/G1/G2 `33/21/18`, G3 rows `30`, mutations `17`, matrix `35`,
+  exhaustive `37,120/111,360`, and 11 implementation commits. Line phases remain
+  `9/10/12/14/15`; `FAST_AUDIT_SOURCES` remains one definition/three consumers;
+  both selector commits remain mandatory and reversible.
+- The current round-2 closure is historical FAIL. Global remaining-gaps-none
+  language is absent, and this is the sole final three-sentence closure.
+
+The five authorized Fresh Eyes iteration 1 blockers are closed in plan text
+after corrective round 2. Implementation/runtime evidence remains future.
+Unrelated pre-existing conditions were not adjudicated.
