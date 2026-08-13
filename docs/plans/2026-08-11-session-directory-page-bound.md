@@ -1369,12 +1369,24 @@ cargo_server_test() {
     -p freshell-server
     --bin freshell-server
   )
+  local -a process_deadline=()
   case "$mode" in
     debug) ;;
     release) cargo_args+=(--release) ;;
     *) printf 'invalid test mode: %s\n' "$mode" >&2; return 1 ;;
   esac
-  CARGO_TERM_COLOR=never cargo test "${cargo_args[@]}" "$@"
+  if test -n "${CARGO_SERVER_TEST_DEADLINE:-}"; then
+    command -v timeout >/dev/null || {
+      printf 'required process-deadline command not found: timeout\n' >&2
+      return 1
+    }
+    process_deadline=(
+      timeout --verbose --signal=TERM --kill-after=10s
+      "$CARGO_SERVER_TEST_DEADLINE"
+    )
+  fi
+  CARGO_TERM_COLOR=never "${process_deadline[@]}" \
+    cargo test "${cargo_args[@]}" "$@"
 }
 
 list_selected_tests() {
@@ -1485,6 +1497,7 @@ run_exact_debug_ignored() {
 
 run_exact_release_ignored() {
   local name="$1"
+  local CARGO_SERVER_TEST_DEADLINE=20m
   assert_one_ignored_named_test release "$name" || return 1
   run_cargo_test_success 1 cargo_server_test release \
     "$name" -- --exact --ignored --nocapture --color=never --test-threads=1
@@ -1497,6 +1510,149 @@ from collections import Counter
 import pathlib, re, sys
 
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+MEASURED_PAIRS = 50
+NS_PER_US = 1_000
+RATIO_SCALE_PPB = 1_000_000_000
+U128_MAX = (1 << 128) - 1
+I128_MIN = -(1 << 127)
+I128_MAX = (1 << 127) - 1
+
+STAT_FIELDS = (
+    "materialized_median_twice_ns",
+    "materialized_p95_ns",
+    "fast_median_twice_ns",
+    "fast_p95_ns",
+    "difference_median_twice_ns",
+    "difference_p95_ns",
+    "ratio_median_twice_ppb",
+    "ratio_p95_ppb",
+    "median_threshold_median_twice_ns",
+    "p95_threshold_p95_ns",
+    "median_overage_twice_ns",
+    "p95_overage_ns",
+)
+SIGNED_STAT_FIELDS = {
+    "difference_median_twice_ns",
+    "difference_p95_ns",
+    "median_overage_twice_ns",
+    "p95_overage_ns",
+}
+
+def checked_u128(value, label):
+    if not 0 <= value <= U128_MAX:
+        raise SystemExit(f"{label}: outside u128: {value}")
+    return value
+
+def checked_i128(value, label):
+    if not I128_MIN <= value <= I128_MAX:
+        raise SystemExit(f"{label}: outside i128: {value}")
+    return value
+
+def round_div_u128(n, d, label):
+    checked_u128(n, label)
+    checked_u128(d, label)
+    if d == 0:
+        raise SystemExit(f"{label}: zero divisor")
+    return checked_u128(n + d // 2, label) // d
+
+def ceil_ratio_u128(n, numerator, denominator, label):
+    checked_u128(n, label)
+    if denominator == 0:
+        raise SystemExit(f"{label}: zero denominator")
+    product = checked_u128(n * numerator, label)
+    return checked_u128(product + denominator - 1, label) // denominator
+
+def sorted_50(values, label):
+    if len(values) != MEASURED_PAIRS:
+        raise SystemExit(f"{label}: expected 50 values, got {len(values)}")
+    return sorted(values)
+
+def median_twice(values, signed, label):
+    ordered = sorted_50(values, label)
+    total = ordered[24] + ordered[25]
+    return checked_i128(total, label) if signed else checked_u128(total, label)
+
+def p95(values, label):
+    return sorted_50(values, label)[47]
+
+def recompute_g3_statistics(name, measured):
+    vectors = {key: [] for key in (
+        "materialized", "fast", "difference", "ratio",
+        "median_threshold", "p95_threshold", "median_overage", "p95_overage",
+    )}
+    for baseline, fast in measured:
+        baseline = checked_u128(baseline, f"{name} baseline")
+        fast = checked_u128(fast, f"{name} fast")
+        if baseline == 0:
+            raise SystemExit(f"{name}: zero measured baseline")
+        baseline_i = checked_i128(baseline, f"{name} baseline")
+        fast_i = checked_i128(fast, f"{name} fast")
+        median_threshold = max(
+            ceil_ratio_u128(baseline, 105, 100, f"{name} median threshold"),
+            checked_u128(baseline + 5 * NS_PER_US, f"{name} median threshold"),
+        )
+        p95_threshold = max(
+            ceil_ratio_u128(baseline, 110, 100, f"{name} p95 threshold"),
+            checked_u128(baseline + 10 * NS_PER_US, f"{name} p95 threshold"),
+        )
+        median_threshold_i = checked_i128(
+            median_threshold, f"{name} median threshold"
+        )
+        p95_threshold_i = checked_i128(p95_threshold, f"{name} p95 threshold")
+        ratio_product = checked_u128(
+            fast * RATIO_SCALE_PPB, f"{name} ratio product"
+        )
+        vectors["materialized"].append(baseline)
+        vectors["fast"].append(fast)
+        vectors["difference"].append(
+            checked_i128(fast_i - baseline_i, f"{name} difference")
+        )
+        vectors["ratio"].append(
+            round_div_u128(ratio_product, baseline, f"{name} ratio")
+        )
+        vectors["median_threshold"].append(median_threshold)
+        vectors["p95_threshold"].append(p95_threshold)
+        vectors["median_overage"].append(
+            checked_i128(fast_i - median_threshold_i, f"{name} median overage")
+        )
+        vectors["p95_overage"].append(
+            checked_i128(fast_i - p95_threshold_i, f"{name} p95 overage")
+        )
+    return {
+        "materialized_median_twice_ns": median_twice(
+            vectors["materialized"], False, f"{name} materialized median"
+        ),
+        "materialized_p95_ns": p95(
+            vectors["materialized"], f"{name} materialized p95"
+        ),
+        "fast_median_twice_ns": median_twice(
+            vectors["fast"], False, f"{name} fast median"
+        ),
+        "fast_p95_ns": p95(vectors["fast"], f"{name} fast p95"),
+        "difference_median_twice_ns": median_twice(
+            vectors["difference"], True, f"{name} difference median"
+        ),
+        "difference_p95_ns": p95(
+            vectors["difference"], f"{name} difference p95"
+        ),
+        "ratio_median_twice_ppb": median_twice(
+            vectors["ratio"], False, f"{name} ratio median"
+        ),
+        "ratio_p95_ppb": p95(vectors["ratio"], f"{name} ratio p95"),
+        "median_threshold_median_twice_ns": median_twice(
+            vectors["median_threshold"], False, f"{name} median-threshold median"
+        ),
+        "p95_threshold_p95_ns": p95(
+            vectors["p95_threshold"], f"{name} p95-threshold p95"
+        ),
+        "median_overage_twice_ns": median_twice(
+            vectors["median_overage"], True, f"{name} median-overage median"
+        ),
+        "p95_overage_ns": p95(
+            vectors["p95_overage"], f"{name} p95-overage p95"
+        ),
+    }
+
 warmups = re.findall(
     r"^G3_WARMUP name=(\S+) equality=PASS status=200 body=page$",
     text,
@@ -1538,6 +1694,16 @@ if len(names) != 30 or len(set(names)) != 30:
 if warmups != names:
     raise SystemExit(f"warmup sequence differs from case summaries: {warmups!r} != {names!r}")
 summary_repeats = {row[0]: int(row[1]) for row in summaries}
+summary_statistics = {}
+for row in summaries:
+    if len(row[2:]) != len(STAT_FIELDS):
+        raise SystemExit(f"{row[0]}: summary field count drift")
+    reported = {}
+    for field, token in zip(STAT_FIELDS, row[2:]):
+        value = int(token)
+        checker = checked_i128 if field in SIGNED_STAT_FIELDS else checked_u128
+        reported[field] = checker(value, f"{row[0]} reported {field}")
+    summary_statistics[row[0]] = reported
 
 calibration_names = {name for name, *_ in calibrations}
 if calibration_names != set(names):
@@ -1567,6 +1733,7 @@ for name in names:
         raise SystemExit(f"{name}: expected 10 discarded and 50 measured pairs")
     if len(rows) != 60:
         raise SystemExit(f"{name}: expected exactly 60 pair rows")
+    measured = []
     for expected_pair, row in enumerate(rows):
         (_name, phase, pair, first, repeats, materialized_raw, fast_raw,
          materialized_normalized, fast_normalized) = row
@@ -1577,12 +1744,42 @@ for name in names:
         repeats = int(repeats)
         if repeats != summary_repeats[name]:
             raise SystemExit(f"{name}: pair repeats differ from calibration")
-        for raw, normalized in (
-            (int(materialized_raw), int(materialized_normalized)),
-            (int(fast_raw), int(fast_normalized)),
+        materialized_raw = checked_u128(
+            int(materialized_raw), f"{name} materialized raw"
+        )
+        fast_raw = checked_u128(int(fast_raw), f"{name} fast raw")
+        materialized_normalized = checked_u128(
+            int(materialized_normalized), f"{name} materialized normalized"
+        )
+        fast_normalized = checked_u128(
+            int(fast_normalized), f"{name} fast normalized"
+        )
+        for label, raw, normalized in (
+            ("materialized", materialized_raw, materialized_normalized),
+            ("fast", fast_raw, fast_normalized),
         ):
-            if raw <= 0 or normalized != (raw + repeats // 2) // repeats:
+            if raw <= 0 or normalized != round_div_u128(
+                raw, repeats, f"{name} {label} normalization"
+            ):
                 raise SystemExit(f"{name}: invalid checked normalization in {row!r}")
+        if phase == "measure":
+            measured.append((materialized_normalized, fast_normalized))
+
+    expected = recompute_g3_statistics(name, measured)
+    reported = summary_statistics[name]
+    mismatches = {
+        field: {"reported": reported[field], "expected": expected[field]}
+        for field in STAT_FIELDS
+        if reported[field] != expected[field]
+    }
+    if mismatches:
+        raise SystemExit(
+            f"{name}: G3 summary differs from measured pairs: {mismatches!r}"
+        )
+    if expected["median_overage_twice_ns"] > 0:
+        raise SystemExit(f"{name}: result=PASS contradicts derived median overage")
+    if expected["p95_overage_ns"] > 0:
+        raise SystemExit(f"{name}: result=PASS contradicts derived p95 overage")
 
 if finals != ["G3_MANIFEST_RESULT cases=30 measured_pairs_per_case=50 result=PASS"]:
     raise SystemExit(f"missing/duplicate G3 manifest result: {finals!r}")
@@ -5002,6 +5199,12 @@ The 18 G2 tests already exist from Tasks 4/5. Add only the explicit G3 manifest
 and `adverse_release_ab_non_regression`; do not change production. A G2/G3
 production defect returns to Task 4/5.
 
+Every calibration, discarded, and measured G3 response must exactly equal the
+independently validated Materialized warm response. For each timed request,
+capture the stop timestamp before comparison, and complete that exact comparison
+before starting the next request, so correctness work is excluded from every
+reported request interval.
+
 The G3 declaration is exactly:
 
 ```rust
@@ -6292,7 +6495,9 @@ explicit G3 invocations use `run_g3_release_gate`, which positively discovers
 this exact ignored declaration, requires exactly one passed Rust test, and then
 validates the complete marker transcript. No debug substitute or second G3 test
 is permitted. This repeated quotation is the same source declaration, not a
-second source test.
+second source test. Both task calls reach the G3 helper's locally scoped
+20-minute GNU `timeout` deadline on every external release-list and release-test
+Cargo subprocess; timeout or a missing deadline tool fails the gate.
 
 The G3 test owns this independent nonempty name operand:
 
@@ -6364,6 +6569,33 @@ const F111: G3Flags = G3Flags {
     include_non_interactive: true,
     include_empty: true,
 };
+
+fn g3_identity(
+    terminal_id: &str,
+    provider: Option<&str>,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    updated_at: i64,
+    is_subagent: Option<bool>,
+) -> freshell_ws::identity::TerminalIdentity {
+    let registry = freshell_ws::identity::TerminalIdentityRegistry::new();
+    if let Some(value) = is_subagent {
+        registry.set_is_subagent(terminal_id, Some(value));
+    }
+    registry.upsert(terminal_id, provider, session_id, cwd, updated_at);
+    let identity = registry
+        .get(terminal_id)
+        .expect("G3 identity must exist after upsert");
+    assert_eq!(
+        identity.updated_at, updated_at,
+        "G3 identity timestamp must equal its deterministic fixture timestamp",
+    );
+    assert_eq!(
+        identity.is_subagent, is_subagent,
+        "G3 identity classification must equal its fixture classification",
+    );
+    identity
+}
 
 const fn expected(
     item_count: usize,
@@ -6448,8 +6680,9 @@ every argument is explicit and no `..Default::default()` is permitted. The
 literal expected-name list and literal case calls must compare exactly in the
 sole test; shell transcript validation independently requires all 30 cases.
 
-`build_g3_release_case` completes all deterministic setup before any
-`Instant::now()`:
+`build_g3_release_case` completes all setup into deterministic captured values
+before any `Instant::now()`; no wall-clock-derived value remains in
+`OwnedDirectoryInputs`:
 
 1. Base ordinals `i in 0..N` produce descending `IndexedSession` rows with
    provider `claude`, session `idx-{i:05}`, project/cwd `/g3/project`, title
@@ -6457,9 +6690,13 @@ sole test; shell transcript validation independently requires all 30 cases.
    `last_activity_at = 1_000_000_000i64 - i as i64`. Assert length and adjacent
    `(last_activity_at DESC, full key DESC)` order.
 2. `g3_identity(terminal_id, provider, session_id, cwd, updated_at, is_subagent)`
-   creates a fresh one-entry `TerminalIdentityRegistry`, calls `upsert`, calls
-   `set_is_subagent` when non-`None`, and returns `get(terminal_id).unwrap()`.
-   Build identity vectors in explicit loop order; never use `list()`.
+   uses the exact helper above. It creates a fresh registry; when classification
+   is non-`None`, it calls `set_is_subagent` first; it then calls `upsert`
+   exactly once so the supplied deterministic `updated_at` overwrites the
+   setter's transient wall-clock timestamp while preserving classification. It
+   fetches with `get`, release-asserts exact `updated_at` and `is_subagent`, and
+   returns that identity. Build identity vectors in explicit loop order; never
+   use `list()`.
 3. `Matched` identities use `term-{i:05}`, the exact indexed provider/session,
    and row timestamp. `UnsuppressedSynth` uses `claude:synth-{i:05}`,
    `/g3/synth`, `2_000_000_000-i`, and no subagent classification.
@@ -6701,20 +6938,35 @@ fn assert_g3_integer_statistics_contract() {
     assert_eq!(sorted[47], 47);
 }
 
-async fn measure_g3_batch(app: &axum::Router, repeats: usize) -> u128 {
+async fn measure_g3_batch(
+    app: &axum::Router,
+    repeats: usize,
+    expected_response: &CompletedJsonResponse,
+    case_name: &str,
+    strategy_name: &str,
+) -> u128 {
     assert!((1..=MAX_REPEATS).contains(&repeats));
-    let started = std::time::Instant::now();
-    for _ in 0..repeats {
+    let mut raw_ns = 0_u128;
+    for request in 0..repeats {
+        let started = std::time::Instant::now();
         let response = completed_g3_request(app).await;
-        std::hint::black_box(response);
+        let request_ns = started.elapsed().as_nanos();
+        assert_eq!(
+            &response, expected_response,
+            "{case_name} {strategy_name} timed request {request} response diverged",
+        );
+        raw_ns = raw_ns.checked_add(request_ns).unwrap_or_else(|| {
+            panic!("{case_name} {strategy_name} timed batch elapsed overflow")
+        });
     }
-    started.elapsed().as_nanos()
+    raw_ns
 }
 ```
 
 The exact runner has no early-success path or selective retry. Its one body
-contains, in order, warmup/equality, Materialized-only calibration, the complete
-60-pair loop, and summary/assertions:
+contains, in order, canonical warmup/equality, Materialized-only calibration
+with every response validated after its request timestamp, the complete
+60-pair loop with the same validation, and summary/assertions:
 
 ```rust
 async fn run_g3_release_case(case: &G3ReleaseCase) {
@@ -6741,7 +6993,14 @@ println!(
 let mut repeats = 1usize;
 let mut calibrated = false;
 for step in 0..MAX_CALIBRATION_STEPS {
-    let raw_ns = measure_g3_batch(&materialized_app, repeats).await;
+    let raw_ns = measure_g3_batch(
+        &materialized_app,
+        repeats,
+        &materialized_warm,
+        case.name,
+        "materialized",
+    )
+    .await;
     println!(
         "G3_CALIBRATION name={} step={} repeats={} raw_ns={}",
         case.name, step, repeats, raw_ns,
@@ -6760,12 +7019,40 @@ assert!(calibrated, "{} calibration did not reach 100ms", case.name);
 let mut samples = Vec::with_capacity(MEASURED_PAIRS);
 for pair in 0..(DISCARDED_PAIRED_BATCHES + MEASURED_PAIRS) {
     let (first, materialized_raw_ns, fast_raw_ns) = if pair % 2 == 0 {
-        let materialized = measure_g3_batch(&materialized_app, repeats).await;
-        let fast = measure_g3_batch(&fast_app, repeats).await;
+        let materialized = measure_g3_batch(
+            &materialized_app,
+            repeats,
+            &materialized_warm,
+            case.name,
+            "materialized",
+        )
+        .await;
+        let fast = measure_g3_batch(
+            &fast_app,
+            repeats,
+            &materialized_warm,
+            case.name,
+            "fast",
+        )
+        .await;
         ("materialized", materialized, fast)
     } else {
-        let fast = measure_g3_batch(&fast_app, repeats).await;
-        let materialized = measure_g3_batch(&materialized_app, repeats).await;
+        let fast = measure_g3_batch(
+            &fast_app,
+            repeats,
+            &materialized_warm,
+            case.name,
+            "fast",
+        )
+        .await;
+        let materialized = measure_g3_batch(
+            &materialized_app,
+            repeats,
+            &materialized_warm,
+            case.name,
+            "materialized",
+        )
+        .await;
         ("fast", materialized, fast)
     };
     let baseline_ns = normalized_ns(materialized_raw_ns, repeats)
@@ -6917,13 +7204,17 @@ println!(
 Per case:
 
 1. Run one unmeasured request per strategy; assert the expected non-429
-   status/body class and exact A/B response equality.
+   status/body class and exact A/B response equality. The validated Materialized
+   response is the canonical expected response for every later request.
 2. Calibrate Materialized from repeat 1 with at most 21 doublings and maximum
-   1,048,576 repeats. Raw elapsed `>= 100 ms` passes the floor. Otherwise fail
-   closed and print every attempt.
+   1,048,576 repeats. The checked sum of request-only elapsed intervals
+   `>= 100 ms` passes the floor. Otherwise fail closed and print every attempt.
 3. Run ten discarded paired batches and fifty measured pairs at fixed repeats,
-   alternating which strategy runs first.
-4. Print order, raw elapsed, repeats, normalized integer values, and summaries.
+   alternating which strategy runs first. Every response is captured completely,
+   its request interval is stopped, then it is exact-compared with the canonical
+   response before the next request starts.
+4. Print order, checked request-interval sums, repeats, normalized integer values,
+   and summaries. Response comparison and diagnostics are outside those intervals.
 5. Permit at most one **whole-manifest** rerun for a recorded external
    invalidator; preserve the first output. Never selectively rerun a case.
 
@@ -6943,6 +7234,11 @@ Exact statistics use checked integer arithmetic only:
 - Report strategy median/p95, paired difference median/p95, PPB ratios,
   thresholds, signed overages, and result as batch-normalized synthetic
   observations—not individual request latency or production evidence.
+
+`verify_g3_release_output` independently recomputes all twelve reported case
+statistics and both PASS predicates from only the fifty validated measured
+normalized pairs, using the same checked integer formulas and zero tolerance;
+reported summaries are evidence to compare, never authority.
 
 ---
 
@@ -7126,15 +7422,20 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
   locked/prunable registration; staged/untracked/extra restore refusal; and
   dirty-cleanup path/registration preservation without adding Rust tests.
 - G3 is explicitly ignored in source and each explicit release invocation
-  discovers that ignored declaration, requires exactly one passed Rust test, and
-  validates the non-vacuous marker transcript. The sole body compares its
-  explicit independent 30-name operand to 30 explicit generated case calls,
-  constructs deterministic fixtures, executes and consumes Materialized/Fast
-  full-app requests, asserts warmup response equality/expected pages, performs
-  bounded calibration plus 10 discarded/50 measured alternating pairs, checks
-  integer median/p95 thresholds, and emits every required statistic plus one
-  final manifest marker. A comment-only body cannot pass. It remains
-  synthetic/non-production.
+  discovers that ignored declaration, applies a finite 20-minute GNU `timeout`
+  to every external release-list and release-test Cargo subprocess, requires
+  exactly one passed Rust test, and validates the non-vacuous marker transcript.
+  The sole body compares its explicit independent 30-name operand to 30 explicit
+  generated case calls, constructs deterministic fixtures with release assertions
+  for identity timestamp/classification, executes and consumes Materialized/Fast
+  full-app requests, validates the canonical warm response, and exact-compares
+  every calibration/discard/measure response after its stop timestamp and before
+  the next request starts. It performs bounded calibration plus 10 discarded/50
+  measured alternating pairs and checks integer median/p95 thresholds. The shell
+  verifier independently recomputes all twelve case statistics and both PASS
+  predicates from measured rows before accepting the final marker. A comment-only
+  body, forged summary, timed error response, or unbounded Cargo process cannot
+  pass. It remains synthetic/non-production.
 - Tasks 9/10 each show exact test-first RED, minimal GREEN, refactor/rerun,
   broader checks, and isolated selector-only commits. Nonempty file tiers remain
   Materialized and rollback-ready.
@@ -7341,7 +7642,12 @@ by the dated corrective round-2 rerun below.
   Task 9, and no-query plus Title Fast after Task 10; nonempty file tiers remain
   Materialized.
 - G3 units, checked rounding, median indices 24/25, p95 index 47, thresholds,
-  explicit strata, and rerun policy are unchanged and consistent.
+  explicit strata, and rerun policy are unchanged and consistent. Fixture
+  identities retain only deterministic timestamps/classification; every timed
+  response equals the canonical Materialized warm response after its stop
+  timestamp and before the next start; all twelve summaries and both PASS
+  predicates are independently recomputed from the fifty measured pairs; and
+  every external G3 Cargo subprocess has the shared finite deadline.
 - `FastDirItemProductionAudit` is the sole source of producer/helper sets,
   lexical token rules, recursive edges, and violations for all three G2 source
   tests. Required `DirItem` return declarations are allowed only in the exact
@@ -7882,3 +8188,102 @@ evidence remains future.
 The four Fresh Eyes iteration-2 blockers are closed as executable plan behavior.
 Actual Cargo, mutation, G3, and final REST success remain required future
 completion evidence and are not claimed by this static correction.
+
+### Fresh Eyes iteration 3 corrective Self-Review — 2026-08-12
+
+This append-only review preserves the historical iteration-2 record but
+supersedes only its G3 conclusions about deterministic registry-built identity
+fixtures, warmup-only request correctness, shape-only “complete statistics,” and
+process finiteness without an external Cargo deadline. This is a skill-free
+static review of rendered plan text. No Cargo build/test, real G3 release run,
+selector test, REST sweep, server launch, production restart, or implementation
+command was executed; all such evidence remains future Task-8/Task-10 work.
+
+#### Pass 1 — requirement coverage and transitive scope
+
+**Result: PASS for corrected plan text; future runtime evidence remains open.**
+
+- Identity determinism is owned by the support-manifest `g3_identity`: optional
+  classification is written before one `upsert`, then release-active assertions
+  bind exact fixture `updated_at` and `is_subagent` before capture. Task 8, the
+  manifest rules, Done Criteria, and both shared-gate consumers describe the
+  same deterministic operand.
+- Timed-response correctness is owned by Task 8, `measure_g3_batch`, and its five
+  calls. Every calibration/discard/measure response uses the validated
+  Materialized warm response as one canonical oracle; each elapsed timestamp
+  precedes comparison and each comparison precedes the next request.
+- Statistics binding is owned by the existing release-output verifier. It parses
+  and range-checks every reported field, retains only fifty measured normalized
+  pairs, independently recomputes all twelve statistics with exact checked
+  integer formulas, and independently enforces both PASS predicates.
+- Process finiteness is owned by the inert optional prefix in
+  `cargo_server_test` and the local `CARGO_SERVER_TEST_DEADLINE=20m` in
+  `run_exact_release_ignored`. Dynamic scope bounds both release-list processes
+  and the exact ignored release execution. Task 8 and Task 10 retain their sole
+  shared-gate calls and fail before commit on timeout.
+- Remaining gap: actual compilation, Cargo execution, performance observations,
+  selector behavior, and REST parity are deliberately not established here.
+
+#### Pass 1b — no silent deferrals or stand-ins
+
+**Result: PASS for corrected plan text.** Shared A/B input corruption cannot
+stand in for fixture correctness; one valid warm response cannot stand in for
+later requests; producer summaries and literal PASS cannot stand in for an
+independent decision; finite Rust loop counts cannot stand in for process
+termination. The static synthetic probes below validate plan machinery only and
+do not replace either future release G3 invocation.
+
+#### Pass 2 — placeholder and stale-instruction scan
+
+**Result: PASS for corrected plan text.** The affected G3 path contains no old
+upsert-before-setter instruction, outer whole-batch timer,
+`black_box(response)`, two-argument measured call, warmup-only correctness claim,
+semantically unused summary tuple, raw Task-8/Task-10 Cargo bypass, or
+TBD/TODO/“implement later” placeholder. Historical iteration-2 output remains
+visible as history and is not rewritten to imply probes that were not run.
+
+#### Pass 3 — signature/name/count/filter/command consistency
+
+**Result: PASS for corrected plan text.** Mechanical checks found one identity
+helper with one setter/upsert/get in the required order; six code occurrences
+of `measure_g3_batch` (one declaration plus five calls), five canonical
+response operands, three Materialized and two Fast call labels; one deadline-
+enabled Cargo helper; one local G3 deadline; one output verifier; one shared G3
+gate; and exactly two task calls. The two source-test quotations remain
+byte-identical presentations of one ignored test. The 30-name operand, 30 ordered
+case calls, and 30-row prose table remain identical; calibration constants,
+10-discard/50-measure policy, markers, thresholds, test name, inventories,
+artifact operands, and commit ordering are preserved.
+
+#### Executable static/probe results
+
+**Result: PASS.**
+
+- Markdown extraction: `total_fences=84 bash=44 python_heredocs=40 rust=27
+  standalone_python=0`; all Bash fences passed `bash -n`, all Python heredocs
+  compiled, and `rustfmt --edition 2021 --emit stdout` parsed all nine affected
+  G3 Rust fences.
+- Identity source checker: positive helper `ACCEPT`; original-order,
+  missing-timestamp-assertion, and missing-classification-assertion mutations
+  `REJECT` (3/3).
+- Timed-response source checker: positive helper/runner `ACCEPT`; black-box,
+  assertion-before-stop, and Fast-noncanonical-oracle mutations `REJECT` (3/3).
+- Extracted verifier transcript corpus: positive transcripts `ACCEPT` (4/4:
+  literal varied golden, ratio round-up, ceiling/max, and discard-only change);
+  required negatives `REJECT` (24/24), including forged zeros, all twelve
+  one-field summary mutations (12/12), stale summary after measured-pair change,
+  median-only and p95-only forged PASS, zero baseline, u128 intermediate
+  overflow, and the six prior structural probes (6/6). Mutations of all ten
+  verifier categories were killed (10/10).
+- Deadline topology passed. Synthetic GNU-timeout probes produced
+  `status=124 partial-output=yes timeout-diagnostic=yes child-reaped=yes` and
+  `empty-prefix=yes deadline-success-transparent=yes`; no Cargo process was used.
+- Topology/inventory checks passed: one source G3 test represented by two
+  byte-identical quotations, ordered names/calls/table 30/30/30, one shared gate,
+  two task calls, and preserved unrelated artifact/inventory tokens.
+- `git diff --check` returned zero and path-qualified status named only
+  `docs/plans/2026-08-11-session-directory-page-bound.md`.
+
+The four Fresh Eyes iteration-3 blockers are closed in rendered plan text only.
+Actual Task-8/Task-10 Cargo builds and release G3 executions, selector gates, and
+final REST parity remain required future evidence and are not claimed here.
