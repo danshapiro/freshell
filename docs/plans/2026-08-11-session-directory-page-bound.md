@@ -522,6 +522,108 @@ fn completed_strategy_app(
 ) -> Router;
 ```
 
+Task 8 implements the following G3 support contract in
+`session_directory_page_bound_support.rs`. Every item is `pub(super)` because
+`page_bound_g3_tests` is a sibling module:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct G3Flags {
+    pub(super) include_subagents: bool,
+    pub(super) include_non_interactive: bool,
+    pub(super) include_empty: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum G3QuerySpec {
+    None,
+    Title(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum G3CursorSpec {
+    None,
+    IndexedOrdinal(usize),
+    TitleMatchOrdinal(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum G3FixtureShape {
+    Base,
+    MixedHidden,
+    AllHidden,
+    DeletedHead(usize),
+    AllDeleted,
+    TitleDenseAscii,
+    TitleDenseAsciiWithDenseValidAux,
+    TitleLateSparse4000,
+    TitleUnicodeMiss4000,
+    TitleUnicodeCombiningHit,
+    DuplicateEqualColonCollision,
+    IdentityWinnerFallbackCollision,
+    I64Boundaries,
+    DenseValidAux,
+    MalformedLongAux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum G3IdentityShape {
+    Matched,
+    UnsuppressedSynth,
+    MatchedPlusOneSynth,
+    AllFilteredSynth,
+    FixtureDefined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum G3ColorShape {
+    Empty,
+    OrderedTwo,
+    OrderedThree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct G3ExpectedPage {
+    pub(super) item_count: usize,
+    pub(super) has_next_cursor: bool,
+    pub(super) title_annotations: bool,
+    pub(super) color_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct G3CaseSpec {
+    pub(super) name: &'static str,
+    pub(super) indexed_rows: usize,
+    pub(super) identities: usize,
+    pub(super) limit: usize,
+    pub(super) query: G3QuerySpec,
+    pub(super) cursor: G3CursorSpec,
+    pub(super) flags: G3Flags,
+    pub(super) fixture: G3FixtureShape,
+    pub(super) identity_shape: G3IdentityShape,
+    pub(super) colors: G3ColorShape,
+    pub(super) expected: G3ExpectedPage,
+}
+
+pub(super) struct G3ReleaseCase {
+    pub(super) name: &'static str,
+    pub(super) inputs: Arc<OwnedDirectoryInputs>,
+    pub(super) query: Arc<DirQuery>,
+    pub(super) project_colors: Arc<Map<String, Value>>,
+    pub(super) expected_colors: &'static [(&'static str, &'static str)],
+    pub(super) expected_revision: Option<i64>,
+    pub(super) expected: G3ExpectedPage,
+}
+
+pub(super) fn build_g3_release_case(spec: G3CaseSpec) -> G3ReleaseCase;
+pub(super) fn g3_release_cases() -> Vec<G3ReleaseCase>;
+```
+
+`g3_release_cases()` is an explicit 30-call vector in the same order as the
+independent `EXPECTED_G3_CASE_NAMES` operand below. It never generates names
+from dimensions, filters a larger table, derives the expected-name list from
+itself, or hides a dimension behind `Default`.
+
 It uses `directory_result_response` and `with_full_application_layers`, reads no
 owner, and is complemented by Task 0's actual owner-backed
 `session_directory::router(state)` executor.
@@ -1237,8 +1339,15 @@ share a commit.
 ## Fail-Closed Execution Harness
 
 Run this harness in the task execution shell before Task 0A. If the shell is
-replaced, rerun it. It is intentionally not persisted as a repository file.
-Every copied multi-command block starts with `set -euo pipefail`.
+replaced, rerun the complete harness. Shell replacement discards every
+task-local value and every scratch ownership token. Task 7 may re-enter only at
+a clean commit boundary by calling `load_validated_task6_mutation_base`; that
+helper rehydrates only the Task-6 commit/base from the durable Git ledger. If
+replacement occurs after any scratch creation and before its successful
+ownership-aware clean removal, stop and preserve the scratch; never reconstruct
+its ownership, restore it, remove it, reuse it, or create another scratch. The
+harness is intentionally not persisted as a repository file. Every copied
+multi-command block starts with `set -euo pipefail`.
 
 ### Exact test and broader-check helpers
 
@@ -1379,6 +1488,123 @@ run_exact_release_ignored() {
   assert_one_ignored_named_test release "$name" || return 1
   run_cargo_test_success 1 cargo_server_test release \
     "$name" -- --exact --ignored --nocapture --color=never --test-threads=1
+}
+
+verify_g3_release_output() {
+  local log="$1"
+  python3 - "$log" <<'PY'
+from collections import Counter
+import pathlib, re, sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+warmups = re.findall(
+    r"^G3_WARMUP name=(\S+) equality=PASS status=200 body=page$",
+    text,
+    re.MULTILINE,
+)
+calibrations = re.findall(
+    r"^G3_CALIBRATION name=(\S+) step=(\d+) repeats=(\d+) raw_ns=(\d+)$",
+    text,
+    re.MULTILINE,
+)
+pairs = re.findall(
+    r"^G3_PAIR name=(\S+) phase=(discard|measure) pair=(\d+) "
+    r"first=(materialized|fast) repeats=(\d+) "
+    r"materialized_raw_ns=(\d+) fast_raw_ns=(\d+) "
+    r"materialized_normalized_ns=(\d+) fast_normalized_ns=(\d+)$",
+    text,
+    re.MULTILINE,
+)
+summaries = re.findall(
+    r"^G3_CASE_RESULT name=(\S+) repeats=(\d+) measured_pairs=50 "
+    r"materialized_median_twice_ns=(\d+) materialized_p95_ns=(\d+) "
+    r"fast_median_twice_ns=(\d+) fast_p95_ns=(\d+) "
+    r"difference_median_twice_ns=(-?\d+) difference_p95_ns=(-?\d+) "
+    r"ratio_median_twice_ppb=(\d+) ratio_p95_ppb=(\d+) "
+    r"median_threshold_median_twice_ns=(\d+) p95_threshold_p95_ns=(\d+) "
+    r"median_overage_twice_ns=(-?\d+) p95_overage_ns=(-?\d+) result=PASS$",
+    text,
+    re.MULTILINE,
+)
+finals = re.findall(
+    r"^G3_MANIFEST_RESULT cases=30 measured_pairs_per_case=50 result=PASS$",
+    text,
+    re.MULTILINE,
+)
+
+names = [row[0] for row in summaries]
+if len(names) != 30 or len(set(names)) != 30:
+    raise SystemExit(f"expected 30 unique G3 case summaries, got {names!r}")
+if warmups != names:
+    raise SystemExit(f"warmup sequence differs from case summaries: {warmups!r} != {names!r}")
+summary_repeats = {row[0]: int(row[1]) for row in summaries}
+
+calibration_names = {name for name, *_ in calibrations}
+if calibration_names != set(names):
+    raise SystemExit(f"calibration names differ: {calibration_names!r}")
+for name in names:
+    rows = [row for row in calibrations if row[0] == name]
+    if not 1 <= len(rows) <= 21:
+        raise SystemExit(f"{name}: expected 1..=21 calibration attempts, got {len(rows)}")
+    for expected_step, (_name, step, repeats, raw_ns) in enumerate(rows):
+        if int(step) != expected_step or int(repeats) != 1 << expected_step:
+            raise SystemExit(f"{name}: non-doubling calibration row {rows!r}")
+        if int(repeats) > 1_048_576 or int(raw_ns) <= 0:
+            raise SystemExit(f"{name}: invalid calibration bound/value {rows!r}")
+        if expected_step + 1 < len(rows) and int(raw_ns) >= 100_000_000:
+            raise SystemExit(f"{name}: calibration continued after reaching 100ms")
+    if int(rows[-1][3]) < 100_000_000:
+        raise SystemExit(f"{name}: calibration never reached 100ms")
+    if summary_repeats[name] != int(rows[-1][2]):
+        raise SystemExit(f"{name}: summary repeats differ from calibration")
+
+if {name for name, *_ in pairs} != set(names) or len(pairs) != 30 * 60:
+    raise SystemExit("pair names/count differ from the 30x60 protocol")
+phase_counts = Counter((name, phase) for name, phase, *_ in pairs)
+for name in names:
+    rows = [row for row in pairs if row[0] == name]
+    if phase_counts[(name, "discard")] != 10 or phase_counts[(name, "measure")] != 50:
+        raise SystemExit(f"{name}: expected 10 discarded and 50 measured pairs")
+    if len(rows) != 60:
+        raise SystemExit(f"{name}: expected exactly 60 pair rows")
+    for expected_pair, row in enumerate(rows):
+        (_name, phase, pair, first, repeats, materialized_raw, fast_raw,
+         materialized_normalized, fast_normalized) = row
+        expected_phase = "discard" if expected_pair < 10 else "measure"
+        expected_first = "materialized" if expected_pair % 2 == 0 else "fast"
+        if int(pair) != expected_pair or phase != expected_phase or first != expected_first:
+            raise SystemExit(f"{name}: bad pair order/phase/strategy at {row!r}")
+        repeats = int(repeats)
+        if repeats != summary_repeats[name]:
+            raise SystemExit(f"{name}: pair repeats differ from calibration")
+        for raw, normalized in (
+            (int(materialized_raw), int(materialized_normalized)),
+            (int(fast_raw), int(fast_normalized)),
+        ):
+            if raw <= 0 or normalized != (raw + repeats // 2) // repeats:
+                raise SystemExit(f"{name}: invalid checked normalization in {row!r}")
+
+if finals != ["G3_MANIFEST_RESULT cases=30 measured_pairs_per_case=50 result=PASS"]:
+    raise SystemExit(f"missing/duplicate G3 manifest result: {finals!r}")
+PY
+}
+
+run_g3_release_gate() {
+  local log
+  log="$(mktemp)" || return 1
+  if ! run_exact_release_ignored \
+      "$TEST_G3::adverse_release_ab_non_regression" >"$log" 2>&1; then
+    cat "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  if ! verify_g3_release_output "$log"; then
+    cat "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+  cat "$log" || { rm -f "$log"; return 1; }
+  rm -f "$log"
 }
 
 expect_debug_compile_failure() {
@@ -1534,6 +1760,103 @@ run_clippy() {
 run_shared_typecheck() {
   npm --prefix "$WT" run typecheck || return 1
 }
+
+assert_rest_parity_ports_free() {
+  python3 - <<'PY'
+import socket
+
+for port in (17871, 17872, 17876, 17877):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.25)
+    try:
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(
+                f"REST parity port {port} is already listening; "
+                "do not collide with a foreign process or concurrent sweep"
+            )
+    finally:
+        sock.close()
+PY
+}
+
+run_rest_parity_gate() {
+  local head evidence_root results_json sweep_log
+  head="$(git -C "$WT" rev-parse --verify HEAD)" || return 1
+  mkdir -p "$WT/.worktrees" || return 1
+  evidence_root="$(mktemp -d "$WT/.worktrees/session-directory-rest-parity.${head}.XXXXXXXX")" || return 1
+  results_json="$evidence_root/results.json"
+  sweep_log="$evidence_root/sweep.log"
+
+  npm --prefix "$WT" run build || return 1
+  test -f "$WT/dist/server/index.js" || return 1
+  test -d "$WT/dist/client" || return 1
+  cargo build --manifest-path "$MANIFEST" --release -p freshell-server || return 1
+  test -x "$WT/target/release/freshell-server" || return 1
+  assert_rest_parity_ports_free || return 1
+
+  printf 'REST parity evidence directory: %s\n' "$evidence_root"
+  node "$WT/port/oracle/rest-parity/sweep.mjs" --out "$results_json" 2>&1 | tee "$sweep_log"
+
+  python3 - "$results_json" "$evidence_root" <<'PY'
+import json
+import pathlib
+import sys
+
+results_path = pathlib.Path(sys.argv[1])
+evidence_root = pathlib.Path(sys.argv[2])
+payload = json.loads(results_path.read_text(encoding="utf-8"))
+expected_summary = {"total": 187, "pass": 187, "divergence": 0, "deferred": 0}
+if payload.get("summary") != expected_summary:
+    raise SystemExit(
+        f"unexpected REST parity summary: {payload.get('summary')!r}; "
+        f"expected {expected_summary!r}"
+    )
+
+results = payload.get("results")
+if not isinstance(results, list) or len(results) != 187:
+    raise SystemExit(f"expected exactly 187 result records; got {type(results).__name__} {len(results) if isinstance(results, list) else ''}")
+if any(result.get("verdict") != "PASS" for result in results):
+    raise SystemExit("REST parity artifact contains a non-PASS verdict")
+
+expected_session_directory_ids = {
+    "sd.empty.happy",
+    "sd.empty.background",
+    "sd.nopriority",
+    "sd.badlimit",
+    "sd.badpriority",
+    "sd.badcursor",
+    "sd.no-auth",
+    "sd.seeded.happy",
+    "sd.seeded.query",
+    "sd.seeded.query-nomatch",
+    "sd.seeded.include-flags",
+    "sd.seeded.limit",
+}
+observed_session_directory = [
+    result for result in results if result.get("group") == "session-directory"
+]
+observed_ids = {result.get("id") for result in observed_session_directory}
+if observed_ids != expected_session_directory_ids or len(observed_session_directory) != len(expected_session_directory_ids):
+    raise SystemExit(
+        "session-directory REST coverage drifted: "
+        f"expected={sorted(expected_session_directory_ids)!r} "
+        f"observed={sorted(observed_ids)!r}"
+    )
+
+# pgrepRust is intentionally not asserted: it may report the authorized live :3001
+# server. The sweep's ss field is restricted to the :1787x ports it owns.
+if payload.get("orphanCheck", {}).get("ssListeners") not in (None, ""):
+    raise SystemExit(
+        f"REST parity sweep left a :1787x listener: "
+        f"{payload['orphanCheck']['ssListeners']!r}"
+    )
+
+print(
+    "REST parity gate passed: 187/187 PASS; "
+    "12/12 session-directory cases PASS; evidence=" + str(evidence_root)
+)
+PY
+}
 ```
 
 `run_fmt_check` is intentionally nonmutating. If it fails, edit only the current
@@ -1552,7 +1875,13 @@ ordinary exact test passed to an ignored runner fails; any ignored prefix member
 fails; an exit-zero `0 passed` transcript fails; an extra/malformed libtest
 summary fails; and any nonzero failed/ignored/measured count fails closed while
 printing captured output. Discovery and execution must use the same
-profile/filter/exactness/ignored selection.
+profile/filter/exactness/ignored selection. Before either G3 invocation, exercise
+`verify_g3_release_output` itself: reject an exit-zero one-passed transcript with
+no `G3_*` markers, 29 case summaries, a missing Fast warmup/equality marker, 49
+measured pairs for one case, a missing statistic, and a duplicate final marker.
+The positive synthetic operand has 30 unique ordered warmups/summaries, 1..=21
+doubling calibration rows per case, exactly 10 discarded plus 50 measured pairs
+with alternating first strategy, every checked statistic, and one final marker.
 
 ### NUL-safe exact Git scope and commit helper
 
@@ -1680,6 +2009,119 @@ commit_exact_scope() {
   new_head="$(git -C "$WT" rev-parse HEAD)" || return 1
   if test "$new_head" = "$old_head"; then return 1; fi
   _assert_git_scope committed "$subject" "${allowlist[@]}" || return 1
+}
+
+TASK5_SUBJECT='perf(session-directory): add page-bounded title candidate'
+TASK6_SUBJECT='test(session-directory): commit complete compatibility and mutation-killer gates'
+TASK6_BASE_FILES=(
+  crates/freshell-server/src/session_directory_page_bound_support.rs
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
+)
+TASK6_TEST_FILES=(
+  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
+  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
+  crates/freshell-server/src/session_directory_page_bound_support.rs
+  crates/freshell-server/src/session_directory_page_bound_source_audit.rs
+)
+TASK6_PRODUCTION_FILES=(
+  crates/freshell-server/src/session_directory.rs
+  crates/freshell-server/src/session_directory_materialized.rs
+  crates/freshell-server/src/session_directory_inputs.rs
+  crates/freshell-server/src/session_directory_fast.rs
+)
+
+load_validated_task6_mutation_base() {
+  local candidate confirmed status
+  candidate="$(python3 - "$WT" "$TASK5_SUBJECT" "$TASK6_SUBJECT" \
+    --required "${TASK6_BASE_FILES[@]}" \
+    --allowed "${TASK6_TEST_FILES[@]}" <<'PY'
+import os
+import subprocess
+import sys
+
+wt, task5_subject, task6_subject, *args = sys.argv[1:]
+if not args or args[0] != "--required" or "--allowed" not in args:
+    raise SystemExit("invalid Task-6 identity arguments")
+separator = args.index("--allowed")
+required = args[1:separator]
+allowed = args[separator + 1 :]
+if (
+    not required
+    or not allowed
+    or len(required) != len(set(required))
+    or len(allowed) != len(set(allowed))
+    or not set(required) <= set(allowed)
+):
+    raise SystemExit("invalid Task-6 required/allowed path sets")
+
+
+def git(*items: str) -> bytes:
+    return subprocess.check_output(["git", "-C", wt, *items])
+
+
+def text(*items: str) -> str:
+    return git(*items).decode("utf-8").rstrip("\n")
+
+
+actual_top = os.path.realpath(text("rev-parse", "--show-toplevel"))
+if actual_top != os.path.realpath(wt):
+    raise SystemExit("Task-6 recovery worktree identity changed")
+if git(
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+    "status", "--porcelain=v1", "-z", "--untracked-files=all",
+):
+    raise SystemExit("Task-6 recovery requires a clean active worktree")
+
+head = text("rev-parse", "--verify", "HEAD^{commit}")
+if text("show", "-s", "--format=%s", head) != task6_subject:
+    raise SystemExit("active HEAD is not the Task-6 commit")
+
+parent_row = text("rev-list", "--parents", "-n", "1", head).split()
+if len(parent_row) != 2 or parent_row[0] != head:
+    raise SystemExit("Task-6 commit must have exactly one parent")
+parent = parent_row[1]
+if text("show", "-s", "--format=%s", parent) != task5_subject:
+    raise SystemExit("Task-6 parent is not the Task-5 commit")
+
+raw = git(
+    "diff-tree", "--root", "--no-commit-id", "--name-only", "-z",
+    "-r", "--no-renames", head,
+)
+if raw and not raw.endswith(b"\0"):
+    raise SystemExit("Task-6 path list is not NUL terminated")
+paths = [] if not raw else [os.fsdecode(path) for path in raw[:-1].split(b"\0")]
+if len(paths) != len(set(paths)):
+    raise SystemExit(f"Task-6 path list contains duplicates: {paths!r}")
+actual = set(paths)
+missing = set(required) - actual
+outside = actual - set(allowed)
+if missing or outside:
+    raise SystemExit(
+        f"Task-6 scope differs: missing={sorted(missing)!r}, "
+        f"outside={sorted(outside)!r}, actual={sorted(actual)!r}"
+    )
+print(head)
+PY
+  )" || return 1
+  test -n "$candidate" || return 1
+
+  confirmed="$(git -C "$WT" rev-parse --verify 'HEAD^{commit}')" || return 1
+  test "$confirmed" = "$candidate" || {
+    printf 'active HEAD changed during Task-6 recovery\n' >&2
+    return 1
+  }
+  status="$(git -C "$WT" -c core.fsmonitor=false \
+    -c core.untrackedCache=false status --porcelain=v1 \
+    --untracked-files=all)" || return 1
+  test -z "$status" || {
+    printf 'active worktree changed during Task-6 recovery\n' >&2
+    return 1
+  }
+
+  TASK6_COMMIT="$candidate"
+  MUTATION_BASE="$candidate"
+  export TASK6_COMMIT MUTATION_BASE
 }
 ```
 
@@ -4133,13 +4575,13 @@ successful-Fast equations and `full_row_clone == 0`.
 | `g2_no_query_indexed_work_table_is_exact` | Table `(N,limit)={(0,50),(1,50),(49,50),(50,50),(51,50)}`, T=0, no cursor, flags 000. Add two boundary compositions: raw untitled row + typed `titleOverride:"rescued"` must be visible/backfill; raw titled row + nonempty whitespace override must become effectively empty/hidden and backfill. Force Fast; assert independently listed returned keys, cursor iff a 51st visible descriptor exists, `indexed_full == returned_indexed`, each indexed decoration equals that count, serialization equals returned count, synth/clone zero. |
 | `g2_no_query_synth_work_table_is_exact` | N=0; T in `{0,1,49,50,51,500}` distinct provider-bearing visible identities; limit 50, flags 111. Assert returned synth count `min(T,50)`, cursor iff `T>50`, synth/serialization exact, every indexed stage/title/clone zero. |
 | `g2_no_query_all_filtered_large_live_set_builds_zero_items` | N=0, T=500 identities with `is_subagent=Some(true)`, flags 000, limit 50. Assert empty body/null cursor and every ledger field zero. |
-| `g2_no_query_mixed_indexed_and_synth_work_is_exact` | N=49 visible indexed `claude:idx-{timestamp}` rows, one for every even `last_activity_at` in the inclusive range 104..=200; two unsuppressed, provider-bearing, otherwise noncolliding synths `claude:synth-mid` at 151 and `claude:synth-tail` at 1; no query or cursor; T=2, limit 50, flags 111. Independently expect the descending indexed timestamps 200 through 152, then `claude:synth-mid` at ordinal 26, then descending indexed timestamps 150 through 104. Assert exact key order, the exact legacy cursor encoding of `(104, "claude:idx-104")`, revision 200, and `claude:synth-tail` as descriptor 51/lookahead only. Assert 49 indexed + 1 synth returned, 49 of each indexed stage, one synth constructor, 50 serializations, zero title/clones. |
+| `g2_no_query_mixed_indexed_and_synth_work_is_exact` | N=49 visible indexed `claude:idx-{timestamp}` rows, one for every even `last_activity_at` in the inclusive range 104..=200; two unsuppressed, provider-bearing, otherwise noncolliding synths `claude:synth-mid` at 151 and `claude:synth-tail` at 1; no query or cursor; T=2, limit 50, flags 111. Independently expect the descending indexed timestamps 200 through 152, then `claude:synth-mid` at ordinal 26, then descending indexed timestamps 150 through 104. Before generic equality/audit assertions, directly assert the complete expected key vector with `synth-mid` at ordinal 26 and `idx-104` last (therefore fixing the cursor) using `SESSION_DIRECTORY_MUTATION_KILL:defer-synth-on-greater`. Assert exact key order, the exact legacy cursor encoding of `(104, "claude:idx-104")`, revision 200, and `claude:synth-tail` as descriptor 51/lookahead only. Assert 49 indexed + 1 synth returned, 49 of each indexed stage, one synth constructor, 50 serializations, zero title/clones. |
 | `g2_no_query_duplicate_and_cursor_filtered_synths_build_only_returned_rows` | N=2, ordered T=51 containing same-full-key first-winner duplicates, colon-colliding tuples, synths before/on/after an arbitrary cursor; limit 2. Assert exact two post-cursor winner keys/terminal IDs and construct only their independently known provenance; all duplicate/prefix/lookahead descriptors remain unconstructed. |
-| `g2_no_query_lookahead_descriptor_is_never_constructed` | N=51 visible indexed rows, T=0, limit 50. Assert 50 returned, nonnull cursor from row 50, and exactly 50 indexed constructions/decorations/serializations—not 51. |
-| `g2_candidate_source_has_no_direct_dir_item_literal` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; require exact producer/helper sets and no violations. Specifically assert its tokenized Fast region reports zero direct construction tokens outside the two marked producer bodies reached through `materialize_selected_descriptor`. Ordinary `DirItem` references and the two allowed helper return declarations do not count as construction. |
+| `g2_no_query_lookahead_descriptor_is_never_constructed` | N=51 visible indexed rows, T=0, limit 50. Before broader equations, directly assert the exact returned-row work tuple—especially `indexed_full == 50` and `item_serialization == 50`—using `SESSION_DIRECTORY_MUTATION_KILL:construct-lookahead`. Assert 50 returned, nonnull cursor from row 50, and exactly 50 indexed constructions/decorations/serializations—not 51. |
+| `g2_candidate_source_has_no_direct_dir_item_literal` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; require exact producer/helper sets and no violations. Before the generic empty-violations assertion, directly assert the focused direct-construction violation subset is empty using `SESSION_DIRECTORY_MUTATION_KILL:direct-dir-item-literal`. Specifically assert its tokenized Fast region reports zero direct construction tokens outside the two marked producer bodies reached through `materialize_selected_descriptor`. Ordinary `DirItem` references and the two allowed helper return declarations do not count as construction. |
 | `g2_fast_region_has_no_clone_or_indirect_full_row_construction` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; require no clone token anywhere in the Fast/helper regions, no producer call outside `materialize_selected_descriptor`, no unknown `DirItem`-returning declaration/call, and a recursively closed helper graph of `materialize -> {indexed,synth}` and `annotate -> {}`. This is the sole interpretation of “indirect”; no adjacent broader return-type ban exists. |
-| `g2_full_row_constructor_inventory_is_exact_and_instrumented` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; assert exactly the three producer markers, exactly the two helper markers, exactly one manual `impl Clone for DirItem`, and the matching bump helper in each producer. Require the audit's complete violation list to be empty. The compile-valid unmarked `uninstrumented_full_row_copy` mutation returns `DirItem` and clones, so it necessarily appears as both an unknown returning helper and a clone violation and this exact test kills it. |
-| `g2_one_returned_row_with_500_identities_has_zero_full_row_clones` | N=1 indexed row; T=500 ordered identities all exact-component-match that row; limit 50, flags 111. Assert one indexed row/first terminal winner, no synth, one of each indexed stage/serialization, and zero clones. The compile-valid mutation must leave response bytes unchanged while making `full_row_clone == 500`. |
+| `g2_full_row_constructor_inventory_is_exact_and_instrumented` | Call `let audit = audit_fast_dir_item_production_contract(FAST_AUDIT_SOURCES);`; assert exactly the three producer markers, exactly the two helper markers, exactly one manual `impl Clone for DirItem`, and the matching bump helper in each producer. Before the generic complete-violations assertion, directly assert the focused `{unknown DirItem-returning helper, clone violation}` subset is empty using `SESSION_DIRECTORY_MUTATION_KILL:indirect-full-row-constructor`. The compile-valid unmarked `uninstrumented_full_row_copy` mutation returns `DirItem` and clones, so it necessarily appears as both an unknown returning helper and a clone violation and this exact test kills it. |
+| `g2_one_returned_row_with_500_identities_has_zero_full_row_clones` | N=1 indexed row; T=500 ordered identities all exact-component-match that row; limit 50, flags 111. Before broader equations, directly assert `full_row_clone == 0` using `SESSION_DIRECTORY_MUTATION_KILL:clone-per-identity`. Assert one indexed row/first terminal winner, no synth, one of each indexed stage/serialization, and zero clones. The compile-valid mutation must leave response bytes unchanged while making `full_row_clone == 500`. |
 
 Implement the one shared audit interface exactly once in the test boundary:
 
@@ -4347,7 +4789,7 @@ keys and asserts exact page/cursor/revision plus all successful-Fast equations.
 | `g2_title_non_ascii_expansion_table_is_exact` | Fixed table covering CAFÉ, dotted-I expansion, Straße, Greek sigma, and combining text in each match field. For each query, compare exact returned keys/`matchedIn`/snippet to the frozen legacy fixture and exact per-row ledger equations. |
 | `g2_title_mixed_indexed_and_synth_work_is_exact` | N=49 matching indexed rows plus two unsuppressed provider-display synth matches ordered one in page/one lookahead, limit 50, flags 111. Assert 49 indexed + 1 synth, cursor, 49 indexed stages, one synth construction, 50 annotations/serializations, zero clones. |
 | `g2_title_synth_matches_build_only_selected_rows` | N=0, T=51 provider-bearing identities whose borrowed display titles match `CLI`, limit 50, flags 111. Assert 50 exact first-winner synth keys, cursor, 50 synth constructions/annotations/serializations, all indexed stages/clone zero. |
-| `g2_title_post_selection_has_no_rejection_path` | N=51 with selected matches distributed across title/summary/first-message and one descriptor lookahead; limit 50. Assert exactly 50 rows and a cursor fixed by row 50. Source-audit the materialization region: carried `TitleMatchField` annotation exists exactly once and no `apply_title_search`, `filter`, `filter_map`, rejecting `match`, or `continue` occurs after selection. Carries marker `RED_TITLE_FAST_PATH_MUST_USE_CARRIED_DECISION` before Task-5 implementation. |
+| `g2_title_post_selection_has_no_rejection_path` | N=51 with selected matches distributed across title/summary/first-message and one descriptor lookahead; limit 50. Assert exactly 50 rows and a cursor fixed by row 50. Before any generic audit assertion, directly assert that the post-selection materialization region contains no `apply_title_search` call and no rejecting `continue`/filter path using `SESSION_DIRECTORY_MUTATION_KILL:recompute-title-and-skip`; the same assertion may retain `RED_TITLE_FAST_PATH_MUST_USE_CARRIED_DECISION` before Task-5 implementation. Source-audit the materialization region: carried `TitleMatchField` annotation exists exactly once and no `apply_title_search`, `filter`, `filter_map`, rejecting `match`, or `continue` occurs after selection. |
 
 The late-sparse override-only matches are mandatory dataflow evidence that Title
 selection receives `inputs.overrides`; they complement Task 4's override-effective
@@ -4464,6 +4906,43 @@ dispatch_tier_without_query_is_no_query_branch
 dispatch_blank_query_is_no_query_branch
 ```
 
+The G1 and selector killers place mutation-specific direct observations before
+generic three-strategy/completed-response equality:
+
+- `g1_duplicate_equal_and_colon_collision_old_materialized_fast` has independent
+  equal-time and colon-composition subcases. They directly assert Fast's
+  descending full-key vector with
+  `SESSION_DIRECTORY_MUTATION_KILL:reverse-full-key-order`, and the legacy
+  full-string-collision membership/winner vector with
+  `SESSION_DIRECTORY_MUTATION_KILL:tuple-dedupe`.
+- `g1_arbitrary_and_malformed_cursors_old_materialized_fast` directly asserts
+  the strict exact-on-row/equal-timestamp post-cursor suffix using
+  `SESSION_DIRECTORY_MUTATION_KILL:cursor-inclusive`.
+- `g1_fast_deleted_override_backfills_page_old_materialized_fast` directly
+  asserts the exact backfilled Fast page after head/middle/tail deletion using
+  `SESSION_DIRECTORY_MUTATION_KILL:deletion-after-selection`.
+- `g1_ordered_identity_permutations_old_materialized_fast` consolidates the two
+  Fast winners and directly asserts `["terminal-a", "terminal-b"]` for A→B and
+  B→A using `SESSION_DIRECTORY_MUTATION_KILL:choose-last-identity`.
+- `g1_i64_revision_boundaries_old_materialized_fast` has independent
+  identity-maximum and deleted-head subcases. They directly assert the exact
+  revision using `SESSION_DIRECTORY_MUTATION_KILL:omit-identity-revision` and
+  `SESSION_DIRECTORY_MUTATION_KILL:use-deleted-index-head-revision`.
+- `g1_all_eight_flags_old_materialized_fast` has three
+  classification-isolated sentinels and directly asserts inclusion vectors
+  across each false/true flag using
+  `SESSION_DIRECTORY_MUTATION_KILL:invert-subagent-filter`,
+  `SESSION_DIRECTORY_MUTATION_KILL:invert-noninteractive-filter`, and
+  `SESSION_DIRECTORY_MUTATION_KILL:invert-empty-filter`.
+- `dispatch_nonempty_user_messages_and_full_text_are_materialized` consolidates
+  both nonempty file-tier results and directly asserts
+  `[Materialized, Materialized]` using
+  `SESSION_DIRECTORY_MUTATION_KILL:route-file-tier-fast`.
+
+Each exact marker is the custom message on one direct assertion, appears in no
+fixture or diagnostic print, and is emitted before a generic assertion that the
+same mutant could trip.
+
 ```bash
 set -euo pipefail
 run_g1_aggregate
@@ -4481,8 +4960,7 @@ commit_exact_scope \
   'test(session-directory): commit complete compatibility and mutation-killer gates' \
   crates/freshell-server/src/session_directory_page_bound_support.rs \
   crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
-TASK6_COMMIT="$(git -C "$WT" rev-parse HEAD)"
-export TASK6_COMMIT
+load_validated_task6_mutation_base
 ```
 
 GREEN criteria: exact 21 G1/33 legacy inventories, the revised deterministic raw
@@ -4497,9 +4975,13 @@ Never mutate or restore the active worktree.
 
 Use the complete protocol in **Scratch mutation protocol** below. Every mutation
 must (1) change each declared old snippet exactly once, (2) compile successfully,
-(3) list its exact killer once, (4) fail that exact Fast/selector test once, and
-(5) restore only the disposable scratch file to the committed scratch base.
-Compilation failure is invalid setup, never a kill.
+(3) list its exact killer once, (4) make Cargo exit exactly 101 with the selected
+test as the sole failed test, the mutation-specific marker exactly once inside
+that test's failure-detail block and globally, an exact one-name failure list,
+and exactly one strict `0 passed; 1 failed; 0 ignored; 0 measured` libtest
+summary, and (5) restore only the disposable scratch file to the committed
+scratch base. Compilation failure, an unrelated panic, or an arbitrary nonzero
+exit is invalid setup, never a kill.
 
 Each scratch lives under a fresh private mode-`0700` temp root. Ownership becomes
 true only after exact NUL-safe registration/path/detached-HEAD/clean/root/
@@ -4526,7 +5008,37 @@ The G3 declaration is exactly:
 #[test]
 #[ignore = "finite full-app release A/B gate; run explicitly in release"]
 fn adverse_release_ab_non_regression() {
-    // explicit 30-row manifest and finite protocol
+    assert!(
+        !cfg!(debug_assertions),
+        "G3_RELEASE_PROFILE_REQUIRED: run the ignored gate with --release",
+    );
+    assert_g3_integer_statistics_contract();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build G3 Tokio runtime");
+
+    runtime.block_on(async {
+        let expected_names = EXPECTED_G3_CASE_NAMES;
+        let cases = g3_release_cases();
+        let actual_names: Vec<_> = cases.iter().map(|case| case.name).collect();
+        assert_eq!(
+            actual_names.as_slice(),
+            expected_names,
+            "G3 generated manifest must equal the explicit ordered name manifest",
+        );
+
+        for case in &cases {
+            run_g3_release_case(case).await;
+        }
+
+        println!(
+            "G3_MANIFEST_RESULT cases={} measured_pairs_per_case={} result=PASS",
+            expected_names.len(),
+            MEASURED_PAIRS,
+        );
+    });
 }
 ```
 
@@ -4542,7 +5054,7 @@ run_sessions_sanity
 run_fmt_check
 run_clippy
 run_both_guards
-run_exact_release_ignored "$TEST_G3::adverse_release_ab_non_regression"
+run_g3_release_gate
 assert_max_1000_lines "${SD_TASK8_FILES[@]}"
 commit_exact_scope \
   'test(session-directory): add exact work and finite adverse release gates' \
@@ -4646,18 +5158,24 @@ run_fmt_check
 run_clippy
 run_shared_typecheck
 run_both_guards
-run_exact_release_ignored "$TEST_G3::adverse_release_ab_non_regression"
+run_g3_release_gate
 assert_max_1000_lines "${SD_TASK8_FILES[@]}"
 commit_exact_scope \
   'perf(session-directory): route title search through the fast path' \
   crates/freshell-server/src/session_directory_fast.rs \
   crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
 replay_pinned_parent_authority
+run_rest_parity_gate
 ```
 
 This is the sole post-switch whole G3. Completion requires both Fast selectors,
 retained Materialized file tiers, and the compiled/tested Materialized rollback
 path.
+
+After the Task-10 commit and pinned-parent replay, `run_rest_parity_gate` is the
+mandatory cross-process Node/Rust REST completion gate. Rust-local raw-byte,
+G1/G2/G3, and parent-artifact checks do not substitute for its declared
+normalized external comparator.
 
 ---
 
@@ -4668,11 +5186,7 @@ path.
 ```bash
 set -euo pipefail
 run_both_guards
-: "${TASK6_COMMIT:?Task 6 must export TASK6_COMMIT before scratch validation}"
-test "$(git -C "$WT" rev-parse HEAD)" = "$TASK6_COMMIT"
-MUTATION_BASE="$TASK6_COMMIT"
-test "$(git -C "$WT" show -s --format=%s "$MUTATION_BASE")" = \
-  'test(session-directory): commit complete compatibility and mutation-killer gates'
+load_validated_task6_mutation_base
 assert_mutation_worktree_record() {
   local mode="$1"
   python3 - "$WT" "$MUT_WT_EXPECTED" "$MUT_WT_HEAD" "$mode" <<'PY'
@@ -4901,8 +5415,76 @@ scratch_compile_mutation() {
   }
 }
 
+assert_exact_mutation_kill_log() {
+  local cargo_status="$1" log="$2" name="$3" marker="$4"
+  python3 - "$cargo_status" "$log" "$name" "$marker" <<'PY'
+import pathlib
+import re
+import sys
+
+cargo_status_text, log_path, name, marker = sys.argv[1:]
+try:
+    cargo_status = int(cargo_status_text)
+except ValueError as exc:
+    raise SystemExit(f"invalid Cargo status: {cargo_status_text!r}") from exc
+if cargo_status != 101:
+    raise SystemExit(
+        f"Cargo status was {cargo_status}; expected mutation-test failure status 101"
+    )
+if not marker or "\n" in marker or "\r" in marker:
+    raise SystemExit(f"invalid mutation marker: {marker!r}")
+
+text = pathlib.Path(log_path).read_text(encoding="utf-8")
+lines = text.splitlines()
+expected_status = f"test {name} ... FAILED"
+status_lines = [
+    line for line in lines
+    if line.startswith("test ") and " ... " in line
+]
+if status_lines != [expected_status]:
+    raise SystemExit(
+        f"selected-test status lines differ: {status_lines!r} != {[expected_status]!r}"
+    )
+
+detail = f"---- {name} stdout ----"
+if lines.count(detail) != 1:
+    raise SystemExit("selected-test failure detail is absent or duplicated")
+detail_at = lines.index(detail)
+failure_headers = [i for i, line in enumerate(lines) if line == "failures:"]
+result_indices = [
+    i for i, line in enumerate(lines) if line.startswith("test result:")
+]
+if len(failure_headers) != 2 or len(result_indices) != 1:
+    raise SystemExit(
+        "expected exactly two libtest failure headers and one result line; "
+        f"found failures={failure_headers!r}, results={result_indices!r}"
+    )
+result_at = result_indices[0]
+if not (failure_headers[0] < detail_at < failure_headers[1] < result_at):
+    raise SystemExit("libtest failure sections are malformed or out of order")
+listed = [
+    line for line in lines[failure_headers[1] + 1 : result_at] if line
+]
+if listed != [f"    {name}"]:
+    raise SystemExit(f"failure list differs from selected test: {listed!r}")
+summary = re.compile(
+    r"test result: FAILED\. 0 passed; 1 failed; 0 ignored; "
+    r"0 measured; [0-9]+ filtered out; finished in [^\r\n]+"
+)
+if summary.fullmatch(lines[result_at]) is None:
+    raise SystemExit(f"unexpected libtest failure summary: {lines[result_at]!r}")
+detail_text = "\n".join(lines[detail_at + 1 : failure_headers[1]])
+if detail_text.count(marker) != 1 or text.count(marker) != 1:
+    raise SystemExit(
+        "mutation marker was not emitted exactly once inside selected-test detail: "
+        f"{marker!r}"
+    )
+PY
+}
+
 scratch_require_killed() {
-  local name="$1" log expected cargo_status
+  local mutation="$1" name="$2" log marker cargo_status
+  marker="SESSION_DIRECTORY_MUTATION_KILL:$mutation"
   scratch_assert_one "$name" || return 1
   log="$(mktemp)" || return 1
   assert_mutation_worktree_owned || { rm -f "$log"; return 1; }
@@ -4920,18 +5502,17 @@ scratch_require_killed() {
     return 1
   fi
   if test "$cargo_status" -eq 0; then
-    printf 'SURVIVED: %s\n' "$name" >&2
+    printf 'SURVIVED: %s (%s)\n' "$mutation" "$name" >&2
     cat "$log" >&2 || true
     rm -f "$log"
     return 1
   fi
-  expected="test $name ... FAILED"
-  python3 - "$log" "$expected" <<'PY' || { cat "$log" >&2 || true; rm -f "$log"; return 1; }
-import pathlib, sys
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-if text.count(sys.argv[2]) != 1:
-    raise SystemExit("failure was not the declared test exactly once")
-PY
+  if ! assert_exact_mutation_kill_log \
+      "$cargo_status" "$log" "$name" "$marker"; then
+    cat "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
   cat "$log" || { rm -f "$log"; return 1; }
   rm -f "$log"
 }
@@ -5207,7 +5788,91 @@ run_mutation_ownership_probes() {
     probe_h_dirty_cleanup_preservation
 }
 
+expect_mutation_kill_probe_rejected() {
+  local status="$1" log="$2" name="$3" marker="$4"
+  if assert_exact_mutation_kill_log "$status" "$log" "$name" "$marker"; then
+    printf 'mutation-kill parser accepted negative probe: %s\n' "$log" >&2
+    return 1
+  fi
+}
+
+run_mutation_kill_parser_probes() {
+  local root name marker
+  root="$(mktemp -d)" || return 1
+  name='session_directory::page_bound_g2_tests::mutation_parser_probe'
+  marker='SESSION_DIRECTORY_MUTATION_KILL:mutation-parser-probe'
+  python3 - "$root" "$name" "$marker" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+name, marker = sys.argv[2:]
+
+
+def transcript(
+    *,
+    test_name=name,
+    detail=marker,
+    listed=name,
+    summary="test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.01s",
+    prefix="",
+    extra_status="",
+    suffix="",
+):
+    return (
+        f"{prefix}running 1 test\n"
+        f"test {test_name} ... FAILED\n"
+        f"{extra_status}\n"
+        "failures:\n\n"
+        f"---- {test_name} stdout ----\n"
+        f"{detail}\n\n"
+        "failures:\n"
+        f"    {listed}\n\n"
+        f"{summary}\n"
+        f"{suffix}"
+    )
+
+
+logs = {
+    "valid": transcript(),
+    "unrelated": transcript(detail="unrelated setup panic"),
+    "environment": f"error: linker failed\ntest {name} ... FAILED\n",
+    "wrong-test": transcript(test_name=f"{name}_other", listed=f"{name}_other"),
+    "extra-status": transcript(extra_status=f"test {name}_other ... ok"),
+    "marker-outside": transcript(prefix=f"{marker}\n", detail="unrelated panic"),
+    "duplicate-marker": transcript(detail=f"{marker}\n{marker}"),
+    "malformed-summary": transcript(summary="test result: FAILED. 0 passed; 1 failed"),
+    "extra-summary": transcript(suffix="test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.01s\n"),
+    "passed-count": transcript(summary="test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.01s"),
+    "second-failed": transcript(summary="test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.01s"),
+    "ignored-count": transcript(summary="test result: FAILED. 0 passed; 1 failed; 1 ignored; 0 measured; 99 filtered out; finished in 0.01s"),
+    "measured-count": transcript(summary="test result: FAILED. 0 passed; 1 failed; 0 ignored; 1 measured; 99 filtered out; finished in 0.01s"),
+    "wrong-list": transcript(listed=f"{name}_other"),
+}
+for label, text in logs.items():
+    (root / label).write_text(text, encoding="utf-8")
+PY
+
+  assert_exact_mutation_kill_log 101 "$root/valid" "$name" "$marker" || return 1
+  expect_mutation_kill_probe_rejected 0 "$root/valid" "$name" "$marker" || return 1
+  expect_mutation_kill_probe_rejected 1 "$root/valid" "$name" "$marker" || return 1
+  for label in unrelated environment wrong-test extra-status marker-outside \
+      duplicate-marker malformed-summary extra-summary passed-count second-failed \
+      ignored-count measured-count wrong-list; do
+    expect_mutation_kill_probe_rejected \
+      101 "$root/$label" "$name" "$marker" || return 1
+  done
+  rm -- \
+    "$root/valid" "$root/unrelated" "$root/environment" "$root/wrong-test" \
+    "$root/extra-status" "$root/marker-outside" "$root/duplicate-marker" \
+    "$root/malformed-summary" "$root/extra-summary" "$root/passed-count" \
+    "$root/second-failed" "$root/ignored-count" "$root/measured-count" \
+    "$root/wrong-list" || return 1
+  rmdir "$root"
+}
+
 run_mutation_ownership_probes
+run_mutation_kill_parser_probes
 MUT_TMP_OWNED=0
 MUT_WT_OWNED=0
 create_mutation_scratch "$MUTATION_BASE"
@@ -5336,23 +6001,25 @@ evidence; this plan edit does not claim either has already run.
 
 ### Mutation-to-killer table and run
 
-| Mutation | Exact mandatory killer |
-|---|---|
-| `reverse-full-key-order` | `g1_duplicate_equal_and_colon_collision_old_materialized_fast` |
-| `defer-synth-on-greater` | `g2_no_query_mixed_indexed_and_synth_work_is_exact` |
-| `cursor-inclusive` | `g1_arbitrary_and_malformed_cursors_old_materialized_fast` |
-| `deletion-after-selection` | `g1_fast_deleted_override_backfills_page_old_materialized_fast` |
-| `choose-last-identity` | `g1_ordered_identity_permutations_old_materialized_fast` |
-| `tuple-dedupe` | `g1_duplicate_equal_and_colon_collision_old_materialized_fast` |
-| `omit-identity-revision` | `g1_i64_revision_boundaries_old_materialized_fast` |
-| `use-deleted-index-head-revision` | `g1_i64_revision_boundaries_old_materialized_fast` |
-| each `invert-*` | `g1_all_eight_flags_old_materialized_fast` |
-| `construct-lookahead` | `g2_no_query_lookahead_descriptor_is_never_constructed` |
-| `direct-dir-item-literal` | `g2_candidate_source_has_no_direct_dir_item_literal` |
-| `clone-per-identity` | `g2_one_returned_row_with_500_identities_has_zero_full_row_clones` |
-| `indirect-full-row-constructor` | `g2_full_row_constructor_inventory_is_exact_and_instrumented` |
-| `recompute-title-and-skip` | `g2_title_post_selection_has_no_rejection_path` |
-| `route-file-tier-fast` | `dispatch_nonempty_user_messages_and_full_text_are_materialized` |
+| Mutation | Exact mandatory killer | Exact marker | Direct expected failure observation |
+|---|---|---|---|
+| `reverse-full-key-order` | `g1_duplicate_equal_and_colon_collision_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:reverse-full-key-order` | Distinct equal-time subcase's exact descending Fast full-key vector. |
+| `defer-synth-on-greater` | `g2_no_query_mixed_indexed_and_synth_work_is_exact` | `SESSION_DIRECTORY_MUTATION_KILL:defer-synth-on-greater` | Complete key vector with `synth-mid` at ordinal 26 and `idx-104` last, fixing the cursor. |
+| `cursor-inclusive` | `g1_arbitrary_and_malformed_cursors_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:cursor-inclusive` | Exact-on-row/equal-time strict post-cursor suffix. |
+| `deletion-after-selection` | `g1_fast_deleted_override_backfills_page_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:deletion-after-selection` | Exact full backfilled Fast page after deleted head/middle/tail rows. |
+| `choose-last-identity` | `g1_ordered_identity_permutations_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:choose-last-identity` | Consolidated Fast winners `["terminal-a","terminal-b"]` for A→B and B→A. |
+| `tuple-dedupe` | `g1_duplicate_equal_and_colon_collision_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:tuple-dedupe` | Separate colon-composition subcase's exact legacy full-string-collision result/winner vector. |
+| `omit-identity-revision` | `g1_i64_revision_boundaries_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:omit-identity-revision` | Isolated identity-maximum case's exact Fast revision. |
+| `use-deleted-index-head-revision` | `g1_i64_revision_boundaries_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:use-deleted-index-head-revision` | Distinct deleted-head case's revision from valid sources. |
+| `invert-subagent-filter` | `g1_all_eight_flags_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:invert-subagent-filter` | Classification-isolated subagent inclusion vector for false/true. |
+| `invert-noninteractive-filter` | `g1_all_eight_flags_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:invert-noninteractive-filter` | Classification-isolated noninteractive inclusion vector for false/true. |
+| `invert-empty-filter` | `g1_all_eight_flags_old_materialized_fast` | `SESSION_DIRECTORY_MUTATION_KILL:invert-empty-filter` | Override-effective empty-only inclusion vector for false/true. |
+| `construct-lookahead` | `g2_no_query_lookahead_descriptor_is_never_constructed` | `SESSION_DIRECTORY_MUTATION_KILL:construct-lookahead` | Exact returned-row work tuple, especially `indexed_full == 50` and `item_serialization == 50`. |
+| `direct-dir-item-literal` | `g2_candidate_source_has_no_direct_dir_item_literal` | `SESSION_DIRECTORY_MUTATION_KILL:direct-dir-item-literal` | Focused direct-construction violation subset is empty before generic audit equality. |
+| `clone-per-identity` | `g2_one_returned_row_with_500_identities_has_zero_full_row_clones` | `SESSION_DIRECTORY_MUTATION_KILL:clone-per-identity` | `full_row_clone == 0` before broader equations. |
+| `indirect-full-row-constructor` | `g2_full_row_constructor_inventory_is_exact_and_instrumented` | `SESSION_DIRECTORY_MUTATION_KILL:indirect-full-row-constructor` | Focused unknown-returning-helper/clone violation subset is empty. |
+| `recompute-title-and-skip` | `g2_title_post_selection_has_no_rejection_path` | `SESSION_DIRECTORY_MUTATION_KILL:recompute-title-and-skip` | Post-selection region has no `apply_title_search` or rejecting continuation/filter. |
+| `route-file-tier-fast` | `dispatch_nonempty_user_messages_and_full_text_are_materialized` | `SESSION_DIRECTORY_MUTATION_KILL:route-file-tier-fast` | Both nonempty file-tier selectors equal `[Materialized, Materialized]`. |
 
 The `choose-last-identity` killer is the explicit fixed-capture A/B+B/A test. It
 must fail because mutated Fast disagrees with FrozenOld/ExtractedMaterialized and
@@ -5365,7 +6032,7 @@ run_one_mutation() {
   local mutation="$1" killer="$2"
   apply_exact_mutation "$mutation" || { scratch_restore; return 1; }
   scratch_compile_mutation || { scratch_restore; return 1; }
-  scratch_require_killed "$killer" || { scratch_restore; return 1; }
+  scratch_require_killed "$mutation" "$killer" || { scratch_restore; return 1; }
   scratch_restore || return 1
 }
 run_one_mutation reverse-full-key-order "$TEST_G1::g1_duplicate_equal_and_colon_collision_old_materialized_fast"
@@ -5391,8 +6058,11 @@ Run the whole literal sequence serially. Prior kills do not count after any
 Task-6 amendment or candidate rebuild. In the future scratch run,
 `defer-synth-on-greater` must compile and
 `g2_no_query_mixed_indexed_and_synth_work_is_exact` must be the exact single
-failing test, with its order/cursor assertion observing the Greater-arm defect.
-No such candidate compilation or kill has happened at plan-edit time.
+failing test, with
+`SESSION_DIRECTORY_MUTATION_KILL:defer-synth-on-greater` emitted exactly once in
+its failure detail and the strict one-failure summary, and with its order/cursor
+assertion observing the Greater-arm defect. No such candidate compilation or
+kill has happened at plan-edit time.
 
 ### Surviving mutation and cleanup rules
 
@@ -5403,19 +6073,6 @@ byte-identical. Neither helper performs destructive recovery:
 
 ```bash
 set -euo pipefail
-TASK6_TEST_FILES=(
-  crates/freshell-server/src/session_directory_page_bound_g1_tests.rs
-  crates/freshell-server/src/session_directory_page_bound_g2_tests.rs
-  crates/freshell-server/src/session_directory_page_bound_support.rs
-  crates/freshell-server/src/session_directory_page_bound_source_audit.rs
-)
-TASK6_PRODUCTION_FILES=(
-  crates/freshell-server/src/session_directory.rs
-  crates/freshell-server/src/session_directory_materialized.rs
-  crates/freshell-server/src/session_directory_inputs.rs
-  crates/freshell-server/src/session_directory_fast.rs
-)
-
 assert_task6_amend_is_test_only() {
   local baseline="$1"
   shift
@@ -5545,9 +6202,7 @@ If a compiling mutation survives:
    tests from Task 6, `run_server_all_targets`, `run_sessions_sanity`,
    `run_fmt_check`, `run_clippy`, and `run_both_guards`.
 4. Run `amend_task6_tests_exact_scope "$MUTATION_BASE" "${changed_paths[@]}"`;
-   then set and export
-   `TASK6_COMMIT="$(git -C "$WT" rev-parse HEAD)"`, set
-   `MUTATION_BASE="$TASK6_COMMIT"`, prove active `HEAD == TASK6_COMMIT`, call
+   then run `load_validated_task6_mutation_base`, call
    `create_mutation_scratch "$MUTATION_BASE"` to obtain a new random root and new
    root/worktree/gitdir identities, and rerun the entire mutation sequence from
    the first row. Never reuse the old path or identity tokens; prior kills do not
@@ -5578,6 +6233,15 @@ reused, locked/prunable, or otherwise ambiguous state is preserved and returns
 nonzero. Never use pathname grep, reset, clean, forced removal, recursive
 scratch deletion, or restore on active/foreign work.
 
+`load_validated_task6_mutation_base` recovers only the committed mutation base.
+It never establishes scratch ownership. If the shell is replaced after
+`create_mutation_scratch` begins and before the clean-removal block completes,
+stop and preserve the scratch: no fresh shell may call `scratch_restore`,
+`cleanup_mutation_scratch`, or create another mutation scratch from
+reconstructed path or identity values. Re-entry runs from the first ownership
+probe only after an uninterrupted shell has reached a documented clean Task-7
+boundary.
+
 ---
 
 ## G3: Explicit Finite Full-App Release A/B Manifest
@@ -5589,16 +6253,263 @@ The sole G3 Rust test is declared exactly as follows in
 #[test]
 #[ignore = "finite full-app release A/B gate; run explicitly in release"]
 fn adverse_release_ab_non_regression() {
-    // existing explicit 30-row manifest and finite protocol
+    assert!(
+        !cfg!(debug_assertions),
+        "G3_RELEASE_PROFILE_REQUIRED: run the ignored gate with --release",
+    );
+    assert_g3_integer_statistics_contract();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build G3 Tokio runtime");
+
+    runtime.block_on(async {
+        let expected_names = EXPECTED_G3_CASE_NAMES;
+        let cases = g3_release_cases();
+        let actual_names: Vec<_> = cases.iter().map(|case| case.name).collect();
+        assert_eq!(
+            actual_names.as_slice(),
+            expected_names,
+            "G3 generated manifest must equal the explicit ordered name manifest",
+        );
+
+        for case in &cases {
+            run_g3_release_case(case).await;
+        }
+
+        println!(
+            "G3_MANIFEST_RESULT cases={} measured_pairs_per_case={} result=PASS",
+            expected_names.len(),
+            MEASURED_PAIRS,
+        );
+    });
 }
 ```
 
 The ignore is load-bearing. Broad debug tests compile but skip this test. Both
-explicit G3 invocations use `run_exact_release_ignored`, which positively
-discovers this exact ignored declaration and requires exactly one passed Rust
-test. The test itself requires the existing exact ordered 30-row manifest. No
-debug substitute or second G3 test is permitted. This repeated contract is not
-a second source declaration.
+explicit G3 invocations use `run_g3_release_gate`, which positively discovers
+this exact ignored declaration, requires exactly one passed Rust test, and then
+validates the complete marker transcript. No debug substitute or second G3 test
+is permitted. This repeated quotation is the same source declaration, not a
+second source test.
+
+The G3 test owns this independent nonempty name operand:
+
+```rust
+const EXPECTED_G3_CASE_NAMES: &[&str] = &[
+    "n0_t0_no_query_l50_none_empty",
+    "n1_t0_no_query_l1_none",
+    "n49_t1_no_query_l2_first_cursor",
+    "n50_t50_no_query_l25_none",
+    "n51_t0_no_query_l49_none",
+    "n51_t0_no_query_l50_none",
+    "n400_t1_no_query_l1_deep_cursor",
+    "n28000_t0_no_query_l50_none",
+    "n28000_t50_mixed_hidden_l25",
+    "n28000_t1_all_hidden_l49",
+    "n28000_t0_long_deleted_head_l50",
+    "n28000_t0_all_deleted_l2",
+    "title_early_dense_ascii_l1",
+    "title_early_dense_ascii_l25_first_cursor",
+    "title_late_sparse_4000_l2_deep",
+    "title_no_match_ascii_l50",
+    "title_no_match_unicode_expansion_l49",
+    "title_combining_expansion_t50_l25",
+    "t1_all_matched_l50",
+    "t50_all_matched_l50",
+    "t51_unsuppressed_synth_l50",
+    "t500_all_matched_l50",
+    "t500_unsuppressed_synth_l50",
+    "t500_all_filtered_synth_l50",
+    "duplicate_equal_colon_collision_l2",
+    "identity_winner_fallback_collision_l25",
+    "i64_boundaries_l49",
+    "dense_valid_aux_t50_l50",
+    "malformed_long_aux_t51_l25_colors",
+    "title_colors_order_t1_l2_first_cursor",
+];
+```
+
+The support module's concrete generated manifest is:
+
+```rust
+use self::G3ColorShape::{Empty, OrderedThree, OrderedTwo};
+use self::G3CursorSpec::{IndexedOrdinal, TitleMatchOrdinal};
+use self::G3FixtureShape::{
+    AllDeleted, AllHidden, Base, DeletedHead, DenseValidAux,
+    DuplicateEqualColonCollision, I64Boundaries, IdentityWinnerFallbackCollision,
+    MalformedLongAux, MixedHidden, TitleDenseAscii, TitleLateSparse4000,
+    TitleDenseAsciiWithDenseValidAux, TitleUnicodeCombiningHit,
+    TitleUnicodeMiss4000,
+};
+use self::G3IdentityShape::{
+    AllFilteredSynth, FixtureDefined, Matched, MatchedPlusOneSynth,
+    UnsuppressedSynth,
+};
+use self::G3QuerySpec::Title;
+
+const F000: G3Flags = G3Flags {
+    include_subagents: false,
+    include_non_interactive: false,
+    include_empty: false,
+};
+const F101: G3Flags = G3Flags {
+    include_subagents: true,
+    include_non_interactive: false,
+    include_empty: true,
+};
+const F111: G3Flags = G3Flags {
+    include_subagents: true,
+    include_non_interactive: true,
+    include_empty: true,
+};
+
+const fn expected(
+    item_count: usize,
+    has_next_cursor: bool,
+    title_annotations: bool,
+    color_count: usize,
+) -> G3ExpectedPage {
+    G3ExpectedPage {
+        item_count,
+        has_next_cursor,
+        title_annotations,
+        color_count,
+    }
+}
+
+fn case(
+    name: &'static str,
+    indexed_rows: usize,
+    identities: usize,
+    limit: usize,
+    query: G3QuerySpec,
+    cursor: G3CursorSpec,
+    flags: G3Flags,
+    fixture: G3FixtureShape,
+    identity_shape: G3IdentityShape,
+    colors: G3ColorShape,
+    expected: G3ExpectedPage,
+) -> G3ReleaseCase {
+    build_g3_release_case(G3CaseSpec {
+        name,
+        indexed_rows,
+        identities,
+        limit,
+        query,
+        cursor,
+        flags,
+        fixture,
+        identity_shape,
+        colors,
+        expected,
+    })
+}
+
+pub(super) fn g3_release_cases() -> Vec<G3ReleaseCase> {
+    vec![
+        case("n0_t0_no_query_l50_none_empty", 0, 0, 50, G3QuerySpec::None, G3CursorSpec::None, F000, Base, Matched, Empty, expected(0, false, false, 0)),
+        case("n1_t0_no_query_l1_none", 1, 0, 1, G3QuerySpec::None, G3CursorSpec::None, F000, Base, Matched, Empty, expected(1, false, false, 0)),
+        case("n49_t1_no_query_l2_first_cursor", 49, 1, 2, G3QuerySpec::None, IndexedOrdinal(0), F000, Base, Matched, Empty, expected(2, true, false, 0)),
+        case("n50_t50_no_query_l25_none", 50, 50, 25, G3QuerySpec::None, G3CursorSpec::None, F111, Base, Matched, Empty, expected(25, true, false, 0)),
+        case("n51_t0_no_query_l49_none", 51, 0, 49, G3QuerySpec::None, G3CursorSpec::None, F000, Base, Matched, Empty, expected(49, true, false, 0)),
+        case("n51_t0_no_query_l50_none", 51, 0, 50, G3QuerySpec::None, G3CursorSpec::None, F000, Base, Matched, Empty, expected(50, true, false, 0)),
+        case("n400_t1_no_query_l1_deep_cursor", 400, 1, 1, G3QuerySpec::None, IndexedOrdinal(199), F000, Base, Matched, Empty, expected(1, true, false, 0)),
+        case("n28000_t0_no_query_l50_none", 28_000, 0, 50, G3QuerySpec::None, G3CursorSpec::None, F000, Base, Matched, Empty, expected(50, true, false, 0)),
+        case("n28000_t50_mixed_hidden_l25", 28_000, 50, 25, G3QuerySpec::None, G3CursorSpec::None, F101, MixedHidden, Matched, Empty, expected(25, true, false, 0)),
+        case("n28000_t1_all_hidden_l49", 28_000, 1, 49, G3QuerySpec::None, G3CursorSpec::None, F000, AllHidden, Matched, Empty, expected(0, false, false, 0)),
+        case("n28000_t0_long_deleted_head_l50", 28_000, 0, 50, G3QuerySpec::None, G3CursorSpec::None, F000, DeletedHead(20_000), Matched, Empty, expected(50, true, false, 0)),
+        case("n28000_t0_all_deleted_l2", 28_000, 0, 2, G3QuerySpec::None, G3CursorSpec::None, F000, AllDeleted, Matched, Empty, expected(0, false, false, 0)),
+        case("title_early_dense_ascii_l1", 28_000, 0, 1, Title("needle"), G3CursorSpec::None, F000, TitleDenseAscii, Matched, Empty, expected(1, true, true, 0)),
+        case("title_early_dense_ascii_l25_first_cursor", 28_000, 1, 25, Title("needle"), TitleMatchOrdinal(0), F111, TitleDenseAscii, Matched, Empty, expected(25, true, true, 0)),
+        case("title_late_sparse_4000_l2_deep", 28_000, 1, 2, Title("late-needle"), TitleMatchOrdinal(19), F000, TitleLateSparse4000, Matched, Empty, expected(2, true, true, 0)),
+        case("title_no_match_ascii_l50", 28_000, 0, 50, Title("absent-ascii"), G3CursorSpec::None, F111, Base, Matched, Empty, expected(0, false, false, 0)),
+        case("title_no_match_unicode_expansion_l49", 28_000, 0, 49, Title("absent-ω"), G3CursorSpec::None, F111, TitleUnicodeMiss4000, Matched, Empty, expected(0, false, false, 0)),
+        case("title_combining_expansion_t50_l25", 400, 50, 25, Title("i\u{307}stanbul e\u{301}"), G3CursorSpec::None, F111, TitleUnicodeCombiningHit, Matched, Empty, expected(25, true, true, 0)),
+        case("t1_all_matched_l50", 400, 1, 50, G3QuerySpec::None, G3CursorSpec::None, F111, Base, Matched, Empty, expected(50, true, false, 0)),
+        case("t50_all_matched_l50", 400, 50, 50, G3QuerySpec::None, G3CursorSpec::None, F111, Base, Matched, Empty, expected(50, true, false, 0)),
+        case("t51_unsuppressed_synth_l50", 0, 51, 50, G3QuerySpec::None, G3CursorSpec::None, F111, Base, UnsuppressedSynth, Empty, expected(50, true, false, 0)),
+        case("t500_all_matched_l50", 500, 500, 50, G3QuerySpec::None, G3CursorSpec::None, F111, Base, Matched, Empty, expected(50, true, false, 0)),
+        case("t500_unsuppressed_synth_l50", 0, 500, 50, G3QuerySpec::None, G3CursorSpec::None, F111, Base, UnsuppressedSynth, Empty, expected(50, true, false, 0)),
+        case("t500_all_filtered_synth_l50", 0, 500, 50, G3QuerySpec::None, G3CursorSpec::None, F000, Base, AllFilteredSynth, Empty, expected(0, false, false, 0)),
+        case("duplicate_equal_colon_collision_l2", 51, 50, 2, G3QuerySpec::None, G3CursorSpec::None, F111, DuplicateEqualColonCollision, FixtureDefined, Empty, expected(2, true, false, 0)),
+        case("identity_winner_fallback_collision_l25", 49, 50, 25, G3QuerySpec::None, G3CursorSpec::None, F111, IdentityWinnerFallbackCollision, FixtureDefined, Empty, expected(25, true, false, 0)),
+        case("i64_boundaries_l49", 51, 1, 49, G3QuerySpec::None, G3CursorSpec::None, F111, I64Boundaries, Matched, Empty, expected(49, true, false, 0)),
+        case("dense_valid_aux_t50_l50", 28_000, 50, 50, G3QuerySpec::None, G3CursorSpec::None, F111, DenseValidAux, Matched, Empty, expected(50, true, false, 0)),
+        case("malformed_long_aux_t51_l25_colors", 28_000, 51, 25, G3QuerySpec::None, G3CursorSpec::None, F111, MalformedLongAux, MatchedPlusOneSynth, OrderedTwo, expected(25, true, false, 2)),
+        case("title_colors_order_t1_l2_first_cursor", 400, 1, 2, Title("needle"), TitleMatchOrdinal(0), F111, TitleDenseAsciiWithDenseValidAux, Matched, OrderedThree, expected(2, true, true, 3)),
+    ]
+}
+```
+
+`case(...)` is only concise notation for the complete `G3CaseSpec` literal:
+every argument is explicit and no `..Default::default()` is permitted. The
+literal expected-name list and literal case calls must compare exactly in the
+sole test; shell transcript validation independently requires all 30 cases.
+
+`build_g3_release_case` completes all deterministic setup before any
+`Instant::now()`:
+
+1. Base ordinals `i in 0..N` produce descending `IndexedSession` rows with
+   provider `claude`, session `idx-{i:05}`, project/cwd `/g3/project`, title
+   `visible-{i:05}`, absent remaining optionals, false flags, and
+   `last_activity_at = 1_000_000_000i64 - i as i64`. Assert length and adjacent
+   `(last_activity_at DESC, full key DESC)` order.
+2. `g3_identity(terminal_id, provider, session_id, cwd, updated_at, is_subagent)`
+   creates a fresh one-entry `TerminalIdentityRegistry`, calls `upsert`, calls
+   `set_is_subagent` when non-`None`, and returns `get(terminal_id).unwrap()`.
+   Build identity vectors in explicit loop order; never use `list()`.
+3. `Matched` identities use `term-{i:05}`, the exact indexed provider/session,
+   and row timestamp. `UnsuppressedSynth` uses `claude:synth-{i:05}`,
+   `/g3/synth`, `2_000_000_000-i`, and no subagent classification.
+   `MatchedPlusOneSynth` uses `T-1` matches plus one synth.
+   `AllFilteredSynth` marks every synth as a subagent.
+4. `MixedHidden` cycles deleted override, noninteractive, subagent, and
+   `title=None` rows; flags 101 admit subagent/empty but reject the other two.
+   `AllHidden` makes every indexed row subagent+untitled and its matching
+   identity subagent-classified under flags 000.
+5. `DeletedHead(20_000)` deletes exact rows `0..20_000`; `AllDeleted` deletes
+   every exact indexed key.
+6. `TitleDenseAscii` puts `needle` in every title.
+   `TitleDenseAsciiWithDenseValidAux` applies that exact title behavior and also
+   applies the complete `DenseValidAux` override/metadata behavior from rule 11;
+   the composite is selected explicitly by the final manifest call rather than
+   inferred from the case name or color variant.
+   `TitleLateSparse4000` uses 4,000-character ASCII titles with exactly 100
+   `late-needle` matches at ordinals 27,900..28,000; match ordinal 19 means
+   independently known indexed ordinal 27,919.
+7. `TitleUnicodeMiss4000` cycles 4,000-character dotted-I, sharp-s, sigma,
+   combining, astral, and broad-Unicode fields while the query is absent.
+   `TitleUnicodeCombiningHit` puts `İSTANBUL e\u{301}` in every title, matching
+   Rust-lowercased `i\u{307}stanbul e\u{301}`.
+8. `DuplicateEqualColonCollision` starts with explicit equal-time duplicates
+   and both `("a","b:c")`/`("a:b","c")` component pairs, then appends base rows
+   to exactly 51 and explicit first-winner identities to exactly 50. Assert both
+   counts and the intended colliding full strings.
+9. `IdentityWinnerFallbackCollision` has exactly 49 base rows and 50 explicitly
+   ordered identities covering same-component duplicates, missing provider,
+   missing/empty session IDs, and provider/session versus
+   `terminal:<terminal_id>` synthesized-key collision. Assert component
+   distinctions and full-key collisions.
+10. `I64Boundaries` deletes row 0 at `i64::MAX`; every remaining row/identity is
+    `<=0`, including `i64::MIN` and `-1`. Its expected revision is `Some(0)`;
+    every other fixture uses `None`.
+11. `DenseValidAux` gives every indexed key valid `titleOverride`,
+    `summaryOverride`, alternating `archived`, valid `titleSource`, and metadata
+    `sessionType:"kilroy"`. `MalformedLongAux` cycles nonobject/null/array,
+    wrong-typed/empty fields, and 4,000-character values without setting
+    `deleted:true`.
+12. `OrderedTwo` inserts `/g3/z:#112233` then `/g3/a:#445566`;
+    `OrderedThree` appends `/g3/m:#778899`. The expected static slices retain
+    exact iteration order; `Empty` uses `&[]`.
+13. Build `DirQuery` directly with `tier=Title`, `limit=Some(limit)`, all three
+    explicit flags, exact optional query, and a cursor encoded by frozen
+    `encode_cursor` from the independently selected indexed row—never by calling
+    either strategy first.
+14. Before return, assert exact N/T counts, `1<=limit<=50`, flags/query/cursor
+    shape, fixture auxiliary/color cardinalities, and zero strategy calls during
+    setup.
 
 `adverse_release_ab_non_regression` forces Materialized and Fast through
 `completed_strategy_app` with identical immutable captures and full application
@@ -5643,7 +6554,80 @@ The test owns this explicit name table and asserts the generated manifest's
 ordered names equal it. The case count is `expected_names.len()`; do not preserve
 a stale independent numeric count.
 
-Finite protocol:
+The G3 test performs and consumes real in-process full-app requests:
+
+```rust
+async fn completed_g3_request(app: &axum::Router) -> CompletedJsonResponse {
+    use tower::ServiceExt as _;
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/api/session-directory")
+                .header("x-auth-token", "g3")
+                .body(axum::body::Body::empty())
+                .expect("build G3 request"),
+        )
+        .await
+        .expect("execute G3 request");
+    collect_completed_json_response(response).await
+}
+
+fn assert_g3_expected_page(case: &G3ReleaseCase, response: &CompletedJsonResponse) {
+    assert_eq!(response.status, axum::http::StatusCode::OK, "{}", case.name);
+    assert_ne!(response.status, axum::http::StatusCode::TOO_MANY_REQUESTS, "{}", case.name);
+    assert_eq!(response.content_type, "application/json; charset=utf-8", "{}", case.name);
+
+    let page: serde_json::Value =
+        serde_json::from_slice(&response.body).expect("G3 response is JSON");
+    let object = page.as_object().expect("G3 response is a page object");
+    assert!(object.contains_key("items"), "{}", case.name);
+    assert!(object.contains_key("nextCursor"), "{}", case.name);
+    assert!(object.contains_key("revision"), "{}", case.name);
+    let items = page["items"].as_array().expect("G3 items array");
+    assert_eq!(items.len(), case.expected.item_count, "{}", case.name);
+    assert_eq!(
+        !page["nextCursor"].is_null(),
+        case.expected.has_next_cursor,
+        "{}",
+        case.name,
+    );
+    if let Some(expected_revision) = case.expected_revision {
+        assert_eq!(page["revision"].as_i64(), Some(expected_revision), "{}", case.name);
+    }
+
+    if case.expected.title_annotations {
+        assert!(!items.is_empty(), "annotated G3 case must return an item");
+        assert!(items.iter().all(|item| item.get("matchedIn").is_some()));
+        assert!(items.iter().all(|item| item.get("snippet").is_some()));
+    } else {
+        assert!(items.iter().all(|item| item.get("matchedIn").is_none()));
+        assert!(items.iter().all(|item| item.get("snippet").is_none()));
+    }
+
+    let actual_colors: Vec<_> = page
+        .get("projectColors")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        key.as_str(),
+                        value.as_str().expect("G3 project color must be a string"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(actual_colors.len(), case.expected.color_count, "{}", case.name);
+    assert_eq!(actual_colors.as_slice(), case.expected_colors, "{}", case.name);
+}
+```
+
+The finite protocol constants, checked helpers, and sample type are module
+items used by the sole ignored test and its exact runner:
 
 ```rust
 const TARGET_BASELINE_BATCH: Duration = Duration::from_millis(100);
@@ -5653,6 +6637,281 @@ const DISCARDED_PAIRED_BATCHES: usize = 10;
 const MEASURED_PAIRS: usize = 50;
 const NS_PER_US: u128 = 1_000;
 const RATIO_SCALE_PPB: u128 = 1_000_000_000;
+
+#[derive(Debug, Clone, Copy)]
+struct G3PairSample {
+    baseline_ns: u128,
+    fast_ns: u128,
+    difference_ns: i128,
+    ratio_ppb: u128,
+    median_threshold_ns: u128,
+    p95_threshold_ns: u128,
+    median_overage_ns: i128,
+    p95_overage_ns: i128,
+}
+```
+
+```rust
+fn round_div(n: u128, d: u128) -> Option<u128> {
+    (d != 0).then_some(())?;
+    n.checked_add(d / 2)?.checked_div(d)
+}
+
+fn ceil_ratio(n: u128, numerator: u128, denominator: u128) -> Option<u128> {
+    (denominator != 0).then_some(())?;
+    let product = n.checked_mul(numerator)?;
+    product
+        .checked_add(denominator - 1)?
+        .checked_div(denominator)
+}
+
+fn checked_i128(value: u128) -> Option<i128> {
+    i128::try_from(value).ok()
+}
+
+fn normalized_ns(raw_ns: u128, repeats: usize) -> Option<u128> {
+    round_div(raw_ns, u128::try_from(repeats).ok()?)
+}
+
+fn ratio_ppb(fast_ns: u128, baseline_ns: u128) -> Option<u128> {
+    (baseline_ns != 0).then_some(())?;
+    round_div(fast_ns.checked_mul(RATIO_SCALE_PPB)?, baseline_ns)
+}
+
+fn median_twice_u128(sorted: &[u128]) -> Option<u128> {
+    (sorted.len() == MEASURED_PAIRS).then_some(())?;
+    sorted[24].checked_add(sorted[25])
+}
+
+fn median_twice_i128(sorted: &[i128]) -> Option<i128> {
+    (sorted.len() == MEASURED_PAIRS).then_some(())?;
+    sorted[24].checked_add(sorted[25])
+}
+
+fn assert_g3_integer_statistics_contract() {
+    assert_eq!(round_div(5, 2), Some(3));
+    assert_eq!(round_div(4, 3), Some(1));
+    assert_eq!(ceil_ratio(101, 105, 100), Some(107));
+    assert_eq!(round_div(1, 0), None);
+    assert_eq!(ceil_ratio(1, 1, 0), None);
+    assert_eq!(round_div(u128::MAX, 2), None);
+    assert_eq!(ceil_ratio(u128::MAX, 2, 1), None);
+    let sorted: Vec<u128> = (0..50).collect();
+    assert_eq!(median_twice_u128(&sorted), Some(49));
+    assert_eq!(sorted[47], 47);
+}
+
+async fn measure_g3_batch(app: &axum::Router, repeats: usize) -> u128 {
+    assert!((1..=MAX_REPEATS).contains(&repeats));
+    let started = std::time::Instant::now();
+    for _ in 0..repeats {
+        let response = completed_g3_request(app).await;
+        std::hint::black_box(response);
+    }
+    started.elapsed().as_nanos()
+}
+```
+
+The exact runner has no early-success path or selective retry. Its one body
+contains, in order, warmup/equality, Materialized-only calibration, the complete
+60-pair loop, and summary/assertions:
+
+```rust
+async fn run_g3_release_case(case: &G3ReleaseCase) {
+let materialized_app = completed_strategy_app(
+    ComparisonStrategy::ExtractedMaterialized,
+    Arc::clone(&case.inputs),
+    Arc::clone(&case.query),
+    Arc::clone(&case.project_colors),
+);
+let fast_app = completed_strategy_app(
+    ComparisonStrategy::Fast,
+    Arc::clone(&case.inputs),
+    Arc::clone(&case.query),
+    Arc::clone(&case.project_colors),
+);
+let materialized_warm = completed_g3_request(&materialized_app).await;
+let fast_warm = completed_g3_request(&fast_app).await;
+assert_g3_expected_page(case, &materialized_warm);
+assert_eq!(fast_warm, materialized_warm, "{} A/B completed response", case.name);
+println!(
+    "G3_WARMUP name={} equality=PASS status=200 body=page",
+    case.name,
+);
+let mut repeats = 1usize;
+let mut calibrated = false;
+for step in 0..MAX_CALIBRATION_STEPS {
+    let raw_ns = measure_g3_batch(&materialized_app, repeats).await;
+    println!(
+        "G3_CALIBRATION name={} step={} repeats={} raw_ns={}",
+        case.name, step, repeats, raw_ns,
+    );
+    if raw_ns >= TARGET_BASELINE_BATCH.as_nanos() {
+        calibrated = true;
+        break;
+    }
+    repeats = repeats
+        .checked_mul(2)
+        .filter(|next| *next <= MAX_REPEATS)
+        .unwrap_or_else(|| panic!("{} calibration did not reach 100ms", case.name));
+}
+assert!(calibrated, "{} calibration did not reach 100ms", case.name);
+
+let mut samples = Vec::with_capacity(MEASURED_PAIRS);
+for pair in 0..(DISCARDED_PAIRED_BATCHES + MEASURED_PAIRS) {
+    let (first, materialized_raw_ns, fast_raw_ns) = if pair % 2 == 0 {
+        let materialized = measure_g3_batch(&materialized_app, repeats).await;
+        let fast = measure_g3_batch(&fast_app, repeats).await;
+        ("materialized", materialized, fast)
+    } else {
+        let fast = measure_g3_batch(&fast_app, repeats).await;
+        let materialized = measure_g3_batch(&materialized_app, repeats).await;
+        ("fast", materialized, fast)
+    };
+    let baseline_ns = normalized_ns(materialized_raw_ns, repeats)
+        .unwrap_or_else(|| panic!("{} invalid Materialized normalization", case.name));
+    let fast_ns = normalized_ns(fast_raw_ns, repeats)
+        .unwrap_or_else(|| panic!("{} invalid Fast normalization", case.name));
+    let phase = if pair < DISCARDED_PAIRED_BATCHES {
+        "discard"
+    } else {
+        "measure"
+    };
+    println!(
+        "G3_PAIR name={} phase={} pair={} first={} repeats={} \
+         materialized_raw_ns={} fast_raw_ns={} \
+         materialized_normalized_ns={} fast_normalized_ns={}",
+        case.name,
+        phase,
+        pair,
+        first,
+        repeats,
+        materialized_raw_ns,
+        fast_raw_ns,
+        baseline_ns,
+        fast_ns,
+    );
+    if phase == "discard" {
+        continue;
+    }
+
+    let baseline_i = checked_i128(baseline_ns)
+        .unwrap_or_else(|| panic!("{} baseline exceeds i128", case.name));
+    let fast_i = checked_i128(fast_ns)
+        .unwrap_or_else(|| panic!("{} Fast sample exceeds i128", case.name));
+    let median_threshold = std::cmp::max(
+        ceil_ratio(baseline_ns, 105, 100).expect("checked median ratio"),
+        baseline_ns
+            .checked_add(5 * NS_PER_US)
+            .expect("checked median floor"),
+    );
+    let p95_threshold = std::cmp::max(
+        ceil_ratio(baseline_ns, 110, 100).expect("checked p95 ratio"),
+        baseline_ns
+            .checked_add(10 * NS_PER_US)
+            .expect("checked p95 floor"),
+    );
+    samples.push(G3PairSample {
+        baseline_ns,
+        fast_ns,
+        difference_ns: fast_i.checked_sub(baseline_i).expect("checked difference"),
+        ratio_ppb: ratio_ppb(fast_ns, baseline_ns)
+            .unwrap_or_else(|| panic!("{} zero/overflow baseline ratio", case.name)),
+        median_threshold_ns: median_threshold,
+        p95_threshold_ns: p95_threshold,
+        median_overage_ns: fast_i
+            .checked_sub(checked_i128(median_threshold).expect("median threshold i128"))
+            .expect("checked median overage"),
+        p95_overage_ns: fast_i
+            .checked_sub(checked_i128(p95_threshold).expect("p95 threshold i128"))
+            .expect("checked p95 overage"),
+    });
+}
+assert_eq!(samples.len(), MEASURED_PAIRS, "{}", case.name);
+let mut materialized: Vec<_> = samples.iter().map(|s| s.baseline_ns).collect();
+let mut fast: Vec<_> = samples.iter().map(|s| s.fast_ns).collect();
+let mut differences: Vec<_> = samples.iter().map(|s| s.difference_ns).collect();
+let mut ratios: Vec<_> = samples.iter().map(|s| s.ratio_ppb).collect();
+let mut median_thresholds: Vec<_> =
+    samples.iter().map(|s| s.median_threshold_ns).collect();
+let mut p95_thresholds: Vec<_> =
+    samples.iter().map(|s| s.p95_threshold_ns).collect();
+let mut median_overages: Vec<_> =
+    samples.iter().map(|s| s.median_overage_ns).collect();
+let mut p95_overages: Vec<_> =
+    samples.iter().map(|s| s.p95_overage_ns).collect();
+materialized.sort_unstable();
+fast.sort_unstable();
+differences.sort_unstable();
+ratios.sort_unstable();
+median_thresholds.sort_unstable();
+p95_thresholds.sort_unstable();
+median_overages.sort_unstable();
+p95_overages.sort_unstable();
+for len in [
+    materialized.len(),
+    fast.len(),
+    differences.len(),
+    ratios.len(),
+    median_thresholds.len(),
+    p95_thresholds.len(),
+    median_overages.len(),
+    p95_overages.len(),
+] {
+    assert_eq!(len, MEASURED_PAIRS, "{} summary sample count", case.name);
+}
+
+let materialized_median_twice =
+    median_twice_u128(&materialized).expect("Materialized median");
+let fast_median_twice = median_twice_u128(&fast).expect("Fast median");
+let difference_median_twice =
+    median_twice_i128(&differences).expect("difference median");
+let ratio_median_twice = median_twice_u128(&ratios).expect("ratio median");
+let median_threshold_median_twice =
+    median_twice_u128(&median_thresholds).expect("median threshold summary");
+let median_overage_twice =
+    median_twice_i128(&median_overages).expect("median overage");
+let materialized_p95 = materialized[47];
+let fast_p95 = fast[47];
+let difference_p95 = differences[47];
+let ratio_p95 = ratios[47];
+let p95_threshold = p95_thresholds[47];
+let p95_overage = p95_overages[47];
+assert!(
+    median_overage_twice <= 0,
+    "{} median non-regression failed: overage_twice={median_overage_twice}",
+    case.name,
+);
+assert!(
+    p95_overage <= 0,
+    "{} p95 non-regression failed: overage={p95_overage}",
+    case.name,
+);
+println!(
+    "G3_CASE_RESULT name={} repeats={} measured_pairs={} \
+     materialized_median_twice_ns={} materialized_p95_ns={} \
+     fast_median_twice_ns={} fast_p95_ns={} \
+     difference_median_twice_ns={} difference_p95_ns={} \
+     ratio_median_twice_ppb={} ratio_p95_ppb={} \
+     median_threshold_median_twice_ns={} p95_threshold_p95_ns={} \
+     median_overage_twice_ns={} p95_overage_ns={} result=PASS",
+    case.name,
+    repeats,
+    MEASURED_PAIRS,
+    materialized_median_twice,
+    materialized_p95,
+    fast_median_twice,
+    fast_p95,
+    difference_median_twice,
+    difference_p95,
+    ratio_median_twice,
+    ratio_p95,
+    median_threshold_median_twice,
+    p95_threshold,
+    median_overage_twice,
+    p95_overage,
+);
+}
 ```
 
 Per case:
@@ -5678,8 +6937,9 @@ Exact statistics use checked integer arithmetic only:
   passes iff `overage[24] + overage[25] <= 0`.
 - Nearest-rank p95 is zero-based index 47.
 - Per-pair median threshold is
-  `max(ceil(105 * baseline / 100), baseline + 5_000ns)`; p95 threshold is
-  `max(ceil(110 * baseline / 100), baseline + 10_000ns)`. Equality passes.
+  `max(ceil(105 * baseline / 100), baseline + 5 * NS_PER_US)`; p95 threshold is
+  `max(ceil(110 * baseline / 100), baseline + 10 * NS_PER_US)`, with
+  `NS_PER_US = 1_000ns`. Equality passes.
 - Report strategy median/p95, paired difference median/p95, PPB ratios,
   thresholds, signed overages, and result as batch-normalized synthetic
   observations—not individual request latency or production evidence.
@@ -5841,13 +7101,23 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
 - The 17-entry mutation dictionary first rejects every embedded/cross-pair old
   anchor, then enforces exact 1/0 → 0/1 source counts. Every mutation is
   compile-valid and behavior-affecting under its named fixture, compiles in the
-  future scratch candidate, and then fails its exact Fast/selector killer;
-  compile failure is invalid setup. `defer-synth-on-greater` is observed by the
-  mixed G2 fixture's forced Greater comparison and exact order/cursor assertions.
+  future scratch candidate, and then fails its exact Fast/selector killer under
+  the strict mutation parser: Cargo status 101, sole exact failed test, its own
+  `SESSION_DIRECTORY_MUTATION_KILL:<mutation-id>` marker exactly once in that
+  test's failure detail and globally, exact one-name failure list, and one strict
+  `0 passed; 1 failed; 0 ignored; 0 measured` summary. Compile failure,
+  unrelated panic, environment error, arbitrary nonzero status, or malformed
+  transcript is invalid setup. `defer-synth-on-greater` is observed by the mixed
+  G2 fixture's forced Greater comparison and exact order/cursor assertions.
   `choose-last-identity` is observed by fixed A/B+B/A captures, never an owner
-  iteration-order assumption. Scratch base equals exported `TASK6_COMMIT`,
-  including after a test-only amendment. Scratch operations never alter foreign
-  work. Each mutation run uses a fresh private temp root and gains ownership only
+  iteration-order assumption. Scratch base equals the Task-6 commit rehydrated
+  from validated active Git HEAD, including after a test-only amendment.
+  Validation requires clean stable HEAD, exact Task-6 subject, a single direct
+  Task-5 parent, both baseline Task-6 paths, and no path outside the
+  amendment-eligible test set before assigning/exporting identical
+  `TASK6_COMMIT` and `MUTATION_BASE` values. Fresh-shell recovery never
+  reconstructs scratch ownership. Scratch operations never alter foreign work.
+  Each mutation run uses a fresh private temp root and gains ownership only
   after exact NUL-safe registration/path/detached-HEAD/clean/root/worktree/gitdir
   identity checks. Mutation, Cargo, status, Fast-file-only restore, and
   non-forced removal revalidate that identity; ambiguous state is preserved.
@@ -5856,10 +7126,15 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
   locked/prunable registration; staged/untracked/extra restore refusal; and
   dirty-cleanup path/registration preservation without adding Rust tests.
 - G3 is explicitly ignored in source and each explicit release invocation
-  discovers that ignored declaration and requires exactly one passed Rust test.
-  It uses the explicit manifest, limits 2/25/49, first-cursor pages, T=1/T=50,
-  finite calibration/warmup/measurement, checked integer median/p95 arithmetic,
-  and at most one whole-manifest rerun. It remains synthetic/non-production.
+  discovers that ignored declaration, requires exactly one passed Rust test, and
+  validates the non-vacuous marker transcript. The sole body compares its
+  explicit independent 30-name operand to 30 explicit generated case calls,
+  constructs deterministic fixtures, executes and consumes Materialized/Fast
+  full-app requests, asserts warmup response equality/expected pages, performs
+  bounded calibration plus 10 discarded/50 measured alternating pairs, checks
+  integer median/p95 thresholds, and emits every required statistic plus one
+  final manifest marker. A comment-only body cannot pass. It remains
+  synthetic/non-production.
 - Tasks 9/10 each show exact test-first RED, minimal GREEN, refactor/rerun,
   broader checks, and isolated selector-only commits. Nonempty file tiers remain
   Materialized and rollback-ready.
@@ -5870,9 +7145,13 @@ No persisted-state, client-query, cursor, or wire rollback is needed.
   reject foreign staged/unstaged/
   untracked work and never destructively recover it.
 - Completion requires actual recorded successful future output from exact tests,
-  `run_server_all_targets`, `run_sessions_sanity`, `run_fmt_check`,
-  `run_clippy`, `run_shared_typecheck`, authority guards, mutations, and G3.
-  This plan does not claim those future results already exist.
+  `run_server_all_targets`, `run_sessions_sanity`, `run_fmt_check`, `run_clippy`,
+  `run_shared_typecheck`, authority guards, mutations, G3, and
+  `run_rest_parity_gate`. The final REST gate must retain its ignored
+  `results.json` and `sweep.log`, report exactly `187 total / 187 pass / 0
+  divergence / 0 deferred`, show all twelve named `session-directory` cases as
+  `PASS`, and leave no `:1787x` listener. This plan does not claim those future
+  results already exist.
 
 ---
 
@@ -5992,8 +7271,13 @@ by the dated corrective round-2 rerun below.
   requests registry insertion order, retries until a desired hash order, or adds
   an owner seam, fake, or production sort.
 - The Task-3 drift test is declared once; Task 5 explicitly reuses/reruns it.
-- `TASK6_COMMIT` is exported, required by scratch setup, checked against active
-  HEAD, and updated with `MUTATION_BASE` after a test-only amendment.
+- `load_validated_task6_mutation_base` validates clean stable active HEAD against
+  the Task-6 subject/single Task-5 parent/required-and-allowed path contract
+  before assigning and exporting identical `TASK6_COMMIT`/`MUTATION_BASE`
+  values. It runs after the Task-6 producer, unconditionally at every Task-7
+  entry or re-entry, and after a guarded test-only amendment. It recovers only
+  the commit boundary and never reconstructs scratch ownership after shell
+  replacement.
 - Task 0A's command block runs the claimed `git -C "$WT" diff --check` before
   typecheck/commit. Reset/read/storage/scope and all eight bump helpers have exact
   signatures and call sites.
@@ -6154,10 +7438,11 @@ no-commit Task 7).
   restore -> guarded cleanup; amendment requires explicit test-only paths and
   creates a fresh scratch identity before all 17 rerun.
 
-The pre-existing `TASK6_COMMIT` fresh-shell persistence question is unchanged and
-out of scope. Broad-test coordinator and e2e disposition are likewise not
-adjudicated. This rerun does not claim whole-plan variable-lifecycle PASS beyond
-the five authorized edits.
+Fresh-shell `TASK6_COMMIT` persistence was out of scope for iteration 1. For
+issue 4, that iteration-1 non-adjudication is superseded by the Fresh Eyes
+iteration-2 validated-HEAD loader and explicit no-scratch-reconstruction
+boundary. Broad-test coordinator and e2e disposition remain outside the
+iteration-1 review scope.
 
 #### Pass 3 — names, types, paths, inventories, and semantic observability
 
@@ -6442,3 +7727,158 @@ capture/replay, mutation, G3, server, or runtime feature command was executed.
 The five authorized Fresh Eyes iteration 1 blockers are closed in plan text
 after corrective round 2. Implementation/runtime evidence remains future.
 Unrelated pre-existing conditions were not adjudicated.
+
+### Fresh Eyes iteration 2 corrective Self-Review — 2026-08-12
+
+This appended review retains the historical PASS/FAIL conclusions above while
+making the two explicitly required issue-4 lifecycle clarifications in their
+original review locations. It supersedes only the four iteration-2 blocker
+conclusions. It is a skill-free static review of the rendered plan. No Cargo
+build/test, G3 release run, REST sweep, server launch, production restart,
+mutation worktree, or implementation command was executed; all such runtime
+evidence remains future.
+
+#### 1. Mandatory final Node/Rust REST parity gate
+
+**Result: PASS for plan text; future sweep evidence remains open.**
+
+- The fail-closed harness defines one `run_rest_parity_gate`. It builds the Node
+  client/server and Rust release server, verifies all expected artifacts,
+  refuses occupied ports 17871/17872/17876/17877, stores `results.json` and
+  `sweep.log` under the ignored worktree `.worktrees/` directory, and runs the
+  existing unmodified `port/oracle/rest-parity/sweep.mjs`.
+- The artifact predicate requires exactly 187 records, summary
+  `187/187/0/0`, every verdict `PASS`, the exact twelve session-directory IDs,
+  and empty `orphanCheck.ssListeners`. It intentionally does not reject
+  `pgrepRust`, which may see the authorized live service on port 3001.
+- Task 10 invokes the gate exactly once after its selector-only commit and
+  pinned-parent replay. Done Criteria names the gate and retained evidence, so
+  Rust-local authority/G1/G2/G3 checks cannot substitute for the declared
+  external comparator.
+- Static execution of the extracted artifact validator against the committed
+  baseline printed: `REST parity gate passed: 187/187 PASS; 12/12
+  session-directory cases PASS; evidence=/tmp/static-rest-parity-evidence`.
+  This validates only the predicate and historical artifact, not the future
+  final candidate or sweep runtime.
+- Extracted-validator probes produced `valid=ACCEPT`; `bad-summary`,
+  `short-results`, `non-pass`, `session-id-drift`, and `listener-left` all
+  produced `REJECT`.
+
+#### 2. Non-vacuous sole G3 release protocol
+
+**Result: PASS for plan text; future release execution remains open.**
+
+- Both plan presentations quote the same executable ignored source body;
+  comment-only bodies are absent. There remains one source test in the existing
+  G3 module and no dependency, feature, target, fixture file, listener, or
+  second test.
+- The independent name operand has 30 unique names. The support vector has 30
+  explicit complete case calls in the identical order and no default-hidden
+  dimension. Deterministic fixture rules cover indexed rows, registry-built
+  identities, hidden/deleted/title/Unicode/collision/i64/auxiliary/color/cursor
+  shapes before timing.
+- The final row explicitly selects
+  `TitleDenseAsciiWithDenseValidAux`; its construction applies both dense
+  `needle` titles and the complete dense-valid override/metadata contract.
+  Neither the row name nor `OrderedThree` hides that auxiliary behavior.
+- Every case constructs Materialized and Fast full-app routers, executes and
+  consumes requests, validates the expected Materialized page and exact A/B
+  completed response, calibrates Materialized, runs 10 discarded plus 50
+  measured alternating pairs, performs checked normalization/ratio/median/p95
+  assertions, and emits complete warmup/calibration/pair/case/final markers.
+- There is exactly one async `run_g3_release_case` declaration with the required
+  `&G3ReleaseCase` parameter and exactly two calls from the byte-identical test
+  quotations. One connected Rust fence contains warmup, calibration, the
+  60-pair loop, and summary/assertions in that order; it has no
+  return/early-success or retry path. `rustfmt` parsed the extracted runner
+  successfully.
+- Rust-fence symbol scanning found one `NS_PER_US` declaration and two code
+  uses, in the exact `5 * NS_PER_US` and `10 * NS_PER_US` threshold floors. An
+  isolated `rustc -D warnings` probe using those exact expressions returned
+  zero, closing the prior dead-constant defect without claiming a future crate
+  build or clippy result.
+- Both required Task-8/Task-10 sites invoke `run_g3_release_gate`. Its verifier
+  requires 30 unique ordered warmups/summaries, bounded doubling calibration,
+  exactly 30×60 ordered pairs, complete statistics, and one final marker.
+- Extracted-verifier probes produced:
+  `valid=ACCEPT`, while `comment-only`, `29-summaries`, `missing-warmup`,
+  `49-measured`, `missing-statistic`, and `duplicate-final` all produced
+  `REJECT`.
+- Minimal report-snippet correction: the concise `case(...)` wrapper is an
+  ordinary Rust function, not a `const fn`, because it calls the specified
+  non-const `build_g3_release_case`; every operand remains explicit and the
+  report's no-hidden-dimension invariant is unchanged.
+
+#### 3. Mutation-specific kill proof
+
+**Result: PASS for plan text; future 17-mutation execution remains open.**
+
+- The mutation dictionary and all 17 literal invocations are byte-for-byte
+  unchanged from `HEAD`. The expanded 17-row killer table has the same ordered
+  IDs and one mechanically derived
+  `SESSION_DIRECTORY_MUTATION_KILL:<mutation-id>` marker per row.
+- Task 4/5/6 contracts place each marker on its direct named semantic
+  observation before generic equality/audit assertions, with independent
+  subcases for shared killers. No test is added or renamed.
+- `scratch_require_killed` now receives `"$mutation" "$killer"` and accepts only
+  Cargo status 101, one exact selected FAILED status, one selected failure
+  detail containing the exact marker once and globally once, one exact failure
+  list name, and one strict `0/1/0/0` summary.
+- The actual extracted parser accepted the valid synthetic transcript and
+  rejected status 0, status 1, unrelated panic, environment error plus forged
+  status, wrong test, extra status, marker outside detail, duplicate marker,
+  malformed summary, extra summary, passed/second-failed/ignored/measured
+  counts, and wrong failure-list name.
+
+#### 4. Clean-boundary Task-6 recovery
+
+**Result: PASS for plan text; future Task-6/Task-7 execution remains open.**
+
+- `TASK6_BASE_FILES`, `TASK6_TEST_FILES`, and `TASK6_PRODUCTION_FILES` each have
+  one definition before first use. The loader reads neither destination before
+  assignment and is called unconditionally after Task 6 and at Task-7 entry;
+  amendment instructions call it again before creating fresh scratch.
+- The stale earlier self-review summary now states the validated-HEAD flow at
+  the Task-6 producer, every Task-7 entry/re-entry, and post-amendment. The
+  iteration-1 historical note now records that fresh-shell persistence was then
+  out of scope and is superseded for issue 4 by this iteration-2 loader and
+  no-scratch-reconstruction boundary.
+- Extracted-loader probes accepted valid initial and amended synthetic Task-6
+  histories with both exported variables equal to active HEAD. They rejected
+  wrong Task-6 subject, wrong direct-parent subject, merge HEAD, missing baseline
+  path, outside path, dirty status, Task-5 HEAD, Task-8 HEAD, changed second HEAD,
+  and changed second status.
+- Fresh-shell scanning found no direct nounset-guard dependency on the old
+  Task-6 shell variable and no mutation-base assignment from that old value. No
+  scratch path, inode, Git-dir, run-ID, or ownership token is persisted or
+  reconstructed. Shell replacement
+  after scratch creation requires stop-and-preserve, never restore/removal/reuse
+  or another scratch.
+
+#### 5. Full writing-plans static rerun
+
+**Result: PASS.**
+
+- Mechanical Markdown extraction found 84 total fences. All 44 Bash fences
+  passed `bash -n`; all 40 embedded Python heredocs compiled; standalone Python
+  fences remain zero.
+- `rustfmt --edition 2021 --emit stdout` parsed all nine edited G3 Rust fences:
+  the support contract, both identical test quotations, expected names,
+  manifest, request/page helpers, constants/sample type, checked helpers, and
+  the connected runner. This is static syntax/format plausibility only, not a
+  future crate build.
+- Affected invariants passed: two identical executable G3 body quotations; one
+  runner declaration/two calls with ordered connected blocks; one 30-name
+  operand equals one ordered 30-call vector; the final composite fixture is
+  explicit; `NS_PER_US` has two threshold uses; two G3 gate invocations; one
+  final REST invocation after replay; twelve REST session-directory IDs; 17
+  unchanged literal mutation invocations equal the 17-row marker table; one
+  definition of each Task-6 path set; two shell loader calls plus the amendment
+  consumer; both required historical review replacements; and no stale direct
+  Task-7 `TASK6_COMMIT` read.
+- `git diff --check` returned zero. Path-qualified status/diff named only
+  `docs/plans/2026-08-11-session-directory-page-bound.md`.
+
+The four Fresh Eyes iteration-2 blockers are closed as executable plan behavior.
+Actual Cargo, mutation, G3, and final REST success remain required future
+completion evidence and are not claimed by this static correction.
