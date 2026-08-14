@@ -15,7 +15,7 @@ annotations and materialize/serialize no more than `limit` rows.
 **Current amendment state:** `0/7 tasks completed; no application code changed.`
 Amendment preparation changes this plan and appends the three authorized
 external evidence logs. The outer process must commit/review the plan and create
-`amendment-5-independent-review.md`; only then may Task 1 consume the committed
+`amendment-6-independent-review.md`; only then may Task 1 consume the committed
 plan, unchanged adapter, and review receipt. Task 1 does not create, edit, or
 commit them. Amendment preparation does not run Cargo, Playwright, Docker,
 Cloud Run, Vitest, `npm test`, or any product/runtime workload.
@@ -68,20 +68,23 @@ Rust file: `crates/freshell-server/src/session_directory.rs`.
   title-search fields, snippets, project paths, and `checkoutPath` omission:
   recency/full-key order; title, summary, first user message only; Rust `char`
   truncation to 140; and no `checkoutPath`.
-- Keep deep-search check order exactly: lookahead count, scan budget, source
-  path, supported provider, scan increment, file I/O. A later budget stop
-  overwrites an earlier `io_error` reason.
+- Keep deep-search's existing `limit + 1` semantic stop and check order exactly:
+  lookahead stop first, then scan budget, source path, supported provider, scan
+  increment, and file I/O. A later budget stop overwrites an earlier `io_error`
+  reason. Never inspect or scan beyond the lookahead stop to manufacture RED.
 - Preserve the current strict duplicate cursor gap, unordered supplied identity
   vector semantics, ignored request `revision` parameter, providerless identity
   contribution to page revision, and full-catalog revision calculation.
 - The final selector delivered by Task 6 may inspect all shallow candidates,
   but it may retain at most `limit + 1` selected descriptors/annotations and
   materialize/serialize at most `limit` rows. Task 5 deliberately cuts over to
-  one semantics-correct **unbounded** policy that retains/materializes all
-  matching candidates before page truncation. Task 6 first proves the structural
-  tests RED against that checkpoint, then implements this final bound and proves
-  the same tests GREEN. This is a structural bound, not a latency, RSS,
-  allocator, or CPU claim.
+  one semantics-correct **PRE-BOUND** policy: no-query/title retain and
+  materialize all selected matches, while UserMessages/FullText preserve their
+  existing semantic `limit + 1` match/annotation stop and materialize those
+  retained matches. Task 6 first proves path-specific structural RED against
+  that checkpoint, then implements the final bound without changing deep-search
+  selection or check order and proves GREEN. This is a structural bound, not a
+  latency, RSS, allocator, or CPU claim.
 - The route tests in Tasks 2 and 3 must call the real authenticated Axum route
   through Tower `oneshot`, collect the complete response body, parse it, and
   compare literal expected values. They must not call a policy helper to produce
@@ -137,7 +140,9 @@ These files are outside Git and are part of this amendment's evidence boundary:
   `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
 - `$LOG_ROOT/reports/amendment-4-independent-review.md` — historical Amendment
   4 review record only. Task 1 does not consume, hash, or modify it.
-- `$LOG_ROOT/reports/amendment-5-independent-review.md` — final review receipt
+- `$LOG_ROOT/reports/amendment-5-independent-review.md` — historical Amendment
+  5 review record only. Task 1 does not consume, hash, or modify it.
+- `$LOG_ROOT/reports/amendment-6-independent-review.md` — final review receipt
   created by the outer process only after this amendment is committed and
   independently reviewed. Task 1 consumes but never creates or edits it. It is
   not pinned by its own file hash and need not contain the plan's content hash.
@@ -198,7 +203,7 @@ An `attempt_record` failure stage is reserved for evidence-write failure.
 The historical Amendment 4 review records that the no-cost normal and
 `PYTHONOPTIMIZE=1` mock gates covered execute status 17, delete failure,
 failed-attempt rejection, successful post-Electron acceptance, and equal-digest
-rejection. The outer process creates the separate Amendment 5 review receipt
+rejection. The outer process creates the separate Amendment 6 review receipt
 after this amendment is committed/reviewed. Task 1 verifies that receipt and the
 actual adapter; it does not create or rerun a fake-Git/fake-gcloud harness.
 
@@ -511,8 +516,8 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
   -> Task 2: real-route rows/order/pages/bytes
     -> Task 3: real-route cursors/search/partial/edge cases
       -> Task 4: borrowed types and mechanical accessors only
-        -> Task 5: one source edit, one unbounded policy, handler cutover, test migration, old-policy deletion
-          -> Task 6: structural RED, bounded GREEN, output cleanup, work-limit proof
+        -> Task 5: one source edit, one PRE-BOUND policy, handler cutover, test migration, old-policy deletion
+          -> Task 6: path-specific RED, final bound, GREEN, output cleanup, work-limit proof
             -> Task 7: final checks and exact-final-HEAD pinned cloud suite
 ```
 
@@ -526,7 +531,7 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
 - Read/consume: `AGENTS.md`, the committed plan, Git state,
   manifests/lockfiles, coordinator sources, browser configuration/spec,
   `scripts/e2e-cloud.sh`, current `session_directory.rs`, the external reviewed
-  adapter, the outer-created Amendment 5 review receipt ending in `PASSED`, and
+  adapter, the outer-created Amendment 6 review receipt ending in `PASSED`, and
   the append-only cloud JSONL.
 - External writes: one append-only cloud attempt record for every started cloud
   attempt, one linked acceptance record only after complete `npm test` success,
@@ -546,7 +551,7 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
   `crates/freshell-server/src/session_directory.rs` is byte-identical to the
   frozen base. If any check fails, stop; do not edit, stage, or commit anything
   in Task 1.
-- [ ] Verify the actual existing external adapter and outer-created Amendment 5
+- [ ] Verify the actual existing external adapter and outer-created Amendment 6
   independent review receipt before any product test or cloud work:
 
 ```bash
@@ -557,7 +562,7 @@ plan_rel=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
 plan="${root}/${plan_rel}"
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-review="${logroot}/reports/amendment-5-independent-review.md"
+review="${logroot}/reports/amendment-6-independent-review.md"
 branch=the-usual/session-directory-lazy-page-prep
 frozen_base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
 adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
@@ -611,7 +616,7 @@ BASH
   This consumes the reviewed artifacts. The report is not pinned by its own
   hash and is not required to name a self-referential plan content hash. Do not
   generate, extract, persist, or run a replacement mock harness, and do not
-  create or edit the plan, adapter, or Amendment 5 review receipt in Task 1.
+  create or edit the plan, adapter, or Amendment 6 review receipt in Task 1.
 - [ ] Run the literal branch push and exact remote-HEAD check:
 
 ```bash
@@ -979,7 +984,7 @@ production-equivalent expected-side logic.
 **Task 4 success:** the borrowed type graph and mechanical accessors compile
 against the locked APIs while the current route policy remains untouched.
 
-### Task 5: Make one uninterrupted unbounded single-policy edit, cut over the handler, migrate every direct test, and delete the old policy
+### Task 5: Make one uninterrupted PRE-BOUND single-policy edit, cut over the handler, migrate every direct test, and delete the old policy
 
 **Files**
 
@@ -993,13 +998,16 @@ against the locked APIs while the current route policy remains untouched.
 - [ ] Start from the clean Task 4 source checkpoint. Before the edit, record
   that the type scaffolding compiles. Then make one uninterrupted source edit.
   Do not compile or run tests between the first replacement and the completion
-  of this edit. The edit must add the complete semantics-correct **unbounded**
+  of this edit. The edit must add the complete semantics-correct **PRE-BOUND**
   policy, cut over the real handler, migrate all direct tests listed above,
-  remove the old policy inventory, and remove stale test helpers. It must not
-  implement `limit + 1` descriptor/annotation retention or `limit`
-  materialization. Leave only the already-existing output representation needed
-  to compile this single-policy checkpoint; Task 6 first proves structural RED
-  against it, then implements the bound and performs final output cleanup.
+  remove the old policy inventory, and remove stale test helpers. For no-query
+  and title search it must not yet implement the final `limit + 1` selected
+  retention or `limit` materialization bound. For UserMessages and FullText it
+  must preserve the existing semantic `limit + 1` stop and exact deep-search
+  check order. Leave only the already-existing output representation needed to
+  compile this single-policy checkpoint; Task 6 first proves path-specific RED
+  against it, then implements the final preparation bound and performs output
+  cleanup.
 
 **Single policy to add in that one edit**
 
@@ -1021,21 +1029,23 @@ against the locked APIs while the current route policy remains untouched.
   empty rows, running rows, and strict cursor continuation. No second predicate
   may be added in a test or compatibility wrapper.
 - [ ] Add title search in the exact field order and exact literal snippet rules.
-  Add deep search with the exact lookahead, budget, source, provider, increment,
-  and I/O order and the exact partial precedence.
-- [ ] Select semantically in one pass after stable sorting, but deliberately
-  retain every eligible/search-matching descriptor and owned annotation in an
-  unbounded vector. Materialize every matching selected row before truncating
-  the returned page to `limit`. Preserve lookahead, `nextCursor`, deep-search
-  budget/partial behavior, and derive `nextCursor` from the last returned row.
-  This intentionally inefficient checkpoint is required so Task 6's structural
-  test detects the missing bound. Do not stop at `limit + 1`, truncate the
-  descriptor vector early, or limit materialization in Task 5.
-- [ ] Materialize those unbounded selected rows from the captured metadata map,
-  then return/serialize only the first page. Preserve every output field,
-  omission, default, live field, and insertion order in the literal response
-  fixture. Read project colors only after successful derivation, exactly where
-  the old route did.
+  Add deep search with the existing first check `matches.len() > limit`, so it
+  stops after exactly `limit + 1` matches. On each later candidate the exact
+  order remains: lookahead stop, scan budget, source path, supported provider,
+  scan increment, then file I/O. Preserve exact partial precedence. Never scan
+  past deep lookahead for counters, preparation, or RED evidence.
+- [ ] For no query and title search, retain every selected match and every title
+  annotation and materialize every retained row before truncating the response
+  to `limit`. Serialize/return only the first `limit`.
+- [ ] For UserMessages and FullText, retain exactly up to `limit + 1` deep
+  matches and their annotations under the existing semantic stop. Materialize
+  every retained deep match, including the lookahead row, but serialize/return
+  only the first `limit`. No later candidate may be classified, scanned, read,
+  annotated, retained, or materialized after lookahead fires.
+- [ ] Across all four paths preserve `has_more`, cursor derivation from the last
+  returned row, `partial`, `partialReason`, full-catalog revision, field
+  omission/insertion order, and exact response bytes. Read project colors only
+  after successful derivation, exactly where the old route did.
 - [ ] Replace the handler body after auth/query validation with sequential
   captures: one awaited index snapshot, overrides, one awaited metadata map,
   identities, synchronous `derive_directory_page`, snapshot release, then
@@ -1075,13 +1085,16 @@ against the locked APIs while the current route policy remains untouched.
 - [ ] Run `git diff --check`, commit the coherent source change with the
   configured identity/footer, and do not open a pull request.
 
-**Task 5 success:** one compiled production policy is live; every direct old
-helper test uses the new path or real route; the old whole-list policy and all
-listed support symbols are deleted before the first post-edit compile/test; no
-runtime switch or second policy exists. The one policy is semantics-correct but
-deliberately unbounded, so Task 6 can prove a real structural RED.
+**Task 5 success:** one compiled PRE-BOUND production policy is live; every
+direct old-helper test uses the new path or real route; the old whole-list
+policy and all listed support symbols are deleted before the first post-edit
+compile/test; no runtime switch or second policy exists. No-query/title still
+retain and materialize all selected matches. Both deep tiers stop at exactly
+`limit + 1`, preserve check order, materialize the retained lookahead, and never
+scan beyond it. Task 6 can therefore prove path-specific RED without changing
+deep-search semantics.
 
-### Task 6: Prove structural RED, implement the bound, prove GREEN, and clean output
+### Task 6: Prove path-specific RED, implement the final bound, prove GREEN, and clean output
 
 **Files**
 
@@ -1098,13 +1111,19 @@ deliberately unbounded, so Task 6 can prove a real structural RED.
   Counters may be observed only after complete authenticated response-body
   collection. Every recorder call on the production path, including the call in
   the existing Task 5 serializer, must be guarded with `#[cfg(test)]` so locked
-  production compilation remains valid.
-- [ ] Instrument the existing **unbounded** Task 5 policy at exactly one
-  selector retained-peak site, one owned annotation site per annotation
-  construction path, one indexed materializer site, one synthesized
-  materializer site, and one existing serializer site. Do not change selection
-  retention, materialization, pagination, or any production behavior while
-  adding counters and tests.
+  production compilation remains valid. `PreparationCounts` has exactly these
+  five counters: `selected_peak`, `annotations_created`,
+  `indexed_materializations`, `synthesized_materializations`, and
+  `serializations`. Tests derive `total_materializations` as
+  `indexed_materializations + synthesized_materializations`; it is not a sixth
+  independently updated counter.
+- [ ] Instrument the existing **PRE-BOUND** Task 5 policy at exactly one
+  `selected_peak` site, one `annotations_created` site per annotation
+  construction path, one `indexed_materializations` site, one
+  `synthesized_materializations` site, and one existing `serializations` site.
+  Do not change selection retention, materialization, pagination, deep-search
+  lookahead/check order, or any production behavior while adding counters and
+  tests.
 - [ ] Add current-thread route tests that exercise every accepted limit
   `1..=MAX_DIRECTORY_PAGE_ITEMS` (`1..=50`) against oversized corpora of
   `MAX_DIRECTORY_PAGE_ITEMS + 2` rows for no-search, title, UserMessages, and
@@ -1114,29 +1133,50 @@ deliberately unbounded, so Task 6 can prove a real structural RED.
 - [ ] Include the exact boundary set
   `(0,1,0,false), (1,1,1,false), (2,1,1,true),
   (50,50,50,false), (51,50,50,true)` and an all-hidden case with empty items,
-  no cursor, `revision=10000`, and zero materializations/serializations.
+  no cursor, `revision=10000`, and all five counters zero.
 - [ ] **RED:** Before any bound implementation or output cleanup, run the exact
-  structural work-limit test command against the unbounded Task 5 policy.
-  Require nonzero exit caused by the new retained/materialized limit assertions,
-  while the literal route/page/cursor assertions that precede those counter
-  assertions remain correct. In particular, the oversized `limit=1` sentinel
-  must observe retained descriptors above `2` and materializations above `1`.
-  Save the exact command, failing test name, nonzero status, and assertion
-  values in the Task 6 execution evidence. A compile failure, fixture failure,
-  route mismatch, or unrelated failure is not the required RED and must be
-  fixed without implementing the bound. Do not proceed without this recorded
-  structural RED; there is no TDD waiver.
+  structural work-limit test command against the PRE-BOUND Task 5 policy. Use 52
+  matching indexed rows and `limit=1`; therefore
+  `synthesized_materializations=0` in these four sentinels. Require these exact
+  observations before final-bound assertions:
+
+  ```text
+  path          selected_peak  annotations_created  indexed_materializations  synthesized_materializations  total_materializations  serializations
+  no query      52             0                    52                        0                             52                      1
+  title         52             52                   52                        0                             52                      1
+  UserMessages  2              2                    2                         0                             2                       1
+  FullText      2              2                    2                         0                             2                       1
+  ```
+
+  No-query/title RED fails selected-retention, annotation (title only), and
+  materialization bounds. Each deep-tier RED fails **only**
+  `total_materializations <= limit`: its selected/annotation counts already
+  satisfy `limit + 1`, and serialization already satisfies `limit`. A deep
+  `selected_peak` or `annotations_created` above `2`, any scan beyond semantic
+  lookahead, any changed route/page/cursor/partial/revision/byte assertion, or
+  any unrelated failure is forbidden and is not valid RED. Save the exact
+  command, failing test names, nonzero status, and observed counters in Task 6
+  execution evidence. Do not proceed without this recorded path-specific RED;
+  there is no TDD waiver.
 - [ ] Only after the recorded RED, modify the one existing selector so it keeps
-  no more than `limit + 1` lightweight selected descriptors/owned annotations,
-  materializes and serializes only the first `limit`, preserves all
-  search/lookahead/partial semantics, and derives `nextCursor` from the last
-  returned row. Do not add a second selector, runtime switch, old-policy copy,
-  or test-only production policy.
+  no more than `limit + 1` lightweight selected descriptors/owned annotations.
+  No-query/title now stop selection after `limit + 1`. Deep selection and its
+  first-lookahead-then-budget/source/provider/increment/I/O order remain exactly
+  unchanged. Every path materializes and serializes only the first `limit`,
+  preserving `has_more`, cursor, partial reason, revision, fields, and bytes.
+  Do not add a second selector, runtime switch, old-policy copy, post-lookahead
+  scan, or test-only production policy.
 - [ ] **GREEN:** Run the identical structural work-limit command and require
   exit zero. Then run the complete every-limit/four-tier matrix and require
-  selected descriptors/annotations `<= limit + 1`, materializations and
-  serializations `<= limit`, and every literal route/page/cursor assertion
-  unchanged. Record the matching RED/GREEN command and both outcomes.
+  `selected_peak <= limit + 1`, `annotations_created <= limit + 1`,
+  `total_materializations = indexed_materializations +
+  synthesized_materializations <= limit`, and `serializations <= limit` for
+  every `limit=1..=50`, the exact boundary set, and the all-hidden case.
+  No-query/title must now stop after `limit + 1` selections; deep selected/
+  annotation counts and check order remain unchanged. Every path materializes/
+  serializes only the first `limit`, and every literal
+  has-more/cursor/partial/revision/response-byte assertion remains unchanged.
+  Record the matching RED/GREEN command and both outcomes.
 - [ ] After GREEN, replace the complete legacy `DirItem` declaration with the
   final `#[derive(Debug)]` non-clone shape. Remove only legacy-only
   `title_source` and `source_file` fields after static search proves no
@@ -1182,11 +1222,12 @@ deliberately unbounded, so Task 6 can prove a real structural RED.
 - [ ] Commit the final source-only Task 6 checkpoint with the configured
   identity/footer. Do not open a pull request.
 
-**Task 6 success:** the same structural test command was observed RED against
-Task 5's unbounded single policy and GREEN only after the bound was implemented;
-the released single policy passes the exact route suite, runtime matrix, and
-static locality proof; output shape/bytes are unchanged; and the old path is
-absent.
+**Task 6 success:** the same structural test command observed exact path-specific
+RED against Task 5's PRE-BOUND single policy and GREEN only after the final
+preparation bound was implemented. Deep RED was materialization-only; no deep
+scan or retention crossed `limit + 1`. The released single policy passes the
+exact route suite, every-limit/boundary/all-hidden counter matrix, and static
+locality proof; output shape/bytes are unchanged; and the old path is absent.
 
 ### Task 7: Run final checks and the exact-final-HEAD pinned cloud suite
 
@@ -1522,15 +1563,19 @@ This section is a plan review, not an execution attestation:
 - [ ] All expected order/cursor/search/visibility/page/revision/snippet/partial
   values are literal fixture values.
 - [ ] Task 4 contains only borrowed types, lifetimes, and mechanical accessors.
-- [ ] Task 5 performs one uninterrupted semantics-correct **unbounded**
+- [ ] Task 5 performs one uninterrupted semantics-correct **PRE-BOUND**
   policy/cutover/migration/deletion edit before the first post-edit
-  compile/test; it contains no retained-work bound.
+  compile/test. No-query/title retain and materialize all selected matches;
+  both deep tiers preserve exact `limit + 1` lookahead and check order,
+  materialize the retained lookahead, and never scan beyond it.
 - [ ] The exact old-policy deletion inventory and every direct test name are
   present.
-- [ ] Task 6 adds the structural tests/counters first, records genuine RED
-  against Task 5's unbounded policy, implements the one-policy bound only
-  afterward, then runs the identical command GREEN and completes runtime/static
-  proof without a deleted-path comparison.
+- [ ] Task 6 adds the five named counters and structural tests first, records
+  exact path-specific RED against Task 5's PRE-BOUND policy, implements the
+  one-policy final preparation bound only afterward, then runs the identical
+  command GREEN and completes runtime/static proof without a deleted-path
+  comparison. Deep RED is materialization-only; deep selected/annotations never
+  exceed `limit + 1`.
 - [ ] Task 1 and Task 7 broad suites use cloud plus the reviewed external
   adapter; focused commands do not select a fake local Vitest backend.
 - [ ] The adapter body passes `bash -n` and ShellCheck and its recorded SHA is
@@ -1540,7 +1585,7 @@ This section is a plan review, not an execution attestation:
   evidence, required unique-job deletion, post-run remote checks, retry-safe
   attempt preservation, and acceptance only after coordinator/Electron success.
 - [ ] Task 1 consumes an already committed clean plan-only HEAD, executable
-  reviewed adapter, and outer-created `amendment-5-independent-review.md`
+  reviewed adapter, and outer-created `amendment-6-independent-review.md`
   ending in standalone `PASSED`; it derives HEAD at runtime, pins no review-file
   or self-referential plan hash, performs no tracked write/commit, and creates
   no mock harness.
