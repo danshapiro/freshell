@@ -3607,7 +3607,14 @@ The fallback form is:
     assert_eq!(item.running_terminal_id.as_deref(), Some("terminal-1"));
 ```
 
-Use `TerminalIdentityRegistry::new()`, `upsert`, and `list` for registry-backed fixtures. Where a current test already constructs a `TerminalIdentity` value directly to set `is_subagent`, retain that compiling fixture verbatim and bind `let identities = vec![identity];`; do not invent a constructor or change its values.
+Use `TerminalIdentityRegistry::new()`, `upsert`, and `list` for registry-backed
+fixtures. For `live_terminal_item_mirrors_identity_subagent_flag`, retain the
+current single mutable `TerminalIdentity` fixture verbatim. Run its two cases in
+separate scopes: for the `Some(true)` case, bind
+`let identities = vec![identity.clone()];`; after that scope, retain the existing
+`identity.is_subagent = None;` assignment and bind
+`let identities = vec![identity];` in the `None` case. `TerminalIdentity` already
+derives `Clone`; do not invent a constructor or change fixture values.
 
 For every synthesized-row test on the fallback branch, replace the deleted helper call with this candidate/materializer sequence after the existing `identity` fixture:
 
@@ -3655,9 +3662,11 @@ build_live_terminal_session_item_with_session_id_is_not_live_terminal_only
   keep every existing session id, provider, project path, title, activity,
   running-terminal id, live-terminal-only, and session-type assertion.
 live_terminal_item_mirrors_identity_subagent_flag
-  Run the synthesized-row sequence separately for the retained `Some(true)`
-  and `None` identity fixtures; keep both existing `to_value()["isSubagent"]`
-  assertions.
+  Run the synthesized-row sequence in the two scoped passes specified above.
+  Retain both existing `item.is_subagent` assertions and the sole existing wire
+  assertion exactly:
+  `assert_eq!(item.to_value()["isSubagent"], serde_json::json!(true));`.
+  Do not add a second serializer call or a new negative wire assertion.
 build_live_terminal_session_item_without_session_id_is_live_terminal_only
   Retain the no-session identity and use the synthesized-row sequence; keep
   the existing exact fallback session-id assertion, fallback project path,
@@ -6640,6 +6649,21 @@ Final counter ledger:
 - [ ] **Step 4: Record the required RED counts against Task 6 and the GREEN scope control.**
 
 ```bash
+declare -A TASK7_RED_ACTUAL_COUNTS=(
+  [no_search_materializes_only_returned_indexed_rows_not_lookahead]='PreparationCounts { indexed_full: 100, synthesized_full: 0, override_decoration: 100, metadata_decoration: 100, running_decoration: 100, serialization: 2, retained_descriptor_peak: 100, search_annotations: 0 }'
+  [no_search_materializes_only_returned_synthesized_rows_not_lookahead]='PreparationCounts { indexed_full: 0, synthesized_full: 100, override_decoration: 0, metadata_decoration: 0, running_decoration: 0, serialization: 2, retained_descriptor_peak: 100, search_annotations: 0 }'
+  [no_search_long_deleted_and_hidden_prefix_materializes_only_backfilled_rows]='PreparationCounts { indexed_full: 11, synthesized_full: 0, override_decoration: 11, metadata_decoration: 11, running_decoration: 11, serialization: 2, retained_descriptor_peak: 11, search_annotations: 0 }'
+  [title_search_scans_sparse_corpus_but_materializes_only_returned_rows]='PreparationCounts { indexed_full: 3, synthesized_full: 0, override_decoration: 3, metadata_decoration: 3, running_decoration: 3, serialization: 1, retained_descriptor_peak: 3, search_annotations: 3 }'
+  [deep_search_owns_only_limit_plus_one_annotations_and_materializes_only_returned_rows]='PreparationCounts { indexed_full: 2, synthesized_full: 0, override_decoration: 2, metadata_decoration: 2, running_decoration: 2, serialization: 1, retained_descriptor_peak: 2, search_annotations: 2 }'
+)
+declare -A TASK7_RED_EXPECTED_COUNTS=(
+  [no_search_materializes_only_returned_indexed_rows_not_lookahead]='PreparationCounts { indexed_full: 2, synthesized_full: 0, override_decoration: 2, metadata_decoration: 2, running_decoration: 2, serialization: 2, retained_descriptor_peak: 3, search_annotations: 0 }'
+  [no_search_materializes_only_returned_synthesized_rows_not_lookahead]='PreparationCounts { indexed_full: 0, synthesized_full: 2, override_decoration: 0, metadata_decoration: 0, running_decoration: 0, serialization: 2, retained_descriptor_peak: 3, search_annotations: 0 }'
+  [no_search_long_deleted_and_hidden_prefix_materializes_only_backfilled_rows]='PreparationCounts { indexed_full: 2, synthesized_full: 0, override_decoration: 2, metadata_decoration: 2, running_decoration: 2, serialization: 2, retained_descriptor_peak: 3, search_annotations: 0 }'
+  [title_search_scans_sparse_corpus_but_materializes_only_returned_rows]='PreparationCounts { indexed_full: 1, synthesized_full: 0, override_decoration: 1, metadata_decoration: 1, running_decoration: 1, serialization: 1, retained_descriptor_peak: 2, search_annotations: 2 }'
+  [deep_search_owns_only_limit_plus_one_annotations_and_materializes_only_returned_rows]='PreparationCounts { indexed_full: 1, synthesized_full: 0, override_decoration: 1, metadata_decoration: 1, running_decoration: 1, serialization: 1, retained_descriptor_peak: 2, search_annotations: 2 }'
+)
+
 for test_name in \
   no_search_materializes_only_returned_indexed_rows_not_lookahead \
   no_search_materializes_only_returned_synthesized_rows_not_lookahead \
@@ -6647,38 +6671,75 @@ for test_name in \
   title_search_scans_sparse_corpus_but_materializes_only_returned_rows \
   deep_search_owns_only_limit_plus_one_annotations_and_materializes_only_returned_rows
 do
-  set +e
-  env CARGO_TERM_COLOR=never \
+  TASK7_RED_LOG="$LOG_ROOT/task7-red-$test_name.log"
+  if run_logged "task7-red-$test_name" \
+    env CARGO_TERM_COLOR=never \
     cargo test --manifest-path "$MANIFEST" \
       -p freshell-server --bin freshell-server \
       "session_directory::page_bound_tests::$test_name" -- \
-      --exact --color=never --test-threads=1 \
-    2>&1 | tee "$LOG_ROOT/task7-red-$test_name.log"
-  status=${PIPESTATUS[0]}
-  printf 'exit_code=%s\n' "$status" \
-    | tee "$LOG_ROOT/task7-red-$test_name.exit"
-  set -e
-  test "$status" -ne 0
+      --exact --color=never --test-threads=1
+  then
+    printf 'STOP: intentional RED unexpectedly passed: %s\n' "$test_name" >&2
+    exit 1
+  else
+    TASK7_RED_STATUS=$?
+  fi
+
+  test "$TASK7_RED_STATUS" -ne 0
+  grep -Fx "exit_code=$TASK7_RED_STATUS" \
+    "$LOG_ROOT/task7-red-$test_name.exit" >/dev/null
+  test "$(grep -Fxc 'running 1 test' "$TASK7_RED_LOG")" -eq 1
+  test "$(grep -Fxc \
+    "test session_directory::page_bound_tests::$test_name ... FAILED" \
+    "$TASK7_RED_LOG")" -eq 1
+  test "$(grep -Fc \
+    "thread 'session_directory::page_bound_tests::$test_name' panicked at " \
+    "$TASK7_RED_LOG")" -eq 1
+  test "$(grep -Fxc 'assertion `left == right` failed' \
+    "$TASK7_RED_LOG")" -eq 1
+  assert_exact_cargo_summary \
+    'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured' \
+    "$TASK7_RED_LOG"
+  test "$(grep -Fxc \
+    "  left: ${TASK7_RED_ACTUAL_COUNTS[$test_name]}" \
+    "$TASK7_RED_LOG")" -eq 1
+  test "$(grep -Fxc \
+    " right: ${TASK7_RED_EXPECTED_COUNTS[$test_name]}" \
+    "$TASK7_RED_LOG")" -eq 1
 done
+
+TASK7_SCOPE_TEST=preparation_scope_ignores_unscoped_requests_and_resets_between_current_thread_intervals
 run_logged task7-scope-reset-control \
   env CARGO_TERM_COLOR=never \
   cargo test --manifest-path "$MANIFEST" \
     -p freshell-server --bin freshell-server \
-    'session_directory::page_bound_tests::preparation_scope_ignores_unscoped_requests_and_resets_between_current_thread_intervals' -- \
+    "session_directory::page_bound_tests::$TASK7_SCOPE_TEST" -- \
     --exact --color=never --test-threads=1
+test "$(grep -Fxc 'running 1 test' \
+  "$LOG_ROOT/task7-scope-reset-control.log")" -eq 1
+test "$(grep -Fxc \
+  "test session_directory::page_bound_tests::$TASK7_SCOPE_TEST ... ok" \
+  "$LOG_ROOT/task7-scope-reset-control.log")" -eq 1
+assert_exact_cargo_summary \
+  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured' \
+  "$LOG_ROOT/task7-scope-reset-control.log"
 ```
-
-Expected RED:
 
 ```text
-indexed corpus: indexed_full 100 and retained peak 100; expected 2 and 3
-synthesized corpus: synthesized_full 100 and retained peak 100; expected 2 and 3
-long filtered/cursor corpus: indexed_full 11 and retained peak 11; expected 2 and 3
-sparse title search: indexed_full 3, retained peak 3, annotations 3; expected 1, 2, 2
-deep lookahead: indexed_full 2; expected 1; retained peak and annotations are correctly 2
-```
+Required RED proof: each of the five commands must return nonzero, report exactly
+one executed test, name that exact test as FAILED, report exactly `0 passed; 1
+failed; 0 ignored; 0 measured`, and contain exactly one native `assert_eq!`
+left/right pair equal to the corresponding `TASK7_RED_ACTUAL_COUNTS` and
+`TASK7_RED_EXPECTED_COUNTS` entries above. Those literal left/right entries are
+the stated intentional-RED failure markers. A compile error, stale/zero-test
+filter, different test, earlier behavioral assertion, different count tuple, or
+missing/duplicate marker stops Task 7 before Step 5.
 
-The all-hidden test may already pass at zero because visibility precedes materialization. The scope reset/negative-control test must be GREEN before the bound change.
+The all-hidden test may already pass at zero because visibility precedes
+materialization. The scope reset/negative-control exact filter must execute one
+named test and report `1 passed; 0 failed; 0 ignored; 0 measured` before the
+bound change.
+```
 
 - [ ] **Step 5: Bound retained descriptors for no-search and title while preserving deep loop order.**
 
@@ -8672,7 +8733,7 @@ serializer_offsets = [
 require(
     classify(serializer_offsets) == Counter({
         "production:derive_directory_page": 1,
-        "test:live_terminal_item_mirrors_identity_subagent_flag": 2,
+        "test:live_terminal_item_mirrors_identity_subagent_flag": 1,
         "test:item_from_meta_maps_fields_and_fallback_session_id": 1,
     }),
     "serializer call allowlist",
@@ -8796,6 +8857,9 @@ run_logged task7-page-bound \
     -p freshell-server --bin freshell-server \
     'session_directory::page_bound_tests' -- \
     --color=never --test-threads=1
+assert_exact_cargo_summary \
+  'test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured' \
+  "$LOG_ROOT/task7-page-bound.log"
 for test_name in \
   tier_user_messages_matches_only_the_user_turn \
   tier_full_text_matches_assistant_turn_too \
@@ -8814,6 +8878,9 @@ do
       -p freshell-server --bin freshell-server \
       "session_directory::tests::$test_name" -- \
       --exact --color=never --test-threads=1
+  assert_exact_cargo_summary \
+    'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured' \
+    "$LOG_ROOT/task7-deep-$test_name.log"
 done
 run_logged task7-session-directory \
   env CARGO_TERM_COLOR=never \
@@ -8826,7 +8893,7 @@ run_logged task7-server-all-targets \
     -p freshell-server --all-targets
 ```
 
-Expected GREEN: page-bound module reports `27 passed; 0 failed; 0 ignored; 0 measured`; each of the ten named deep/title exact filters reports `1 passed`; focused and all-target suites have positive counts and zero failures.
+Required GREEN: `assert_exact_cargo_summary` finds exactly one `test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured` summary in `task7-page-bound.log` and exactly one `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured` summary in each of the ten named deep/title logs; focused and all-target suites have positive counts and zero failures.
 
 - [ ] **Step 9: Commit only the source file.**
 
@@ -8871,6 +8938,9 @@ run_logged final-page-bound \
     -p freshell-server --bin freshell-server \
     'session_directory::page_bound_tests' -- \
     --color=never --test-threads=1
+assert_exact_cargo_summary \
+  'test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured' \
+  "$LOG_ROOT/final-page-bound.log"
 run_logged final-session-directory \
   env CARGO_TERM_COLOR=never \
   cargo test --manifest-path "$MANIFEST" \
@@ -8878,7 +8948,7 @@ run_logged final-session-directory \
     session_directory -- --color=never --test-threads=1
 ```
 
-Required GREEN: exactly 27 page-bound tests pass; focused family has positive count and zero failures. Stop on any failure.
+Required GREEN: `assert_exact_cargo_summary` finds exactly one `test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured` summary in `final-page-bound.log`; the focused family has a positive count and zero failures. Stop on any command or summary-assertion failure.
 
 - [ ] **Step 2: Run the local seven-test Rust-backed Playwright matrix.**
 
@@ -10347,7 +10417,7 @@ No post-audit plan edit is part of the protocol. Reviewers run checks against th
 | A02 | Both handler statuses are captured under `set -e`; fallback authorization remains primary-span fail closed; the sole fallback fence supplies complete index/provenance types, resolver/accessors, selector, materializer-with-inputs, derivation, test call sites, and exact A08 profile. |
 | A03 | Effective overrides, deletion/re-synthesis, running, synthesis/dedupe, visibility, order, cursor, title/deep search, partials, metadata, wire order/shape, and colors remain explicitly covered. |
 | A04 | Final retained operational state is descriptors/annotations plus partial aggregate/colors, not a traversal cap. |
-| A05 | Annotations may reach `limit + 1`; full rows, returned-field decoration, and serialization are capped at returned `limit`. |
+| A05 | Annotations may reach `limit + 1`; full rows, returned-field decoration, and serialization are capped at returned `limit`. The Task-7 pre-change RED gate accepts only one execution of each of the five named tests with its exact Task-6 `PreparationCounts` left marker and final-bound right marker; the scope-reset control accepts exactly one named pass. |
 | A06 | The exact 516/21/15/nine/focused checkpoint runs before cutover and immediately before deletion; marker/proof-commit ancestry follows the latest representation; temporary oracle/generator/test are deleted. |
 | A07 | Snapshot-generation pinning remains accepted; no allocator, fixed-generation, allocation, or RSS non-increase claim is made. |
 | A08 | One declaration-aware audit selects the persisted borrowed/indexed profile; retains exact constructor/helper/annotation/counter/order checks; inventories every enumerated copy/conversion site in reachable production policy functions by owner, kind, and canonical expression; and runs an operation-sensitive source-wide pass across production, oracle, and tests. Explicit row/slice/vector category and reference depth propagate through aliases, closures, direct container loops, and iterator loops. Nested unary borrow/deref, inherent/trait-qualified slice `to_vec`/`to_owned`, UFCS, qualified clone items, `Vec::from`, cloned/map/collect, and from-iterator forms are covered. Row/vector value copies and slice materializations fail; clones whose result is only an already-borrowed reference pass. The only genuine full-row exception is test fixture `StaticSessionSource::parse` / `row.clone()`; oracle exceptions are empty. The contract is syntactic, not a macro/typechecker/custom-wrapper/allocator proof. |
