@@ -13,8 +13,10 @@ it, but retain no more than `limit + 1` selected descriptors and search
 annotations and materialize/serialize no more than `limit` rows.
 
 **Current amendment state:** `0/7 tasks completed; no application code changed.`
-The amendment work changes this plan and creates external evidence helpers only.
-It does not run Cargo, Playwright, Docker, Cloud Run, Vitest, `npm test`, or any
+Amendment preparation changed this plan and created the external reviewed
+adapter/evidence before execution. Task 1 consumes those existing committed and
+reviewed inputs; it does not create, edit, or commit them. Amendment preparation
+does not run Cargo, Playwright, Docker, Cloud Run, Vitest, `npm test`, or any
 product/runtime workload.
 
 ## Architecture
@@ -115,10 +117,11 @@ Rust file: `crates/freshell-server/src/session_directory.rs`.
   one unique job per attempt, execute it, delete that exact unique job, append
   an attempt record, and—only after `npm test` including local Electron exits
   zero—append its linked acceptance record. Retries preserve prior attempts.
-- Do not run paid cloud work during this plan amendment. The adapter is syntax
-  checked only now. A future Task 1 or Task 7 cloud run must stop if account
-  refresh, project access, quota, image build, digest resolution, or job creation
-  is unavailable.
+- Do not run paid cloud work during this plan amendment. The adapter was
+  syntax-checked and independently reviewed during amendment preparation; Task
+  1 re-verifies the actual unchanged file before cloud work. A future Task 1 or
+  Task 7 cloud run must stop if account refresh, project access, quota, image
+  build, digest resolution, or job creation is unavailable.
 
 ## External evidence artifacts
 
@@ -127,6 +130,10 @@ These files are outside Git and are part of this amendment's evidence boundary:
 - `$LOG_ROOT/reports/amendment-4-single-policy-cloud.md` — append-only report.
 - `$LOG_ROOT/pinned-vitest-cloud-v1.sh` — reviewed adapter, SHA-256
   `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
+- `$LOG_ROOT/reports/amendment-4-independent-review.md` — immutable independent
+  review record, SHA-256
+  `c4cd14479f2334bc7f2d9774e65259238d208c99e29c30e223c26b862ff243b4`;
+  its final line is the standalone verdict `PASSED`.
 - `$LOG_ROOT/pinned-cloud-runs.jsonl` — empty until a real cloud attempt occurs;
   each attempt is preserved as its own append-only record, and only a completed
   coordinator-owned `npm test` with local Electron success receives a linked
@@ -169,8 +176,11 @@ delete failure therefore remains nonzero in both process status and attempt
 `exitCode`; cleanup failure turns an otherwise-zero status nonzero. The only
 valid successful record clears failure/cleanup fields before evidence append.
 An `attempt_record` failure stage is reserved for evidence-write failure.
-No-cost mock gates cover execute status 17, delete failure, and successful
-post-Electron acceptance before Task 1 may spend cloud resources.
+The immutable independent review record attests that the no-cost normal and
+`PYTHONOPTIMIZE=1` mock gates covered execute status 17, delete failure,
+failed-attempt rejection, successful post-Electron acceptance, and equal-digest
+rejection. Task 1 verifies that existing report and the actual adapter; it does
+not create or rerun a fake-Git/fake-gcloud harness.
 
 ## Current Rust policy facts to preserve
 
@@ -477,7 +487,7 @@ tier_search_budget_is_checked_before_no_source_tail
 ## Dependency order
 
 ```text
-Task 1: publish the plan-only branch and prove the unchanged baseline
+Task 1: verify and push the existing plan-only branch, then prove the unchanged baseline
   -> Task 2: real-route rows/order/pages/bytes
     -> Task 3: real-route cursors/search/partial/edge cases
       -> Task 4: borrowed types and mechanical accessors only
@@ -486,30 +496,103 @@ Task 1: publish the plan-only branch and prove the unchanged baseline
             -> Task 7: final checks and exact-final-HEAD pinned cloud suite
 ```
 
-### Task 1: Publish the plan-only branch and prove the unchanged baseline
+### Task 1: Verify and push the existing plan-only branch, then prove the unchanged baseline
 
 **Files and effects**
 
-- Tracked repository file content modified by this task: none. It consumes and
-  commits the already-amended plan; it does not edit application/test source.
-- Read: `AGENTS.md`, the plan, manifests/lockfiles, coordinator sources,
-  browser configuration/spec, `scripts/e2e-cloud.sh`, the adapter, and current
-  `session_directory.rs`.
+- Tracked repository file content modified by this task: none. Task 1 consumes
+  the existing clean committed plan-only HEAD. It must not create, edit, stage,
+  or commit the plan, adapter, application/test source, or any other file.
+- Read/consume: `AGENTS.md`, the committed plan, Git state,
+  manifests/lockfiles, coordinator sources, browser configuration/spec,
+  `scripts/e2e-cloud.sh`, current `session_directory.rs`, the external reviewed
+  adapter, and the immutable independent review record ending in `PASSED`.
 - External writes: one append-only cloud attempt record for every started cloud
   attempt, one linked acceptance record only after complete `npm test` success,
   and a temporary attempt-ID handoff file.
-- Remote/cloud effects: push the named branch; build/push its image; create and
-  execute one unique job per attempt; delete that exact unique job on success
-  and best-effort on failure. Never create/update/delete `freshell-vitest`.
+- Remote/cloud effects: push the named branch once without force and without
+  opening a pull request; build/push its exact-HEAD image; create and execute one
+  unique job per attempt; delete that exact unique job on success and
+  best-effort on failure. Never create/update/delete `freshell-vitest`.
 
 **Steps**
 
-- [ ] Verify branch, frozen-base ancestry, clean status, and that
-  `base..HEAD` changes only the committed plan. Prove that
-  `crates/freshell-server/src/session_directory.rs` is unchanged from base.
-- [ ] Commit the plan-only change with the configured identity and required
-  Amplifier footer. Do not commit application source and do not open a pull
-  request.
+- [ ] Begin only from the existing committed amendment state. Verify the named
+  branch, clean status, frozen-base ancestry, reviewed anchor
+  `69850fff1a74b53e5478409b8dd044036fdb5167`, and that `base..HEAD` changes only
+  the committed plan. Verify the worktree plan bytes equal the `HEAD` plan blob
+  and prove `crates/freshell-server/src/session_directory.rs` is byte-identical
+  to the frozen base. If any check fails, stop; do not edit, stage, or commit
+  anything in Task 1.
+- [ ] Verify the actual existing external adapter and immutable independent
+  review report before any product test or cloud work:
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+plan_rel=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
+plan="${root}/${plan_rel}"
+logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
+adapter="${logroot}/pinned-vitest-cloud-v1.sh"
+review="${logroot}/reports/amendment-4-independent-review.md"
+branch=the-usual/session-directory-lazy-page-prep
+frozen_base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
+reviewed_anchor=69850fff1a74b53e5478409b8dd044036fdb5167
+reviewed_plan_sha=27ded732d8bf36e9c8987c875777d98cb92aa3a10c1722ab4866979fb2040e70
+adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
+review_sha=c4cd14479f2334bc7f2d9774e65259238d208c99e29c30e223c26b862ff243b4
+
+test "$(git -C "$root" branch --show-current)" = "$branch"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git -C "$root" merge-base --is-ancestor "$frozen_base" HEAD
+git -C "$root" merge-base --is-ancestor "$reviewed_anchor" HEAD
+mapfile -t changed_paths < <(git -C "$root" diff --name-only "${frozen_base}..HEAD")
+test "${#changed_paths[@]}" -eq 1
+test "${changed_paths[0]}" = "$plan_rel"
+test "$(git -C "$root" show "HEAD:${plan_rel}" | sha256sum | awk '{print $1}')" = \
+  "$(sha256sum "$plan" | awk '{print $1}')"
+git -C "$root" diff --exit-code "$frozen_base" HEAD -- \
+  crates/freshell-server/src/session_directory.rs
+test "$(git -C "$root" show "${reviewed_anchor}:${plan_rel}" | sha256sum | awk '{print $1}')" = \
+  "$reviewed_plan_sha"
+
+test -x "$adapter"
+test "$(sha256sum "$adapter" | awk '{print $1}')" = "$adapter_sha"
+bash -n "$adapter"
+command -v shellcheck >/dev/null
+shellcheck "$adapter"
+test "$(sha256sum "$review" | awk '{print $1}')" = "$review_sha"
+
+python3 -I - "$review" "$reviewed_anchor" "$reviewed_plan_sha" "$adapter_sha" <<'PY'
+import sys
+from pathlib import Path
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(message)
+
+
+path = Path(sys.argv[1])
+plan_commit, plan_sha, adapter_sha = sys.argv[2:]
+lines = path.read_text(encoding="utf-8").splitlines()
+require(bool(lines), f"independent review is empty: {path}")
+require(lines[-1] == "PASSED", f"independent review must end with standalone PASSED, got {lines[-1]!r}")
+text = "\n".join(lines)
+for label, value in (
+    ("Plan commit", plan_commit),
+    ("Plan SHA-256", plan_sha),
+    ("Adapter SHA-256", adapter_sha),
+):
+    require(f"- {label}: `{value}`" in text, f"independent review lacks matching {label}: {value}")
+print("committed plan, reviewed adapter, and independent PASSED record verified")
+PY
+BASH
+```
+
+  This consumes the reviewed artifacts. Do not generate, extract, persist, or
+  run a replacement mock harness, and do not edit the plan, adapter, or review.
 - [ ] Run the literal branch push and exact remote-HEAD check:
 
 ```bash
@@ -530,7 +613,9 @@ test "$remote_head" = "$expected_head"
 ```
 
   Expected: exit 0. The local branch, clean local HEAD, and exact remote branch
-  HEAD are identical. This creates/updates only the named feature branch.
+  HEAD are identical. This creates/updates only the named feature branch. The
+  command has no force option; a non-fast-forward failure is a stop. Do not open
+  a pull request.
 - [ ] Check cloud auth and project access without mutation. The project check
   must name the project both positionally and with explicit `--project`:
 
@@ -551,14 +636,6 @@ gcloud projects describe misc-puttering-project \
   `rust-chromium`, one worker, and
   `test/e2e-browser/specs/session-directory-matrix.spec.ts`. Require every
   existing case to pass. Readiness is not pass evidence.
-- [ ] Before paid work, run the adapter and extracted Task 1/7 evidence programs
-  through the no-cost fake-Git/fake-gcloud harness twice: once with inherited
-  `PYTHONOPTIMIZE` absent and once with `PYTHONOPTIMIZE=1`. Both runs must prove:
-  execution status 17 remains a failed, unaccepted attempt; delete failure
-  remains failed and unaccepted; a `cloud_failed` attempt cannot be accepted;
-  equal baseline/final digests fail final selection; valid success plus
-  post-Electron acceptance passes; and all executed evidence programs are
-  isolated and contain no Python runtime assertion nodes.
 - [ ] Run the complete coordinator-owned baseline, acceptance write, and latest
   accepted-record selection in one self-contained shell. The hash check occurs
   immediately before `npm test`; the adapter repeats it immediately before
@@ -581,7 +658,6 @@ trap cleanup EXIT
 test "$(git -C "$root" branch --show-current)" = "$branch"
 test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
 expected_head="$(git -C "$root" rev-parse HEAD)"
-git -C "$root" push origin "HEAD:refs/heads/${branch}"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
 test -z "${extra:-}"
@@ -660,10 +736,12 @@ BASH
 - [ ] If any baseline command fails, stop. Record command, status, and concise
   output; do not begin Task 2, call the failure pre-existing, or waive it.
 
-**Task 1 success:** clean pushed plan-only HEAD; unchanged application source;
-focused Rust/browser green; latest accepted baseline links a truthful successful
-cloud attempt to a zero-exit coordinator run including Electron; prior failed
-attempts, if any, remain preserved; no pull request opened.
+**Task 1 success:** existing committed plan-only HEAD and reviewed artifacts
+verified without tracked writes or a Task 1 commit; clean non-force branch push;
+unchanged application source; focused Rust/browser green; latest accepted
+baseline links a truthful successful cloud attempt to a zero-exit coordinator
+run including Electron; prior failed attempts, if any, remain preserved; no
+pull request opened.
 
 ### Task 2: Add authenticated real-route tests for rows, order, pages, and bytes
 
@@ -1132,6 +1210,9 @@ This section is a plan review, not an execution attestation:
   expected-HEAD inputs, immediate adapter-hash checks, exact created-job-image
   evidence, required unique-job deletion, post-run remote checks, retry-safe
   attempt preservation, and acceptance only after coordinator/Electron success.
+- [ ] Task 1 consumes an already committed clean plan-only HEAD, executable
+  reviewed adapter, and immutable independent review ending in standalone
+  `PASSED`; it performs no tracked write/commit and creates no mock harness.
 - [ ] No plan step opens a pull request, merges, deploys, or restarts a server.
 - [ ] No product/runtime command was run while making this amendment.
 
