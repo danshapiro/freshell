@@ -13,11 +13,12 @@ it, but retain no more than `limit + 1` selected descriptors and search
 annotations and materialize/serialize no more than `limit` rows.
 
 **Current amendment state:** `0/7 tasks completed; no application code changed.`
-Amendment preparation changed this plan and created the external reviewed
-adapter/evidence before execution. Task 1 consumes those existing committed and
-reviewed inputs; it does not create, edit, or commit them. Amendment preparation
-does not run Cargo, Playwright, Docker, Cloud Run, Vitest, `npm test`, or any
-product/runtime workload.
+Amendment preparation changes this plan and appends the three authorized
+external evidence logs. The outer process must commit/review the plan and create
+`amendment-5-independent-review.md`; only then may Task 1 consume the committed
+plan, unchanged adapter, and review receipt. Task 1 does not create, edit, or
+commit them. Amendment preparation does not run Cargo, Playwright, Docker,
+Cloud Run, Vitest, `npm test`, or any product/runtime workload.
 
 ## Architecture
 
@@ -73,10 +74,14 @@ Rust file: `crates/freshell-server/src/session_directory.rs`.
 - Preserve the current strict duplicate cursor gap, unordered supplied identity
   vector semantics, ignored request `revision` parameter, providerless identity
   contribution to page revision, and full-catalog revision calculation.
-- The selector may inspect all shallow candidates, but it may retain at most
-  `limit + 1` selected descriptors/annotations. It may materialize and serialize
-  at most `limit` rows. This is a structural bound, not a latency, RSS, allocator,
-  or CPU claim.
+- The final selector delivered by Task 6 may inspect all shallow candidates,
+  but it may retain at most `limit + 1` selected descriptors/annotations and
+  materialize/serialize at most `limit` rows. Task 5 deliberately cuts over to
+  one semantics-correct **unbounded** policy that retains/materializes all
+  matching candidates before page truncation. Task 6 first proves the structural
+  tests RED against that checkpoint, then implements this final bound and proves
+  the same tests GREEN. This is a structural bound, not a latency, RSS,
+  allocator, or CPU claim.
 - The route tests in Tasks 2 and 3 must call the real authenticated Axum route
   through Tower `oneshot`, collect the complete response body, parse it, and
   compare literal expected values. They must not call a policy helper to produce
@@ -130,14 +135,25 @@ These files are outside Git and are part of this amendment's evidence boundary:
 - `$LOG_ROOT/reports/amendment-4-single-policy-cloud.md` — append-only report.
 - `$LOG_ROOT/pinned-vitest-cloud-v1.sh` — reviewed adapter, SHA-256
   `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
-- `$LOG_ROOT/reports/amendment-4-independent-review.md` — immutable independent
-  review record, SHA-256
-  `c4cd14479f2334bc7f2d9774e65259238d208c99e29c30e223c26b862ff243b4`;
-  its final line is the standalone verdict `PASSED`.
+- `$LOG_ROOT/reports/amendment-4-independent-review.md` — historical Amendment
+  4 review record only. Task 1 does not consume, hash, or modify it.
+- `$LOG_ROOT/reports/amendment-5-independent-review.md` — final review receipt
+  created by the outer process only after this amendment is committed and
+  independently reviewed. Task 1 consumes but never creates or edits it. It is
+  not pinned by its own file hash and need not contain the plan's content hash.
+  Its final standalone line must be `PASSED`; it must contain standalone lines
+  naming the exact runtime `Plan commit: <HEAD>`, exact absolute `Plan path:
+  <path>`, and actual `Adapter SHA-256: <sha>`.
 - `$LOG_ROOT/pinned-cloud-runs.jsonl` — empty until a real cloud attempt occurs;
   each attempt is preserved as its own append-only record, and only a completed
   coordinator-owned `npm test` with local Electron success receives a linked
   acceptance record. No fabricated or deleted retry record is allowed.
+- `$LOG_ROOT/cloud-baseline-accepted.json` — absent until Task 1 has a fully
+  linked successful baseline attempt and acceptance. Task 1 atomically writes
+  this dedicated receipt with the exact baseline HEAD, immutable digest, cloud
+  attempt ID, acceptance ID, adapter SHA, JSONL path, and exact attempt and
+  acceptance line/linkage. Task 7 consumes this exact receipt; it never chooses
+  a baseline by phase alone.
 - `$LOG_ROOT/load-bearing-ledger.md` — append-only amendment entries.
 - `$LOG_ROOT/writing-plans-self-review.md` — append-only amendment entry.
 
@@ -167,8 +183,11 @@ attempt ID after another clean local/remote HEAD check. Successful attempts must
 have `failureStage=null`, `cleanupError=null`, `jobDeleted=true`, matching
 created/execution immutable images, the expected success count, and zero failed.
 Failed or superseded attempts remain in the JSONL; retries create additional
-attempt records. Task 1 and Task 7 select the latest acceptance matching phase,
-exact HEAD, and the attempt's exact digest rather than requiring one raw attempt.
+attempt records. Task 1 selects the exact accepted baseline identified by its
+attempt handoff ID, phase, exact HEAD, and digest, then atomically records that
+linkage in `cloud-baseline-accepted.json`. Task 7 validates exactly that receipt
+and its linked JSONL rows before comparing it with an exact final attempt and
+acceptance. Neither task selects baseline evidence by phase alone.
 
 The EXIT trap passes the triggering status explicitly (`trap 'on_exit "$?"'
 EXIT`; handler `local status="$1"`). Any build/create/describe/execute/verify or
@@ -176,11 +195,12 @@ delete failure therefore remains nonzero in both process status and attempt
 `exitCode`; cleanup failure turns an otherwise-zero status nonzero. The only
 valid successful record clears failure/cleanup fields before evidence append.
 An `attempt_record` failure stage is reserved for evidence-write failure.
-The immutable independent review record attests that the no-cost normal and
+The historical Amendment 4 review records that the no-cost normal and
 `PYTHONOPTIMIZE=1` mock gates covered execute status 17, delete failure,
 failed-attempt rejection, successful post-Electron acceptance, and equal-digest
-rejection. Task 1 verifies that existing report and the actual adapter; it does
-not create or rerun a fake-Git/fake-gcloud harness.
+rejection. The outer process creates the separate Amendment 5 review receipt
+after this amendment is committed/reviewed. Task 1 verifies that receipt and the
+actual adapter; it does not create or rerun a fake-Git/fake-gcloud harness.
 
 ## Current Rust policy facts to preserve
 
@@ -491,8 +511,8 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
   -> Task 2: real-route rows/order/pages/bytes
     -> Task 3: real-route cursors/search/partial/edge cases
       -> Task 4: borrowed types and mechanical accessors only
-        -> Task 5: one source edit, one policy, handler cutover, test migration, old-policy deletion
-          -> Task 6: bounded retained work, output cleanup, work-limit proof
+        -> Task 5: one source edit, one unbounded policy, handler cutover, test migration, old-policy deletion
+          -> Task 6: structural RED, bounded GREEN, output cleanup, work-limit proof
             -> Task 7: final checks and exact-final-HEAD pinned cloud suite
 ```
 
@@ -506,10 +526,12 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
 - Read/consume: `AGENTS.md`, the committed plan, Git state,
   manifests/lockfiles, coordinator sources, browser configuration/spec,
   `scripts/e2e-cloud.sh`, current `session_directory.rs`, the external reviewed
-  adapter, and the immutable independent review record ending in `PASSED`.
+  adapter, the outer-created Amendment 5 review receipt ending in `PASSED`, and
+  the append-only cloud JSONL.
 - External writes: one append-only cloud attempt record for every started cloud
   attempt, one linked acceptance record only after complete `npm test` success,
-  and a temporary attempt-ID handoff file.
+  a temporary attempt-ID handoff file, and—only after exact linkage validation—
+  one atomic `$LOG_ROOT/cloud-baseline-accepted.json` receipt.
 - Remote/cloud effects: push the named branch once without force and without
   opening a pull request; build/push its exact-HEAD image; create and execute one
   unique job per attempt; delete that exact unique job on success and
@@ -518,14 +540,14 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
 **Steps**
 
 - [ ] Begin only from the existing committed amendment state. Verify the named
-  branch, clean status, frozen-base ancestry, reviewed anchor
-  `69850fff1a74b53e5478409b8dd044036fdb5167`, and that `base..HEAD` changes only
-  the committed plan. Verify the worktree plan bytes equal the `HEAD` plan blob
-  and prove `crates/freshell-server/src/session_directory.rs` is byte-identical
-  to the frozen base. If any check fails, stop; do not edit, stage, or commit
-  anything in Task 1.
-- [ ] Verify the actual existing external adapter and immutable independent
-  review report before any product test or cloud work:
+  branch, clean status, frozen-base ancestry, and that `base..HEAD` changes only
+  the committed plan. Derive the exact current `HEAD` at runtime, verify the
+  worktree plan bytes equal its `HEAD` plan blob, and prove
+  `crates/freshell-server/src/session_directory.rs` is byte-identical to the
+  frozen base. If any check fails, stop; do not edit, stage, or commit anything
+  in Task 1.
+- [ ] Verify the actual existing external adapter and outer-created Amendment 5
+  independent review receipt before any product test or cloud work:
 
 ```bash
 bash <<'BASH'
@@ -535,18 +557,15 @@ plan_rel=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
 plan="${root}/${plan_rel}"
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-review="${logroot}/reports/amendment-4-independent-review.md"
+review="${logroot}/reports/amendment-5-independent-review.md"
 branch=the-usual/session-directory-lazy-page-prep
 frozen_base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
-reviewed_anchor=69850fff1a74b53e5478409b8dd044036fdb5167
-reviewed_plan_sha=27ded732d8bf36e9c8987c875777d98cb92aa3a10c1722ab4866979fb2040e70
 adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
-review_sha=c4cd14479f2334bc7f2d9774e65259238d208c99e29c30e223c26b862ff243b4
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
 test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
 git -C "$root" merge-base --is-ancestor "$frozen_base" HEAD
-git -C "$root" merge-base --is-ancestor "$reviewed_anchor" HEAD
+current_head="$(git -C "$root" rev-parse HEAD)"
 mapfile -t changed_paths < <(git -C "$root" diff --name-only "${frozen_base}..HEAD")
 test "${#changed_paths[@]}" -eq 1
 test "${changed_paths[0]}" = "$plan_rel"
@@ -554,17 +573,15 @@ test "$(git -C "$root" show "HEAD:${plan_rel}" | sha256sum | awk '{print $1}')" 
   "$(sha256sum "$plan" | awk '{print $1}')"
 git -C "$root" diff --exit-code "$frozen_base" HEAD -- \
   crates/freshell-server/src/session_directory.rs
-test "$(git -C "$root" show "${reviewed_anchor}:${plan_rel}" | sha256sum | awk '{print $1}')" = \
-  "$reviewed_plan_sha"
 
 test -x "$adapter"
 test "$(sha256sum "$adapter" | awk '{print $1}')" = "$adapter_sha"
 bash -n "$adapter"
 command -v shellcheck >/dev/null
 shellcheck "$adapter"
-test "$(sha256sum "$review" | awk '{print $1}')" = "$review_sha"
+test -r "$review"
 
-python3 -I - "$review" "$reviewed_anchor" "$reviewed_plan_sha" "$adapter_sha" <<'PY'
+python3 -I - "$review" "$current_head" "$adapter_sha" "$plan" <<'PY'
 import sys
 from pathlib import Path
 
@@ -575,24 +592,26 @@ def require(condition: bool, message: str) -> None:
 
 
 path = Path(sys.argv[1])
-plan_commit, plan_sha, adapter_sha = sys.argv[2:]
+plan_commit, adapter_sha, plan_path = sys.argv[2:]
 lines = path.read_text(encoding="utf-8").splitlines()
 require(bool(lines), f"independent review is empty: {path}")
 require(lines[-1] == "PASSED", f"independent review must end with standalone PASSED, got {lines[-1]!r}")
-text = "\n".join(lines)
-for label, value in (
-    ("Plan commit", plan_commit),
-    ("Plan SHA-256", plan_sha),
-    ("Adapter SHA-256", adapter_sha),
-):
-    require(f"- {label}: `{value}`" in text, f"independent review lacks matching {label}: {value}")
+required_lines = {
+    f"Plan commit: {plan_commit}",
+    f"Plan path: {plan_path}",
+    f"Adapter SHA-256: {adapter_sha}",
+}
+missing = sorted(required_lines.difference(lines))
+require(not missing, f"independent review lacks exact identity lines: {missing}")
 print("committed plan, reviewed adapter, and independent PASSED record verified")
 PY
 BASH
 ```
 
-  This consumes the reviewed artifacts. Do not generate, extract, persist, or
-  run a replacement mock harness, and do not edit the plan, adapter, or review.
+  This consumes the reviewed artifacts. The report is not pinned by its own
+  hash and is not required to name a self-referential plan content hash. Do not
+  generate, extract, persist, or run a replacement mock harness, and do not
+  create or edit the plan, adapter, or Amendment 5 review receipt in Task 1.
 - [ ] Run the literal branch push and exact remote-HEAD check:
 
 ```bash
@@ -636,8 +655,9 @@ gcloud projects describe misc-puttering-project \
   `rust-chromium`, one worker, and
   `test/e2e-browser/specs/session-directory-matrix.spec.ts`. Require every
   existing case to pass. Readiness is not pass evidence.
-- [ ] Run the complete coordinator-owned baseline, acceptance write, and latest
-  accepted-record selection in one self-contained shell. The hash check occurs
+- [ ] Run the complete coordinator-owned baseline, acceptance write, exact
+  linked-record selection, and atomic baseline-receipt write in one
+  self-contained shell. The hash check occurs
   immediately before `npm test`; the adapter repeats it immediately before
   cloud work. `accept` runs only after `npm test` returns zero, therefore after
   local Electron succeeds:
@@ -651,6 +671,7 @@ logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-laz
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
 adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
 records="${logroot}/pinned-cloud-runs.jsonl"
+baseline_receipt="${logroot}/cloud-baseline-accepted.json"
 attempt_file="$(mktemp /tmp/freshell-baseline-attempt.XXXXXX)"
 cleanup() { rm -f -- "$attempt_file"; }
 trap cleanup EXIT
@@ -689,10 +710,12 @@ test "$remote_head" = "$expected_head"
 FRESHELL_PINNED_COORDINATOR_EXIT_CODE=0 \
   env --chdir="$root" "$adapter" accept "$attempt_id"
 
-RECORDS="$records" PHASE=baseline HEAD_SHA="$expected_head" ATTEMPT_ID="$attempt_id" \
+RECORDS="$records" RECEIPT="$baseline_receipt" BRANCH="$branch" \
+ADAPTER_SHA="$adapter_sha" HEAD_SHA="$expected_head" ATTEMPT_ID="$attempt_id" \
 python3 -I - <<'PY'
 import json
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -701,47 +724,136 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
-records = [json.loads(line) for line in Path(os.environ["RECORDS"]).read_text(encoding="utf-8").splitlines() if line]
+records_path = Path(os.environ["RECORDS"]).resolve()
+receipt_path = Path(os.environ["RECEIPT"]).resolve()
+indexed_records = [
+    (line_number, json.loads(line))
+    for line_number, line in enumerate(
+        records_path.read_text(encoding="utf-8").splitlines(), start=1
+    )
+    if line
+]
 attempt_id = os.environ["ATTEMPT_ID"]
-attempts = [r for r in records if r.get("recordType") == "attempt" and r.get("attemptId") == attempt_id]
-require(len(attempts) == 1, f"baseline selector requires one attempt {attempt_id}, found {len(attempts)}")
-attempt = attempts[0]
+baseline_head = os.environ["HEAD_SHA"]
+branch = os.environ["BRANCH"]
+adapter_sha = os.environ["ADAPTER_SHA"]
+attempts = [
+    (line_number, record)
+    for line_number, record in indexed_records
+    if record.get("recordType") == "attempt"
+    and record.get("attemptId") == attempt_id
+    and record.get("phase") == "baseline"
+    and record.get("expectedHead") == baseline_head
+]
+require(
+    len(attempts) == 1,
+    f"baseline selector requires one exact attempt id/phase/HEAD match, found {len(attempts)}",
+)
+attempt_line, attempt = attempts[0]
 target_digest = attempt.get("digest")
-accepted = [r for r in records if r.get("recordType") == "acceptance" and r.get("phase") == os.environ["PHASE"] and r.get("expectedHead") == os.environ["HEAD_SHA"] and r.get("digest") == target_digest]
-require(bool(accepted), f"no accepted baseline for HEAD {os.environ['HEAD_SHA']} and digest {target_digest!r}")
-latest = accepted[-1]
-require(latest.get("attemptId") == attempt_id, f"latest baseline acceptance links {latest.get('attemptId')!r}, expected {attempt_id}")
-require(latest.get("coordinatorExitCode") == 0, f"baseline coordinator exit must be 0, got {latest.get('coordinatorExitCode')!r}")
+accepted = [
+    (line_number, record)
+    for line_number, record in indexed_records
+    if record.get("recordType") == "acceptance"
+    and record.get("attemptId") == attempt_id
+    and record.get("phase") == "baseline"
+    and record.get("expectedHead") == baseline_head
+    and record.get("digest") == target_digest
+]
+require(
+    len(accepted) == 1,
+    f"baseline selector requires one exact linked acceptance, found {len(accepted)}",
+)
+acceptance_line, acceptance = accepted[0]
+acceptance_id = f"acceptance:{attempt_id}"
+require(acceptance.get("coordinatorExitCode") == 0, f"baseline coordinator exit must be 0, got {acceptance.get('coordinatorExitCode')!r}")
+for field in ("branch", "localHeadBefore", "remoteHeadBefore", "localHeadAfter", "remoteHeadAfter"):
+    expected = branch if field == "branch" else baseline_head
+    require(attempt.get(field) == expected, f"baseline attempt {field} must be {expected!r}, got {attempt.get(field)!r}")
+for field in ("branch", "localHead", "remoteHead"):
+    expected = branch if field == "branch" else baseline_head
+    require(acceptance.get(field) == expected, f"baseline acceptance {field} must be {expected!r}, got {acceptance.get(field)!r}")
 require(attempt.get("outcome") == "cloud_succeeded", f"baseline attempt outcome is {attempt.get('outcome')!r}")
 require(attempt.get("exitCode") == 0, f"baseline attempt exitCode is {attempt.get('exitCode')!r}")
 require(attempt.get("createdJobImage") == attempt.get("image") == attempt.get("executionImage"), "baseline immutable image fields do not match")
+require(acceptance.get("image") == attempt.get("image"), "baseline acceptance image does not match attempt image")
+require(acceptance.get("createdJobImage") == attempt.get("image"), "baseline acceptance created-job image does not match")
+require(acceptance.get("executionImage") == attempt.get("image"), "baseline acceptance execution image does not match")
 require(attempt.get("jobCreated") is True and attempt.get("jobDeleted") is True, "baseline unique job was not created and deleted")
 require(attempt.get("failureStage") is None and attempt.get("cleanupError") is None, "baseline successful attempt contains failure metadata")
 require(attempt.get("succeededTasks") == 4 and attempt.get("failedTasks") == 0, "baseline task counts are not 4 succeeded and 0 failed")
-print(f"latest accepted baseline: attempt={latest['attemptId']} digest={latest['digest']}")
+require(isinstance(target_digest, str) and target_digest.startswith("sha256:"), f"invalid baseline digest {target_digest!r}")
+
+receipt = {
+    "schemaVersion": 1,
+    "phase": "baseline",
+    "baselineHead": baseline_head,
+    "digest": target_digest,
+    "cloudAttemptId": attempt_id,
+    "acceptanceId": acceptance_id,
+    "adapterSha256": adapter_sha,
+    "recordsPath": str(records_path),
+    "attemptRecordLine": attempt_line,
+    "acceptanceRecordLine": acceptance_line,
+    "attemptRecordLink": {"recordType": "attempt", "attemptId": attempt_id},
+    "acceptanceRecordLink": {"recordType": "acceptance", "attemptId": attempt_id},
+}
+receipt_path.parent.mkdir(parents=True, exist_ok=True)
+temporary_path = None
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=receipt_path.parent,
+        prefix=f".{receipt_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        temporary_path = Path(stream.name)
+        json.dump(receipt, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_path, receipt_path)
+    directory_fd = os.open(receipt_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if temporary_path is not None and temporary_path.exists():
+        temporary_path.unlink()
+print(
+    f"accepted baseline receipt written atomically: attempt={attempt_id} "
+    f"acceptance={acceptance_id} digest={target_digest}"
+)
 PY
 BASH
 ```
 
   A failed Electron or coordinator stage leaves the attempt record but creates
-  no acceptance. A legitimate retry appends a new attempt; do not delete or
-  rewrite earlier attempts merely to make counts look singular.
-- [ ] Verify the latest accepted baseline record selected above links to an
-  attempt with exact phase/branch/HEAD/digest, pre/post remote checks,
+  no acceptance or dedicated receipt. A legitimate retry appends a new attempt;
+  do not delete or rewrite earlier attempts merely to make counts look singular.
+- [ ] Verify `cloud-baseline-accepted.json` exists only after the exact selector
+  succeeds and names the exact accepted attempt/acceptance lines and IDs,
+  baseline phase, branch, HEAD, digest, adapter SHA, and JSONL path. Verify the
+  linked attempt has exact phase/branch/HEAD/digest and pre/post remote checks,
   `failureStage == null`, `cleanupError == null`,
   `createdJobImage == image == executionImage`, four successful/zero failed
-  tasks, and successful unique-job deletion. Separately verify the persisted
-  coordinator `test`/`full-suite` receipt has exact target paths, HEAD,
-  environment-sourced summary, exit 0, and `isDirty=false`.
+  tasks, and successful unique-job deletion; verify the linked acceptance has
+  the same ID/HEAD/digest/images and coordinator exit zero. Separately verify
+  the persisted coordinator `test`/`full-suite` receipt has exact target paths,
+  HEAD, environment-sourced summary, exit 0, and `isDirty=false`.
 - [ ] If any baseline command fails, stop. Record command, status, and concise
   output; do not begin Task 2, call the failure pre-existing, or waive it.
 
 **Task 1 success:** existing committed plan-only HEAD and reviewed artifacts
 verified without tracked writes or a Task 1 commit; clean non-force branch push;
-unchanged application source; focused Rust/browser green; latest accepted
+unchanged application source; focused Rust/browser green; the exact accepted
 baseline links a truthful successful cloud attempt to a zero-exit coordinator
-run including Electron; prior failed attempts, if any, remain preserved; no
-pull request opened.
+run including Electron; the dedicated atomic baseline receipt pins its exact
+JSONL linkage; prior failed attempts, if any, remain preserved; no pull request
+opened.
 
 ### Task 2: Add authenticated real-route tests for rows, order, pages, and bytes
 
@@ -867,7 +979,7 @@ production-equivalent expected-side logic.
 **Task 4 success:** the borrowed type graph and mechanical accessors compile
 against the locked APIs while the current route policy remains untouched.
 
-### Task 5: Make one uninterrupted single-policy edit, cut over the handler, migrate every direct test, and delete the old policy
+### Task 5: Make one uninterrupted unbounded single-policy edit, cut over the handler, migrate every direct test, and delete the old policy
 
 **Files**
 
@@ -881,12 +993,13 @@ against the locked APIs while the current route policy remains untouched.
 - [ ] Start from the clean Task 4 source checkpoint. Before the edit, record
   that the type scaffolding compiles. Then make one uninterrupted source edit.
   Do not compile or run tests between the first replacement and the completion
-  of this edit. The edit must add the complete policy, cut over the real
-  handler, migrate all direct tests listed above, remove the old policy
-  inventory, and remove stale test helpers. Leave only the already-existing
-  output representation needed to compile this single-policy checkpoint; Task
-  6 performs the final output cleanup after its work-bound instrumentation is
-  ready.
+  of this edit. The edit must add the complete semantics-correct **unbounded**
+  policy, cut over the real handler, migrate all direct tests listed above,
+  remove the old policy inventory, and remove stale test helpers. It must not
+  implement `limit + 1` descriptor/annotation retention or `limit`
+  materialization. Leave only the already-existing output representation needed
+  to compile this single-policy checkpoint; Task 6 first proves structural RED
+  against it, then implements the bound and performs final output cleanup.
 
 **Single policy to add in that one edit**
 
@@ -910,14 +1023,19 @@ against the locked APIs while the current route policy remains untouched.
 - [ ] Add title search in the exact field order and exact literal snippet rules.
   Add deep search with the exact lookahead, budget, source, provider, increment,
   and I/O order and the exact partial precedence.
-- [ ] Select in one pass after stable sorting. Retain at most `limit + 1`
-  selected descriptors/annotations. Use the first `limit` only for consuming
-  materialization and serialization. Derive `nextCursor` from the last returned
-  row, never from a discarded row.
-- [ ] Materialize only selected rows from the captured metadata map. Preserve
-  every output field, omission, default, live field, and insertion order in the
-  literal response fixture. Read project colors only after successful
-  derivation, exactly where the old route did.
+- [ ] Select semantically in one pass after stable sorting, but deliberately
+  retain every eligible/search-matching descriptor and owned annotation in an
+  unbounded vector. Materialize every matching selected row before truncating
+  the returned page to `limit`. Preserve lookahead, `nextCursor`, deep-search
+  budget/partial behavior, and derive `nextCursor` from the last returned row.
+  This intentionally inefficient checkpoint is required so Task 6's structural
+  test detects the missing bound. Do not stop at `limit + 1`, truncate the
+  descriptor vector early, or limit materialization in Task 5.
+- [ ] Materialize those unbounded selected rows from the captured metadata map,
+  then return/serialize only the first page. Preserve every output field,
+  omission, default, live field, and insertion order in the literal response
+  fixture. Read project colors only after successful derivation, exactly where
+  the old route did.
 - [ ] Replace the handler body after auth/query validation with sequential
   captures: one awaited index snapshot, overrides, one awaited metadata map,
   identities, synchronous `derive_directory_page`, snapshot release, then
@@ -960,9 +1078,10 @@ against the locked APIs while the current route policy remains untouched.
 **Task 5 success:** one compiled production policy is live; every direct old
 helper test uses the new path or real route; the old whole-list policy and all
 listed support symbols are deleted before the first post-edit compile/test; no
-runtime switch or second policy exists.
+runtime switch or second policy exists. The one policy is semantics-correct but
+deliberately unbounded, so Task 6 can prove a real structural RED.
 
-### Task 6: Bound retained work, clean output, and prove the work limit
+### Task 6: Prove structural RED, implement the bound, prove GREEN, and clean output
 
 **Files**
 
@@ -973,29 +1092,19 @@ runtime switch or second policy exists.
 
 **Steps**
 
-- [ ] Replace the complete legacy `DirItem` declaration with the final
-  `#[derive(Debug)]` non-clone shape. Remove only the legacy-only
-  `title_source` and `source_file` fields after static search proves no
-  production or retained-test consumer remains.
-- [ ] Replace the complete `impl DirItem` with one `to_value` serializer. Keep
-  insertion order and optional-field omission exactly as characterized, start
-  with `let mut object = Map::new();`, and place exactly one
-  `record_preparation(|counts| counts.serializations += 1);` site in that
-  serializer. Explicitly remove `DirItem::key`.
-- [ ] Replace the final `Comparable::from(&DirItem)` projection with
-  `format!("{}:{}", i.provider, i.session_id)`. Do not remove or alter the
-  separate `IndexedSession::key` method or its consumer.
-- [ ] Compile immediately after this output cleanup before adding counters or
-  structural tests. A failure stops and permits only correction within the
-  one-file design.
 - [ ] Add test-only `PreparationCounts`, `PreparationScope`, and
   `record_preparation`. The scope is a request-level activation interval; it
   does not claim that index or metadata acquisition uses the same thread.
   Counters may be observed only after complete authenticated response-body
-  collection.
-- [ ] Instrument exactly one selector retained-peak site, one owned annotation
-  site per annotation construction path, one indexed materializer site, one
-  synthesized materializer site, and the single final serializer site.
+  collection. Every recorder call on the production path, including the call in
+  the existing Task 5 serializer, must be guarded with `#[cfg(test)]` so locked
+  production compilation remains valid.
+- [ ] Instrument the existing **unbounded** Task 5 policy at exactly one
+  selector retained-peak site, one owned annotation site per annotation
+  construction path, one indexed materializer site, one synthesized
+  materializer site, and one existing serializer site. Do not change selection
+  retention, materialization, pagination, or any production behavior while
+  adding counters and tests.
 - [ ] Add current-thread route tests that exercise every accepted limit
   `1..=MAX_DIRECTORY_PAGE_ITEMS` (`1..=50`) against oversized corpora of
   `MAX_DIRECTORY_PAGE_ITEMS + 2` rows for no-search, title, UserMessages, and
@@ -1006,6 +1115,42 @@ runtime switch or second policy exists.
   `(0,1,0,false), (1,1,1,false), (2,1,1,true),
   (50,50,50,false), (51,50,50,true)` and an all-hidden case with empty items,
   no cursor, `revision=10000`, and zero materializations/serializations.
+- [ ] **RED:** Before any bound implementation or output cleanup, run the exact
+  structural work-limit test command against the unbounded Task 5 policy.
+  Require nonzero exit caused by the new retained/materialized limit assertions,
+  while the literal route/page/cursor assertions that precede those counter
+  assertions remain correct. In particular, the oversized `limit=1` sentinel
+  must observe retained descriptors above `2` and materializations above `1`.
+  Save the exact command, failing test name, nonzero status, and assertion
+  values in the Task 6 execution evidence. A compile failure, fixture failure,
+  route mismatch, or unrelated failure is not the required RED and must be
+  fixed without implementing the bound. Do not proceed without this recorded
+  structural RED; there is no TDD waiver.
+- [ ] Only after the recorded RED, modify the one existing selector so it keeps
+  no more than `limit + 1` lightweight selected descriptors/owned annotations,
+  materializes and serializes only the first `limit`, preserves all
+  search/lookahead/partial semantics, and derives `nextCursor` from the last
+  returned row. Do not add a second selector, runtime switch, old-policy copy,
+  or test-only production policy.
+- [ ] **GREEN:** Run the identical structural work-limit command and require
+  exit zero. Then run the complete every-limit/four-tier matrix and require
+  selected descriptors/annotations `<= limit + 1`, materializations and
+  serializations `<= limit`, and every literal route/page/cursor assertion
+  unchanged. Record the matching RED/GREEN command and both outcomes.
+- [ ] After GREEN, replace the complete legacy `DirItem` declaration with the
+  final `#[derive(Debug)]` non-clone shape. Remove only legacy-only
+  `title_source` and `source_file` fields after static search proves no
+  production or retained-test consumer remains.
+- [ ] Replace the complete `impl DirItem` with one `to_value` serializer. Keep
+  insertion order and optional-field omission exactly as characterized, start
+  with `let mut object = Map::new();`, preserve exactly one test-only
+  `record_preparation(|counts| counts.serializations += 1);` site in that
+  serializer, and explicitly remove `DirItem::key`.
+- [ ] Replace the final `Comparable::from(&DirItem)` projection with
+  `format!("{}:{}", i.provider, i.session_id)`. Do not remove or alter the
+  separate `IndexedSession::key` method or its consumer.
+- [ ] Compile immediately after output cleanup. A failure stops and permits only
+  correction within the one-file design; rerun the GREEN command afterward.
 - [ ] Add the mandatory static post-capture locality/centrality proof. It must
   prove that index capture, overrides capture, metadata capture, and identity
   capture precede the one synchronous `derive_directory_page` call; that no
@@ -1015,9 +1160,9 @@ runtime switch or second policy exists.
   and that selector/materializer/serializer definitions and call sites exist
   exactly once. Acquisition-time offload before the boundary is allowed and is
   outside this proof.
-- [ ] Run the runtime work-bound tests and the static proof. Both legs are
-  mandatory; elapsed time, TLS alone, source spelling alone, allocator data,
-  RSS, and latency are not substitutes.
+- [ ] Rerun the runtime work-bound tests and the static proof after cleanup.
+  Both legs are mandatory; elapsed time, TLS alone, source spelling alone,
+  allocator data, RSS, and latency are not substitutes.
 - [ ] Run the full focused family after counter instrumentation. Require exact
   literal route bytes and all partial/search/visibility/cursor values unchanged.
 - [ ] Run final locked production and inline-test compilation after all output
@@ -1037,9 +1182,11 @@ runtime switch or second policy exists.
 - [ ] Commit the final source-only Task 6 checkpoint with the configured
   identity/footer. Do not open a pull request.
 
-**Task 6 success:** the released single policy passes the exact route suite, the
-runtime matrix and static locality proof establish the retained-work limits, the
-output shape/bytes are unchanged, and the old path is absent.
+**Task 6 success:** the same structural test command was observed RED against
+Task 5's unbounded single policy and GREEN only after the bound was implemented;
+the released single policy passes the exact route suite, runtime matrix, and
+static locality proof; output shape/bytes are unchanged; and the old path is
+absent.
 
 ### Task 7: Run final checks and the exact-final-HEAD pinned cloud suite
 
@@ -1047,8 +1194,9 @@ output shape/bytes are unchanged, and the old path is absent.
 
 - Tracked repository file content modified by this task: none. Task 7 is
   validation-only for tracked files.
-- Read: committed source/plan, Git state, external adapter/report/JSONL,
-  manifests, browser config/spec, coordinator receipt, and sandbox evidence.
+- Read: committed source/plan, Git state, external adapter/report/JSONL, the
+  exact Task 1 `cloud-baseline-accepted.json` receipt, manifests, browser
+  config/spec, coordinator receipt, and sandbox evidence.
 - External writes: append each final cloud attempt and, only after complete
   coordinator/Electron success, its linked acceptance record; write/remove a
   temporary attempt-ID handoff file.
@@ -1077,7 +1225,7 @@ output shape/bytes are unchanged, and the old path is absent.
   is unavailable.
 - [ ] Run the literal final push, exact remote checks, adapter hash check,
   coordinator-owned `npm test`, post-run remote check, acceptance append, and
-  latest accepted-record selection in one shell. `accept` is sequenced only
+  exact receipt/linked-record selection in one shell. `accept` is sequenced only
   after `npm test` exits zero, including local Electron:
 
 ```bash
@@ -1089,6 +1237,7 @@ logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-laz
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
 adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
 records="${logroot}/pinned-cloud-runs.jsonl"
+baseline_receipt="${logroot}/cloud-baseline-accepted.json"
 attempt_file="$(mktemp /tmp/freshell-final-attempt.XXXXXX)"
 cleanup() { rm -f -- "$attempt_file"; }
 trap cleanup EXIT
@@ -1128,7 +1277,8 @@ test "$remote_head" = "$expected_head"
 FRESHELL_PINNED_COORDINATOR_EXIT_CODE=0 \
   env --chdir="$root" "$adapter" accept "$attempt_id"
 
-RECORDS="$records" HEAD_SHA="$expected_head" ATTEMPT_ID="$attempt_id" \
+RECORDS="$records" BASELINE_RECEIPT="$baseline_receipt" BRANCH="$branch" \
+ADAPTER_SHA="$adapter_sha" HEAD_SHA="$expected_head" ATTEMPT_ID="$attempt_id" \
 python3 -I - <<'PY'
 import json
 import os
@@ -1140,30 +1290,201 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
-records = [json.loads(line) for line in Path(os.environ["RECORDS"]).read_text(encoding="utf-8").splitlines() if line]
-attempt_id = os.environ["ATTEMPT_ID"]
-attempts = [r for r in records if r.get("recordType") == "attempt" and r.get("attemptId") == attempt_id]
-require(len(attempts) == 1, f"final selector requires one attempt {attempt_id}, found {len(attempts)}")
-attempt = attempts[0]
-target_digest = attempt.get("digest")
-final_accepted = [r for r in records if r.get("recordType") == "acceptance" and r.get("phase") == "final" and r.get("expectedHead") == os.environ["HEAD_SHA"] and r.get("digest") == target_digest]
-require(bool(final_accepted), f"no accepted final for HEAD {os.environ['HEAD_SHA']} and digest {target_digest!r}")
-latest_final = final_accepted[-1]
-require(latest_final.get("attemptId") == attempt_id, f"latest final acceptance links {latest_final.get('attemptId')!r}, expected {attempt_id}")
-require(latest_final.get("coordinatorExitCode") == 0, f"final coordinator exit must be 0, got {latest_final.get('coordinatorExitCode')!r}")
-require(attempt.get("outcome") == "cloud_succeeded", f"final attempt outcome is {attempt.get('outcome')!r}")
-require(attempt.get("exitCode") == 0, f"final attempt exitCode is {attempt.get('exitCode')!r}")
-require(attempt.get("createdJobImage") == attempt.get("image") == attempt.get("executionImage"), "final immutable image fields do not match")
-require(attempt.get("jobCreated") is True and attempt.get("jobDeleted") is True, "final unique job was not created and deleted")
-require(attempt.get("failureStage") is None and attempt.get("cleanupError") is None, "final successful attempt contains failure metadata")
-require(attempt.get("succeededTasks") == 4 and attempt.get("failedTasks") == 0, "final task counts are not 4 succeeded and 0 failed")
-baseline_accepted = [r for r in records if r.get("recordType") == "acceptance" and r.get("phase") == "baseline"]
-require(bool(baseline_accepted), "no accepted baseline record exists")
-latest_baseline = baseline_accepted[-1]
-require(latest_baseline.get("expectedHead") != latest_final.get("expectedHead"), "baseline and final accepted records use the same HEAD")
-require(latest_baseline.get("digest") != latest_final.get("digest"), "baseline and final accepted records use the same digest")
-print(f"latest accepted final: attempt={latest_final['attemptId']} digest={latest_final['digest']}")
-print(f"latest accepted baseline: attempt={latest_baseline['attemptId']} digest={latest_baseline['digest']}")
+records_path = Path(os.environ["RECORDS"]).resolve()
+receipt_path = Path(os.environ["BASELINE_RECEIPT"]).resolve()
+branch = os.environ["BRANCH"]
+adapter_sha = os.environ["ADAPTER_SHA"]
+final_head = os.environ["HEAD_SHA"]
+final_attempt_id = os.environ["ATTEMPT_ID"]
+indexed_records = [
+    (line_number, json.loads(line))
+    for line_number, line in enumerate(
+        records_path.read_text(encoding="utf-8").splitlines(), start=1
+    )
+    if line
+]
+by_line = dict(indexed_records)
+receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+
+def require_fields(record: dict, expected: dict, label: str) -> None:
+    for field, value in expected.items():
+        require(
+            record.get(field) == value,
+            f"{label} {field} must be {value!r}, got {record.get(field)!r}",
+        )
+
+
+require_fields(
+    receipt,
+    {
+        "schemaVersion": 1,
+        "phase": "baseline",
+        "adapterSha256": adapter_sha,
+        "recordsPath": str(records_path),
+    },
+    "baseline receipt",
+)
+baseline_head = receipt.get("baselineHead")
+baseline_digest = receipt.get("digest")
+baseline_attempt_id = receipt.get("cloudAttemptId")
+baseline_acceptance_id = receipt.get("acceptanceId")
+require(isinstance(baseline_head, str) and len(baseline_head) == 40, "baseline receipt has invalid HEAD")
+require(isinstance(baseline_digest, str) and baseline_digest.startswith("sha256:"), "baseline receipt has invalid digest")
+require(isinstance(baseline_attempt_id, str) and baseline_attempt_id, "baseline receipt has invalid attempt ID")
+require(
+    baseline_acceptance_id == f"acceptance:{baseline_attempt_id}",
+    "baseline receipt acceptance ID does not link to its cloud attempt",
+)
+require(
+    receipt.get("attemptRecordLink")
+    == {"recordType": "attempt", "attemptId": baseline_attempt_id},
+    "baseline receipt has invalid attempt linkage",
+)
+require(
+    receipt.get("acceptanceRecordLink")
+    == {"recordType": "acceptance", "attemptId": baseline_attempt_id},
+    "baseline receipt has invalid acceptance linkage",
+)
+attempt_line = receipt.get("attemptRecordLine")
+acceptance_line = receipt.get("acceptanceRecordLine")
+require(isinstance(attempt_line, int) and attempt_line > 0, "baseline receipt has invalid attempt line")
+require(isinstance(acceptance_line, int) and acceptance_line > 0, "baseline receipt has invalid acceptance line")
+baseline_attempt = by_line.get(attempt_line)
+baseline_acceptance = by_line.get(acceptance_line)
+require(baseline_attempt is not None, f"baseline attempt line {attempt_line} is absent")
+require(baseline_acceptance is not None, f"baseline acceptance line {acceptance_line} is absent")
+require_fields(
+    baseline_attempt,
+    {
+        "recordType": "attempt",
+        "attemptId": baseline_attempt_id,
+        "phase": "baseline",
+        "branch": branch,
+        "expectedHead": baseline_head,
+        "localHeadBefore": baseline_head,
+        "remoteHeadBefore": baseline_head,
+        "localHeadAfter": baseline_head,
+        "remoteHeadAfter": baseline_head,
+        "digest": baseline_digest,
+        "outcome": "cloud_succeeded",
+        "exitCode": 0,
+        "failureStage": None,
+        "cleanupError": None,
+        "jobCreated": True,
+        "jobDeleted": True,
+        "succeededTasks": 4,
+        "failedTasks": 0,
+    },
+    "baseline attempt",
+)
+require_fields(
+    baseline_acceptance,
+    {
+        "recordType": "acceptance",
+        "attemptId": baseline_attempt_id,
+        "phase": "baseline",
+        "branch": branch,
+        "expectedHead": baseline_head,
+        "localHead": baseline_head,
+        "remoteHead": baseline_head,
+        "digest": baseline_digest,
+        "coordinatorExitCode": 0,
+    },
+    "baseline acceptance",
+)
+require(
+    baseline_attempt.get("createdJobImage")
+    == baseline_attempt.get("image")
+    == baseline_attempt.get("executionImage")
+    == baseline_acceptance.get("image")
+    == baseline_acceptance.get("createdJobImage")
+    == baseline_acceptance.get("executionImage"),
+    "baseline attempt/acceptance immutable images do not match",
+)
+
+final_attempts = [
+    record
+    for _, record in indexed_records
+    if record.get("recordType") == "attempt"
+    and record.get("attemptId") == final_attempt_id
+    and record.get("phase") == "final"
+    and record.get("expectedHead") == final_head
+]
+require(
+    len(final_attempts) == 1,
+    f"final selector requires one exact attempt id/phase/HEAD match, found {len(final_attempts)}",
+)
+final_attempt = final_attempts[0]
+final_digest = final_attempt.get("digest")
+require(
+    isinstance(final_digest, str) and final_digest.startswith("sha256:"),
+    f"final attempt has invalid immutable digest {final_digest!r}",
+)
+final_acceptances = [
+    record
+    for _, record in indexed_records
+    if record.get("recordType") == "acceptance"
+    and record.get("attemptId") == final_attempt_id
+    and record.get("phase") == "final"
+    and record.get("expectedHead") == final_head
+    and record.get("digest") == final_digest
+]
+require(
+    len(final_acceptances) == 1,
+    f"final selector requires one exact linked acceptance, found {len(final_acceptances)}",
+)
+final_acceptance = final_acceptances[0]
+require_fields(
+    final_attempt,
+    {
+        "branch": branch,
+        "localHeadBefore": final_head,
+        "remoteHeadBefore": final_head,
+        "localHeadAfter": final_head,
+        "remoteHeadAfter": final_head,
+        "outcome": "cloud_succeeded",
+        "exitCode": 0,
+        "failureStage": None,
+        "cleanupError": None,
+        "jobCreated": True,
+        "jobDeleted": True,
+        "succeededTasks": 4,
+        "failedTasks": 0,
+    },
+    "final attempt",
+)
+require_fields(
+    final_acceptance,
+    {
+        "branch": branch,
+        "localHead": final_head,
+        "remoteHead": final_head,
+        "coordinatorExitCode": 0,
+    },
+    "final acceptance",
+)
+require(
+    final_attempt.get("createdJobImage")
+    == final_attempt.get("image")
+    == final_attempt.get("executionImage")
+    == final_acceptance.get("image")
+    == final_acceptance.get("createdJobImage")
+    == final_acceptance.get("executionImage"),
+    "final attempt/acceptance immutable images do not match",
+)
+require(
+    str(final_attempt.get("image", "")).endswith(f"@{final_digest}"),
+    "final image does not contain the selected immutable digest",
+)
+require(
+    str(baseline_attempt.get("image", "")).endswith(f"@{baseline_digest}"),
+    "baseline image does not contain the receipt's immutable digest",
+)
+require(baseline_head != final_head, "baseline and final accepted evidence use the same HEAD")
+require(baseline_digest != final_digest, "baseline and final accepted evidence use the same digest")
+print(f"exact accepted final: attempt={final_attempt_id} digest={final_digest}")
+print(f"exact accepted baseline: attempt={baseline_attempt_id} digest={baseline_digest}")
 PY
 BASH
 ```
@@ -1175,17 +1496,22 @@ BASH
   phase/branch/HEAD/digest, pre/post remote checks,
   `failureStage == null`, `cleanupError == null`,
   `createdJobImage == image == executionImage`, four successful/zero failed
-  tasks, and successful unique-job deletion. Verify latest accepted baseline
-  and final have different HEADs and digests. Separately verify the persisted
-  coordinator receipt has `summarySource=env`, successful `test`/`full-suite`,
-  exact `npm test` shape, target paths, final HEAD, and `isDirty=false`.
+  tasks, and successful unique-job deletion. Verify the dedicated Task 1
+  baseline receipt's exact record lines, IDs, HEAD, digest, adapter SHA, and
+  JSONL linkage resolve to one successful baseline attempt and one linked
+  acceptance with the same immutable images and coordinator exit zero. Require
+  baseline HEAD != final HEAD and baseline digest != final digest. Separately
+  verify the persisted coordinator receipt has `summarySource=env`, successful
+  `test`/`full-suite`, exact `npm test` shape, target paths, final HEAD, and
+  `isDirty=false`.
 - [ ] Run `git diff --check`, final exact-scope/forbidden-file checks, and a
   clean-state check. Do not create a pull request or merge in this task.
 
 **Task 7 success:** every focused, browser, sandbox, lint, compilation, static,
 coordinator, cloud, Electron, provenance, and scope gate passes against the
-exact final pushed SHA; latest accepted baseline/final evidence is distinct;
-all retry attempts remain truthful; no pull request has been opened.
+exact final pushed SHA; the exact Task 1 baseline receipt and exact final linked
+records are both validated and distinct by HEAD and digest; all retry attempts
+remain truthful; no pull request has been opened.
 
 ## Amendment self-review checklist
 
@@ -1196,12 +1522,15 @@ This section is a plan review, not an execution attestation:
 - [ ] All expected order/cursor/search/visibility/page/revision/snippet/partial
   values are literal fixture values.
 - [ ] Task 4 contains only borrowed types, lifetimes, and mechanical accessors.
-- [ ] Task 5 performs one uninterrupted policy/cutover/migration/deletion edit
-  before the first post-edit compile/test.
+- [ ] Task 5 performs one uninterrupted semantics-correct **unbounded**
+  policy/cutover/migration/deletion edit before the first post-edit
+  compile/test; it contains no retained-work bound.
 - [ ] The exact old-policy deletion inventory and every direct test name are
   present.
-- [ ] Task 6 has both runtime retained-work limits and static post-capture
-  locality/centrality proof, without a deleted-path comparison.
+- [ ] Task 6 adds the structural tests/counters first, records genuine RED
+  against Task 5's unbounded policy, implements the one-policy bound only
+  afterward, then runs the identical command GREEN and completes runtime/static
+  proof without a deleted-path comparison.
 - [ ] Task 1 and Task 7 broad suites use cloud plus the reviewed external
   adapter; focused commands do not select a fake local Vitest backend.
 - [ ] The adapter body passes `bash -n` and ShellCheck and its recorded SHA is
@@ -1211,8 +1540,14 @@ This section is a plan review, not an execution attestation:
   evidence, required unique-job deletion, post-run remote checks, retry-safe
   attempt preservation, and acceptance only after coordinator/Electron success.
 - [ ] Task 1 consumes an already committed clean plan-only HEAD, executable
-  reviewed adapter, and immutable independent review ending in standalone
-  `PASSED`; it performs no tracked write/commit and creates no mock harness.
+  reviewed adapter, and outer-created `amendment-5-independent-review.md`
+  ending in standalone `PASSED`; it derives HEAD at runtime, pins no review-file
+  or self-referential plan hash, performs no tracked write/commit, and creates
+  no mock harness.
+- [ ] Task 1 atomically writes the dedicated exact baseline receipt only after
+  full linked acceptance. Task 7 resolves that receipt's exact line/ID/HEAD/
+  digest linkage and selects final evidence by exact phase/final HEAD/ID/digest;
+  no active baseline lookup selects by phase alone.
 - [ ] No plan step opens a pull request, merges, deploys, or restarts a server.
 - [ ] No product/runtime command was run while making this amendment.
 
