@@ -29,11 +29,11 @@
 - LB-03 is accepted only as a compiler residual risk, not a confirmed compile claim. The complete borrowed core must pass locked production and inline-test compiler stop-steps before handler cutover; the real Axum handler must pass the same locked checks immediately after cutover; final cleanup/selector assembly must compile before commit and again in final validation. Any failure stops and permits only correction of the planned one-file borrowed design plus complete rerun. It never authorizes an owned/index-provenance fallback, compatibility adapter, public/store/index API or manifest change, or another source file. If correction cannot stay within those bounds, reopen the architecture decision before further edits.
 - The full corpus may require `O(N)` shallow candidates, stable sorting, and sparse-search inspection. The accepted bound is at most `limit + 1` retained descriptors/annotations and at most `limit` full-row materializations/serializations.
 - Keep deep search's `limit * 10` scan budget and exact check order: lookahead count, budget, source, provider, increment, file I/O. A later budget stop overwrites an earlier `io_error` reason.
-- Exact TLS structural counts plus a mandatory static post-capture preparation locality/centrality proof establish the bound; neither elapsed time nor TLS alone is evidence. `PreparationScope` is a request-level activation window, not a claim that index/metadata acquisition is same-thread. The static leg requires current-thread structural tests; proves that the awaited index snapshot, override snapshot, awaited metadata snapshot, and identity snapshot all precede the sole synchronous `derive_directory_page` call; proves no await or recognized handoff in the post-capture counted candidate-derivation subgraph or transcript helper; proves direct Tower/Axum polling and full response-body completion before the test snapshots counts; and proves exact-one production selection/materialization/serialization sites. Acquisition-time offload before candidate derivation is allowed and outside the counted-work locality claim. Any failure of the post-capture locality/centrality invariant stops and reopens LB-08; do not waive it or silently keep the counters. Do not make allocator, RSS, or latency claims.
+- An exhaustive real-route TLS matrix proves limiter consequences for every accepted limit `1..=MAX_DIRECTORY_PAGE_ITEMS` on oversized no-search, title, `userMessages`, and `fullText` corpora; a mandatory static post-capture preparation locality/centrality proof establishes that the observed counters belong to the sole production chain. Neither elapsed time nor TLS alone is evidence. `PreparationScope` is a request-level activation window, not a claim that index/metadata acquisition is same-thread. The static leg requires current-thread structural tests; proves that the awaited index snapshot, override snapshot, awaited metadata snapshot, and identity snapshot all precede the sole synchronous `derive_directory_page` call; proves no await or recognized handoff in the post-capture counted candidate-derivation subgraph or transcript helper; proves direct Tower/Axum polling and full response-body completion before the test snapshots counts; and proves exact-one production selection/materialization/serialization sites and counter placement. Acquisition-time offload before candidate derivation is allowed and outside the counted-work locality claim. Any failure of either runtime limiter evidence or the post-capture locality/centrality invariant stops and reopens LB-08; do not waive either leg or silently keep the counters. Do not make allocator, RSS, or latency claims.
 - Use RED-GREEN-REFACTOR. Characterization tests added before the refactor must pass against the eager route; Task 4's intended RED is missing candidate symbols; Task 6's intended RED is exact structural-count mismatch.
-- Every checkbox step is one monotonic 2-5 minute action: one module shell, cohesive helper group, individual test, production function or implementation/type group, independent command, or commit. Do not combine unrelated tests, function groups, or commands into one step. A provenance-bracketed sandbox gate is one indivisible evidence action even though its internal build/run/postflight and duration exceed ordinary step granularity; it must remain one self-contained shell process so the captured image ID cannot be handed off or recomputed ambiguously.
+- Every checkbox step is one monotonic 2-5 minute action: one module shell, cohesive helper group, individual test, production function or implementation/type group, independent command, or commit. Do not combine unrelated tests, function groups, or commands into one step. A provenance-bracketed sandbox gate is one indivisible evidence action even though its internal build/run/postflight and duration exceed ordinary step granularity; it must remain one self-contained shell process that records the exact worktree-context build result via `--iidfile` and passes that full immutable image ID to the test container. The build creates no Docker tag, and no mutable tag may serve as provenance or runtime selection.
 - Every shell command is self-contained, uses absolute paths or `git -C`, assumes no caller working directory, and begins with `FRESHELL_VITEST_BACKEND=local` even when it does not invoke Vitest. This branch-local override is mandatory because LB-10 falsified reviewed-source provenance and race freedom for the remote wrapper; it does not alter repository or user configuration.
-- Preflight, readiness, coordinator history, and prior results are never pass evidence. The exact local browser matrix, fresh coordinator-owned local suite, and provenance-bracketed sandbox workload must execute successfully. Any preflight, build, runtime, or image-ID discrepancy stops. Never substitute a remote runner, unsandboxed Cargo, narrowed browser project/package target, focused-only evidence, or a waiver. If another coordinator holder or container uses a shared resource, wait and retry the same gate; never kill a foreign holder, process, or container.
+- Preflight, readiness, coordinator history, and prior results are never pass evidence. The exact local browser matrix, fresh coordinator-owned local suite, and provenance-bracketed sandbox workload must execute successfully. Any preflight, build, runtime, or image-ID discrepancy stops. The sandbox bracket never reads or mutates `freshell-sandbox:latest`, creates no Docker tag, and performs no image/tag deletion; its content-addressed build result remains subject to normal Docker image/cache policy. Concurrent foreign image builds or containers cannot change the full-ID run, and no foreign process, container, tag, or image is removed. Never substitute a remote runner, unsandboxed Cargo, narrowed browser project/package target, focused-only evidence, or a waiver. If another coordinator holder uses a shared coordinator resource, wait and retry the same gate; never kill or bypass it.
 - Never invoke raw `npx vitest`. Broad JavaScript tests run through the repository coordinator; destructive server-package tests run through the repository sandbox.
 - Make ordinary coherent local task-level commits after green source-changing work, using the configured repository identity and Amplifier co-author footer. Every shown commit subject/body is one valid example, not a mandatory history. Mandatory task spec/quality reviews or final checks may require additional source-only correction commits and reruns before advancing. Do not prescribe or validate an exact commit count, subject sequence, commit order, or ancestry ledger.
 - This plan contains no push, pull-request creation, merge, deployment, or server-restart step.
@@ -159,7 +159,7 @@ Expected: exit 0 and every existing matrix case passes. Retain the exact output 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
+FRESHELL_VITEST_BACKEND=local env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep INIT_CWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep PWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
 ```
 
 Expected: exit 0 and truthful holder state. If another holder is active, wait and rerun this same independent command; never kill or bypass the holder. Readiness and historical results do not satisfy Step 7.
@@ -169,10 +169,10 @@ Expected: exit 0 and truthful holder state. If another holder is active, wait an
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page unchanged local baseline" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
+FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page unchanged local baseline" env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep INIT_CWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep PWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
 ```
 
-Expected: a fresh coordinator-owned exit 0 for the target worktree and current `HEAD`, with clean source provenance. Retain observed counts and require output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute.
+Expected: a fresh coordinator-owned exit 0 for the target worktree and current `HEAD`, with clean source provenance. Retain observed counts and require output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute, and this run is not accepted until Step 8 machine-proves its persisted `byKey.test` receipt.
 
 - [ ] **Step 8: Reseal source provenance and close the authorization receipt**
 
@@ -184,18 +184,46 @@ set -euo pipefail
 root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
 expected=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
+summary="session-directory lazy-page unchanged local baseline"
 diff -u <(printf "%s\n" "$expected") <(git -C "$root" diff --name-only "$base" HEAD)
 git -C "$root" diff --exit-code "$base" HEAD -- crates/freshell-server/src/session_directory.rs
 test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
-printf "head=%s\n" "$(git -C "$root" rev-parse HEAD)"
+head="$(git -C "$root" rev-parse HEAD)"
+printf "head=%s\n" "$head"
 rustc --version
 cargo --version
 node --version
-npm --prefix "$root" run test:status
+env --chdir="$root" INIT_CWD="$root" PWD="$root" npm --prefix "$root" run test:status
+record="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/freshell-test-coordinator/command-runs.json"
+ROOT="$root" HEAD="$head" SUMMARY="$summary" RECORD="$record" python3 - <<PY
+import json
+import os
+from pathlib import Path
+
+root = os.environ["ROOT"]
+head = os.environ["HEAD"]
+summary = os.environ["SUMMARY"]
+record = json.loads(
+    Path(os.environ["RECORD"]).read_text(encoding="utf-8")
+)["byKey"]["test"]
+assert record["summary"] == summary, record
+assert record["summarySource"] == "env", record
+assert record["outcome"] == "success", record
+assert record["exitCode"] == 0, record
+assert record["entrypoint"] == {"commandKey": "test", "suiteKey": "full-suite"}, record
+assert record["command"] == {"display": "npm test", "argv": ["test"]}, record
+repo = record["repo"]
+assert repo["invocationCwd"] == root, repo
+assert repo["checkoutRoot"] == root, repo
+assert repo["worktreePath"] == root, repo
+assert repo["commit"] == head, repo
+assert repo["isDirty"] is False, repo
+print("coordinator receipt provenance: PASS")
+PY
 '
 ```
 
-Expected: exit 0; plan-only scope, frozen-base source bytes, and clean status are still sealed after all runtime gates; exact `HEAD`, Rust/Cargo/Node versions, and the just-completed coordinator record are printed. Attach the retained Step 3, Step 5, and Step 7 command outputs to this receipt, including exact commands, exit statuses, and observed test/matrix counts. Ignored build caches, `target/`, `dist/`, Playwright output, and coordinator records are allowed test side effects; any unexpected unignored artifact stops. Only this complete receipt authorizes Task 2.
+Expected: exit 0; plan-only scope, frozen-base source bytes, and clean status are still sealed after all runtime gates; exact `HEAD` and Rust/Cargo/Node versions are printed; and the exact line `coordinator receipt provenance: PASS` machine-proves the unique environment-sourced summary, successful exit-0 `test`/`full-suite`, exact `npm test` command shape, exact target `invocationCwd`/`checkoutRoot`/`worktreePath`, sealed contemporaneous `HEAD`, and `isDirty=false` from persisted `command-runs.json.byKey.test`. Attach the retained Step 3, Step 5, and Step 7 command outputs to this receipt, including exact commands, exit statuses, and observed test/matrix counts. Ignored build caches, `target/`, `dist/`, Playwright output, and coordinator records are allowed test side effects; any unexpected unignored artifact stops. Only this complete machine-proven receipt authorizes Task 2.
 
 - [ ] **Step 9: Apply fail-closed remediation to any discrepancy**
 
@@ -1779,7 +1807,7 @@ Insert this complete test before the closing brace of `candidate_tests`:
                 );
                 assert_eq!(
                     candidate_is_strictly_after_cursor(&candidate, &cursor),
-                    expected == Ordering::Greater,
+                    expected == std::cmp::Ordering::Greater,
                 );
             }
         }
@@ -5252,7 +5280,7 @@ Expected: exit 0 and a normal local source-only migration commit. The eager help
 
 **Interfaces:**
 - Consumes: Task 5's migrated tests, retained eager helpers/oracle and 2,884-case differential, legacy temporary `DirItem` fields/materializer/serializer, temporary unbounded non-deep selector, single production candidate path, and Task 2 route harness.
-- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; structural RED against the unbounded selector; the exact verified final selector; final-selector parsed/byte parity against the retained eager oracle before deletion; final non-`Clone` counted output path; no eager/differential residue; exact runtime structural counts plus the mandatory static post-capture preparation locality/centrality proof; locked final assembly; and provenance-bracketed sandbox evidence. TLS counters are one runtime evidence leg, never sole proof.
+- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; structural RED against the unbounded selector; the exact verified final selector; final-selector parsed/byte parity against the retained eager oracle before deletion; final non-`Clone` counted output path; no eager/differential residue; an exact full-valid-limit runtime structural matrix plus the mandatory static post-capture preparation locality/centrality proof; locked final assembly; and provenance-bracketed sandbox evidence. TLS counters are one runtime evidence leg, never sole proof.
 
 - [ ] **Step 1: Add the preparation counter value type**
 
@@ -5492,14 +5520,14 @@ Add this complete shell inside `page_bound_tests`:
     }
 ```
 
-- [ ] **Step 10: Add structural test `no_search_materializes_only_returned_indexed_rows`**
+- [ ] **Step 10: Add structural test `no_search_materializes_only_returned_indexed_rows` across every accepted limit**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
 ```rust
         #[tokio::test(flavor = "current_thread")]
         async fn no_search_materializes_only_returned_indexed_rows() {
-            let rows = (0..100)
+            let rows = (0..(MAX_DIRECTORY_PAGE_ITEMS + 2))
                 .map(|index| {
                     indexed_row(
                         &format!("s-{index:03}"),
@@ -5510,23 +5538,34 @@ Insert this complete current-thread route test before the closing brace of `prep
                 .collect();
             let harness = directory_route_harness(rows);
 
-            let scope = PreparationScope::begin();
-            let page = get_page(harness.app.clone(), "&limit=2").await;
-            let counts = scope.snapshot();
-            drop(scope);
+            for limit in 1..=MAX_DIRECTORY_PAGE_ITEMS {
+                let scope = PreparationScope::begin();
+                let page = get_page(
+                    harness.app.clone(),
+                    &format!("&limit={limit}"),
+                )
+                .await;
+                let counts = scope.snapshot();
+                drop(scope);
 
-            assert_eq!(page["items"].as_array().expect("items").len(), 2);
-            assert!(page_cursor(&page).is_some());
-            assert_eq!(
-                counts,
-                PreparationCounts {
-                    indexed_materializations: 2,
-                    synthesized_materializations: 0,
-                    serializations: 2,
-                    retained_descriptor_peak: 3,
-                    owned_annotations: 0,
-                }
-            );
+                assert_eq!(
+                    page["items"].as_array().expect("items").len(),
+                    limit,
+                    "limit={limit}",
+                );
+                assert!(page_cursor(&page).is_some(), "limit={limit}");
+                assert_eq!(
+                    counts,
+                    PreparationCounts {
+                        indexed_materializations: limit,
+                        synthesized_materializations: 0,
+                        serializations: limit,
+                        retained_descriptor_peak: limit + 1,
+                        owned_annotations: 0,
+                    },
+                    "limit={limit}",
+                );
+            }
         }
 ```
 
@@ -5687,7 +5726,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 14: Add structural test `sparse_title_search_retains_only_limit_plus_one_annotations`**
+- [ ] **Step 14: Add structural test `sparse_title_search_retains_only_limit_plus_one_annotations` across every accepted limit**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -5703,7 +5742,7 @@ Insert this complete current-thread route test before the closing brace of `prep
                     )
                 })
                 .collect();
-            for index in 0..3 {
+            for index in 0..(MAX_DIRECTORY_PAGE_ITEMS + 2) {
                 rows.push(indexed_row(
                     &format!("match-{index:02}"),
                     1_000 - index as i64,
@@ -5712,31 +5751,36 @@ Insert this complete current-thread route test before the closing brace of `prep
             }
             let harness = directory_route_harness(rows);
 
-            let scope = PreparationScope::begin();
-            let page = get_page(
-                harness.app.clone(),
-                "&query=needle&tier=title&limit=1",
-            )
-            .await;
-            let counts = scope.snapshot();
-            drop(scope);
+            for limit in 1..=MAX_DIRECTORY_PAGE_ITEMS {
+                let scope = PreparationScope::begin();
+                let page = get_page(
+                    harness.app.clone(),
+                    &format!("&query=needle&tier=title&limit={limit}"),
+                )
+                .await;
+                let counts = scope.snapshot();
+                drop(scope);
 
-            assert_eq!(item_ids(&page), vec!["match-00"]);
-            assert!(page_cursor(&page).is_some());
-            assert_eq!(
-                counts,
-                PreparationCounts {
-                    indexed_materializations: 1,
-                    synthesized_materializations: 0,
-                    serializations: 1,
-                    retained_descriptor_peak: 2,
-                    owned_annotations: 2,
-                }
-            );
+                let ids = item_ids(&page);
+                assert_eq!(ids.len(), limit, "limit={limit}");
+                assert_eq!(ids[0], "match-00", "limit={limit}");
+                assert!(page_cursor(&page).is_some(), "limit={limit}");
+                assert_eq!(
+                    counts,
+                    PreparationCounts {
+                        indexed_materializations: limit,
+                        synthesized_materializations: 0,
+                        serializations: limit,
+                        retained_descriptor_peak: limit + 1,
+                        owned_annotations: limit + 1,
+                    },
+                    "limit={limit}",
+                );
+            }
         }
 ```
 
-- [ ] **Step 15: Add structural test `deep_search_retains_only_limit_plus_one_annotations`**
+- [ ] **Step 15: Add structural test `deep_search_retains_only_limit_plus_one_annotations` across every accepted limit and both deep tiers**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -5745,7 +5789,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         async fn deep_search_retains_only_limit_plus_one_annotations() {
             let home = tempfile::tempdir().expect("transcript home");
             let mut rows = Vec::new();
-            for index in 0..3 {
+            for index in 0..(MAX_DIRECTORY_PAGE_ITEMS + 2) {
                 let path = home.path().join(format!("match-{index}.jsonl"));
                 std::fs::write(
                     &path,
@@ -5764,29 +5808,47 @@ Insert this complete current-thread route test before the closing brace of `prep
             }
             let harness = directory_route_harness(rows);
 
-            let scope = PreparationScope::begin();
-            let page = get_page(
-                harness.app.clone(),
-                "&query=needle&tier=userMessages&limit=1",
-            )
-            .await;
-            let counts = scope.snapshot();
-            drop(scope);
+            for tier in ["userMessages", "fullText"] {
+                for limit in 1..=MAX_DIRECTORY_PAGE_ITEMS {
+                    let scope = PreparationScope::begin();
+                    let page = get_page(
+                        harness.app.clone(),
+                        &format!("&query=needle&tier={tier}&limit={limit}"),
+                    )
+                    .await;
+                    let counts = scope.snapshot();
+                    drop(scope);
 
-            assert_eq!(item_ids(&page), vec!["deep-0"]);
-            assert!(page_cursor(&page).is_some());
-            assert_eq!(page["items"][0]["matchedIn"], json!("userMessage"));
-            assert_eq!(page["items"][0]["snippet"], json!("needle deep 0"));
-            assert_eq!(
-                counts,
-                PreparationCounts {
-                    indexed_materializations: 1,
-                    synthesized_materializations: 0,
-                    serializations: 1,
-                    retained_descriptor_peak: 2,
-                    owned_annotations: 2,
+                    let ids = item_ids(&page);
+                    assert_eq!(ids.len(), limit, "tier={tier} limit={limit}");
+                    assert_eq!(ids[0], "deep-0", "tier={tier} limit={limit}");
+                    assert!(
+                        page_cursor(&page).is_some(),
+                        "tier={tier} limit={limit}",
+                    );
+                    assert_eq!(
+                        page["items"][0]["matchedIn"],
+                        json!("userMessage"),
+                        "tier={tier} limit={limit}",
+                    );
+                    assert_eq!(
+                        page["items"][0]["snippet"],
+                        json!("needle deep 0"),
+                        "tier={tier} limit={limit}",
+                    );
+                    assert_eq!(
+                        counts,
+                        PreparationCounts {
+                            indexed_materializations: limit,
+                            synthesized_materializations: 0,
+                            serializations: limit,
+                            retained_descriptor_peak: limit + 1,
+                            owned_annotations: limit + 1,
+                        },
+                        "tier={tier} limit={limit}",
+                    );
                 }
-            );
+            }
         }
 ```
 
@@ -5842,7 +5904,9 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-The RED run uses the temporary unbounded selector. Response assertions must already pass; only exact descriptor/annotation counts for no-search/title paths may fail.
+All three bound-stressing corpora contain `MAX_DIRECTORY_PAGE_ITEMS + 2` eligible or matching candidates; do not reduce any to `MAX_DIRECTORY_PAGE_ITEMS + 1`, which would make the maximum-limit limiter proof vacuous.
+
+The RED run uses the temporary unbounded selector. Response assertions must already pass. The no-search and title exhaustive matrices fail exact retained peaks/owned annotations, including at the maximum limit because 52 selectable matches exist; the already-bounded deep path remains green.
 
 - [ ] **Step 17: Run the structural tests and observe the intended RED**
 
@@ -5852,7 +5916,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
 ```
 
-Expected RED: response assertions already pass, but exact no-search/title descriptor peaks or annotation counts exceed their specified `limit + 1` values under the temporary selector. Compilation failure, response mismatch, timing failure, or unrelated failure is not valid RED.
+Expected RED: response assertions already pass, but exact no-search/title descriptor peaks or annotation counts exceed their specified `limit + 1` values under the temporary selector for the exhaustive valid-limit matrix, including limit 50 because each corpus has 52 selectable matches. The deep matrix remains green under its existing bounded path. Compilation failure, response mismatch, timing failure, or unrelated failure is not valid RED.
 
 - [ ] **Step 18: Replace only the selector with the final bounded implementation**
 
@@ -6010,7 +6074,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
 ```
 
-Expected: exit 0. Indexed/synthesized materializations, serializations, retained peak, and owned annotation counts exactly equal every test's struct literal. This is the runtime leg only; it is not admissible as sole proof without Step 44's static leg.
+Expected: exit 0 with all seven current-thread test functions and all 203 measured route activations passing exact dynamic response length, cursor, materialization, serialization, retained-peak, and owned-annotation counts. The 203 cases are 50 no-search indexed, three focused single cases, 50 title, and 100 deep cases across two tiers; the seventh function is lifecycle-only. This is the runtime leg only; it is not admissible as sole proof without Step 44's static leg.
 
 - [ ] **Step 23: Run the complete focused family before oracle deletion**
 
@@ -6409,7 +6473,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
 ```
 
-Expected: exit 0 with all seven current-thread scenarios and every exact count unchanged. This remains the runtime leg only; Step 44 is mandatory companion evidence.
+Expected: exit 0 with all seven current-thread test functions and all 203 measured route activations passing every exact dynamic count unchanged. This remains the runtime leg only; Step 44 is mandatory companion evidence.
 
 - [ ] **Step 40: Rerun every route and candidate characterization after final output cleanup**
 
@@ -6485,10 +6549,10 @@ def only_position(text: str, needle: str) -> int:
     assert text.count(needle) == 1, (needle, text.count(needle))
     return text.index(needle)
 
-# Exactly six named work-bound tests arm one TLS recorder around one fully awaited
-# real route request. This is an activation interval that may include
-# acquisition-time offload. The seventh current-thread test is explicitly the
-# lifecycle/reset-only test.
+# Exactly six named work-bound tests define one activation template per named test;
+# each dynamic case surrounds exactly one fully awaited real route request. The
+# interval may include acquisition-time offload. The seventh current-thread test
+# is explicitly the lifecycle/reset-only test.
 request_tests = (
     'no_search_materializes_only_returned_indexed_rows',
     'no_search_materializes_only_returned_synthesized_rows',
@@ -6618,7 +6682,8 @@ assert count(r'impl\s+(?:serde::)?Serialize\s+for\s+DirItem\b', production_code)
 assert count(r'#\[derive\([^\]]*\bSerialize\b[^\]]*\)\]\s*struct DirItem', production_code) == 0
 assert count(r'\bto_value\b', serializer) == 1
 
-# Keep the exact canonical chain and counter-site checks.
+# Exhaustive oversized runtime cases prove limiter semantics; this section proves
+# the exact canonical chain and counter-site centrality without locking source spelling.
 assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
 assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
 assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
@@ -6651,44 +6716,109 @@ print('static post-capture preparation locality/centrality proof: PASS')
 PY
 ```
 
-Expected: exit 0 and the explicit PASS line. The six named tests each arm one TLS recorder around exactly one fully awaited real route request and snapshot it only after full response-body completion; the seventh lifecycle-only test is excluded. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
+Expected: exit 0 and the explicit PASS line. The six named tests each define one TLS activation template, and every dynamic activation encloses exactly one fully awaited real route request before snapshot after full response-body completion; the seventh lifecycle-only test is excluded. The exhaustive oversized runtime matrix, not static source spelling, proves selector limiting for all valid limits and all no-search/title/deep modes. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
 
 - [ ] **Step 45: Rebuild and run the broad server package in one sandbox provenance bracket**
 
 Run this indivisible shell process; do not split build, image capture, test, or postflight:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local bash -c '
-set -u -o pipefail
-root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
-tag=freshell-sandbox:latest
+FRESHELL_VITEST_BACKEND=local bash <<'BASH'
+set -euo pipefail
 
-docker version >/dev/null || exit 1
-docker info >/dev/null || exit 1
-active_containers="$(docker ps -q --filter "ancestor=${tag}")" || exit 1
-if test -n "${active_containers}"; then
-  echo "shared sandbox image is in active use; wait and retry without killing it" >&2
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+sandbox_test="${root}/scripts/sandbox-test.sh"
+real_docker="$(type -P docker)"
+tmp_dir=
+wrapper=
+iidfile=
+expected_image_id=
+
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+
+  if [ -n "${wrapper}" ] && [ -e "${wrapper}" ]; then
+    rm -f -- "${wrapper}" || status=1
+  fi
+  if [ -n "${iidfile}" ] && [ -e "${iidfile}" ]; then
+    rm -f -- "${iidfile}" || status=1
+  fi
+  if [ -n "${tmp_dir}" ] && [ -d "${tmp_dir}" ]; then
+    rmdir -- "${tmp_dir}" || status=1
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+test -n "${real_docker}"
+test -x "${real_docker}"
+"${real_docker}" version >/dev/null
+"${real_docker}" info >/dev/null
+
+tmp_dir="$(mktemp -d /tmp/freshell-sandbox-provenance.XXXXXX)"
+wrapper="${tmp_dir}/docker"
+iidfile="${tmp_dir}/image.id"
+
+cat >"${wrapper}" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "build" ]; then
+  echo "pinned sandbox runner refuses mutable-tag fallback builds" >&2
   exit 1
 fi
+real_docker="${FRESHELL_REAL_DOCKER:?}"
+pinned_image_id="${FRESHELL_SANDBOX_IMAGE_ID:?}"
+args=()
+for arg in "$@"; do
+  if [ "${arg}" = "freshell-sandbox:latest" ]; then
+    args+=("${pinned_image_id}")
+  else
+    args+=("${arg}")
+  fi
+done
+exec "${real_docker}" "${args[@]}"
+WRAPPER
+chmod 700 "${wrapper}"
+bash -n "${wrapper}"
 
-"${root}/scripts/sandbox-build.sh" || exit $?
-expected_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
-printf "sandbox_image_id_before=%s\n" "${expected_image_id}"
+tag_count="$(grep -Fxc 'IMAGE_TAG="freshell-sandbox:latest"' "${sandbox_test}" || true)"
+inspect_count="$(grep -Fxc 'if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then' "${sandbox_test}" || true)"
+run_count="$(grep -Fxc 'docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?' "${sandbox_test}" || true)"
+test "${tag_count}" -eq 1
+test "${inspect_count}" -eq 1
+test "${run_count}" -eq 1
+
+"${real_docker}" build \
+  --network=host \
+  --build-arg "UID=$(id -u)" \
+  --build-arg "GID=$(id -g)" \
+  --iidfile "${iidfile}" \
+  "${root}/docker/sandbox"
+
+expected_image_id="$(cat "${iidfile}")"
+test -n "${expected_image_id}"
+built_image_id="$("${real_docker}" image inspect --format '{{.Id}}' "${expected_image_id}")"
+test "${built_image_id}" = "${expected_image_id}"
+printf 'sandbox_image_id=%s\n' "${expected_image_id}"
 
 test_status=0
-"${root}/scripts/sandbox-test.sh" "cargo test -p freshell-server --all-targets" || test_status=$?
+PATH="${tmp_dir}:${PATH}" \
+FRESHELL_REAL_DOCKER="${real_docker}" \
+FRESHELL_SANDBOX_IMAGE_ID="${expected_image_id}" \
+"${sandbox_test}" "cargo test -p freshell-server --all-targets" || test_status=$?
 
-actual_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
-printf "sandbox_image_id_after=%s\n" "${actual_image_id}"
-if test "${actual_image_id}" != "${expected_image_id}"; then
-  echo "sandbox image tag changed during the gate; result has invalid provenance" >&2
-  exit 1
-fi
+actual_image_id="$("${real_docker}" image inspect --format '{{.Id}}' "${expected_image_id}")"
+printf 'sandbox_image_id_after=%s\n' "${actual_image_id}"
+test "${actual_image_id}" = "${expected_image_id}"
 exit "${test_status}"
-'
+BASH
 ```
 
-Expected: Docker preflight succeeds; no active container uses the shared tag; this worktree's `sandbox-build.sh` succeeds; before/after `freshell-sandbox:latest` image IDs are identical; `sandbox-test.sh` exits 0; and every `freshell-server --all-targets` target passes. Any other result stops before commit. Wait rather than kill a foreign holder/container, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
+Expected: Docker preflight succeeds; the untagged worktree-context build succeeds; the `--iidfile` ID immediately resolves to that same full ID in the local Docker image store; the actual repository `sandbox-test.sh` wrapper runs `cargo test -p freshell-server --all-targets` with `docker run` receiving that full immutable ID; postflight still inspects the same full ID; all tests pass; owned wrapper/IID/temporary-directory artifacts clean successfully; the content-addressed image/cache is intentionally left to normal Docker policy with no image/tag deletion; and `freshell-sandbox:latest` is untouched. Any failure stops before commit. Never kill or remove a foreign process, container, tag, or image, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
 
 - [ ] **Step 46: Commit the final-selector, oracle-cleanup, and combined-proof result**
 
@@ -6700,7 +6830,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "perf(session-directory): bound returned-page preparation" -m "Install the verified bounded selector, prove final eager parity, remove test-only oracle residue, finalize the counted output path, and retain combined static/runtime structural coverage." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
-Expected: exit 0 and a normal local source-only commit. This commit is authorized only after the locked final assembly, post-cleanup literal/structural/focused tests, residue checks, static post-capture preparation locality/centrality proof, and sandbox provenance bracket all pass.
+Expected: exit 0 and a normal local source-only commit. This commit is authorized only after the locked final assembly, post-cleanup literal/structural/focused tests, full-valid-domain runtime structural receipt, residue checks, static post-capture preparation locality/centrality receipt, and sandbox provenance bracket all pass.
 
 ### Task 7: Run final checks and prove exact scope
 
@@ -6711,7 +6841,7 @@ Expected: exit 0 and a normal local source-only commit. This commit is authorize
 
 **Interfaces:**
 - Consumes: Task 6's committed final source and all retained test interfaces.
-- Produces: separate locked production and inline-test compiler receipts; exact runtime structural-count and static post-capture preparation locality/centrality receipts; fresh focused, rebuilt-image sandbox package, dependency, format, lint, exact local browser-matrix, and fresh coordinator-owned local-suite pass evidence; plus single-policy/call-site, residue, exact-file-scope, forbidden-file, and clean-state evidence. Browser/Docker preflights and coordinator history are readiness/provenance only, never runtime pass evidence. No repository file changes.
+- Produces: separate locked production and inline-test compiler receipts; the exact full-valid-limit runtime structural matrix and static post-capture preparation locality/centrality receipts against committed final `HEAD`; fresh focused, rebuilt-image sandbox package, dependency, format, lint, exact local browser-matrix, and fresh coordinator-owned local-suite pass evidence; plus single-policy/call-site, residue, exact-file-scope, forbidden-file, clean-state, and exact persisted coordinator-provenance evidence. Browser/Docker preflights and coordinator history are readiness/provenance only, never runtime pass evidence. No repository file changes.
 
 - [ ] **Step 1: Compile the committed final production source against the lockfile**
 
@@ -6741,44 +6871,109 @@ Run:
 FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
-Expected: exit 0 and no failed test. Report the exact seven `preparation_tests` count results as the runtime structural leg separately from Step 15's static post-capture preparation locality/centrality leg. This workload is comparable with Task 1's focused local receipt.
+Expected: exit 0 and no failed test. Report seven `preparation_tests` functions and all 203 measured route activations, including the exhaustive no-search/title/both-deep-tier valid-limit matrix, as the runtime structural leg separately from Step 15's static post-capture preparation locality/centrality leg. This workload is comparable with Task 1's focused local receipt.
 
 - [ ] **Step 4: Rebuild and run the full server package in one sandbox provenance bracket**
 
 Run this indivisible shell process; do not split build, image capture, test, or postflight:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local bash -c '
-set -u -o pipefail
-root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
-tag=freshell-sandbox:latest
+FRESHELL_VITEST_BACKEND=local bash <<'BASH'
+set -euo pipefail
 
-docker version >/dev/null || exit 1
-docker info >/dev/null || exit 1
-active_containers="$(docker ps -q --filter "ancestor=${tag}")" || exit 1
-if test -n "${active_containers}"; then
-  echo "shared sandbox image is in active use; wait and retry without killing it" >&2
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+sandbox_test="${root}/scripts/sandbox-test.sh"
+real_docker="$(type -P docker)"
+tmp_dir=
+wrapper=
+iidfile=
+expected_image_id=
+
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+
+  if [ -n "${wrapper}" ] && [ -e "${wrapper}" ]; then
+    rm -f -- "${wrapper}" || status=1
+  fi
+  if [ -n "${iidfile}" ] && [ -e "${iidfile}" ]; then
+    rm -f -- "${iidfile}" || status=1
+  fi
+  if [ -n "${tmp_dir}" ] && [ -d "${tmp_dir}" ]; then
+    rmdir -- "${tmp_dir}" || status=1
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+test -n "${real_docker}"
+test -x "${real_docker}"
+"${real_docker}" version >/dev/null
+"${real_docker}" info >/dev/null
+
+tmp_dir="$(mktemp -d /tmp/freshell-sandbox-provenance.XXXXXX)"
+wrapper="${tmp_dir}/docker"
+iidfile="${tmp_dir}/image.id"
+
+cat >"${wrapper}" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "build" ]; then
+  echo "pinned sandbox runner refuses mutable-tag fallback builds" >&2
   exit 1
 fi
+real_docker="${FRESHELL_REAL_DOCKER:?}"
+pinned_image_id="${FRESHELL_SANDBOX_IMAGE_ID:?}"
+args=()
+for arg in "$@"; do
+  if [ "${arg}" = "freshell-sandbox:latest" ]; then
+    args+=("${pinned_image_id}")
+  else
+    args+=("${arg}")
+  fi
+done
+exec "${real_docker}" "${args[@]}"
+WRAPPER
+chmod 700 "${wrapper}"
+bash -n "${wrapper}"
 
-"${root}/scripts/sandbox-build.sh" || exit $?
-expected_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
-printf "sandbox_image_id_before=%s\n" "${expected_image_id}"
+tag_count="$(grep -Fxc 'IMAGE_TAG="freshell-sandbox:latest"' "${sandbox_test}" || true)"
+inspect_count="$(grep -Fxc 'if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then' "${sandbox_test}" || true)"
+run_count="$(grep -Fxc 'docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?' "${sandbox_test}" || true)"
+test "${tag_count}" -eq 1
+test "${inspect_count}" -eq 1
+test "${run_count}" -eq 1
+
+"${real_docker}" build \
+  --network=host \
+  --build-arg "UID=$(id -u)" \
+  --build-arg "GID=$(id -g)" \
+  --iidfile "${iidfile}" \
+  "${root}/docker/sandbox"
+
+expected_image_id="$(cat "${iidfile}")"
+test -n "${expected_image_id}"
+built_image_id="$("${real_docker}" image inspect --format '{{.Id}}' "${expected_image_id}")"
+test "${built_image_id}" = "${expected_image_id}"
+printf 'sandbox_image_id=%s\n' "${expected_image_id}"
 
 test_status=0
-"${root}/scripts/sandbox-test.sh" "cargo test -p freshell-server --all-targets" || test_status=$?
+PATH="${tmp_dir}:${PATH}" \
+FRESHELL_REAL_DOCKER="${real_docker}" \
+FRESHELL_SANDBOX_IMAGE_ID="${expected_image_id}" \
+"${sandbox_test}" "cargo test -p freshell-server --all-targets" || test_status=$?
 
-actual_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
-printf "sandbox_image_id_after=%s\n" "${actual_image_id}"
-if test "${actual_image_id}" != "${expected_image_id}"; then
-  echo "sandbox image tag changed during the gate; result has invalid provenance" >&2
-  exit 1
-fi
+actual_image_id="$("${real_docker}" image inspect --format '{{.Id}}' "${expected_image_id}")"
+printf 'sandbox_image_id_after=%s\n' "${actual_image_id}"
+test "${actual_image_id}" = "${expected_image_id}"
 exit "${test_status}"
-'
+BASH
 ```
 
-Expected: Docker preflight succeeds; no active container uses the shared tag; this worktree's `sandbox-build.sh` succeeds; before/after image IDs are identical; `sandbox-test.sh` exits 0; and every `freshell-server --all-targets` target passes. Any other result stops final readiness. Wait rather than kill a foreign holder/container, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
+Expected: Docker preflight succeeds; the untagged worktree-context build succeeds; the `--iidfile` ID immediately resolves to that same full ID in the local Docker image store; the actual repository `sandbox-test.sh` wrapper runs `cargo test -p freshell-server --all-targets` with `docker run` receiving that full immutable ID; postflight still inspects the same full ID; all tests pass; owned wrapper/IID/temporary-directory artifacts clean successfully; the content-addressed image/cache is intentionally left to normal Docker policy with no image/tag deletion; and `freshell-sandbox:latest` is untouched. Any failure stops final readiness. Never kill or remove a foreign process, container, tag, or image, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
 
 - [ ] **Step 5: Run the direct sessions dependency regression**
 
@@ -6894,7 +7089,7 @@ Expected: exit 0 and every existing matrix case passes. This exact workload is c
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
+FRESHELL_VITEST_BACKEND=local env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep INIT_CWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep PWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
 ```
 
 Expected: exit 0 and truthful holder state. If another holder is active, wait and rerun this command; never kill or bypass it. Readiness/history cannot satisfy Step 14.
@@ -6904,10 +7099,10 @@ Expected: exit 0 and truthful holder state. If another holder is active, wait an
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page final local full suite" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
+FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page final local full suite" env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep INIT_CWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep PWD=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
 ```
 
-Expected: fresh coordinator-owned exit 0 from the target worktree and committed final `HEAD`, with output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute. The focused, browser, and coordinator workloads are comparable with Task 1 because both receipts use the same exact local backends; a failure in a non-baselined final command may require a targeted frozen-base reproduction rather than a retroactive baseline claim.
+Expected: fresh coordinator-owned exit 0 from the target worktree and committed final `HEAD`, with output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute, and final acceptance also requires Step 20's exact persisted `byKey.test` receipt assertion. The focused, browser, and coordinator workloads are comparable with Task 1 because both receipts use the same exact local backends; a failure in a non-baselined final command may require a targeted frozen-base reproduction rather than a retroactive baseline claim.
 
 - [ ] **Step 15: Repeat the mandatory static post-capture preparation locality and centrality proof against committed final `HEAD`**
 
@@ -6943,10 +7138,10 @@ def only_position(text: str, needle: str) -> int:
     assert text.count(needle) == 1, (needle, text.count(needle))
     return text.index(needle)
 
-# Exactly six named work-bound tests arm one TLS recorder around one fully awaited
-# real route request. This is an activation interval that may include
-# acquisition-time offload. The seventh current-thread test is explicitly the
-# lifecycle/reset-only test.
+# Exactly six named work-bound tests define one activation template per named test;
+# each dynamic case surrounds exactly one fully awaited real route request. The
+# interval may include acquisition-time offload. The seventh current-thread test
+# is explicitly the lifecycle/reset-only test.
 request_tests = (
     'no_search_materializes_only_returned_indexed_rows',
     'no_search_materializes_only_returned_synthesized_rows',
@@ -7076,7 +7271,8 @@ assert count(r'impl\s+(?:serde::)?Serialize\s+for\s+DirItem\b', production_code)
 assert count(r'#\[derive\([^\]]*\bSerialize\b[^\]]*\)\]\s*struct DirItem', production_code) == 0
 assert count(r'\bto_value\b', serializer) == 1
 
-# Keep the exact canonical chain and counter-site checks.
+# Exhaustive oversized runtime cases prove limiter semantics; this section proves
+# the exact canonical chain and counter-site centrality without locking source spelling.
 assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
 assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
 assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
@@ -7109,7 +7305,7 @@ print('static post-capture preparation locality/centrality proof: PASS')
 PY
 ```
 
-Expected: exit 0 and the explicit PASS line. The six named tests each arm one TLS recorder around exactly one fully awaited real route request and snapshot it only after full response-body completion; the seventh lifecycle-only test is excluded. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
+Expected: exit 0 and the explicit PASS line. The six named tests each define one TLS activation template, and every dynamic activation encloses exactly one fully awaited real route request before snapshot after full response-body completion; the seventh lifecycle-only test is excluded. The exhaustive oversized runtime matrix, not static source spelling, proves selector limiting for all valid limits and all no-search/title/deep modes. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
 
 - [ ] **Step 16: Prove eager policy functions are absent from `HEAD`**
 
@@ -7151,29 +7347,61 @@ FRESHELL_VITEST_BACKEND=local bash -o pipefail -c "git -C /home/dan/code/freshel
 
 Expected: exit 0 and no output.
 
-- [ ] **Step 20: Prove the worktree is clean**
+- [ ] **Step 20: Prove the worktree is clean and the final coordinator receipt has exact provenance**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=local test -z "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep status --porcelain=v1 --untracked-files=all)"
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+summary="session-directory lazy-page final local full suite"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+head="$(git -C "$root" rev-parse HEAD)"
+record="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/freshell-test-coordinator/command-runs.json"
+ROOT="$root" HEAD="$head" SUMMARY="$summary" RECORD="$record" python3 - <<PY
+import json
+import os
+from pathlib import Path
+
+root = os.environ["ROOT"]
+head = os.environ["HEAD"]
+summary = os.environ["SUMMARY"]
+record = json.loads(
+    Path(os.environ["RECORD"]).read_text(encoding="utf-8")
+)["byKey"]["test"]
+assert record["summary"] == summary, record
+assert record["summarySource"] == "env", record
+assert record["outcome"] == "success", record
+assert record["exitCode"] == 0, record
+assert record["entrypoint"] == {"commandKey": "test", "suiteKey": "full-suite"}, record
+assert record["command"] == {"display": "npm test", "argv": ["test"]}, record
+repo = record["repo"]
+assert repo["invocationCwd"] == root, repo
+assert repo["checkoutRoot"] == root, repo
+assert repo["worktreePath"] == root, repo
+assert repo["commit"] == head, repo
+assert repo["isDirty"] is False, repo
+print("coordinator receipt provenance: PASS")
+PY
+'
 ```
 
-Expected: exit 0. No readiness, historical, focused-only, or preflight result substitutes for any required runtime gate. Do not inspect or enforce commit count, commit subjects, or commit order.
+Expected: exit 0 with clean status and the exact line `coordinator receipt provenance: PASS`, machine-proving the unique environment-sourced final summary, successful exit-0 `test`/`full-suite`, exact `npm test` command shape, exact target `invocationCwd`/`checkoutRoot`/`worktreePath`, contemporaneous final `HEAD`, and `isDirty=false` from persisted `command-runs.json.byKey.test`. No readiness, historical, focused-only, or preflight result substitutes for any required runtime gate. Do not inspect or enforce commit count, commit subjects, or commit order.
 
 ## Self-Review Checklist and Results
 
-- [x] **1. Spec coverage:** Re-ran coverage against the complete corrected plan and the original requirements plus LB-01/LB-03/LB-05/LB-06/LB-08/LB-09/LB-10. Exactly seven Tasks remain. The Base64 chain is covered from Task 3's sole cursor helper through Task 4's parent trait import, Task 5's glob-import handoff and migrated callers, Task 6's retention point, and Task 7's planned locked compile/focused/warnings-denied gates. The LB-08 chain retains both mandatory proof legs: six exact real-route runtime structural count tests and the Task 6/7 static post-capture preparation locality/centrality proof; the seventh lifecycle-only test remains excluded. No amended requirement lacks a task.
-- [x] **1b. No silent deferrals of required behavior:** `StaticSessionSource` remains deterministic input to the real `SessionIndex` and authenticated Axum route, and Task 4 cuts over the actual handler. Browser preflight is only readiness; Tasks 1 and 7 require the exact local matrix. Docker/image checks are only provenance; Tasks 6 and 7 require the exact sandbox all-target run with a stable rebuilt image ID. TLS counters are only the runtime leg; Tasks 6 and 7 also require the static post-capture proof of capture-before-derive ordering, counted-region locality, recorder-site confinement, direct polling, and full-body completion. The Base64 handoff is exercised by migrated cursor cases and future locked compile/focused/warnings-denied gates. Pre-cutover compilation, unbounded differentials, and pre-deletion parity do not substitute for their later production gates. No product/runtime gate was executed during this document review, and no fake, preflight, seam, or future-only substitute is claimed as execution evidence.
-- [x] **2. Placeholder and stale-claim scan:** Re-ran the full-plan scan for prohibited deferred markers, vague implementation instructions, moved/undefined names, remote-backend execution, stale oracle timing, TLS-only proof, premature green claims, and unbracketed sandbox work. No stale whole-request/source-wide no-offload claim remains: both static scripts use the scoped PASS label and receipt, allow acquisition-time offload, and omit the obsolete whole-source assertions. Task 5 has no redundant direct Base64 trait import or duplicate cursor helper. Fresh product/runtime gates remain pending execution.
-- [x] **3. Type/signature/lifecycle consistency:** Rechecked Tasks 3-7 in order. There is one `encode_raw_cursor_payload(payload: &[u8]) -> String`; Task 4 retains parent `Engine as _`; Task 5 retains `use super::*;`, names all three inherited helpers, and reuses the cursor helper without redefining it; Task 6's retention/deletion wording remains aligned. The Task 6/7 Python proof bodies are byte-identical: every symbol is defined before use, capture order is index -> overrides -> metadata -> identities -> sole synchronous `derive_directory_page` -> snapshot release, scans cover the complete local candidate region plus provider-name/serializer/transcript helpers, and each recorder token is bound to its selector/materializer/serializer region while preserving sole-chain/direct-poll/full-body checks. The final-selector, oracle-deletion, final `DirItem`, parser/`Comparable`, locked-assembly, exact-one-signature, monotonic-step, and path-prefixed command lifecycles remain consistent.
+- [x] **1. Spec coverage:** Re-ran coverage against the complete Iteration 2-corrected plan and the original requirements plus LB-01/LB-03/LB-05/LB-06/LB-08/LB-09/LB-10. Exactly seven Tasks remain. Task 4's RED qualifies `std::cmp::Ordering::Greater` before the later production import. All five Task 1/7 coordinator invocations pin real cwd, `INIT_CWD`, `PWD`, and npm prefix, while Task 1 Step 8 and Task 7 Step 20 machine-prove persisted receipts. Task 6/7 sandbox brackets build from the worktree without creating a Docker tag, pass the exact `--iidfile` image ID to the real sandbox runner, and never use shared `latest` for provenance or selection. LB-08 retains both mandatory legs: six named real-route request tests execute a 203-case matrix that exhausts every valid limit on oversized no-search/title/both-deep-tier corpora, while byte-identical Task 6/7 static proofs establish post-capture locality/centrality; the seventh test function remains lifecycle-only. No amended requirement lacks a task.
+- [x] **1b. No silent deferrals of required behavior:** Task 4's real compiler RED must reach only the intentionally absent candidate symbols. Coordinator status remains readiness-only; acceptance requires the fresh local suite plus persisted exact target-worktree/current-HEAD receipt. Docker readiness/build/inspection alone is not package evidence; the exact `--iidfile` ID from each worktree-context build is passed as the `docker run` image reference while the real `scripts/sandbox-test.sh` executes the all-target workload. TLS/counter sites alone are not work-bound proof; the runtime leg exhausts limits 1-50 on `MAX_DIRECTORY_PAGE_ITEMS + 2` corpora for no-search, title, `userMessages`, and `fullText`, and the static companion proves capture-before-derive ordering, counted-region locality, recorder-site confinement, direct polling, and full-body completion without substituting source spelling for limiter semantics. Pre-cutover compilation, unbounded differentials, and pre-deletion parity do not substitute for later production gates. No product/runtime gate was executed during this document review, and no fake, preflight, seam, mutable tag, static-only check, or future-only substitute is claimed as execution evidence.
+- [x] **2. Placeholder and stale-claim scan:** Re-ran the full-plan scan for prohibited deferred markers, vague implementation instructions, moved/undefined names, remote-backend execution, stale oracle timing, TLS-only proof, premature green claims, and unbracketed sandbox work. The Task 4 RED has no premature unqualified comparison ordering; every coordinator command pins provenance inputs; no claim treats mutable-tag endpoint equality as container identity; and no static-proof or self-review wording assigns full limiter semantics to counter placement or limits 1-2. Both static scripts use the scoped PASS label and receipt, allow acquisition-time offload, and omit obsolete whole-source or limiter-spelling assertions. Fresh product/runtime gates remain pending execution.
+- [x] **3. Type/signature/lifecycle consistency:** Rechecked Tasks 3-7 in execution order. Task 4's fully qualified RED expression coexists with the later sole production `cmp::Ordering` import and unqualified production uses. All five coordinator invocations use the same target cwd/`INIT_CWD`/`PWD`/prefix contract, and both persisted receipt bodies assert the same record schema with task-specific summaries. The Task 6/7 sandbox brackets are byte-identical from the untagged worktree build and `--iidfile` through immediate local-ID validation, wrapper substitution, immutable-ID postflight, status propagation, and filesystem-only cleanup; no image/tag deletion is attempted. The Task 6/7 Python proof bodies are byte-identical: each named request function has one syntactic activation template despite dynamic loops; all symbols are defined before use; capture order, sole-chain, counter-site, direct-poll, and full-body checks remain intact; and no brittle limiter regex was added. Seven current-thread Rust test functions remain while six named functions execute 203 measured route cases. The final-selector, oracle-deletion, final `DirItem`, parser/`Comparable`, locked-assembly, exact-one-signature, monotonic-step, and path-prefixed command lifecycles remain consistent.
 - [x] **Mandatory structure and task boundaries:** The workflow execute-stage header, goal, architecture, tech stack, global constraints, file map, dependency order, and exactly seven numbered Tasks are present. Task 1 and Task 7 are validation-only; Task 5 ends with the eager oracle intact; Task 6 alone proves the final selector, deletes the oracle, finalizes output, and proves bounds.
-- [x] **Bite-sized execution:** Task 5 and Task 6 step numbers are monotonic. Module shells, cohesive helper groups, individual tests, production functions/types, independent commands, and commits remain separate. The two sandbox provenance brackets are the documented narrow exception: each stays one indivisible process so its captured image ID cannot race across steps.
+- [x] **Bite-sized execution:** Task 5 and Task 6 step numbers are monotonic. Module shells, cohesive helper groups, individual tests, production functions/types, independent commands, and commits remain separate. The two sandbox provenance brackets are the documented narrow exception: each indivisible bracket builds without a Docker tag, records the exact `--iidfile` ID, pins the real sandbox runner to that full ID, fail-closed cleans only its wrapper/IID/temporary-directory artifacts, and intentionally leaves the content-addressed image/cache to normal Docker policy.
 - [x] **Supported concurrency contract:** Snapshots/values are independent and sequential in accessor order, never an atomic cross-store instant. Overlapping writes and old projection/read race windows are unspecified; no race test freezes one allowed outcome. `revision` is full-corpus candidate/identity recency, not a cross-store version. Every deterministic candidate/override/metadata/live-join/order/cursor/visibility/search/partial/page obligation remains exact for fixed captured inputs and non-overlapping operations.
 - [x] **One borrowed architecture and compiler residual:** The plan retains one borrowed candidate representation in one source file. Compiler failure is a fail-closed stop and architecture-reopen condition, never authorization for an owned fallback, adapter, manifest/public/store/index API change, or second file. Locked stop-gates exist before and immediately after cutover, after final assembly, and at Task 7 start.
-- [x] **Combined work-bound proof:** At most `limit + 1` descriptors/owned annotations and at most `limit` materializations/serializations require both exact real-route runtime counts and the mandatory static post-capture preparation locality/centrality proof. Each of the six named request tests establishes one activation interval (`begin < fully awaited request < snapshot`); the seventh lifecycle-only test is explicitly excluded. The static gate proves all four captures precede the sole synchronous derivation, no await or recognized handoff occurs in the post-capture counted route/candidate region or transcript helper, every counter site is confined to the sole selector/materializer/serializer chain, and Tower/Axum polling is direct with full-body completion before snapshot. Acquisition-time offload is allowed, TLS alone is inadmissible, and Tasks 6 and 7 contain the same byte-identical static proof body plus the same runtime structural suite.
+- [x] **Combined work-bound proof:** At most `limit + 1` descriptors/owned annotations and exactly `limit` materializations/serializations on full pages require both the full-valid-domain real-route runtime matrix and the mandatory static post-capture preparation locality/centrality proof. Six named request functions execute 203 measured cases: 50 no-search indexed, three focused single cases, 50 title, and 100 deep across `userMessages`/`fullText`; every bound-stressing corpus has `MAX_DIRECTORY_PAGE_ITEMS + 2` eligible/matching rows, and each dynamic matrix case establishes one activation interval (`begin < fully awaited request < snapshot`). The seventh function is lifecycle-only. Runtime evidence proves selector-limit semantics; the static gate proves all captures precede the sole synchronous derivation, no await or recognized handoff occurs in the post-capture counted route/candidate region or transcript helper, every counter site is confined to the sole selector/materializer/serializer chain, and Tower/Axum polling is direct with full-body completion before snapshot. Acquisition-time offload is allowed, TLS alone is inadmissible, and Tasks 6 and 7 contain the same byte-identical static proof body plus the same runtime suite.
 - [x] **Assertion and oracle sequencing:** All existing behavior/data-model/lookahead assertions remain. The exact final selector is unchanged. The final 2,884-case parsed/byte differential runs after that selector and before oracle deletion with no intervening production edit; exact route, structural, and focused gates run before deletion, and locked compile plus exact literal bytes, structural, page-bound, and focused gates rerun after final output cleanup.
 - [x] **Helper lifecycle and residue:** Task 5 consumes Task 3's single definitions of `encode_raw_cursor_payload`, `write_nonmatching_claude_transcript`, and `deep_search_query` without redefining them; its complete import replacement preserves Base64 method resolution through Task 4's parent-module `Engine as _` import and `use super::*;` without leaving a redundant direct test-local import. Task 6 deletes eager helpers and all differential support only after final-selector parity, then uses the same complete residue-name set that Task 7 repeats against `HEAD`.
-- [x] **Command and backend discipline:** Every runnable shell fence begins with `FRESHELL_VITEST_BACKEND=local`, is self-contained, and uses absolute paths or `git -C`. No raw Vitest command, remote-wrapper execution dependency, caller-directory assumption, unsandboxed broad package fallback, narrowed substitute, or waiver appears. Task 1 and Task 7 use comparable local focused/browser/coordinator workloads.
+- [x] **Command and backend discipline:** Every runnable shell fence begins with `FRESHELL_VITEST_BACKEND=local`, is self-contained, and uses absolute paths or `git -C`. All coordinator npm calls pin the target as real cwd, `INIT_CWD`, `PWD`, and prefix; Task 1/7 receipt closes assert exact persisted paths, commit, clean state, summary source, entrypoint, command, outcome, and exit code. No raw Vitest command, remote-wrapper execution dependency, caller-directory assumption, unsandboxed broad package fallback, narrowed substitute, or waiver appears. Task 1 and Task 7 use comparable local focused/browser/coordinator workloads.
 - [x] **Scope and workflow discipline:** No manifest, lockfile, kata configuration, package file, TypeScript, or JavaScript edit is planned. Task 7 expects exactly the plan plus `crates/freshell-server/src/session_directory.rs` from the frozen base. Local commit examples do not prescribe history, and no push, pull request, merge, deployment, or restart is included.
-- [x] **Residual-risk control, not pre-execution attestation:** LB-05, LB-06, LB-08, and LB-10 are corrected in the plan by the explicit post-capture counted-region boundary, final-selector oracle sequencing, combined static/runtime proof, and mandatory local backend. LB-01, LB-03, and LB-09 remain accepted residuals pending their exact fail-closed execution gates. This document review does not claim those runtime gates have passed; no requirement is deferred or waived.
+- [x] **Residual-risk control, not pre-execution attestation:** LB-05, LB-06, LB-08, and LB-10 are corrected in the plan by the explicit post-capture counted-region boundary, final-selector oracle sequencing, full-valid-domain oversized-corpus runtime matrix plus static locality/centrality, immutable sandbox-image pinning, exact coordinator provenance receipts, and mandatory local backend. LB-01, LB-03, and LB-09 remain accepted residuals pending their exact fail-closed execution gates. This document review does not claim those runtime gates have passed; no requirement is deferred or waived.
