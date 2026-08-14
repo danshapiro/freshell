@@ -29,7 +29,7 @@
 - LB-03 is accepted only as a compiler residual risk, not a confirmed compile claim. The complete borrowed core must pass locked production and inline-test compiler stop-steps before handler cutover; the real Axum handler must pass the same locked checks immediately after cutover; final cleanup/selector assembly must compile before commit and again in final validation. Any failure stops and permits only correction of the planned one-file borrowed design plus complete rerun. It never authorizes an owned/index-provenance fallback, compatibility adapter, public/store/index API or manifest change, or another source file. If correction cannot stay within those bounds, reopen the architecture decision before further edits.
 - The full corpus may require `O(N)` shallow candidates, stable sorting, and sparse-search inspection. The accepted bound is at most `limit + 1` retained descriptors/annotations and at most `limit` full-row materializations/serializations.
 - Keep deep search's `limit * 10` scan budget and exact check order: lookahead count, budget, source, provider, increment, file I/O. A later budget stop overwrites an earlier `io_error` reason.
-- Exact TLS structural counts plus a mandatory static locality/centrality proof establish the bound; neither elapsed time nor TLS alone is evidence. The static leg requires current-thread structural tests, no spawn/offload in the measured Freshell call graph, direct Tower/Axum polling, full response-body completion before snapshot, and exact-one production selection/materialization/serialization sites. Any static invariant failure stops and reopens LB-08; do not waive it or silently keep the counters. Do not make allocator, RSS, or latency claims.
+- Exact TLS structural counts plus a mandatory static post-capture preparation locality/centrality proof establish the bound; neither elapsed time nor TLS alone is evidence. `PreparationScope` is a request-level activation window, not a claim that index/metadata acquisition is same-thread. The static leg requires current-thread structural tests; proves that the awaited index snapshot, override snapshot, awaited metadata snapshot, and identity snapshot all precede the sole synchronous `derive_directory_page` call; proves no await or recognized handoff in the post-capture counted candidate-derivation subgraph or transcript helper; proves direct Tower/Axum polling and full response-body completion before the test snapshots counts; and proves exact-one production selection/materialization/serialization sites. Acquisition-time offload before candidate derivation is allowed and outside the counted-work locality claim. Any failure of the post-capture locality/centrality invariant stops and reopens LB-08; do not waive it or silently keep the counters. Do not make allocator, RSS, or latency claims.
 - Use RED-GREEN-REFACTOR. Characterization tests added before the refactor must pass against the eager route; Task 4's intended RED is missing candidate symbols; Task 6's intended RED is exact structural-count mismatch.
 - Every checkbox step is one monotonic 2-5 minute action: one module shell, cohesive helper group, individual test, production function or implementation/type group, independent command, or commit. Do not combine unrelated tests, function groups, or commands into one step. A provenance-bracketed sandbox gate is one indivisible evidence action even though its internal build/run/postflight and duration exceed ordinary step granularity; it must remain one self-contained shell process so the captured image ID cannot be handed off or recomputed ambiguously.
 - Every shell command is self-contained, uses absolute paths or `git -C`, assumes no caller working directory, and begins with `FRESHELL_VITEST_BACKEND=local` even when it does not invoke Vitest. This branch-local override is mandatory because LB-10 falsified reviewed-source provenance and race freedom for the remote wrapper; it does not alter repository or user configuration.
@@ -3755,7 +3755,7 @@ Expected: exit 0 and a normal local source-only commit.
 - Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/fixtures/sessions/**`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/sessions_tests.rs` for the unchanged cross-router override assertion.
 
 **Interfaces:**
-- Consumes: Task 3's unchanged `fn write_nonmatching_claude_transcript(path: &Path)` and `fn deep_search_query() -> DirQuery` helpers; Task 4's production `build_directory_candidates`, `resolve_indexed_overlay`, `derive_directory_page`, temporary unbounded selector/materializer, handler cutover, and temporary eager differential.
+- Consumes: Task 3's unchanged `fn encode_raw_cursor_payload(payload: &[u8]) -> String`, `fn write_nonmatching_claude_transcript(path: &Path)`, and `fn deep_search_query() -> DirQuery` helpers; Task 4's production `build_directory_candidates`, `resolve_indexed_overlay`, `derive_directory_page`, temporary unbounded selector/materializer, handler cutover, and temporary eager differential.
 - Produces: all retained semantic assertions routed through `IndexedSession` and the production derivation while deliberately retaining, under test-only use, every eager helper, `derive_eager_oracle_page`, all 2,884-case differential support, the temporary legacy `DirItem` fields/materializer/serializer, and the unbounded non-deep selector. Task 6 consumes and removes that one oracle after proving the final selector; Task 5 adds no second oracle representation.
 
 - [ ] **Step 1: Update the main test-module imports for indexed derivation**
@@ -3767,6 +3767,8 @@ At the top of the existing main `tests` module, replace its imports with this co
     use freshell_sessions::directory_index::{ClaudeSource, SessionIndex, SessionSource};
     use std::time::Duration;
 ```
+
+This replacement intentionally removes Task 3's direct test-local `use base64::Engine as _;`. Task 4 retains `Engine as _` at the parent module scope, and this block's `use super::*;` imports that anonymous trait into `tests`, so the retained `encode_raw_cursor_payload` helper still resolves `URL_SAFE_NO_PAD.encode(...)`. Do not add a second direct trait import: after rustfmt places `use super::*;` first, Rust 1.96 reports the direct import as unused, which would fail Task 7's warnings-denied Clippy gates.
 
 - [ ] **Step 2: Add the shared indexed-row fixture**
 
@@ -5250,7 +5252,7 @@ Expected: exit 0 and a normal local source-only migration commit. The eager help
 
 **Interfaces:**
 - Consumes: Task 5's migrated tests, retained eager helpers/oracle and 2,884-case differential, legacy temporary `DirItem` fields/materializer/serializer, temporary unbounded non-deep selector, single production candidate path, and Task 2 route harness.
-- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; structural RED against the unbounded selector; the exact verified final selector; final-selector parsed/byte parity against the retained eager oracle before deletion; final non-`Clone` counted output path; no eager/differential residue; exact runtime structural counts plus the mandatory static locality/centrality proof; locked final assembly; and provenance-bracketed sandbox evidence. TLS counters are one runtime evidence leg, never sole proof.
+- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; structural RED against the unbounded selector; the exact verified final selector; final-selector parsed/byte parity against the retained eager oracle before deletion; final non-`Clone` counted output path; no eager/differential residue; exact runtime structural counts plus the mandatory static post-capture preparation locality/centrality proof; locked final assembly; and provenance-bracketed sandbox evidence. TLS counters are one runtime evidence leg, never sole proof.
 
 - [ ] **Step 1: Add the preparation counter value type**
 
@@ -5309,6 +5311,8 @@ impl PreparationScope {
     }
 }
 ```
+
+`PreparationScope` only arms the test recorder. Its lexical lifetime surrounds the real request so the test can read counts after full body completion; the bounded-work measurement consists only of `record_preparation` sites, which the mandatory static gate proves are downstream of all four input captures in one synchronous derivation.
 
 - [ ] **Step 4: Clear preparation state when the scope drops**
 
@@ -6447,7 +6451,7 @@ FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees
 
 Expected: no matches and exit 0. Task 7 repeats this exact complete residue-name set against committed `HEAD`.
 
-- [ ] **Step 44: Run the mandatory static locality and centrality proof**
+- [ ] **Step 44: Run the mandatory static post-capture preparation locality and centrality proof**
 
 Run this source-shape and locked-dependency gate after the post-cleanup compiler/route/structural/focused evidence and before sandbox or commit:
 
@@ -6481,8 +6485,10 @@ def only_position(text: str, needle: str) -> int:
     assert text.count(needle) == 1, (needle, text.count(needle))
     return text.index(needle)
 
-# Exactly six named work-bound tests measure one fully awaited real route request.
-# The seventh current-thread test is explicitly the lifecycle/reset-only test.
+# Exactly six named work-bound tests arm one TLS recorder around one fully awaited
+# real route request. This is an activation interval that may include
+# acquisition-time offload. The seventh current-thread test is explicitly the
+# lifecycle/reset-only test.
 request_tests = (
     'no_search_materializes_only_returned_indexed_rows',
     'no_search_materializes_only_returned_synthesized_rows',
@@ -6519,11 +6525,6 @@ for test_name in request_tests:
     assert begin < request.start() < request.end() < snapshot, test_name
 assert source.count('let counts = scope.snapshot();') == 6
 
-# No Freshell handoff exists in the synchronous measured path or transcript helper.
-offload = re.compile(r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))')
-assert offload.search(source) is None
-assert offload.search(search) is None
-
 # The route helper directly polls one request and fully collects its body before returning.
 bytes_helper = braced_region(source, '    async fn get_page_with_bytes(')
 page_helper = braced_region(source, '    async fn get_page(')
@@ -6546,11 +6547,49 @@ assert count(constructor_pattern, test_only_parser) == 1
 production = production_region.replace(join_tests, '', 1).replace(test_only_parser, '', 1)
 production_code = '\n'.join(line.split('//', 1)[0] for line in production.splitlines())
 
+route = braced_region(production, 'async fn session_directory(')
+provider_name = braced_region(production, 'fn provider_display_name(')
 selector = braced_region(production, "fn select_page_candidates<'a>(")
 materializer = braced_region(production, 'fn materialize_selected_candidate(')
 derive = braced_region(production, 'fn derive_directory_page(')
 dir_item_impl = braced_region(production, 'impl DirItem {')
 serializer = braced_region(dir_item_impl, '    fn to_value(&self) -> Value {')
+
+# The TLS activation surrounds the full request, but counted work starts only
+# after all independent input captures and remains in synchronous derivation.
+index_capture = only_position(route, 'Some(index) => Some(index.snapshot().await),')
+overrides_capture = only_position(route, 'let overrides = state.settings.session_overrides();')
+metadata_capture = only_position(route, 'let metadata = state.metadata.get_all().await;')
+identities_capture = only_position(route, 'let identities = state.identity.list();')
+derive_call = only_position(route, 'derive_directory_page(')
+snapshot_release = only_position(route, 'drop(snapshot);')
+assert (
+    index_capture
+    < overrides_capture
+    < metadata_capture
+    < identities_capture
+    < derive_call
+    < snapshot_release
+)
+post_capture_route = route[identities_capture:snapshot_release]
+assert post_capture_route.count('derive_directory_page(') == 1
+assert '.await' not in post_capture_route
+
+# Scan the complete local candidate-function block, the serializer, and the
+# external synchronous transcript module. Index/metadata acquisition is
+# intentionally outside this no-handoff claim and may offload.
+candidate_start = only_position(production, "fn resolve_indexed_overlay<'a>(")
+candidate_end = production.index(derive) + len(derive)
+candidate_region = production[candidate_start:candidate_end]
+offload = re.compile(
+    r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))'
+)
+assert re.search(r'\basync\s+fn\b|\.await\b', candidate_region) is None
+assert offload.search(post_capture_route) is None
+assert offload.search(provider_name) is None
+assert offload.search(candidate_region) is None
+assert offload.search(serializer) is None
+assert offload.search(search) is None
 
 # Exact-one policy definitions and exhaustive production references/call sites.
 assert count(r'^fn compare_directory_order\(', production) == 1
@@ -6583,12 +6622,12 @@ assert count(r'\bto_value\b', serializer) == 1
 assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
 assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
 assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
-assert source.count('rows.push(SelectedCandidate {') == 1
-assert source.count('counts.retained_descriptor_peak =') == 1
-assert source.count('counts.indexed_materializations += 1') == 1
-assert source.count('counts.synthesized_materializations += 1') == 1
-assert source.count('counts.serializations += 1') == 1
-assert source.count('counts.owned_annotations += 1') == 2
+assert source.count('rows.push(SelectedCandidate {') == selector.count('rows.push(SelectedCandidate {') == 1
+assert source.count('counts.retained_descriptor_peak =') == selector.count('counts.retained_descriptor_peak =') == 1
+assert source.count('counts.indexed_materializations += 1') == materializer.count('counts.indexed_materializations += 1') == 1
+assert source.count('counts.synthesized_materializations += 1') == materializer.count('counts.synthesized_materializations += 1') == 1
+assert source.count('counts.serializations += 1') == serializer.count('counts.serializations += 1') == 1
+assert source.count('counts.owned_annotations += 1') == selector.count('counts.owned_annotations += 1') == 2
 
 # Locked Tower/Axum mechanisms remain direct-poll, full-body, synchronous-JSON paths.
 registry = Path('/home/dan/.cargo/registry/src')
@@ -6608,11 +6647,11 @@ assert 'Handler::call(handler, req, self.state.clone())' in handler
 assert 'IntoServiceFuture::new(future)' in handler
 assert re.search(r'Limited::new\(body, limit\)\s*\.collect\(\)\s*\.await', body)
 assert 'serde_json::to_writer(&mut buf, &self.0)' in json
-print('static preparation locality/centrality proof: PASS')
+print('static post-capture preparation locality/centrality proof: PASS')
 PY
 ```
 
-Expected: exit 0 and the explicit PASS line. This static leg extracts all six named request-count test bodies and proves exactly one scope, one fully awaited measured route request, one snapshot, and `begin < awaited request < snapshot` in each while explicitly excluding the seventh lifecycle/reset-only test. It also proves no offload in the measured Freshell call graph, direct Tower/Axum polling, reviewed locked dependency mechanisms, the sole production selector/materializer/serializer call chain, no alternate production `DirItem` construction/materialization/serialization path, and the exact canonical-chain/counter sites. If any invariant fails, the TLS counts are inadmissible: stop before sandbox/commit, restore the direct same-thread centralized path and rerun both static and runtime gates, or reopen LB-08 and replace TLS with a concrete fail-closed request-carried/thread-safe probe. Never waive a static failure because TLS is fail-open off-thread.
+Expected: exit 0 and the explicit PASS line. The six named tests each arm one TLS recorder around exactly one fully awaited real route request and snapshot it only after full response-body completion; the seventh lifecycle-only test is excluded. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
 
 - [ ] **Step 45: Rebuild and run the broad server package in one sandbox provenance bracket**
 
@@ -6661,7 +6700,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "perf(session-directory): bound returned-page preparation" -m "Install the verified bounded selector, prove final eager parity, remove test-only oracle residue, finalize the counted output path, and retain combined static/runtime structural coverage." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
-Expected: exit 0 and a normal local source-only commit. This commit is authorized only after the locked final assembly, post-cleanup literal/structural/focused tests, residue checks, static locality/centrality proof, and sandbox provenance bracket all pass.
+Expected: exit 0 and a normal local source-only commit. This commit is authorized only after the locked final assembly, post-cleanup literal/structural/focused tests, residue checks, static post-capture preparation locality/centrality proof, and sandbox provenance bracket all pass.
 
 ### Task 7: Run final checks and prove exact scope
 
@@ -6672,7 +6711,7 @@ Expected: exit 0 and a normal local source-only commit. This commit is authorize
 
 **Interfaces:**
 - Consumes: Task 6's committed final source and all retained test interfaces.
-- Produces: separate locked production and inline-test compiler receipts; exact runtime structural-count and static locality/centrality receipts; fresh focused, rebuilt-image sandbox package, dependency, format, lint, exact local browser-matrix, and fresh coordinator-owned local-suite pass evidence; plus single-policy/call-site, residue, exact-file-scope, forbidden-file, and clean-state evidence. Browser/Docker preflights and coordinator history are readiness/provenance only, never runtime pass evidence. No repository file changes.
+- Produces: separate locked production and inline-test compiler receipts; exact runtime structural-count and static post-capture preparation locality/centrality receipts; fresh focused, rebuilt-image sandbox package, dependency, format, lint, exact local browser-matrix, and fresh coordinator-owned local-suite pass evidence; plus single-policy/call-site, residue, exact-file-scope, forbidden-file, and clean-state evidence. Browser/Docker preflights and coordinator history are readiness/provenance only, never runtime pass evidence. No repository file changes.
 
 - [ ] **Step 1: Compile the committed final production source against the lockfile**
 
@@ -6702,7 +6741,7 @@ Run:
 FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
-Expected: exit 0 and no failed test. Report the exact seven `preparation_tests` count results as the runtime structural leg separately from Step 15's static locality/centrality leg. This workload is comparable with Task 1's focused local receipt.
+Expected: exit 0 and no failed test. Report the exact seven `preparation_tests` count results as the runtime structural leg separately from Step 15's static post-capture preparation locality/centrality leg. This workload is comparable with Task 1's focused local receipt.
 
 - [ ] **Step 4: Rebuild and run the full server package in one sandbox provenance bracket**
 
@@ -6870,7 +6909,7 @@ FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page
 
 Expected: fresh coordinator-owned exit 0 from the target worktree and committed final `HEAD`, with output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute. The focused, browser, and coordinator workloads are comparable with Task 1 because both receipts use the same exact local backends; a failure in a non-baselined final command may require a targeted frozen-base reproduction rather than a retroactive baseline claim.
 
-- [ ] **Step 15: Repeat the mandatory static locality and centrality proof against committed final `HEAD`**
+- [ ] **Step 15: Repeat the mandatory static post-capture preparation locality and centrality proof against committed final `HEAD`**
 
 Run the same hard source-shape and locked-dependency gate as Task 6:
 
@@ -6904,8 +6943,10 @@ def only_position(text: str, needle: str) -> int:
     assert text.count(needle) == 1, (needle, text.count(needle))
     return text.index(needle)
 
-# Exactly six named work-bound tests measure one fully awaited real route request.
-# The seventh current-thread test is explicitly the lifecycle/reset-only test.
+# Exactly six named work-bound tests arm one TLS recorder around one fully awaited
+# real route request. This is an activation interval that may include
+# acquisition-time offload. The seventh current-thread test is explicitly the
+# lifecycle/reset-only test.
 request_tests = (
     'no_search_materializes_only_returned_indexed_rows',
     'no_search_materializes_only_returned_synthesized_rows',
@@ -6942,11 +6983,6 @@ for test_name in request_tests:
     assert begin < request.start() < request.end() < snapshot, test_name
 assert source.count('let counts = scope.snapshot();') == 6
 
-# No Freshell handoff exists in the synchronous measured path or transcript helper.
-offload = re.compile(r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))')
-assert offload.search(source) is None
-assert offload.search(search) is None
-
 # The route helper directly polls one request and fully collects its body before returning.
 bytes_helper = braced_region(source, '    async fn get_page_with_bytes(')
 page_helper = braced_region(source, '    async fn get_page(')
@@ -6969,11 +7005,49 @@ assert count(constructor_pattern, test_only_parser) == 1
 production = production_region.replace(join_tests, '', 1).replace(test_only_parser, '', 1)
 production_code = '\n'.join(line.split('//', 1)[0] for line in production.splitlines())
 
+route = braced_region(production, 'async fn session_directory(')
+provider_name = braced_region(production, 'fn provider_display_name(')
 selector = braced_region(production, "fn select_page_candidates<'a>(")
 materializer = braced_region(production, 'fn materialize_selected_candidate(')
 derive = braced_region(production, 'fn derive_directory_page(')
 dir_item_impl = braced_region(production, 'impl DirItem {')
 serializer = braced_region(dir_item_impl, '    fn to_value(&self) -> Value {')
+
+# The TLS activation surrounds the full request, but counted work starts only
+# after all independent input captures and remains in synchronous derivation.
+index_capture = only_position(route, 'Some(index) => Some(index.snapshot().await),')
+overrides_capture = only_position(route, 'let overrides = state.settings.session_overrides();')
+metadata_capture = only_position(route, 'let metadata = state.metadata.get_all().await;')
+identities_capture = only_position(route, 'let identities = state.identity.list();')
+derive_call = only_position(route, 'derive_directory_page(')
+snapshot_release = only_position(route, 'drop(snapshot);')
+assert (
+    index_capture
+    < overrides_capture
+    < metadata_capture
+    < identities_capture
+    < derive_call
+    < snapshot_release
+)
+post_capture_route = route[identities_capture:snapshot_release]
+assert post_capture_route.count('derive_directory_page(') == 1
+assert '.await' not in post_capture_route
+
+# Scan the complete local candidate-function block, the serializer, and the
+# external synchronous transcript module. Index/metadata acquisition is
+# intentionally outside this no-handoff claim and may offload.
+candidate_start = only_position(production, "fn resolve_indexed_overlay<'a>(")
+candidate_end = production.index(derive) + len(derive)
+candidate_region = production[candidate_start:candidate_end]
+offload = re.compile(
+    r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))'
+)
+assert re.search(r'\basync\s+fn\b|\.await\b', candidate_region) is None
+assert offload.search(post_capture_route) is None
+assert offload.search(provider_name) is None
+assert offload.search(candidate_region) is None
+assert offload.search(serializer) is None
+assert offload.search(search) is None
 
 # Exact-one policy definitions and exhaustive production references/call sites.
 assert count(r'^fn compare_directory_order\(', production) == 1
@@ -7006,12 +7080,12 @@ assert count(r'\bto_value\b', serializer) == 1
 assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
 assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
 assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
-assert source.count('rows.push(SelectedCandidate {') == 1
-assert source.count('counts.retained_descriptor_peak =') == 1
-assert source.count('counts.indexed_materializations += 1') == 1
-assert source.count('counts.synthesized_materializations += 1') == 1
-assert source.count('counts.serializations += 1') == 1
-assert source.count('counts.owned_annotations += 1') == 2
+assert source.count('rows.push(SelectedCandidate {') == selector.count('rows.push(SelectedCandidate {') == 1
+assert source.count('counts.retained_descriptor_peak =') == selector.count('counts.retained_descriptor_peak =') == 1
+assert source.count('counts.indexed_materializations += 1') == materializer.count('counts.indexed_materializations += 1') == 1
+assert source.count('counts.synthesized_materializations += 1') == materializer.count('counts.synthesized_materializations += 1') == 1
+assert source.count('counts.serializations += 1') == serializer.count('counts.serializations += 1') == 1
+assert source.count('counts.owned_annotations += 1') == selector.count('counts.owned_annotations += 1') == 2
 
 # Locked Tower/Axum mechanisms remain direct-poll, full-body, synchronous-JSON paths.
 registry = Path('/home/dan/.cargo/registry/src')
@@ -7031,11 +7105,11 @@ assert 'Handler::call(handler, req, self.state.clone())' in handler
 assert 'IntoServiceFuture::new(future)' in handler
 assert re.search(r'Limited::new\(body, limit\)\s*\.collect\(\)\s*\.await', body)
 assert 'serde_json::to_writer(&mut buf, &self.0)' in json
-print('static preparation locality/centrality proof: PASS')
+print('static post-capture preparation locality/centrality proof: PASS')
 PY
 ```
 
-Expected: exit 0 and the explicit PASS line against committed final source. Report this static leg separately from Step 3's exact runtime structural counts. It proves the six named measured request bodies have one scope, one fully awaited measured route request, one snapshot, and the required lexical order; the seventh lifecycle/reset-only test is explicitly excluded. It also proves exhaustive production selector/materializer/serializer centrality and no alternate production `DirItem` construction/materialization/serialization path while retaining the exact canonical-chain and counter-site checks. If any invariant fails, TLS counts are inadmissible and final readiness stops: restore and rerun the direct same-thread centralized path, or reopen LB-08 for a concrete fail-closed request-carried/thread-safe probe. Never waive a static failure because TLS is fail-open off-thread.
+Expected: exit 0 and the explicit PASS line. The six named tests each arm one TLS recorder around exactly one fully awaited real route request and snapshot it only after full response-body completion; the seventh lifecycle-only test is excluded. The lexical activation may include index/metadata offload. The handler-shape checks prove all four input captures precede the sole `derive_directory_page` call, with no await or recognized handoff from the final capture through the counted candidate derivation and snapshot release. Every recorder token is confined to the sole selector/materializer/serializer chain, and the local candidate block plus transcript helper is handoff-free. Therefore the TLS counts are admissible only for the post-capture bounded-work claim, not as evidence that the whole request is same-thread. If that post-capture invariant fails, stop; either restore synchronous counted derivation or replace TLS with a concrete request-carried/thread-safe probe.
 
 - [ ] **Step 16: Prove eager policy functions are absent from `HEAD`**
 
@@ -7089,17 +7163,17 @@ Expected: exit 0. No readiness, historical, focused-only, or preflight result su
 
 ## Self-Review Checklist and Results
 
-- [x] **1. Spec coverage:** Re-read the original requirements and LB-01/LB-03/LB-05/LB-06/LB-08/LB-09/LB-10 findings. Exactly seven Tasks remain. Task 1 creates a fresh local authorization receipt and post-run seal; Tasks 2-3 preserve all behavior fixtures/assertions; Task 4 adds locked compiler gates around real-handler cutover and documents fixed-input concurrency semantics; Task 5 migrates tests while retaining the oracle; Task 6 observes structural RED, installs the exact final selector, runs the 2,884-case final parity before deletion, finalizes the output path, and proves combined bounds; Task 7 repeats final locked/static/runtime/local/scope gates without editing source. No amended requirement lacks a task.
-- [x] **1b. No silent deferrals of required behavior:** `StaticSessionSource` remains deterministic input to the real `SessionIndex` and authenticated Axum route, and Task 4 cuts over the actual handler. Browser preflight is only readiness; Tasks 1 and 7 require the exact local matrix. Docker/image checks are only provenance; Tasks 6 and 7 require the exact sandbox all-target run with a stable rebuilt image ID. TLS counters are only the runtime leg; Tasks 6 and 7 require the static locality/centrality leg. Pre-cutover compilation is not final proof; immediate post-cutover, final assembly, and Task 7 locked gates remain. Task 4/5 unbounded differentials are not final-selector proof; Task 6's post-selector 2,884-case differential is. Pre-deletion parity is not post-cleanup serializer proof; locked compile plus literal-byte, structural, route, and focused reruns cover the released output path. No fake, preflight, seam, or future task substitutes for a required production outcome.
-- [x] **2. Placeholder and stale-claim scan:** No prohibited deferred marker or vague implementation instruction remains. The exact remote backend token and wrapper dependency are absent. Oracle retention/deletion follows the Task 5/6 boundary, work-bound evidence is explicitly combined, fresh runtime gates remain pending execution, and both broad sandbox calls are enclosed by rebuild/image-ID provenance brackets.
-- [x] **3. Type/signature/lifecycle consistency:** Task 5 leaves legacy `DirItem: Clone`, `title_source`, `source_file`, eager helpers, differential support, and the unbounded selector available. Early Task 6 counters instrument that exact legacy path; structural RED precedes the one final-selector installation; no production edit intervenes before final eager parity; deletion follows route/structural/focused validation; only then do the non-`Clone` `DirItem`, counted serializer/materializer, parser callers, `Comparable`, and docs reach final shape. Locked final-assembly commands precede all post-cleanup evidence and commit. Task 7's exact-one production/counter signatures match the final definitions.
+- [x] **1. Spec coverage:** Re-ran coverage against the complete corrected plan and the original requirements plus LB-01/LB-03/LB-05/LB-06/LB-08/LB-09/LB-10. Exactly seven Tasks remain. The Base64 chain is covered from Task 3's sole cursor helper through Task 4's parent trait import, Task 5's glob-import handoff and migrated callers, Task 6's retention point, and Task 7's planned locked compile/focused/warnings-denied gates. The LB-08 chain retains both mandatory proof legs: six exact real-route runtime structural count tests and the Task 6/7 static post-capture preparation locality/centrality proof; the seventh lifecycle-only test remains excluded. No amended requirement lacks a task.
+- [x] **1b. No silent deferrals of required behavior:** `StaticSessionSource` remains deterministic input to the real `SessionIndex` and authenticated Axum route, and Task 4 cuts over the actual handler. Browser preflight is only readiness; Tasks 1 and 7 require the exact local matrix. Docker/image checks are only provenance; Tasks 6 and 7 require the exact sandbox all-target run with a stable rebuilt image ID. TLS counters are only the runtime leg; Tasks 6 and 7 also require the static post-capture proof of capture-before-derive ordering, counted-region locality, recorder-site confinement, direct polling, and full-body completion. The Base64 handoff is exercised by migrated cursor cases and future locked compile/focused/warnings-denied gates. Pre-cutover compilation, unbounded differentials, and pre-deletion parity do not substitute for their later production gates. No product/runtime gate was executed during this document review, and no fake, preflight, seam, or future-only substitute is claimed as execution evidence.
+- [x] **2. Placeholder and stale-claim scan:** Re-ran the full-plan scan for prohibited deferred markers, vague implementation instructions, moved/undefined names, remote-backend execution, stale oracle timing, TLS-only proof, premature green claims, and unbracketed sandbox work. No stale whole-request/source-wide no-offload claim remains: both static scripts use the scoped PASS label and receipt, allow acquisition-time offload, and omit the obsolete whole-source assertions. Task 5 has no redundant direct Base64 trait import or duplicate cursor helper. Fresh product/runtime gates remain pending execution.
+- [x] **3. Type/signature/lifecycle consistency:** Rechecked Tasks 3-7 in order. There is one `encode_raw_cursor_payload(payload: &[u8]) -> String`; Task 4 retains parent `Engine as _`; Task 5 retains `use super::*;`, names all three inherited helpers, and reuses the cursor helper without redefining it; Task 6's retention/deletion wording remains aligned. The Task 6/7 Python proof bodies are byte-identical: every symbol is defined before use, capture order is index -> overrides -> metadata -> identities -> sole synchronous `derive_directory_page` -> snapshot release, scans cover the complete local candidate region plus provider-name/serializer/transcript helpers, and each recorder token is bound to its selector/materializer/serializer region while preserving sole-chain/direct-poll/full-body checks. The final-selector, oracle-deletion, final `DirItem`, parser/`Comparable`, locked-assembly, exact-one-signature, monotonic-step, and path-prefixed command lifecycles remain consistent.
 - [x] **Mandatory structure and task boundaries:** The workflow execute-stage header, goal, architecture, tech stack, global constraints, file map, dependency order, and exactly seven numbered Tasks are present. Task 1 and Task 7 are validation-only; Task 5 ends with the eager oracle intact; Task 6 alone proves the final selector, deletes the oracle, finalizes output, and proves bounds.
 - [x] **Bite-sized execution:** Task 5 and Task 6 step numbers are monotonic. Module shells, cohesive helper groups, individual tests, production functions/types, independent commands, and commits remain separate. The two sandbox provenance brackets are the documented narrow exception: each stays one indivisible process so its captured image ID cannot race across steps.
 - [x] **Supported concurrency contract:** Snapshots/values are independent and sequential in accessor order, never an atomic cross-store instant. Overlapping writes and old projection/read race windows are unspecified; no race test freezes one allowed outcome. `revision` is full-corpus candidate/identity recency, not a cross-store version. Every deterministic candidate/override/metadata/live-join/order/cursor/visibility/search/partial/page obligation remains exact for fixed captured inputs and non-overlapping operations.
 - [x] **One borrowed architecture and compiler residual:** The plan retains one borrowed candidate representation in one source file. Compiler failure is a fail-closed stop and architecture-reopen condition, never authorization for an owned fallback, adapter, manifest/public/store/index API change, or second file. Locked stop-gates exist before and immediately after cutover, after final assembly, and at Task 7 start.
-- [x] **Combined work-bound proof:** At most `limit + 1` descriptors/owned annotations and at most `limit` materializations/serializations are covered by exact runtime counters plus mandatory static checks over each of the six named measured request bodies (`begin < fully awaited request < snapshot`), explicit exclusion of the seventh lifecycle/reset-only test, current-thread/no-offload/direct-poll/full-body invariants, and exhaustive production selector/materializer/serializer references with no alternate `DirItem` path. TLS alone is explicitly inadmissible, and Tasks 6 and 7 contain the same byte-identical static gate plus the same runtime structural suite.
+- [x] **Combined work-bound proof:** At most `limit + 1` descriptors/owned annotations and at most `limit` materializations/serializations require both exact real-route runtime counts and the mandatory static post-capture preparation locality/centrality proof. Each of the six named request tests establishes one activation interval (`begin < fully awaited request < snapshot`); the seventh lifecycle-only test is explicitly excluded. The static gate proves all four captures precede the sole synchronous derivation, no await or recognized handoff occurs in the post-capture counted route/candidate region or transcript helper, every counter site is confined to the sole selector/materializer/serializer chain, and Tower/Axum polling is direct with full-body completion before snapshot. Acquisition-time offload is allowed, TLS alone is inadmissible, and Tasks 6 and 7 contain the same byte-identical static proof body plus the same runtime structural suite.
 - [x] **Assertion and oracle sequencing:** All existing behavior/data-model/lookahead assertions remain. The exact final selector is unchanged. The final 2,884-case parsed/byte differential runs after that selector and before oracle deletion with no intervening production edit; exact route, structural, and focused gates run before deletion, and locked compile plus exact literal bytes, structural, page-bound, and focused gates rerun after final output cleanup.
-- [x] **Helper lifecycle and residue:** Task 5 consumes the single Task 3 helper definitions without redefining them and retains eager/differential residue for Task 6. Task 6 deletes eager helpers and all differential support only after final-selector parity, then uses the same complete residue-name set that Task 7 repeats against `HEAD`.
+- [x] **Helper lifecycle and residue:** Task 5 consumes Task 3's single definitions of `encode_raw_cursor_payload`, `write_nonmatching_claude_transcript`, and `deep_search_query` without redefining them; its complete import replacement preserves Base64 method resolution through Task 4's parent-module `Engine as _` import and `use super::*;` without leaving a redundant direct test-local import. Task 6 deletes eager helpers and all differential support only after final-selector parity, then uses the same complete residue-name set that Task 7 repeats against `HEAD`.
 - [x] **Command and backend discipline:** Every runnable shell fence begins with `FRESHELL_VITEST_BACKEND=local`, is self-contained, and uses absolute paths or `git -C`. No raw Vitest command, remote-wrapper execution dependency, caller-directory assumption, unsandboxed broad package fallback, narrowed substitute, or waiver appears. Task 1 and Task 7 use comparable local focused/browser/coordinator workloads.
 - [x] **Scope and workflow discipline:** No manifest, lockfile, kata configuration, package file, TypeScript, or JavaScript edit is planned. Task 7 expects exactly the plan plus `crates/freshell-server/src/session_directory.rs` from the frozen base. Local commit examples do not prescribe history, and no push, pull request, merge, deployment, or restart is included.
-- [x] **Residual-risk control, not pre-execution attestation:** LB-05, LB-06, LB-08, and LB-10 are corrected in the plan by the explicit concurrency boundary, final-selector oracle sequencing, combined static/runtime proof, and mandatory local backend. LB-01, LB-03, and LB-09 remain accepted residuals pending their exact fail-closed execution gates. This document review does not claim those runtime gates have passed; no requirement is deferred or waived.
+- [x] **Residual-risk control, not pre-execution attestation:** LB-05, LB-06, LB-08, and LB-10 are corrected in the plan by the explicit post-capture counted-region boundary, final-selector oracle sequencing, combined static/runtime proof, and mandatory local backend. LB-01, LB-03, and LB-09 remain accepted residuals pending their exact fail-closed execution gates. This document review does not claim those runtime gates have passed; no requirement is deferred or waived.
