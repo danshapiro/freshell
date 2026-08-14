@@ -2,8 +2,16 @@
 
 > **For agentic workers:** This plan is executed task-by-task by the
 > workflow's execute stage: a fresh implementer per task, with a spec +
-> quality review after each task. Steps use checkbox (`- [ ]`) syntax
-> for tracking.
+> quality review after each task. Gate 0, Tasks 1-7, and Gate 8 are nine
+> independent execution units. Every unit starts its own persistent Bash
+> session, evaluates the complete Command and Evidence Harness in that
+> session before its first Bash command, and runs every Bash fence in that
+> unit in the same session. No plan-created variable, function, shell option,
+> array, or trap is assumed to survive an execution-unit boundary; durable
+> plan state crosses boundaries only through committed Git state and files
+> under `$LOG_ROOT`. Externally persisted environment configuration remains
+> available where the plan explicitly requires it. Steps use checkbox
+> (`- [ ]`) syntax for tracking.
 
 **Goal:** Preserve the current Rust `GET /api/session-directory` contract while limiting full `DirItem` construction, override/metadata/running output decoration, and serialization to returned rows, and limiting owned search annotations to the retained `limit + 1` match descriptors.
 
@@ -105,7 +113,7 @@ The sufficient page state is corpus-wide `revision`, the first `limit + 1` opera
 
 ## Command and Evidence Harness
 
-Run this once in the implementation shell before Gate 0. It creates only external evidence directories and a shell function.
+Evaluate this complete block once at the start of every execution unit's persistent Bash session (Gate 0, Tasks 1-7, and Gate 8), not once for the whole implementation. Re-evaluating it in each fresh session is required and safe: it applies shell options, sets task-local variables, creates only the external evidence directory with idempotent `mkdir -p`, and defines ten task-local helper functions. Do not execute an execution unit's later Bash fences in isolated replacement shells.
 
 ```bash
 set -euo pipefail
@@ -1004,6 +1012,8 @@ Every expected-GREEN command must return 0. Every intentional RED command must r
 
 ### Gate 0: Prove Committed-Plan Identity and the Unchanged Application Baseline
 
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
+
 **Files:**
 - Modify: none
 - Read only: repository metadata and test outputs
@@ -1114,16 +1124,23 @@ then
   BASELINE_MATRIX_STATUS=0
 else
   BASELINE_MATRIX_STATUS=$?
+  printf '%s\n' \
+    "STOP: baseline Rust Playwright matrix exited $BASELINE_MATRIX_STATUS; do not run Gate 0 Step 8 or Task 1." \
+    'Recovery is only through Gate 8 Step 7 with FAILED_COMMAND_NAME=baseline-rust-session-directory-matrix and the next canonical FAILURE_SEQUENCE.' \
+    'Only paired_candidate_recovered_green or matching_BASE_SHA_playwright_environment_failure may resume; functional, timeout, route/API, DOM, and live-flow failures are non-waivable.' >&2
+  exit "$BASELINE_MATRIX_STATUS"
 fi
-if [[ "$BASELINE_MATRIX_STATUS" -eq 0 ]]; then
-  test "$(grep -Ec '(^|[^0-9])7 passed([^0-9]|$)' \
-    "$LOG_ROOT/baseline-rust-session-directory-matrix.log")" -eq 1
-  ! grep -Eq '(^|[^0-9])(failed|skipped|interrupted|did not run)([^0-9]|$)' \
-    "$LOG_ROOT/baseline-rust-session-directory-matrix.log"
+test "$(grep -Ec '(^|[^0-9])7 passed([^0-9]|$)' \
+  "$LOG_ROOT/baseline-rust-session-directory-matrix.log")" -eq 1
+if grep -Eq '(^|[^0-9])(failed|skipped|interrupted|did not run)([^0-9]|$)' \
+  "$LOG_ROOT/baseline-rust-session-directory-matrix.log"
+then
+  printf '%s\n' 'STOP: baseline Rust Playwright matrix has a non-GREEN result summary.' >&2
+  exit 1
 fi
 ```
 
-Required GREEN: exit 0, exactly one final `7 passed` marker, and no failed, skipped, interrupted, or did-not-run count. A named assertion or timeout after server startup blocks implementation. Only a pre-assertion browser/shared-library/sandbox/permission/port/bootstrap failure may enter Gate 8's direct-child comparison, and every A12 attestation must pass; otherwise stop.
+Required GREEN: exit 0, exactly one final `7 passed` marker, and no failed, skipped, interrupted, or did-not-run count. The command block exits on every nonzero status before Step 8, after `run_logged` has persisted the original command, argv, log, and exit evidence. To recover, execute Gate 8 Step 7 immediately with `FAILED_COMMAND_NAME=baseline-rust-session-directory-matrix` and the next canonical `FAILURE_SEQUENCE`. Resume at Step 8 only if the full protocol and cleanup complete with `paired_candidate_recovered_green` or `matching_BASE_SHA_playwright_environment_failure`. The latter is a waiver, never a pass. A named assertion, route/API or DOM mismatch, timeout after server startup, or live create/search/delete failure is terminal and non-waivable.
 
 - [ ] **Step 8: Run the canonical broad baseline through the coordinator.**
 
@@ -1145,11 +1162,13 @@ Expected normal result: client, server, and Electron exits are `code: 0`, positi
 
 - [ ] **Step 9: Classify any baseline failure before proceeding.**
 
-If `BASELINE_MATRIX_STATUS` is nonzero, classify it under Gate 8's Playwright command class; functional failure blocks and only a fully attested matching pre-assertion environment failure may be recorded as `matching_BASE_SHA_playwright_environment_failure`. If `BASELINE_NPM_STATUS` is nonzero, run Gate 8's coordinated-npm paired protocol. Proceed only after fresh candidate and base reruns match under all required attestations, recording `baseline_broad_disposition=matching_unrelated_BASE_SHA_failure`. Otherwise stop before Task 1. Never edit unrelated files to repair the baseline.
+A nonzero baseline matrix has already stopped in Step 7 and must complete the recovery handoff described there before Step 8. If `BASELINE_NPM_STATUS` is nonzero, run Gate 8's coordinated-npm paired protocol. Proceed to Task 1 only after every failed baseline command has either recovered GREEN or produced its exact permitted matching-`BASE_SHA` disposition under all required attestations. Otherwise stop. Never edit unrelated files to repair the baseline.
 
 ---
 
 ### Task 1: Add the Complete Route Harness and Five Boundary Characterizations
+
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
 
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
@@ -1521,6 +1540,8 @@ git -C "$WT" commit \
 
 ### Task 2: Characterize Visibility, Cursor Union, Limits, Ordering, and Revision
 
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
+
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
 - Test: `crates/freshell-server/src/session_directory.rs`
@@ -1786,6 +1807,8 @@ git -C "$WT" commit \
 ---
 
 ### Task 3: Pin Empty Cursor Keys, Deep-Search Partials, and Stable Duplicate Semantics
+
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
 
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
@@ -2115,6 +2138,8 @@ git -C "$WT" commit \
 
 ### Task 4: Characterize Search, Wire Shape, and Archived Recency
 
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
+
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
 - Test: `crates/freshell-server/src/session_directory.rs`
@@ -2357,6 +2382,8 @@ git -C "$WT" commit \
 
 ### Task 5: Normalize the Existing Provider Display Helper In Place
 
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
+
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
 - Test: `crates/freshell-server/src/session_directory.rs`
@@ -2441,6 +2468,8 @@ git -C "$WT" commit \
 ---
 
 ### Task 6: Stage, Differentially Validate, Cut Over, and Remove the Eager Policy
+
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
 
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
@@ -5002,6 +5031,8 @@ Apply this exhaustive signature/call-site mapping on the fallback branch:
 
 Every join-test materializer call uses the exact slice that built its candidate: `materialize_test_candidate(candidate, &indexed, &overrides, &identities)` when `indexed` is a `Vec<IndexedSession>`, `materialize_test_candidate(candidate, std::slice::from_ref(&indexed), &overrides, &identities)` when it is one row, and `materialize_test_candidate(candidate, &[], &overrides, &identities)` for synthesized-only input. Every direct running assertion first binds a stable local `metadata = HashMap::new()` and the matching `DirectoryInputs`, then calls `candidate.is_running(inputs)`; use `&indexed`, `std::slice::from_ref(&indexed)`, or `&[]` by the same rule. The Step-5 exact resolver example similarly uses `overlay.resolved_title(&row, Some(&override_value))` and `overlay.resolved_summary(&row, Some(&override_value))`. These are all direct resolver/accessor/materializer call sites named by the plan; derivation-based tests continue to call `derive_directory_page` unchanged.
 
+**Same-shell dependency:** `TASK6_FALLBACK_REQUIRED` was set by the Phase-C compiler fence and is consumed below. Run both fences in this Task-6 shell; do not start a replacement shell between them.
+
 > If `TASK6_FALLBACK_REQUIRED=1`, first apply exactly the documented reference-free profile. The first command below then proves its four shared tests, supplied-vector winner, actual-handler `cargo check`, and complete test-target `--no-run`. Both representations then execute the same 516/21/15/nine/focused checkpoint. Only after every required command passes is the persisted marker written. The marker always exists and contains exactly one of `fallback_used=0` or `fallback_used=1`; file existence is never treated as fallback evidence.
 
 ```bash
@@ -5937,6 +5968,8 @@ Expected: Task 6 now has exactly three source-only commits: candidate plus diffe
 ---
 
 ### Task 7: Observe RED Full-Row Work, Then Prove Returned-Row and Lookahead Bounds
+
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
 
 **Files:**
 - Modify: `crates/freshell-server/src/session_directory.rs`
@@ -8789,6 +8822,8 @@ git -C "$WT" commit \
 
 ### Gate 8: Final Verification, Exact Scope, and Unrelated-Failure Evidence
 
+**Fresh-shell precondition:** Start this execution unit in a new persistent Bash session and evaluate the complete `Command and Evidence Harness` block before Step 1. Run every Bash fence in this unit in that session; do not reuse shell state from a prior unit.
+
 **Files:**
 - Modify: none
 - Read only: repository, manifests, tests, and coordinator status
@@ -8833,16 +8868,23 @@ then
   FINAL_MATRIX_STATUS=0
 else
   FINAL_MATRIX_STATUS=$?
+  printf '%s\n' \
+    "STOP: final Rust Playwright matrix exited $FINAL_MATRIX_STATUS; do not run Gate 8 Step 3 or any later acceptance step." \
+    'Recovery is only through Gate 8 Step 7 with FAILED_COMMAND_NAME=final-rust-session-directory-matrix and the next canonical FAILURE_SEQUENCE.' \
+    'Only paired_candidate_recovered_green or matching_BASE_SHA_playwright_environment_failure may resume; functional, timeout, route/API, DOM, and live-flow failures are non-waivable.' >&2
+  exit "$FINAL_MATRIX_STATUS"
 fi
-if [[ "$FINAL_MATRIX_STATUS" -eq 0 ]]; then
-  test "$(grep -Ec '(^|[^0-9])7 passed([^0-9]|$)' \
-    "$LOG_ROOT/final-rust-session-directory-matrix.log")" -eq 1
-  ! grep -Eq '(^|[^0-9])(failed|skipped|interrupted|did not run)([^0-9]|$)' \
-    "$LOG_ROOT/final-rust-session-directory-matrix.log"
+test "$(grep -Ec '(^|[^0-9])7 passed([^0-9]|$)' \
+  "$LOG_ROOT/final-rust-session-directory-matrix.log")" -eq 1
+if grep -Eq '(^|[^0-9])(failed|skipped|interrupted|did not run)([^0-9]|$)' \
+  "$LOG_ROOT/final-rust-session-directory-matrix.log"
+then
+  printf '%s\n' 'STOP: final Rust Playwright matrix has a non-GREEN result summary.' >&2
+  exit 1
 fi
 ```
 
-Required GREEN: exit zero and exactly one final `7 passed` marker. Any named assertion, route/API mismatch, DOM mismatch, timeout after server startup, or live create/search/delete failure blocks and is never waivable. Only a pre-assertion browser/shared-library/sandbox/permission/port/bootstrap failure may enter Step 7; a matching environment result is recorded as `matching_BASE_SHA_playwright_environment_failure`, never as a pass.
+Required GREEN: exit zero and exactly one final `7 passed` marker. The command block exits on every nonzero status before Step 3, after `run_logged` has persisted the original command, argv, log, and exit evidence. To recover, execute Step 7 immediately with `FAILED_COMMAND_NAME=final-rust-session-directory-matrix` and the next canonical `FAILURE_SEQUENCE`. Resume at Step 3 only if the full protocol and cleanup complete with `paired_candidate_recovered_green` or `matching_BASE_SHA_playwright_environment_failure`. The latter is a waiver, never a pass. Any named assertion, route/API mismatch, DOM mismatch, timeout after server startup, or live create/search/delete failure is terminal and non-waivable.
 
 - [ ] **Step 3: Run full server and read-only sessions sanity.**
 
@@ -8931,6 +8973,8 @@ Normal GREEN: all suite exits are `code: 0`, test counts are positive, command e
 
 This protocol applies only after focused Rust is GREEN and no functional Playwright assertion has failed; a pre-assertion Playwright bootstrap/environment failure may itself enter this protocol. Functional matrix failures and focused session-directory failures are never waived. Execute the protocol serially for each eligible failed command. Set `FAILED_COMMAND_NAME` and supply the next canonical decimal `FAILURE_SEQUENCE`. `$LOG_ROOT/waiver-sequence-state.txt` starts logically at zero, is never reset during the gate, and requires each accepted proposal to equal the prior persisted value plus one. Accepted values are exactly `1..999999999`; the final value may be allocated once, and every later attempt is durably denied as exhausted. The allocator locks, validates, safely increments only a bounded value, pads the supplied canonical string lexically to nine digits, atomically persists it, and then derives every artifact basename. Gaps, reuse, malformed/out-of-range input or state, lock/state failure, and exhaustion use unique `rejected-waiver-input.XXXXXXXX` denial artifacts. No unbounded value reaches Bash arithmetic or numeric `printf`.
 
+For a matrix failure, enter this protocol immediately from Gate 0 Step 7 or Gate 8 Step 2, before the downstream step named by that gate's failure branch; after a successful disposition and cleanup, resume only at Gate 0 Step 8 or Gate 8 Step 3 respectively.
+
 ```text
 Per-failure identity = injective nine-digit monotonic sequence + gate phase + exact run_logged command name
 Sequence authority = locked atomic last-sequence state; bounded 1..999999999; lexical zero padding
@@ -8939,6 +8983,8 @@ Adjudication authority = original + paired candidate + paired base artifacts
 ```
 
 Create one fresh, detached, direct child of the repository's `.worktrees` directory and install ownership-safe cleanup:
+
+**Same-shell safety dependency:** For each eligible failure, execute every Step-7 Bash fence from failure-identity initialization through `trap - EXIT` in one uninterrupted Gate-8 shell. The helper functions, arrays, `BASE_WT` ownership flag, and EXIT cleanup trap are live safety state; never split this protocol across one-shot shells.
 
 ```bash
 FAILED_COMMAND_NAME=${FAILED_COMMAND_NAME-}
@@ -10230,7 +10276,7 @@ No post-audit plan edit is part of the protocol. Reviewers run checks against th
 | A09 | Both local `rust-chromium` gates require exit zero and one exact seven-pass marker; functional failures block. |
 | A10 | Unchanged-base comparison uses a fresh direct child of `.worktrees`; detached exact `BASE_SHA` is re-read immediately before removal; final absence is fail closed. |
 | A11 | Revision includes effective corpus activity and every identity update before sort/filter/search/retention/materialization. |
-| A12 | Lossless argv, class-specific context/scratch, paired actual-path Node evidence, executed-only counts, three-way status/phase/signature equality, nonempty coordinator IDs, durable denials, and exact cleanup predicates are executable checks. Per-failure identity additionally uses locked atomic monotonic state, canonical bounded decimal `1..999999999`, safe previous-plus-one validation, lexical nine-digit padding, and durable gap/reuse/malformed/exhaustion denial; no unbounded input reaches arithmetic or `%d`. |
+| A12 | Lossless argv, class-specific context/scratch, paired actual-path Node evidence, executed-only counts, three-way status/phase/signature equality, nonempty coordinator IDs, durable denials, and exact cleanup predicates are executable checks. Per-failure identity additionally uses locked atomic monotonic state, canonical bounded decimal `1..999999999`, safe previous-plus-one validation, lexical nine-digit padding, and durable gap/reuse/malformed/exhaustion denial; no unbounded input reaches arithmetic or `%d`. The execution harness is also fail-closed at every worker boundary: all nine execution units carry the fresh-shell precondition, Task 6 preserves its fallback-decision shell, and each Gate-8 Step-7 replay preserves one shell and EXIT trap through verified cleanup. |
 
 No item is deferred or marked not applicable. Synthetic route rows are paired with the real route and nine named routes; the temporary eager oracle directly composes old production helpers and is deleted; thread-local counters are paired with the source-wide audit; local provider fixtures are paired with the seven-test Rust/browser matrix. Explicit non-goals remain unchanged.
 
@@ -10244,6 +10290,7 @@ The final plan must reproduce all of the following from text alone:
 - 28 unique direct-helper tests / 29 obligations, seven transitive override tests, one display test, nine named routes, and seven Playwright tests at each local gate;
 - exactly three Task-6 source-only commits and nine implementation subjects;
 - temporary differential names confined to Task 6 and absent from Task 7/final completion state;
+- exactly nine `**Fresh-shell precondition:**` markers exist: one each under Gate 0, Tasks 1-7, and Gate 8; the obsolete once-before-Gate-0 harness instruction is absent; Task 6 explicitly preserves its fallback-decision shell, and each Gate-8 Step-7 replay is explicitly same-shell through `trap - EXIT`;
 - `total_fences=136`, `bash_fences=58`, `rust_fences=56`, `text_fences=22`, `python_heredocs=4`, and `node_heredocs=2`;
 - every Bash fence parses, every Python heredoc compiles under isolated Python with no plain `assert`, every Node heredoc passes `node --check`, and every Rust fence is syntactically parseable as its intended insertion unit;
 - the corrected seed/cardinality validator, both A08 profile baselines, all 48 prior genuine/corrected escape cases, twelve new inherent/trait/path-qualified-slice/direct-loop cases, twelve harmless-reference/selected-field controls, every retained A08 mutant, the independent exact production-expression ledger mutants, and bounded/injective/exhaustion failure-ID fixtures produce their required success/denial outcomes.
@@ -10273,4 +10320,4 @@ The branch is ready for user review only when all twenty nonduplicative statemen
 17. Deep-loop order, empty-key rejection, stable duplicate gap, current Rust recency/full-key ordering, serializer byte order, fields/omissions, colors, validation, and no-total contract remain unchanged.
 18. Every accepted waiver used a locked atomic sequence state with the exact next canonical value in `1..999999999`, injective lexical nine-digit padding, and durable malformed/gap/reuse/lock/state/exhaustion denial; unique lossless command artifacts; class-specific context and scratch; paired target/base Node evidence where required; fresh exact-argv candidate/base reruns; passed-plus-failed execution counts; validated coordinator transitions with nonempty string run IDs; original/candidate/base phase and signature equality; durable disposition records; a fresh direct-child base checkout; and fail-closed detached-`BASE_SHA` cleanup/registration absence. Otherwise no waiver was granted.
 19. Final `BASE_SHA..HEAD` is exactly the plan and `crates/freshell-server/src/session_directory.rs`; all nine implementation commits are source-only; forbidden manifests, locks, config, spec, README, schema, Node/client/browser, WS, sessions/index/search, refresh/sweep, fixture, and setting files are unchanged; the worktree is clean.
-20. No release benchmark, temporary manifest edit, unrelated repair, or unapproved PR occurred.
+20. No release benchmark, temporary manifest edit, unrelated repair, or unapproved PR occurred. Every execution unit used its own harness-initialized persistent shell, and every Gate-8 Step-7 replay retained its ownership state and EXIT trap through verified cleanup.
