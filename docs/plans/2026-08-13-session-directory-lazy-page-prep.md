@@ -5,11 +5,11 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Preserve the exact current Rust behavior of `GET /api/session-directory` while bounding full `DirItem` preparation and JSON serialization to the returned page and bounding selected descriptors and owned search annotations to `limit + 1`.
+**Goal:** Preserve every current Rust HTTP result for fixed captured inputs and non-overlapping operations while bounding full `DirItem` preparation and JSON serialization to the returned page and bounding selected descriptors and owned search annotations to `limit + 1`; the route's explicitly unsupported cross-store race timing is not frozen.
 
-**Architecture:** Capture one `Arc<Vec<IndexedSession>>`, one overrides snapshot, one metadata snapshot, and one identity snapshot in the existing observable order, then borrow them during one synchronous derivation. Build and stable-sort shallow effective candidates across the complete corpus, apply one shared order and eligibility policy before tier-specific search, retain at most `limit + 1` selected descriptors, and consume only the first `limit` through the sole full-row materializer and serializer.
+**Architecture:** Capture one independent value from each accessor in the existing accessor order: one `Arc<Vec<IndexedSession>>`, one overrides snapshot, one metadata snapshot, and one identity snapshot, then borrow them during one synchronous derivation. The captures do not represent one atomic point in time, and moving projection work after all captures can change overlap windows. Build and stable-sort shallow effective candidates across the complete corpus, apply one shared order and eligibility policy before tier-specific search, retain at most `limit + 1` selected descriptors, and consume only the first `limit` through the sole full-row materializer and serializer.
 
-**Tech Stack:** Rust 1.96, Axum, Tokio, `Arc`, `serde_json` with `preserve_order`, URL-safe no-padding Base64, `freshell-sessions` `SessionIndex` and transcript search, `freshell-ws` terminal identities, Cargo test/clippy/rustfmt, Axum `tower::ServiceExt` route tests, Playwright's Rust-backed browser matrix, and the repository test coordinator with cloud Vitest.
+**Tech Stack:** Rust 1.96, Axum, Tokio, `Arc`, `serde_json` with `preserve_order`, URL-safe no-padding Base64, `freshell-sessions` `SessionIndex` and transcript search, `freshell-ws` terminal identities, Cargo test/clippy/rustfmt, Axum `tower::ServiceExt` route tests, Playwright's Rust-backed browser matrix, and the repository test coordinator with explicitly selected local Vitest for every baseline, impacted, and final run in this branch.
 
 ## Global Constraints
 
@@ -21,16 +21,19 @@
 - Do not modify any `Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.kata.toml`, any TypeScript or JavaScript file, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, or `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`.
 - Do not change public route/state/query/wire interfaces, status codes, authentication, `SessionIndex::snapshot(&self) -> Arc<Vec<IndexedSession>>`, cursor encoding, response fields, optional-field omission, or object insertion order.
 - Preserve accessor order: auth, raw-query validation, one awaited index snapshot, one overrides snapshot, one awaited metadata snapshot, one identity snapshot, synchronous page derivation, snapshot release, then whole-map project colors only on success.
-- Preserve exact current Rust candidate, override, metadata, live-join, revision, stable order, strict cursor, visibility, search, partial-reason, and page semantics described in the evidence reports.
+- Supported concurrency is one independent snapshot/value per accessor, captured sequentially in this order: index, overrides, metadata, identities; project colors remains a separate late success-only read. These values do not form an atomic or common point-in-time cross-store view. If a write overlaps the GET across stores, whether that write appears is unspecified and only each accessor's own locking/freshness contract applies. Moving projection work until after all captures can change old race windows; exact old overlap timing is not promised. `revision` remains full-corpus candidate/identity recency and is not a cross-store generation/version; override, metadata, and project-color writes can change a page without changing it. Do not add a race test that freezes either allowed overlap outcome.
+- For fixed captured inputs and non-overlapping operations, preserve exact current Rust candidate, override, metadata, live-join, revision, stable order, strict cursor, visibility, search, partial-reason, and page semantics described in the evidence reports.
 - Do not import Node-only archived-last ordering, project-path or cwd-leaf title matching, focused Node title snippets, checkout-root synthesis, or `checkoutPath`.
-- Production ends with one borrowed candidate representation, one comparator used by sorting and cursor continuation, one eligibility predicate, one selector, and one consuming materializer. A temporary eager oracle is test-only and is deleted in Task 5.
+- Production ends with one borrowed candidate representation, one comparator used by sorting and cursor continuation, one eligibility predicate, one selector, and one consuming materializer. A temporary eager oracle is test-only and is deleted in Task 6 only after final-selector parity.
 - Do not add an owned/index-provenance fallback, a runtime old/new strategy, a `SessionIndex` paging API, caching, a population total, or a compatibility `Vec<DirItem>` adapter.
+- LB-03 is accepted only as a compiler residual risk, not a confirmed compile claim. The complete borrowed core must pass locked production and inline-test compiler stop-steps before handler cutover; the real Axum handler must pass the same locked checks immediately after cutover; final cleanup/selector assembly must compile before commit and again in final validation. Any failure stops and permits only correction of the planned one-file borrowed design plus complete rerun. It never authorizes an owned/index-provenance fallback, compatibility adapter, public/store/index API or manifest change, or another source file. If correction cannot stay within those bounds, reopen the architecture decision before further edits.
 - The full corpus may require `O(N)` shallow candidates, stable sorting, and sparse-search inspection. The accepted bound is at most `limit + 1` retained descriptors/annotations and at most `limit` full-row materializations/serializations.
 - Keep deep search's `limit * 10` scan budget and exact check order: lookahead count, budget, source, provider, increment, file I/O. A later budget stop overwrites an earlier `io_error` reason.
-- Structural counters, not elapsed time, prove the work bound. Do not make allocator, RSS, or latency claims.
+- Exact TLS structural counts plus a mandatory static locality/centrality proof establish the bound; neither elapsed time nor TLS alone is evidence. The static leg requires current-thread structural tests, no spawn/offload in the measured Freshell call graph, direct Tower/Axum polling, full response-body completion before snapshot, and exact-one production selection/materialization/serialization sites. Any static invariant failure stops and reopens LB-08; do not waive it or silently keep the counters. Do not make allocator, RSS, or latency claims.
 - Use RED-GREEN-REFACTOR. Characterization tests added before the refactor must pass against the eager route; Task 4's intended RED is missing candidate symbols; Task 6's intended RED is exact structural-count mismatch.
-- Every checkbox step is one monotonic 2-5 minute action: one module shell, cohesive helper group, individual test, production function or implementation/type group, independent command, or commit. Do not combine unrelated tests, function groups, or commands into one step.
-- Every shell command is self-contained, uses absolute paths or `git -C`, assumes no caller working directory, and begins with `FRESHELL_VITEST_BACKEND=cloud` even when it does not invoke Vitest.
+- Every checkbox step is one monotonic 2-5 minute action: one module shell, cohesive helper group, individual test, production function or implementation/type group, independent command, or commit. Do not combine unrelated tests, function groups, or commands into one step. A provenance-bracketed sandbox gate is one indivisible evidence action even though its internal build/run/postflight and duration exceed ordinary step granularity; it must remain one self-contained shell process so the captured image ID cannot be handed off or recomputed ambiguously.
+- Every shell command is self-contained, uses absolute paths or `git -C`, assumes no caller working directory, and begins with `FRESHELL_VITEST_BACKEND=local` even when it does not invoke Vitest. This branch-local override is mandatory because LB-10 falsified reviewed-source provenance and race freedom for the remote wrapper; it does not alter repository or user configuration.
+- Preflight, readiness, coordinator history, and prior results are never pass evidence. The exact local browser matrix, fresh coordinator-owned local suite, and provenance-bracketed sandbox workload must execute successfully. Any preflight, build, runtime, or image-ID discrepancy stops. Never substitute a remote runner, unsandboxed Cargo, narrowed browser project/package target, focused-only evidence, or a waiver. If another coordinator holder or container uses a shared resource, wait and retry the same gate; never kill a foreign holder, process, or container.
 - Never invoke raw `npx vitest`. Broad JavaScript tests run through the repository coordinator; destructive server-package tests run through the repository sandbox.
 - Make ordinary coherent local task-level commits after green source-changing work, using the configured repository identity and Amplifier co-author footer. Every shown commit subject/body is one valid example, not a mandatory history. Mandatory task spec/quality reviews or final checks may require additional source-only correction commits and reruns before advancing. Do not prescribe or validate an exact commit count, subject sequence, commit order, or ancestry ledger.
 - This plan contains no push, pull-request creation, merge, deployment, or server-restart step.
@@ -42,7 +45,7 @@
 
 - **Modify and test only:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs` — route handler, request-local candidate pipeline, inline characterization/differential/structural tests, and test-only counters.
 - **Committed execution input, never edit during these tasks:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/plans/2026-08-13-session-directory-lazy-page-prep.md` — the implementation plan whose commit is the sole pre-execution delta.
-- **Read-only repository rules and test orchestration:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/skills/testing.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/vitest-cloud.sh`.
+- **Read-only repository rules and test orchestration:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/skills/testing.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-build.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`.
 - **Read-only Rust contracts:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs` owns `IndexedSession`, `SessionSource`, and `SessionIndex::snapshot`; `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs` owns `FileSearchTier`, `FileSearchMatch`, and `search_session_file`; `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs` owns `TerminalIdentity` and registry snapshots; `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs` owns override/color snapshots; `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs` owns metadata snapshots.
 - **Read-only manifests/configuration:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/Cargo.toml`, every other tracked `Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.kata.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`.
 - **Read-only behavior references:** `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/shared/read-models.ts` and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/server/session-directory/service.ts`; they document cross-server differences and must not be edited or treated as an oracle over current Rust behavior.
@@ -53,98 +56,150 @@
 ## Dependency Order
 
 ```text
-Task 1 baseline/setup
+Task 1 fresh unchanged-source authorization gate
   -> Task 2 effective-corpus route characterizations
     -> Task 3 cursor/search/partial/wire characterizations
-      -> Task 4 borrowed candidate path, differential, and handler cutover
-        -> Task 5 retained-test migration and eager-oracle removal
-          -> Task 6 structural RED/GREEN work bounds
+      -> Task 4 borrowed candidate path, differential, locked compiler gates, and handler cutover
+        -> Task 5 retained-test migration with eager oracle retained
+          -> Task 6 structural RED, final selector, final oracle parity, cleanup, final assembly, and work-bound proof
             -> Task 7 final validation and exact scope proof
 ```
 
-### Task 1: Verify setup and establish an unchanged baseline
+### Task 1: Run the fresh unchanged-source authorization gate
 
 **Files:**
 - Modify: none.
-- Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/plans/2026-08-13-session-directory-lazy-page-prep.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/skills/testing.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.github/workflows/rust-clippy.yml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/vitest-cloud.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts`, and `/home/dan/code/freshell/node_modules/@playwright/test/cli.js`.
+- Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/plans/2026-08-13-session-directory-lazy-page-prep.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/skills/testing.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.github/workflows/rust-clippy.yml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts`, and `/home/dan/code/freshell/node_modules/@playwright/test/cli.js`.
 
 **Interfaces:**
-- Consumes: base commit `225a91db3e4d48d4b6a7e8bc0987afad8ff31917`, committed plan path `docs/plans/2026-08-13-session-directory-lazy-page-prep.md`, current `router(SessionDirectoryState)`, existing focused Rust tests, browser matrix, and coordinator.
-- Produces: a clean green execution state whose only committed pre-implementation path is the plan and whose `crates/freshell-server/src/session_directory.rs` bytes equal the base; no later task is authorized after any failure.
+- Consumes: LB-01 as an accepted residual rather than a verified green claim; base commit `225a91db3e4d48d4b6a7e8bc0987afad8ff31917`; committed plan path `docs/plans/2026-08-13-session-directory-lazy-page-prep.md`; current `router(SessionDirectoryState)`; existing focused Rust tests; the exact local browser matrix; and the local coordinator path.
+- Produces: only after every command succeeds, a fresh local authorization receipt proving plan-only `HEAD` carries frozen-base implementation bytes and that exact focused Rust, exact Rust-backed browser, and fresh coordinator-owned local workloads passed before a post-run source seal. No green-base claim exists before execution, and Task 2 cannot be dispatched after any failure or before the final seal.
 
 - [ ] **Step 1: Prove branch, base ancestry, committed-plan-only scope, and a clean worktree**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep branch --show-current)" = "the-usual/session-directory-lazy-page-prep" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep merge-base --is-ancestor 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD && diff -u <(printf "%s\n" "docs/plans/2026-08-13-session-directory-lazy-page-prep.md") <(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD) && test -z "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep status --porcelain=v1 --untracked-files=all)"'
+FRESHELL_VITEST_BACKEND=local bash -c 'test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep branch --show-current)" = "the-usual/session-directory-lazy-page-prep" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep merge-base --is-ancestor 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD && diff -u <(printf "%s\n" "docs/plans/2026-08-13-session-directory-lazy-page-prep.md") <(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD) && test -z "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep status --porcelain=v1 --untracked-files=all)"'
 ```
 
-Expected: exit 0 and no diff/status output. `HEAD` is allowed and expected to be ahead of the base by the plan commit; equality with the base is not tested.
+Expected: exit 0 and no diff/status output. `HEAD` is allowed and expected to be ahead of the base by the plan commit; equality with the base is not tested. This is provenance evidence, not behavior-pass evidence.
 
 - [ ] **Step 2: Prove the implementation source is unchanged from the frozen base**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --exit-code 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD -- crates/freshell-server/src/session_directory.rs
+FRESHELL_VITEST_BACKEND=local git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --exit-code 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD -- crates/freshell-server/src/session_directory.rs
 ```
 
-Expected: exit 0 and no diff.
+Expected: exit 0 and no diff. This is source provenance, not a green claim.
 
-- [ ] **Step 3: Run the unchanged focused Rust baseline**
+- [ ] **Step 3: Run the unchanged focused Rust behavior gate**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
-Expected: exit 0, every emitted `test result` is `ok`, and no `FAILED` line. Record the observed counts as run evidence, but do not convert them into a future count assertion.
+Expected: exit 0, every emitted `test result` is `ok`, and no `FAILED` line. Retain the exact command output and record observed counts as run evidence without converting them into a future count assertion.
 
-- [ ] **Step 4: Verify the external Playwright CLI exists**
+- [ ] **Step 4: Run the fail-closed local-browser readiness preflight**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud test -f /home/dan/code/freshell/node_modules/@playwright/test/cli.js
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+for name in FRESHELL_E2E_TARGET_URL FRESHELL_E2E_TARGET_TOKEN FRESHELL_E2E_TARGET_WS_URL FRESHELL_E2E_TARGET_HOME FRESHELL_E2E_RUST_SERVER_BIN CARGO_TARGET_DIR PLAYWRIGHT_BROWSERS_PATH; do
+  test -z "${!name-}" || { echo "unexpected routing override: ${name}" >&2; exit 1; }
+done
+test -f /home/dan/code/freshell/node_modules/@playwright/test/cli.js
+node -e "
+const fs = require(\"fs\");
+const lock = JSON.parse(fs.readFileSync(\"${root}/package-lock.json\", \"utf8\"));
+for (const p of [\"node_modules/@playwright/test\", \"node_modules/playwright\", \"node_modules/playwright-core\"]) {
+  if (lock.packages[p]?.version !== \"1.58.2\") throw new Error(p + \" lock mismatch\");
+}
+const installed = require(\"/home/dan/code/freshell/node_modules/@playwright/test/package.json\").version;
+if (installed !== \"1.58.2\") throw new Error(\"installed Playwright mismatch: \" + installed);
+"
+for exe in \
+  /home/dan/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome \
+  /home/dan/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell; do
+  test -x "$exe"
+  ldd_output="$(ldd "$exe")" || exit 1
+  if grep -q "not found" <<<"$ldd_output"; then echo "unresolved library: $exe" >&2; exit 1; fi
+done
+command -v cargo rustc cc gcc g++ ar ranlib make pkg-config perl python3 ldd >/dev/null
+rustup target list --installed | grep -Fx x86_64-unknown-linux-gnu >/dev/null
+cargo --version
+rustc --version
+df -h "$root"
+grep "^MemAvailable:" /proc/meminfo
+'
 ```
 
-Expected: exit 0.
+Expected: exit 0 with exact installed/locked Playwright 1.58.2, both Chromium revision-1208 executables, no unresolved libraries, Cargo/Rust 1.96 and the native Linux toolchain available, and resource state printed without a pass threshold. This is readiness evidence only and never substitutes for the matrix.
 
-- [ ] **Step 5: Run the unchanged Rust-backed browser baseline**
+- [ ] **Step 5: Run the unchanged exact local Rust-backed browser behavior gate**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep FRESHELL_E2E_BACKEND=local node /home/dan/code/freshell/node_modules/@playwright/test/cli.js test --config /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts --project=rust-chromium --workers=1 --reporter=line /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts
+FRESHELL_VITEST_BACKEND=local env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep FRESHELL_E2E_BACKEND=local node /home/dan/code/freshell/node_modules/@playwright/test/cli.js test --config /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts --project=rust-chromium --workers=1 --reporter=line /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts
 ```
 
-Expected: exit 0 and every existing matrix case passes.
+Expected: exit 0 and every existing matrix case passes. Retain the exact output and observed case count. Any compile, launch, server, Chromium, or matrix failure stops; do not install, reroute, move to a remote runner, narrow the project/spec, or waive the matrix.
 
 - [ ] **Step 6: Inspect the coordinator without treating advisory history as this run**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
+FRESHELL_VITEST_BACKEND=local npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
 ```
 
-Expected: exit 0 and truthful holder state. If another holder is active, wait and rerun this same independent command; never kill or bypass the holder.
+Expected: exit 0 and truthful holder state. If another holder is active, wait and rerun this same independent command; never kill or bypass the holder. Readiness and historical results do not satisfy Step 7.
 
-- [ ] **Step 7: Run a fresh coordinator-owned full baseline**
+- [ ] **Step 7: Run a fresh coordinator-owned local full-suite behavior gate**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud FRESHELL_TEST_SUMMARY="session-directory lazy-page unchanged baseline" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
+FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page unchanged local baseline" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
 ```
 
-Expected: exit 0 from the fresh coordinated client/server/Electron run. A prior advisory result is not a substitute.
+Expected: a fresh coordinator-owned exit 0 for the target worktree and current `HEAD`, with clean source provenance. Retain observed counts and require output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute.
 
-- [ ] **Step 8: Stop cleanly on any baseline discrepancy**
+- [ ] **Step 8: Reseal source provenance and close the authorization receipt**
 
-If any preceding command fails, make no source edit and report the exact command, exit status, and concise failure output. Task 2 starts only after all seven commands succeed.
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
+expected=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
+diff -u <(printf "%s\n" "$expected") <(git -C "$root" diff --name-only "$base" HEAD)
+git -C "$root" diff --exit-code "$base" HEAD -- crates/freshell-server/src/session_directory.rs
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+printf "head=%s\n" "$(git -C "$root" rev-parse HEAD)"
+rustc --version
+cargo --version
+node --version
+npm --prefix "$root" run test:status
+'
+```
+
+Expected: exit 0; plan-only scope, frozen-base source bytes, and clean status are still sealed after all runtime gates; exact `HEAD`, Rust/Cargo/Node versions, and the just-completed coordinator record are printed. Attach the retained Step 3, Step 5, and Step 7 command outputs to this receipt, including exact commands, exit statuses, and observed test/matrix counts. Ignored build caches, `target/`, `dist/`, Playwright output, and coordinator records are allowed test side effects; any unexpected unignored artifact stops. Only this complete receipt authorizes Task 2.
+
+- [ ] **Step 9: Apply fail-closed remediation to any discrepancy**
+
+Any command, preflight, runtime gate, or source seal failure means no production source edit and no Task 2 dispatch. Record the exact command, exit status, and concise failure output. For a runner/transient failure, repair only the environment, restore clean provenance, and rerun Task 1 from Step 1. For a real frozen-base failure, stop for a separate prerequisite repair or rebase onto known-green `origin/main`, update every frozen SHA and expectation, re-review this plan, and rerun Task 1 from Step 1. Never waive a gate, retry until lucky, call a failure pre-existing but acceptable, or attribute it to a refactor that does not yet exist.
 
 ### Task 2: Add the real-route harness and effective-corpus characterizations
 
@@ -153,7 +208,7 @@ If any preceding command fails, make no source edit and report the exact command
 - Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs`.
 
 **Interfaces:**
-- Consumes: Task 1 green baseline; `router(SessionDirectoryState) -> Router`; `SessionIndex::with_ttl_and_cache_path(Vec<Arc<dyn SessionSource>>, Duration, Option<PathBuf>)`; `SettingsStore`; `SessionMetadataStore`; `TerminalIdentityRegistry`; current eager route semantics.
+- Consumes: Task 1's complete local green receipt and post-run source-provenance seal, which is the authorization token for this first production-editing task; `router(SessionDirectoryState) -> Router`; `SessionIndex::with_ttl_and_cache_path(Vec<Arc<dyn SessionSource>>, Duration, Option<PathBuf>)`; `SettingsStore`; `SessionMetadataStore`; `TerminalIdentityRegistry`; current eager route semantics.
 - Produces: sibling test module `page_bound_tests`; direct-listed in-memory `StaticSessionSource` with stable `direct_change_token` and cloned `direct_list` rows; `DirectoryRouteHarness`; `indexed_row`, `provider_row`, `get_page_with_bytes`, `get_page`, `item_ids`, `item_keys`, `page_cursor`, and `test_query`; complete current-GREEN effective-corpus, pagination, revision, Rust-title, archived-order, and wire-shape characterizations consumed by Tasks 3-6.
 
 - [ ] **Step 1: Create the `page_bound_tests` module shell and imports**
@@ -1247,7 +1302,7 @@ This is stronger than the replaced assertion: it retains exact parsed equality a
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
 ```
 
 Expected: exit 0. Every new characterization is GREEN before production restructuring. If the exact raw bytes differ, stop and report the actual body; do not bless a later candidate-path ordering.
@@ -1257,7 +1312,7 @@ Expected: exit 0. Every new characterization is GREEN before production restruct
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
 Expected: exit 0 and no existing test regresses.
@@ -1267,7 +1322,7 @@ Expected: exit 0 and no existing test regresses.
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs
+FRESHELL_VITEST_BACKEND=local git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs
 ```
 
 Expected: exit 0 and no output.
@@ -1279,7 +1334,7 @@ The command below is one valid example for a coherent task-level source checkpoi
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "test(session-directory): characterize effective page semantics" -m "Pin effective-corpus paging, revision, Rust-only search/order behavior, and exact wire bytes through the real Axum route." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "test(session-directory): characterize effective page semantics" -m "Pin effective-corpus paging, revision, Rust-only search/order behavior, and exact wire bytes through the real Axum route." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
 Expected: exit 0 and a normal local source-only commit. Do not inspect or enforce repository commit counts.
@@ -1600,7 +1655,7 @@ The two budget tests retain all three result-state assertions: empty items, `par
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::tests::invalid_cursor_is_rejected -- --exact --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::tests::invalid_cursor_is_rejected -- --exact --color=never --test-threads=1
 ```
 
 Expected: exit 0 with the exact matching test passing.
@@ -1610,7 +1665,7 @@ Expected: exit 0 with the exact matching test passing.
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::tests::cursor_with_required_fields_and_extra_json_field_remains_accepted -- --exact --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::tests::cursor_with_required_fields_and_extra_json_field_remains_accepted -- --exact --color=never --test-threads=1
 ```
 
 Expected: exit 0 with one matching test passing.
@@ -1620,7 +1675,7 @@ Expected: exit 0 with one matching test passing.
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server tier_search_ -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server tier_search_ -- --color=never --test-threads=1
 ```
 
 Expected: exit 0; the missing-source case reports `io_error`, and both budget-order cases report `budget` with empty items and `partial=true`.
@@ -1630,7 +1685,7 @@ Expected: exit 0; the missing-source case reports `io_error`, and both budget-or
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
 ```
 
 Expected: exit 0.
@@ -1640,7 +1695,7 @@ Expected: exit 0.
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
 Expected: exit 0. Production is still unchanged.
@@ -1652,7 +1707,7 @@ The command below is one valid example for a coherent task-level source checkpoi
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "test(session-directory): freeze cursor and search edges" -m "Characterize invalid cursors, accepted extra cursor fields, transcript I/O failures, scan-budget precedence, and budget-before-source ordering." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "test(session-directory): freeze cursor and search edges" -m "Characterize invalid cursors, accepted extra cursor fields, transcript I/O failures, scan-budget precedence, and budget-before-source ordering." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
 Expected: exit 0 and a normal local source-only commit.
@@ -2090,7 +2145,7 @@ Insert this complete test before the closing brace of `candidate_tests`:
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
 ```
 
 Expected RED: compilation fails only because the new candidate types/functions are not yet defined, naming symbols such as `build_directory_candidates`, `DecodedCursor`, or `resolve_indexed_overlay`. Any unrelated parse, type, or fixture failure is not valid RED.
@@ -2862,17 +2917,37 @@ fn derive_directory_page(
 }
 ```
 
-- [ ] **Step 27: Run the shared candidate tests GREEN before handler cutover**
+- [ ] **Step 27: Compile the complete borrowed production core before handler cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo check --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
+```
+
+Expected: exit 0. This compiles the complete non-test borrowed core against the real locked crate while the eager handler remains registered. On failure, stop before handler modification, retain diagnostics, repair only the planned one-file borrowed design, and rerun this gate and Step 28. No failure authorizes an owned fallback, adapter, API/manifest change, or second source file.
+
+- [ ] **Step 28: Compile inline candidate and eager-oracle coexistence before handler cutover**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+```
+
+Expected: exit 0. This compiles inline candidate tests and eager/candidate coexistence against the lockfile. On failure, stop before handler modification under the same one-file correction/reopen rule as Step 27.
+
+- [ ] **Step 29: Run the shared candidate tests GREEN before handler cutover**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
 ```
 
 Expected: exit 0; shared order/cursor, eligibility, override, candidate-winner, and title-annotation tests pass.
 
-- [ ] **Step 28: Gate every eager policy declaration to tests**
+- [ ] **Step 30: Gate every eager policy declaration to tests**
 
 Add this complete attribute immediately before each existing declaration named `dir_item_from_indexed`, `apply_session_overrides`, `apply_session_metadata`, `join_running_state`, `build_live_terminal_session_item`, `join_live_terminals`, `apply_query`, `FileSearchOutcome`, `apply_file_search`, and `apply_title_search`; leave each body unchanged:
 
@@ -2880,7 +2955,7 @@ Add this complete attribute immediately before each existing declaration named `
 #[cfg(test)]
 ```
 
-- [ ] **Step 29: Add the temporary eager page oracle**
+- [ ] **Step 31: Add the temporary eager page oracle**
 
 Add this complete test-only oracle function:
 
@@ -2901,7 +2976,7 @@ fn derive_eager_oracle_page(
 }
 ```
 
-- [ ] **Step 30: Add deterministic differential support types and seeds**
+- [ ] **Step 32: Add deterministic differential support types and seeds**
 
 Insert this complete support group before the closing brace of `candidate_tests`:
 
@@ -2940,7 +3015,7 @@ impl DeterministicLcg {
 const DIFFERENTIAL_SEEDS: [u64; 2] = [0x5EED_0001, 0x5EED_0002];
 ```
 
-- [ ] **Step 31: Build the seeded differential fixture**
+- [ ] **Step 33: Build the seeded differential fixture**
 
 Insert this complete fixture builder inside `candidate_tests`:
 
@@ -3106,7 +3181,7 @@ fn seeded_differential_fixture(seed: u64) -> DifferentialFixture {
 }
 ```
 
-- [ ] **Step 32: Add differential visibility axes**
+- [ ] **Step 34: Add differential visibility axes**
 
 Insert this complete axis function inside `candidate_tests`:
 
@@ -3125,7 +3200,7 @@ fn differential_visibility_cases() -> [(bool, bool, bool); 8] {
 }
 ```
 
-- [ ] **Step 33: Add differential query/tier axes**
+- [ ] **Step 35: Add differential query/tier axes**
 
 Insert this complete axis function inside `candidate_tests`:
 
@@ -3146,7 +3221,7 @@ fn differential_query_cases() -> [(Option<&'static str>, Tier); 10] {
 }
 ```
 
-- [ ] **Step 34: Add the initial differential limit axis**
+- [ ] **Step 36: Add the initial differential limit axis**
 
 Insert this complete axis function inside `candidate_tests`:
 
@@ -3156,7 +3231,7 @@ fn differential_limits() -> [usize; 2] {
 }
 ```
 
-- [ ] **Step 35: Add differential cursor axes**
+- [ ] **Step 37: Add differential cursor axes**
 
 Insert this complete axis function inside `candidate_tests`:
 
@@ -3166,7 +3241,7 @@ fn differential_cursors() -> [Option<String>; 2] {
 }
 ```
 
-- [ ] **Step 36: Add fixed deep-partial differential cases**
+- [ ] **Step 38: Add fixed deep-partial differential cases**
 
 Insert this complete fixture-case function inside `candidate_tests`:
 
@@ -3262,7 +3337,7 @@ fn fixed_deep_partial_cases() -> Vec<(
 
 `io-budget-stop` sorts after the ten scannable rows, so the selector must visit this later eligible candidate with `scanned_files == 10` and overwrite the earlier `io_error` with `budget`. The tuple pins `io-only -> io_error`, `io-then-budget -> budget`, `budget-before-no-source -> budget`, and exact omission of both partial fields for `lookahead-before-later-partial`. Keep Task 3's dedicated I/O/budget tests unchanged.
 
-- [ ] **Step 37: Add the initial seeded differential test**
+- [ ] **Step 39: Add the initial seeded differential test**
 
 Insert this complete test inside `candidate_tests`:
 
@@ -3373,7 +3448,7 @@ fn candidate_path_matches_eager_oracle_across_seeded_cross_product() {
 }
 ```
 
-- [ ] **Step 38: Add empty and malformed metadata variants to the seeded fixture**
+- [ ] **Step 40: Add empty and malformed metadata variants to the seeded fixture**
 
 After the two existing metadata inserts in `seeded_differential_fixture`, add this complete block:
 
@@ -3388,7 +3463,7 @@ After the two existing metadata inserts in `seeded_differential_fixture`, add th
     );
 ```
 
-- [ ] **Step 39: Expand the differential limit axis to include 50**
+- [ ] **Step 41: Expand the differential limit axis to include 50**
 
 Replace `differential_limits` with this complete function:
 
@@ -3398,7 +3473,7 @@ fn differential_limits() -> [usize; 3] {
 }
 ```
 
-- [ ] **Step 40: Add named full/no-override/no-identity fixture variants**
+- [ ] **Step 42: Add named full/no-override/no-identity fixture variants**
 
 Insert this complete fixture-variant function inside `candidate_tests`:
 
@@ -3422,7 +3497,7 @@ fn seeded_differential_fixture_variants(
 }
 ```
 
-- [ ] **Step 41: Strengthen the differential across every named fixture axis**
+- [ ] **Step 43: Strengthen the differential across every named fixture axis**
 
 Replace `candidate_path_matches_eager_oracle_across_seeded_cross_product` with this complete test:
 
@@ -3553,19 +3628,19 @@ fn candidate_path_matches_eager_oracle_across_seeded_cross_product() {
 
 The named `full`, `no-overrides`, and `no-identities` fixtures cover both presence and absence axes; the full corpus includes delete/title/summary/archive/provider-title overrides, exact/providerless/known-session/fallback/collision identities, and metadata hit/empty/malformed/miss. The comparison total remains derived from array/vector lengths; do not replace it with a numeric literal.
 
-- [ ] **Step 42: Run exact eager/candidate parsed and serialized parity**
+- [ ] **Step 44: Run exact eager/candidate parsed and serialized parity**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests::candidate_path_matches_eager_oracle_across_seeded_cross_product -- --exact --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests::candidate_path_matches_eager_oracle_across_seeded_cross_product -- --exact --color=never --test-threads=1
 ```
 
 Expected: exit 0; every named cross-product and fixed deep-partial case has equal `Value` and equal `serde_json::to_vec` bytes, and the fixed cases assert `io_error`, `budget`, `budget`, and exact omission of both partial fields respectively.
 
-- [ ] **Step 43: Cut the real handler over to the narrow borrow scope**
+- [ ] **Step 45: Cut the real handler over to the narrow borrow scope**
 
-Replace the eager body after successful query validation with this complete block:
+Only after Steps 27-28's locked compiler gates, Step 29's candidate tests, and Step 44's parsed/serialized eager parity all pass, replace the eager body after successful query validation with this complete block:
 
 ```rust
     let snapshot: Option<Arc<Vec<IndexedSession>>> = match &state.session_index {
@@ -3609,79 +3684,79 @@ Replace the eager body after successful query validation with this complete bloc
     }
 ```
 
-This preserves auth/query early returns, capture order, invalid-cursor timing, explicit snapshot release, late whole-map project colors, and `Err(message)`.
+This preserves auth/query early returns, accessor order and fixed-input semantics, invalid-cursor timing, explicit snapshot release, late whole-map project colors, and `Err(message)`. It intentionally does not preserve old interleaving windows between projection stages and later independent accessor reads; overlapping-write outcomes remain unspecified.
 
-- [ ] **Step 44: Compile the production server candidate path**
+- [ ] **Step 46: Compile the real Axum handler immediately after cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo check --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo check --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
 ```
 
-Expected: exit 0. The non-test server has only the candidate policy path.
+Expected: exit 0. This is the load-bearing production proof for the real registered Axum handler, not a repeat of the old-handler pre-cutover check. Any failure stops before route tests or commit and permits only correction of the planned one-file borrowed design followed by complete rerun; it never authorizes a fallback, adapter, API/manifest change, or second source file.
 
-- [ ] **Step 45: Compile all test-only coexistence code**
+- [ ] **Step 47: Compile all inline test-only coexistence code immediately after cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
 ```
 
-Expected: exit 0. If the borrowed lifetime design fails, stop with the compiler diagnostics and revise the single borrowed design; do not introduce a second owned architecture.
+Expected: exit 0. This separately proves inline `#[cfg(test)]` coexistence against the cut-over handler. A failure has the same stop/correct-within-plan/reopen rule as Step 46 and occurs before route tests or commit.
 
-- [ ] **Step 46: Rerun all candidate tests after handler cutover**
+- [ ] **Step 48: Rerun all candidate tests after handler cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests -- --color=never --test-threads=1
 ```
 
 Expected: exit 0.
 
-- [ ] **Step 47: Rerun all real-route characterizations after cutover**
+- [ ] **Step 49: Rerun all real-route characterizations after cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
 ```
 
 Expected: exit 0 with exact route behavior and bytes unchanged.
 
-- [ ] **Step 48: Rerun the complete focused family after cutover**
+- [ ] **Step 50: Rerun the complete focused family after cutover**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
 Expected: exit 0.
 
-- [ ] **Step 49: Commit the green borrowed-path cutover**
+- [ ] **Step 51: Commit the green borrowed-path cutover**
 
 The command below is one valid example for a coherent task-level source checkpoint; its subject and body are illustrative, not required history. If this task's mandatory spec/quality review or a later final check finds a defect, make any additional source-only correction commit needed and rerun the affected checks before advancing. Do not infer an exact commit count, subject sequence, or commit order from this example.
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "refactor(session-directory): add borrowed page derivation" -m "Normalize the captured corpus into borrowed candidates, prove exact eager parity, and route production through one shared order and eligibility policy." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "refactor(session-directory): add borrowed page derivation" -m "Normalize the captured corpus into borrowed candidates, prove exact eager parity, and route production through one shared order and eligibility policy." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
 Expected: exit 0 and a normal local source-only commit.
 
-### Task 5: Migrate retained tests and delete eager-oracle residue
+### Task 5: Migrate retained tests while preserving the eager oracle
 
 **Files:**
 - Modify/test: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`.
 - Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/fixtures/sessions/**`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/sessions_tests.rs` for the unchanged cross-router override assertion.
 
 **Interfaces:**
-- Consumes: Task 3's unchanged `fn write_nonmatching_claude_transcript(path: &Path)` and `fn deep_search_query() -> DirQuery` helpers; Task 4's production `build_directory_candidates`, `resolve_indexed_overlay`, `derive_directory_page`, candidate selector/materializer, handler cutover, and temporary eager differential.
-- Produces: existing semantic assertions routed through `IndexedSession` and the production derivation; final non-`Clone` `DirItem`; final materializer without legacy fields; no eager helper, oracle, temporary differential support, obsolete `deep_search_dir_item`/`guard_item`/`overlaid_title`, or old `Vec<DirItem>` policy seam.
+- Consumes: Task 3's unchanged `fn write_nonmatching_claude_transcript(path: &Path)` and `fn deep_search_query() -> DirQuery` helpers; Task 4's production `build_directory_candidates`, `resolve_indexed_overlay`, `derive_directory_page`, temporary unbounded selector/materializer, handler cutover, and temporary eager differential.
+- Produces: all retained semantic assertions routed through `IndexedSession` and the production derivation while deliberately retaining, under test-only use, every eager helper, `derive_eager_oracle_page`, all 2,884-case differential support, the temporary legacy `DirItem` fields/materializer/serializer, and the unbounded non-deep selector. Task 6 consumes and removes that one oracle after proving the final selector; Task 5 adds no second oracle representation.
 
 - [ ] **Step 1: Update the main test-module imports for indexed derivation**
 
@@ -5130,423 +5205,52 @@ Also leave `sessions_tests::patch_override_is_visible_through_session_directory_
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
 ```
 
-Expected: exit 0; no stale direct-helper call remains.
+Expected: exit 0; no stale direct-helper call remains, while eager/candidate coexistence and the legacy temporary output path still compile against the lockfile.
 
 - [ ] **Step 57: Run all migrated and unchanged session-directory tests**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
 ```
 
 Expected: exit 0 with all migrated and unchanged route tests passing.
 
-- [ ] **Step 58: Run the differential one final time immediately before deletion**
+- [ ] **Step 58: Run the migration checkpoint differential with the eager oracle retained**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests::candidate_path_matches_eager_oracle_across_seeded_cross_product -- --exact --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests::candidate_path_matches_eager_oracle_across_seeded_cross_product -- --exact --color=never --test-threads=1
 ```
 
-Expected: exit 0 with exact parsed and serialized parity plus the fixed-case `io_error`/`budget`/`budget`/omission assertions. Begin deletion without an intervening source edit.
+Expected: exit 0 with exact parsed and serialized parity plus the fixed-case `io_error`/`budget`/`budget`/omission assertions. This proves migration changed tests/callers only; both unbounded candidate and eager paths, the legacy temporary `DirItem` fields/materializer/serializer, and all 2,884-case support remain for Task 6. Do not delete or finalize output types in this task.
 
-- [ ] **Step 59: Delete all eager policy and temporary differential symbols together**
+- [ ] **Step 59: Commit the green retained-test migration with the eager oracle intact**
 
-Immediately after the green differential, delete the complete definitions of these exact symbols and no neighboring retained parser/route code:
-
-```text
-dir_item_from_indexed
-apply_session_overrides
-apply_session_metadata
-join_running_state
-build_live_terminal_session_item
-join_live_terminals
-apply_query
-FileSearchOutcome
-apply_file_search
-apply_title_search
-deep_search_dir_item
-guard_item
-overlaid_title
-derive_eager_oracle_page
-DifferentialFixture
-DeterministicLcg
-DIFFERENTIAL_SEEDS
-seeded_differential_fixture
-seeded_differential_fixture_variants
-differential_visibility_cases
-differential_query_cases
-differential_limits
-differential_cursors
-fixed_deep_partial_cases
-candidate_path_matches_eager_oracle_across_seeded_cross_product
-```
-
-Do not leave wrappers under old names. This cleanup occurs only after every consumer has migrated and before the final `DirItem` replacement. Keep the shared candidate tests in `candidate_tests`, plus Task 3's reused `write_nonmatching_claude_transcript`, `deep_search_query`, and `encode_raw_cursor_payload` helpers.
-
-- [ ] **Step 60: Replace `DirItem` with the final non-cloneable output shape**
-
-Replace the complete `DirItem` declaration with:
-
-```rust
-#[derive(Debug)]
-struct DirItem {
-    session_id: String,
-    provider: String,
-    project_path: String,
-    title: Option<String>,
-    summary: Option<String>,
-    first_user_message: Option<String>,
-    last_activity_at: i64,
-    created_at: Option<i64>,
-    cwd: Option<String>,
-    is_subagent: bool,
-    is_non_interactive: bool,
-    is_running: bool,
-    archived: bool,
-    matched_in: Option<String>,
-    snippet: Option<String>,
-    running_terminal_id: Option<String>,
-    live_terminal_only: bool,
-    session_type: Option<String>,
-}
-```
-
-- [ ] **Step 61: Replace `DirItem::to_value` with the final serializer**
-
-Replace the complete serializer implementation with this counter-free Task 5 version:
-
-```rust
-impl DirItem {
-    fn to_value(&self) -> Value {
-        let mut object = Map::new();
-        object.insert("sessionId".into(), json!(self.session_id));
-        object.insert("provider".into(), json!(self.provider));
-        object.insert("projectPath".into(), json!(self.project_path));
-        object.insert("lastActivityAt".into(), json!(self.last_activity_at));
-        object.insert("isRunning".into(), json!(self.is_running));
-        object.insert("archived".into(), json!(self.archived));
-        if let Some(value) = &self.title {
-            object.insert("title".into(), json!(value));
-        }
-        if let Some(value) = &self.summary {
-            object.insert("summary".into(), json!(value));
-        }
-        if let Some(value) = &self.first_user_message {
-            object.insert("firstUserMessage".into(), json!(value));
-        }
-        if let Some(value) = self.created_at {
-            object.insert("createdAt".into(), json!(value));
-        }
-        if let Some(value) = &self.cwd {
-            object.insert("cwd".into(), json!(value));
-        }
-        if self.is_subagent {
-            object.insert("isSubagent".into(), json!(true));
-        }
-        if self.is_non_interactive {
-            object.insert("isNonInteractive".into(), json!(true));
-        }
-        if let Some(value) = &self.matched_in {
-            object.insert("matchedIn".into(), json!(value));
-        }
-        if let Some(value) = &self.snippet {
-            object.insert("snippet".into(), json!(value));
-        }
-        if let Some(value) = &self.running_terminal_id {
-            object.insert("runningTerminalId".into(), json!(value));
-        }
-        if self.live_terminal_only {
-            object.insert("liveTerminalOnly".into(), json!(true));
-        }
-        if let Some(value) = &self.session_type {
-            object.insert("sessionType".into(), json!(value));
-        }
-        Value::Object(object)
-    }
-}
-```
-
-- [ ] **Step 62: Replace the temporary materializer with the final legacy-free materializer**
-
-Use this complete block, omitting counters until Task 6:
-
-```rust
-fn materialize_selected_candidate(
-    selected: SelectedCandidate<'_>,
-    metadata: &HashMap<String, Value>,
-) -> DirItem {
-    let SelectedCandidate {
-        candidate,
-        annotation,
-    } = selected;
-    let DirectoryCandidate { key, source } = candidate;
-    let (matched_in, snippet) = match annotation {
-        Some(SearchAnnotation {
-            matched_in,
-            snippet,
-        }) => (Some(matched_in.to_string()), Some(snippet)),
-        None => (None, None),
-    };
-
-    match source {
-        DirectoryCandidateSource::Indexed {
-            row,
-            overlay,
-            running_identity,
-        } => {
-            let session_type = metadata
-                .get(key.as_ref())
-                .and_then(Value::as_object)
-                .and_then(|entry| entry.get("sessionType"))
-                .and_then(Value::as_str)
-                .filter(|session_type| !session_type.is_empty())
-                .map(str::to_string);
-            DirItem {
-                session_id: row.session_id.clone(),
-                provider: row.provider.clone(),
-                project_path: row.project_path.clone(),
-                title: overlay.effective_title.map(str::to_string),
-                summary: overlay.effective_summary.map(str::to_string),
-                first_user_message: row.first_user_message.clone(),
-                last_activity_at: row.last_activity_at,
-                created_at: row.created_at,
-                cwd: row.cwd.clone(),
-                is_subagent: row.is_subagent,
-                is_non_interactive: row.is_non_interactive,
-                is_running: running_identity.is_some(),
-                archived: overlay.archived,
-                matched_in,
-                snippet,
-                running_terminal_id: running_identity
-                    .map(|identity| identity.terminal_id.clone()),
-                live_terminal_only: false,
-                session_type,
-            }
-        }
-        DirectoryCandidateSource::Synthesized {
-            identity,
-            provider,
-            session_id,
-        } => {
-            let (session_id, live_terminal_only) = match session_id {
-                SynthesizedSessionId::Existing(session_id) => {
-                    (session_id.to_string(), false)
-                }
-                SynthesizedSessionId::TerminalFallback(terminal_id) => {
-                    (format!("terminal:{terminal_id}"), true)
-                }
-            };
-            let terminal_fallback = format!("terminal:{}", identity.terminal_id);
-            DirItem {
-                session_id,
-                provider: provider.to_string(),
-                project_path: identity
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| terminal_fallback.clone()),
-                title: Some(provider_display_name(provider).to_string()),
-                summary: None,
-                first_user_message: None,
-                last_activity_at: identity.updated_at,
-                created_at: Some(identity.updated_at),
-                cwd: identity.cwd.clone(),
-                is_subagent: identity.is_subagent.unwrap_or(false),
-                is_non_interactive: false,
-                is_running: true,
-                archived: false,
-                matched_in,
-                snippet,
-                running_terminal_id: Some(identity.terminal_id.clone()),
-                live_terminal_only,
-                session_type: Some(provider.to_string()),
-            }
-        }
-    }
-}
-```
-
-- [ ] **Step 63: Replace the test-only parser row constructor**
-
-Replace `item_from_meta` with this complete final test-only function:
-
-```rust
-#[cfg(test)]
-fn item_from_meta(
-    meta: &ParsedSessionMeta,
-    provider: &str,
-    fallback_session_id: &str,
-    force_subagent: bool,
-) -> DirItem {
-    DirItem {
-        session_id: meta
-            .session_id
-            .clone()
-            .unwrap_or_else(|| fallback_session_id.to_string()),
-        provider: provider.to_string(),
-        project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
-        title: meta.title.clone(),
-        summary: meta.summary.clone(),
-        first_user_message: meta.first_user_message.clone(),
-        last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
-        created_at: meta.created_at,
-        cwd: meta.cwd.clone(),
-        is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
-        is_non_interactive: meta.is_non_interactive.unwrap_or(false),
-        is_running: false,
-        archived: false,
-        matched_in: None,
-        snippet: None,
-        running_terminal_id: None,
-        live_terminal_only: false,
-        session_type: None,
-    }
-}
-```
-
-- [ ] **Step 64: Remove the obsolete source path from the parser call**
-
-Replace the parser call with this complete expression:
-
-```rust
-    Some(item_from_meta(
-        &meta,
-        "claude",
-        &fallback,
-        force_subagent,
-    ))
-```
-
-- [ ] **Step 65: Update the real-corrupted parser test call**
-
-Replace the direct test call with:
-
-```rust
-        let item = item_from_meta(&meta, "claude", "real-corrupted", false);
-```
-
-- [ ] **Step 66: Update the healthy parser test call**
-
-Replace the direct test call with:
-
-```rust
-        let item = item_from_meta(&meta, "claude", "healthy", false);
-```
-
-- [ ] **Step 67: Replace the removed `DirItem::key` use in `Comparable`**
-
-Replace `Comparable::from(&DirItem)`'s key field with:
-
-```rust
-                key: format!("{}:{}", i.provider, i.session_id),
-```
-
-- [ ] **Step 68: Replace the module-level candidate-pipeline documentation**
-
-Replace the module header with:
-
-```rust
-//! Rust implementation of `GET /api/session-directory`.
-//!
-//! Each request captures one index snapshot plus request-local override,
-//! metadata, and terminal-identity snapshots. A shared borrowed-candidate
-//! pipeline owns effective membership, ordering, visibility, cursor, and search
-//! policy for every tier; only returned descriptors become `DirItem` values.
-```
-
-- [ ] **Step 69: Replace stale `SessionDirectoryState` field documentation**
-
-Replace the complete state declaration and comments with:
-
-```rust
-/// Request dependencies for the Rust session-directory route. `session_index`
-/// may be absent; provider-bearing live identities can still synthesize rows.
-#[derive(Clone)]
-pub struct SessionDirectoryState {
-    pub auth_token: Arc<String>,
-    pub settings: crate::settings_store::SettingsStore,
-    pub session_index: Option<Arc<SessionIndex>>,
-    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
-    pub metadata: crate::session_metadata::SessionMetadataStore,
-}
-```
-
-- [ ] **Step 70: Replace stale search-tier documentation**
-
-Replace the `Tier` documentation with:
-
-```rust
-/// Search tier. A nonblank query selects title metadata or transcript search;
-/// a missing or blank query uses the same no-search candidate pipeline for all
-/// tier values.
-```
-
-- [ ] **Step 71: Compile the final test target after eager cleanup**
+The command below is one valid example for a coherent task-level source checkpoint; its subject and body are illustrative, not required history. If this task's mandatory spec/quality review or a later final check finds a defect, make any additional source-only correction commit needed and rerun the affected checks before advancing. Do not infer an exact commit count, subject sequence, or commit order from this example. The review must accept the retained eager code only as the temporary `#[cfg(test)]` oracle consumed by Task 6, never as a second production policy.
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "refactor(session-directory): migrate retained candidate tests" -m "Route retained assertions through indexed candidates and production derivation while preserving the test-only eager oracle for final-selector parity in Task 6." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
-Expected: exit 0; final `DirItem` is non-`Clone`, and no eager symbol is required.
+Expected: exit 0 and a normal local source-only migration commit. The eager helpers, oracle, 2,884-case support, legacy temporary output fields/path, and unbounded selector remain present by design.
 
-- [ ] **Step 72: Run the final focused family after eager cleanup**
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
-```
-
-Expected: exit 0; all retained and unchanged route tests pass.
-
-- [ ] **Step 73: Prove old eager policy functions are absent**
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "^fn (dir_item_from_indexed|apply_session_overrides|apply_session_metadata|join_running_state|build_live_terminal_session_item|join_live_terminals|apply_query|apply_file_search|apply_title_search|derive_eager_oracle_page)\\(" -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
-```
-
-Expected: no matches and exit 0.
-
-- [ ] **Step 74: Prove obsolete helpers and all temporary differential support are absent**
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "FileSearchOutcome|derive_eager_oracle_page|DifferentialFixture|DeterministicLcg|DIFFERENTIAL_SEEDS|seeded_differential_fixture|seeded_differential_fixture_variants|differential_visibility_cases|differential_query_cases|differential_limits|differential_cursors|fixed_deep_partial_cases|candidate_path_matches_eager_oracle_across_seeded_cross_product|deep_search_dir_item|guard_item|overlaid_title" -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
-```
-
-Expected: no matches and exit 0. This is the same complete residue-name set used by Task 7.
-
-- [ ] **Step 75: Commit the green retained-test migration and eager cleanup**
-
-The command below is one valid example for a coherent task-level source checkpoint; its subject and body are illustrative, not required history. If this task's mandatory spec/quality review or a later final check finds a defect, make any additional source-only correction commit needed and rerun the affected checks before advancing. Do not infer an exact commit count, subject sequence, or commit order from this example.
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "refactor(session-directory): remove eager policy residue" -m "Migrate retained assertions to indexed candidates and the real derivation, then remove the temporary eager oracle and legacy full-row policy path." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
-```
-
-Expected: exit 0 and a normal local source-only commit.
-
-### Task 6: Add structural RED tests and enforce page-bounded work
+### Task 6: Prove the bounded selector against the eager oracle, finalize output cleanup, and enforce structural work bounds
 
 **Files:**
 - Modify/test: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`.
-- Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`.
+- Read only: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/settings_store.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_metadata.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-build.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, and `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`.
 
 **Interfaces:**
-- Consumes: Task 5's single production candidate path, temporary unbounded non-deep selector, final consuming materializer/serializer, and Task 2 route harness.
-- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; exact retained-peak/materialization/serialization/annotation tests; final selector that retains no more than `limit + 1`; at most `limit` full rows and JSON objects.
+- Consumes: Task 5's migrated tests, retained eager helpers/oracle and 2,884-case differential, legacy temporary `DirItem` fields/materializer/serializer, temporary unbounded non-deep selector, single production candidate path, and Task 2 route harness.
+- Produces: test-only `PreparationCounts`, `PreparationScope`, and `record_preparation`; structural RED against the unbounded selector; the exact verified final selector; final-selector parsed/byte parity against the retained eager oracle before deletion; final non-`Clone` counted output path; no eager/differential residue; exact runtime structural counts plus the mandatory static locality/centrality proof; locked final assembly; and provenance-bracketed sandbox evidence. TLS counters are one runtime evidence leg, never sole proof.
 
 - [ ] **Step 1: Add the preparation counter value type**
 
@@ -5745,200 +5449,36 @@ fn select_page_candidates<'a>(
 }
 ```
 
-- [ ] **Step 7: Count indexed and synthesized materializations**
+- [ ] **Step 7: Count both arms of the still-legacy temporary materializer**
 
-Replace `materialize_selected_candidate` with this complete counted version:
+Keep the complete Task 4 temporary `materialize_selected_candidate` shape, including `title_source` and `source_file`, because the eager oracle still consumes those fields. Insert this block at entry to the indexed arm, immediately after its `=> {`:
 
 ```rust
-fn materialize_selected_candidate(
-    selected: SelectedCandidate<'_>,
-    metadata: &HashMap<String, Value>,
-) -> DirItem {
-    let SelectedCandidate {
-        candidate,
-        annotation,
-    } = selected;
-    let DirectoryCandidate { key, source } = candidate;
-    let (matched_in, snippet) = match annotation {
-        Some(SearchAnnotation {
-            matched_in,
-            snippet,
-        }) => (Some(matched_in.to_string()), Some(snippet)),
-        None => (None, None),
-    };
-
-    match source {
-        DirectoryCandidateSource::Indexed {
-            row,
-            overlay,
-            running_identity,
-        } => {
             #[cfg(test)]
             record_preparation(|counts| counts.indexed_materializations += 1);
+```
 
-            let session_type = metadata
-                .get(key.as_ref())
-                .and_then(Value::as_object)
-                .and_then(|entry| entry.get("sessionType"))
-                .and_then(Value::as_str)
-                .filter(|session_type| !session_type.is_empty())
-                .map(str::to_string);
-            DirItem {
-                session_id: row.session_id.clone(),
-                provider: row.provider.clone(),
-                project_path: row.project_path.clone(),
-                title: overlay.effective_title.map(str::to_string),
-                summary: overlay.effective_summary.map(str::to_string),
-                first_user_message: row.first_user_message.clone(),
-                last_activity_at: row.last_activity_at,
-                created_at: row.created_at,
-                cwd: row.cwd.clone(),
-                is_subagent: row.is_subagent,
-                is_non_interactive: row.is_non_interactive,
-                is_running: running_identity.is_some(),
-                archived: overlay.archived,
-                matched_in,
-                snippet,
-                running_terminal_id: running_identity
-                    .map(|identity| identity.terminal_id.clone()),
-                live_terminal_only: false,
-                session_type,
-            }
-        }
-        DirectoryCandidateSource::Synthesized {
-            identity,
-            provider,
-            session_id,
-        } => {
+Insert this block at entry to the synthesized arm, immediately after its `=> {`:
+
+```rust
             #[cfg(test)]
             record_preparation(|counts| counts.synthesized_materializations += 1);
-
-            let (session_id, live_terminal_only) = match session_id {
-                SynthesizedSessionId::Existing(session_id) => {
-                    (session_id.to_string(), false)
-                }
-                SynthesizedSessionId::TerminalFallback(terminal_id) => {
-                    (format!("terminal:{terminal_id}"), true)
-                }
-            };
-            let terminal_fallback = format!("terminal:{}", identity.terminal_id);
-            DirItem {
-                session_id,
-                provider: provider.to_string(),
-                project_path: identity
-                    .cwd
-                    .clone()
-                    .unwrap_or_else(|| terminal_fallback.clone()),
-                title: Some(provider_display_name(provider).to_string()),
-                summary: None,
-                first_user_message: None,
-                last_activity_at: identity.updated_at,
-                created_at: Some(identity.updated_at),
-                cwd: identity.cwd.clone(),
-                is_subagent: identity.is_subagent.unwrap_or(false),
-                is_non_interactive: false,
-                is_running: true,
-                archived: false,
-                matched_in,
-                snippet,
-                running_terminal_id: Some(identity.terminal_id.clone()),
-                live_terminal_only,
-                session_type: Some(provider.to_string()),
-            }
-        }
-    }
-}
 ```
 
-- [ ] **Step 8: Retain the final non-cloneable `DirItem` shape**
+Do not replace any constructor field or create a second oracle/output representation in this step.
 
-Replace the complete `DirItem` declaration with:
+- [ ] **Step 8: Count serializations in the still-legacy temporary serializer**
 
-```rust
-#[derive(Debug)]
-struct DirItem {
-    session_id: String,
-    provider: String,
-    project_path: String,
-    title: Option<String>,
-    summary: Option<String>,
-    first_user_message: Option<String>,
-    last_activity_at: i64,
-    created_at: Option<i64>,
-    cwd: Option<String>,
-    is_subagent: bool,
-    is_non_interactive: bool,
-    is_running: bool,
-    archived: bool,
-    matched_in: Option<String>,
-    snippet: Option<String>,
-    running_terminal_id: Option<String>,
-    live_terminal_only: bool,
-    session_type: Option<String>,
-}
-```
-
-- [ ] **Step 9: Count final row serializations**
-
-Replace `DirItem::to_value` with this complete counted serializer:
+Keep the current serializer's complete field order and body unchanged for eager parity. Insert this exact counter at entry to the current `DirItem::to_value`, before `let mut object = Map::new();`:
 
 ```rust
-impl DirItem {
-    fn to_value(&self) -> Value {
         #[cfg(test)]
         record_preparation(|counts| counts.serializations += 1);
-
-        let mut object = Map::new();
-        object.insert("sessionId".into(), json!(self.session_id));
-        object.insert("provider".into(), json!(self.provider));
-        object.insert("projectPath".into(), json!(self.project_path));
-        object.insert("lastActivityAt".into(), json!(self.last_activity_at));
-        object.insert("isRunning".into(), json!(self.is_running));
-        object.insert("archived".into(), json!(self.archived));
-        if let Some(value) = &self.title {
-            object.insert("title".into(), json!(value));
-        }
-        if let Some(value) = &self.summary {
-            object.insert("summary".into(), json!(value));
-        }
-        if let Some(value) = &self.first_user_message {
-            object.insert("firstUserMessage".into(), json!(value));
-        }
-        if let Some(value) = self.created_at {
-            object.insert("createdAt".into(), json!(value));
-        }
-        if let Some(value) = &self.cwd {
-            object.insert("cwd".into(), json!(value));
-        }
-        if self.is_subagent {
-            object.insert("isSubagent".into(), json!(true));
-        }
-        if self.is_non_interactive {
-            object.insert("isNonInteractive".into(), json!(true));
-        }
-        if let Some(value) = &self.matched_in {
-            object.insert("matchedIn".into(), json!(value));
-        }
-        if let Some(value) = &self.snippet {
-            object.insert("snippet".into(), json!(value));
-        }
-        if let Some(value) = &self.running_terminal_id {
-            object.insert("runningTerminalId".into(), json!(value));
-        }
-        if self.live_terminal_only {
-            object.insert("liveTerminalOnly".into(), json!(true));
-        }
-        if let Some(value) = &self.session_type {
-            object.insert("sessionType".into(), json!(value));
-        }
-        Value::Object(object)
-    }
-}
 ```
 
-No other production site records these counters.
+The differential runs outside `PreparationScope`, so this test-only recorder is inactive and cannot alter parsed or byte output.
 
-- [ ] **Step 10: Create the nested `preparation_tests` module shell**
+- [ ] **Step 9: Create the nested `preparation_tests` module shell**
 
 Add this complete shell inside `page_bound_tests`:
 
@@ -5948,7 +5488,7 @@ Add this complete shell inside `page_bound_tests`:
     }
 ```
 
-- [ ] **Step 11: Add structural test `no_search_materializes_only_returned_indexed_rows`**
+- [ ] **Step 10: Add structural test `no_search_materializes_only_returned_indexed_rows`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -5986,7 +5526,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 12: Add structural test `no_search_materializes_only_returned_synthesized_rows`**
+- [ ] **Step 11: Add structural test `no_search_materializes_only_returned_synthesized_rows`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6024,7 +5564,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 13: Add structural test `filtered_and_cursor_prefixes_do_not_expand_full_preparation`**
+- [ ] **Step 12: Add structural test `filtered_and_cursor_prefixes_do_not_expand_full_preparation`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6111,7 +5651,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 14: Add structural test `all_hidden_page_materializes_nothing_and_keeps_revision`**
+- [ ] **Step 13: Add structural test `all_hidden_page_materializes_nothing_and_keeps_revision`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6143,7 +5683,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 15: Add structural test `sparse_title_search_retains_only_limit_plus_one_annotations`**
+- [ ] **Step 14: Add structural test `sparse_title_search_retains_only_limit_plus_one_annotations`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6192,7 +5732,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 16: Add structural test `deep_search_retains_only_limit_plus_one_annotations`**
+- [ ] **Step 15: Add structural test `deep_search_retains_only_limit_plus_one_annotations`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6246,7 +5786,7 @@ Insert this complete current-thread route test before the closing brace of `prep
         }
 ```
 
-- [ ] **Step 17: Add structural test `preparation_scope_resets_and_is_inactive_outside_interval`**
+- [ ] **Step 16: Add structural test `preparation_scope_resets_and_is_inactive_outside_interval`**
 
 Insert this complete current-thread route test before the closing brace of `preparation_tests`:
 
@@ -6300,17 +5840,17 @@ Insert this complete current-thread route test before the closing brace of `prep
 
 The RED run uses the temporary unbounded selector. Response assertions must already pass; only exact descriptor/annotation counts for no-search/title paths may fail.
 
-- [ ] **Step 18: Run the structural tests and observe the intended RED**
+- [ ] **Step 17: Run the structural tests and observe the intended RED**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
 ```
 
 Expected RED: response assertions already pass, but exact no-search/title descriptor peaks or annotation counts exceed their specified `limit + 1` values under the temporary selector. Compilation failure, response mismatch, timing failure, or unrelated failure is not valid RED.
 
-- [ ] **Step 19: Replace only the selector with the final bounded implementation**
+- [ ] **Step 18: Replace only the selector with the final bounded implementation**
 
 Use this complete final selector:
 
@@ -6428,244 +5968,1138 @@ fn select_page_candidates<'a>(
 
 The post-push break applies only to no-search/title paths. Deep search retains its pre-budget lookahead check before source/provider filtering.
 
-- [ ] **Step 20: Rerun the structural tests GREEN with exact counts**
+- [ ] **Step 19: Compile the final selector before using the eager oracle**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo check --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
 ```
 
-Expected: exit 0. Indexed/synthesized materializations, serializations, retained peak, and owned annotation counts exactly equal each test's struct literal.
+Expected: exit 0 against the real locked production crate. The selector in Step 18 is the last production behavior edit before Step 20; this command may intervene, but no production edit may. Failure stops and reopens LB-03 under the one-file correction rule, never an owned fallback, adapter, API/manifest change, or second source file.
 
-- [ ] **Step 21: Rerun all focused behavior and structure tests**
+- [ ] **Step 20: Prove exact 2,884-case parity against the final bounded selector**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::candidate_tests::candidate_path_matches_eager_oracle_across_seeded_cross_product -- --exact --color=never --test-threads=1
 ```
 
-Expected: exit 0. Exact response behavior remains unchanged while the structural bound is retained as regression coverage.
+Expected: exit 0 with 2,884 cases, 2,884 parsed `Value` equalities, 2,884 serialized-byte equalities, and all fixed partial expectations passing against the final bounded selector. No production edit may occur between Steps 18 and 20.
 
-- [ ] **Step 22: Run the broad server package in the destructive-test sandbox**
+- [ ] **Step 21: Run every route characterization before oracle deletion**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh "cargo test -p freshell-server --all-targets"
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
 ```
 
-Expected: exit 0 from every server unit/integration target inside the disposable sandbox.
+Expected: exit 0, including the 599-byte literal wire assertion and the final-selector differential. Commands may intervene after Step 18; production edits may not.
 
-- [ ] **Step 23: Commit the green structural bound**
+- [ ] **Step 22: Run the runtime structural leg GREEN before oracle deletion**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
+```
+
+Expected: exit 0. Indexed/synthesized materializations, serializations, retained peak, and owned annotation counts exactly equal every test's struct literal. This is the runtime leg only; it is not admissible as sole proof without Step 44's static leg.
+
+- [ ] **Step 23: Run the complete focused family before oracle deletion**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+```
+
+Expected: exit 0 with exact response behavior and structural counts intact. No production edit has occurred since Step 18. The first production edit after this command is Step 24's planned eager/oracle deletion.
+
+- [ ] **Step 24: Delete all eager policy and temporary differential symbols after final-selector proof**
+
+Immediately after Steps 20-23 pass, delete the complete definitions of these exact symbols and no neighboring retained parser/route code:
+
+```text
+dir_item_from_indexed
+apply_session_overrides
+apply_session_metadata
+join_running_state
+build_live_terminal_session_item
+join_live_terminals
+apply_query
+FileSearchOutcome
+apply_file_search
+apply_title_search
+deep_search_dir_item
+guard_item
+overlaid_title
+derive_eager_oracle_page
+DifferentialFixture
+DeterministicLcg
+DIFFERENTIAL_SEEDS
+seeded_differential_fixture
+seeded_differential_fixture_variants
+differential_visibility_cases
+differential_query_cases
+differential_limits
+differential_cursors
+fixed_deep_partial_cases
+candidate_path_matches_eager_oracle_across_seeded_cross_product
+```
+
+Do not leave wrappers under old names. This is the first production edit after final-selector validation. Keep the shared candidate tests in `candidate_tests`, plus Task 3's reused `write_nonmatching_claude_transcript`, `deep_search_query`, and `encode_raw_cursor_payload` helpers. Do not add a second oracle representation.
+
+- [ ] **Step 25: Replace `DirItem` with the final non-cloneable output shape**
+
+Replace the complete legacy `DirItem` declaration with:
+
+```rust
+#[derive(Debug)]
+struct DirItem {
+    session_id: String,
+    provider: String,
+    project_path: String,
+    title: Option<String>,
+    summary: Option<String>,
+    first_user_message: Option<String>,
+    last_activity_at: i64,
+    created_at: Option<i64>,
+    cwd: Option<String>,
+    is_subagent: bool,
+    is_non_interactive: bool,
+    is_running: bool,
+    archived: bool,
+    matched_in: Option<String>,
+    snippet: Option<String>,
+    running_terminal_id: Option<String>,
+    live_terminal_only: bool,
+    session_type: Option<String>,
+}
+```
+
+The removed `Clone`, `title_source`, and `source_file` are now safe because Step 24 deleted their final eager consumers.
+
+- [ ] **Step 26: Replace `DirItem::to_value` with the final counted serializer**
+
+Replace the complete legacy serializer with:
+
+```rust
+impl DirItem {
+    fn to_value(&self) -> Value {
+        #[cfg(test)]
+        record_preparation(|counts| counts.serializations += 1);
+
+        let mut object = Map::new();
+        object.insert("sessionId".into(), json!(self.session_id));
+        object.insert("provider".into(), json!(self.provider));
+        object.insert("projectPath".into(), json!(self.project_path));
+        object.insert("lastActivityAt".into(), json!(self.last_activity_at));
+        object.insert("isRunning".into(), json!(self.is_running));
+        object.insert("archived".into(), json!(self.archived));
+        if let Some(value) = &self.title {
+            object.insert("title".into(), json!(value));
+        }
+        if let Some(value) = &self.summary {
+            object.insert("summary".into(), json!(value));
+        }
+        if let Some(value) = &self.first_user_message {
+            object.insert("firstUserMessage".into(), json!(value));
+        }
+        if let Some(value) = self.created_at {
+            object.insert("createdAt".into(), json!(value));
+        }
+        if let Some(value) = &self.cwd {
+            object.insert("cwd".into(), json!(value));
+        }
+        if self.is_subagent {
+            object.insert("isSubagent".into(), json!(true));
+        }
+        if self.is_non_interactive {
+            object.insert("isNonInteractive".into(), json!(true));
+        }
+        if let Some(value) = &self.matched_in {
+            object.insert("matchedIn".into(), json!(value));
+        }
+        if let Some(value) = &self.snippet {
+            object.insert("snippet".into(), json!(value));
+        }
+        if let Some(value) = &self.running_terminal_id {
+            object.insert("runningTerminalId".into(), json!(value));
+        }
+        if self.live_terminal_only {
+            object.insert("liveTerminalOnly".into(), json!(true));
+        }
+        if let Some(value) = &self.session_type {
+            object.insert("sessionType".into(), json!(value));
+        }
+        Value::Object(object)
+    }
+}
+```
+
+The insertion order is unchanged, and this is the sole serialization recorder site.
+
+- [ ] **Step 27: Replace the temporary materializer with the final counted legacy-free materializer**
+
+Replace the complete temporary materializer with:
+
+```rust
+fn materialize_selected_candidate(
+    selected: SelectedCandidate<'_>,
+    metadata: &HashMap<String, Value>,
+) -> DirItem {
+    let SelectedCandidate {
+        candidate,
+        annotation,
+    } = selected;
+    let DirectoryCandidate { key, source } = candidate;
+    let (matched_in, snippet) = match annotation {
+        Some(SearchAnnotation {
+            matched_in,
+            snippet,
+        }) => (Some(matched_in.to_string()), Some(snippet)),
+        None => (None, None),
+    };
+
+    match source {
+        DirectoryCandidateSource::Indexed {
+            row,
+            overlay,
+            running_identity,
+        } => {
+            #[cfg(test)]
+            record_preparation(|counts| counts.indexed_materializations += 1);
+
+            let session_type = metadata
+                .get(key.as_ref())
+                .and_then(Value::as_object)
+                .and_then(|entry| entry.get("sessionType"))
+                .and_then(Value::as_str)
+                .filter(|session_type| !session_type.is_empty())
+                .map(str::to_string);
+            DirItem {
+                session_id: row.session_id.clone(),
+                provider: row.provider.clone(),
+                project_path: row.project_path.clone(),
+                title: overlay.effective_title.map(str::to_string),
+                summary: overlay.effective_summary.map(str::to_string),
+                first_user_message: row.first_user_message.clone(),
+                last_activity_at: row.last_activity_at,
+                created_at: row.created_at,
+                cwd: row.cwd.clone(),
+                is_subagent: row.is_subagent,
+                is_non_interactive: row.is_non_interactive,
+                is_running: running_identity.is_some(),
+                archived: overlay.archived,
+                matched_in,
+                snippet,
+                running_terminal_id: running_identity
+                    .map(|identity| identity.terminal_id.clone()),
+                live_terminal_only: false,
+                session_type,
+            }
+        }
+        DirectoryCandidateSource::Synthesized {
+            identity,
+            provider,
+            session_id,
+        } => {
+            #[cfg(test)]
+            record_preparation(|counts| counts.synthesized_materializations += 1);
+
+            let (session_id, live_terminal_only) = match session_id {
+                SynthesizedSessionId::Existing(session_id) => {
+                    (session_id.to_string(), false)
+                }
+                SynthesizedSessionId::TerminalFallback(terminal_id) => {
+                    (format!("terminal:{terminal_id}"), true)
+                }
+            };
+            let terminal_fallback = format!("terminal:{}", identity.terminal_id);
+            DirItem {
+                session_id,
+                provider: provider.to_string(),
+                project_path: identity
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| terminal_fallback.clone()),
+                title: Some(provider_display_name(provider).to_string()),
+                summary: None,
+                first_user_message: None,
+                last_activity_at: identity.updated_at,
+                created_at: Some(identity.updated_at),
+                cwd: identity.cwd.clone(),
+                is_subagent: identity.is_subagent.unwrap_or(false),
+                is_non_interactive: false,
+                is_running: true,
+                archived: false,
+                matched_in,
+                snippet,
+                running_terminal_id: Some(identity.terminal_id.clone()),
+                live_terminal_only,
+                session_type: Some(provider.to_string()),
+            }
+        }
+    }
+}
+```
+
+No legacy field remains and the indexed/synthesized arm entries are the sole materialization recorder sites.
+
+- [ ] **Step 28: Replace the test-only parser row constructor for the final output shape**
+
+Replace `item_from_meta` with:
+
+```rust
+#[cfg(test)]
+fn item_from_meta(
+    meta: &ParsedSessionMeta,
+    provider: &str,
+    fallback_session_id: &str,
+    force_subagent: bool,
+) -> DirItem {
+    DirItem {
+        session_id: meta
+            .session_id
+            .clone()
+            .unwrap_or_else(|| fallback_session_id.to_string()),
+        provider: provider.to_string(),
+        project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
+        title: meta.title.clone(),
+        summary: meta.summary.clone(),
+        first_user_message: meta.first_user_message.clone(),
+        last_activity_at: meta.last_activity_at.unwrap_or(0).max(0),
+        created_at: meta.created_at,
+        cwd: meta.cwd.clone(),
+        is_subagent: force_subagent || meta.is_subagent.unwrap_or(false),
+        is_non_interactive: meta.is_non_interactive.unwrap_or(false),
+        is_running: false,
+        archived: false,
+        matched_in: None,
+        snippet: None,
+        running_terminal_id: None,
+        live_terminal_only: false,
+        session_type: None,
+    }
+}
+```
+
+- [ ] **Step 29: Remove the obsolete source path from the parser call**
+
+Replace the parser call with:
+
+```rust
+    Some(item_from_meta(
+        &meta,
+        "claude",
+        &fallback,
+        force_subagent,
+    ))
+```
+
+- [ ] **Step 30: Update the real-corrupted parser test call**
+
+Replace the direct test call with:
+
+```rust
+        let item = item_from_meta(&meta, "claude", "real-corrupted", false);
+```
+
+- [ ] **Step 31: Update the healthy parser test call**
+
+Replace the direct test call with:
+
+```rust
+        let item = item_from_meta(&meta, "claude", "healthy", false);
+```
+
+- [ ] **Step 32: Replace the removed `DirItem::key` use in `Comparable`**
+
+Replace `Comparable::from(&DirItem)`'s key field with:
+
+```rust
+                key: format!("{}:{}", i.provider, i.session_id),
+```
+
+- [ ] **Step 33: Replace the module-level candidate-pipeline and concurrency documentation**
+
+Replace the module header with:
+
+```rust
+//! Rust implementation of `GET /api/session-directory`.
+//!
+//! Each request captures independent index, override, metadata, and terminal-
+//! identity values sequentially in accessor order. They are not one atomic
+//! cross-store cut; overlapping writes and the old projection/read race windows
+//! are unspecified. `revision` is full-corpus candidate/identity recency, not a
+//! cross-store version. A shared borrowed-candidate pipeline owns effective
+//! membership, ordering, visibility, cursor, and search policy for every tier;
+//! only returned descriptors become `DirItem` values.
+```
+
+- [ ] **Step 34: Replace stale `SessionDirectoryState` field documentation**
+
+Replace the complete state declaration and comments with:
+
+```rust
+/// Request dependencies for the Rust session-directory route. `session_index`
+/// may be absent; provider-bearing live identities can still synthesize rows.
+#[derive(Clone)]
+pub struct SessionDirectoryState {
+    pub auth_token: Arc<String>,
+    pub settings: crate::settings_store::SettingsStore,
+    pub session_index: Option<Arc<SessionIndex>>,
+    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    pub metadata: crate::session_metadata::SessionMetadataStore,
+}
+```
+
+- [ ] **Step 35: Replace stale search-tier documentation**
+
+Replace the `Tier` documentation with:
+
+```rust
+/// Search tier. A nonblank query selects title metadata or transcript search;
+/// a missing or blank query uses the same no-search candidate pipeline for all
+/// tier values.
+```
+
+- [ ] **Step 36: Compile the final production assembly against the lockfile**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo check --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
+```
+
+Expected: exit 0 after final selector installation, oracle deletion, final counted serializer/materializer, parser callers, and documentation assembly. Any failure stops and reopens LB-03 under the one-file correction rule; it never authorizes a fallback, adapter, API/manifest change, or second source file.
+
+- [ ] **Step 37: Compile the final inline-test assembly against the lockfile**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+```
+
+Expected: exit 0 with the final non-`Clone` `DirItem`, counted sites, parser callers, candidate tests, and route tests type-consistent. Failure has the same stop/correct-within-plan/reopen rule as Step 36.
+
+- [ ] **Step 38: Prove the exact literal response bytes after final output cleanup**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::no_search_exact_response_shape_preserves_all_fields_bytes_and_no_totals -- --exact --color=never --test-threads=1
+```
+
+Expected: exit 0 with the exact parsed object, 599-byte literal body, insertion order, omission rules, and no totals unchanged after the oracle is gone.
+
+- [ ] **Step 39: Rerun the exact runtime structural suite after final output cleanup**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests::preparation_tests -- --color=never --test-threads=1
+```
+
+Expected: exit 0 with all seven current-thread scenarios and every exact count unchanged. This remains the runtime leg only; Step 44 is mandatory companion evidence.
+
+- [ ] **Step 40: Rerun every route and candidate characterization after final output cleanup**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory::page_bound_tests -- --color=never --test-threads=1
+```
+
+Expected: exit 0. The released selector/output path preserves every retained route assertion; the deleted differential is no longer expected in this post-cleanup run.
+
+- [ ] **Step 41: Rerun the complete focused family after final output cleanup**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+```
+
+Expected: exit 0 with all retained and unchanged route tests passing. Do not claim Step 20's differential independently validates this mechanical post-deletion phase; Steps 36-41 are its evidence.
+
+- [ ] **Step 42: Prove old eager policy functions are absent**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "^fn (dir_item_from_indexed|apply_session_overrides|apply_session_metadata|join_running_state|build_live_terminal_session_item|join_live_terminals|apply_query|apply_file_search|apply_title_search|derive_eager_oracle_page)\\(" -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
+```
+
+Expected: no matches and exit 0.
+
+- [ ] **Step 43: Prove obsolete helpers and all temporary differential support are absent**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "FileSearchOutcome|derive_eager_oracle_page|DifferentialFixture|DeterministicLcg|DIFFERENTIAL_SEEDS|seeded_differential_fixture|seeded_differential_fixture_variants|differential_visibility_cases|differential_query_cases|differential_limits|differential_cursors|fixed_deep_partial_cases|candidate_path_matches_eager_oracle_across_seeded_cross_product|deep_search_dir_item|guard_item|overlaid_title" -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
+```
+
+Expected: no matches and exit 0. Task 7 repeats this exact complete residue-name set against committed `HEAD`.
+
+- [ ] **Step 44: Run the mandatory static locality and centrality proof**
+
+Run this source-shape and locked-dependency gate after the post-cleanup compiler/route/structural/focused evidence and before sandbox or commit:
+
+```bash
+FRESHELL_VITEST_BACKEND=local python3 - <<'PY'
+from pathlib import Path
+import re
+
+root = Path('/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep')
+source = (root / 'crates/freshell-server/src/session_directory.rs').read_text(encoding='utf-8')
+search = (root / 'crates/freshell-sessions/src/search.rs').read_text(encoding='utf-8')
+
+def count(pattern: str, text: str = source) -> int:
+    return len(re.findall(pattern, text, flags=re.MULTILINE | re.DOTALL))
+
+def braced_region(text: str, marker: str) -> str:
+    assert text.count(marker) == 1, (marker, text.count(marker))
+    start = text.index(marker)
+    opening = text.index('{', start)
+    depth = 0
+    for end in range(opening, len(text)):
+        if text[end] == '{':
+            depth += 1
+        elif text[end] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:end + 1]
+    raise AssertionError(f'unclosed braced region: {marker}')
+
+def only_position(text: str, needle: str) -> int:
+    assert text.count(needle) == 1, (needle, text.count(needle))
+    return text.index(needle)
+
+# Exactly six named work-bound tests measure one fully awaited real route request.
+# The seventh current-thread test is explicitly the lifecycle/reset-only test.
+request_tests = (
+    'no_search_materializes_only_returned_indexed_rows',
+    'no_search_materializes_only_returned_synthesized_rows',
+    'filtered_and_cursor_prefixes_do_not_expand_full_preparation',
+    'all_hidden_page_materializes_nothing_and_keeps_revision',
+    'sparse_title_search_retains_only_limit_plus_one_annotations',
+    'deep_search_retains_only_limit_plus_one_annotations',
+)
+lifecycle_test = 'preparation_scope_resets_and_is_inactive_outside_interval'
+preparation = braced_region(source, '    mod preparation_tests {')
+current_thread_tests = re.findall(
+    r'#\[tokio::test\(flavor = "current_thread"\)\]\s*async fn ([a-z0-9_]+)\(\)',
+    preparation,
+)
+assert current_thread_tests == [*request_tests, lifecycle_test]
+assert source.count('#[tokio::test(flavor = "current_thread")]') == len(current_thread_tests) == 7
+assert 'tokio::test(flavor = "multi_thread")' not in source
+assert lifecycle_test not in request_tests
+lifecycle_body = braced_region(preparation, f'        async fn {lifecycle_test}()')
+assert lifecycle_body.count('PreparationScope::begin()') == 5
+assert 'catch_unwind(PreparationScope::begin)' in lifecycle_body
+
+awaited_request = re.compile(
+    r'\bget_page(?:_with_bytes)?\s*\([^;]*?\)\s*\.await\b',
+    flags=re.DOTALL,
+)
+for test_name in request_tests:
+    test_body = braced_region(preparation, f'        async fn {test_name}()')
+    begin = only_position(test_body, 'let scope = PreparationScope::begin();')
+    snapshot = only_position(test_body, 'scope.snapshot()')
+    requests = list(awaited_request.finditer(test_body, begin, snapshot))
+    assert len(requests) == 1, (test_name, len(requests))
+    request = requests[0]
+    assert begin < request.start() < request.end() < snapshot, test_name
+assert source.count('let counts = scope.snapshot();') == 6
+
+# No Freshell handoff exists in the synchronous measured path or transcript helper.
+offload = re.compile(r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))')
+assert offload.search(source) is None
+assert offload.search(search) is None
+
+# The route helper directly polls one request and fully collects its body before returning.
+bytes_helper = braced_region(source, '    async fn get_page_with_bytes(')
+page_helper = braced_region(source, '    async fn get_page(')
+assert bytes_helper.count('.oneshot(') == 1
+assert bytes_helper.count('to_bytes(response.into_body(), usize::MAX)') == 1
+assert bytes_helper.index('.oneshot(') < bytes_helper.index('to_bytes(') < bytes_helper.index('serde_json::from_slice')
+assert page_helper.count('get_page_with_bytes(app, suffix).await.0') == 1
+
+# Restrict exhaustive centrality checks to non-test production. The migrated
+# join-test module and sole direct parser constructor are proved cfg(test) and excluded.
+tests_marker = '\n#[cfg(test)]\nmod tests {'
+assert source.count(tests_marker) == 1
+production_region = source[:source.index(tests_marker)]
+join_tests = braced_region(production_region, '#[cfg(test)]\nmod join_tests {')
+test_only_parser = braced_region(production_region, '#[cfg(test)]\nfn item_from_meta(')
+constructor_pattern = r'(?<!struct )(?<!impl )(?<!-> )\bDirItem\s*\{'
+assert join_tests.startswith('#[cfg(test)]')
+assert test_only_parser.startswith('#[cfg(test)]')
+assert count(constructor_pattern, test_only_parser) == 1
+production = production_region.replace(join_tests, '', 1).replace(test_only_parser, '', 1)
+production_code = '\n'.join(line.split('//', 1)[0] for line in production.splitlines())
+
+selector = braced_region(production, "fn select_page_candidates<'a>(")
+materializer = braced_region(production, 'fn materialize_selected_candidate(')
+derive = braced_region(production, 'fn derive_directory_page(')
+dir_item_impl = braced_region(production, 'impl DirItem {')
+serializer = braced_region(dir_item_impl, '    fn to_value(&self) -> Value {')
+
+# Exact-one policy definitions and exhaustive production references/call sites.
+assert count(r'^fn compare_directory_order\(', production) == 1
+assert count(r'^fn candidate_is_eligible\(', production) == 1
+assert count(r'^fn select_page_candidates', production) == 1
+assert count(r'^fn materialize_selected_candidate\(', production) == 1
+assert count(r'^fn derive_directory_page\(', production) == 1
+assert count(r'^impl DirItem\s*\{', production) == 1
+assert count(r'^[ \t]+fn to_value\(', production) == 1
+assert count(r'\bselect_page_candidates\b', production_code) == 2
+assert count(r'\bmaterialize_selected_candidate\b', production_code) == 2
+assert count(r'\bderive_directory_page\b', production_code) == 2
+assert count(r'\bto_value\b', production_code) == 2
+assert count(r'\bselect_page_candidates\s*\(', production_code) == 1
+assert count(r'\bselect_page_candidates\s*\(', derive) == 1
+assert count(r'(?<!fn )\bmaterialize_selected_candidate\s*\(', production_code) == 1
+assert count(r'(?<!fn )\bmaterialize_selected_candidate\s*\(', derive) == 1
+assert count(r'(?<!fn )\bderive_directory_page\s*\(', production_code) == 1
+assert count(r'(?:\.|DirItem::)\s*to_value\s*\(', production_code) == 1
+assert count(r'(?:\.|DirItem::)\s*to_value\s*\(', derive) == 1
+assert count(constructor_pattern, production_code) == 2
+assert count(constructor_pattern, materializer) == 2
+assert count(r'->\s*DirItem\b', production_code) == 1
+assert count(r'->\s*DirItem\b', materializer) == 1
+assert count(r'impl\s+(?:serde::)?Serialize\s+for\s+DirItem\b', production_code) == 0
+assert count(r'#\[derive\([^\]]*\bSerialize\b[^\]]*\)\]\s*struct DirItem', production_code) == 0
+assert count(r'\bto_value\b', serializer) == 1
+
+# Keep the exact canonical chain and counter-site checks.
+assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
+assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
+assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
+assert source.count('rows.push(SelectedCandidate {') == 1
+assert source.count('counts.retained_descriptor_peak =') == 1
+assert source.count('counts.indexed_materializations += 1') == 1
+assert source.count('counts.synthesized_materializations += 1') == 1
+assert source.count('counts.serializations += 1') == 1
+assert source.count('counts.owned_annotations += 1') == 2
+
+# Locked Tower/Axum mechanisms remain direct-poll, full-body, synchronous-JSON paths.
+registry = Path('/home/dan/.cargo/registry/src')
+def one(pattern: str) -> Path:
+    matches = list(registry.glob(pattern))
+    assert len(matches) == 1, (pattern, matches)
+    return matches[0]
+
+tower = one('*/tower-0.5.3/src/util/oneshot.rs').read_text(encoding='utf-8')
+router = one('*/axum-0.8.9/src/routing/mod.rs').read_text(encoding='utf-8')
+handler = one('*/axum-0.8.9/src/handler/service.rs').read_text(encoding='utf-8')
+body = one('*/axum-0.8.9/src/body/mod.rs').read_text(encoding='utf-8')
+json = one('*/axum-0.8.9/src/json.rs').read_text(encoding='utf-8')
+assert 'ready!(svc.poll_ready(cx))?' in tower and 'ready!(fut.poll(cx))?' in tower
+assert 'self.call_with_state(req, ())' in router
+assert 'Handler::call(handler, req, self.state.clone())' in handler
+assert 'IntoServiceFuture::new(future)' in handler
+assert re.search(r'Limited::new\(body, limit\)\s*\.collect\(\)\s*\.await', body)
+assert 'serde_json::to_writer(&mut buf, &self.0)' in json
+print('static preparation locality/centrality proof: PASS')
+PY
+```
+
+Expected: exit 0 and the explicit PASS line. This static leg extracts all six named request-count test bodies and proves exactly one scope, one fully awaited measured route request, one snapshot, and `begin < awaited request < snapshot` in each while explicitly excluding the seventh lifecycle/reset-only test. It also proves no offload in the measured Freshell call graph, direct Tower/Axum polling, reviewed locked dependency mechanisms, the sole production selector/materializer/serializer call chain, no alternate production `DirItem` construction/materialization/serialization path, and the exact canonical-chain/counter sites. If any invariant fails, the TLS counts are inadmissible: stop before sandbox/commit, restore the direct same-thread centralized path and rerun both static and runtime gates, or reopen LB-08 and replace TLS with a concrete fail-closed request-carried/thread-safe probe. Never waive a static failure because TLS is fail-open off-thread.
+
+- [ ] **Step 45: Rebuild and run the broad server package in one sandbox provenance bracket**
+
+Run this indivisible shell process; do not split build, image capture, test, or postflight:
+
+```bash
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -u -o pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+tag=freshell-sandbox:latest
+
+docker version >/dev/null || exit 1
+docker info >/dev/null || exit 1
+active_containers="$(docker ps -q --filter "ancestor=${tag}")" || exit 1
+if test -n "${active_containers}"; then
+  echo "shared sandbox image is in active use; wait and retry without killing it" >&2
+  exit 1
+fi
+
+"${root}/scripts/sandbox-build.sh" || exit $?
+expected_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
+printf "sandbox_image_id_before=%s\n" "${expected_image_id}"
+
+test_status=0
+"${root}/scripts/sandbox-test.sh" "cargo test -p freshell-server --all-targets" || test_status=$?
+
+actual_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
+printf "sandbox_image_id_after=%s\n" "${actual_image_id}"
+if test "${actual_image_id}" != "${expected_image_id}"; then
+  echo "sandbox image tag changed during the gate; result has invalid provenance" >&2
+  exit 1
+fi
+exit "${test_status}"
+'
+```
+
+Expected: Docker preflight succeeds; no active container uses the shared tag; this worktree's `sandbox-build.sh` succeeds; before/after `freshell-sandbox:latest` image IDs are identical; `sandbox-test.sh` exits 0; and every `freshell-server --all-targets` target passes. Any other result stops before commit. Wait rather than kill a foreign holder/container, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
+
+- [ ] **Step 46: Commit the final-selector, oracle-cleanup, and combined-proof result**
 
 The command below is one valid example for a coherent task-level source checkpoint; its subject and body are illustrative, not required history. If this task's mandatory spec/quality review or a later final check finds a defect, make any additional source-only correction commit needed and rerun the affected checks before advancing. Do not infer an exact commit count, subject sequence, or commit order from this example.
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "perf(session-directory): bound returned-page preparation" -m "Retain at most limit plus one selected descriptors and materialize and serialize only returned rows, with exact structural regression counters." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --check -- crates/freshell-server/src/session_directory.rs && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep add -- crates/freshell-server/src/session_directory.rs && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --cached --name-only)" = "crates/freshell-server/src/session_directory.rs" && git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep commit -m "perf(session-directory): bound returned-page preparation" -m "Install the verified bounded selector, prove final eager parity, remove test-only oracle residue, finalize the counted output path, and retain combined static/runtime structural coverage." -m "Generated with Amplifier" -m "Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"'
 ```
 
-Expected: exit 0 and a normal local source-only commit.
+Expected: exit 0 and a normal local source-only commit. This commit is authorized only after the locked final assembly, post-cleanup literal/structural/focused tests, residue checks, static locality/centrality proof, and sandbox provenance bracket all pass.
 
 ### Task 7: Run final checks and prove exact scope
 
 **Files:**
 - Modify: none.
-- Read/validate: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/plans/2026-08-13-session-directory-lazy-page-prep.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, every tracked `Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.kata.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/vitest-cloud.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts`, and `/home/dan/code/freshell/node_modules/@playwright/test/cli.js`.
-
+- Read/validate: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/AGENTS.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/plans/2026-08-13-session-directory-lazy-page-prep.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.lock`, every tracked `Cargo.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/.kata.toml`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/package-lock.json`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/docs/development/test-sandbox.md`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-build.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/testing/test-coordinator.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/run-standard-tests.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/session_directory.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/directory_index.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-sessions/src/search.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-ws/src/identity.rs`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts`, `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts`, and `/home/dan/code/freshell/node_modules/@playwright/test/cli.js`.
 - Read/validate unchanged cross-router coverage: `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/crates/freshell-server/src/sessions_tests.rs`.
 
 **Interfaces:**
 - Consumes: Task 6's committed final source and all retained test interfaces.
-- Produces: fresh focused, package, dependency, format, lint, browser, coordinator-full, single-policy, exact-file-scope, forbidden-file, and clean-state evidence. No repository file changes.
+- Produces: separate locked production and inline-test compiler receipts; exact runtime structural-count and static locality/centrality receipts; fresh focused, rebuilt-image sandbox package, dependency, format, lint, exact local browser-matrix, and fresh coordinator-owned local-suite pass evidence; plus single-policy/call-site, residue, exact-file-scope, forbidden-file, and clean-state evidence. Browser/Docker preflights and coordinator history are readiness/provenance only, never runtime pass evidence. No repository file changes.
 
-- [ ] **Step 1: Run the complete focused behavior and structural family**
+- [ ] **Step 1: Compile the committed final production source against the lockfile**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo check --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server
+```
+
+Expected: exit 0 against committed Task 6 source. This is the final production compiler receipt that can move LB-03 from accepted residual to runtime-confirmed. Any failure stops final readiness and reopens the one-file borrowed architecture; it never authorizes a fallback, adapter, API/manifest change, or second source file.
+
+- [ ] **Step 2: Compile the committed final inline-test source against the lockfile**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server --no-run
+```
+
+Expected: exit 0. This is the separate final inline `#[cfg(test)]` coexistence compiler receipt; failure has the same stop/reopen rule as Step 1.
+
+- [ ] **Step 3: Run the complete focused behavior and runtime structural family**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --bin freshell-server session_directory -- --color=never --test-threads=1
+```
+
+Expected: exit 0 and no failed test. Report the exact seven `preparation_tests` count results as the runtime structural leg separately from Step 15's static locality/centrality leg. This workload is comparable with Task 1's focused local receipt.
+
+- [ ] **Step 4: Rebuild and run the full server package in one sandbox provenance bracket**
+
+Run this indivisible shell process; do not split build, image capture, test, or postflight:
+
+```bash
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -u -o pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+tag=freshell-sandbox:latest
+
+docker version >/dev/null || exit 1
+docker info >/dev/null || exit 1
+active_containers="$(docker ps -q --filter "ancestor=${tag}")" || exit 1
+if test -n "${active_containers}"; then
+  echo "shared sandbox image is in active use; wait and retry without killing it" >&2
+  exit 1
+fi
+
+"${root}/scripts/sandbox-build.sh" || exit $?
+expected_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
+printf "sandbox_image_id_before=%s\n" "${expected_image_id}"
+
+test_status=0
+"${root}/scripts/sandbox-test.sh" "cargo test -p freshell-server --all-targets" || test_status=$?
+
+actual_image_id="$(docker image inspect --format "{{.Id}}" "${tag}")" || exit 1
+printf "sandbox_image_id_after=%s\n" "${actual_image_id}"
+if test "${actual_image_id}" != "${expected_image_id}"; then
+  echo "sandbox image tag changed during the gate; result has invalid provenance" >&2
+  exit 1
+fi
+exit "${test_status}"
+'
+```
+
+Expected: Docker preflight succeeds; no active container uses the shared tag; this worktree's `sandbox-build.sh` succeeds; before/after image IDs are identical; `sandbox-test.sh` exits 0; and every `freshell-server --all-targets` target passes. Any other result stops final readiness. Wait rather than kill a foreign holder/container, and never substitute unsandboxed Cargo, a remote runner, narrowed targets, or a waiver.
+
+- [ ] **Step 5: Run the direct sessions dependency regression**
+
+Run:
+
+```bash
+FRESHELL_VITEST_BACKEND=local CARGO_TERM_COLOR=never cargo test --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-sessions
 ```
 
 Expected: exit 0 and no failed test.
 
-- [ ] **Step 2: Run the full server package in the destructive-test sandbox**
+- [ ] **Step 6: Verify formatting**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/scripts/sandbox-test.sh "cargo test -p freshell-server --all-targets"
-```
-
-Expected: exit 0 for every target inside the sandbox.
-
-- [ ] **Step 3: Run the direct sessions dependency regression**
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud CARGO_TERM_COLOR=never cargo test --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-sessions
-```
-
-Expected: exit 0 and no failed test.
-
-- [ ] **Step 4: Verify formatting**
-
-Run:
-
-```bash
-FRESHELL_VITEST_BACKEND=cloud cargo fmt --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml --all --check
+FRESHELL_VITEST_BACKEND=local cargo fmt --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml --all --check
 ```
 
 Expected: exit 0 and no rustfmt diff.
 
-- [ ] **Step 5: Run warnings-denied server Clippy**
+- [ ] **Step 7: Run warnings-denied server Clippy**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud cargo clippy --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --all-targets -- -D warnings
+FRESHELL_VITEST_BACKEND=local cargo clippy --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-server --all-targets -- -D warnings
 ```
 
 Expected: exit 0 and no warning/error.
 
-- [ ] **Step 6: Run warnings-denied workspace Clippy**
+- [ ] **Step 8: Run warnings-denied workspace Clippy**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud cargo clippy --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml --workspace --all-targets -- -D warnings
+FRESHELL_VITEST_BACKEND=local cargo clippy --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml --workspace --all-targets -- -D warnings
 ```
 
 Expected: exit 0 and no warning/error.
 
-- [ ] **Step 7: Run warnings-denied Codex real-transport Clippy**
+- [ ] **Step 9: Run warnings-denied Codex real-transport Clippy**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud cargo clippy --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-codex --features real-transport --all-targets -- -D warnings
+FRESHELL_VITEST_BACKEND=local cargo clippy --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-codex --features real-transport --all-targets -- -D warnings
 ```
 
 Expected: exit 0.
 
-- [ ] **Step 8: Run warnings-denied OpenCode real-transport Clippy**
+- [ ] **Step 10: Run warnings-denied OpenCode real-transport Clippy**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud cargo clippy --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-opencode --features real-transport --all-targets -- -D warnings
+FRESHELL_VITEST_BACKEND=local cargo clippy --locked --manifest-path /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/Cargo.toml -p freshell-opencode --features real-transport --all-targets -- -D warnings
 ```
 
 Expected: exit 0.
 
-- [ ] **Step 9: Run the existing Rust-backed browser matrix**
+- [ ] **Step 11: Run the fail-closed local-browser readiness preflight**
 
-Run:
+Run the same full preflight as Task 1 immediately before the final matrix:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep FRESHELL_E2E_BACKEND=local node /home/dan/code/freshell/node_modules/@playwright/test/cli.js test --config /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts --project=rust-chromium --workers=1 --reporter=line /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts
+FRESHELL_VITEST_BACKEND=local bash -c '
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+for name in FRESHELL_E2E_TARGET_URL FRESHELL_E2E_TARGET_TOKEN FRESHELL_E2E_TARGET_WS_URL FRESHELL_E2E_TARGET_HOME FRESHELL_E2E_RUST_SERVER_BIN CARGO_TARGET_DIR PLAYWRIGHT_BROWSERS_PATH; do
+  test -z "${!name-}" || { echo "unexpected routing override: ${name}" >&2; exit 1; }
+done
+test -f /home/dan/code/freshell/node_modules/@playwright/test/cli.js
+node -e "
+const fs = require(\"fs\");
+const lock = JSON.parse(fs.readFileSync(\"${root}/package-lock.json\", \"utf8\"));
+for (const p of [\"node_modules/@playwright/test\", \"node_modules/playwright\", \"node_modules/playwright-core\"]) {
+  if (lock.packages[p]?.version !== \"1.58.2\") throw new Error(p + \" lock mismatch\");
+}
+const installed = require(\"/home/dan/code/freshell/node_modules/@playwright/test/package.json\").version;
+if (installed !== \"1.58.2\") throw new Error(\"installed Playwright mismatch: \" + installed);
+"
+for exe in \
+  /home/dan/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome \
+  /home/dan/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell; do
+  test -x "$exe"
+  ldd_output="$(ldd "$exe")" || exit 1
+  if grep -q "not found" <<<"$ldd_output"; then echo "unresolved library: $exe" >&2; exit 1; fi
+done
+command -v cargo rustc cc gcc g++ ar ranlib make pkg-config perl python3 ldd >/dev/null
+rustup target list --installed | grep -Fx x86_64-unknown-linux-gnu >/dev/null
+cargo --version
+rustc --version
+df -h "$root"
+grep "^MemAvailable:" /proc/meminfo
+'
 ```
 
-Expected: exit 0 and every existing matrix case passes.
+Expected: exit 0 with the same routing/build overrides absent, exact installed/locked Playwright 1.58.2, both Chromium revision-1208 executables, no unresolved libraries, Cargo/Rust 1.96 and native Linux tools available, and resource state printed without a threshold. This is readiness only, not browser-pass evidence.
 
-- [ ] **Step 10: Inspect the coordinator holder**
+- [ ] **Step 12: Run the exact local Rust-backed browser matrix**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
+FRESHELL_VITEST_BACKEND=local env --chdir=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep FRESHELL_E2E_BACKEND=local node /home/dan/code/freshell/node_modules/@playwright/test/cli.js test --config /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/playwright.config.ts --project=rust-chromium --workers=1 --reporter=line /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/test/e2e-browser/specs/session-directory-matrix.spec.ts
 ```
 
-Expected: exit 0. If another holder is active, wait and rerun; never kill or bypass it.
+Expected: exit 0 and every existing matrix case passes. This exact workload is comparable with Task 1's matrix receipt. Any compile, launch, server, Chromium, or case failure stops; do not install, reroute, use a remote runner, narrow the matrix, or waive it.
 
-- [ ] **Step 11: Run a fresh coordinator-owned full suite**
+- [ ] **Step 13: Inspect the local coordinator holder without treating history as this run**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud FRESHELL_TEST_SUMMARY="session-directory lazy-page final full suite" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
+FRESHELL_VITEST_BACKEND=local npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep run test:status
 ```
 
-Expected: exit 0 from the fresh coordinated run.
+Expected: exit 0 and truthful holder state. If another holder is active, wait and rerun this command; never kill or bypass it. Readiness/history cannot satisfy Step 14.
 
-- [ ] **Step 12: Prove the final single-policy definitions exist exactly once**
+- [ ] **Step 14: Run a fresh coordinator-owned local full suite**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -h -c "^fn compare_directory_order(" HEAD -- crates/freshell-server/src/session_directory.rs)" -eq 1 && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -h -c "^fn candidate_is_eligible(" HEAD -- crates/freshell-server/src/session_directory.rs)" -eq 1 && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -h -c "^fn select_page_candidates" HEAD -- crates/freshell-server/src/session_directory.rs)" -eq 1 && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -h -c "^fn materialize_selected_candidate(" HEAD -- crates/freshell-server/src/session_directory.rs)" -eq 1 && test "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -h -c "^fn derive_directory_page(" HEAD -- crates/freshell-server/src/session_directory.rs)" -eq 1'
+FRESHELL_VITEST_BACKEND=local FRESHELL_TEST_SUMMARY="session-directory lazy-page final local full suite" npm --prefix /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep test
 ```
 
-Expected: exit 0.
+Expected: fresh coordinator-owned exit 0 from the target worktree and committed final `HEAD`, with output containing `Resolved standard test plan` and not containing `Dispatching client+server suites to cloud vitest`. Advisory history is not a substitute. The focused, browser, and coordinator workloads are comparable with Task 1 because both receipts use the same exact local backends; a failure in a non-baselined final command may require a targeted frozen-base reproduction rather than a retroactive baseline claim.
 
-- [ ] **Step 13: Prove eager policy functions are absent from `HEAD`**
+- [ ] **Step 15: Repeat the mandatory static locality and centrality proof against committed final `HEAD`**
+
+Run the same hard source-shape and locked-dependency gate as Task 6:
+
+```bash
+FRESHELL_VITEST_BACKEND=local python3 - <<'PY'
+from pathlib import Path
+import re
+
+root = Path('/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep')
+source = (root / 'crates/freshell-server/src/session_directory.rs').read_text(encoding='utf-8')
+search = (root / 'crates/freshell-sessions/src/search.rs').read_text(encoding='utf-8')
+
+def count(pattern: str, text: str = source) -> int:
+    return len(re.findall(pattern, text, flags=re.MULTILINE | re.DOTALL))
+
+def braced_region(text: str, marker: str) -> str:
+    assert text.count(marker) == 1, (marker, text.count(marker))
+    start = text.index(marker)
+    opening = text.index('{', start)
+    depth = 0
+    for end in range(opening, len(text)):
+        if text[end] == '{':
+            depth += 1
+        elif text[end] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:end + 1]
+    raise AssertionError(f'unclosed braced region: {marker}')
+
+def only_position(text: str, needle: str) -> int:
+    assert text.count(needle) == 1, (needle, text.count(needle))
+    return text.index(needle)
+
+# Exactly six named work-bound tests measure one fully awaited real route request.
+# The seventh current-thread test is explicitly the lifecycle/reset-only test.
+request_tests = (
+    'no_search_materializes_only_returned_indexed_rows',
+    'no_search_materializes_only_returned_synthesized_rows',
+    'filtered_and_cursor_prefixes_do_not_expand_full_preparation',
+    'all_hidden_page_materializes_nothing_and_keeps_revision',
+    'sparse_title_search_retains_only_limit_plus_one_annotations',
+    'deep_search_retains_only_limit_plus_one_annotations',
+)
+lifecycle_test = 'preparation_scope_resets_and_is_inactive_outside_interval'
+preparation = braced_region(source, '    mod preparation_tests {')
+current_thread_tests = re.findall(
+    r'#\[tokio::test\(flavor = "current_thread"\)\]\s*async fn ([a-z0-9_]+)\(\)',
+    preparation,
+)
+assert current_thread_tests == [*request_tests, lifecycle_test]
+assert source.count('#[tokio::test(flavor = "current_thread")]') == len(current_thread_tests) == 7
+assert 'tokio::test(flavor = "multi_thread")' not in source
+assert lifecycle_test not in request_tests
+lifecycle_body = braced_region(preparation, f'        async fn {lifecycle_test}()')
+assert lifecycle_body.count('PreparationScope::begin()') == 5
+assert 'catch_unwind(PreparationScope::begin)' in lifecycle_body
+
+awaited_request = re.compile(
+    r'\bget_page(?:_with_bytes)?\s*\([^;]*?\)\s*\.await\b',
+    flags=re.DOTALL,
+)
+for test_name in request_tests:
+    test_body = braced_region(preparation, f'        async fn {test_name}()')
+    begin = only_position(test_body, 'let scope = PreparationScope::begin();')
+    snapshot = only_position(test_body, 'scope.snapshot()')
+    requests = list(awaited_request.finditer(test_body, begin, snapshot))
+    assert len(requests) == 1, (test_name, len(requests))
+    request = requests[0]
+    assert begin < request.start() < request.end() < snapshot, test_name
+assert source.count('let counts = scope.snapshot();') == 6
+
+# No Freshell handoff exists in the synchronous measured path or transcript helper.
+offload = re.compile(r'\b(?:spawn_blocking|block_in_place|tokio::(?:task::)?spawn|std::thread(?:\s*::|\b))')
+assert offload.search(source) is None
+assert offload.search(search) is None
+
+# The route helper directly polls one request and fully collects its body before returning.
+bytes_helper = braced_region(source, '    async fn get_page_with_bytes(')
+page_helper = braced_region(source, '    async fn get_page(')
+assert bytes_helper.count('.oneshot(') == 1
+assert bytes_helper.count('to_bytes(response.into_body(), usize::MAX)') == 1
+assert bytes_helper.index('.oneshot(') < bytes_helper.index('to_bytes(') < bytes_helper.index('serde_json::from_slice')
+assert page_helper.count('get_page_with_bytes(app, suffix).await.0') == 1
+
+# Restrict exhaustive centrality checks to non-test production. The migrated
+# join-test module and sole direct parser constructor are proved cfg(test) and excluded.
+tests_marker = '\n#[cfg(test)]\nmod tests {'
+assert source.count(tests_marker) == 1
+production_region = source[:source.index(tests_marker)]
+join_tests = braced_region(production_region, '#[cfg(test)]\nmod join_tests {')
+test_only_parser = braced_region(production_region, '#[cfg(test)]\nfn item_from_meta(')
+constructor_pattern = r'(?<!struct )(?<!impl )(?<!-> )\bDirItem\s*\{'
+assert join_tests.startswith('#[cfg(test)]')
+assert test_only_parser.startswith('#[cfg(test)]')
+assert count(constructor_pattern, test_only_parser) == 1
+production = production_region.replace(join_tests, '', 1).replace(test_only_parser, '', 1)
+production_code = '\n'.join(line.split('//', 1)[0] for line in production.splitlines())
+
+selector = braced_region(production, "fn select_page_candidates<'a>(")
+materializer = braced_region(production, 'fn materialize_selected_candidate(')
+derive = braced_region(production, 'fn derive_directory_page(')
+dir_item_impl = braced_region(production, 'impl DirItem {')
+serializer = braced_region(dir_item_impl, '    fn to_value(&self) -> Value {')
+
+# Exact-one policy definitions and exhaustive production references/call sites.
+assert count(r'^fn compare_directory_order\(', production) == 1
+assert count(r'^fn candidate_is_eligible\(', production) == 1
+assert count(r'^fn select_page_candidates', production) == 1
+assert count(r'^fn materialize_selected_candidate\(', production) == 1
+assert count(r'^fn derive_directory_page\(', production) == 1
+assert count(r'^impl DirItem\s*\{', production) == 1
+assert count(r'^[ \t]+fn to_value\(', production) == 1
+assert count(r'\bselect_page_candidates\b', production_code) == 2
+assert count(r'\bmaterialize_selected_candidate\b', production_code) == 2
+assert count(r'\bderive_directory_page\b', production_code) == 2
+assert count(r'\bto_value\b', production_code) == 2
+assert count(r'\bselect_page_candidates\s*\(', production_code) == 1
+assert count(r'\bselect_page_candidates\s*\(', derive) == 1
+assert count(r'(?<!fn )\bmaterialize_selected_candidate\s*\(', production_code) == 1
+assert count(r'(?<!fn )\bmaterialize_selected_candidate\s*\(', derive) == 1
+assert count(r'(?<!fn )\bderive_directory_page\s*\(', production_code) == 1
+assert count(r'(?:\.|DirItem::)\s*to_value\s*\(', production_code) == 1
+assert count(r'(?:\.|DirItem::)\s*to_value\s*\(', derive) == 1
+assert count(constructor_pattern, production_code) == 2
+assert count(constructor_pattern, materializer) == 2
+assert count(r'->\s*DirItem\b', production_code) == 1
+assert count(r'->\s*DirItem\b', materializer) == 1
+assert count(r'impl\s+(?:serde::)?Serialize\s+for\s+DirItem\b', production_code) == 0
+assert count(r'#\[derive\([^\]]*\bSerialize\b[^\]]*\)\]\s*struct DirItem', production_code) == 0
+assert count(r'\bto_value\b', serializer) == 1
+
+# Keep the exact canonical chain and counter-site checks.
+assert count(r'\blet\s+selected\s*=\s*select_page_candidates\s*\(\s*candidates\s*,\s*query\s*,\s*cursor\.as_ref\(\)\s*,\s*limit\s*\)\s*;', derive) == 1
+assert count(r'rows\s*\.into_iter\(\)\s*\.take\(limit\)', derive) == 1
+assert count(r'materialize_selected_candidate\s*\(\s*selected\s*,\s*inputs\.metadata\s*\)\s*\.to_value\s*\(\s*\)', derive) == 1
+assert source.count('rows.push(SelectedCandidate {') == 1
+assert source.count('counts.retained_descriptor_peak =') == 1
+assert source.count('counts.indexed_materializations += 1') == 1
+assert source.count('counts.synthesized_materializations += 1') == 1
+assert source.count('counts.serializations += 1') == 1
+assert source.count('counts.owned_annotations += 1') == 2
+
+# Locked Tower/Axum mechanisms remain direct-poll, full-body, synchronous-JSON paths.
+registry = Path('/home/dan/.cargo/registry/src')
+def one(pattern: str) -> Path:
+    matches = list(registry.glob(pattern))
+    assert len(matches) == 1, (pattern, matches)
+    return matches[0]
+
+tower = one('*/tower-0.5.3/src/util/oneshot.rs').read_text(encoding='utf-8')
+router = one('*/axum-0.8.9/src/routing/mod.rs').read_text(encoding='utf-8')
+handler = one('*/axum-0.8.9/src/handler/service.rs').read_text(encoding='utf-8')
+body = one('*/axum-0.8.9/src/body/mod.rs').read_text(encoding='utf-8')
+json = one('*/axum-0.8.9/src/json.rs').read_text(encoding='utf-8')
+assert 'ready!(svc.poll_ready(cx))?' in tower and 'ready!(fut.poll(cx))?' in tower
+assert 'self.call_with_state(req, ())' in router
+assert 'Handler::call(handler, req, self.state.clone())' in handler
+assert 'IntoServiceFuture::new(future)' in handler
+assert re.search(r'Limited::new\(body, limit\)\s*\.collect\(\)\s*\.await', body)
+assert 'serde_json::to_writer(&mut buf, &self.0)' in json
+print('static preparation locality/centrality proof: PASS')
+PY
+```
+
+Expected: exit 0 and the explicit PASS line against committed final source. Report this static leg separately from Step 3's exact runtime structural counts. It proves the six named measured request bodies have one scope, one fully awaited measured route request, one snapshot, and the required lexical order; the seventh lifecycle/reset-only test is explicitly excluded. It also proves exhaustive production selector/materializer/serializer centrality and no alternate production `DirItem` construction/materialization/serialization path while retaining the exact canonical-chain and counter-site checks. If any invariant fails, TLS counts are inadmissible and final readiness stops: restore and rerun the direct same-thread centralized path, or reopen LB-08 for a concrete fail-closed request-carried/thread-safe probe. Never waive a static failure because TLS is fail-open off-thread.
+
+- [ ] **Step 16: Prove eager policy functions are absent from `HEAD`**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "^fn (dir_item_from_indexed|apply_session_overrides|apply_session_metadata|join_running_state|build_live_terminal_session_item|join_live_terminals|apply_query|apply_file_search|apply_title_search|derive_eager_oracle_page)\\(" HEAD -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "^fn (dir_item_from_indexed|apply_session_overrides|apply_session_metadata|join_running_state|build_live_terminal_session_item|join_live_terminals|apply_query|apply_file_search|apply_title_search|derive_eager_oracle_page)\\(" HEAD -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
 ```
 
 Expected: no output and exit 0.
 
-- [ ] **Step 14: Prove obsolete helpers and all temporary differential support are absent from `HEAD`**
+- [ ] **Step 17: Prove obsolete helpers and all temporary differential support are absent from `HEAD`**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "FileSearchOutcome|derive_eager_oracle_page|DifferentialFixture|DeterministicLcg|DIFFERENTIAL_SEEDS|seeded_differential_fixture|seeded_differential_fixture_variants|differential_visibility_cases|differential_query_cases|differential_limits|differential_cursors|fixed_deep_partial_cases|candidate_path_matches_eager_oracle_across_seeded_cross_product|deep_search_dir_item|guard_item|overlaid_title" HEAD -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
+FRESHELL_VITEST_BACKEND=local bash -c 'git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep grep -n -E "FileSearchOutcome|derive_eager_oracle_page|DifferentialFixture|DeterministicLcg|DIFFERENTIAL_SEEDS|seeded_differential_fixture|seeded_differential_fixture_variants|differential_visibility_cases|differential_query_cases|differential_limits|differential_cursors|fixed_deep_partial_cases|candidate_path_matches_eager_oracle_across_seeded_cross_product|deep_search_dir_item|guard_item|overlaid_title" HEAD -- crates/freshell-server/src/session_directory.rs; test "$?" -eq 1'
 ```
 
-Expected: no output and exit 0. This is the same complete residue-name set used by Task 5.
+Expected: no output and exit 0. This is the same complete residue-name set used by Task 6 after final-selector parity.
 
-- [ ] **Step 15: Prove exact final base scope is plan plus Rust source**
+- [ ] **Step 18: Prove exact final base scope is plan plus Rust source**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -c 'diff -u <(printf "%s\n" "crates/freshell-server/src/session_directory.rs" "docs/plans/2026-08-13-session-directory-lazy-page-prep.md") <(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD)'
+FRESHELL_VITEST_BACKEND=local bash -c 'diff -u <(printf "%s\n" "crates/freshell-server/src/session_directory.rs" "docs/plans/2026-08-13-session-directory-lazy-page-prep.md") <(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD)'
 ```
 
 Expected: exit 0 and no output. This intentionally includes the already-committed plan; source alone is not the expected final scope.
 
-- [ ] **Step 16: Prove forbidden manifests/configuration/languages did not drift**
+- [ ] **Step 19: Prove forbidden manifests, configuration, and languages did not drift**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud bash -o pipefail -c "git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD | awk '/(^|\\/)Cargo\\.toml$|^Cargo\\.lock$|(^|\\/)\\.kata\\.toml$|^package(-lock)?\\.json$|\\.(ts|tsx|js|jsx)$/{print; bad=1} END{exit bad}'"
+FRESHELL_VITEST_BACKEND=local bash -o pipefail -c "git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep diff --name-only 225a91db3e4d48d4b6a7e8bc0987afad8ff31917 HEAD | awk '/(^|\\/)Cargo\\.toml$|^Cargo\\.lock$|(^|\\/)\\.kata\\.toml$|^package(-lock)?\\.json$|\\.(ts|tsx|js|jsx)$/{print; bad=1} END{exit bad}'"
 ```
 
 Expected: exit 0 and no output.
 
-- [ ] **Step 17: Prove the worktree is clean**
+- [ ] **Step 20: Prove the worktree is clean**
 
 Run:
 
 ```bash
-FRESHELL_VITEST_BACKEND=cloud test -z "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep status --porcelain=v1 --untracked-files=all)"
+FRESHELL_VITEST_BACKEND=local test -z "$(git -C /home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep status --porcelain=v1 --untracked-files=all)"
 ```
 
-Expected: exit 0. Do not inspect or enforce commit count, commit subjects, or commit order.
+Expected: exit 0. No readiness, historical, focused-only, or preflight result substitutes for any required runtime gate. Do not inspect or enforce commit count, commit subjects, or commit order.
 
 ## Self-Review Checklist and Results
 
-- [x] **Mandatory structure:** The required four-line workflow execute-stage header is verbatim; goal, architecture, tech stack, global constraints, file map, dependency order, and exactly seven numbered Tasks are present.
-- [x] **Task boundaries:** Task 1 performs setup and unchanged baselines without edits; Tasks 2-3 characterize; Task 4 builds/proves/cuts over; Task 5 migrates and removes the oracle; Task 6 proves the work bound; Task 7 only validates.
-- [x] **Bite-sized execution:** Every checkbox is one monotonic 2-5 minute action. Module shells, helper groups, individual tests, individual production functions, independent commands, and commits are separate steps; no step hides a multi-hundred-line module or multi-command action.
-- [x] **Spec coverage:** Observation order, deletion/overlays, metadata, supplied identity order, synthesis collisions, revision, stable full-key order, strict duplicate cursor gap, all visibility flags, title/deep search, exact fixed-case partial reasons/omission, exact wire bytes, whole-map project colors, no totals, and Rust-vs-Node exclusions each have an implementation and retained test/check.
-- [x] **No silent test-double deferral:** `StaticSessionSource` is the approved minimal in-memory direct source: empty `discover`, `None` `parse`, stable `direct_change_token`, and cloned ordered `direct_list` rows. It is only deterministic input to the real `SessionIndex` and Axum route and never enters production. Task 4 cuts the real handler over to the candidate path, Tasks 2-6 exercise that production path through authenticated route calls, and Task 7's Rust-backed browser matrix plus coordinator suite prove the real user-visible endpoint. No required outcome is deferred to a later task.
-- [x] **One architecture:** Only the borrowed candidate design is specified. There is no owned fallback, raw-snapshot paging, runtime dual strategy, compatibility full-row adapter, cache, or new paging API.
-- [x] **Work bounds:** The plan retains at most `limit + 1` descriptors/annotations, materializes/serializes at most `limit`, and proves those facts with exact structural counters rather than timing.
-- [x] **Assertion preservation:** Existing direct-helper assertions are either retained under the same test name against candidate/route interfaces or explicitly replaced by stronger route/differential/structural assertions. Duplicate first-title/null-cursor and both dedicated budget empty/partial/reason assertions remain; the differential additionally pins `io_error`, `budget`, `budget`, and exact partial-field omission for its four fixed cases.
-- [x] **Code completeness:** Every planned insertion/replacement is a complete shell, helper group, test, function, type group, or deletion list; every branch and assertion is explicit, with no deferred marker or omitted behavior.
-- [x] **Helper lifecycle and residue:** Task 5 consumes the single Task 3 definitions of `fn write_nonmatching_claude_transcript(path: &Path)` and `fn deep_search_query() -> DirQuery` without redefining them. After all consumers migrate, it deletes `deep_search_dir_item`, `guard_item`, `overlaid_title`, the eager oracle, and every temporary differential support symbol before replacing `DirItem`; Tasks 5 and 7 use the same complete residue regex.
-- [x] **Type consistency:** `DirectoryInputs`, candidate lifetimes, `DecodedCursor`, `SearchAnnotation`, selector, consuming materializer, handler, fixed differential-case tuple, and test-counter signatures agree across tasks; no execution point has duplicate planned helper definitions.
-- [x] **Command discipline:** Every command is independent, begins with `FRESHELL_VITEST_BACKEND=cloud`, uses `git -C` or absolute paths, and states expected output. No raw Vitest command or caller-directory assumption appears.
-- [x] **Scope discipline:** No manifest, lockfile, kata configuration, package file, TypeScript, or JavaScript edit is planned. Task 7 expects exactly the plan plus `crates/freshell-server/src/session_directory.rs` from the frozen base.
-- [x] **Workflow boundary:** Normal local task-level commits remain. Their shown subjects/bodies are examples only, and mandatory task reviews or final checks may add source-only correction commits; no exact count, subject sequence, order, ancestry ledger, push, pull-request, merge, deploy, or restart execution is prescribed.
-- [x] **Unresolved plan gaps:** None. Compile-time lifetime failure and baseline/raw-byte mismatch are explicit stop conditions, not alternate designs or silently accepted deviations.
+- [x] **1. Spec coverage:** Re-read the original requirements and LB-01/LB-03/LB-05/LB-06/LB-08/LB-09/LB-10 findings. Exactly seven Tasks remain. Task 1 creates a fresh local authorization receipt and post-run seal; Tasks 2-3 preserve all behavior fixtures/assertions; Task 4 adds locked compiler gates around real-handler cutover and documents fixed-input concurrency semantics; Task 5 migrates tests while retaining the oracle; Task 6 observes structural RED, installs the exact final selector, runs the 2,884-case final parity before deletion, finalizes the output path, and proves combined bounds; Task 7 repeats final locked/static/runtime/local/scope gates without editing source. No amended requirement lacks a task.
+- [x] **1b. No silent deferrals of required behavior:** `StaticSessionSource` remains deterministic input to the real `SessionIndex` and authenticated Axum route, and Task 4 cuts over the actual handler. Browser preflight is only readiness; Tasks 1 and 7 require the exact local matrix. Docker/image checks are only provenance; Tasks 6 and 7 require the exact sandbox all-target run with a stable rebuilt image ID. TLS counters are only the runtime leg; Tasks 6 and 7 require the static locality/centrality leg. Pre-cutover compilation is not final proof; immediate post-cutover, final assembly, and Task 7 locked gates remain. Task 4/5 unbounded differentials are not final-selector proof; Task 6's post-selector 2,884-case differential is. Pre-deletion parity is not post-cleanup serializer proof; locked compile plus literal-byte, structural, route, and focused reruns cover the released output path. No fake, preflight, seam, or future task substitutes for a required production outcome.
+- [x] **2. Placeholder and stale-claim scan:** No prohibited deferred marker or vague implementation instruction remains. The exact remote backend token and wrapper dependency are absent. Oracle retention/deletion follows the Task 5/6 boundary, work-bound evidence is explicitly combined, fresh runtime gates remain pending execution, and both broad sandbox calls are enclosed by rebuild/image-ID provenance brackets.
+- [x] **3. Type/signature/lifecycle consistency:** Task 5 leaves legacy `DirItem: Clone`, `title_source`, `source_file`, eager helpers, differential support, and the unbounded selector available. Early Task 6 counters instrument that exact legacy path; structural RED precedes the one final-selector installation; no production edit intervenes before final eager parity; deletion follows route/structural/focused validation; only then do the non-`Clone` `DirItem`, counted serializer/materializer, parser callers, `Comparable`, and docs reach final shape. Locked final-assembly commands precede all post-cleanup evidence and commit. Task 7's exact-one production/counter signatures match the final definitions.
+- [x] **Mandatory structure and task boundaries:** The workflow execute-stage header, goal, architecture, tech stack, global constraints, file map, dependency order, and exactly seven numbered Tasks are present. Task 1 and Task 7 are validation-only; Task 5 ends with the eager oracle intact; Task 6 alone proves the final selector, deletes the oracle, finalizes output, and proves bounds.
+- [x] **Bite-sized execution:** Task 5 and Task 6 step numbers are monotonic. Module shells, cohesive helper groups, individual tests, production functions/types, independent commands, and commits remain separate. The two sandbox provenance brackets are the documented narrow exception: each stays one indivisible process so its captured image ID cannot race across steps.
+- [x] **Supported concurrency contract:** Snapshots/values are independent and sequential in accessor order, never an atomic cross-store instant. Overlapping writes and old projection/read race windows are unspecified; no race test freezes one allowed outcome. `revision` is full-corpus candidate/identity recency, not a cross-store version. Every deterministic candidate/override/metadata/live-join/order/cursor/visibility/search/partial/page obligation remains exact for fixed captured inputs and non-overlapping operations.
+- [x] **One borrowed architecture and compiler residual:** The plan retains one borrowed candidate representation in one source file. Compiler failure is a fail-closed stop and architecture-reopen condition, never authorization for an owned fallback, adapter, manifest/public/store/index API change, or second file. Locked stop-gates exist before and immediately after cutover, after final assembly, and at Task 7 start.
+- [x] **Combined work-bound proof:** At most `limit + 1` descriptors/owned annotations and at most `limit` materializations/serializations are covered by exact runtime counters plus mandatory static checks over each of the six named measured request bodies (`begin < fully awaited request < snapshot`), explicit exclusion of the seventh lifecycle/reset-only test, current-thread/no-offload/direct-poll/full-body invariants, and exhaustive production selector/materializer/serializer references with no alternate `DirItem` path. TLS alone is explicitly inadmissible, and Tasks 6 and 7 contain the same byte-identical static gate plus the same runtime structural suite.
+- [x] **Assertion and oracle sequencing:** All existing behavior/data-model/lookahead assertions remain. The exact final selector is unchanged. The final 2,884-case parsed/byte differential runs after that selector and before oracle deletion with no intervening production edit; exact route, structural, and focused gates run before deletion, and locked compile plus exact literal bytes, structural, page-bound, and focused gates rerun after final output cleanup.
+- [x] **Helper lifecycle and residue:** Task 5 consumes the single Task 3 helper definitions without redefining them and retains eager/differential residue for Task 6. Task 6 deletes eager helpers and all differential support only after final-selector parity, then uses the same complete residue-name set that Task 7 repeats against `HEAD`.
+- [x] **Command and backend discipline:** Every runnable shell fence begins with `FRESHELL_VITEST_BACKEND=local`, is self-contained, and uses absolute paths or `git -C`. No raw Vitest command, remote-wrapper execution dependency, caller-directory assumption, unsandboxed broad package fallback, narrowed substitute, or waiver appears. Task 1 and Task 7 use comparable local focused/browser/coordinator workloads.
+- [x] **Scope and workflow discipline:** No manifest, lockfile, kata configuration, package file, TypeScript, or JavaScript edit is planned. Task 7 expects exactly the plan plus `crates/freshell-server/src/session_directory.rs` from the frozen base. Local commit examples do not prescribe history, and no push, pull request, merge, deployment, or restart is included.
+- [x] **Residual-risk control, not pre-execution attestation:** LB-05, LB-06, LB-08, and LB-10 are corrected in the plan by the explicit concurrency boundary, final-selector oracle sequencing, combined static/runtime proof, and mandatory local backend. LB-01, LB-03, and LB-09 remain accepted residuals pending their exact fail-closed execution gates. This document review does not claim those runtime gates have passed; no requirement is deferred or waived.
