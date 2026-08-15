@@ -15,7 +15,7 @@ annotations and materialize/serialize no more than `limit` rows.
 **Current amendment state:** `0/7 tasks completed; no application code changed.`
 Amendment preparation changes this plan and appends the three authorized
 external evidence logs. The outer process must commit/review the plan and create
-`amendment-6-independent-review.md`; only then may Task 1 consume the committed
+`amendment-7-independent-review.md`; only then may Task 1 consume the committed
 plan, unchanged adapter, and review receipt. Task 1 does not create, edit, or
 commit them. Amendment preparation does not run Cargo, Playwright, Docker,
 Cloud Run, Vitest, `npm test`, or any product/runtime workload.
@@ -125,6 +125,13 @@ Rust file: `crates/freshell-server/src/session_directory.rs`.
   one unique job per attempt, execute it, delete that exact unique job, append
   an attempt record, and—only after `npm test` including local Electron exits
   zero—append its linked acceptance record. Retries preserve prior attempts.
+- The direct Task 1 and Task 7 Rust release prebuilds may create or update
+  ignored files under `target/` and Cargo's external registry, Git, and
+  configured compiler caches. They may not change a tracked repository file.
+  They do not require the JavaScript test coordinator and must not start,
+  deploy, stop, or restart a server. Do not increase the Playwright
+  `testServer` fixture's 60-second timeout; move compilation outside that
+  timeout by prebuilding instead.
 - Do not run paid cloud work during this plan amendment. The adapter was
   syntax-checked and independently reviewed during amendment preparation; Task
   1 re-verifies the actual unchanged file before cloud work. A future Task 1 or
@@ -142,7 +149,9 @@ These files are outside Git and are part of this amendment's evidence boundary:
   4 review record only. Task 1 does not consume, hash, or modify it.
 - `$LOG_ROOT/reports/amendment-5-independent-review.md` — historical Amendment
   5 review record only. Task 1 does not consume, hash, or modify it.
-- `$LOG_ROOT/reports/amendment-6-independent-review.md` — final review receipt
+- `$LOG_ROOT/reports/amendment-6-independent-review.md` — historical Amendment
+  6 review record only. Task 1 does not consume, hash, or modify it.
+- `$LOG_ROOT/reports/amendment-7-independent-review.md` — final review receipt
   created by the outer process only after this amendment is committed and
   independently reviewed. Task 1 consumes but never creates or edits it. It is
   not pinned by its own file hash and need not contain the plan's content hash.
@@ -203,7 +212,7 @@ An `attempt_record` failure stage is reserved for evidence-write failure.
 The historical Amendment 4 review records that the no-cost normal and
 `PYTHONOPTIMIZE=1` mock gates covered execute status 17, delete failure,
 failed-attempt rejection, successful post-Electron acceptance, and equal-digest
-rejection. The outer process creates the separate Amendment 6 review receipt
+rejection. The outer process creates the separate Amendment 7 review receipt
 after this amendment is committed/reviewed. Task 1 verifies that receipt and the
 actual adapter; it does not create or rerun a fake-Git/fake-gcloud harness.
 
@@ -531,16 +540,32 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
 - Read/consume: `AGENTS.md`, the committed plan, Git state,
   manifests/lockfiles, coordinator sources, browser configuration/spec,
   `scripts/e2e-cloud.sh`, current `session_directory.rs`, the external reviewed
-  adapter, the outer-created Amendment 6 review receipt ending in `PASSED`, and
+  adapter, the outer-created Amendment 7 review receipt ending in `PASSED`, and
   the append-only cloud JSONL.
 - External writes: one append-only cloud attempt record for every started cloud
   attempt, one linked acceptance record only after complete `npm test` success,
   a temporary attempt-ID handoff file, and—only after exact linkage validation—
   one atomic `$LOG_ROOT/cloud-baseline-accepted.json` receipt.
+- Local build effects: the release prebuild may create/update ignored `target/`
+  artifacts and Cargo's external registry/Git/compiler caches. It must leave all
+  tracked repository files clean and does not run through the test coordinator.
 - Remote/cloud effects: push the named branch once without force and without
   opening a pull request; build/push its exact-HEAD image; create and execute one
   unique job per attempt; delete that exact unique job on success and
   best-effort on failure. Never create/update/delete `freshell-vitest`.
+
+**Observed incomplete pre-amendment attempt**
+
+The first Rust-backed Playwright `testServer` fixture hit its 60-second startup
+timeout while an unchanged cold
+`cargo build --release -p freshell-server` took 3 minutes 6 seconds. The first
+test body never ran; the remaining six cases passed after that build completed.
+This is environment/setup evidence, not product-behavior evidence and not a
+7/7 baseline. Use the repository-history-prescribed prebuild rather than
+changing the timeout. Task 1 remains incomplete. After this amendment is
+committed, independently reviewed, and paired with the Amendment 7 receipt,
+restart Task 1 coherently from its first preflight step; do not resume at the
+failed browser case or carry any partial success forward.
 
 **Steps**
 
@@ -551,7 +576,7 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
   `crates/freshell-server/src/session_directory.rs` is byte-identical to the
   frozen base. If any check fails, stop; do not edit, stage, or commit anything
   in Task 1.
-- [ ] Verify the actual existing external adapter and outer-created Amendment 6
+- [ ] Verify the actual existing external adapter and outer-created Amendment 7
   independent review receipt before any product test or cloud work:
 
 ```bash
@@ -562,7 +587,7 @@ plan_rel=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
 plan="${root}/${plan_rel}"
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-review="${logroot}/reports/amendment-6-independent-review.md"
+review="${logroot}/reports/amendment-7-independent-review.md"
 branch=the-usual/session-directory-lazy-page-prep
 frozen_base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
 adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
@@ -616,7 +641,7 @@ BASH
   This consumes the reviewed artifacts. The report is not pinned by its own
   hash and is not required to name a self-referential plan content hash. Do not
   generate, extract, persist, or run a replacement mock harness, and do not
-  create or edit the plan, adapter, or Amendment 6 review receipt in Task 1.
+  create or edit the plan, adapter, or Amendment 7 review receipt in Task 1.
 - [ ] Run the literal branch push and exact remote-HEAD check:
 
 ```bash
@@ -655,11 +680,49 @@ gcloud projects describe misc-puttering-project \
   `cargo test --locked --manifest-path ... -p freshell-server --bin
   freshell-server session_directory -- --color=never --test-threads=1`.
   Require exit 0 and no failed test.
+- [ ] Immediately before the Rust-backed Playwright matrix, prebuild the exact
+  unchanged release server outside the fixture's 60-second startup window:
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+branch=the-usual/session-directory-lazy-page-prep
+
+test "$(git -C "$root" branch --show-current)" = "$branch"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+expected_head="$(git -C "$root" rev-parse HEAD)"
+remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
+read -r remote_head remote_ref extra <<<"$remote_line"
+test -z "${extra:-}"
+test "$remote_ref" = "refs/heads/${branch}"
+test "$remote_head" = "$expected_head"
+
+env --chdir="$root" cargo build --locked --release -p freshell-server
+
+test -x "$root/target/release/freshell-server"
+test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
+read -r remote_head remote_ref extra <<<"$remote_line"
+test -z "${extra:-}"
+test "$remote_ref" = "refs/heads/${branch}"
+test "$remote_head" = "$expected_head"
+BASH
+```
+
+  Require exit 0, executable
+  `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/target/release/freshell-server`,
+  unchanged exact local/remote HEAD identity, and clean tracked status. Ignored
+  `target/` output and external Cargo cache writes are expected. This direct
+  Cargo command needs no coordinator and must not launch or restart the binary.
 - [ ] Run the exact Rust-backed browser matrix from the target worktree with
   the pinned Playwright CLI, `FRESHELL_E2E_BACKEND=local`, project
   `rust-chromium`, one worker, and
-  `test/e2e-browser/specs/session-directory-matrix.spec.ts`. Require every
-  existing case to pass. Readiness is not pass evidence.
+  `test/e2e-browser/specs/session-directory-matrix.spec.ts`. Keep the existing
+  matrix and 60-second fixture timeout unchanged. Require exactly 7/7 cases to
+  pass. Readiness, the earlier 6/7 observation, and a completed prebuild are not
+  substitutes for a fresh 7/7 matrix result.
 - [ ] Run the complete coordinator-owned baseline, acceptance write, exact
   linked-record selection, and atomic baseline-receipt write in one
   self-contained shell. The hash check occurs
@@ -854,11 +917,12 @@ BASH
 
 **Task 1 success:** existing committed plan-only HEAD and reviewed artifacts
 verified without tracked writes or a Task 1 commit; clean non-force branch push;
-unchanged application source; focused Rust/browser green; the exact accepted
-baseline links a truthful successful cloud attempt to a zero-exit coordinator
-run including Electron; the dedicated atomic baseline receipt pins its exact
-JSONL linkage; prior failed attempts, if any, remain preserved; no pull request
-opened.
+unchanged application source; focused Rust green; exact release prebuild
+executable with tracked status and local/remote identity unchanged; fresh
+Rust-backed browser matrix 7/7; the exact accepted baseline links a truthful
+successful cloud attempt to a zero-exit coordinator run including Electron; the
+dedicated atomic baseline receipt pins its exact JSONL linkage; prior failed
+attempts, if any, remain preserved; no pull request opened.
 
 ### Task 2: Add authenticated real-route tests for rows, order, pages, and bytes
 
@@ -1241,6 +1305,10 @@ locality proof; output shape/bytes are unchanged; and the old path is absent.
 - External writes: append each final cloud attempt and, only after complete
   coordinator/Electron success, its linked acceptance record; write/remove a
   temporary attempt-ID handoff file.
+- Local build effects: the final release prebuild may create/update ignored
+  `target/` artifacts and Cargo's external registry/Git/compiler caches. It must
+  leave the exact committed final HEAD and every tracked repository file
+  unchanged. It does not use the coordinator or start/restart a server.
 - Remote/cloud effects: push the named final branch; build/push its image;
   create/execute one unique job per attempt; delete only that unique job on
   success and best-effort on failure. Never touch `freshell-vitest`.
@@ -1258,9 +1326,38 @@ locality proof; output shape/bytes are unchanged; and the old path is absent.
 - [ ] Run the exact tagless immutable-ID sandbox package gate again from the
   final target worktree. Require the exact all-target workload to run against
   the image ID built from this final SHA.
+- [ ] Immediately before the final Rust-backed Playwright matrix, prebuild the
+  committed final Rust server outside the fixture's 60-second startup window:
+
+```bash
+bash <<'BASH'
+set -euo pipefail
+root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
+branch=the-usual/session-directory-lazy-page-prep
+
+test "$(git -C "$root" branch --show-current)" = "$branch"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+expected_head="$(git -C "$root" rev-parse HEAD)"
+
+env --chdir="$root" cargo build --locked --release -p freshell-server
+
+test -x "$root/target/release/freshell-server"
+test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
+test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+BASH
+```
+
+  Require exit 0, executable
+  `/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep/target/release/freshell-server`,
+  the same exact committed final HEAD before/after, and clean tracked status.
+  Ignored `target/` output and external Cargo cache writes are expected. This
+  direct Cargo command needs no coordinator and must not launch or restart the
+  binary. The existing later final push and `ls-remote` gate establishes exact
+  remote identity for this same unchanged HEAD.
 - [ ] Run the exact Rust-backed browser matrix with the target worktree,
   `FRESHELL_E2E_BACKEND=local`, project `rust-chromium`, one worker, and the
-  session-directory matrix spec. Require every case green.
+  session-directory matrix spec. Keep the existing matrix and 60-second fixture
+  timeout unchanged. Require exactly 7/7 cases green.
 - [ ] Check cloud auth/project access without mutation, using explicit
   `--project=misc-puttering-project`. Stop before paid work if refresh or access
   is unavailable.
@@ -1549,10 +1646,11 @@ BASH
   clean-state check. Do not create a pull request or merge in this task.
 
 **Task 7 success:** every focused, browser, sandbox, lint, compilation, static,
-coordinator, cloud, Electron, provenance, and scope gate passes against the
-exact final pushed SHA; the exact Task 1 baseline receipt and exact final linked
-records are both validated and distinct by HEAD and digest; all retry attempts
-remain truthful; no pull request has been opened.
+release-prebuild, coordinator, cloud, Electron, provenance, and scope gate
+passes against the exact final pushed SHA; the final release executable exists
+before a fresh Rust-backed browser 7/7 result; the exact Task 1 baseline receipt
+and exact final linked records are both validated and distinct by HEAD and
+digest; all retry attempts remain truthful; no pull request has been opened.
 
 ## Amendment self-review checklist
 
@@ -1578,6 +1676,11 @@ This section is a plan review, not an execution attestation:
   exceed `limit + 1`.
 - [ ] Task 1 and Task 7 broad suites use cloud plus the reviewed external
   adapter; focused commands do not select a fake local Vitest backend.
+- [ ] Task 1 and Task 7 run the independent locked release prebuild immediately
+  before their unchanged Rust-backed Playwright matrices, verify the executable
+  and clean exact HEAD provenance, allow only ignored `target/`/external Cargo
+  cache effects, do not use the coordinator or restart a server, preserve the
+  60-second fixture timeout, and require fresh 7/7 matrix results.
 - [ ] The adapter body passes `bash -n` and ShellCheck and its recorded SHA is
   `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
 - [ ] Task 1/7 include literal push and `ls-remote` checks, required branch and
@@ -1585,7 +1688,7 @@ This section is a plan review, not an execution attestation:
   evidence, required unique-job deletion, post-run remote checks, retry-safe
   attempt preservation, and acceptance only after coordinator/Electron success.
 - [ ] Task 1 consumes an already committed clean plan-only HEAD, executable
-  reviewed adapter, and outer-created `amendment-6-independent-review.md`
+  reviewed adapter, and outer-created `amendment-7-independent-review.md`
   ending in standalone `PASSED`; it derives HEAD at runtime, pins no review-file
   or self-referential plan hash, performs no tracked write/commit, and creates
   no mock harness.
