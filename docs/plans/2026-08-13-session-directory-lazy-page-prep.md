@@ -15,8 +15,8 @@ annotations and materialize/serialize no more than `limit` rows.
 **Current amendment state:** `0/7 tasks completed; no application code changed.`
 Amendment preparation changes this plan and appends the three authorized
 external evidence logs. The outer process must commit/review the plan and create
-`amendment-7-independent-review.md`; only then may Task 1 consume the committed
-plan, unchanged adapter, and review receipt. Task 1 does not create, edit, or
+`amendment-8-independent-review.md`; only then may Task 1 consume the committed
+plan, reviewed adapter, and review receipt. Task 1 does not create, edit, or
 commit them. Amendment preparation does not run Cargo, Playwright, Docker,
 Cloud Run, Vitest, `npm test`, or any product/runtime workload.
 
@@ -132,6 +132,12 @@ Rust file: `crates/freshell-server/src/session_directory.rs`.
   deploy, stop, or restart a server. Do not increase the Playwright
   `testServer` fixture's 60-second timeout; move compilation outside that
   timeout by prebuilding instead.
+- Every active clean-worktree gate is fail closed. It must run `git status` in
+  an explicit conditional assignment, preserve and reject a nonzero command
+  status before trusting its captured output, and only then require that output
+  to be empty. Never put `git status` command substitution directly inside
+  `test -z` or `[[ -z ... ]]`; those forms can mistake command failure for a
+  clean worktree.
 - Do not run paid cloud work during this plan amendment. The adapter was
   syntax-checked and independently reviewed during amendment preparation; Task
   1 re-verifies the actual unchanged file before cloud work. A future Task 1 or
@@ -144,30 +150,39 @@ These files are outside Git and are part of this amendment's evidence boundary:
 
 - `$LOG_ROOT/reports/amendment-4-single-policy-cloud.md` — append-only report.
 - `$LOG_ROOT/pinned-vitest-cloud-v1.sh` — reviewed adapter, SHA-256
-  `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
+  `ef22952c8ef53ebdabae899159730d3d1745d9197382d77a2975647b2036d2ed`.
 - `$LOG_ROOT/reports/amendment-4-independent-review.md` — historical Amendment
   4 review record only. Task 1 does not consume, hash, or modify it.
 - `$LOG_ROOT/reports/amendment-5-independent-review.md` — historical Amendment
   5 review record only. Task 1 does not consume, hash, or modify it.
 - `$LOG_ROOT/reports/amendment-6-independent-review.md` — historical Amendment
   6 review record only. Task 1 does not consume, hash, or modify it.
-- `$LOG_ROOT/reports/amendment-7-independent-review.md` — final review receipt
+- `$LOG_ROOT/reports/amendment-7-independent-review.md` — historical Amendment
+  7 review record only. Task 1 does not consume, hash, or modify it.
+- `$LOG_ROOT/reports/amendment-8-independent-review.md` — final review receipt
   created by the outer process only after this amendment is committed and
   independently reviewed. Task 1 consumes but never creates or edits it. It is
   not pinned by its own file hash and need not contain the plan's content hash.
   Its final standalone line must be `PASSED`; it must contain standalone lines
   naming the exact runtime `Plan commit: <HEAD>`, exact absolute `Plan path:
   <path>`, and actual `Adapter SHA-256: <sha>`.
-- `$LOG_ROOT/pinned-cloud-runs.jsonl` — empty until a real cloud attempt occurs;
-  each attempt is preserved as its own append-only record, and only a completed
-  coordinator-owned `npm test` with local Electron success receives a linked
-  acceptance record. No fabricated or deleted retry record is allowed.
+- `$LOG_ROOT/pinned-cloud-runs.jsonl` — already contains exactly one truthful,
+  failed schema-2 baseline attempt from HEAD
+  `bf000e041499cacf045f01d2f7e353ab36dbfdf2`; its SHA-256 is
+  `88a3e4c548d125ab6f648e7e682a68a60074913892675a0c0edea9867ad70bb3`.
+  Preserve that row byte-for-byte. The temporary Job was deleted and no orphan
+  remains; no acceptance or baseline receipt exists. Every retry appends a new
+  schema-3 attempt, and only a completed coordinator-owned `npm test` with local
+  Electron success receives a linked schema-3 acceptance.
+  Never accept or rewrite the failed schema-2 row.
 - `$LOG_ROOT/cloud-baseline-accepted.json` — absent until Task 1 has a fully
   linked successful baseline attempt and acceptance. Task 1 atomically writes
-  this dedicated receipt with the exact baseline HEAD, immutable digest, cloud
-  attempt ID, acceptance ID, adapter SHA, JSONL path, and exact attempt and
-  acceptance line/linkage. Task 7 consumes this exact receipt; it never chooses
-  a baseline by phase alone.
+  this schema-2 receipt with the exact baseline HEAD, image repository,
+  OCI-index digest, created Job name/UID/generation/index image, exact execution
+  ID, owner Job name/UID/generation, platform-manifest image, cloud attempt ID,
+  acceptance ID, adapter SHA, JSONL path, and exact attempt and acceptance
+  line/linkage. Task 7 consumes this exact receipt; it never chooses a baseline
+  by phase alone.
 - `$LOG_ROOT/load-bearing-ledger.md` — append-only amendment entries.
 - `$LOG_ROOT/writing-plans-self-review.md` — append-only amendment entry.
 
@@ -184,24 +199,38 @@ The reviewed adapter requires phase, branch, expected full HEAD, reviewed
 adapter hash, and a unique attempt handoff path. Before cloud work and again
 after execution verification it requires a clean worktree and exact equality
 among local HEAD, the expected HEAD, and `git ls-remote origin` for the named
-branch. It builds through `scripts/e2e-cloud.sh`, resolves `@sha256:...`, creates
-one lowercase length-checked unique job, describes that exact job and verifies
-its stored image, captures and verifies the exact execution, deletes only that
-unique job, then appends an immutable attempt record. It never selects a mutable
-image tag, updates/reuses `freshell-vitest`, or chooses a latest execution.
+branch. Its shared clean-worktree helper separately checks the `git status`
+exit code and captured output for the before, after, and acceptance gates; a
+status failure remains nonzero and a dirty result is rejected. For every exact
+new HEAD it rebuilds through `scripts/e2e-cloud.sh`,
+resolves the commit tag to an immutable OCI-index `@sha256:...`, creates one
+lowercase length-checked unique Job, and captures that Job's name, UID,
+generation, and index image. It executes with supported
+`--format=value(metadata.name)` while keeping stdout/stderr separate. Its strict
+parser accepts only one plain `$JOB-[a-z0-9]{5}` line or the exact observed bold
+wrapper `ESC[1m<ID>ESC[m`; it rejects every other control sequence, prose,
+multiline/multiple IDs, foreign prefix, or malformed suffix. It then verifies
+the execution's exact name, controller owner Job name/UID, generation label,
+same Artifact Registry repository, immutable platform-manifest image, and 4/0
+task counts before deleting only that unique Job and appending a schema-3
+record. The platform-manifest digest may differ from the Job's OCI-index digest.
+It never uses `CLOUDSDK_*`, changes gcloud configuration, selects a mutable image
+tag, updates/reuses `freshell-vitest`, or chooses a latest execution.
 
 A cloud attempt is not acceptance. The adapter's separate `accept ATTEMPT_ID`
 operation runs only after the complete coordinator-owned `npm test` returns
 zero, including local Electron. It links a distinct acceptance record to the
-attempt ID after another clean local/remote HEAD check. Successful attempts must
-have `failureStage=null`, `cleanupError=null`, `jobDeleted=true`, matching
-created/execution immutable images, the expected success count, and zero failed.
-Failed or superseded attempts remain in the JSONL; retries create additional
-attempt records. Task 1 selects the exact accepted baseline identified by its
-attempt handoff ID, phase, exact HEAD, and digest, then atomically records that
-linkage in `cloud-baseline-accepted.json`. Task 7 validates exactly that receipt
-and its linked JSONL rows before comparing it with an exact final attempt and
-acceptance. Neither task selects baseline evidence by phase alone.
+attempt ID after another clean local/remote HEAD check. Successful schema-3
+attempts must have `failureStage=null`, `cleanupError=null`, `jobDeleted=true`,
+exact Job UID/generation and controller-owner linkage, immutable same-repository
+index/manifest refs, the exact execution ID, the expected success count, and
+zero failed. Failed or superseded attempts remain in the JSONL; retries create
+additional attempt records. Task 1 selects the exact schema-3 accepted baseline
+identified by its new attempt handoff ID, phase, exact HEAD, and OCI-index
+digest, then atomically records that linkage in `cloud-baseline-accepted.json`.
+Task 7 validates exactly that receipt and its linked JSONL rows before comparing
+it with an exact schema-3 final attempt and acceptance. Neither task selects
+baseline evidence by phase alone or retroactively reuses an earlier attempt.
 
 The EXIT trap passes the triggering status explicitly (`trap 'on_exit "$?"'
 EXIT`; handler `local status="$1"`). Any build/create/describe/execute/verify or
@@ -212,7 +241,15 @@ An `attempt_record` failure stage is reserved for evidence-write failure.
 The historical Amendment 4 review records that the no-cost normal and
 `PYTHONOPTIMIZE=1` mock gates covered execute status 17, delete failure,
 failed-attempt rejection, successful post-Electron acceptance, and equal-digest
-rejection. The outer process creates the separate Amendment 7 review receipt
+rejection. Amendment 8 additionally records normal and `PYTHONOPTIMIZE=1`
+no-cost mocks for strict plain/bold execution-ID acceptance, prose/foreign/
+unsupported-ANSI/multiline rejection, stdout/stderr separation, exact
+Job-generation ownership, OCI-index-to-platform-manifest provenance, status-17
+and delete failures, schema-2 rejection, and successful 4/0 coordinator
+acceptance. The same normal/optimized fake-Git matrix proves clean status
+continues, dirty status stops, and status exit 42 propagates before any build,
+execution, deletion, evidence append, or acceptance. The outer process creates
+the separate Amendment 8 review receipt
 after this amendment is committed/reviewed. Task 1 verifies that receipt and the
 actual adapter; it does not create or rerun a fake-Git/fake-gcloud harness.
 
@@ -540,7 +577,7 @@ Task 1: verify and push the existing plan-only branch, then prove the unchanged 
 - Read/consume: `AGENTS.md`, the committed plan, Git state,
   manifests/lockfiles, coordinator sources, browser configuration/spec,
   `scripts/e2e-cloud.sh`, current `session_directory.rs`, the external reviewed
-  adapter, the outer-created Amendment 7 review receipt ending in `PASSED`, and
+  adapter, the outer-created Amendment 8 review receipt ending in `PASSED`, and
   the append-only cloud JSONL.
 - External writes: one append-only cloud attempt record for every started cloud
   attempt, one linked acceptance record only after complete `npm test` success,
@@ -563,9 +600,21 @@ test body never ran; the remaining six cases passed after that build completed.
 This is environment/setup evidence, not product-behavior evidence and not a
 7/7 baseline. Use the repository-history-prescribed prebuild rather than
 changing the timeout. Task 1 remains incomplete. After this amendment is
-committed, independently reviewed, and paired with the Amendment 7 receipt,
+committed, independently reviewed, and paired with the Amendment 8 receipt,
 restart Task 1 coherently from its first preflight step; do not resume at the
 failed browser case or carry any partial success forward.
+
+A later real Task 1 attempt passed provenance, the non-force push, cloud access,
+68/68 focused Rust tests, the locked release prebuild, and a fresh browser 7/7.
+The coordinator baseline then stopped in the old pinned adapter: gcloud returned
+the exact execution name wrapped as `ESC[1m<ID>ESC[m`, the broad prose parser
+stored those control bytes, and the ownership prefix check failed. The truthful
+failed schema-2 attempt remains the first and only JSONL row, the unique Job was
+deleted, no orphan exists, and no acceptance or baseline receipt was created.
+Those earlier gates still do not complete Task 1. After Amendment 8 commit/review,
+restart Task 1 from its first preflight and run a new exact-HEAD build/tag/digest
+resolution and schema-3 attempt. Never reuse the old attempt or digest
+retroactively, even if the rebuilt content resolves to the same digest.
 
 **Steps**
 
@@ -576,7 +625,7 @@ failed browser case or carry any partial success forward.
   `crates/freshell-server/src/session_directory.rs` is byte-identical to the
   frozen base. If any check fails, stop; do not edit, stage, or commit anything
   in Task 1.
-- [ ] Verify the actual existing external adapter and outer-created Amendment 7
+- [ ] Verify the actual existing external adapter and outer-created Amendment 8
   independent review receipt before any product test or cloud work:
 
 ```bash
@@ -587,13 +636,24 @@ plan_rel=docs/plans/2026-08-13-session-directory-lazy-page-prep.md
 plan="${root}/${plan_rel}"
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-review="${logroot}/reports/amendment-7-independent-review.md"
+review="${logroot}/reports/amendment-8-independent-review.md"
+records="${logroot}/pinned-cloud-runs.jsonl"
+baseline_receipt="${logroot}/cloud-baseline-accepted.json"
 branch=the-usual/session-directory-lazy-page-prep
 frozen_base=225a91db3e4d48d4b6a7e8bc0987afad8ff31917
-adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
+adapter_sha=ef22952c8ef53ebdabae899159730d3d1745d9197382d77a2975647b2036d2ed
+legacy_runs_sha=88a3e4c548d125ab6f648e7e682a68a60074913892675a0c0edea9867ad70bb3
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 git -C "$root" merge-base --is-ancestor "$frozen_base" HEAD
 current_head="$(git -C "$root" rev-parse HEAD)"
 mapfile -t changed_paths < <(git -C "$root" diff --name-only "${frozen_base}..HEAD")
@@ -635,13 +695,44 @@ missing = sorted(required_lines.difference(lines))
 require(not missing, f"independent review lacks exact identity lines: {missing}")
 print("committed plan, reviewed adapter, and independent PASSED record verified")
 PY
+
+test "$(sha256sum "$records" | awk '{print $1}')" = "$legacy_runs_sha"
+test ! -e "$baseline_receipt"
+python3 -I - "$records" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(message)
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+require(len(lines) == 1, f"expected one preserved cloud row, found {len(lines)}")
+row = json.loads(lines[0])
+require(row.get("schemaVersion") == 2, "preserved cloud row is not schema 2")
+require(row.get("recordType") == "attempt", "preserved cloud row is not an attempt")
+require(row.get("phase") == "baseline", "preserved cloud row is not baseline")
+require(row.get("outcome") == "cloud_failed", "preserved cloud row is not failed")
+require(row.get("failureStage") == "job_execute", "unexpected preserved failure stage")
+require(row.get("exitCode") != 0, "preserved failure has zero exit")
+require(row.get("jobDeleted") is True, "preserved temporary Job was not deleted")
+require(
+    row.get("attemptId")
+    == "attempt-bf000e041499-20260815011004-d3d4dc59",
+    "preserved attempt identity changed",
+)
+print("one immutable failed schema-2 attempt verified; acceptance/receipt absent")
+PY
 BASH
 ```
 
   This consumes the reviewed artifacts. The report is not pinned by its own
   hash and is not required to name a self-referential plan content hash. Do not
   generate, extract, persist, or run a replacement mock harness, and do not
-  create or edit the plan, adapter, or Amendment 7 review receipt in Task 1.
+  create or edit the plan, adapter, or Amendment 8 review receipt in Task 1.
 - [ ] Run the literal branch push and exact remote-HEAD check:
 
 ```bash
@@ -650,7 +741,15 @@ set -euo pipefail
 root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 branch=the-usual/session-directory-lazy-page-prep
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 expected_head="$(git -C "$root" rev-parse HEAD)"
 git -C "$root" push origin "HEAD:refs/heads/${branch}"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
@@ -690,7 +789,15 @@ root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 branch=the-usual/session-directory-lazy-page-prep
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=no)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 expected_head="$(git -C "$root" rev-parse HEAD)"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
@@ -702,7 +809,15 @@ env --chdir="$root" cargo build --locked --release -p freshell-server
 
 test -x "$root/target/release/freshell-server"
 test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=no)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
 test -z "${extra:-}"
@@ -737,7 +852,7 @@ root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 branch=the-usual/session-directory-lazy-page-prep
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
+adapter_sha=ef22952c8ef53ebdabae899159730d3d1745d9197382d77a2975647b2036d2ed
 records="${logroot}/pinned-cloud-runs.jsonl"
 baseline_receipt="${logroot}/cloud-baseline-accepted.json"
 attempt_file="$(mktemp /tmp/freshell-baseline-attempt.XXXXXX)"
@@ -745,7 +860,15 @@ cleanup() { rm -f -- "$attempt_file"; }
 trap cleanup EXIT
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 expected_head="$(git -C "$root" rev-parse HEAD)"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
@@ -768,7 +891,15 @@ env --chdir="$root" INIT_CWD="$root" PWD="$root" \
 
 attempt_id="$(cat "$attempt_file")"
 test -n "$attempt_id"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
@@ -805,10 +936,33 @@ attempt_id = os.environ["ATTEMPT_ID"]
 baseline_head = os.environ["HEAD_SHA"]
 branch = os.environ["BRANCH"]
 adapter_sha = os.environ["ADAPTER_SHA"]
+
+
+def require_fields(record: dict, expected: dict, label: str) -> None:
+    for field, value in expected.items():
+        require(
+            record.get(field) == value,
+            f"{label} {field} must be {value!r}, got {record.get(field)!r}",
+        )
+
+
+def immutable_ref(repository: str, value, label: str) -> str:
+    prefix = f"{repository}@sha256:"
+    require(
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(char in "0123456789abcdef" for char in value[-64:]),
+        f"{label} is not one immutable image in {repository}: {value!r}",
+    )
+    return value
+
+
 attempts = [
     (line_number, record)
     for line_number, record in indexed_records
     if record.get("recordType") == "attempt"
+    and record.get("schemaVersion") == 3
     and record.get("attemptId") == attempt_id
     and record.get("phase") == "baseline"
     and record.get("expectedHead") == baseline_head
@@ -818,15 +972,16 @@ require(
     f"baseline selector requires one exact attempt id/phase/HEAD match, found {len(attempts)}",
 )
 attempt_line, attempt = attempts[0]
-target_digest = attempt.get("digest")
+index_digest = attempt.get("imageIndexDigest")
 accepted = [
     (line_number, record)
     for line_number, record in indexed_records
     if record.get("recordType") == "acceptance"
+    and record.get("schemaVersion") == 3
     and record.get("attemptId") == attempt_id
     and record.get("phase") == "baseline"
     and record.get("expectedHead") == baseline_head
-    and record.get("digest") == target_digest
+    and record.get("imageIndexDigest") == index_digest
 ]
 require(
     len(accepted) == 1,
@@ -834,29 +989,112 @@ require(
 )
 acceptance_line, acceptance = accepted[0]
 acceptance_id = f"acceptance:{attempt_id}"
-require(acceptance.get("coordinatorExitCode") == 0, f"baseline coordinator exit must be 0, got {acceptance.get('coordinatorExitCode')!r}")
-for field in ("branch", "localHeadBefore", "remoteHeadBefore", "localHeadAfter", "remoteHeadAfter"):
-    expected = branch if field == "branch" else baseline_head
-    require(attempt.get(field) == expected, f"baseline attempt {field} must be {expected!r}, got {attempt.get(field)!r}")
-for field in ("branch", "localHead", "remoteHead"):
-    expected = branch if field == "branch" else baseline_head
-    require(acceptance.get(field) == expected, f"baseline acceptance {field} must be {expected!r}, got {acceptance.get(field)!r}")
-require(attempt.get("outcome") == "cloud_succeeded", f"baseline attempt outcome is {attempt.get('outcome')!r}")
-require(attempt.get("exitCode") == 0, f"baseline attempt exitCode is {attempt.get('exitCode')!r}")
-require(attempt.get("createdJobImage") == attempt.get("image") == attempt.get("executionImage"), "baseline immutable image fields do not match")
-require(acceptance.get("image") == attempt.get("image"), "baseline acceptance image does not match attempt image")
-require(acceptance.get("createdJobImage") == attempt.get("image"), "baseline acceptance created-job image does not match")
-require(acceptance.get("executionImage") == attempt.get("image"), "baseline acceptance execution image does not match")
-require(attempt.get("jobCreated") is True and attempt.get("jobDeleted") is True, "baseline unique job was not created and deleted")
-require(attempt.get("failureStage") is None and attempt.get("cleanupError") is None, "baseline successful attempt contains failure metadata")
-require(attempt.get("succeededTasks") == 4 and attempt.get("failedTasks") == 0, "baseline task counts are not 4 succeeded and 0 failed")
-require(isinstance(target_digest, str) and target_digest.startswith("sha256:"), f"invalid baseline digest {target_digest!r}")
+require_fields(
+    attempt,
+    {
+        "schemaVersion": 3,
+        "branch": branch,
+        "localHeadBefore": baseline_head,
+        "remoteHeadBefore": baseline_head,
+        "localHeadAfter": baseline_head,
+        "remoteHeadAfter": baseline_head,
+        "outcome": "cloud_succeeded",
+        "exitCode": 0,
+        "failureStage": None,
+        "cleanupError": None,
+        "jobCreated": True,
+        "jobDeleted": True,
+        "succeededTasks": 4,
+        "failedTasks": 0,
+    },
+    "baseline attempt",
+)
+require_fields(
+    acceptance,
+    {
+        "schemaVersion": 3,
+        "branch": branch,
+        "localHead": baseline_head,
+        "remoteHead": baseline_head,
+        "coordinatorExitCode": 0,
+    },
+    "baseline acceptance",
+)
+repository = attempt.get("imageRepository")
+require(
+    isinstance(repository, str) and repository and "@" not in repository,
+    f"invalid baseline image repository {repository!r}",
+)
+require(
+    isinstance(index_digest, str)
+    and len(index_digest) == 71
+    and index_digest.startswith("sha256:")
+    and all(char in "0123456789abcdef" for char in index_digest[7:]),
+    f"invalid baseline OCI-index digest {index_digest!r}",
+)
+created_index = immutable_ref(
+    repository, attempt.get("createdJobImageIndex"), "baseline Job OCI-index"
+)
+require(
+    created_index == f"{repository}@{index_digest}",
+    "baseline Job OCI-index does not match the resolved digest",
+)
+manifest = immutable_ref(
+    repository,
+    attempt.get("executionImageManifest"),
+    "baseline execution platform manifest",
+)
+job = attempt.get("job")
+job_uid = attempt.get("jobUid")
+job_generation = attempt.get("jobGeneration")
+execution = attempt.get("execution")
+require(isinstance(job, str) and job, f"invalid baseline Job name {job!r}")
+require(isinstance(job_uid, str) and job_uid, f"invalid baseline Job UID {job_uid!r}")
+require(
+    isinstance(job_generation, int) and job_generation > 0,
+    f"invalid baseline Job generation {job_generation!r}",
+)
+require(
+    isinstance(execution, str)
+    and execution.startswith(f"{job}-")
+    and len(execution) == len(job) + 6
+    and all(char in "abcdefghijklmnopqrstuvwxyz0123456789" for char in execution[-5:]),
+    f"invalid exact baseline execution ID {execution!r}",
+)
+require(
+    attempt.get("executionOwnerJob") == job
+    and attempt.get("executionOwnerJobUid") == job_uid
+    and attempt.get("executionOwnerJobGeneration") == job_generation,
+    "baseline execution does not belong to the exact created Job generation",
+)
+for field in (
+    "imageRepository", "imageIndexDigest", "job", "jobUid", "jobGeneration",
+    "createdJobImageIndex", "execution", "executionOwnerJob",
+    "executionOwnerJobUid", "executionOwnerJobGeneration",
+    "executionImageManifest", "succeededTasks", "failedTasks", "jobDeleted",
+):
+    require(
+        acceptance.get(field) == attempt.get(field),
+        f"baseline acceptance field {field} does not match its attempt",
+    )
 
 receipt = {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "phase": "baseline",
     "baselineHead": baseline_head,
-    "digest": target_digest,
+    "attemptSchemaVersion": 3,
+    "acceptanceSchemaVersion": 3,
+    "imageRepository": repository,
+    "imageIndexDigest": index_digest,
+    "job": job,
+    "jobUid": job_uid,
+    "jobGeneration": job_generation,
+    "createdJobImageIndex": created_index,
+    "execution": execution,
+    "executionOwnerJob": attempt["executionOwnerJob"],
+    "executionOwnerJobUid": attempt["executionOwnerJobUid"],
+    "executionOwnerJobGeneration": attempt["executionOwnerJobGeneration"],
+    "executionImageManifest": manifest,
     "cloudAttemptId": attempt_id,
     "acceptanceId": acceptance_id,
     "adapterSha256": adapter_sha,
@@ -893,7 +1131,7 @@ finally:
         temporary_path.unlink()
 print(
     f"accepted baseline receipt written atomically: attempt={attempt_id} "
-    f"acceptance={acceptance_id} digest={target_digest}"
+    f"acceptance={acceptance_id} index={created_index} manifest={manifest}"
 )
 PY
 BASH
@@ -902,14 +1140,16 @@ BASH
   A failed Electron or coordinator stage leaves the attempt record but creates
   no acceptance or dedicated receipt. A legitimate retry appends a new attempt;
   do not delete or rewrite earlier attempts merely to make counts look singular.
+  The existing first schema-2 failure remains immutable and cannot be accepted.
 - [ ] Verify `cloud-baseline-accepted.json` exists only after the exact selector
-  succeeds and names the exact accepted attempt/acceptance lines and IDs,
-  baseline phase, branch, HEAD, digest, adapter SHA, and JSONL path. Verify the
-  linked attempt has exact phase/branch/HEAD/digest and pre/post remote checks,
-  `failureStage == null`, `cleanupError == null`,
-  `createdJobImage == image == executionImage`, four successful/zero failed
-  tasks, and successful unique-job deletion; verify the linked acceptance has
-  the same ID/HEAD/digest/images and coordinator exit zero. Separately verify
+  succeeds and names the exact schema-3 attempt/acceptance lines and IDs,
+  baseline phase, branch, HEAD, image repository/index digest, Job
+  name/UID/generation/index image, exact execution ID, owner
+  name/UID/generation, platform-manifest image, adapter SHA, and JSONL path.
+  Verify exact pre/post source identity, `failureStage == null`,
+  `cleanupError == null`, four successful/zero failed tasks, and required unique
+  Job deletion. Verify the linked acceptance copies every provenance/task/
+  cleanup field and has coordinator exit zero. Separately verify
   the persisted coordinator `test`/`full-suite` receipt has exact target paths,
   HEAD, environment-sourced summary, exit 0, and `isDirty=false`.
 - [ ] If any baseline command fails, stop. Record command, status, and concise
@@ -919,10 +1159,11 @@ BASH
 verified without tracked writes or a Task 1 commit; clean non-force branch push;
 unchanged application source; focused Rust green; exact release prebuild
 executable with tracked status and local/remote identity unchanged; fresh
-Rust-backed browser matrix 7/7; the exact accepted baseline links a truthful
-successful cloud attempt to a zero-exit coordinator run including Electron; the
-dedicated atomic baseline receipt pins its exact JSONL linkage; prior failed
-attempts, if any, remain preserved; no pull request opened.
+Rust-backed browser matrix 7/7; the exact accepted schema-3 baseline links a
+truthful new exact-HEAD cloud attempt to a zero-exit coordinator run including
+Electron; the dedicated atomic schema-2 baseline receipt pins its exact JSONL
+and Job/execution/image linkage; the failed schema-2 attempt remains preserved
+and unaccepted; no pull request opened.
 
 ### Task 2: Add authenticated real-route tests for rows, order, pages, and bytes
 
@@ -1336,14 +1577,30 @@ root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 branch=the-usual/session-directory-lazy-page-prep
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=no)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 expected_head="$(git -C "$root" rev-parse HEAD)"
 
 env --chdir="$root" cargo build --locked --release -p freshell-server
 
 test -x "$root/target/release/freshell-server"
 test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=no)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=no)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 BASH
 ```
 
@@ -1373,7 +1630,7 @@ root=/home/dan/code/freshell/.worktrees/session-directory-lazy-page-prep
 branch=the-usual/session-directory-lazy-page-prep
 logroot=/home/dan/code/freshell/.worktrees/.the-usual-logs/session-directory-lazy-page-prep
 adapter="${logroot}/pinned-vitest-cloud-v1.sh"
-adapter_sha=4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3
+adapter_sha=ef22952c8ef53ebdabae899159730d3d1745d9197382d77a2975647b2036d2ed
 records="${logroot}/pinned-cloud-runs.jsonl"
 baseline_receipt="${logroot}/cloud-baseline-accepted.json"
 attempt_file="$(mktemp /tmp/freshell-final-attempt.XXXXXX)"
@@ -1381,7 +1638,15 @@ cleanup() { rm -f -- "$attempt_file"; }
 trap cleanup EXIT
 
 test "$(git -C "$root" branch --show-current)" = "$branch"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 expected_head="$(git -C "$root" rev-parse HEAD)"
 git -C "$root" push origin "HEAD:refs/heads/${branch}"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
@@ -1405,7 +1670,15 @@ env --chdir="$root" INIT_CWD="$root" PWD="$root" \
 
 attempt_id="$(cat "$attempt_file")"
 test -n "$attempt_id"
-test -z "$(git -C "$root" status --porcelain=v1 --untracked-files=all)"
+git_status_output=""
+if git_status_output="$(git -C "$root" status --porcelain=v1 --untracked-files=all)"; then
+  :
+else
+  git_status_exit=$?
+  echo "git status failed with exit ${git_status_exit}" >&2
+  exit "$git_status_exit"
+fi
+test -z "$git_status_output"
 test "$(git -C "$root" rev-parse HEAD)" = "$expected_head"
 remote_line="$(git -C "$root" ls-remote --exit-code origin "refs/heads/${branch}")"
 read -r remote_head remote_ref extra <<<"$remote_line"
@@ -1453,22 +1726,133 @@ def require_fields(record: dict, expected: dict, label: str) -> None:
         )
 
 
+def immutable_ref(repository: str, value, label: str) -> str:
+    prefix = f"{repository}@sha256:"
+    require(
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(char in "0123456789abcdef" for char in value[-64:]),
+        f"{label} is not one immutable image in {repository}: {value!r}",
+    )
+    return value
+
+
+def validate_pair(attempt: dict, acceptance: dict, head: str, phase: str, label: str):
+    require_fields(
+        attempt,
+        {
+            "schemaVersion": 3,
+            "recordType": "attempt",
+            "phase": phase,
+            "branch": branch,
+            "expectedHead": head,
+            "localHeadBefore": head,
+            "remoteHeadBefore": head,
+            "localHeadAfter": head,
+            "remoteHeadAfter": head,
+            "outcome": "cloud_succeeded",
+            "exitCode": 0,
+            "failureStage": None,
+            "cleanupError": None,
+            "jobCreated": True,
+            "jobDeleted": True,
+            "succeededTasks": 4,
+            "failedTasks": 0,
+        },
+        f"{label} attempt",
+    )
+    require_fields(
+        acceptance,
+        {
+            "schemaVersion": 3,
+            "recordType": "acceptance",
+            "phase": phase,
+            "branch": branch,
+            "expectedHead": head,
+            "localHead": head,
+            "remoteHead": head,
+            "coordinatorExitCode": 0,
+        },
+        f"{label} acceptance",
+    )
+    repository = attempt.get("imageRepository")
+    index_digest = attempt.get("imageIndexDigest")
+    require(
+        isinstance(repository, str) and repository and "@" not in repository,
+        f"{label} image repository is invalid: {repository!r}",
+    )
+    require(
+        isinstance(index_digest, str)
+        and len(index_digest) == 71
+        and index_digest.startswith("sha256:")
+        and all(char in "0123456789abcdef" for char in index_digest[7:]),
+        f"{label} OCI-index digest is invalid: {index_digest!r}",
+    )
+    created_index = immutable_ref(
+        repository, attempt.get("createdJobImageIndex"), f"{label} Job OCI-index"
+    )
+    require(
+        created_index == f"{repository}@{index_digest}",
+        f"{label} Job OCI-index does not match its resolved digest",
+    )
+    manifest = immutable_ref(
+        repository,
+        attempt.get("executionImageManifest"),
+        f"{label} execution platform manifest",
+    )
+    job = attempt.get("job")
+    job_uid = attempt.get("jobUid")
+    job_generation = attempt.get("jobGeneration")
+    execution = attempt.get("execution")
+    require(isinstance(job, str) and job, f"{label} Job name is invalid")
+    require(isinstance(job_uid, str) and job_uid, f"{label} Job UID is invalid")
+    require(
+        isinstance(job_generation, int) and job_generation > 0,
+        f"{label} Job generation is invalid",
+    )
+    require(
+        isinstance(execution, str)
+        and execution.startswith(f"{job}-")
+        and len(execution) == len(job) + 6
+        and all(char in "abcdefghijklmnopqrstuvwxyz0123456789" for char in execution[-5:]),
+        f"{label} exact execution ID is invalid: {execution!r}",
+    )
+    require(
+        attempt.get("executionOwnerJob") == job
+        and attempt.get("executionOwnerJobUid") == job_uid
+        and attempt.get("executionOwnerJobGeneration") == job_generation,
+        f"{label} execution does not belong to its exact created Job generation",
+    )
+    for field in (
+        "imageRepository", "imageIndexDigest", "job", "jobUid", "jobGeneration",
+        "createdJobImageIndex", "execution", "executionOwnerJob",
+        "executionOwnerJobUid", "executionOwnerJobGeneration",
+        "executionImageManifest", "succeededTasks", "failedTasks", "jobDeleted",
+    ):
+        require(
+            acceptance.get(field) == attempt.get(field),
+            f"{label} acceptance field {field} does not match its attempt",
+        )
+    return repository, index_digest, created_index, manifest
+
+
 require_fields(
     receipt,
     {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "phase": "baseline",
+        "attemptSchemaVersion": 3,
+        "acceptanceSchemaVersion": 3,
         "adapterSha256": adapter_sha,
         "recordsPath": str(records_path),
     },
     "baseline receipt",
 )
 baseline_head = receipt.get("baselineHead")
-baseline_digest = receipt.get("digest")
 baseline_attempt_id = receipt.get("cloudAttemptId")
 baseline_acceptance_id = receipt.get("acceptanceId")
 require(isinstance(baseline_head, str) and len(baseline_head) == 40, "baseline receipt has invalid HEAD")
-require(isinstance(baseline_digest, str) and baseline_digest.startswith("sha256:"), "baseline receipt has invalid digest")
 require(isinstance(baseline_attempt_id, str) and baseline_attempt_id, "baseline receipt has invalid attempt ID")
 require(
     baseline_acceptance_id == f"acceptance:{baseline_attempt_id}",
@@ -1495,56 +1879,47 @@ require(baseline_acceptance is not None, f"baseline acceptance line {acceptance_
 require_fields(
     baseline_attempt,
     {
+        "schemaVersion": 3,
         "recordType": "attempt",
         "attemptId": baseline_attempt_id,
-        "phase": "baseline",
-        "branch": branch,
-        "expectedHead": baseline_head,
-        "localHeadBefore": baseline_head,
-        "remoteHeadBefore": baseline_head,
-        "localHeadAfter": baseline_head,
-        "remoteHeadAfter": baseline_head,
-        "digest": baseline_digest,
-        "outcome": "cloud_succeeded",
-        "exitCode": 0,
-        "failureStage": None,
-        "cleanupError": None,
-        "jobCreated": True,
-        "jobDeleted": True,
-        "succeededTasks": 4,
-        "failedTasks": 0,
     },
     "baseline attempt",
 )
 require_fields(
     baseline_acceptance,
     {
+        "schemaVersion": 3,
         "recordType": "acceptance",
         "attemptId": baseline_attempt_id,
-        "phase": "baseline",
-        "branch": branch,
-        "expectedHead": baseline_head,
-        "localHead": baseline_head,
-        "remoteHead": baseline_head,
-        "digest": baseline_digest,
-        "coordinatorExitCode": 0,
     },
     "baseline acceptance",
 )
-require(
-    baseline_attempt.get("createdJobImage")
-    == baseline_attempt.get("image")
-    == baseline_attempt.get("executionImage")
-    == baseline_acceptance.get("image")
-    == baseline_acceptance.get("createdJobImage")
-    == baseline_acceptance.get("executionImage"),
-    "baseline attempt/acceptance immutable images do not match",
+baseline_repository, baseline_digest, baseline_index, baseline_manifest = validate_pair(
+    baseline_attempt, baseline_acceptance, baseline_head, "baseline", "baseline"
 )
+for field, expected in (
+    ("imageRepository", baseline_repository),
+    ("imageIndexDigest", baseline_digest),
+    ("job", baseline_attempt["job"]),
+    ("jobUid", baseline_attempt["jobUid"]),
+    ("jobGeneration", baseline_attempt["jobGeneration"]),
+    ("createdJobImageIndex", baseline_index),
+    ("execution", baseline_attempt["execution"]),
+    ("executionOwnerJob", baseline_attempt["executionOwnerJob"]),
+    ("executionOwnerJobUid", baseline_attempt["executionOwnerJobUid"]),
+    ("executionOwnerJobGeneration", baseline_attempt["executionOwnerJobGeneration"]),
+    ("executionImageManifest", baseline_manifest),
+):
+    require(
+        receipt.get(field) == expected,
+        f"baseline receipt field {field} does not match its linked schema-3 attempt",
+    )
 
 final_attempts = [
     record
     for _, record in indexed_records
     if record.get("recordType") == "attempt"
+    and record.get("schemaVersion") == 3
     and record.get("attemptId") == final_attempt_id
     and record.get("phase") == "final"
     and record.get("expectedHead") == final_head
@@ -1554,19 +1929,16 @@ require(
     f"final selector requires one exact attempt id/phase/HEAD match, found {len(final_attempts)}",
 )
 final_attempt = final_attempts[0]
-final_digest = final_attempt.get("digest")
-require(
-    isinstance(final_digest, str) and final_digest.startswith("sha256:"),
-    f"final attempt has invalid immutable digest {final_digest!r}",
-)
+final_digest = final_attempt.get("imageIndexDigest")
 final_acceptances = [
     record
     for _, record in indexed_records
     if record.get("recordType") == "acceptance"
+    and record.get("schemaVersion") == 3
     and record.get("attemptId") == final_attempt_id
     and record.get("phase") == "final"
     and record.get("expectedHead") == final_head
-    and record.get("digest") == final_digest
+    and record.get("imageIndexDigest") == final_digest
 ]
 require(
     len(final_acceptances) == 1,
@@ -1576,69 +1948,55 @@ final_acceptance = final_acceptances[0]
 require_fields(
     final_attempt,
     {
-        "branch": branch,
-        "localHeadBefore": final_head,
-        "remoteHeadBefore": final_head,
-        "localHeadAfter": final_head,
-        "remoteHeadAfter": final_head,
-        "outcome": "cloud_succeeded",
-        "exitCode": 0,
-        "failureStage": None,
-        "cleanupError": None,
-        "jobCreated": True,
-        "jobDeleted": True,
-        "succeededTasks": 4,
-        "failedTasks": 0,
+        "schemaVersion": 3,
+        "recordType": "attempt",
+        "attemptId": final_attempt_id,
     },
     "final attempt",
 )
 require_fields(
     final_acceptance,
     {
-        "branch": branch,
-        "localHead": final_head,
-        "remoteHead": final_head,
-        "coordinatorExitCode": 0,
+        "schemaVersion": 3,
+        "recordType": "acceptance",
+        "attemptId": final_attempt_id,
     },
     "final acceptance",
 )
-require(
-    final_attempt.get("createdJobImage")
-    == final_attempt.get("image")
-    == final_attempt.get("executionImage")
-    == final_acceptance.get("image")
-    == final_acceptance.get("createdJobImage")
-    == final_acceptance.get("executionImage"),
-    "final attempt/acceptance immutable images do not match",
-)
-require(
-    str(final_attempt.get("image", "")).endswith(f"@{final_digest}"),
-    "final image does not contain the selected immutable digest",
-)
-require(
-    str(baseline_attempt.get("image", "")).endswith(f"@{baseline_digest}"),
-    "baseline image does not contain the receipt's immutable digest",
+final_repository, final_digest, final_index, final_manifest = validate_pair(
+    final_attempt, final_acceptance, final_head, "final", "final"
 )
 require(baseline_head != final_head, "baseline and final accepted evidence use the same HEAD")
-require(baseline_digest != final_digest, "baseline and final accepted evidence use the same digest")
-print(f"exact accepted final: attempt={final_attempt_id} digest={final_digest}")
-print(f"exact accepted baseline: attempt={baseline_attempt_id} digest={baseline_digest}")
+require(
+    baseline_attempt_id != final_attempt_id,
+    "baseline and final accepted evidence reuse the same attempt ID",
+)
+print(
+    f"exact accepted final: attempt={final_attempt_id} "
+    f"index={final_index} manifest={final_manifest}"
+)
+print(
+    f"exact accepted baseline: attempt={baseline_attempt_id} "
+    f"index={baseline_index} manifest={baseline_manifest}"
+)
 PY
 BASH
 ```
 
   A failed coordinator or Electron stage preserves its cloud attempt without an
   acceptance. Retrying appends another attempt; never delete prior attempts to
-  force a one-record count.
-- [ ] Verify the latest accepted final selected above links to exact
-  phase/branch/HEAD/digest, pre/post remote checks,
-  `failureStage == null`, `cleanupError == null`,
-  `createdJobImage == image == executionImage`, four successful/zero failed
-  tasks, and successful unique-job deletion. Verify the dedicated Task 1
-  baseline receipt's exact record lines, IDs, HEAD, digest, adapter SHA, and
-  JSONL linkage resolve to one successful baseline attempt and one linked
-  acceptance with the same immutable images and coordinator exit zero. Require
-  baseline HEAD != final HEAD and baseline digest != final digest. Separately
+  force a one-record count. Schema-2 failures remain historical and unaccepted.
+- [ ] Verify the exact accepted final selected above links to schema 3,
+  phase/branch/HEAD, pre/post remote checks, image repository/index digest, Job
+  name/UID/generation/index image, exact execution ID, controller-owner
+  name/UID/generation, same-repository platform-manifest image,
+  `failureStage == null`, `cleanupError == null`, four successful/zero failed
+  tasks, and successful unique Job deletion. Verify the dedicated Task 1
+  baseline receipt's exact record lines and all schema-3 provenance fields
+  resolve to one successful baseline attempt and one linked acceptance with
+  coordinator exit zero. Require different exact baseline/final HEADs and
+  attempt IDs; do not require different content digests and never reuse an old
+  attempt when a rebuilt exact HEAD resolves to a repeated digest. Separately
   verify the persisted coordinator receipt has `summarySource=env`, successful
   `test`/`full-suite`, exact `npm test` shape, target paths, final HEAD, and
   `isDirty=false`.
@@ -1649,8 +2007,9 @@ BASH
 release-prebuild, coordinator, cloud, Electron, provenance, and scope gate
 passes against the exact final pushed SHA; the final release executable exists
 before a fresh Rust-backed browser 7/7 result; the exact Task 1 baseline receipt
-and exact final linked records are both validated and distinct by HEAD and
-digest; all retry attempts remain truthful; no pull request has been opened.
+and exact final linked schema-3 records are validated with distinct HEADs and
+attempt IDs (regardless of repeated content digest); all retry attempts remain
+truthful; no pull request has been opened.
 
 ## Amendment self-review checklist
 
@@ -1682,20 +2041,28 @@ This section is a plan review, not an execution attestation:
   cache effects, do not use the coordinator or restart a server, preserve the
   60-second fixture timeout, and require fresh 7/7 matrix results.
 - [ ] The adapter body passes `bash -n` and ShellCheck and its recorded SHA is
-  `4d65abf81f203293bc8045cffcb933cc4e0febfcad6859b1c7a494ada141bad3`.
+  `ef22952c8ef53ebdabae899159730d3d1745d9197382d77a2975647b2036d2ed`.
 - [ ] Task 1/7 include literal push and `ls-remote` checks, required branch and
-  expected-HEAD inputs, immediate adapter-hash checks, exact created-job-image
-  evidence, required unique-job deletion, post-run remote checks, retry-safe
-  attempt preservation, and acceptance only after coordinator/Electron success.
+  expected-HEAD inputs, immediate adapter-hash checks, strict execution-ID
+  parsing, schema-3 Job UID/generation/index and controller-owner/platform-
+  manifest evidence, required unique Job deletion, post-run remote checks,
+  retry-safe schema-2/3 attempt preservation, and acceptance only after
+  coordinator/Electron success.
+- [ ] Every active plan and adapter clean-worktree check separately proves
+  `git status` succeeded before testing captured output for emptiness. No
+  fail-open `test -z "$(git ... status ...)"` or
+  `[[ -z "$(git ... status ...)" ]]` remains; normal and optimized fake-Git
+  clean/dirty/exit-42 cases prove the gate before build/cloud/acceptance.
 - [ ] Task 1 consumes an already committed clean plan-only HEAD, executable
-  reviewed adapter, and outer-created `amendment-7-independent-review.md`
+  reviewed adapter, and outer-created `amendment-8-independent-review.md`
   ending in standalone `PASSED`; it derives HEAD at runtime, pins no review-file
   or self-referential plan hash, performs no tracked write/commit, and creates
   no mock harness.
-- [ ] Task 1 atomically writes the dedicated exact baseline receipt only after
-  full linked acceptance. Task 7 resolves that receipt's exact line/ID/HEAD/
-  digest linkage and selects final evidence by exact phase/final HEAD/ID/digest;
-  no active baseline lookup selects by phase alone.
+- [ ] Task 1 atomically writes the schema-2 dedicated baseline receipt only after
+  full linked schema-3 acceptance. Task 7 resolves its exact line/ID/HEAD/Job/
+  execution/index/manifest linkage and selects final schema-3 evidence by exact
+  phase/final HEAD/attempt ID/index digest; no active lookup selects by phase
+  alone or accepts/reuses the preserved schema-2 failure.
 - [ ] No plan step opens a pull request, merges, deploys, or restarts a server.
 - [ ] No product/runtime command was run while making this amendment.
 
