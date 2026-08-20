@@ -23,6 +23,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // below stays the sole authority over panel interactions. No opt-out needed.
 
 const SEEDED_CLAUDE_ID = randomUUID()
+// case-d gets its own seeded claude id: the serial suite already bound
+// SEEDED_CLAUDE_ID to a running resume terminal in case-b, and the Rust
+// server now rejects REST resume of a still-running session (409
+// RESTORE_UNAVAILABLE). A distinct, unbound id keeps case-d's premise valid.
+const SEEDED_CLAUDE_ID_D = randomUUID()
 const PROJECT_DIR = '/tmp/p114-sidebar-project'
 
 // Copied VERBATIM from pane-ledger-restart-rust.spec.ts:29 (per this
@@ -31,6 +36,35 @@ async function installFakeCli(binDir: string, name: string, source: string): Pro
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, name)
   await fs.copyFile(path.resolve(__dirname, '../fixtures', source), target)
+  await fs.chmod(target, 0o755)
+  return target
+}
+
+// Dual-role codex shim, donor shape: restore-contract-wall-rust.spec.ts's
+// installDualRoleCodex — terminal target swapped for THIS spec's rollout-writing
+// fake-codex-terminal.mjs (argv log env name adjusted to match). Required because
+// the Rust server's codex terminal lane boots a `codex app-server` sidecar FIRST
+// (spawned with the SAME CODEX_CMD): a terminal-only fake exits 0 there (stdin
+// is /dev/null), and every codex pane create fails with PTY_SPAWN_FAILED
+// ("app-server exited before listening"). One executable must answer both roles:
+// app-server argv -> the shared fake app-server fixture; otherwise the terminal
+// fake.
+async function installDualRoleCodex(binDir: string, argLogPath: string): Promise<string> {
+  await fs.mkdir(binDir, { recursive: true })
+  const target = path.join(binDir, 'codex')
+  const appServerSource = path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+  const terminalSource = path.resolve(__dirname, '../fixtures/fake-codex-terminal.mjs')
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process')
+const argv = process.argv.slice(2)
+if (argv.includes('app-server')) {
+  const result = spawnSync(process.execPath, [${JSON.stringify(appServerSource)}, ...argv], { stdio: 'inherit', env: process.env })
+  process.exit(result.status ?? 1)
+}
+const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: { ...process.env, FAKE_CODEX_TERMINAL_ARGV_LOG: ${JSON.stringify(argLogPath)} } })
+process.exit(result.status ?? 1)
+`
+  await fs.writeFile(target, script, 'utf8')
   await fs.chmod(target, 0o755)
   return target
 }
@@ -177,7 +211,12 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'p114-sidebar-'))
     const binDir = path.join(sharedRoot, 'bin')
     const fakeClaude = await installFakeCli(binDir, 'claude', 'fake-claude-cli.mjs')
-    const fakeCodex = await installFakeCli(binDir, 'codex', 'fake-codex-terminal.mjs')
+    // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
+    // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+    const fakeCodex = await installDualRoleCodex(
+      binDir,
+      path.join(sharedRoot, 'codex-argv.jsonl'),
+    )
     server = new RustServer({
       env: {
         CLAUDE_CMD: fakeClaude,
@@ -210,6 +249,9 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
         await fs.writeFile(
           path.join(projDir, `${SEEDED_CLAUDE_ID}.jsonl`),
           buildClaudeSessionJsonl(SEEDED_CLAUDE_ID, PROJECT_DIR, 'P114 seeded claude session'))
+        await fs.writeFile(
+          path.join(projDir, `${SEEDED_CLAUDE_ID_D}.jsonl`),
+          buildClaudeSessionJsonl(SEEDED_CLAUDE_ID_D, PROJECT_DIR, 'P114 case-d claude session'))
       },
     })
     info = await server.start()
@@ -650,25 +692,25 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // Open a claude resume pane so there is something to lose + recover.
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
       headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
-      data: { mode: 'claude', cwd: PROJECT_DIR, sessionRef: { provider: 'claude', sessionId: SEEDED_CLAUDE_ID } },
+      data: { mode: 'claude', cwd: PROJECT_DIR, sessionRef: { provider: 'claude', sessionId: SEEDED_CLAUDE_ID_D } },
     })
     expect(res.ok(), `POST /api/tabs claude resume: ${res.status()} ${await res.text()}`).toBe(true)
     const restTabId: string = (await res.json())?.data?.tabId
     expect(restTabId).toBeTruthy()
-    await expect(page.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`))
+    await expect(page.locator(`[data-session-id="${SEEDED_CLAUDE_ID_D}"][data-provider="claude"]`))
       .toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
 
     // Disk-settle before the kill (donor: recover-my-panes-rust.spec.ts:275-287):
     // the ledger binding row for the session, then a snapshot generation whose
     // CONTENT includes THIS test's pane. Needle on restTabId too: earlier
-    // cases' generations already contain SEEDED_CLAUDE_ID, so the sessionId
+    // cases' generations already contain SEEDED_CLAUDE_ID_D, so the sessionId
     // alone would match a stale generation and the wait would be vacuous.
     await expect(async () => {
       const dir = path.join(info.homeDir, '.freshell', 'pane-ledger', 'bindings', 'claude')
       const rows = await fs.readdir(dir, { recursive: true }).catch(() => [] as string[])
-      expect(rows.map(String).some((f) => f.includes(SEEDED_CLAUDE_ID))).toBe(true)
+      expect(rows.map(String).some((f) => f.includes(SEEDED_CLAUDE_ID_D))).toBe(true)
     }).toPass({ timeout: 15_000 })
-    await waitForSnapshotContaining([SEEDED_CLAUDE_ID, restTabId])
+    await waitForSnapshotContaining([SEEDED_CLAUDE_ID_D, restTabId])
 
     // Lost client + abrupt server death. Closing the WHOLE context (donor
     // :290) is the validated lost-client simulation: the fresh context below
@@ -698,7 +740,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     await expect(page2.locator('.xterm').first()).toBeAttached({ timeout: 30_000 })
 
     // THE CONTRACT: the recovered session is green again, exactly once.
-    const row = page2.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`)
+    const row = page2.locator(`[data-session-id="${SEEDED_CLAUDE_ID_D}"][data-provider="claude"]`)
     await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
     await expect(row).toHaveCount(1)
 

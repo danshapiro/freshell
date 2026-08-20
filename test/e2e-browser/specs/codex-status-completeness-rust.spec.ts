@@ -34,11 +34,37 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const FAKE_BEL_CLI = path.resolve(__dirname, '../fixtures/fake-bel-cli.mjs')
+const FAKE_CODEX_CLI = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 
 async function installFakeCli(binDir: string, name: string, source: string): Promise<string> {
   await fs.mkdir(binDir, { recursive: true })
   const target = path.join(binDir, name)
   await fs.copyFile(source, target)
+  await fs.chmod(target, 0o755)
+  return target
+}
+
+// Dual-role codex shim, donor shape: restore-contract-wall-rust.spec.ts's
+// installDualRoleCodex (terminal source parameterized). Required: the Rust
+// server's codex terminal lane boots a `codex app-server` sidecar FIRST with
+// the SAME CODEX_CMD; a terminal-only fake exits 0 on that spawn (stdin is
+// /dev/null) and every codex pane create fails PTY_SPAWN_FAILED
+// ("app-server exited before listening").
+async function installDualRoleCodexCli(binDir: string, terminalSource: string): Promise<string> {
+  await fs.mkdir(binDir, { recursive: true })
+  const target = path.join(binDir, 'codex')
+  const appServerSource = path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process')
+const argv = process.argv.slice(2)
+if (argv.includes('app-server')) {
+  const result = spawnSync(process.execPath, [${JSON.stringify(appServerSource)}, ...argv], { stdio: 'inherit', env: process.env })
+  process.exit(result.status ?? 1)
+}
+const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: process.env })
+process.exit(result.status ?? 1)
+`
+  await fs.writeFile(target, script, 'utf8')
   await fs.chmod(target, 0o755)
   return target
 }
@@ -309,11 +335,9 @@ test.describe('Codex status completeness (Rust only)', () => {
   }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-restart-'))
-    const fakeCodex = await installFakeCli(
-      path.join(sharedRoot, 'bin'),
-      'codex',
-      path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs'),
-    )
+    // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
+    // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_CODEX_CLI)
     let rolloutPath = ''
     const server = new RustServer({
       env: { CODEX_CMD: fakeCodex },
@@ -415,7 +439,9 @@ test.describe('Codex status completeness (Rust only)', () => {
   }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-twin-'))
-    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+    // Dual-role (see note at site one): the codex lane boots an app-server
+    // sidecar first; the BEL fake must cover only the terminal branch.
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
     const mkServer = () =>
       new RustServer({
         env: { CODEX_CMD: fakeCodex },
