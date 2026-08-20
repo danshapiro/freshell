@@ -78,8 +78,23 @@ let rustBuildDone = false
  * with `cargo build --release -p freshell-server` if missing (idempotent —
  * cargo itself no-ops on a clean, unchanged build).
  * Source of truth: `port/oracle/harness/external-server.ts`'s `ensureRustServerBuilt`.
+ *
+ * INTENTIONAL DIVERGENCE from that source: the Cloud Run e2e image prebuilds
+ * the binary, selects it via `FRESHELL_E2E_RUST_SERVER_BIN`, and runs specs in
+ * a 2-CPU / 2-GiB task where a workspace `cargo build` gets killed outright.
+ * When the override is set, this short-circuits through
+ * `resolveRustServerBin`'s FAIL-CLOSED validation (:2015) and returns the
+ * override — cargo NEVER runs on that path (a typo'd override must throw, not
+ * silently run a different binary). The oracle harness deliberately keeps the
+ * source behavior: it runs on dev/CI machines with cargo available and no
+ * prebuilt-image contract.
  */
 export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
+  if (process.env.FRESHELL_E2E_RUST_SERVER_BIN?.trim()) {
+    return resolveRustServerBin(process.env, () => {
+      throw new Error('unreachable: FRESHELL_E2E_RUST_SERVER_BIN is set; buildHead must not run')
+    }).bin
+  }
   const bin = rustServerBinPath(root)
   if (rustBuildDone && fs.existsSync(bin)) return bin
 
