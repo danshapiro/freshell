@@ -50,13 +50,31 @@ async function openFreshAgentSettings(page: any, providerName: string) {
   }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
-  const dialog = pane.getByRole('dialog', { name: 'Agent settings' })
+  // The popover is portaled to document.body (it must escape the pane header's
+  // overflow-hidden clip stripe), so scope the dialog to the page, not the pane.
+  const dialog = page.getByRole('dialog', { name: 'Agent settings' })
   if (!(await dialog.isVisible().catch(() => false))) {
     await pane.getByRole('button', { name: /^agent settings$/i }).click()
   }
 
   await expect(dialog).toBeVisible({ timeout: 10_000 })
+  await expectPopoverUnclipped(dialog)
   return dialog
+}
+
+/** A header-clipped popover keeps a non-zero bounding box (toBeVisible passes)
+ * but its interior receives no pointer hits below the header stripe. Pin the
+ * portal escape via a hit-test at the dialog's center. */
+async function expectPopoverUnclipped(dialog: any): Promise<void> {
+  const hitInside = await dialog.evaluate((el: HTMLElement) => {
+    const rect = el.getBoundingClientRect()
+    const probe = document.elementFromPoint(
+      rect.left + rect.width / 2,
+      rect.top + rect.height / 2,
+    )
+    return probe !== null && (probe === el || el.contains(probe))
+  })
+  expect(hitInside).toBe(true)
 }
 
 async function expectFreshAgentSubmitButtonContrasted(

@@ -580,4 +580,28 @@ describe('FreshAgentSettingsButton', () => {
     // table's re-clamped 'high'
     expect(thinking).toHaveValue('beta')
   })
+
+  it('renders the open popover outside the overflow-hidden .pane-header stripe', () => {
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+    })
+
+    render(
+      <Provider store={store}>
+        <div className="pane-header">
+          <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+        </div>
+      </Provider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent settings' })
+    // .pane-header is an overflow-hidden clip container (index.css); a popover
+    // rendered inline inside it is clipped to a sliver of the header stripe.
+    // The popover must escape the header (portal to document.body).
+    expect(dialog.closest('.pane-header')).toBeNull()
+  })
 })

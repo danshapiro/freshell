@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Settings } from 'lucide-react'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -104,6 +105,7 @@ export function FreshAgentSettingsButton({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
+  const [popoverPos, setPopoverPos] = useState<{ top: number; right: number } | undefined>(undefined)
   const [probedCapabilities, setProbedCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
 
@@ -232,16 +234,27 @@ export function FreshAgentSettingsButton({
         onMouseDown={(event) => event.stopPropagation()}
         onClick={(event) => {
           event.stopPropagation()
+          if (!open && buttonRef.current) {
+            // The popover is portaled to document.body to escape the pane
+            // header's overflow-hidden clip stripe; anchor it to the gear's
+            // viewport rect (same 4px gap the old in-header mt-1 produced).
+            const rect = buttonRef.current.getBoundingClientRect()
+            setPopoverPos({
+              top: rect.bottom + 4,
+              right: Math.max(8, window.innerWidth - rect.right),
+            })
+          }
           setOpen((value) => !value)
         }}
       >
         <Settings className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
       </button>
 
-      {open ? (
+      {open && popoverPos ? createPortal(
         <div
           ref={popoverRef}
-          className="absolute right-0 top-full z-50 mt-1 w-[min(16rem,calc(100vw-1rem))] rounded-md border border-border bg-card p-3 text-xs text-foreground shadow-lg"
+          className="fixed z-50 w-[min(16rem,calc(100vw-1rem))] rounded-md border border-border bg-card p-3 text-xs text-foreground shadow-lg"
+          style={{ top: popoverPos.top, right: popoverPos.right }}
           role="dialog"
           aria-label="Agent settings"
         >
@@ -417,7 +430,8 @@ export function FreshAgentSettingsButton({
               </label>
             ) : null}
           </div>
-        </div>
+        </div>,
+        document.body,
       ) : null}
 
       {opensModelDialog ? (
