@@ -27,6 +27,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Test Coordination
 - Broad repo-supported test runs wait for the shared coordinator gate; if another agent holds it, wait rather than kill a foreign holder.
+- Pre-worktree green-base checks (and any broad gate intended to validate `origin/main` itself, as opposed to a branch under test) go through `scripts/base-gate.sh` (e.g. `scripts/base-gate.sh test`), which runs the command from a clean scratch worktree at `origin/main`. The main checkout accumulates untracked litter; the cloud runners treat that as a non-addressable `-dirty` image and pay a ~13 min cold rebuild every time, whereas a clean worktree uses the content-addressed commit tag — built at most once per commit and shared by every later run.
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
