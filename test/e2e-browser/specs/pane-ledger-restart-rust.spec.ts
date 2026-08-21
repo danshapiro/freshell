@@ -6,10 +6,11 @@
  * moments after creation loses nothing, and the restarted server's boot
  * scan preserves (never quarantines, never sweeps) the evidence.
  *
- * Wall 2 (`SIGKILL-inside-locator-window`): a pane killed mid
- * identity-establishment leaves a durable pending marker that SURVIVES the
- * restart boot scan — fresh-by-race stays distinguishable from
- * fresh-by-intent.
+ * Wall 2 (`SIGKILL-between-spawn-and-identity-resolution`): in the managed
+ * codex topology, identity resolves at the first managed handshake
+ * (`thread/started` from the proxy candidate). A pane killed BEFORE ever
+ * being submitted leaves a durable pending marker that SURVIVES the restart
+ * boot scan — fresh-by-race stays distinguishable from fresh-by-intent.
  *
  * Fixture shapes (fake CLIs, temp-home seeding, restart choreography)
  * mirror compound-restart-rust.spec.ts; helpers are copied, not imported,
@@ -22,6 +23,7 @@ import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -106,6 +108,12 @@ async function within5s(check: () => Promise<boolean>, what: string): Promise<vo
   throw new Error(`5s durability wall breached: ${what}`)
 }
 
+// The walls below assert RAW ledger file state after SIGKILL; the harness
+// auto-decline watcher would answer the recovery offer first, and the
+// decline routes through terminal.kill, which deletes the pending marker
+// (crates/freshell-ws/src/terminal.rs). Keep decline manual here.
+test.use({ recoveryOfferHandling: 'manual' })
+
 test.describe('pane-identity ledger restart durability', () => {
   test.setTimeout(180_000)
 
@@ -116,7 +124,9 @@ test.describe('pane-identity ledger restart durability', () => {
     try {
       const argLog = path.join(sharedRoot, 'claude-argv.jsonl')
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', 'fake-claude-cli.mjs')
-      const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', 'fake-codex-cli.mjs')
+      // Dual-role: the Rust codex terminal lane boots a 'codex app-server'
+      // sidecar first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+      const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs'))
       const seed = seedConfig()
       const server = new RustServer({
         env: { CLAUDE_CMD: fakeClaude, CODEX_CMD: fakeCodex, FAKE_CLAUDE_ARGV_LOG: argLog },
@@ -254,23 +264,17 @@ test.describe('pane-identity ledger restart durability', () => {
     }
   })
 
-  test('SIGKILL inside the codex locator window leaves a durable fresh-by-race marker', async ({ page, e2eServerKind }) => {
+  test('SIGKILL between spawn and identity resolution leaves a durable fresh-by-race marker', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pane-ledger-locator-'))
     let capturedHome = ''
     try {
-      const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', 'fake-codex-terminal.mjs')
+      // Dual-role: the Rust codex terminal lane boots a 'codex app-server'
+      // sidecar first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+      const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), path.resolve(__dirname, '../fixtures/fake-codex-terminal.mjs'))
       const seed = seedConfig()
-      // ROLLOUT GATE (REQUIRED for this wall's premise): the fake codex
-      // WRITES a real rollout JSONL on its FIRST Enter unless
-      // FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH is set and the gate file
-      // never exists (fake-codex-terminal.mjs:76-86). Point it at a
-      // path we NEVER create, so identity deterministically never resolves
-      // and the pending marker is the only evidence — no race against the
-      // SIGKILL.
-      const rolloutGate = path.join(sharedRoot, 'rollout-gate-never-created')
       const server = new RustServer({
-        env: { CODEX_CMD: fakeCodex, FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH: rolloutGate },
+        env: { CODEX_CMD: fakeCodex },
         setupHome: async (homeDir: string) => {
           capturedHome = homeDir
           await seed(homeDir)
@@ -292,33 +296,31 @@ test.describe('pane-identity ledger restart durability', () => {
           'codex pending marker on disk',
         )
 
-        // The codex pending marker exists from SPAWN (codex is in
-        // MARKER_MODES), but the locator WINDOW is Enter-anchored: it only
-        // opens on the pane's first submit. Click the fresh pane's xterm
-        // (`.last()` — only the boot shell and this pane exist) and type +
-        // Enter so the SIGKILL below lands INSIDE an open window. A short
-        // settle lets the Enter complete the browser -> WS -> PTY hop
-        // before the kill.
-        await page.locator('.xterm').last().click()
-        await page.keyboard.type('hello codex')
-        await page.keyboard.press('Enter')
-        await page.waitForTimeout(500)
-
-        // SIGKILL INSIDE the locator window (the never-created gate means
-        // no rollout exists for the fake, so identity never resolves — the
-        // marker is the only evidence identity was in flight).
+        // Identity window semantics in the managed topology (codex terminal
+        // v2): the proxy candidate binds identity at the pane's FIRST managed
+        // handshake (`thread/started` after the first Enter). A pane that is
+        // spawned and NEVER submitted is exactly the fresh-by-race shape this
+        // wall protects: pending marker, zero bindings. SIGKILL here, without
+        // touching the pane, and the restarted boot scan must PRESERVE the
+        // marker (never sweep, never quarantine) and land NO binding row for
+        // it. (Bindings live under bindings/<provider>/<session>.json — the
+        // listFiles below is intentionally NOT recursive: a file at that path
+        // means the marker consumed correctly, which did not happen.)
         await server.restartAbrupt()
         await expect(async () => {
           const status = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__?.getWsReadyState())
           expect(status).toBe('ready')
         }).toPass({ timeout: 60_000 })
 
-        // The restarted boot scan PRESERVED the marker (fresh-by-race
-        // distinguishable from fresh-by-intent) — and nothing bound it.
         const pending = (await listFiles(path.join(ledgerDir, 'pending'))).filter((f) => f.endsWith('.json'))
         expect(pending.length).toBeGreaterThan(0)
-        const bindings = await listFiles(path.join(ledgerDir, 'bindings'))
-        expect(bindings.filter((f) => f.endsWith('.json'))).toHaveLength(0)
+        // Bindings are nested as bindings/<provider>/<session-id>.json —
+        // check the FULL tree for any binding row (the penultimate shape of
+        // "identity resolved"), which must be empty here.
+        const bindingRows = (await fs.readdir(path.join(ledgerDir, 'bindings'), { recursive: true }).catch(() => []))
+          .map(String)
+          .filter((f) => f.endsWith('.json'))
+        expect(bindingRows).toHaveLength(0)
       } finally {
         await server.stop().catch(() => {})
       }

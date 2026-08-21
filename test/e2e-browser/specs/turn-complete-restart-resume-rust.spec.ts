@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 /**
@@ -97,7 +98,10 @@ test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
   test('a recovered CLI pane rings exactly once for its first post-restart turn', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-lane-c-chime-'))
-    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+    // Dual-role: the Rust codex terminal lane boots a `codex app-server`
+    // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
+    // that spawn and every codex create fails PTY_SPAWN_FAILED.
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
     const server = new RustServer({
       env: { CODEX_CMD: fakeCodex },
       setupHome: async (homeDir) => {

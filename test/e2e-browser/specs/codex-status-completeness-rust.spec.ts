@@ -8,6 +8,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
 /**
  * Codex status completeness (Rust only) — wire-level proof that codex panes
@@ -44,30 +45,9 @@ async function installFakeCli(binDir: string, name: string, source: string): Pro
   return target
 }
 
-// Dual-role codex shim, donor shape: restore-contract-wall-rust.spec.ts's
-// installDualRoleCodex (terminal source parameterized). Required: the Rust
-// server's codex terminal lane boots a `codex app-server` sidecar FIRST with
-// the SAME CODEX_CMD; a terminal-only fake exits 0 on that spawn (stdin is
-// /dev/null) and every codex pane create fails PTY_SPAWN_FAILED
-// ("app-server exited before listening").
-async function installDualRoleCodexCli(binDir: string, terminalSource: string): Promise<string> {
-  await fs.mkdir(binDir, { recursive: true })
-  const target = path.join(binDir, 'codex')
-  const appServerSource = path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
-  const script = `#!/usr/bin/env node
-const { spawnSync } = require('node:child_process')
-const argv = process.argv.slice(2)
-if (argv.includes('app-server')) {
-  const result = spawnSync(process.execPath, [${JSON.stringify(appServerSource)}, ...argv], { stdio: 'inherit', env: process.env })
-  process.exit(result.status ?? 1)
-}
-const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: process.env })
-process.exit(result.status ?? 1)
-`
-  await fs.writeFile(target, script, 'utf8')
-  await fs.chmod(target, 0o755)
-  return target
-}
+// Dual-role codex shim: shared helper (test/e2e-browser/fixtures/codex-dual-role.ts).
+// A terminal-only fake at CODEX_CMD dies instantly on the codex app-server
+// sidecar spawn and every codex create fails PTY_SPAWN_FAILED.
 
 /**
  * A raw, node-side WS capture client: performs the real hello handshake and

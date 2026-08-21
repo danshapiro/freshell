@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
 /**
  * COMPOUND-RESTART -- the two never-tested disruption modes called out by
@@ -52,11 +53,10 @@ const __dirname = path.dirname(__filename)
 const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 
 async function installFakeCodexCli(binDir: string): Promise<string> {
-  await fs.mkdir(binDir, { recursive: true })
-  const target = path.join(binDir, 'codex')
-  await fs.copyFile(FAKE_CODEX_CLI_SOURCE, target)
-  await fs.chmod(target, 0o755)
-  return target
+  // Dual-role: the Rust codex terminal lane boots a `codex app-server`
+  // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
+  // that spawn and every codex create fails PTY_SPAWN_FAILED.
+  return installDualRoleCodexCli(binDir, FAKE_CODEX_CLI_SOURCE)
 }
 
 async function selectShellIfPickerShowing(page: import('@playwright/test').Page): Promise<void> {

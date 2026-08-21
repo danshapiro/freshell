@@ -20,6 +20,7 @@
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
@@ -549,11 +550,9 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-dead-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const fakeCodexPath = await installFakeCli(
-      FAKE_CODEX_CLI_SOURCE,
-      'codex',
-      path.join(sharedRoot, 'bin'),
-    )
+    // Dual-role: the Rust codex terminal lane boots a 'codex app-server'
+    // sidecar first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+    const fakeCodexPath = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_CODEX_CLI_SOURCE)
     const { server, harness, info } = await bootAdoption(page, {
       env: { CODEX_CMD: fakeCodexPath },
       setupHome: seedCodexAdoptionHome(

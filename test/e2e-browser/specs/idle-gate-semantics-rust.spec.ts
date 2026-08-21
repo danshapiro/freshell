@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { WsCapture, type WsFrame } from '../helpers/ws-capture.js'
 
 const FIXTURES_DIR = fileURLToPath(new URL('../fixtures', import.meta.url))
@@ -165,7 +166,9 @@ test.describe('idle-gate semantics (rust)', () => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-codex-'))
     try {
-      const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+      // Dual-role: the Rust codex terminal lane boots a 'codex app-server'
+      // sidecar first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
+      const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
       const server = new RustServer({
         env: { CODEX_CMD: fakeCodex },
         setupHome: seedProviders(['codex']),

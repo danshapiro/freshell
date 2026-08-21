@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // NOTE (RESTORE-01): this spec imports `test` from '@playwright/test'
@@ -40,34 +41,11 @@ async function installFakeCli(binDir: string, name: string, source: string): Pro
   return target
 }
 
-// Dual-role codex shim, donor shape: restore-contract-wall-rust.spec.ts's
-// installDualRoleCodex — terminal target swapped for THIS spec's rollout-writing
-// fake-codex-terminal.mjs (argv log env name adjusted to match). Required because
-// the Rust server's codex terminal lane boots a `codex app-server` sidecar FIRST
-// (spawned with the SAME CODEX_CMD): a terminal-only fake exits 0 there (stdin
-// is /dev/null), and every codex pane create fails with PTY_SPAWN_FAILED
-// ("app-server exited before listening"). One executable must answer both roles:
-// app-server argv -> the shared fake app-server fixture; otherwise the terminal
-// fake.
-async function installDualRoleCodex(binDir: string, argLogPath: string): Promise<string> {
-  await fs.mkdir(binDir, { recursive: true })
-  const target = path.join(binDir, 'codex')
-  const appServerSource = path.resolve(__dirname, '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
-  const terminalSource = path.resolve(__dirname, '../fixtures/fake-codex-terminal.mjs')
-  const script = `#!/usr/bin/env node
-const { spawnSync } = require('node:child_process')
-const argv = process.argv.slice(2)
-if (argv.includes('app-server')) {
-  const result = spawnSync(process.execPath, [${JSON.stringify(appServerSource)}, ...argv], { stdio: 'inherit', env: process.env })
-  process.exit(result.status ?? 1)
-}
-const result = spawnSync(process.execPath, [${JSON.stringify(terminalSource)}, ...argv], { stdio: 'inherit', env: { ...process.env, FAKE_CODEX_TERMINAL_ARGV_LOG: ${JSON.stringify(argLogPath)} } })
-process.exit(result.status ?? 1)
-`
-  await fs.writeFile(target, script, 'utf8')
-  await fs.chmod(target, 0o755)
-  return target
-}
+// Dual-role codex shim: shared helper (test/e2e-browser/fixtures/codex-dual-role.ts),
+// terminal target = THIS spec's rollout-writing fake-codex-terminal.mjs, argv log
+// threaded via terminalEnv. A terminal-only fake at CODEX_CMD dies instantly on
+// the codex app-server sidecar spawn -> every codex create PTY_SPAWN_FAILED.
+const FAKE_CODEX_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-terminal.mjs')
 
 // Copied VERBATIM from remote-tab-linkage-rust.spec.ts:60-74.
 async function selectShellIfPickerShowing(page: import('@playwright/test').Page): Promise<void> {
@@ -213,9 +191,10 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     const fakeClaude = await installFakeCli(binDir, 'claude', 'fake-claude-cli.mjs')
     // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
     // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
-    const fakeCodex = await installDualRoleCodex(
+    const fakeCodex = await installDualRoleCodexCli(
       binDir,
-      path.join(sharedRoot, 'codex-argv.jsonl'),
+      FAKE_CODEX_TERMINAL_SOURCE,
+      { FAKE_CODEX_TERMINAL_ARGV_LOG: path.join(sharedRoot, 'codex-argv.jsonl') },
     )
     server = new RustServer({
       env: {

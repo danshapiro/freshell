@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 /**
@@ -311,7 +312,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     expect(e2eServerKind).toBe('rust')
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-codex-'))
-    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+    // Dual-role: the Rust codex terminal lane boots a `codex app-server`
+    // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
+    // that spawn and every codex create fails PTY_SPAWN_FAILED.
+    const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
     const server = await createE2eServerHandle(process.env, {
       kind: e2eServerKind,
       construct: {

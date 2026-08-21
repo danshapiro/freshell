@@ -8,6 +8,7 @@ import fs from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 
 /**
  * CONTINUITY TRIO deliverable 3 acceptance
@@ -42,11 +43,10 @@ const run = promisify(execFile)
 const SESSION_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 async function installFakeCodexCli(binDir: string): Promise<string> {
-  await fs.mkdir(binDir, { recursive: true })
-  const target = path.join(binDir, 'codex')
-  await fs.copyFile(FAKE_CODEX_CLI_SOURCE, target)
-  await fs.chmod(target, 0o755)
-  return target
+  // Dual-role: the Rust codex terminal lane boots a `codex app-server`
+  // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
+  // that spawn and every codex create fails PTY_SPAWN_FAILED.
+  return installDualRoleCodexCli(binDir, FAKE_CODEX_CLI_SOURCE)
 }
 
 async function connect(page: import('@playwright/test').Page, info: any): Promise<TestHarness> {
