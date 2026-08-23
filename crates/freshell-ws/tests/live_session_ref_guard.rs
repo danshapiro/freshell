@@ -184,7 +184,9 @@ async fn d7_refusal_names_the_live_owner_terminal() {
     assert_eq!(err["code"], json!("RESTORE_UNAVAILABLE"), "{err}");
     assert_eq!(
         err["message"],
-        json!(format!("Session {session_id} is still running on the server.")),
+        json!(format!(
+            "Session {session_id} is still running on the server."
+        )),
         "refusal text stays byte-identical (regexes and muscle memory depend on it): {err}"
     );
     assert_eq!(

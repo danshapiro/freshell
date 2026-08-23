@@ -6775,8 +6775,9 @@ mod pane_reconcile_gate_tests {
     /// client — no mocked sink. The upgrade handler parks forever so the
     /// socket stays open for the whole assertion window; the listener task
     /// dies with the test runtime.
-    type TestClient =
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    type TestClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     async fn loopback_sink_and_client() -> (WsSink, TestClient) {
         let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
@@ -6902,7 +6903,10 @@ mod pane_reconcile_gate_tests {
             &create_cancel_rx,
         )
         .await;
-        assert!(keep_open, "the refusal must answer, not tear the connection down");
+        assert!(
+            keep_open,
+            "the refusal must answer, not tear the connection down"
+        );
 
         // Health marker behind the request: one dispatch loop, strictly
         // ordered, so on the OLD accept-and-strip path the FIRST frame back

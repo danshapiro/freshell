@@ -2799,7 +2799,10 @@ mod tests {
             !saw_materialized,
             "an attach addressed by the real id must not spam the materialized frame"
         );
-        assert!(saw_snapshot, "the real-id attach still answers with a snapshot");
+        assert!(
+            saw_snapshot,
+            "the real-id attach still answers with a snapshot"
+        );
     }
 
     #[tokio::test]

@@ -2379,10 +2379,7 @@ pub(crate) mod tests {
     /// The consumer folds the tracked status BEFORE it broadcasts the matching
     /// wire frame, so observing this frame proves the fold the attach acks read
     /// has landed — the arrangement races nothing.
-    async fn await_status_on_wire(
-        rx: &mut tokio::sync::broadcast::Receiver<String>,
-        status: &str,
-    ) {
+    async fn await_status_on_wire(rx: &mut tokio::sync::broadcast::Receiver<String>, status: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
@@ -2560,7 +2557,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-rebind-status")).await;
+        st.handle_create(dedup_create_msg("req-rebind-status"))
+            .await;
         let created = await_claude_created(&mut rx, "req-rebind-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -2610,7 +2608,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-settle-status")).await;
+        st.handle_create(dedup_create_msg("req-settle-status"))
+            .await;
         let created = await_claude_created(&mut rx, "req-settle-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -2628,7 +2627,8 @@ pub(crate) mod tests {
 
         // The compacted turn completes: sdk.result is the settle edge. Observing
         // its broadcast proves the settle fold has landed.
-        st.handle_send(send_msg(&session_id, "__emit_result__")).await;
+        st.handle_send(send_msg(&session_id, "__emit_result__"))
+            .await;
         let _ = await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
 
         // The reconnect rescue AFTER the turn settled: the ack must speak "idle",
@@ -2659,7 +2659,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-running-status")).await;
+        st.handle_create(dedup_create_msg("req-running-status"))
+            .await;
         let created = await_claude_created(&mut rx, "req-running-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -2672,7 +2673,8 @@ pub(crate) mod tests {
 
         // A turn starts: sdk.assistant is the running edge. Observing its
         // broadcast proves the running fold has landed.
-        st.handle_send(send_msg(&session_id, "__emit_assistant__")).await;
+        st.handle_send(send_msg(&session_id, "__emit_assistant__"))
+            .await;
         let _ = await_frame_of_inner_type(&mut rx, "freshAgent.assistant").await;
 
         // The reconnect rescue mid-turn: the ack must speak "running".

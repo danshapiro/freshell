@@ -1240,8 +1240,8 @@ pub(crate) async fn spawn_terminal_pane(
         // Reconnect-revive Task 7: every refusal that CAN name a live terminal
         // carries its id (`liveTerminalId`) so the caller can reattach instead
         // of dead-ending. The envelope and message text stay byte-identical.
-        if let Some(owner_terminal_id) = registry
-            .live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
+        if let Some(owner_terminal_id) =
+            registry.live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
         {
             tracing::warn!(
                 target: "freshell_freshagent::terminal_tabs",
@@ -1294,10 +1294,7 @@ pub(crate) async fn spawn_terminal_pane(
                     pane_id = %pane_id,
                     "spawn_refused: sessionRef already bound to a live terminal (D8, REST rung)"
                 );
-                return Err(fail_json_restore_unavailable(
-                    live_sid,
-                    Some(&terminal_id),
-                ));
+                return Err(fail_json_restore_unavailable(live_sid, Some(&terminal_id)));
             }
             SessionRefClaim::Held { .. } | SessionRefClaim::ExpiredNeedsKill { .. } => {
                 tracing::warn!(
