@@ -1754,7 +1754,8 @@ fn settle_turn_outcome(
     }
 }
 
-/// `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder -> durable
+/// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
+/// emission of the same event; line numbers drift — cite by name): placeholder -> durable
 /// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
 /// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
 /// snapshot, so the pane can correlate the ack it is about to receive).
