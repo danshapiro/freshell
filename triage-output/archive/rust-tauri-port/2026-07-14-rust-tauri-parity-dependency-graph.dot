@@ -1,0 +1,301 @@
+// Rust/Tauri Parity Completion Campaign — Dependency Graph
+// Worktree: .worktrees/rust-tauri-port  Branch: feat/rust-tauri-port
+// Source of truth: docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md
+//
+// Accounts for all 233 checklist IDs across 18 families. Family nodes carry
+// item counts; critical IDs are pulled out as their own nodes. Directed edges
+// point prerequisite -> consumer.
+//
+// Shape vocabulary:
+//   box            = harness fixture / infrastructure step
+//   box (green)    = WSL2-executable family / ID (can reach PASS here)
+//   box (amber,dashed) = native-Windows environment-limited — NOT passable on WSL2
+//   note (gray)    = family aggregate (N items) / annotation
+//   hexagon (amber)= council decision gate (frozen legacy paths)
+//   diamond        = final release gate
+//
+// Render: dot -Tpng 2026-07-14-rust-tauri-parity-dependency-graph.dot -o 2026-07-14-rust-tauri-parity-dependency-graph.png
+
+digraph rust_tauri_parity {
+    rankdir=LR;
+    compound=true;
+    newrank=true;
+    fontname="Helvetica";
+    fontsize=13;
+    labelloc="t";
+    label="Rust/Tauri Parity Completion — Dependency Graph (233 IDs / 18 families / 67 nodes)\nCurrent: 0/233 qualifying acceptance proofs  •  Oracle prerequisite: 98/98 passed  •  Batches B1..B10";
+    nodesep=0.35;
+    ranksep=1.0;
+
+    node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#dae8fc"];
+    edge [fontname="Helvetica", fontsize=8, color="#555555"];
+
+    // ============================================================
+    // PREREQUISITE — deterministic oracle gate (already green)
+    // ============================================================
+    oracle [label="Oracle gate T0–T3\n98/98 passed\n(prerequisite, not a checklist ID)",
+            shape=cylinder, fillcolor="#d5e8d4", penwidth=2];
+
+    // ============================================================
+    // CLUSTER 1 — WSL2 HARNESS CRITICAL PATH (owned-real-binary)
+    // ============================================================
+    subgraph cluster_harness {
+        label="1 · WSL2 harness critical path (HARNESS-01 is the SINGLE ARTICULATION POINT)";
+        style="rounded,filled"; fillcolor="#eaf2fb"; color="#2C6FAC"; fontsize=12;
+
+        h01 [label="HARNESS-01 [B1 · TASK 1]\nSINGLE ARTICULATION POINT\nowned freshell-server fixture\nephemeral port, isolated HOME,\nexact PID, restart, teardown", fillcolor="#bbdcff", penwidth=3];
+        h02 [label="HARNESS-02 [B1 · TASK 2]\nlegacy/rust Playwright matrix", fillcolor="#bbdcff", penwidth=2];
+        h03 [label="HARNESS-03 [B2]\nprovider fixtures\n(claude/codex/opencode)"];
+        h04 [label="HARNESS-04 [B2]\nsession fixture"];
+        h05 [label="HARNESS-05 [B2]\nterminal/PTY fixture"];
+        h06 [label="HARNESS-06 [B2]\nbrowser-pane fixture"];
+        h10 [label="HARNESS-10 [B2]\nnetwork fixture"];
+        h11 [label="HARNESS-11 [B2]\nfile/diag fixture"];
+        h12 [label="HARNESS-12 [B2]\nsafety fixture"];
+        h14 [label="HARNESS-14 [B2]\nauto-update test seam"];
+    }
+
+    // ============================================================
+    // CLUSTER 2 — SERVER / FEATURE FAMILIES (WSL2-executable)
+    // ============================================================
+    subgraph cluster_families {
+        label="2 · Server / feature families — WSL2-executable via PW-RUST (family = remaining count; critical IDs pulled out)";
+        style="rounded,filled"; fillcolor="#eef7ec"; color="#4E7D2E"; fontsize=12;
+        node [fillcolor="#d5e8d4"];
+
+        // --- CFG (12): CFG-05 is in the native-Windows cluster ---
+        cfg_family [label="CFG · config (9)", shape=note, fillcolor="#e8f5e9"];
+        cfg_01 [label="CFG-01 [B3]\nconfig identity", penwidth=2];
+        cfg_08 [label="CFG-08 [B3]\nauto-update config", penwidth=2];
+
+        // --- SESSION (22) ---
+        session_family [label="SESSION · sessions (21)", shape=note, fillcolor="#e8f5e9"];
+        session_13 [label="SESSION-13 [B4]\nsession ownership", penwidth=2];
+
+        // --- TERM (27) ---
+        term_family [label="TERM · terminals (26)", shape=note, fillcolor="#e8f5e9"];
+        term_22 [label="TERM-22 [B4]\nPTY lifecycle vs main-drift", penwidth=2];
+
+        // --- AGENT (25) / AUTO (15) / EXT (10) / BROWSER (5) ---
+        agent_family [label="AGENT · fresh-agents (25)", shape=note, fillcolor="#e8f5e9"];
+        auto_family [label="AUTO · automation (14)", shape=note, fillcolor="#e8f5e9"];
+        auto_15 [label="AUTO-15 [B5]\nauto-update automation", penwidth=2];
+        ext_family [label="EXT · external providers (10)", shape=note, fillcolor="#e8f5e9"];
+        browser_family [label="BROWSER · browser panes (5)", shape=note, fillcolor="#e8f5e9"];
+
+        // --- FILE (6) / NET (10) / DIAG (8) / SAFE (13) ---
+        file_family [label="FILE · file ops (6)", shape=note, fillcolor="#e8f5e9"];
+        net_family [label="NET · networking (10)", shape=note, fillcolor="#e8f5e9"];
+        diag_family [label="DIAG · diagnostics (8)", shape=note, fillcolor="#e8f5e9"];
+        safe_family [label="SAFE · safety (12)", shape=note, fillcolor="#e8f5e9"];
+        safe_11 [label="SAFE-11 [B6]\nprocess-safety vs main-drift", penwidth=2];
+
+    }
+
+    // ============================================================
+    // CLUSTER 3 — NATIVE-WINDOWS ENVIRONMENT-LIMITED PATH
+    //   Implemented + covered here, but native-Windows proof cannot
+    //   be produced on WSL2. NOT pass/complete — recorded only.
+    // ============================================================
+    subgraph cluster_windows {
+        label="3 · Native-Windows environment-limited path — implement + cover; native proof RECORDED, NOT passed";
+        style="rounded,dashed,filled"; fillcolor="#fff4e8"; color="#C47A10"; fontsize=12;
+        node [fillcolor="#ffe6cc", style="rounded,filled,dashed", penwidth=1];
+
+        h07 [label="HARNESS-07 [WIN WAVE · B8]\nnative Windows Tauri fixture\n(real WebView2/UAC/tray)"];
+        h08 [label="HARNESS-08 [WIN WAVE · B8]\ninstaller-handler fixture"];
+        h09 [label="HARNESS-09 [WIN WAVE · B8]\nWindows UI-Automation fixture"];
+        h13 [label="HARNESS-13 [WIN WAVE · B8]\npackaged native e2e lane"];
+
+        // All TAURI acceptance requires PW-TAURI-WIN through HARNESS-07.
+        tauri_family [label="TAURI · native shell/WebView2 (28)\nENV-LIMITED — NOT PASSABLE HERE", shape=note, fillcolor="#fff0dd"];
+        tauri_16 [label="TAURI-16 [WIN WAVE · B8]\nprovisioning atomicity /\ninstaller handoff", penwidth=2];
+        tauri_30 [label="TAURI-30 [WIN WAVE · B8]\nTauri restart ownership", penwidth=2];
+
+        // MIGRATE-01..12 and CFG-05 require the real Electron→Tauri/WebView2 path.
+        mig_01_10 [label="MIGRATE-01..10 [WIN WAVE · B8]\nElectron→Tauri migration (10)\n(MIGRATE-06 highlighted)", shape=note, fillcolor="#fff0dd"];
+        mig_06 [label="MIGRATE-06 [WIN WAVE · B8]\nsession/config ownership\npreserved on migrate", penwidth=2];
+        mig_11_12 [label="MIGRATE-11..12 [WIN WAVE · B8]\nprofile discovery + receipt (2)", shape=note, fillcolor="#fff0dd"];
+        cfg_05 [label="CFG-05 [WIN WAVE · B8]\nElectron→Tauri browser-state\nmigration umbrella gate", penwidth=2];
+
+        pkg_02 [label="PACKAGE-02 [WIN WAVE · B8]\ninstaller (NSIS/MSI)", penwidth=2];
+        pkg_rest [label="PACKAGE-01,03,04 (3)", shape=note, fillcolor="#fff0dd"];
+
+        upd_03 [label="UPDATE-03 [WIN WAVE · B8]\ninstall-over update", penwidth=2];
+        upd_04 [label="UPDATE-04 [WIN WAVE · B8]\nNSIS handoff into TAURI-16", penwidth=2];
+        upd_rest [label="UPDATE-01,02,05 (3)", shape=note, fillcolor="#fff0dd"];
+
+        mig_13 [label="MIGRATE-13 [WIN WAVE · B8]\npackaged Electron→Tauri\nupgrade + rollback", penwidth=2];
+    }
+
+    // ============================================================
+    // CLUSTER 5 — SYNC / MAIN-DRIFT DECISION
+    //   Checklist specifies two passes. The post-HARNESS-02 checkpoint is an
+    //   explicit operational interpretation, not a third checklist pass.
+    // ============================================================
+    subgraph cluster_sync {
+        label="5 · SYNC / main-drift decision (2 required passes + 1 operational checkpoint)";
+        style="rounded,filled"; fillcolor="#f3eefb"; color="#673ab7"; fontsize=12;
+
+        sync_inv [label="SYNC-00 · REQUIRED PASS 1 [B1]\npre-implementation inventory/reconcile\nREAD-ONLY inventory before harness", fillcolor="#e8def5"];
+        sync_rec [label="OPERATIONAL CHECKPOINT [B2]\npost-HARNESS-02 reconcile interpretation\nNOT a third SYNC-00 checklist pass", fillcolor="#e8def5", style="rounded,filled,dashed"];
+        council [label="COUNCIL / ANTAGONIST DECISION\nactual reconcile may conflict with frozen\nserver/ shared/ src/ byte-purity\ninventory only until adjudicated;\ndo not claim SYNC-00 complete",
+                 shape=hexagon, fillcolor="#ffe0b2", color="#C47A10", penwidth=2];
+        sync_pre [label="SYNC-00 · REQUIRED PASS 2 [B9]\npre-release reconcile + inventory", fillcolor="#e8def5"];
+        sync_05 [label="SYNC-05 [B9]\nexpected-restart gate across owners\nnative portion environment-limited", fillcolor="#ffe6cc", style="rounded,filled,dashed", penwidth=2];
+        sync_rest [label="SYNC-01..04 (4)", shape=note, fillcolor="#efe6fb"];
+    }
+
+    // ============================================================
+    // CLUSTER 4 — FINAL GATES
+    // ============================================================
+    subgraph cluster_gates {
+        label="4 · Final gates (GATE-01..08 · B10)";
+        style="rounded,filled"; fillcolor="#fdeef0"; color="#b3364a"; fontsize=12;
+        node [shape=diamond, fillcolor="#f8cecc"];
+
+        g01 [label="GATE-01 [B10]\nunchanged legacy browser suite\nagainst Node + Rust"];
+        g02 [label="GATE-02 [B10]\nfull native-Windows packaged\nTauri WebView2 suite\nENV-LIMITED — NOT PASSABLE HERE",
+             fillcolor="#ffe6cc", style="filled,dashed", color="#C47A10", penwidth=2];
+        g03 [label="GATE-03 [B10]\nupgrade safety on a copy of\na representative legacy profile\nENV-LIMITED", fillcolor="#ffe6cc", style="filled,dashed"];
+        g04 [label="GATE-04 [B10]\nmulti-client isolation + recovery\n(two browsers + Tauri)\nENV-LIMITED", fillcolor="#ffe6cc", style="filled,dashed"];
+        g05 [label="GATE-05 [B10]\nresource + process hygiene\nunder stress\nENV-LIMITED", fillcolor="#ffe6cc", style="filled,dashed"];
+        g06 [label="GATE-06 [B10]\nsecurity boundaries\nENV-LIMITED", fillcolor="#ffe6cc", style="filled,dashed"];
+        g07 [label="GATE-07 [B10]\naccessibility + keyboard use\nENV-LIMITED", fillcolor="#ffe6cc", style="filled,dashed"];
+        g08 [label="GATE-08 [B10]\none parity receipt\nALL 233 IDs linked to passing proof\nENV-LIMITED — NOT PASSABLE HERE",
+             fillcolor="#ffcc99", style="filled,dashed", color="#C47A10", penwidth=3];
+    }
+
+    // ============================================================
+    // LEGEND
+    // ============================================================
+    subgraph cluster_legend {
+        label="Legend";
+        style="rounded,filled"; fillcolor="#ffffff"; color="#999999"; fontsize=11;
+
+        lg_wsl2 [label="WSL2-executable\n(can reach PASS)", shape=box, style="rounded,filled", fillcolor="#d5e8d4"];
+        lg_env [label="Environment-limited\n(native Windows) — NOT pass,\nimplemented + covered + recorded", shape=box, style="rounded,filled,dashed", fillcolor="#ffe6cc"];
+        lg_harness [label="Harness / infra fixture", shape=box, style="rounded,filled", fillcolor="#dae8fc"];
+        lg_family [label="Family aggregate (N items)", shape=note, fillcolor="#e8f5e9"];
+        lg_crit [label="Critical ID (pulled out)", shape=box, style="rounded,filled", fillcolor="#d5e8d4", penwidth=2];
+        lg_council [label="Council decision (amber)", shape=hexagon, fillcolor="#ffe0b2", color="#C47A10"];
+        lg_gate [label="Final gate\n(amber/dashed when native proof required)", shape=diamond, fillcolor="#f8cecc"];
+        lg_count [label="Family count check (233 total):\nHARNESS 14 · CFG 12 · SESSION 22 · TERM 27\nAGENT 25 · AUTO 15 · EXT 10 · BROWSER 5\nFILE 6 · NET 10 · DIAG 8 · SAFE 13\nTAURI 30 · PACKAGE 4 · UPDATE 5 · MIGRATE 13\nSYNC 6 · GATE 8  =  233", shape=note, fillcolor="#f5f5f5"];
+
+        lg_wsl2 -> lg_env [style=invis];
+        lg_env -> lg_harness [style=invis];
+        lg_harness -> lg_family [style=invis];
+        lg_family -> lg_crit [style=invis];
+        lg_crit -> lg_council [style=invis];
+        lg_council -> lg_gate [style=invis];
+        lg_gate -> lg_count [style=invis];
+    }
+
+    // ============================================================
+    // EDGES — prerequisite & harness critical path
+    // ============================================================
+    oracle -> h01 [label="oracle green\nbefore any port work", penwidth=2, color="#2E7D32"];
+    sync_inv -> h01 [label="read-only inventory\nbefore harness", style=dashed, color="#673ab7"];
+
+    h01 -> h02 [penwidth=2];
+    h01 -> h03;
+    h01 -> h04;
+    h01 -> h05;
+    h01 -> h06;
+    h01 -> h10;
+    h01 -> h11;
+    h01 -> h12;
+    h01 -> h14;
+
+    // HARNESS-01 -> all PW-RUST families (directly or via specialized fixtures)
+    h01 -> cfg_family;
+    h01 -> cfg_01;
+    h01 -> cfg_05;
+    h01 -> cfg_08;
+    h01 -> file_family;
+    h01 -> tauri_family;
+    h01 -> tauri_16;
+    h01 -> tauri_30;
+    h01 -> mig_01_10;
+    h01 -> mig_11_12;
+    h04 -> session_family;
+    h04 -> session_13;
+    h05 -> term_family;
+    h05 -> term_22;
+    h03 -> agent_family;
+    h03 -> auto_family;
+    h03 -> ext_family;
+    h06 -> browser_family;
+    h10 -> net_family;
+    h11 -> diag_family;
+    h12 -> safe_family;
+    h12 -> safe_11;
+    h14 -> auto_15;
+
+    // ============================================================
+    // EDGES — cross-family feature dependencies
+    // ============================================================
+    mig_01_10 -> cfg_05 [label="migrated config\nfeeds CFG-05"];
+    mig_01_10 -> mig_06 [style=dotted, label="member (highlighted)"];
+    cfg_01 -> mig_06 [label="config identity\npreserved"];
+    session_13 -> mig_06 [label="session ownership\npreserved on migrate"];
+    cfg_08 -> auto_15 [label="update config\ngates automation"];
+
+    // ============================================================
+    // EDGES — SYNC / main-drift
+    // ============================================================
+    h02 -> sync_rec [label="matrix exists →\nreconcile", color="#673ab7"];
+    sync_rec -> council [color="#673ab7"];
+    council -> sync_rest [label="decision recorded", color="#673ab7"];
+    council -> g03 [label="frozen legacy\nconfirmed", style=dashed, color="#673ab7"];
+    term_22 -> sync_05;
+    safe_11 -> sync_05;
+    tauri_30 -> sync_05;
+    sync_05 -> sync_pre [label="merge then recheck", color="#673ab7"];
+
+    // ============================================================
+    // EDGES — native-Windows environment-limited path
+    // ============================================================
+    tauri_family -> h07 [label="packaged build", style=dashed, color="#C47A10"];
+    h07 -> h08 [color="#C47A10"];
+    h07 -> h09 [color="#C47A10"];
+    h08 -> h13 [color="#C47A10"];
+    h09 -> h13 [color="#C47A10"];
+    h13 -> pkg_02 [color="#C47A10"];
+    h13 -> pkg_rest [color="#C47A10"];
+    h13 -> upd_rest [color="#C47A10"];
+    pkg_02 -> mig_13 [color="#C47A10"];
+    pkg_02 -> upd_03 [color="#C47A10"];
+    pkg_02 -> upd_04 [color="#C47A10"];
+    tauri_16 -> upd_04 [label="update-check →\napply"];
+
+    // ============================================================
+    // EDGES — final gates
+    // ============================================================
+    h02 -> g01 [label="matrix"];
+    term_family -> g01;
+    agent_family -> g01;
+    safe_family -> g01;
+    session_family -> g01;
+    oracle -> g02 [style=dotted];
+    h01 -> g04 [label="cross-compile"];
+    // env-limited gate (amber) — recorded, not passed
+    h13 -> g05 [style=dashed, color="#C47A10"];
+    pkg_02 -> g05 [style=dashed, color="#C47A10"];
+    mig_13 -> g05 [style=dashed, color="#C47A10"];
+    upd_04 -> g05 [style=dashed, color="#C47A10"];
+    // update + migrate proof
+    mig_01_10 -> g06;
+    upd_04 -> g06 [style=dashed, color="#C47A10"];
+    mig_13 -> g06 [style=dashed, color="#C47A10"];
+    // sync gate
+    sync_pre -> g07 [color="#673ab7"];
+    // final rollup
+    g01 -> g08;
+    g02 -> g08;
+    g03 -> g08;
+    g04 -> g08;
+    g05 -> g08 [label="env-limited\nrecorded", style=dashed, color="#C47A10"];
+    g06 -> g08;
+    g07 -> g08;
+}
