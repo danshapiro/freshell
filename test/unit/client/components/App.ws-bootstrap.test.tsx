@@ -89,6 +89,7 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
   onDisconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
+  poke: vi.fn(),
   isReady: false,
   serverInstanceId: undefined as string | undefined,
 }))
@@ -116,6 +117,7 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: wsMocks.onReconnect,
     onDisconnect: wsMocks.onDisconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    poke: wsMocks.poke,
     cancelCreate: vi.fn(),
     setReconcilePendingCreates: vi.fn(),
     clearReconcileCreateHold: vi.fn(),
@@ -361,6 +363,33 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(wsMocks.connect).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('pokes the websocket from a foreground visibilitychange listener', async () => {
+    const store = createStore()
+    wsMocks.connect.mockResolvedValueOnce(undefined)
+    // jsdom reports 'prerender'; force the visible state the listener gates on.
+    const visibilitySpy = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+
+    try {
+      render(
+        <Provider store={store}>
+          <App />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+      })
+
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'))
+      })
+
+      expect(wsMocks.poke).toHaveBeenCalled()
+    } finally {
+      visibilitySpy.mockRestore()
+    }
   })
 
   it('loads shell-critical bootstrap through /api/bootstrap without falling back to legacy settings/platform reads', async () => {

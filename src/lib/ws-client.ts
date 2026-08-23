@@ -71,6 +71,18 @@ type InFlightCreate = {
 
 const CONNECTION_TIMEOUT_MS = 10_000
 
+// App-level transport liveness. Server-side WS pings are invisible to JS, so
+// liveness is proven by an app-level {type:'ping'}→{type:'pong'} round trip
+// that both servers implement. 10s tick so a probe's 10s timeout is
+// re-evaluated 10s after it was sent (a 30s tick would delay abandonment to
+// t=60 — fresh-eyes F1). Probe fires once inbound silence reaches 30s (both
+// servers' keepalive cadence); the foreground abandon threshold is >2 server
+// keepalive windows.
+const LIVENESS_TICK_MS = 10_000
+const PROBE_AFTER_SILENCE_MS = 30_000
+const PONG_TIMEOUT_MS = 10_000
+const FOREGROUND_RECYCLE_SILENCE_MS = 65_000
+
 // Bounded pre-verdict create hold: when the server acks paneReconcileV1, pane
 // creates are held until their pane's reconcile verdict folds — or this
 // wall-clock bound elapses and every still-held create flushes (legacy-eager
@@ -147,6 +159,14 @@ export class WsClient {
   // Per-connection: {} until a ready with capabilities arrives on the CURRENT
   // socket; reset on disconnect so a downgraded server is honored.
   private serverCapabilities: NonNullable<ReadyCapabilities> = {}
+
+  // Bumped for every new WebSocket; each socket's handlers capture their
+  // generation and no-op once superseded (a late event from an abandoned socket
+  // must never touch the live connection's state).
+  private socketGen = 0
+  private lastInboundAt = 0
+  private probeSentAt: number | null = null
+  private livenessTimer: number | null = null
 
   constructor(private url: string) {}
 
@@ -229,6 +249,10 @@ export class WsClient {
   }
 
   private handleIncomingMessage(msg: ServerMessage): void {
+    // Any parsed inbound frame is liveness evidence (a socket relaying traffic
+    // is not half-open): resets the silence clock and clears an outstanding probe.
+    this.lastInboundAt = Date.now()
+    this.probeSentAt = null
     if (msg.type === 'ready') {
       this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
         ? msg.serverInstanceId
@@ -450,9 +474,18 @@ export class WsClient {
       }, CONNECTION_TIMEOUT_MS)
 
       this.ws = new WebSocket(this.url)
+      // Generation guard: each socket's handlers capture their generation and
+      // no-op once superseded — a late event from an abandoned socket must
+      // never touch the live connection's state (LB-3).
+      const gen = ++this.socketGen
+      const socket = this.ws
 
       this.ws.onopen = () => {
+        if (gen !== this.socketGen || this.ws !== socket) return
         this._state = 'connected'
+        this.lastInboundAt = Date.now()
+        this.probeSentAt = null
+        this.startLivenessWatch()
         this.reconnectAttempts = 0
         this.fastReconnectMode = false
         this.slowRetryAnnounced = false
@@ -476,6 +509,7 @@ export class WsClient {
       }
 
       this.ws.onmessage = (event) => {
+        if (gen !== this.socketGen || this.ws !== socket) return
         let msg: ServerMessage
         try {
           msg = JSON.parse(event.data) as ServerMessage
@@ -506,7 +540,9 @@ export class WsClient {
       }
 
       this.ws.onclose = (event) => {
+        if (gen !== this.socketGen || this.ws !== socket) return
         this.clearReadyTimeout()
+        this.clearLivenessWatch()
         const wasReady = this._state === 'ready'
         const closedBeforeReady = !wasReady
         this._state = 'disconnected'
@@ -586,6 +622,7 @@ export class WsClient {
       }
 
       this.ws.onerror = () => {
+        if (gen !== this.socketGen || this.ws !== socket) return
         // onclose will fire with details; if still connecting, reject quickly.
         if (this._state === 'connecting') {
           finishReject(new Error('WebSocket error'))
@@ -645,6 +682,9 @@ export class WsClient {
     this.intentionalClose = true
     this.clearReconnectTimer()
     this.clearReadyTimeout()
+    this.clearLivenessWatch()
+    // Bump the generation so a torn-down socket's late events are inert.
+    this.socketGen += 1
     this.ws?.close()
     this.ws = null
     this._state = 'disconnected'
@@ -673,6 +713,97 @@ export class WsClient {
       window.clearTimeout(this.readyTimeout)
       this.readyTimeout = null
     }
+  }
+
+  private startLivenessWatch(): void {
+    this.clearLivenessWatch()
+    this.livenessTimer = window.setInterval(() => this.tickLiveness(), LIVENESS_TICK_MS)
+  }
+
+  private clearLivenessWatch(): void {
+    if (this.livenessTimer !== null) {
+      window.clearInterval(this.livenessTimer)
+      this.livenessTimer = null
+    }
+    this.probeSentAt = null
+  }
+
+  private tickLiveness(): void {
+    if (this._state !== 'ready' || !this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    const now = Date.now()
+    if (this.probeSentAt !== null) {
+      if (now - this.probeSentAt >= PONG_TIMEOUT_MS) {
+        this.abandonStaleSocket('liveness probe unanswered')
+      }
+      return
+    }
+    if (now - this.lastInboundAt < PROBE_AFTER_SILENCE_MS) return
+    this.probeSentAt = now
+    this.sendNow({ type: 'ping' })
+  }
+
+  /**
+   * Half-open socket disposal. A dead transport cannot be trusted to deliver
+   * onclose promptly (or ever), so recycling never waits on the old socket's
+   * events: handlers detach, connection-local state is forced down, and a fresh
+   * connect is driven NOW. The generation guard makes the old socket's late
+   * events no-ops (LB-3: the bare this.ws swap in connect() would otherwise let
+   * the old onclose corrupt the new connection).
+   */
+  private abandonStaleSocket(reason: string): void {
+    const old = this.ws
+    if (old) {
+      old.onopen = null
+      old.onmessage = null
+      old.onclose = null
+      old.onerror = null
+      try { old.close() } catch { /* best effort: resource hygiene only */ }
+    }
+    this.ws = null
+    this._state = 'disconnected'
+    this.serverCapabilities = {}
+    this.resetReconcileHold({ requeueHeld: true })
+    this.clearLivenessWatch()
+    // A normal close notifies disconnectHandlers (App flips Redux
+    // connection.status at App.tsx's onDisconnect subscription) — abandonment
+    // must too, or Redux sits at 'ready' forever and every status-keyed
+    // recovery wedges.
+    this.disconnectHandlers.forEach((h) => h())
+    log.warn(`abandoning stale socket: ${reason}`)
+    this.connect().catch((err) => log.debug('reconnect after abandon failed', err))
+  }
+
+  /**
+   * Foreground poke: re-assert connectivity when the page becomes visible/online.
+   * - ready + recently active   → probe immediately (fast failure discovery).
+   * - ready + silent past two server keepalive windows → abandon: the peer may
+   *   already be reaped, and reconnect convergence is cheaper than the probe wait.
+   * - down with a (possibly background-clamped) backoff timer pending → connect now.
+   */
+  poke(): void {
+    if (this.intentionalClose) return
+    if (this._state === 'ready') {
+      if (this.probeSentAt !== null && Date.now() - this.probeSentAt >= PONG_TIMEOUT_MS) {
+        this.abandonStaleSocket('foreground poke: outstanding probe expired')
+        return
+      }
+      if (Date.now() - this.lastInboundAt >= FOREGROUND_RECYCLE_SILENCE_MS) {
+        this.abandonStaleSocket('foreground poke past keepalive windows')
+        return
+      }
+      // Foreground means "ask now": probe immediately, bypassing the 30s silence
+      // gate (fresh-eyes F1 — routing this through tickLiveness's guard could
+      // never fire the immediate probe the tests pin).
+      if (this.probeSentAt === null) {
+        this.probeSentAt = Date.now()
+        this.sendNow({ type: 'ping' })
+      }
+      return
+    }
+    if (this.connectPromise) return
+    if (this._state === 'connecting') return
+    this.clearReconnectTimer()
+    this.connect().catch((err) => log.debug('poke reconnect failed', err))
   }
 
   /**

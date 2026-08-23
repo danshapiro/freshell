@@ -1476,7 +1476,21 @@ export default function App() {
 
     const cleanupPromise = bootstrap()
 
+    // Foreground reconnect poke: mobile browsers freeze or silently kill the
+    // socket while backgrounded, so re-assert transport liveness whenever the
+    // page comes back to the front (visibilitychange/online/pageshow — the
+    // iOS bfcache restore only fires pageshow).
+    const ws = getWsClient()
+    const pokeWs = () => ws.poke()
+    const pokeWsWhenVisible = () => { if (document.visibilityState === 'visible') ws.poke() }
+    window.addEventListener('online', pokeWs)
+    window.addEventListener('pageshow', pokeWs)
+    document.addEventListener('visibilitychange', pokeWsWhenVisible)
+
     return () => {
+      window.removeEventListener('online', pokeWs)
+      window.removeEventListener('pageshow', pokeWs)
+      document.removeEventListener('visibilitychange', pokeWsWhenVisible)
       cancelled = true
       cleanedUp = true
       cleanup?.()
