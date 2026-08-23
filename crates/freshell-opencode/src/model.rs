@@ -45,7 +45,9 @@ fn default_model() -> Option<&'static str> {
 /// `resolveFreshAgentModelOption(freshopencode, model)` (`fresh-agent-models.ts:93-99`):
 /// the matching menu entry, or `None` (no fallback when the menu is empty).
 fn resolve_model_option(model: &str) -> Option<&'static ModelOption> {
-    FRESHOPENCODE_MODEL_OPTIONS.iter().find(|o| o.value == model)
+    FRESHOPENCODE_MODEL_OPTIONS
+        .iter()
+        .find(|o| o.value == model)
 }
 
 /// `normalizeFreshAgentModel(freshopencode, 'opencode', model)` (`fresh-agent-models.ts:114-117`).
@@ -186,7 +188,10 @@ mod tests {
         // No static menu → blank model resolves to None → pass-through →
         // absent effort is None (no fabricated default).
         assert_eq!(normalize_opencode_effort(None, None), None);
-        assert_eq!(normalize_opencode_effort(Some("  "), Some("bogus")), Some("bogus".to_string()));
+        assert_eq!(
+            normalize_opencode_effort(Some("  "), Some("bogus")),
+            Some("bogus".to_string())
+        );
     }
 
     #[test]
