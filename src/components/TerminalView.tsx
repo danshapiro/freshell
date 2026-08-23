@@ -5210,9 +5210,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           getHydrationQueue().onHydrationComplete(paneIdRef.current)
           hydrationRegisteredRef.current = false
           // Always queueIfStarted: a hidden pane's reattach must not wait for
-          // reveal. The deferred intent chosen above (transport_reconnect vs
-          // viewport_hydrate) still governs WHAT the attach asks for; this
-          // only governs THAT it runs.
+          // reveal. The deferred intent chosen above governs the REVEAL path;
+          // when the pump grants this pane a slot it recomputes the checkpoint
+          // decision at grant time. This call only governs THAT the pump runs.
           registerForBackgroundHydration({ queueIfStarted: true })
           return
         }
