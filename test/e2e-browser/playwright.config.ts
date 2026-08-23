@@ -289,6 +289,9 @@ export const RUST_ONLY_SPECS = [
   // RustServers, hard e2eServerKind==='rust' assertion per test; the legacy
   // tree has no amplifier provider registered at all (pre-existing gap fix).
   /remote-tab-linkage-rust\.spec\.ts$/,
+  // Reconnect-revive acceptance: socket-drop/freeze revival; drives
+  // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
+  /reconnect-revive-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -528,6 +531,9 @@ export default defineConfig({
         // SESSION-02/03 -- soft-delete route + unmatched-/api/* 404-JSON
         // contract wall (see RUST_ONLY_SPECS entry + the spec's doc comment).
         /session-delete-rust\.spec\.ts$/,
+        // Reconnect-revive acceptance: socket-drop/freeze revival; drives
+        // RustServer + forceDisconnect + SIGSTOP (see RUST_ONLY_SPECS entry).
+        /reconnect-revive-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
