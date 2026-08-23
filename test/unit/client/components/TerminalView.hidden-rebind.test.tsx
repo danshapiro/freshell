@@ -3,7 +3,7 @@ import { render, cleanup, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { updatePaneContent } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
@@ -176,6 +176,7 @@ function renderTerminalView(opts: RenderOptions) {
   )
   const result = render(ui(opts))
   return {
+    store,
     rerender: (o: RenderOptions) => result.rerender(ui(o)),
   }
 }
@@ -268,5 +269,50 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
     // The reveal effect requires mode === 'waiting_for_geometry' to attach;
     // a live pane only gets a layout fit.
     expect(sentFrames('terminal.attach').length).toBe(attachesBeforeReveal)
+  })
+
+  it('reconnect while hidden re-registers with queueIfStarted (the pump cannot wait for reveal)', () => {
+    const { store } = renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-3', status: 'running', createRequestId: 'req-3' },
+      hidden: true,
+    })
+    // Fold the live terminalId into the layout (mirrors the terminal.created
+    // fold) so the #534 attach gate admits it.
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: { ...baseTerminalContent, terminalId: 'term-3', status: 'running', createRequestId: 'req-3' },
+      }))
+    })
+    // The mount-time background-hydration registration consumed the guard;
+    // clear the mock log so the assertions below see only the reconnect's
+    // actions.
+    hydrationMocks.queue.register.mockClear()
+    hydrationMocks.queue.onHydrationComplete.mockClear()
+
+    const reconnect = wsMocks.onReconnect.mock.calls.at(-1)?.[0]
+    expect(reconnect).toBeTypeOf('function')
+    act(() => { reconnect() })
+
+    // THE FIX: same three-step dance as the terminal.created hidden path --
+    // release this pane's stale queue slot, then re-register with
+    // queueIfStarted, since a hidden pane's reattach must not wait for reveal.
+    expect(hydrationMocks.queue.onHydrationComplete).toHaveBeenCalledWith('pane-1')
+    expect(hydrationMocks.queue.register).toHaveBeenCalledWith(
+      expect.objectContaining({ paneId: 'pane-1', trigger: expect.any(Function) }),
+      expect.objectContaining({ queueIfStarted: true }),
+    )
+
+    // When the queue grants the slot, a full replay attach leaves the client
+    // even though the pane is still hidden (no usable checkpoint here).
+    wsMocks.send.mockClear()
+    act(() => { hydrationMocks.registered.at(-1)!.trigger() })
+    expect(sentFrames('terminal.attach').at(-1)).toMatchObject({
+      terminalId: 'term-3',
+      intent: 'keepalive_delta', // wire token for hidden viewport hydration
+      sinceSeq: 0,
+      priority: 'background',
+    })
   })
 })

@@ -5204,7 +5204,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          registerForBackgroundHydration({ queueIfStarted: canResumeFromParserAppliedSurface })
+          // Same three-step re-register as the terminal.created hidden path
+          // (~:4506): a stale active slot or a consumed registration guard
+          // otherwise wedges this pane out of the post-reconnect pump entirely.
+          getHydrationQueue().onHydrationComplete(paneIdRef.current)
+          hydrationRegisteredRef.current = false
+          // Always queueIfStarted: a hidden pane's reattach must not wait for
+          // reveal. The deferred intent chosen above (transport_reconnect vs
+          // viewport_hydrate) still governs WHAT the attach asks for; this
+          // only governs THAT it runs.
+          registerForBackgroundHydration({ queueIfStarted: true })
           return
         }
         attachTerminal(tid, 'transport_reconnect')

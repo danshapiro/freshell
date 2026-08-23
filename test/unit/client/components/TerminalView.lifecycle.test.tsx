@@ -7973,6 +7973,76 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('pumps the hydration queue for a hidden pane on reconnect even without a usable parser checkpoint', async () => {
+      // The active tab hydrated first: the background pump is already started
+      // (onActiveTabReady is one-shot) before this hidden pane ever mounts.
+      act(() => {
+        getHydrationQueue().onActiveTabReady('tab-active-first', ['tab-active-first'])
+      })
+
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hidden-reconnect-pump',
+        hidden: true,
+        ackInitialAttach: false,
+      })
+
+      // A hidden pane mounted post-startup registers WITHOUT queueIfStarted by
+      // design -- it waits for reveal. Nothing may attach while it stays hidden.
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+
+      // No parser-applied checkpoint exists for this terminal in the harness,
+      // so the reconnect hidden branch takes the checkpoint-missing path --
+      // exactly the branch that registered with queueIfStarted:false and wedged
+      // behind the consumed registration guard.
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      // The pane must be re-queued AND pumped with no reveal: a full replay
+      // attach leaves the client through the background hydration slot.
+      // (Hidden viewport hydration uses the keepalive_delta wire token per the
+      // attach policy's geometry swap; sinceSeq 0 = full replay.)
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'keepalive_delta',
+          sinceSeq: 0,
+          priority: 'background',
+          attachRequestId: expect.any(String),
+        }))
+      })
+
+      // The queue stays one-at-a-time: a second hidden pane registered behind
+      // this one must hold until this pane's hydration completes -- proof the
+      // reconnect re-register took the pump slot and the queue then advanced
+      // past it.
+      const trailingTrigger = vi.fn()
+      act(() => {
+        getHydrationQueue().register(
+          { tabId: 'tab-trailing', paneId: 'pane-trailing', trigger: trailingTrigger },
+          { queueIfStarted: true },
+        )
+      })
+      expect(trailingTrigger).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+        })
+      })
+      await waitFor(() => {
+        expect(trailingTrigger).toHaveBeenCalledTimes(1)
+      })
+    })
+
     it('uses the highest rendered sequence in reconnect attach requests', async () => {
       const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-reconnect' })
 
