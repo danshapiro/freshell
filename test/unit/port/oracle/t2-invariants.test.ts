@@ -18,7 +18,7 @@ import {
 function goodObservation(overrides: Partial<T2Observation> = {}): T2Observation {
   return {
     provider: 'opencode',
-    model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+    model: 'provider/model',
     prompt: 'Reply with exactly: freshell-t2-ok',
     sentinelToken: 'freshell-t2-ok',
 

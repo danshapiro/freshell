@@ -14,7 +14,7 @@ describe('LayoutStore fresh-agent content', () => {
       status: 'connected',
       sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
       initialCwd: '/repo',
-      model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+      model: 'provider/model',
       effort: 'high',
     }
     store.attachPaneContent(tabId, paneId, content)

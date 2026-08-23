@@ -260,14 +260,14 @@ describe('OpencodeServeManager HTTP client', () => {
     expect(session).toMatchObject({ id: 'ses_new', directory: '/repo' })
     await manager.promptAsync('ses_new', {
       parts: [{ type: 'text', text: 'hi' }],
-      model: { providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' },
+      model: { providerID: 'provider', modelID: 'model' },
       variant: 'high',
     })
     const prompt = calls.find((c) => c.url.includes('/prompt_async'))!
     expect(prompt.url).toBe('http://127.0.0.1:47999/session/ses_new/prompt_async')
     expect(JSON.parse(prompt.init.body)).toEqual({
       parts: [{ type: 'text', text: 'hi' }],
-      model: { providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' },
+      model: { providerID: 'provider', modelID: 'model' },
       variant: 'high',
     })
   })

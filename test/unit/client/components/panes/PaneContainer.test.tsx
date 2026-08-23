@@ -1915,7 +1915,7 @@ describe('PaneContainer', () => {
           expect(paneContent.initialCwd).toBe('/home/user/freshopencode-project')
           expect(paneContent.model).toBeUndefined()
           expect(paneContent.modelSelection).toBeUndefined()
-          expect(paneContent.effort).toBe('max')
+          expect(paneContent.effort).toBeUndefined()
           expect(paneContent.permissionMode).toBeUndefined()
         }
       })
@@ -1933,7 +1933,7 @@ describe('PaneContainer', () => {
         undefined,
         ['claude', 'opencode'],
         { claude: true, opencode: true },
-        { freshopencode: { modelSelection: { kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' }, effort: 'high' } },
+        { freshopencode: { modelSelection: { kind: 'exact', modelId: 'provider/model' }, effort: 'high' } },
       )
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshopencode-project' })
 
@@ -1956,8 +1956,8 @@ describe('PaneContainer', () => {
         if (paneContent.kind === 'fresh-agent') {
           expect(paneContent.sessionType).toBe('freshopencode')
           expect(paneContent.provider).toBe('opencode')
-          expect(paneContent.model).toBe('umans-ai-coding-plan/umans-kimi-k2.7')
-          expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' })
+          expect(paneContent.model).toBe('provider/model')
+          expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'provider/model' })
           expect(paneContent.effort).toBe('high')
         }
       })

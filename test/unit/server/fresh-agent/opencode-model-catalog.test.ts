@@ -239,7 +239,7 @@ describe('opencode model catalog thinking variants', () => {
   }
 
   it('derives supportedEffortLevels from the model variants map keys, ordered canonically', () => {
-    // Real served order from lunaroute/glm-5.2-vision (opencode 1.18.18).
+    // A model with off/minimal/low/medium/high/xhigh/max variants (opencode 1.18.18).
     const model = normalizeSingleModel({
       id: 'glm-5.2-vision',
       name: 'glm-5.2-vision',

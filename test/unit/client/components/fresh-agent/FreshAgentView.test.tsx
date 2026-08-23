@@ -247,10 +247,10 @@ beforeEach(() => {
         supportsAdaptiveThinking: true,
       },
       {
-        id: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        id: 'provider/model',
         displayName: 'Kimi k2.7',
         provider: 'opencode',
-        source: { id: 'umans-ai-coding-plan', displayName: 'umans-ai-coding-plan' },
+        source: { id: 'provider', displayName: 'provider' },
         supportsEffort: true,
         supportedEffortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
         supportsAdaptiveThinking: true,
@@ -1953,7 +1953,7 @@ describe('FreshAgentView', () => {
       freshAgent: {
         providers: {
           freshopencode: {
-            modelSelection: { kind: 'exact', modelId: 'umans-ai-coding-plan/umans-kimi-k2.7' },
+            modelSelection: { kind: 'exact', modelId: 'provider/model' },
             effort: 'high',
           },
         },
@@ -1982,7 +1982,7 @@ describe('FreshAgentView', () => {
         type: 'freshAgent.create',
         sessionType: 'freshopencode',
         provider: 'opencode',
-        model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        model: 'provider/model',
         effort: 'high',
       }))
     })

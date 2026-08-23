@@ -560,7 +560,7 @@ fn opencode_model_flag_only_from_explicit_model_on_fresh_launch() {
 
     // Explicit model + armed env → exact `--model` pair.
     let mut fresh = opencode_inputs();
-    fresh.model = Some("umans-ai-coding-plan/umans-kimi-k2.7");
+    fresh.model = Some("provider/model");
     let launch = resolve_coding_cli_command(&specs(), &fresh, &env_of(&all_keys))
         .unwrap()
         .unwrap();
@@ -572,7 +572,7 @@ fn opencode_model_flag_only_from_explicit_model_on_fresh_launch() {
             "--port",
             "51234",
             "--model",
-            "umans-ai-coding-plan/umans-kimi-k2.7"
+            "provider/model"
         ]),
         "explicit model must pass through unchanged with an armed env"
     );

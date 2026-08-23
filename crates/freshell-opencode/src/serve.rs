@@ -1141,17 +1141,17 @@ mod tests {
     fn build_prompt_body_splits_model_and_sets_variant() {
         let body = build_prompt_body(
             "hi",
-            Some("umans-ai-coding-plan/umans-kimi-k2.7"),
+            Some("provider/model"),
             Some("low"),
         );
         assert_eq!(body["parts"][0]["text"], serde_json::json!("hi"));
         assert_eq!(
             body["model"]["providerID"],
-            serde_json::json!("umans-ai-coding-plan")
+            serde_json::json!("provider")
         );
         assert_eq!(
             body["model"]["modelID"],
-            serde_json::json!("umans-kimi-k2.7")
+            serde_json::json!("model")
         );
         assert_eq!(body["variant"], serde_json::json!("low"));
     }

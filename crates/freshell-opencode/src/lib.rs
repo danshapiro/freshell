@@ -47,7 +47,7 @@ pub use events::{
 };
 pub use model::{
     normalize_opencode_effort, normalize_opencode_model, split_opencode_model, OpencodeModel,
-    FRESHOPENCODE_DEFAULT_EFFORT, FRESHOPENCODE_DEFAULT_MODEL,
+    FRESHOPENCODE_DEFAULT_EFFORT,
 };
 pub use serve::{
     is_healthy_response, CreatedSession, Endpoint, EventSource, EventStreamHandle, ForkedSession,

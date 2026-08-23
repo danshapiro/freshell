@@ -155,7 +155,7 @@ describe('executeAction -- tab actions', () => {
 
     const result = await executeAction('new-tab', {
       agent: 'opencode',
-      model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+      model: 'provider/model',
       effort: 'high',
     })
 
@@ -163,7 +163,7 @@ describe('executeAction -- tab actions', () => {
       '/api/tabs',
       expect.objectContaining({
         agent: 'opencode',
-        model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+        model: 'provider/model',
         effort: 'high',
       }),
     )

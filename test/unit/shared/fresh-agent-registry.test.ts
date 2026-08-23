@@ -62,14 +62,14 @@ describe('resolveFreshAgentPaneCreateEffort', () => {
     })).toBeUndefined()
   })
 
-  it('keeps static-menu freshopencode models defaulting to the menu default when nothing is staged', () => {
+  it('does not fabricate effort for freshopencode models when nothing is staged (no static menu)', () => {
     expect(resolveFreshAgentPaneCreateEffort({
       sessionType: 'freshopencode',
       provider: 'opencode',
       model: 'opencode-go/glm-5.2',
       providerEffort: undefined,
       fallbackEffort: 'max',
-    })).toBe('max')
+    })).toBeUndefined()
   })
 })
 

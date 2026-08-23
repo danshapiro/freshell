@@ -18,15 +18,6 @@
     "supportsAdaptiveThinking": true
   },
   {
-    "id": "lunaroute/glm-5.2-vision",
-    "displayName": "glm-5.2-vision",
-    "provider": "opencode",
-    "source": { "id": "lunaroute", "displayName": "LunaRoute" },
-    "supportsEffort": true,
-    "supportedEffortLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-    "supportsAdaptiveThinking": true
-  },
-  {
     "id": "opencode-go/glm-5.2",
     "displayName": "GLM-5.2",
     "provider": "opencode",
@@ -60,6 +51,15 @@
     "source": { "id": "opencode-go", "displayName": "OpenCode Go" },
     "supportsEffort": true,
     "supportedEffortLevels": ["none", "thinking"],
+    "supportsAdaptiveThinking": true
+  },
+  {
+    "id": "test-custom/glm-5.2-vision",
+    "displayName": "glm-5.2-vision",
+    "provider": "opencode",
+    "source": { "id": "test-custom", "displayName": "Test Custom" },
+    "supportsEffort": true,
+    "supportedEffortLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
     "supportsAdaptiveThinking": true
   }
 ]

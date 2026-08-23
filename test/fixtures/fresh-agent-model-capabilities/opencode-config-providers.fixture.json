@@ -68,13 +68,13 @@
       }
     },
     {
-      "id": "lunaroute",
-      "name": "LunaRoute",
+      "id": "test-custom",
+      "name": "Test Custom",
       "source": "custom",
       "models": {
         "glm-5.2-vision": {
           "id": "glm-5.2-vision",
-          "providerID": "lunaroute",
+          "providerID": "test-custom",
           "name": "glm-5.2-vision",
           "status": "active",
           "variants": {
@@ -93,6 +93,6 @@
   "default": {
     "opencode-go": "glm-5.2",
     "kimi-for-coding": "k3-256k",
-    "lunaroute": "glm-5.2-vision"
+    "test-custom": "glm-5.2-vision"
   }
 }

@@ -15,7 +15,6 @@ export type FreshAgentModelOption = {
 export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
 export const FRESHCODEX_DEFAULT_EFFORT = 'max'
 export const FRESHCLAUDE_DEFAULT_EFFORT = 'high'
-export const FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/glm-5.2'
 export const FRESHOPENCODE_DEFAULT_EFFORT = 'max'
 
 export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
@@ -55,32 +54,7 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
       defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],
-  freshopencode: [
-    {
-      value: FRESHOPENCODE_DEFAULT_MODEL,
-      label: 'GLM 5.2',
-      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
-      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
-    },
-    {
-      value: 'opencode-go/glm-5.1',
-      label: 'GLM 5.1',
-      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
-      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
-    },
-    {
-      value: 'opencode-go/deepseek-v4-flash',
-      label: 'DeepSeek V4 Flash',
-      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
-      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
-    },
-    {
-      value: 'umans-ai-coding-plan/umans-kimi-k2.7',
-      label: 'Kimi k2.7',
-      thinkingEfforts: ['minimal', 'low', 'medium', 'high', 'max'],
-      defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
-    },
-  ],
+  freshopencode: [] as readonly FreshAgentModelOption[],
 } as const satisfies Record<FreshAgentSessionType, readonly FreshAgentModelOption[]>
 
 export const FRESHCODEX_MODEL_OPTIONS = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex

@@ -26,12 +26,12 @@ function makeApp(overrides: { freshAgentRuntimeManager?: any } = {}) {
 describe('agent-api fresh-agent: create', () => {
   it('POST /tabs with agent=opencode creates a fresh-agent pane and returns the sessionId', async () => {
     const { app, freshAgentRuntimeManager, wsHandler, layoutStore } = makeApp()
-    const res = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: '/repo', model: 'umans-ai-coding-plan/umans-kimi-k2.7', effort: 'high' })
+    const res = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: '/repo', model: 'provider/model', effort: 'high' })
     expect(res.status).toBe(200)
     expect(res.body.data).toMatchObject({ sessionId: 'freshopencode-abc', sessionRef: { provider: 'opencode', sessionId: 'freshopencode-abc' } })
     expect(res.body.data.paneId).toEqual(expect.any(String))
     expect(freshAgentRuntimeManager.create).toHaveBeenCalledWith(expect.objectContaining({
-      sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo', model: 'umans-ai-coding-plan/umans-kimi-k2.7', effort: 'high', requestId: expect.any(String),
+      sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo', model: 'provider/model', effort: 'high', requestId: expect.any(String),
     }))
     const snap = layoutStore.getPaneSnapshot(res.body.data.paneId)
     expect(snap?.kind).toBe('fresh-agent')

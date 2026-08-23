@@ -8,9 +8,9 @@ import {
 
 describe('splitOpencodeModel', () => {
   it('splits provider/model on the first slash only', () => {
-    expect(splitOpencodeModel('umans-ai-coding-plan/umans-kimi-k2.7')).toEqual({
-      providerID: 'umans-ai-coding-plan',
-      modelID: 'umans-kimi-k2.7',
+    expect(splitOpencodeModel('provider/model')).toEqual({
+      providerID: 'provider',
+      modelID: 'model',
     })
   })
   it('returns undefined for blank or slashless input', () => {

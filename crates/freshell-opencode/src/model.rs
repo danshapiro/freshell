@@ -9,8 +9,8 @@
 //! reference's exact clamp semantics:
 //!
 //! - **model** (`fresh-agent-models.ts:114-117`): trim; a non-empty trimmed value is
-//!   kept verbatim (opencode accepts any `provider/model`), else fall back to the
-//!   freshopencode default model (`FRESHOPENCODE_DEFAULT_MODEL`, `:18`).
+//!   kept verbatim (opencode accepts any `provider/model`), else `None` (no
+//!   hardcoded default — opencode applies its own configured default).
 //! - **effort** (`fresh-agent-models.ts:131-152`): resolve the (normalized) model's
 //!   `thinkingEfforts` menu; if the requested effort is on it keep it, else the model's
 //!   `defaultEffort` if on the menu, else the last menu entry. opencode does NOT apply
@@ -19,8 +19,6 @@
 //!   slash into `{ providerID, modelID }`; blank / slashless / edge-slash values yield
 //!   `None` so the caller omits `model` and the serve session default applies.
 
-/// `FRESHOPENCODE_DEFAULT_MODEL` (`fresh-agent-models.ts:18`).
-pub const FRESHOPENCODE_DEFAULT_MODEL: &str = "opencode-go/glm-5.2";
 /// `FRESHOPENCODE_DEFAULT_EFFORT` (`fresh-agent-models.ts:19`).
 pub const FRESHOPENCODE_DEFAULT_EFFORT: &str = "max";
 
@@ -32,47 +30,22 @@ struct ModelOption {
 }
 
 /// The freshopencode menu (`FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshopencode`,
-/// `fresh-agent-models.ts:58-83`). All four share efforts `[minimal,low,medium,high,max]`
-/// with default `max`. The Kimi entry (`:78`) is the cheapest T2 model.
-const FRESHOPENCODE_MODEL_OPTIONS: &[ModelOption] = &[
-    ModelOption {
-        value: "opencode-go/glm-5.2",
-        thinking_efforts: &["minimal", "low", "medium", "high", "max"],
-        default_effort: "max",
-    },
-    ModelOption {
-        value: "opencode-go/glm-5.1",
-        thinking_efforts: &["minimal", "low", "medium", "high", "max"],
-        default_effort: "max",
-    },
-    ModelOption {
-        value: "opencode-go/deepseek-v4-flash",
-        thinking_efforts: &["minimal", "low", "medium", "high", "max"],
-        default_effort: "max",
-    },
-    ModelOption {
-        value: "umans-ai-coding-plan/umans-kimi-k2.7",
-        thinking_efforts: &["minimal", "low", "medium", "high", "max"],
-        default_effort: "max",
-    },
-];
+/// `fresh-agent-models.ts:58-83`). Empty — opencode models come from the live
+/// catalog probe, not a static fallback. Kept as an empty slice so the
+/// normalization logic (`hasStaticMenu` / `in_static_menu`) structurally
+/// matches the TS reference and can accept entries again if needed.
+const FRESHOPENCODE_MODEL_OPTIONS: &[ModelOption] = &[];
 
 /// `defaultModelForSession(freshopencode)?.value` (`fresh-agent-models.ts:89-91`) — the
-/// first menu entry.
-fn default_model() -> &'static str {
-    FRESHOPENCODE_MODEL_OPTIONS
-        .first()
-        .map(|o| o.value)
-        .unwrap_or(FRESHOPENCODE_DEFAULT_MODEL)
+/// first menu entry, or `None` when the menu is empty (no hardcoded default).
+fn default_model() -> Option<&'static str> {
+    FRESHOPENCODE_MODEL_OPTIONS.first().map(|o| o.value)
 }
 
 /// `resolveFreshAgentModelOption(freshopencode, model)` (`fresh-agent-models.ts:93-99`):
-/// the matching menu entry, else the default (first) entry.
+/// the matching menu entry, or `None` (no fallback when the menu is empty).
 fn resolve_model_option(model: &str) -> Option<&'static ModelOption> {
-    FRESHOPENCODE_MODEL_OPTIONS
-        .iter()
-        .find(|o| o.value == model)
-        .or_else(|| FRESHOPENCODE_MODEL_OPTIONS.first())
+    FRESHOPENCODE_MODEL_OPTIONS.iter().find(|o| o.value == model)
 }
 
 /// `normalizeFreshAgentModel(freshopencode, 'opencode', model)` (`fresh-agent-models.ts:114-117`).
@@ -81,7 +54,7 @@ pub fn normalize_opencode_model(model: Option<&str>) -> Option<String> {
     if !trimmed.is_empty() {
         Some(trimmed.to_string())
     } else {
-        Some(default_model().to_string())
+        default_model().map(|s| s.to_string())
     }
 }
 
@@ -171,7 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_trims_or_falls_back_to_default() {
+    fn model_trims_or_returns_none_for_blank() {
         // Non-empty trimmed values pass through verbatim (opencode accepts any id).
         assert_eq!(
             normalize_opencode_model(Some("opencode-go/glm-5.1")).as_deref(),
@@ -181,99 +154,48 @@ mod tests {
             normalize_opencode_model(Some("  provider/model  ")).as_deref(),
             Some("provider/model")
         );
-        // The T2 baseline Kimi id survives normalization unchanged.
-        assert_eq!(
-            normalize_opencode_model(Some("umans-ai-coding-plan/umans-kimi-k2.7")).as_deref(),
-            Some("umans-ai-coding-plan/umans-kimi-k2.7")
-        );
-        // Blank / missing → the freshopencode default model.
-        assert_eq!(
-            normalize_opencode_model(Some("   ")).as_deref(),
-            Some(FRESHOPENCODE_DEFAULT_MODEL)
-        );
-        assert_eq!(
-            normalize_opencode_model(None).as_deref(),
-            Some(FRESHOPENCODE_DEFAULT_MODEL)
-        );
+        // Blank / missing → None (no hardcoded default; opencode picks its own).
+        assert_eq!(normalize_opencode_model(Some("   ")), None);
+        assert_eq!(normalize_opencode_model(None), None);
     }
 
     #[test]
-    fn effort_clamps_to_menu_with_kimi() {
-        let kimi = Some("umans-ai-coding-plan/umans-kimi-k2.7");
-        // On-menu effort is kept.
+    fn effort_passes_through_for_all_opencode_models() {
+        let model = Some("provider/model");
+        // On-menu effort passes through verbatim.
         assert_eq!(
-            normalize_opencode_effort(kimi, Some("low")).as_deref(),
+            normalize_opencode_effort(model, Some("low")).as_deref(),
             Some("low")
         );
         assert_eq!(
-            normalize_opencode_effort(kimi, Some("minimal")).as_deref(),
-            Some("minimal")
-        );
-        assert_eq!(
-            normalize_opencode_effort(kimi, Some("max")).as_deref(),
+            normalize_opencode_effort(model, Some("max")).as_deref(),
             Some("max")
         );
-        // Absent effort → the model's defaultEffort ("max").
+        // Absent effort → None (explicit Default; no variant sent).
+        assert_eq!(normalize_opencode_effort(model, None), None);
+        assert_eq!(normalize_opencode_effort(model, Some("   ")), None);
+        // Provider-custom effort names pass through verbatim.
         assert_eq!(
-            normalize_opencode_effort(kimi, None).as_deref(),
-            Some("max")
-        );
-        // Off-menu effort → clamped to the default ("max").
-        assert_eq!(
-            normalize_opencode_effort(kimi, Some("bogus")).as_deref(),
-            Some("max")
-        );
-        // 'xhigh' is NOT rewritten for opencode (codex-only) → off-menu → clamps to default.
-        assert_eq!(
-            normalize_opencode_effort(kimi, Some("xhigh")).as_deref(),
-            Some("max")
-        );
-    }
-
-    #[test]
-    fn effort_for_live_catalog_model_not_in_static_menu_passes_through() {
-        // A live-catalog model the static fallback menu does not know has no
-        // declared levels to clamp against (fresh-agent-models.ts
-        // `normalizeFreshAgentEffort` opencode branch, the `hasStaticMenu` guard):
-        // an explicit effort passes through verbatim — including provider-custom
-        // names like minimax-m3's `thinking`…
-        let unknown = Some("some-other/model");
-        assert_eq!(
-            normalize_opencode_effort(unknown, Some("thinking")).as_deref(),
+            normalize_opencode_effort(model, Some("thinking")).as_deref(),
             Some("thinking")
         );
-        assert_eq!(
-            normalize_opencode_effort(unknown, Some("xhigh")).as_deref(),
-            Some("xhigh")
-        );
-        // …and absent/blank effort is the selector's explicit "Default" row:
-        // `None`, so NO `variant` is sent and opencode applies the model's own
-        // provider-side default. (Previously this path fabricated `max`.)
-        assert_eq!(normalize_opencode_effort(unknown, None), None);
-        assert_eq!(normalize_opencode_effort(unknown, Some("   ")), None);
     }
 
     #[test]
-    fn effort_for_blank_model_resolves_via_default_menu_entry() {
-        // normalize_opencode_model(None) → the default menu entry, which IS in the
-        // static menu → legacy clamping still applies (menu default 'max').
-        assert_eq!(
-            normalize_opencode_effort(None, None).as_deref(),
-            Some(FRESHOPENCODE_DEFAULT_EFFORT)
-        );
-        assert_eq!(
-            normalize_opencode_effort(Some("  "), Some("bogus")).as_deref(),
-            Some(FRESHOPENCODE_DEFAULT_EFFORT)
-        );
+    fn effort_for_blank_model_is_none() {
+        // No static menu → blank model resolves to None → pass-through →
+        // absent effort is None (no fabricated default).
+        assert_eq!(normalize_opencode_effort(None, None), None);
+        assert_eq!(normalize_opencode_effort(Some("  "), Some("bogus")), Some("bogus".to_string()));
     }
 
     #[test]
     fn split_model_uses_first_slash_and_rejects_edges() {
         assert_eq!(
-            split_opencode_model(Some("umans-ai-coding-plan/umans-kimi-k2.7")),
+            split_opencode_model(Some("provider/model")),
             Some(OpencodeModel {
-                provider_id: "umans-ai-coding-plan".into(),
-                model_id: "umans-kimi-k2.7".into(),
+                provider_id: "provider".into(),
+                model_id: "model".into(),
             })
         );
         // Split on FIRST slash only — the model id keeps later slashes.

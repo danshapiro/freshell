@@ -25,7 +25,7 @@ import { assertT2Invariants, summarizeT2ForBaseline } from '../../../../port/ora
  *
  * COST: exactly ONE live model call per run, pinned to the cheapest wired model.
  *
- * GATE: skips ONLY when the gate is off OR opencode + the umans-kimi-k2.7
+ * GATE: skips ONLY when the gate is off OR opencode + the model
  * credential are genuinely absent. When the gate is ON and creds are present it
  * runs for real and FAILS LOUDLY on any regression (never silently skips). Never
  * wired into the shared suite — run via `npm run test:oracle:t2`.

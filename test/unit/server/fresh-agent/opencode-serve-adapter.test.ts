@@ -35,7 +35,6 @@ import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/
 import { OpencodeServeLostError } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
 import { hashForLogs } from '../../../../server/fresh-agent/observability.js'
 import { FreshAgentRecoveryStore } from '../../../../server/fresh-agent/recovery-store.js'
-import { FRESHOPENCODE_DEFAULT_MODEL } from '../../../../shared/fresh-agent-models.js'
 
 type FakeManager = ReturnType<typeof makeFakeManager>
 
@@ -123,7 +122,7 @@ describe('OpenCode serve adapter: create + send', () => {
     const adapter = makeAdapter(manager)
     const created = await adapter.create({
       requestId: 'req-1', sessionType: 'freshopencode', provider: 'opencode',
-      cwd: '/repo', model: 'umans-ai-coding-plan/umans-kimi-k2.7', effort: 'high',
+      cwd: '/repo', model: 'provider/model', effort: 'high',
     })
     expect(created).toEqual({
       sessionId: 'freshopencode-req-1',
@@ -136,13 +135,13 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.createSession).toHaveBeenLastCalledWith({ directory: '/repo' })
     expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', {
       parts: [{ type: 'text', text: 'reply ok' }],
-      model: { providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' },
+      model: { providerID: 'provider', modelID: 'model' },
       variant: 'high',
     }, { cwd: '/repo' })
     expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/repo' })
   })
 
-  it('uses the Freshopencode default model when create omits an explicit model', async () => {
+  it('omits the model key when create omits an explicit model (opencode picks its own default)', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)
     await adapter.create({
@@ -152,10 +151,9 @@ describe('OpenCode serve adapter: create + send', () => {
 
     await adapter.send?.('freshopencode-req-default-model', { text: 'reply ok' })
 
-    expect(FRESHOPENCODE_DEFAULT_MODEL).toBe('opencode-go/glm-5.2')
-    expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', expect.objectContaining({
-      model: { providerID: 'opencode-go', modelID: 'glm-5.2' },
-    }), { cwd: '/repo' })
+    expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', {
+      parts: [{ type: 'text', text: 'reply ok' }],
+    }, { cwd: '/repo' })
   })
 
   it('attach during an in-flight send reuses the materialized state (no duplicate serve subscription)', async () => {
@@ -896,7 +894,7 @@ describe('OpenCode serve adapter: create + send', () => {
 describe('OpenCode serve adapter: history reads', () => {
   const messages = [
     { info: { id: 'msg_user_1', role: 'user', time: { created: 1779557095868 } }, parts: [{ id: 'p1', type: 'text', text: 'reply ok' }] },
-    { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'umans-ai-coding-plan', modelID: 'umans-kimi-k2.7' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
+    { info: { id: 'msg_assistant_1', role: 'assistant', providerID: 'provider', modelID: 'model' }, parts: [{ id: 'p2', type: 'text', text: 'ok' }] },
   ]
 
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {

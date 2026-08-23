@@ -14,7 +14,6 @@ import {
   FRESHCODEX_DEFAULT_MODEL,
   FRESHCLAUDE_DEFAULT_EFFORT,
   FRESHOPENCODE_DEFAULT_EFFORT,
-  FRESHOPENCODE_DEFAULT_MODEL,
 } from '@/lib/fresh-agent-models'
 export {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
@@ -23,7 +22,6 @@ export {
   FRESHCLAUDE_DEFAULT_EFFORT,
   FRESHCODEX_MODEL_OPTIONS,
   FRESHOPENCODE_DEFAULT_EFFORT,
-  FRESHOPENCODE_DEFAULT_MODEL,
   FRESHOPENCODE_MODEL_OPTIONS,
   getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
@@ -45,7 +43,7 @@ export type FreshAgentRegistryEntry = {
   runtimeProvider: FreshAgentRuntimeProvider
   label: string
   icon: React.ComponentType<{ className?: string }>
-  defaultModel: string
+  defaultModel?: string
   defaultPermissionMode: string
   defaultEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   settingsVisibility: {
@@ -127,7 +125,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'opencode',
     label: 'Freshopencode',
     icon: OpencodeIcon,
-    defaultModel: FRESHOPENCODE_DEFAULT_MODEL,
+    defaultModel: undefined,
     defaultPermissionMode: 'default',
     defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
     settingsVisibility: {

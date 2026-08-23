@@ -36,7 +36,7 @@ import { assertT2Invariants, summarizeT2ForBaseline } from '../../../../port/ora
  * true differential-equivalence result, not a re-implementation.
  *
  * COST: at most ONE live Kimi call (asserted ≤ 2). GATE: skips ONLY when the gate is
- * off OR opencode + the umans-kimi-k2.7 credential are genuinely absent; when the gate
+ * off OR opencode + the model credential are genuinely absent; when the gate
  * is on and creds are present it runs for real and FAILS LOUDLY on any regression.
  *
  * SAFETY: only reaps this run's sentinel-owned pids (the Rust server + the opencode

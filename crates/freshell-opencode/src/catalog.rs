@@ -885,8 +885,8 @@ mod tests {
     }
 
     /// "derives supportedEffortLevels from the model variants map keys, ordered
-    /// canonically" — the real served order of lunaroute/glm-5.2-vision
-    /// (opencode 1.18.18) must come out low→highest.
+    /// canonically" — a model with off/minimal/low/medium/high/xhigh/max
+    /// variants (opencode 1.18.18) must come out low→highest.
     #[test]
     fn normalize_orders_variant_levels_canonically() {
         let model = normalize_single_model(json!({

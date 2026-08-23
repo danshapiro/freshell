@@ -18,7 +18,7 @@ import {
 } from '../../../test/helpers/coding-cli/real-session-contract-harness.js'
 
 const opencode = await resolveProviderBinary('opencode')
-const KIMI = 'umans-ai-coding-plan/umans-kimi-k2.7'
+const KIMI = 'provider/model'
 const describeReal = opencode.resolvedPath ? describe.sequential : describe.skip
 
 describeReal(
@@ -84,7 +84,7 @@ if (opencode.resolvedPath) {
     const probe = new OpencodeServeManager()
     const { baseUrl } = await probe.ensureStarted()
     const providers = await fetch(`${baseUrl}/config/providers`).then((r) => r.json() as any).catch(() => ({}))
-    kimiAvailable = JSON.stringify(providers).includes('umans-kimi-k2.7')
+    kimiAvailable = JSON.stringify(providers).includes('model')
     if (kimiAvailable) {
       manager = probe
       const adapter = createOpencodeFreshAgentAdapter({ serveManager: manager })

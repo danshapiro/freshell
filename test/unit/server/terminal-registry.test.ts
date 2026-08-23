@@ -1210,12 +1210,12 @@ describe('buildSpawnSpec Unix paths', () => {
         for (const key of ALL_PROVIDER_KEYS) process.env[key] = 'key'
 
         const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
-          model: 'umans-ai-coding-plan/umans-kimi-k2.7',
+          model: 'provider/model',
           opencodeServer: TEST_OPENCODE_SERVER,
         })
 
         expect(spec.args).toContain('--model')
-        expect(spec.args).toContain('umans-ai-coding-plan/umans-kimi-k2.7')
+        expect(spec.args).toContain('provider/model')
         for (const guessed of GUESSED_MODELS) expect(spec.args).not.toContain(guessed)
       })
 
