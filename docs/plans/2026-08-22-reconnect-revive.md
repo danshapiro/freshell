@@ -22,7 +22,7 @@ Fix Freshell's gray-and-dead pane reconnect bug: on WebSocket reconnect (for exa
 
 **Goal:** After any transport drop with the server still up, every open pane of every kind repairs itself: the client detects a dead or half-open socket, reconnects, reattaches (or is routed by reconcile verdicts), and repaints; and a user who closes and reopens such a pane lands attached to the still-running session instead of on a refusal.
 
-**Architecture:** Fix the wedge at each of its four layers, keeping every existing recovery contract intact. (1) Transport liveness — an app-level ping watchdog plus foreground pokes so a half-open socket is recycled into the normal reconnect path. (2) Reconcile loss — a bounded client-side wait that falls back to the legacy inventory census, plus an explicit server error instead of accept-and-strip silence on non-negotiated connections. (3) Per-pane reattach gaps — hidden-pane hydration parity on reconnect, fresh-agent `lost` revocation on truth-bearing evidence, opencode placeholder re-keying on attach ack, and a truthful claude attach-ack status. (4) Close→reopen — route reopen to the live terminal, carry the live terminal id in the D7 refusal, and fold that refusal into an attach instead of a dead-end.
+**Architecture:** Fix the wedge at each of its four layers, keeping every existing recovery contract intact. (1) Transport liveness — an app-level ping watchdog plus foreground pokes, recycling a half-open socket by *abandoning* it (handlers detached, generation-guarded, fresh socket driven immediately) rather than relying on `onclose` delivery from a dead transport. (2) Reconcile loss — a bounded client-side wait that falls back to the legacy inventory census, plus an explicit server error instead of accept-and-strip silence on non-negotiated connections. (3) Per-pane reattach gaps — hidden-pane hydration parity on reconnect, fresh-agent `lost` revocation on truth-bearing evidence, opencode placeholder re-keying on attach ack, and a truthful claude attach-ack status. (4) Close→reopen — the negotiated WS door already adopts (LB-1); the residual refusal lanes (REST doors, non-negotiated windows) carry the live terminal id in the D7 refusal, and the client folds an id-carrying refusal into an epoch-bumping reattach reducer instead of a dead-end.
 
 **Tech Stack:** React 18 / Redux Toolkit / TypeScript client (jsdom Vitest), Rust workspace server crates (`freshell-ws`, `freshell-terminal`, `freshell-freshagent`, `freshell-protocol`; cargo tests), Playwright e2e (`test/e2e-browser`, `rust-chromium` project).
 
@@ -46,7 +46,7 @@ Evidence lives in `.worktrees/.the-usual-logs/reconnect-revive/reports/` (`plan-
 1. **No transport liveness on the client.** Everything rides on the browser delivering `onclose`; a half-open socket (phone radio flap, NAT timeout, frozen tab) never starts `scheduleReconnect` (`src/lib/ws-client.ts:508-586` is onclose-only), and nothing re-asserts connectivity on foreground (no `visibilitychange`/`online`/`pageshow` poke reaches `getWsClient()`). While the socket is dead-but-open, keystrokes pour into `pendingMessages` and are filter-dropped on the eventual reconnect (`ws-client.ts:300-304`).
 2. **Reconcile-result loss is a silent wedge.** The boot `pane.reconcile.result` is unicast to the requesting socket with no client wall-clock bound (`src/App.tsx:916-918` documents the deliberate absence), and the server accept-and-strip ignores the request on non-negotiated connections (`crates/freshell-ws/src/terminal.rs:1232-1243`). A lost result leaves every pane pending-verdict = gray with zero chrome.
 3. **Per-pane reattach gaps.** Hidden terminal panes register with the hydration queue on reconnect WITHOUT enqueueing themselves when their parser checkpoint is unusable (`src/components/TerminalView.tsx:5207`, `queueIfStarted: canResumeFromParserAppliedSurface`), unlike the `terminal.created` path's three-step re-register (`TerminalView.tsx:4506-4508`). Fresh-agent codex panes wedge on `lost=true`: nothing on the reconnect path clears it (`sessionSnapshotReceived` does not; the boot-reconcile attach fold does not; the `.lost` recovery effect cannot re-fire without a dep change — `FreshAgentView.tsx:1726,2045-2077`). Opencode panes addressed by a placeholder id miss frames stamped with the materialized `ses_*` id (`opencode_ws.rs:1394-1397`). Claude attach acks hardcode `idle` (`claude.rs:1203,1373`), leaving stale-busy panes after a dead-window turn completion.
-4. **Close→reopen dead-ends.** Sidebar close is detach-only; reopen issues `terminal.create{sessionRef}` which meets the D7 live-guard → `error{RESTORE_UNAVAILABLE,"Session {sid} is still running on the server."}` (`crates/freshell-ws/src/terminal.rs:2615-2621`; REST twin `crates/freshell-freshagent/src/terminal_tabs.rs:1223-1235`) → a terminal `[Restore failed]` write (`TerminalView.tsx:4897-4901`).
+4. **Close→reopen dead-ends — but only off the negotiated WS door.** Sidebar close is detach-only; reopen issues `terminal.create{sessionRef}`. Load-bearing check LB-1 (validator report `reports/load-bearing-validator-LB-1.md`) behaviorally proved that on a `paneReconcileV1`-negotiated WS connection this create is always ADOPTED into the existing terminal (keyed arm / D8 `BoundElsewhere`) and never reaches D7. The `RESTORE_UNAVAILABLE` refusal provably fires only on the REST spawn doors (`crates/freshell-freshagent/src/terminal_tabs.rs:1223-1235`, no adopt arm exists there), on non-negotiated WS connections (mid-deploy stale bundles), and on the fresh-agent cross-kind owner arm. Where it fires, the pane dead-ends at `[Restore failed]` (`TerminalView.tsx:4897-4901`).
 
 Existing reconnect machinery that MUST stay intact (regression surface): the per-connection revival trio (re-attach on `onReconnect` with generation-tagged `terminal.attach`; boot reconcile + verdict folds; legacy census fallback), the sender-level pre-verdict create hold (`RECONCILE_VERDICT_WAIT_MS`), RebindQueue flap safety for hidden fresh-agent panes, the ws-oracle parity pins, and PR #532 launch-retry semantics.
 
@@ -55,6 +55,8 @@ Existing reconnect machinery that MUST stay intact (regression surface): the per
 ### Task 1: WS transport liveness — app-level ping watchdog + foreground reconnect poke
 
 The client recycles a silently-dead socket into the existing reconnect machinery instead of waiting forever for `onclose`. Server-side WS pings are invisible to JS, so liveness is proven by an app-level `{type:'ping'}`→`{type:'pong'}` round trip that both servers already implement (`crates/freshell-ws/src/terminal.rs` Ping dispatch; legacy `server/ws-handler.ts:1832-1835`; pinned by `test/e2e-browser/specs/ws-ping-pong-matrix.spec.ts`).
+
+**Mechanism (load-bearing LB-3, validated):** all four `scheduleReconnect` sites live inside `onclose` (`ws-client.ts:534/557/567/584`), and a dead transport cannot be trusted to deliver `onclose` promptly (or at all) in response to `ws.close()` — the browser close handshake has no reply to expect from a dead peer. So the recycle MUST NOT depend on the old socket's events: it **abandons** the socket — detaches every handler, generation-guards so a late event from the old socket is a no-op (validator LB-3 proved `connect()`'s bare `this.ws` swap corrupts the new connection otherwise), forces connection-local state down, and drives `connect()` immediately.
 
 **Files:**
 - Modify: `src/lib/ws-client.ts` (state block ~:120-150; `handleIncomingMessage` :231; `onopen` :454; `onmessage` :478; `onclose` :508; `disconnect` :644; add `tickLiveness`/`poke`/`clearLivenessWatch` methods)
@@ -94,14 +96,18 @@ describe('WsClient liveness', () => {
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(false)
   })
 
-  it('closes a socket whose probe goes unanswered past the pong timeout, entering the reconnect path', async () => {
+  it('abandons a socket whose probe goes unanswered past the pong timeout — no reliance on its onclose', async () => {
     const { socket } = await connectReady(new WsClient('ws://test/ws'))
     await vi.advanceTimersByTimeAsync(30_000)          // probe sent
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(true)
-    await vi.advanceTimersByTimeAsync(10_000)          // no pong → stale
-    expect(MockWebSocket.instances.length).toBe(1)
-    await vi.advanceTimersByTimeAsync(5_000)           // reconnect backoff lands a NEW socket
-    expect(MockWebSocket.instances.length).toBe(2)
+    // The dead transport NEVER delivers onclose — that is the hazard under test.
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(MockWebSocket.instances.length).toBe(2)     // fresh socket driven immediately
+    const fresh = MockWebSocket.instances[1]
+    fresh._open(); fresh._message(READY_MSG)           // fresh socket completes handshake
+    socket._close(4002, 'late')                        // stale socket's LATE close arrives
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(MockWebSocket.instances.length).toBe(2)     // …and is ignored (generation guard)
   })
 
   it('clears the outstanding probe on any inbound message (no close)', async () => {
@@ -118,15 +124,14 @@ describe('WsClient liveness', () => {
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(true)
   })
 
-  it('poke() after 65s+ of silence recycles immediately instead of waiting out the probe', async () => {
+  it('poke() after 65s+ of silence abandons immediately instead of waiting out the probe', async () => {
     const { client, socket } = await connectReady(new WsClient('ws://test/ws'))
     // Simulate a frozen tab: no timers ran (background clamp) but the wall
-    // clock jumped past the recycle threshold.
+    // clock jumped past the keepalive window threshold.
     vi.setSystemTime(Date.now() + 65_000)
-    client.poke()
-    await vi.advanceTimersByTimeAsync(2_000)           // reconnect backoff lands
+    client.poke()                                      // no onclose delivery from the dead socket
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(false) // no probe wait
-    expect(MockWebSocket.instances.length).toBe(2)     // recycled into a fresh socket
+    expect(MockWebSocket.instances.length).toBe(2)     // abandoned into a fresh socket
     vi.setSystemTime(Date.now() - 65_000)
   })
 
@@ -147,7 +152,7 @@ describe('WsClient liveness', () => {
 })
 ```
 
-(Redraft note: the 65s-silence case is exercised more directly by setting `vi.setSystemTime` forward past the recycle threshold with the liveness interval temporarily stopped — assert `poke()` closes the socket immediately with no preceding `ping` in `socket.sent`.)
+(`READY_MSG` is a shared fixture object `{type:'ready', bootId:'b1', serverInstanceId:'s1', capabilities:{}}` declared beside `connectReady`; every abandon test uses it for the fresh socket's handshake.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -178,9 +183,14 @@ In `handleIncomingMessage` (top): `this.lastInboundAt = Date.now(); this.probeSe
 
 In `onopen`: `this.lastInboundAt = Date.now(); this.probeSentAt = null; this.startLivenessWatch()`.
 
-New methods:
+New state + methods (the abandon mechanism replaces any reliance on the old socket's own events — LB-3):
 
 ```ts
+// Bumped for every new WebSocket; each socket's handlers capture their
+// generation and no-op once superseded (a late event from an abandoned socket
+// must never touch the live connection's state).
+private socketGen = 0
+
 private startLivenessWatch(): void {
   this.clearLivenessWatch()
   this.livenessTimer = window.setInterval(() => this.tickLiveness(), LIVENESS_INTERVAL_MS)
@@ -196,11 +206,7 @@ private tickLiveness(): void {
   const now = Date.now()
   if (this.probeSentAt !== null) {
     if (now - this.probeSentAt >= PONG_TIMEOUT_MS) {
-      // Half-open socket: the peer (or the path) is dead but the browser never
-      // delivered onclose. Recycling enters the NORMAL onclose → scheduleReconnect
-      // path; every pane-recovery mechanism keys off that.
-      log.warn('liveness probe unanswered; recycling stale socket')
-      this.ws.close()
+      this.abandonStaleSocket('liveness probe unanswered')
     }
     return
   }
@@ -210,9 +216,35 @@ private tickLiveness(): void {
 }
 
 /**
+ * Half-open socket disposal. A dead transport cannot be trusted to deliver
+ * onclose promptly (or ever), so recycling never waits on the old socket's
+ * events: handlers detach, connection-local state is forced down, and a fresh
+ * connect is driven NOW. The generation guard makes the old socket's late
+ * events no-ops (LB-3: the bare this.ws swap in connect() would otherwise let
+ * the old onclose corrupt the new connection).
+ */
+private abandonStaleSocket(reason: string): void {
+  const old = this.ws
+  if (old) {
+    old.onopen = null
+    old.onmessage = null
+    old.onclose = null
+    old.onerror = null
+    try { old.close() } catch { /* best effort: resource hygiene only */ }
+  }
+  this.ws = null
+  this._state = 'disconnected'
+  this.serverCapabilities = {}
+  this.resetReconcileHold({ requeueHeld: true })
+  this.clearLivenessWatch()
+  log.warn(`abandoning stale socket: ${reason}`)
+  this.connect().catch((err) => log.debug('reconnect after abandon failed', err))
+}
+
+/**
  * Foreground poke: re-assert connectivity when the page becomes visible/online.
  * - ready + recently active   → probe immediately (fast failure discovery).
- * - ready + silent past two server keepalive windows → recycle: the peer may
+ * - ready + silent past two server keepalive windows → abandon: the peer may
  *   already be reaped, and reconnect convergence is cheaper than the probe wait.
  * - down with a (possibly background-clamped) backoff timer pending → connect now.
  */
@@ -220,8 +252,7 @@ poke(): void {
   if (this.intentionalClose) return
   if (this._state === 'ready') {
     if (Date.now() - this.lastInboundAt >= FOREGROUND_RECYCLE_SILENCE_MS) {
-      log.info('foreground poke: silent past keepalive windows; recycling socket')
-      this.ws?.close()
+      this.abandonStaleSocket('foreground poke past keepalive windows')
       return
     }
     this.tickLiveness()
@@ -234,7 +265,15 @@ poke(): void {
 }
 ```
 
-Call `this.clearLivenessWatch()` in `onclose` (with the other clears) and in `disconnect()`.
+Generation guard inside `connect()` — after `this.ws = new WebSocket(this.url)`:
+
+```ts
+const gen = ++this.socketGen
+const socket = this.ws
+// Each handler starts with: if (gen !== this.socketGen || this.ws !== socket) return
+```
+
+Apply that one-line guard at the top of the `onopen`, `onmessage`, `onclose`, and `onerror` handlers. Also bump `this.socketGen` in `disconnect()` so a torn-down socket's late events are inert. Call `this.clearLivenessWatch()` in `onclose` (with the other clears) and in `disconnect()`.
 
 `src/App.tsx` bootstrap effect (next to the `cleanupPromise`/cleanup return, ~:1476-1487):
 
@@ -280,7 +319,7 @@ A lost `pane.reconcile.result` must no longer wedge panes pending-verdict foreve
 **Files:**
 - Modify: `src/lib/pane-reconcile.ts` (export the new constant)
 - Modify: `src/App.tsx` (~:1034-1141 ready/reconcile handlers; disconnect handler ~:766-773)
-- Modify: `crates/freshell-protocol/src/server_messages.rs` (new `ErrorCode` variant, ~:enum ErrorCode)
+- Modify: `crates/freshell-protocol/src/common.rs` (new `ErrorCode` variant; the enum lives at common.rs:74)
 - Modify: `crates/freshell-ws/src/terminal.rs` (:1232-1243 PaneReconcileRequest dispatch arm)
 - Test: `test/unit/client/components/App.reconcile-adoption.test.tsx` (add cases)
 - Test: `crates/freshell-ws/src/terminal.rs` `#[cfg(test)]` module (add rust test)
@@ -376,7 +415,7 @@ reconcileResultTimerRef.current = window.setTimeout(() => {
 
 In the `pane.reconcile.result` branch: call `clearReconcileResultWait()` right where `pendingReconcileRef.current = null` runs (fold and malformed paths alike). In the correlated `error` branch: same. In App's disconnect handling (where connection status flips away): `clearReconcileResultWait(); pendingReconcileRef.current = null` — the next ready re-sends the request; never census from stale inventory while offline.
 
-`crates/freshell-protocol/src/server_messages.rs` — add to `ErrorCode`:
+`crates/freshell-protocol/src/common.rs` (:74) — add to `ErrorCode`:
 
 ```rust
 /// pane.reconcile.request arrived on a connection that did not negotiate
@@ -652,7 +691,7 @@ if let Some(real_id) = session_real_id.as_ref() {        // existing real_sessio
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-freshagent attach_placeholder` && `npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts`
+Run: `cargo test -p freshell-freshagent attach_placeholder && npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts`
 
 Expected: PASS
 
@@ -664,9 +703,9 @@ If the send-path materialized construction and this one now duplicate, extract o
 
 The opencode attach/ack pins and the materialization-once pins:
 
-Run: `cargo test -p freshell-freshagent && npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/store/freshAgentSlice.test.ts && npm run test:vitest -- run test/integration/port/oracle/t2-opencode-equivalence-rust.test.ts`
+Run: `cargo test -p freshell-freshagent && npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/store/freshAgentSlice.test.ts test/unit/port/oracle/t2-opencode-equivalence-rust.test.ts`
 
-Expected: PASS (the oracle equivalence run checks the attach-ack capture families; the new frame appears only on placeholder-addressed tracked attach — if a frozen capture pins that path, update the oracle per its documented procedure and note it in the commit).
+Expected: PASS. LB-6 validation settled the pin surface: the only exactly-once pin (`opencode_ws.rs:2688`) covers the send path; no attach-arm test pins the emitted sequence for opencode; the differential oracle never drives an opencode attach addressed by a placeholder id and its baseline projection is duplicate-insensitive. **Constraint recorded by validation: this task must stay OPENCODE-arm-only** — codex's attach arm IS sequence-pinned by the wireshape differential and must not gain any new frame.
 
 - [ ] **Step 7: Commit the task**
 
@@ -748,73 +787,40 @@ git add crates/freshell-freshagent/src/claude.rs
 git commit -m "fix(claude): attach ack announces the session's real last status"
 ```
 
-### Task 7: Close→reopen revives the still-running session (no more D7 dead-end)
+### Task 7: Disarm the residual D7 refusal lanes (REST doors + non-negotiated windows)
 
-Close is detach-only, so the session's PTY often keeps running; reopening issues `terminal.create{sessionRef}` which the D7 live-guard correctly refuses — and the pane dead-ends at `[Restore failed]`. Disarm the trap three ways, keeping D7/D8 fully in force: (a) the reopen path routes to the live terminal when the client already knows one, (b) the refusal carries the live terminal's id on both lanes, (c) the client folds an id-carrying refusal into an attach instead of a dead-end.
+Load-bearing LB-1 (falsified; `reports/load-bearing-validator-LB-1.md`): on negotiated WS connections, close→reopen already ADOPTS via the keyed/D8 arms — the D7 guard only fires on the REST spawn doors (no adopt arm), on non-negotiated WS connections, and on the fresh-agent cross-kind owner arm. So no client routing change is made (it would duplicate the adopt arms' semantics behind a staler cache — dropped under the scope rule). What remains: (a) every refusal that CAN name a live terminal carries its id, and (b) the client's create-error fold reattaches via that id instead of dead-ending — and the reattach MUST go through an epoch-bumping reducer (LB-5: plain `updateContent` does not re-fire the lifecycle effect; deps exclude `terminalId`/`status` by design, TerminalView.tsx:5349-5392).
 
 **Files:**
-- Modify: `src/store/terminalMetaSlice.ts` (new selector)
-- Modify: `src/store/tabsSlice.ts` (`openSessionTab` :569+, new-pane arm)
-- Modify: `crates/freshell-protocol/src/server_messages.rs` (`ErrorMsg` optional field)
-- Modify: `crates/freshell-ws/src/terminal.rs` (D7 guard ~:2580-2623: include `live_terminal_id`)
-- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (REST 409 :1223-1235: include `liveTerminalId` in the JSON body)
-- Modify: `src/components/TerminalView.tsx` (create-error handler :4872-4901)
+- Modify: `crates/freshell-protocol/src/server_messages.rs` (`ErrorMsg` optional `live_terminal_id` field — next to `terminal_id`)
+- Modify: `crates/freshell-ws/src/terminal.rs` (D7 guard ~:2580-2623: include `live_terminal_id`; `send_create_error` :4464-4482 sets `live_terminal_id: None`)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (REST 409 :1223-1235: include `liveTerminalId` in the JSON body when a terminal owns the session)
 - Modify: `shared/ws-protocol.ts` (error-message schema gains optional `liveTerminalId`)
-- Test: `test/unit/client/store/terminalMetaSlice.test.ts` (add/extend)
-- Test: `test/unit/client/store/tabsSlice.test.ts` (reopen routing case)
+- Modify: `src/store/panesSlice.ts` (new reducer next to `applyReconcileAttach` :1948-1985)
+- Modify: `src/components/TerminalView.tsx` (create-error handler :4872-4901)
+- Test: `test/unit/client/store/panesSlice.reconnect.test.ts` (or the slice's existing test home — check before creating)
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (revive fold cases)
 - Test: `crates/freshell-ws/src/terminal.rs` tests; `crates/freshell-freshagent/src/terminal_tabs.rs` tests
 
 **Interfaces:**
-- Consumes: `TerminalMetaRecord{terminalId, provider, sessionId}` + `connection.liveTerminalIds`; `live_session_owner(...) -> Option<String>` (terminal id of the owner) at both guard sites.
-- Produces: `selectLiveTerminalIdForSession(state, provider, sessionId): string | undefined`; wire `error.liveTerminalId?: string`; REST 409 body gains `liveTerminalId` only when a terminal owns the session.
+- Consumes: `live_session_owner(...) -> Option<String>` (owner terminal id) at both guard sites; zod error schema in `shared/ws-protocol.ts`.
+- Produces: wire `error.liveTerminalId?: string` (omitted when absent — frozen clients byte-identical); REST 409 body gains `liveTerminalId` only when a terminal owns the session; `applyReattachToLiveTerminal({ tabId, paneId, terminalId })` — panesSlice reducer that sets `terminalId`, `status:'running'`, clears `restoreError`, and bumps `reconcileEpoch` (mirroring `applyReconcileAttach`'s proven fold shape).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-1. Selector: meta rows + live ids → the live owner id; dead id excluded; provider mismatch excluded.
-2. `openSessionTab` new-pane arm: with a live owner in state, the created pane content carries `terminalId: <owner>`, `status: 'running'`, and NO resume-create follows (spy on the WS send: no `terminal.create` for that pane).
-3. TerminalView revive fold: create-error `{code:'RESTORE_UNAVAILABLE', liveTerminalId:'t1', requestId}` → content gains `terminalId:'t1'`, `status:'running'`, a `terminal.attach` for `t1` is sent, and the pane shows a `Reconnected to the still-running session.` notice — never `[Restore failed]`; a SECOND RESTORE_UNAVAILABLE for the same createRequestId does not revive again (bound the loop) and falls through to the existing error write.
-4. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)`. Rust REST: the 409 body carries `liveTerminalId` when a terminal owns the session and omits it for the fresh-agent-cross-kind arm (no terminal id exists there).
+1. panesSlice: `applyReattachToLiveTerminal` writes terminalId/status, clears restoreError, and bumps reconcileEpoch; it is a no-op for an unknown paneKey.
+2. TerminalView revive fold: create-error `{code:'RESTORE_UNAVAILABLE', liveTerminalId:'t1', requestId}` → the pane's store state gains `terminalId:'t1'`/`status:'running'` via the new reducer, its bumped `reconcileEpoch` re-fires the lifecycle effect so a `terminal.attach` for `t1` leaves the client, and the pane shows a `Reconnected to the still-running session.` notice — never `[Restore failed]`; a SECOND RESTORE_UNAVAILABLE for the same createRequestId does NOT revive again (one-shot bound) and falls through to the existing error write.
+3. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)` when `registry_row_live` (owner known) and `None` on the fresh-agent cross-kind arm. Rust REST: the 409 body carries `liveTerminalId` when a terminal owns the session and omits it for the cross-kind arm.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/store/terminalMetaSlice.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx` and `cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx` and `cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs`
 
-Expected: FAIL because no selector/revive/payload exists yet (`selectLiveTerminalIdForSession` undefined; refusal payload lacks the id), not harness noise.
+Expected: FAIL because the reducer/revive/payload do not exist yet (`applyReattachToLiveTerminal` undefined; refusal payload lacks the id), not harness noise.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Selector (`terminalMetaSlice.ts`):
-
-```ts
-export const selectLiveTerminalIdForSession = (
-  state: { terminalMeta: TerminalMetaState; connection: { liveTerminalIds: string[] | null } },
-  provider: string,
-  sessionId: string,
-): string | undefined => {
-  const live = state.connection.liveTerminalIds
-  if (!live) return undefined
-  for (const meta of Object.values(state.terminalMeta.byTerminalId)) {
-    if (meta.provider === provider && meta.sessionId === sessionId && live.includes(meta.terminalId)) {
-      return meta.terminalId
-    }
-  }
-  return undefined
-}
-```
-
-`openSessionTab` new-pane arm (`tabsSlice.ts`, in the branch that builds fresh resume content):
-
-```ts
-const liveTerminalId = selectLiveTerminalIdForSession(state, resolvedProvider, sessionId)
-// ... when minting the new terminal pane content:
-//   liveTerminalId ? { terminalId: liveTerminalId, status: 'running', sessionRef: {provider, sessionId}, createRequestId: <fresh id> }
-//   : <existing resume content>
-```
-
-(Attach needs no create: TerminalView's create-or-attach effect takes the attach branch when `terminalId` is set — same shape the reconcile-adopt fold writes.)
-
-Wire (`server_messages.rs`):
+Wire (`server_messages.rs`, next to `terminal_id`):
 
 ```rust
 /// D7 (`RESTORE_UNAVAILABLE` only): the live terminal that owns the refused
@@ -824,18 +830,30 @@ Wire (`server_messages.rs`):
 pub live_terminal_id: Option<String>,
 ```
 
-Add it to every `ErrorMsg` literal (`send_create_error` at `terminal.rs:4464-4482` sets `live_terminal_id: None`); WS guard: capture `let owner = state.registry.live_session_owner(...)` and emit `live_terminal_id: owner.clone() when registry_row_live`; REST: put `liveTerminalId` in the 409 JSON body from the same owner; `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
+Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the 409 JSON body from the same owner (omit for the cross-kind arm). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
+
+panesSlice (next to `applyReconcileAttach`):
+
+```ts
+/** Close→reopen revival: a D7 refusal named the live owner terminal — reattach
+ * the pane to it. The reconcileEpoch bump is the lifecycle effect's ONLY
+ * re-fire signal (createRequestId is preserved), mirroring applyReconcileAttach. */
+applyReattachToLiveTerminal(state, action: PayloadAction<{ tabId: string; paneId: string; terminalId: string }>) {
+  // ...same lookup/defensive shape as applyReconcileAttach: find the pane in
+  // layouts, bail when absent; set content.terminalId, content.status='running',
+  // content.restoreError=undefined, content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
+},
+```
 
 TerminalView fold (create-error handler, before the dead-end arms):
 
 ```ts
-if (msg.code === 'RESTORE_UNAVAILABLE' && typeof (msg as { liveTerminalId?: unknown }).liveTerminalId === 'string') {
-  const liveId = (msg as { liveTerminalId: string }).liveTerminalId
+if (msg.code === 'RESTORE_UNAVAILABLE' && typeof msg.liveTerminalId === 'string') {
   // One revival per createRequestId: if the live handle died in the race, the
   // follow-on create lands the existing [Restore failed] path — never loop.
   if (reviveAttemptedRef.current !== reqId) {
     reviveAttemptedRef.current = reqId
-    updateContent({ status: 'running', terminalId: liveId, streamId: undefined, restoreError: undefined })
+    dispatch(applyReattachToLiveTerminal({ tabId, paneId: paneIdRef.current, terminalId: msg.liveTerminalId }))
     writeLocalXtermNotice(term, `\r\nReconnected to the still-running session.\r\n`)
     return
   }
@@ -846,40 +864,40 @@ if (msg.code === 'RESTORE_UNAVAILABLE' && typeof (msg as { liveTerminalId?: unkn
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npm run test:vitest -- run test/unit/client/store/terminalMetaSlice.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx && cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs && npm run typecheck`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx && cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs && npm run typecheck`
 
 Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-Keep the refusals' "still running on the server." message text byte-identical (client regexes and user muscle memory depend on it); all novelty rides the additive id field.
+Keep the refusals' "still running on the server." message text byte-identical (client regexes and user muscle memory depend on it); all novelty rides the additive id field. If `applyReattachToLiveTerminal` and `applyReconcileAttach` share lookup/fold boilerplate, extract one private helper inside panesSlice rather than exporting a new utility.
 
 - [ ] **Step 6: Run impacted-test verification**
 
 Create-error handling (incl. `fresh_after_restore_unavailable`), restore/launch ladders, REST doors, oracle/error-contract pins:
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/lib/terminal-restore.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/terminalMetaSlice.test.ts test/unit/port/oracle/t2-invariants.test.ts && cargo test -p freshell-ws && cargo test -p freshell-freshagent && cargo test -p freshell-protocol`
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/lib/terminal-restore.test.ts test/unit/client/store/panesSlice.reconnect.test.ts test/unit/port/oracle/t2-invariants.test.ts && cargo test -p freshell-ws && cargo test -p freshell-freshagent && cargo test -p freshell-protocol`
 
 Expected: PASS
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/terminalMetaSlice.ts src/store/tabsSlice.ts shared/ws-protocol.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs test/unit/client/store/terminalMetaSlice.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "fix(reopen): reattach to the still-running session instead of dead-ending on D7"
+git add shared/ws-protocol.ts src/store/panesSlice.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+git commit -m "fix(reopen): D7 refusals name the live owner; the pane reattaches instead of dead-ending"
 ```
 
 ### Task 8: E2E acceptance — reconnect revives (Rust server)
 
-First-class browser proof of the user-visible acceptance shape on the production server stack, closing the named coverage gaps (rust-side plain socket drop; "stops being gray/dead" assertions; the close→reopen revival; sequential drops mid-reattach).
+First-class browser proof of the user-visible acceptance shape on the production server stack, closing the named coverage gaps (rust-side plain socket drop; "stops being gray/dead" assertions; the refusal-lane disarm; sequential drops mid-reattach; a fresh-agent in-place socket drop). Load-bearing adjustments folded in (LB-1/LB-4): negotiated close→reopen already adopts on base, so the red-first refusal coverage lives at the REST door; the foreground-recycle window is unit-covered only (real visibilitytransition is not drivable in headless Playwright); server-SIGSTOP is the e2e dead-peer shape.
 
 **Files:**
 - Create: `test/e2e-browser/specs/reconnect-revive-rust.spec.ts`
-- Modify: `test/e2e-browser/playwright.config.ts` (register the spec in `RUST_ONLY_SPECS` :176 list AND the `rust-chromium` project `testMatch` — both, matching the convention of the neighboring entries) and confirm it is NOT in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts`)
+- Modify: `test/e2e-browser/playwright.config.ts` (register `/reconnect-revive-rust\.spec\.ts$/` in BOTH `RUST_ONLY_SPECS` :176 and the `rust-chromium` project `testMatch` list, matching the convention of the neighboring entries) and confirm it is NOT in `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts`)
 - Test: (the spec IS the test)
 
 **Interfaces:**
-- Consumes: fixtures `freshellPage`, `harness` (`forceDisconnect()`, `waitForConnection()`, `getConnectionStatus()`), `terminal` (`waitForTerminal()`, `waitForPrompt()`, `executeCommand()`, `waitForOutput()`), `RustServer`; default `recoveryOfferHandling: 'auto-decline'` (fixtures.ts:94) — no override needed since the spec owns no panel assertions.
+- Consumes: fixtures `freshellPage`, `harness` (`forceDisconnect()`, `waitForConnection()`, `getConnectionStatus()`), `terminal` (`waitForTerminal()`, `waitForPrompt()`, `executeCommand()`, `waitForOutput()`), `RustServer`; `TestServerInfo.pid` (`helpers/test-server.ts:23`) for the SIGSTOP test; default `recoveryOfferHandling: 'auto-decline'` (fixtures.ts:94) — no override needed since the spec owns no panel assertions; fake-claude-sidecar fixture idioms from `hidden-pane-rebind-rust.spec.ts` for the fresh-agent test.
 - Produces: none.
 
 - [ ] **Step 1: Write the failing (or coverage-missing) behavioral test**
@@ -888,9 +906,13 @@ First-class browser proof of the user-visible acceptance shape on the production
 import { test, expect } from '../helpers/fixtures.js'
 
 const noDeadEndText = /still running on the server|\[Restore failed\]/
+const waitReady = (page: any) => page.waitForFunction(
+  () => window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status === 'ready',
+  { timeout: 20_000 },
+)
 
 test.describe('reconnect revive (rust)', () => {
-  test('terminal pane reattaches and repaints after a bare socket drop', async ({ page, harness, terminal }) => {
+  test('terminal pane reattaches and repaints after a bare socket drop', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "rr-marker-one"')
@@ -898,10 +920,7 @@ test.describe('reconnect revive (rust)', () => {
 
     await harness.forceDisconnect()
     await harness.waitForConnection()
-    await page.waitForFunction(
-      () => window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status === 'ready',
-      { timeout: 20_000 },
-    )
+    await waitReady(page)
 
     // Settled end state, not just "ready": backlog visible again, chips gone.
     await terminal.waitForOutput('rr-marker-one', { timeout: 20_000 })
@@ -914,22 +933,30 @@ test.describe('reconnect revive (rust)', () => {
     await terminal.waitForOutput('rr-marker-two', { timeout: 10_000 })
   })
 
-  test('close -> reopen revives the still-running session instead of the "still running" refusal', async ({ page, harness, terminal }) => {
-    await terminal.waitForTerminal()
-    await terminal.waitForPrompt()
-    await terminal.executeCommand('echo "rr-close-marker"')
-    await terminal.waitForOutput('rr-close-marker')
-    // Close the tab (detach-only), then reopen the same session from the
-    // sidebar session list (the exact user workaround that dead-ended).
-    // ... drive close via the tab's close button (aria-label per the a11y
-    // contract) and reopen via the session row; assert:
-    await expect(page.getByText(noDeadEndText)).toHaveCount(0)
-    await terminal.waitForOutput('rr-close-marker', { timeout: 20_000 })
-    await terminal.executeCommand('echo "rr-after-reopen"')
-    await terminal.waitForOutput('rr-after-reopen', { timeout: 10_000 })
+  test('REST resume door names the live owner in its refusal (red-first contract)', async ({ freshellPage, page, harness, terminal }) => {
+    // Shell panes never reach D7 (create_session_locator → None for shell):
+    // use a provider-mode (claude) terminal pane, hermetically seeded with a
+    // known session id, per the opencode-terminal-restore / session-directory
+    // donor idioms. Close it (detach-only), then drive the REST door:
+    //   POST /api/tabs { mode:'claude', sessionRef:{provider:'claude', sessionId:<id>}, ... }
+    // via page.evaluate(fetch). Assert on base-vs-after behavior:
+    //   - status is STILL 409 (D7 stays in force — doctrine),
+    //   - body.code === 'RESTORE_UNAVAILABLE',
+    //   - body.liveTerminalId === the still-running terminal's id   ← red on base
+    //     (reopen in the same client adopts namelessly via WS; this field is
+    //     what lets any refused caller reattach).
   })
 
-  test('two sequential drops mid-reattach converge to a live pane', async ({ page, harness, terminal }) => {
+  test('sidebar close -> reopen of a live session converges (regression pin)', async ({ freshellPage, page, harness, terminal }) => {
+    // LB-1 proved the negotiated WS door adopts on base: this test is GREEN on
+    // base and after — it pins the adopt arm so the Task 7 refusal-lane work
+    // never regresses it. Provider-mode pane with a known session id; close tab
+    // (detach-only); reopen from the sidebar session row; assert no dead-end
+    // text and output continuity (marker + post-reopen input round-trip).
+    await expect(page.getByText(noDeadEndText)).toHaveCount(0)
+  })
+
+  test('two sequential drops mid-reattach converge to a live pane', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "rr-double"')
@@ -938,44 +965,67 @@ test.describe('reconnect revive (rust)', () => {
     await harness.waitForConnection()
     await harness.forceDisconnect() // drop again before reattach could settle
     await harness.waitForConnection()
-    await page.waitForFunction(
-      () => window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status === 'ready',
-      { timeout: 20_000 },
-    )
+    await waitReady(page)
     await terminal.executeCommand('echo "rr-double-after"')
     await terminal.waitForOutput('rr-double-after', { timeout: 20_000 })
     await expect(page.getByText(noDeadEndText)).toHaveCount(0)
   })
+
+  test('server-process freeze (dead-peer shape) converges after thaw', async ({ freshellPage, page, harness, terminal, testServer }) => {
+    test.slow() // ~45s freeze window: trips the 30s probe + 10s pong timeout
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await terminal.executeCommand('echo "rr-freeze"')
+    await terminal.waitForOutput('rr-freeze')
+    // SIGSTOP the SERVER (kernel holds the client sockets open; no close frame
+    // reaches the client — the true phone-background shape). Precedent:
+    // terminal-background-freeze-catchup.spec.ts (+win32 gate).
+    process.kill(testServer.info.pid, 'SIGSTOP')
+    await new Promise((r) => setTimeout(r, 45_000)) // client probe+timeout fires inside this window
+    process.kill(testServer.info.pid, 'SIGCONT')
+    await harness.waitForConnection()
+    await waitReady(page)
+    await terminal.executeCommand('echo "rr-thawed"')
+    await terminal.waitForOutput('rr-thawed', { timeout: 30_000 })
+    await expect(page.getByText(noDeadEndText)).toHaveCount(0)
+  })
+
+  test('fresh-agent pane transcript repaints after a bare socket drop', async ({ freshellPage, page, harness }) => {
+    // Donor: hidden-pane-rebind-rust.spec.ts + its fake-claude-sidecar fixture
+    // (FAKE_CLAUDE_SIDECAR_SOURCE + seeded transcript). Arrange a VISIBLE
+    // freshclaude pane with one completed turn; forceDisconnect(); reconnect;
+    // assert the prior turn renders (HTTP snapshot 'reconnect' fetch fired and
+    // committed) and the composer is enabled — the Task 4/5 wedge would leave
+    // it 'Read-only session' with an empty transcript.
+  })
 })
 ```
-
-(The close/reopen test's exact sidebar driving idioms come from the session-directory specs; the assertions above are the contract. A flaky-looking first red run is acceptable evidence of the missing behavior; a selector error is not.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts`
 
-Expected (before Tasks 1-7 land, or when run against base): the close→reopen test FAILS with the "still running on the server" text; sequential-drop may already pass with Tasks 1-3 landed. In plan order this task runs last, so record the residual failure evidence if any test still cannot go green.
+Expected against base: the REST-door contract test FAILS on the missing `liveTerminalId` field; the freeze test fails without the Task 1 watchdog (pane never revives inside the window); sidebar-adoption pin and plain-drop tests may already pass (documented pins). Record a per-test base-status table in the task's execution notes. In plan order this task runs last; any test still red after Tasks 1-7 is the LB-2 completeness signal — stop and attribute it before proceeding.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Register the spec (`/reconnect-revive-rust\.spec\.ts$/`) in `RUST_ONLY_SPECS` and the `rust-chromium` `testMatch` list with a one-line comment (socket-drop revival, not restartAbrupt-shaped). Production code is Tasks 1-7; this task adds no other production change.
+Register the spec in `RUST_ONLY_SPECS` and the `rust-chromium` `testMatch` list with a one-line comment (socket-drop/freeze revival; drives RustServer + forceDisconnect + SIGSTOP). Production code is Tasks 1-7; this task adds no other production change.
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts`
 
-Expected: PASS (3/3)
+Expected: PASS (6/6). Also run once on the CLOUD backend before the PR per repo rule: `bash scripts/e2e-cloud.sh run --project=rust-chromium reconnect-revive-rust` (or the documented shard filter form) — a spec sitting in CLOUD_SKIP_SPECS is not coverage.
 
 - [ ] **Step 5: Refactor while green**
 
-Extract a tiny shared `expectNoDeadEnd(page)` local helper if the triple-reading gets noisy; keep assertions explicit.
+Extract a tiny shared `expectLivePaneAfterReconnect(page, terminal)` helper if the four terminal tests' tails get noisy; keep assertions explicit. Do not parameterize the freeze window — flakiness hides there.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The spec registration edits touch project gating; run the neighboring rust reconnect family plus the config's own consumers:
+The spec registration edits touch project gating; run the neighboring rust reconnect family:
 
-Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts` and `npm run test:vitest -- run test/e2e/vitest.config consumers` (only if such a config test exists; otherwise omit)
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts`
 
 Expected: PASS
 
@@ -983,11 +1033,12 @@ Expected: PASS
 
 ```bash
 git add test/e2e-browser/specs/reconnect-revive-rust.spec.ts test/e2e-browser/playwright.config.ts
-git commit -m "test(e2e): prove reconnect revives terminal panes on the rust server"
+git commit -m "test(e2e): prove reconnect revives panes on the rust server (drop, freeze, close-reopen, fresh-agent)"
 ```
 
 ## Cross-Cutting Notes
 
+- **Load-bearing resolution record (stage 2):** ledger at `.worktrees/.the-usual-logs/reconnect-revive/load-bearing-ledger.md`; validator reports under `reports/load-bearing-validator-*.md`. LB-1 falsified (WS negotiated close→reopen already adopts — retargeted Task 7, dropped its client-routing arm under the scope rule). LB-3 confirmed → Task 1 uses abandon-and-reconnect with generation guards. LB-4 substantiated → dead-peer e2e shape is server-SIGSTOP; the 65s foreground recycle is unit-covered only (headless Playwright cannot drive real visibility transitions; recorded tradeoff). LB-5 confirmed → Task 7's revive goes through the epoch-bumping `applyReattachToLiveTerminal` reducer. LB-6 confirmed (opencode attach arm only; codex's attach arm stays untouched — it is sequence-pinned by the wireshape differential). LB-7 confirmed → the 30s liveness interval needs no suite guards. LB-2 (completeness) is deferred to Stage 4 by design: Task 8's per-test base-status table plus attribution rubric is its evidence vehicle.
 - **Deferred residue (out of scope by the User Request):** multi-view/multi-device attach and adopt/view policies (#4/#2/#3); server-side retention-overflow signaling (`replayResetReason`) beyond what existing replay-gap handling surfaces; broadcast-bus replay across the dead window (all recovery here is pull/re-ask based, per the existing architecture).
 - **Frozen clients:** pre-reconcile clients never send `pane.reconcile.request` and never receive the new error code; all additive wire fields are omitted when absent. Old client + new server converges via the census. New client + old server: the watchdog/poke never needs the server to know about it; the reconcile wait expires into the census; the D7 revival only fires when the server sends the id (absent → today's `[Restore failed]` path, unchanged).
 - **Perf/visible-first audits:** liveness pings fire only on ≥30s inbound silence and never before ready; no new pre-ready HTTP traffic is introduced.
