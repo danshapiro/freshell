@@ -795,6 +795,12 @@ export class WsClient {
       // gate (fresh-eyes F1 — routing this through tickLiveness's guard could
       // never fire the immediate probe the tests pin).
       if (this.probeSentAt === null) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          // Ready state with a non-open socket: a dead-in-flight close that
+          // may never deliver onclose — abandon rather than throw into send().
+          this.abandonStaleSocket('foreground poke: socket not open')
+          return
+        }
         this.probeSentAt = Date.now()
         this.sendNow({ type: 'ping' })
       }
