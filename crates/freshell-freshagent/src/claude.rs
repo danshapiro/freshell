@@ -211,15 +211,17 @@ struct ClaudeSession {
     broadcast_id: Arc<std::sync::Mutex<String>>,
     /// The folded pending approval/question set (Task 2) — see [`ClaudePending`].
     pending: Arc<std::sync::Mutex<ClaudePending>>,
-    /// Last status the sidecar announced for this session (the stdout consumer's
-    /// `sdk.status` fold). Read by the attach-ack sites so a reconnect ack tells the
-    /// truth instead of the hardcoded "idle" that used to wedge stale-busy/stale-idle
-    /// panes. Starts "idle" — a fresh/just-resumed session has announced nothing else.
+    /// The session's tracked status (the stdout consumer's fold: the reference
+    /// bridge's turn lifecycle — `running` on `sdk.assistant`, `idle` on every
+    /// `sdk.result` — plus the raw `sdk.status` wire values folded on top).
+    /// Read by the attach-ack sites so a reconnect ack tells the truth instead of
+    /// the hardcoded "idle" that used to wedge stale-busy/stale-idle panes.
+    /// Starts "idle" — a fresh/just-resumed session has announced nothing else.
     last_status: Arc<std::sync::Mutex<String>>,
 }
 
 impl ClaudeSession {
-    /// The last status the sidecar announced for this session (the stdout consumer's
+    /// The session's tracked status (the stdout consumer's turn-lifecycle +
     /// `sdk.status` fold) — the truth the attach acks speak.
     fn current_status(&self) -> String {
         self.last_status.lock().expect("last status lock").clone()
@@ -514,7 +516,7 @@ impl FreshClaudeState {
         // binding row at `sdk.session.init`.
         let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
-        // Fresh session: nothing announced yet; the consumer's sdk.status fold owns it.
+        // Fresh session: nothing announced yet; the consumer's status fold owns it.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
         let consumer = self.spawn_consumer(
             reader,
@@ -1050,7 +1052,7 @@ impl FreshClaudeState {
     /// |---|---|
     /// | tracked under `msg.session_id` | no-op -- NO frame (wire-shape parity, unchanged). Safe against dead sidecars ONLY because the consumer-exit eviction removes dead entries (ledger A9) |
     /// | untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) -- unchanged fallback (also covers the verified A2 edge: a pane that never learned its UUID pre-kill attaches bare; lost -> client re-create is the designed, non-destructive outcome) |
-    /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
+    /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the `freshAgent.session.snapshot` stamped with the durable and the session's TRACKED status (the consumer's turn-lifecycle + sdk.status fold, never a hardcoded idle) -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
     /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
     /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit a `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) -- carrying the session's tracked status ("idle" for a fresh resume, by construction) |
     /// | untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
@@ -1210,7 +1212,9 @@ impl FreshClaudeState {
             match guard.get(&map_key) {
                 Some(session) => {
                     // Alias, don't move: flip only the envelope stamp. The status the
-                    // ack speaks is the consumer's sdk.status fold — truth at ack time.
+                    // ack speaks is the consumer's tracked-status fold — truth at
+                    // ack time (a completed turn settles it; a live compaction or
+                    // in-flight turn announces truthfully).
                     *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
                     Some(session.current_status())
                 }
@@ -1394,9 +1398,19 @@ impl FreshClaudeState {
             }
         }
 
-        // Read the tracked status (identical to the hardcoded "idle" it replaces for
-        // a fresh resume — truthful by construction) rather than repeating a literal.
-        let last_announced = last_status.lock().expect("last status lock").clone();
+        // Read the tracked status through the same `current_status()` helper the
+        // rebind arm uses (the session was registered above; the lease-revocation
+        // teardown already returned). Identical to the hardcoded "idle" it replaces
+        // for a fresh resume — truthful by construction. The None fallback covers a
+        // sidecar that died before this read (already EOF-evicted by its consumer):
+        // nothing was ever announced, so "idle" stays the truthful default.
+        let last_announced = self
+            .sessions
+            .lock()
+            .await
+            .get(&msg.session_id)
+            .map(ClaudeSession::current_status)
+            .unwrap_or_else(|| "idle".to_string());
         self.broadcast(&status_snapshot_frame(
             &msg.session_id,
             durable,
@@ -1440,9 +1454,13 @@ impl FreshClaudeState {
     /// `pending` (Task 2): the shared pending approval/question handle the consumer
     /// folds `sdk.permission.*`/`sdk.question.*` lines into BEFORE the normalize/
     /// broadcast step (so a respond racing the event never sees stale membership).
-    /// `last_status`: the shared last-announced-status handle the attach acks read;
-    /// the consumer folds every `sdk.status` line into it BEFORE the broadcast step
-    /// (so an ack racing a status event never understates the tracked status).
+    /// `last_status`: the shared tracked-status handle the attach acks read; the
+    /// consumer folds the turn lifecycle (`sdk.assistant` → "running", every
+    /// `sdk.result` → "idle" — the reference bridge's semantics) and the raw
+    /// `sdk.status` wire values on top into it BEFORE the broadcast step (so an
+    /// ack racing a status event never understates the tracked status). The
+    /// result-edge settle means a mid-turn "compacting" can never wedge the
+    /// tracker past the turn's completion.
     #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
     fn spawn_consumer(
         &self,
@@ -1473,13 +1491,27 @@ impl FreshClaudeState {
                 // normalize/broadcast step, so a respond racing the event never
                 // observes a stale membership check.
                 fold_pending_frame(&pending, &value);
-                // Fold the sidecar's announced status per session BEFORE the
-                // broadcast step: the attach-ack sites read this so a reconnect ack
-                // speaks the REAL last status instead of a hardcoded "idle".
-                if value.get("type").and_then(Value::as_str) == Some("sdk.status") {
-                    if let Some(status) = value.get("status").and_then(Value::as_str) {
-                        *last_status.lock().expect("last status lock") = status.to_string();
+                // Fold the session's tracked status BEFORE the broadcast step, so an
+                // ack racing an event never understates it. Mirror the reference
+                // bridge's lifecycle (server/sdk-bridge.ts): sdk.assistant marks the
+                // turn "running" (:426), EVERY sdk.result settles it back to "idle"
+                // (:445) — so a mid-turn "compacting" can never wedge the tracker
+                // for the rest of the session's life — and the raw sdk.status wire
+                // value folds on top (:351-352 compacting announces truthfully
+                // mid-turn; the stream-end idle is a no-op after the last result).
+                match value.get("type").and_then(Value::as_str) {
+                    Some("sdk.assistant") => {
+                        *last_status.lock().expect("last status lock") = "running".to_string();
                     }
+                    Some("sdk.result") => {
+                        *last_status.lock().expect("last status lock") = "idle".to_string();
+                    }
+                    Some("sdk.status") => {
+                        if let Some(status) = value.get("status").and_then(Value::as_str) {
+                            *last_status.lock().expect("last status lock") = status.to_string();
+                        }
+                    }
+                    _ => {}
                 }
                 // Restart-parity (plan §2.8 item 2): record the durable Claude UUID.
                 // The index insert is load-bearing; the session-field copy is
@@ -2342,6 +2374,29 @@ pub(crate) mod tests {
         .unwrap_or_else(|_| panic!("freshAgent.event with inner type {inner_type} within budget"))
     }
 
+    /// Bounded drain until a `freshAgent.status` broadcast carrying `status` arrives.
+    /// The consumer folds the tracked status BEFORE it broadcasts the matching
+    /// wire frame, so observing this frame proves the fold the attach acks read
+    /// has landed — the arrangement races nothing.
+    async fn await_status_on_wire(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        status: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.status"
+                    && frame["event"]["status"] == status
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freshAgent.status{{status:{status}}} within budget"));
+    }
+
     /// Bounded drain until a TOP-LEVEL `error` ServerMessage arrives; returns its message.
     async fn await_top_level_error(rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -2488,13 +2543,15 @@ pub(crate) mod tests {
     }
 
     /// The rebind arm's ack must announce the session's REAL tracked status (the
-    /// stdout consumer's `sdk.status` fold), not a hardcoded `"idle"`: attaching to a
-    /// live session while a turn is running must not flip the pane to idle, and a
-    /// completion that landed in the reconnect dead window must be told truthfully by
-    /// the ack that rescues the pane. The arrangement drives a `running` status
-    /// through the REAL consumer fold (the fake sidecar's `__set_status__` hook), and
-    /// the fold is observed on the WIRE (the `freshAgent.status` broadcast) before the
-    /// attach, so the assertion races nothing.
+    /// stdout consumer's status fold), not a hardcoded `"idle"`: attaching to a
+    /// live session mid-compaction must keep the pane truthfully busy instead of
+    /// flipping it to idle, and a completion that landed in the reconnect dead
+    /// window must be told truthfully by the ack that rescues the pane. The
+    /// arrangement drives a REAL wire value (`compacting` — one of the two
+    /// statuses the production sidecar actually announces, index.mjs:151-153)
+    /// through the REAL consumer fold (the fake sidecar's `__set_status__`
+    /// hook), and the fold is observed on the WIRE (the `freshAgent.status`
+    /// broadcast) before the attach, so the assertion races nothing.
     #[tokio::test]
     async fn attach_rebind_ack_stamps_the_tracked_live_status_not_hardcoded_idle() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -2514,28 +2571,12 @@ pub(crate) mod tests {
             .await
             .insert(durable.to_string(), session_id.clone());
 
-        // Drive sdk.status { status: "running" } through the REAL stdout consumer fold,
-        // and wait until its broadcast is observable — the fold (which the ack reads)
-        // lands before that broadcast, so the attach below sees "running".
-        st.handle_send(send_msg(&session_id, "__set_status__:running"))
+        // Drive sdk.status { status: "compacting" } through the REAL stdout consumer
+        // fold, and wait until its broadcast is observable — the fold (which the ack
+        // reads) lands before that broadcast, so the attach below sees "compacting".
+        st.handle_send(send_msg(&session_id, "__set_status__:compacting"))
             .await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let raw = tokio::time::timeout(remaining, rx.recv())
-                .await
-                .expect(
-                    "the __set_status__:running sdk.status frame never reached the broadcast bus",
-                )
-                .expect("broadcast bus closed");
-            let frame: Value = serde_json::from_str(&raw).unwrap();
-            if frame["type"] == "freshAgent.event"
-                && frame["event"]["type"] == "freshAgent.status"
-                && frame["event"]["status"] == "running"
-            {
-                break;
-            }
-        }
+        await_status_on_wire(&mut rx, "compacting").await;
 
         // The reconnect rescue: attach addressing the durable id → the REBIND arm.
         st.handle_attach(attach_msg_with_resume("late-attacher", durable))
@@ -2544,8 +2585,104 @@ pub(crate) mod tests {
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
         assert_eq!(frame["sessionId"], durable);
         assert_eq!(
-            frame["event"]["status"], "running",
+            frame["event"]["status"], "compacting",
             "the rebind ack must speak the session's tracked status, not a hardcoded idle: {frame}"
+        );
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
+    }
+
+    /// A mid-turn `compacting` must NOT wedge the tracked status for the rest of
+    /// the session's life. The tracker's fold mirrors the reference bridge's
+    /// lifecycle (sdk-bridge.ts:445): EVERY `sdk.result` settles the status back
+    /// to `"idle"`, so once the compacted turn completes, the close-and-reopen
+    /// rescue ack announces `"idle"` — never a sticky `compacting` that leaves
+    /// the revived pane blue with user input queueing forever (the client's
+    /// flush gate runs only when `!isBusy`). Both transitions are driven through
+    /// the REAL consumer fold (fake-sidecar hooks) in the REAL value space, and
+    /// each fold is observed on the WIRE before the attach, so the assertion
+    /// races nothing.
+    #[tokio::test]
+    async fn attach_rebind_ack_settles_to_idle_once_the_compacted_turn_completes() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        // A tracked live claude session (fake sidecar standing in for the Node one).
+        st.handle_create(dedup_create_msg("req-settle-status")).await;
+        let created = await_claude_created(&mut rx, "req-settle-status").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Alias a durable id at it (as above: live the init fold writes this row).
+        let durable = "8b8b8b8b-8b8b-48b8-8b8b-8b8b8b8b8b8b";
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), session_id.clone());
+
+        // The wedge repro: a turn compacts mid-flight → tracked status "compacting".
+        st.handle_send(send_msg(&session_id, "__set_status__:compacting"))
+            .await;
+        await_status_on_wire(&mut rx, "compacting").await;
+
+        // The compacted turn completes: sdk.result is the settle edge. Observing
+        // its broadcast proves the settle fold has landed.
+        st.handle_send(send_msg(&session_id, "__emit_result__")).await;
+        let _ = await_frame_of_inner_type(&mut rx, "freshAgent.result").await;
+
+        // The reconnect rescue AFTER the turn settled: the ack must speak "idle",
+        // never the pre-completion "compacting".
+        st.handle_attach(attach_msg_with_resume("late-attacher-settled", durable))
+            .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], durable);
+        assert_eq!(
+            frame["event"]["status"], "idle",
+            "a completed turn must settle the tracked status (no sticky compacting): {frame}"
+        );
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
+    }
+
+    /// Attaching while a turn is genuinely in flight must ack `"running"` — the
+    /// reference bridge's per-turn lifecycle edge (sdk-bridge.ts:426 — the real
+    /// sidecar announces NO `sdk.status: running`, busy is derived from stream
+    /// deltas, so this arm is the only way the tracker ever speaks "running").
+    /// Drives a REAL `sdk.assistant` frame through the fold and observes its
+    /// broadcast before the attach, so the assertion races nothing.
+    #[tokio::test]
+    async fn attach_rebind_ack_speaks_running_while_a_turn_is_in_flight() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        // A tracked live claude session (fake sidecar standing in for the Node one).
+        st.handle_create(dedup_create_msg("req-running-status")).await;
+        let created = await_claude_created(&mut rx, "req-running-status").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Alias a durable id at it (as above: live the init fold writes this row).
+        let durable = "7a7a7a7a-7a7a-47a7-8a7a-7a7a7a7a7a7a";
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), session_id.clone());
+
+        // A turn starts: sdk.assistant is the running edge. Observing its
+        // broadcast proves the running fold has landed.
+        st.handle_send(send_msg(&session_id, "__emit_assistant__")).await;
+        let _ = await_frame_of_inner_type(&mut rx, "freshAgent.assistant").await;
+
+        // The reconnect rescue mid-turn: the ack must speak "running".
+        st.handle_attach(attach_msg_with_resume("late-attacher-midturn", durable))
+            .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], durable);
+        assert_eq!(
+            frame["event"]["status"], "running",
+            "the rebind ack must speak \"running\" while a turn is in flight: {frame}"
         );
         assert_eq!(frame["event"]["timelineSessionId"], durable);
         drop(env);
@@ -2834,7 +2971,10 @@ pub(crate) mod tests {
     /// `handleInterrupt`); on `{"type":"shutdown"}` it exits. Task 2 arms: a magic send
     /// of `__raise_permission__` emits a canned `sdk.permission.request` (the canUseTool
     /// stand-in — the fake parks nothing), a magic send of `__set_status__:<status>`
-    /// emits a real `sdk.status` frame (the attach-ack status-arrangement hook), and
+    /// emits a real `sdk.status` frame (the attach-ack status-arrangement hook),
+    /// `__emit_assistant__` emits a real `sdk.assistant` frame (a turn's RUNNING edge)
+    /// and `__emit_result__` a real `sdk.result` frame (a completed turn's SETTLE edge
+    /// — the real sidecar emits it on every SDK result whatever the subtype), and
     /// `permission.respond`/`question.respond`/non-magic `send` frames append the full
     /// received line to `FRESHELL_TEST_CLAUDE_RESPOND_LOG` (the assertion surface for
     /// the respond/compact handlers' exact stdin frame shapes).
@@ -2892,6 +3032,14 @@ rl.on('line', (line) => {
       // non-default tracked status through the REAL stdout consumer fold (the attach
       // ack under test speaks it back).
       process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId: msg.sessionId, status: msg.text.slice('__set_status__:'.length) }) + '\n')
+    } else if (msg.text === '__emit_assistant__') {
+      // Reconnect-revive hook: emit a real sdk.assistant frame (the real wire shape —
+      // index.mjs:165) so a test can drive the tracker's turn-start ("running") fold.
+      process.stdout.write(JSON.stringify({ type: 'sdk.assistant', sessionId: msg.sessionId, content: [{ type: 'text', text: 'part' }], model: 'fake-model' }) + '\n')
+    } else if (msg.text === '__emit_result__') {
+      // Reconnect-revive hook: emit a real sdk.result frame (the real wire shape —
+      // index.mjs:177) so a test can drive the tracker's turn-complete settle fold.
+      process.stdout.write(JSON.stringify({ type: 'sdk.result', sessionId: msg.sessionId, result: 'success', durationMs: 1, costUsd: 0, usage: {} }) + '\n')
     } else if (respondLog) {
       // Non-magic sends (e.g. `/compact …`) land in the respond log verbatim so
       // tests can assert the exact stdin frame shape the compact handler writes.
