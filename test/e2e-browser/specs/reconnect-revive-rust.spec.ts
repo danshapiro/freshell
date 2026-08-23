@@ -694,7 +694,12 @@ test.describe('reconnect revive (rust)', () => {
         { timeout: 60_000 },
       )
     } finally {
-      process.kill(pid, 'SIGCONT') // never leave the fixture server stopped
+      try {
+        process.kill(pid, 'SIGCONT') // never leave the fixture server stopped
+      } catch {
+        // Process already gone (fixture teardown raced us) — the primary
+        // error from the test body stays the reported failure.
+      }
       await page.evaluate(() => clearInterval((window as any).__rrTimer)).catch(() => {})
     }
     await harness.waitForConnection(30_000)
