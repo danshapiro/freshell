@@ -11,6 +11,7 @@ import panesReducer, {
 import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer, { markSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
+import connectionReducer, { setStatus } from '@/store/connectionSlice'
 import {
   FreshAgentView,
   FRESH_AGENT_RESERVE_RETRY_FLOOR_MS,
@@ -19,7 +20,11 @@ import {
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { useAppSelector } from '@/store/hooks'
 import { resetRebindQueueForTests } from '@/lib/rebind-queue'
-import { setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import {
+  buildReconcileRequestForPanes,
+  foldVerdicts,
+  setFreshAgentReconcileActive,
+} from '@/lib/pane-reconcile'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
@@ -89,8 +94,18 @@ function createStore() {
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
       tabs: tabsReducer,
+      // The .lost recovery driver is gated on connection.status === 'ready';
+      // preload ready so existing tests keep their pre-gate behavior, and flip
+      // it deliberately in the reconnect-evidence cases.
+      connection: connectionReducer,
     },
     preloadedState: {
+      connection: {
+        status: 'ready' as const,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
       panes: {
         layouts: {},
         activePane: {},
@@ -183,6 +198,23 @@ function leafContent(state: ReturnType<typeof store.getState>): FreshAgentPaneCo
     throw new Error('Expected fresh-agent leaf content')
   }
   return layout.content
+}
+
+// markSessionLost no-ops when the session record does not exist, so seed
+// it first (setSessionStatus routes through resolveOrEnsureSession) -- the
+// exact shape fresh-agent-ws produces before dispatching markSessionLost.
+function markSessionLostInStore(sessionId = 'live-1') {
+  act(() => {
+    store.dispatch(setSessionStatus({ sessionId, sessionType: 'freshclaude', provider: 'claude', status: 'running' }))
+    store.dispatch(markSessionLost({ sessionId, sessionType: 'freshclaude', provider: 'claude' }))
+  })
+}
+
+function sessionInStore(state: ReturnType<typeof store.getState>, sessionId: string) {
+  const key = makeFreshAgentSessionKey({ sessionId, sessionType: 'freshclaude', provider: 'claude' })
+  const session = state.freshAgent.sessions[key]
+  if (!session) throw new Error(`Missing freshAgent session ${sessionId}`)
+  return session
 }
 
 // Shared harness setup for both describes (Task 9 fold drive, Task 10
@@ -340,23 +372,6 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
 // capability-gated fallback (council rule: NEVER deleted).
 describe('FreshAgentView .lost capability gate (Task 10)', () => {
   const ORIGINAL_CREATE_REQUEST_ID = baseContent.createRequestId
-
-  // markSessionLost no-ops when the session record does not exist, so seed
-  // it first (setSessionStatus routes through resolveOrEnsureSession) -- the
-  // exact shape fresh-agent-ws produces before dispatching markSessionLost.
-  function markSessionLostInStore(sessionId = 'live-1') {
-    act(() => {
-      store.dispatch(setSessionStatus({ sessionId, sessionType: 'freshclaude', provider: 'claude', status: 'running' }))
-      store.dispatch(markSessionLost({ sessionId, sessionType: 'freshclaude', provider: 'claude' }))
-    })
-  }
-
-  function sessionInStore(state: ReturnType<typeof store.getState>, sessionId: string) {
-    const key = makeFreshAgentSessionKey({ sessionId, sessionType: 'freshclaude', provider: 'claude' })
-    const session = state.freshAgent.sessions[key]
-    if (!session) throw new Error(`Missing freshAgent session ${sessionId}`)
-    return session
-  }
 
   it('.lost with fresh-agent reconcile active sends a single-pane reconcile instead of heuristic recovery', async () => {
     setFreshAgentReconcileActive(true)
@@ -540,5 +555,113 @@ describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
       await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
     })
     expect(sentOfType('freshAgent.attach').length).toBeGreaterThan(attachesBefore) // re-driven
+  })
+})
+
+// reconnect-revive Task 4: a fresh-agent pane whose slice entry got lost=true
+// from a transient dead-window attach race must UNWEDGE on truth-bearing
+// reconnect evidence -- (a) the server-authoritative Live -> attach verdict
+// fold revokes the flag (re-arming the suppressed snapshot fetch), and (b) a
+// fresh reconnect re-runs the .lost recovery driver even when every other dep
+// is unchanged. fresh-eyes F4: recovery acts only on post-reconnect evidence
+// -- a ready -> disconnected flip must clear nothing and mint nothing.
+describe('FreshAgentView lost revocation on reconnect evidence (reconnect-revive Task 4)', () => {
+  const CODEX_THREAD = 'thread-live-1'
+  const codexLostLoc = { sessionId: CODEX_THREAD, sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const codexKey = makeFreshAgentSessionKey(codexLostLoc)
+
+  function setConnection(status: 'disconnected' | 'ready') {
+    act(() => { store.dispatch(setStatus(status)) })
+  }
+
+  it('a server-authoritative attach fold revokes lost and the next snapshot-fetch run issues the HTTP GET', async () => {
+    // Codex pane with its durable id already as sessionId (no sessionId change
+    // possible): lost=true suppresses the snapshot GET (a guaranteed 404
+    // against a thread the client believes dead), and only the BOOT reconcile
+    // fold (foldVerdicts -- NOT this view's own .lost fold) can revoke it.
+    setFreshAgentReconcileActive(true) // keep the .lost driver on the reconcile path (never resets pane content)
+    act(() => {
+      store.dispatch(setSessionStatus({ ...codexLostLoc, status: 'running' }))
+      store.dispatch(markSessionLost(codexLostLoc))
+    })
+    expect(store.getState().freshAgent.sessions[codexKey].lost).toBe(true)
+
+    renderFreshAgentPane({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: CODEX_THREAD,
+      sessionRef: { provider: 'codex', sessionId: CODEX_THREAD },
+      status: 'connected',
+    })
+    await flush()
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled() // suppressed while lost
+
+    const bootRequest = buildReconcileRequestForPanes(store.getState(), [{ tabId, paneId }])
+    if (!bootRequest) throw new Error('expected a single-pane boot reconcile request')
+    act(() => {
+      foldVerdicts(store.dispatch, bootRequest, {
+        type: 'pane.reconcile.result',
+        reconcileId: bootRequest.reconcileId,
+        bootId: 'b',
+        serverInstanceId: 's',
+        verdicts: [{
+          paneKey: bootRequest.panes[0].paneKey,
+          verdict: 'attach',
+          sessionRef: { provider: 'codex', sessionId: CODEX_THREAD },
+        }],
+      })
+    })
+    await flush()
+    // The verdict was positive existence evidence: lost revoked, so the very
+    // next snapshot-effect run issues the GET.
+    expect(store.getState().freshAgent.sessions[codexKey].lost).toBe(false)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled()
+  })
+
+  it('a fresh reconnect re-runs the .lost recovery driver (disconnected -> ready), no verdict and unchanged deps', async () => {
+    setFreshAgentReconcileActive(true)
+    setConnection('disconnected')
+    renderFreshAgentPane({ sessionId: 'live-1', status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore()
+    await flush()
+    // Offline: the gate holds recovery -- nothing is sent, no session-id
+    // clearing / create minting before any post-reconnect evidence exists.
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(0)
+    expect(leafContent(store.getState()).createRequestId).toBe(baseContent.createRequestId)
+    // Reconnect: the connection.status flip alone re-drives the driver.
+    setConnection('ready')
+    await flush()
+    const reqs = sentOfType('pane.reconcile.request')
+    expect(reqs).toHaveLength(1)
+    expect((reqs[0].panes as Array<{ kind: string }>)[0].kind).toBe('fresh-agent')
+    // A fresh disconnect/reconnect pair re-drives again (other deps unchanged).
+    setConnection('disconnected')
+    await flush()
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1) // offline gate again
+    setConnection('ready')
+    await flush()
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(2)
+  })
+
+  it('lost while offline does NOT run triggerRecovery (no session-id clearing / create minting) -- fresh-eyes F4', async () => {
+    setFreshAgentReconcileActive(false)
+    // Realistic lost-thread env (same rationale as the Task 10 legacy test):
+    // the snapshot fetch against a dead thread 404s, and the default resolving
+    // mock would overwrite the recovery status with the snapshot's.
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new Error('lost thread'))
+    setConnection('disconnected')
+    renderFreshAgentPane({ sessionId: 'live-1', status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore()
+    await flush()
+    // Ungated, this transition would already have cleared the pane's session
+    // id and minted a new create request -- purely on dead-window-era evidence.
+    expect(leafContent(store.getState()).createRequestId).toBe(baseContent.createRequestId)
+    expect(leafContent(store.getState()).sessionId).toBe('live-1')
+    expect(leafContent(store.getState()).status).toBe('running')
+    // Control: the pane was recoverable all along -- reconnect runs recovery.
+    setConnection('ready')
+    await flush()
+    expect(leafContent(store.getState()).createRequestId).not.toBe(baseContent.createRequestId)
+    expect(leafContent(store.getState()).status).toBe('creating')
   })
 })

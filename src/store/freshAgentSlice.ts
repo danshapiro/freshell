@@ -300,6 +300,10 @@ const freshAgentSlice = createSlice({
     }>) {
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
+      // Truth-bearing frame: a snapshot answer proves the session exists —
+      // revoke a stale `lost` flag from a transient dead-window race
+      // (reconnect unwedge).
+      session.lost = false
       const shouldRestartHydration = Boolean(
         session.historyLoaded
           && action.payload.revision != null
@@ -378,6 +382,10 @@ const freshAgentSlice = createSlice({
         sessionType: snapshot.sessionType,
         provider: snapshot.provider,
       }, snapshot.status as FreshAgentSessionStatus)
+      // Truth-bearing frame: a snapshot answer proves the session exists —
+      // revoke a stale `lost` flag from a transient dead-window race
+      // (reconnect unwedge).
+      session.lost = false
       session.snapshot = snapshot
       writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
       session.latestTurnId = snapshot.latestTurnId

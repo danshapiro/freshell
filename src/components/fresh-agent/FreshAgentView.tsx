@@ -629,6 +629,11 @@ export function FreshAgentView({
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
   const activePaneId = useAppSelector((state) => state.panes.activePane[tabId])
+  // Reconnect authority for the .lost recovery driver below: App flips
+  // connection.status away from 'ready' on every stale-socket abandon and back
+  // to 'ready' after handshake, so a dep flip re-runs the driver on a fresh
+  // reconnect even when every other dep is unchanged.
+  const connectionStatus = useAppSelector((s) => s.connection.status)
   const isActivePane = !hidden && activeTabId === tabId && activePaneId === paneId
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
@@ -2045,6 +2050,11 @@ export function FreshAgentView({
   useEffect(() => {
     if (paneContent.provider !== 'claude' && paneContent.provider !== 'codex') return
     if (!paneContent.sessionId || !agentSession?.lost) return
+    // fresh-eyes F4: the connectionStatus dep also fires on ready->disconnected.
+    // Recovery may only act on POST-reconnect evidence -- while offline,
+    // triggerRecovery() would clear the pane's session id / mint a create
+    // request with no server truth behind it.
+    if (connectionStatus !== 'ready') return
     const shouldDeferUntilVisibleRestore = Boolean(
       agentSession.latestTurnId !== undefined && agentSession.historyLoaded === true
     )
@@ -2070,6 +2080,7 @@ export function FreshAgentView({
     agentSession?.historyLoaded,
     agentSession?.latestTurnId,
     agentSession?.lost,
+    connectionStatus,
     paneContent.provider,
     paneContent.sessionId,
     reconcileLostPane,

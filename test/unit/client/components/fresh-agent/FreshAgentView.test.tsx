@@ -6,6 +6,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
+import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
@@ -63,8 +64,17 @@ function createStore(tabTitleSetByUser = false) {
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
       tabs: tabsReducer,
+      // FreshAgentView reads connection.status to gate the .lost recovery
+      // driver; preload ready so tests keep the pre-gate behavior.
+      connection: connectionReducer,
     },
     preloadedState: {
+      connection: {
+        status: 'ready' as const,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
       panes: {
         layouts: {},
         activePane: {},

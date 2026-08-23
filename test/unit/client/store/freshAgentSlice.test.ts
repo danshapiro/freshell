@@ -152,3 +152,47 @@ describe('freshAgentSlice', () => {
     expect(reducer(undefined, lostGhost).sessions).toEqual({})
   })
 })
+
+describe('freshAgentSlice lost revocation on truth-bearing snapshot evidence', () => {
+  // reconnect-revive Task 4: a snapshot answer is positive existence evidence
+  // (the 404 FRESH_AGENT_LOST_SESSION path never dispatches these reducers), so
+  // it revokes a stale `lost` flag left by a transient dead-window attach race.
+  const loc = { sessionId: 'thread-snapshot-truth', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const key = makeFreshAgentSessionKey(loc)
+
+  function lostState() {
+    // Seed a live session first (markSessionLost is a safe no-op on a missing
+    // record), then wedge it the way the dead-window attach race does.
+    let state = reducer(undefined, setSessionStatus({ ...loc, status: 'running' }))
+    state = reducer(state, markSessionLost(loc))
+    expect(state.sessions[key].lost).toBe(true)
+    return state
+  }
+
+  it('sessionSnapshotReceived revokes a stale lost flag on the addressed session', () => {
+    const state = reducer(lostState(), sessionSnapshotReceived({ ...loc, latestTurnId: null, status: 'idle' }))
+    expect(state.sessions[key].lost).toBe(false)
+  })
+
+  it('freshAgentSnapshotReceived revokes a stale lost flag on the addressed session', () => {
+    const state = reducer(lostState(), freshAgentSnapshotReceived({
+      snapshot: {
+        ...loc,
+        threadId: loc.sessionId,
+        revision: 3,
+        latestTurnId: null,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        pendingApprovals: [],
+        pendingQuestions: [],
+        worktrees: [],
+        diffs: [],
+        childThreads: [],
+        turns: [],
+        extensions: {},
+      },
+    }))
+    expect(state.sessions[key].lost).toBe(false)
+  })
+})

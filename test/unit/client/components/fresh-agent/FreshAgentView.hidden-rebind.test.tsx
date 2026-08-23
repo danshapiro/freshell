@@ -6,6 +6,7 @@ import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
+import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -63,8 +64,17 @@ function createStore() {
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
       tabs: tabsReducer,
+      // FreshAgentView reads connection.status to gate the .lost recovery
+      // driver; preload ready so tests keep the pre-gate behavior.
+      connection: connectionReducer,
     },
     preloadedState: {
+      connection: {
+        status: 'ready' as const,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
       panes: {
         layouts: {},
         activePane: {},
