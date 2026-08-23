@@ -864,7 +864,7 @@ Wire (`server_messages.rs`, next to `terminal_id`):
 pub live_terminal_id: Option<String>,
 ```
 
-Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the D7 409 JSON body from the same owner. ALSO the REST door's D8 arm: `SessionRefClaim::BoundElsewhere { terminal_id }` currently maps to a nameless 409 discarding the id (`terminal_tabs.rs:1267-1281`) — carry `liveTerminalId: terminal_id` there too, so the claim-race refusal is equally attachable (fresh-eyes F5). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
+Add `live_terminal_id: None` to EVERY other `ErrorMsg` literal — the complete site list (compile-checked): `crates/freshell-ws/src/terminal.rs` (incl. `send_create_error` :4464-4482), `crates/freshell-ws/src/create_dedupe.rs`, `crates/freshell-ws/src/lib.rs`, `crates/freshell-freshagent/src/claude.rs`, `crates/freshell-freshagent/src/codex.rs`, `crates/freshell-freshagent/src/opencode_ws.rs`. Omitting any fails compilation; the commit below stages every one of them. WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the D7 409 JSON body from the same owner. ALSO the REST door's D8 arm: `SessionRefClaim::BoundElsewhere { terminal_id }` currently maps to a nameless 409 discarding the id (`terminal_tabs.rs:1267-1281`) — carry `liveTerminalId: terminal_id` there too, so the claim-race refusal is equally attachable (fresh-eyes F5). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
 
 panesSlice (next to `applyReconcileAttach`):
 
@@ -917,7 +917,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add shared/ws-protocol.ts src/store/panesSlice.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx
+git add shared/ws-protocol.ts src/store/panesSlice.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/create_dedupe.rs crates/freshell-ws/src/lib.rs crates/freshell-freshagent/src/terminal_tabs.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx
 git commit -m "fix(reopen): D7 refusals name the live owner; the pane reattaches instead of dead-ending"
 ```
 
@@ -940,8 +940,12 @@ First-class browser proof of the user-visible acceptance shape on the production
 import { test, expect } from '../helpers/fixtures.js'
 
 const noDeadEndText = /still running on the server|\[Restore failed\]/
+// Playwright signature: waitForFunction(pageFunction, arg, options) — the
+// options object must be the THIRD argument or the timeout is ignored
+// (fresh-eyes F3-4).
 const waitReady = (page: any) => page.waitForFunction(
   () => window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status === 'ready',
+  undefined,
   { timeout: 20_000 },
 )
 
@@ -1034,6 +1038,7 @@ test.describe('reconnect revive (rust)', () => {
       // With Task 1: t=30s probe → no pong → t=40s abandon → status flips.
       await page.waitForFunction(
         () => (window as any).__rrStatuses?.some((s: string | undefined) => s !== undefined && s !== 'ready'),
+        undefined,
         { timeout: 50_000 },
       )
     } finally {
@@ -1047,22 +1052,39 @@ test.describe('reconnect revive (rust)', () => {
     await expect(page.getByText(noDeadEndText)).toHaveCount(0)
   })
 
-  test('fresh-agent pane transcript repaints after a bare socket drop', async ({ freshellPage, page, harness }) => {
+  test('fresh-agent pane reattaches and round-trips after a bare socket drop', async ({ freshellPage, page, harness }) => {
     // Donor: hidden-pane-rebind-rust.spec.ts + its fake-claude-sidecar fixture
-    // (FAKE_CLAUDE_SIDECAR_SOURCE + seeded transcript). Arrange a VISIBLE
-    // freshclaude pane with one completed turn; forceDisconnect(); reconnect;
-    // assert the prior turn renders (HTTP snapshot 'reconnect' fetch fired and
-    // committed) and the composer is enabled — the Task 4/5 wedge would leave
-    // it 'Read-only session' with an empty transcript.
+    // (FAKE_CLAUDE_SIDECAR_SOURCE + scripted sidecar protocol). Arrange a
+    // VISIBLE freshclaude pane with one completed turn. forceDisconnect().
+    // THEN, while the client is down, drive the fake sidecar to emit a
+    // server-side-only marker event (the fixture's scripted mechanism — e.g.
+    // its control hook / next scripted turn) so post-reconnect rendering of
+    // the marker CANNOT come from pre-drop local state. Reconnect; assert the
+    // marker turn renders (reattach + snapshot/event pulled fresh state).
+    // FINALLY send a new prompt from the pane's composer and assert the fake
+    // sidecar's scripted reply renders — a post-reconnect send/response round
+    // trip, which only a genuinely reattached WS session can produce
+    // (fresh-eyes F3-2: render-only assertions can pass on surviving local
+    // React/Redux state with a fully broken reattach).
   })
 })
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts`
+Run (against BASE, order-independently — fresh-eyes F3-3: Task 8 executes last, so "red on base" evidence CANNOT come from the current worktree; use a scratch worktree pinned at base_ref `530f5f3530dd660209fae11a81fc028827cdeb2e`, the same pattern `scripts/base-gate.sh` uses):
 
-Expected against base: the REST-door contract test FAILS on the missing `liveTerminalId` field; the freeze test's during-freeze sampler times out (on base nothing flips the status while no close frame exists — true red-first per fresh-eyes F3); the sidebar-adoption pin may already pass on base (documented pin); the fresh-agent drop test fails against the Task 4/5 wedges when drawn from them (lost-suppressed snapshot / placeholder-stamped ack) or passes as a pin otherwise — attribute per the table below. Record a per-test base-status table in the task's execution notes. In plan order this task runs last; any test still red after Tasks 1-7 is the LB-2 completeness signal — stop and attribute it before proceeding.
+```bash
+git worktree add /tmp/rr-base 530f5f3530dd660209fae11a81fc028827cdeb2e
+cd /tmp/rr-base && npm ci --no-audit --no-fund
+# copy the NEW spec + its playwright.config registration into the base tree
+cp <worktree>/test/e2e-browser/specs/reconnect-revive-rust.spec.ts /tmp/rr-base/test/e2e-browser/specs/
+# apply the same RUST_ONLY_SPECS/testMatch registration edit in /tmp/rr-base's playwright.config.ts
+cd /tmp/rr-base && npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts
+# remove the scratch worktree after capturing the table
+```
+
+Expected against base (record this per-test base-status table in the task's execution notes — it is the LB-2 evidence): the REST-door contract test FAILS on the missing `liveTerminalId` field; the freeze test's during-freeze sampler times out (on base nothing flips the status while no close frame exists — true red-first per fresh-eyes F3); the fresh-agent round-trip test FAILS against the Task 4/5 wedge (no fresh state can land while its reattach is suppressed) or passes as a documented pin if base already covers it (attribute per-test); the sidebar-adoption pin may already pass on base (documented pin). Any test still red after Tasks 1-7 is the LB-2 completeness signal — stop and attribute it before proceeding.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
