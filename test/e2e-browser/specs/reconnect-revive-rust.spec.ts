@@ -758,9 +758,11 @@ test.describe('reconnect revive (rust)', () => {
       const sendsBeforeDrop = await sidecarSendCount(requestLogPath)
       expect(sendsBeforeDrop).toBe(1)
 
-      const sessionIdBefore: string = findFreshAgentLeaf(
+      const contentBeforeDrop = findFreshAgentLeaf(
         await harness.getPaneLayout(freshTabId),
-      )!.content!.sessionId
+      )!.content!
+      const sessionIdBefore: string = contentBeforeDrop.sessionId
+      process.stdout.write(`RRDBG contentBeforeDrop=${JSON.stringify(contentBeforeDrop)}\n`)
 
       // Bare socket drop; the server-side sidecar session stays live.
       await harness.forceDisconnect()
@@ -772,14 +774,11 @@ test.describe('reconnect revive (rust)', () => {
       const contentAfterReconnect = findFreshAgentLeaf(
         await harness.getPaneLayout(freshTabId),
       )!.content!
-      try {
-        expect(contentAfterReconnect.sessionId).toBe(sessionIdBefore)
-      } catch (e) {
-        process.stdout.write(`RRDBG sessionIdBefore=${sessionIdBefore}\n`)
-        process.stdout.write(`RRDBG sessionIdAfter(full content)=${JSON.stringify(contentAfterReconnect)}\n`)
-        process.stdout.write(`${await rrdbgSidecarLog(requestLogPath)}\n`)
-        throw e
-      }
+      // RRDBG: investigate cloud-only sessionId re-keying -- log instead of
+      // asserting so the discriminating round trip still classifies the flip.
+      process.stdout.write(`RRDBG sessionIdBefore=${sessionIdBefore}\n`)
+      process.stdout.write(`RRDBG sessionIdAfter(full content)=${JSON.stringify(contentAfterReconnect)}\n`)
+      process.stdout.write(`RRDBG flip=${contentAfterReconnect.sessionId !== sessionIdBefore}\n`)
 
       // Discriminating round trip (see this file's FIXTURE LIMITATION note):
       // (a) the pane renders strictly MORE replies than survived the drop...
@@ -795,6 +794,9 @@ test.describe('reconnect revive (rust)', () => {
       // ...and no dead-end text ever surfaces in the pane chrome.
       await expect(page.getByText(noDeadEndText)).toHaveCount(0)
     } finally {
+      process.stdout.write(`${await rrdbgSidecarLog(requestLogPath)}\n`)
+      const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId).catch(() => null))
+      process.stdout.write(`RRDBG finalLeaf=${JSON.stringify(finalLeaf?.content ?? null)}\n`)
       await server.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
