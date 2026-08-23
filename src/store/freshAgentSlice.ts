@@ -384,7 +384,8 @@ const freshAgentSlice = createSlice({
       }, snapshot.status as FreshAgentSessionStatus)
       // Truth-bearing frame: a snapshot answer proves the session exists —
       // revoke a stale `lost` flag from a transient dead-window race
-      // (reconnect unwedge).
+      // (reconnect unwedge). This reducer is currently production-dormant (no
+      // dispatch site); the line is armor for any future HTTP-snapshot fold.
       session.lost = false
       session.snapshot = snapshot
       writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
