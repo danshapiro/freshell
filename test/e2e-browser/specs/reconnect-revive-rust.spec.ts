@@ -397,6 +397,22 @@ async function fixtureReplyCount(page: Page): Promise<number> {
     .count()
 }
 
+/** RRDBG: summarize the fake claude sidecar request log (create/send/timing). */
+async function rrdbgSidecarLog(requestLogPath: string): Promise<string> {
+  const raw = await fs.readFile(requestLogPath, 'utf8').catch(() => '')
+  const lines = raw.trim().split('\n').filter(Boolean)
+  const entries = lines.map((line) => {
+    try {
+      const e = JSON.parse(line) as { msg?: { type?: string; sessionId?: string; resumeSessionId?: string } }
+      const m = e.msg ?? {}
+      return `${m.type ?? '?'} sessionId=${m.sessionId ?? '-'} resume=${m.resumeSessionId ?? '-'}`
+    } catch {
+      return '<unparseable>'
+    }
+  })
+  return `RRDBG sidecar-log lines=${lines.length} :: ${entries.join(' | ')}`
+}
+
 /** Count `send` entries in the fake claude sidecar's request log. */
 async function sidecarSendCount(requestLogPath: string): Promise<number> {
   const raw = await fs.readFile(requestLogPath, 'utf8').catch(() => '')
@@ -756,7 +772,14 @@ test.describe('reconnect revive (rust)', () => {
       const contentAfterReconnect = findFreshAgentLeaf(
         await harness.getPaneLayout(freshTabId),
       )!.content!
-      expect(contentAfterReconnect.sessionId).toBe(sessionIdBefore)
+      try {
+        expect(contentAfterReconnect.sessionId).toBe(sessionIdBefore)
+      } catch (e) {
+        process.stdout.write(`RRDBG sessionIdBefore=${sessionIdBefore}\n`)
+        process.stdout.write(`RRDBG sessionIdAfter(full content)=${JSON.stringify(contentAfterReconnect)}\n`)
+        process.stdout.write(`${await rrdbgSidecarLog(requestLogPath)}\n`)
+        throw e
+      }
 
       // Discriminating round trip (see this file's FIXTURE LIMITATION note):
       // (a) the pane renders strictly MORE replies than survived the drop...
