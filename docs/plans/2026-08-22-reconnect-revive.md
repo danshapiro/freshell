@@ -112,12 +112,25 @@ describe('WsClient liveness', () => {
     expect(MockWebSocket.instances.length).toBe(2)     // …and is ignored (generation guard)
   })
 
-  it('clears the outstanding probe on any inbound message (no close)', async () => {
+  it('clears the outstanding probe on any inbound message (no abandon while traffic flows)', async () => {
     const { socket } = await connectReady(new WsClient('ws://test/ws'))
-    await vi.advanceTimersByTimeAsync(30_000)
-    socket._message({ type: 'pong', timestamp: 'x' })
-    await vi.advanceTimersByTimeAsync(60_000)
-    expect(MockWebSocket.instances.length).toBe(1)     // socket never recycled
+    await vi.advanceTimersByTimeAsync(30_000)           // t=30: probe
+    socket._message({ type: 'pong', timestamp: 'x' })  // probe cleared; silence restarts from t=30
+    // Silence restarts at the last inbound frame, so feed periodic traffic:
+    // at each 10s tick silence stays < 30s and no further probe is needed.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(20_000)
+      socket._message({ type: 'settings.updated', settings: {} })
+    }
+    expect(MockWebSocket.instances.length).toBe(1)     // never abandoned
+  })
+
+  it('re-probes on persistent silence and abandons when the repeat probe also goes unanswered', async () => {
+    const { socket } = await connectReady(new WsClient('ws://test/ws'))
+    await vi.advanceTimersByTimeAsync(30_000)           // t=30: probe #1
+    socket._message({ type: 'pong', timestamp: 'x' })  // t=30: cleared
+    await vi.advanceTimersByTimeAsync(40_000)           // t=60: probe #2; t=70: unanswered 10s → abandon
+    expect(MockWebSocket.instances.length).toBe(2)
   })
 
   it('poke() while ready and recently active sends an immediate probe', async () => {
