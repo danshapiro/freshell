@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer from '@/store/freshAgentSlice'
-import panesReducer, { initLayout, type PanesState } from '@/store/panesSlice'
+import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
+import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -296,6 +296,57 @@ describe('fresh-agent-ws', () => {
       sessionId: durableId,
       sessionKey: `freshopencode:opencode:${durableId}`,
     })
+    expect(actionTypes).toContain(flushPersistedLayoutNow.type)
+  })
+
+  it('folds an attach-path freshAgent.session.materialized into BOTH slice and pane re-keys for a placeholder-keyed pane (Task 5 reconnect pin)', () => {
+    // The pane exactly as a reconnect restores it: keyed by the PLACEHOLDER id, with
+    // NO create handshake anywhere in this connection (the original create happened
+    // pre-disconnect; only the persisted layout survives). The Task 5 server emit on
+    // the tracked attach arm must therefore need no client change — this fold pin
+    // proves the existing materialized fold already covers the attach path.
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const placeholderId = 'freshopencode-req-reconnect'
+    const durableId = 'ses_reconnect_1'
+
+    store.dispatch(initLayout({
+      tabId: 'tab-reconnect',
+      paneId: 'pane-reconnect',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId: placeholderId,
+        createRequestId: 'req-reconnect',
+        status: 'running',
+        resumeSessionId: placeholderId,
+        sessionRef: { provider: 'opencode', sessionId: placeholderId },
+      },
+    }))
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.session.materialized',
+      previousSessionId: placeholderId,
+      sessionId: durableId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionRef: { provider: 'opencode', sessionId: durableId },
+    })).toBe(true)
+
+    expect(actionTypes).toContain(materializeSession.type)
+    expect(actionTypes).toContain(materializeFreshAgentSession.type)
+
+    const layout = store.getState().panes.layouts['tab-reconnect']
+    if (layout.type !== 'leaf') throw new Error('expected leaf layout')
+    expect(layout.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionId: durableId,
+      resumeSessionId: durableId,
+      sessionRef: { provider: 'opencode', sessionId: durableId },
+    })
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${placeholderId}`]).toBeUndefined()
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${durableId}`]).toBeDefined()
     expect(actionTypes).toContain(flushPersistedLayoutNow.type)
   })
 

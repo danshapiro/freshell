@@ -715,18 +715,7 @@ impl FreshOpencodeState {
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
-                FreshAgentSessionMaterialized {
-                    previous_session_id: session.placeholder_id.clone(),
-                    provider: PROVIDER.to_string(),
-                    session_id: durable_id.clone(),
-                    session_type: SESSION_TYPE.to_string(),
-                    session_ref: Some(SessionLocator {
-                        provider: PROVIDER.to_string(),
-                        session_id: durable_id.clone(),
-                    }),
-                },
-            ));
+            self.broadcast(&materialized_frame(&session.placeholder_id, &durable_id));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -1369,7 +1358,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running) = {
+        let (status_session_id, running, real_session_id) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) -- only
@@ -1400,8 +1389,19 @@ impl FreshOpencodeState {
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
-            (status_session_id, running)
+            (status_session_id, running, session.real_session_id.clone())
         };
+
+        // Attach addressed by the PLACEHOLDER id of an already-materialized session:
+        // the requesting pane cannot correlate frames stamped with the real ses_* id
+        // (locatorMatchesPane), so its snapshot fetch would 404 into a false
+        // restore-error. Re-key it first via the same wire event the send path uses
+        // (materialize-on-send) -- the client fold updates slice AND pane content.
+        if let Some(real_id) = real_session_id.as_ref() {
+            if real_id != &msg.session_id {
+                self.broadcast(&materialized_frame(&msg.session_id, real_id));
+            }
+        }
 
         let status = if running { "running" } else { "idle" };
         self.broadcast(&event_frame(
@@ -1752,6 +1752,23 @@ fn settle_turn_outcome(
         };
         fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
     }
+}
+
+/// `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder -> durable
+/// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
+/// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
+/// snapshot, so the pane can correlate the ack it is about to receive).
+fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage {
+    ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
+        previous_session_id: previous_session_id.to_string(),
+        provider: PROVIDER.to_string(),
+        session_id: real_id.to_string(),
+        session_type: SESSION_TYPE.to_string(),
+        session_ref: Some(SessionLocator {
+            provider: PROVIDER.to_string(),
+            session_id: real_id.to_string(),
+        }),
+    })
 }
 
 /// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
@@ -2682,6 +2699,105 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
         assert_eq!(snapshot["event"]["status"], "idle");
+    }
+
+    /// Task 5 (reconnect-revive): a pane restored from the persisted layout may still be
+    /// addressed by the PLACEHOLDER id of an already-materialized session (it missed the
+    /// original materialized frame while disconnected). Its tracked `freshAgent.attach`
+    /// must re-key it FIRST via `freshAgent.session.materialized` — otherwise the ack
+    /// snapshot (stamped with the real `ses_*` id per the `real ?? placeholder` rule)
+    /// fails `locatorMatchesPane` and the pane's next snapshot GET 404s into a false
+    /// `durable_artifact_missing` against a live session.
+    #[tokio::test]
+    async fn attach_placeholder_addressed_session_emits_materialized_first() {
+        let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
+
+        st.handle_create(create_msg("req-attach-ph")).await;
+        let placeholder = "freshopencode-req-attach-ph";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let real_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized after send")
+        };
+
+        // Same settle-wait as `attach_known_materialized_session_emits_idle_snapshot`:
+        // the ack snapshot's `status` must not race the detached turn task.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let guard = st.sessions.lock().await;
+                    let session_arc = guard.get(&real_id).cloned().expect("session exists");
+                    let s = session_arc.lock().await;
+                    s.turn_task
+                        .as_ref()
+                        .map(|t| t.is_finished())
+                        .unwrap_or(true)
+                };
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn task finishes within the budget");
+
+        // Drain every pre-attach frame (created / materialized-on-send / status / turn
+        // frames) so what is collected below is exactly what THIS attach emits; the
+        // awaited `handle_attach` queues all of its frames before it returns.
+        while rx.try_recv().is_ok() {}
+
+        st.handle_attach(attach_msg(placeholder)).await;
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames.push(serde_json::from_str(&raw).unwrap());
+        }
+
+        let materialized_idx = frames
+            .iter()
+            .position(|f| f["type"] == "freshAgent.session.materialized")
+            .expect("a placeholder-addressed attach must emit the materialized re-key");
+        let materialized = &frames[materialized_idx];
+        assert_eq!(materialized["previousSessionId"], placeholder);
+        assert_eq!(materialized["sessionId"], real_id);
+        assert_eq!(materialized["provider"], "opencode");
+        assert_eq!(materialized["sessionType"], "freshopencode");
+        assert_eq!(materialized["sessionRef"]["sessionId"], real_id);
+        assert_eq!(materialized["sessionRef"]["provider"], "opencode");
+
+        let snapshot_idx = frames
+            .iter()
+            .position(|f| {
+                f["event"]["type"] == "freshAgent.session.snapshot" && f["sessionId"] == real_id
+            })
+            .expect("the ack snapshot is still emitted");
+        assert!(
+            materialized_idx < snapshot_idx,
+            "the re-key must precede the real-id-stamped snapshot: {frames:?}"
+        );
+
+        // Regression guard (identity already matches): an attach addressed by the
+        // REAL id must NOT re-emit the materialized frame — only the snapshot.
+        while rx.try_recv().is_ok() {}
+        st.handle_attach(attach_msg(&real_id)).await;
+        let mut saw_materialized = false;
+        let mut saw_snapshot = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                saw_materialized = true;
+            }
+            if frame["event"]["type"] == "freshAgent.session.snapshot" {
+                saw_snapshot = true;
+            }
+        }
+        assert!(
+            !saw_materialized,
+            "an attach addressed by the real id must not spam the materialized frame"
+        );
+        assert!(saw_snapshot, "the real-id attach still answers with a snapshot");
     }
 
     #[tokio::test]
