@@ -17,8 +17,12 @@
 //! * 9.1.10 single-flight create-dedupe — negotiated connection adopts the
 //!   existing live terminal for a key; a non-negotiating connection keeps the
 //!   legacy spawn path.
-//! * inertness — a non-negotiating connection's `pane.reconcile.request` is
-//!   accept-and-strip ignored.
+//! * gate refusal (reconnect-revive Task 2) — a non-negotiating connection's
+//!   `pane.reconcile.request` is answered with an explicit terminal
+//!   `error{RECONCILE_NOT_NEGOTIATED}` carrying the `reconcileId`, so the
+//!   client's bounded boot-result wait resolves instantly instead of wedging
+//!   every pane pending-verdict. Pre-reconcile ("frozen") clients never send
+//!   the request, so the code can never reach them (§3 inertness).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -309,10 +313,10 @@ async fn hello_without_capability_gets_unchanged_ready_and_with_it_gets_advertis
     );
 }
 
-// --- inertness ------------------------------------------------------------------
+// --- gate refusal (reconnect-revive Task 2) ------------------------------------
 
 #[tokio::test]
-async fn non_negotiating_connection_gets_no_reconcile_response() {
+async fn non_negotiating_connection_gets_explicit_reconcile_refusal() {
     let server = spawn_server().await;
     let (mut ws, _ready) = connect(&server.url, false).await;
 
@@ -322,14 +326,20 @@ async fn non_negotiating_connection_gets_no_reconcile_response() {
     ))
     .await
     .expect("send request");
-    // A ping after the request: if the very next frame is the pong, the
-    // request was accept-and-strip ignored (nothing was sent for it).
+    // A ping after the request proves the refusal is terminal for the
+    // REQUEST, not the connection: the health marker is still answered.
     ws.send(WsMessage::Text(
         serde_json::json!({ "type": "ping" }).to_string(),
     ))
     .await
     .expect("send ping");
 
+    let refusal = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(refusal["code"], "RECONCILE_NOT_NEGOTIATED");
+    assert_eq!(
+        refusal["requestId"], "rec-inert",
+        "the refusal carries the reconcileId so the client correlates it and falls back instantly"
+    );
     let frame = next_frame_of_type(&mut ws, "pong").await;
     assert_eq!(frame["type"], "pong");
 }

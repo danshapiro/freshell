@@ -18,7 +18,7 @@ import {
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
-import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -267,6 +267,9 @@ export default function App() {
   // mint their own).
   const paneReconcileActiveRef = useRef(false)
   const pendingReconcileRef = useRef<PaneReconcileRequest | null>(null)
+  // Wall-clock timer for the bounded boot-reconcile result wait; see
+  // clearReconcileResultWait in the ws effect for the full contract.
+  const reconcileResultTimerRef = useRef<number | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
@@ -511,6 +514,19 @@ export default function App() {
     let lastReadyServerInstanceId: string | undefined
     let lastSessionsRevision = -1
     const versionInfoLoadedRef = { current: false }
+
+    // Bounded wait for the current boot's pane.reconcile.result: the result
+    // is unicast to THIS socket, so a result lost with a dying socket would
+    // otherwise wedge panes pending-verdict until the NEXT ready healed them
+    // (the reported gray-and-dead shape). Armed right after the request is
+    // sent; cancelled by the result, a correlated error, disconnect, or
+    // teardown.
+    const clearReconcileResultWait = () => {
+      if (reconcileResultTimerRef.current !== null) {
+        window.clearTimeout(reconcileResultTimerRef.current)
+        reconcileResultTimerRef.current = null
+      }
+    }
 
     async function bootstrap() {
       const performAuthFailureTeardown = () => {
@@ -765,6 +781,11 @@ export default function App() {
 
       stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
         if (cancelled) return
+        // Cancel any armed boot-result wait: never census from stale
+        // inventory while offline — the next ready re-sends the request and
+        // re-arms the wait.
+        clearReconcileResultWait()
+        pendingReconcileRef.current = null
         resetCodexActivityOverlay()
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
@@ -907,15 +928,19 @@ export default function App() {
         }
       }
 
-      // Terminal failure of a reconcile App minted (cardinality violation or a
+      // Terminal failure of a reconcile App minted (cardinality violation, a
       // correlated server error frame like RECONCILE_TOO_LARGE /
-      // RECONCILE_UNAVAILABLE): deactivate reconcile for THIS inventory cycle
-      // (re-set true on the next ready) and run the legacy census once from
-      // the CACHED liveTerminalIds — on the real wire terminal.inventory
-      // ALWAYS precedes any reconcile result, so the cache is populated.
-      // Deliberately NO wall-clock timeout on the pending reconcile: it would
-      // false-trip on legitimate deferrals; the request is re-sent on every
-      // ready, so reconnect covers loss windows.
+      // RECONCILE_UNAVAILABLE / RECONCILE_NOT_NEGOTIATED, or expiry of the
+      // bounded boot-result wait): deactivate reconcile for THIS inventory
+      // cycle (re-set true on the next ready) and run the legacy census once
+      // from the CACHED liveTerminalIds — on the real wire
+      // terminal.inventory ALWAYS precedes any reconcile result, so the
+      // cache is populated. The pending reconcile carries a bounded
+      // wall-clock wait (RECONCILE_RESULT_WAIT_MS, well past the server's
+      // single 2s warming deferral) that routes here on expiry — the earlier
+      // deliberate no-timeout decision wedged panes pending-verdict forever
+      // when the result died with its socket (the reported gray-and-dead
+      // shape).
       const fallBackToLegacyCensus = () => {
         pendingReconcileRef.current = null
         paneReconcileActiveRef.current = false
@@ -1051,6 +1076,22 @@ export default function App() {
                 dispatch(setReconcilePendingPanes({ paneKeys: req.panes.map((p) => p.paneKey), startedAt: Date.now() }))
                 ws.setReconcilePendingCreates(req.panes.map((p) => p.createRequestId))
                 ws.send(req)
+                clearReconcileResultWait()
+                reconcileResultTimerRef.current = window.setTimeout(() => {
+                  reconcileResultTimerRef.current = null
+                  if (!pendingReconcileRef.current) return
+                  // The result is unicast to THIS socket; if it was lost with
+                  // a dying socket, only ANOTHER ready would heal the wedge
+                  // (gray panes, zero chrome). Bound the wait and degrade to
+                  // the legacy census instead. This supersedes the earlier
+                  // deliberate no-timeout decision: the wedge it permits is
+                  // the reported gray-and-dead shape.
+                  log.warn('[reconcile] result wait expired — falling back to legacy census')
+                  pendingReconcileRef.current = null
+                  dispatch(clearAllReconcilePendingPanes())
+                  ws.clearReconcileCreateHold()
+                  fallBackToLegacyCensus()
+                }, RECONCILE_RESULT_WAIT_MS)
               } else {
                 ws.clearReconcileCreateHold() // nothing to reconcile — release any held creates immediately
               }
@@ -1078,6 +1119,7 @@ export default function App() {
             return
           }
           pendingReconcileRef.current = null
+          clearReconcileResultWait()
           const parsed = PaneReconcileResultSchema.safeParse(msg)
           if (!parsed.success) {
             console.error('[reconcile] malformed result — falling back to legacy census', parsed.error.issues)
@@ -1134,6 +1176,7 @@ export default function App() {
             console.error('[reconcile] server error — falling back to legacy census', (msg as { code?: unknown }).code)
             // Terminal for this reconcile: no verdicts are coming — release
             // the pending panes and the sender hold before the census.
+            clearReconcileResultWait()
             dispatch(clearAllReconcilePendingPanes())
             ws.clearReconcileCreateHold()
             fallBackToLegacyCensus()
@@ -1493,6 +1536,7 @@ export default function App() {
       document.removeEventListener('visibilitychange', pokeWsWhenVisible)
       cancelled = true
       cleanedUp = true
+      clearReconcileResultWait()
       cleanup?.()
       stopTabRegistrySync?.()
       stopWsDisconnectSync?.()

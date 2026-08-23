@@ -88,6 +88,7 @@ vi.mock('@/lib/terminal-restore', () => ({
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
+let disconnectHandler: (() => void) | null = null
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -294,7 +295,7 @@ function readyFrame(options: { capabilities?: Record<string, unknown> } = {}) {
   }
 }
 
-async function bootAppWithReady(options: { capabilities?: Record<string, unknown> } = {}) {
+async function bootApp() {
   const store = createStore()
   render(
     <Provider store={store}>
@@ -304,6 +305,11 @@ async function bootAppWithReady(options: { capabilities?: Record<string, unknown
   await waitFor(() => {
     expect(messageHandler).toBeTypeOf('function')
   })
+  return store
+}
+
+async function bootAppWithReady(options: { capabilities?: Record<string, unknown> } = {}) {
+  const store = await bootApp()
   act(() => {
     messageHandler?.(readyFrame(options))
   })
@@ -371,6 +377,11 @@ function lastSent(type: string): any {
   return sentFrames.filter((f) => f.type === type).pop()
 }
 
+/** The seeded single terminal leaf's content (tab-1 is the bare leaf). */
+function terminalPaneContentOf(store: { getState: () => any }) {
+  return (store.getState().panes.layouts as any)['tab-1']?.content
+}
+
 describe('App pane.reconcile adoption', () => {
   beforeEach(() => {
     cleanup()
@@ -382,10 +393,14 @@ describe('App pane.reconcile adoption', () => {
     seededFreshAgentPane = null
     setFreshAgentReconcileActive(false)
     messageHandler = null
+    disconnectHandler = null
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
     wsMocks.onReconnect.mockReturnValue(() => {})
-    wsMocks.onDisconnect.mockReturnValue(() => {})
+    wsMocks.onDisconnect.mockImplementation((cb: () => void) => {
+      disconnectHandler = cb
+      return () => { disconnectHandler = null }
+    })
     wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
       messageHandler = cb
       return () => { messageHandler = null }
@@ -611,6 +626,89 @@ describe('App pane.reconcile adoption', () => {
     const lastClearOrder = wsMocks.clearReconcileCreateHold.mock.invocationCallOrder.at(-1)!
     for (const order of wsMocks.cancelCreate.mock.invocationCallOrder) {
       expect(order).toBeLessThan(lastClearOrder)
+    }
+  })
+
+  // --- bounded boot-result wait (reconnect-revive Task 2) -------------------
+  // A pane.reconcile.result is unicast to THIS socket; if it dies with a
+  // dying socket, without a bounded wait the pane wedges pending-verdict
+  // forever (gray-and-dead). Fake timers ARE enabled only around the ready
+  // delivery and afterward: bootApp's waitFor needs real timers.
+
+  it('falls back to the legacy census when no reconcile result arrives within 10s', async () => {
+    seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+    const store = await bootApp()
+    vi.useFakeTimers()
+    try {
+      await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
+      // Real wire order: terminal.inventory ALWAYS precedes any reconcile
+      // result — the fallback census runs from this CACHED list.
+      await receiveInventory({ liveTerminalIds: [] })
+      expect(sentFrames.some((f) => f.type === 'pane.reconcile.request')).toBe(true)
+      expect(terminalPaneContentOf(store)?.terminalId).toBe('term-old')
+      expect(Object.keys((store.getState().panes as any).reconcilePendingPanes ?? {})).not.toHaveLength(0)
+      expect(dispatchedTypes).not.toContain(clearDeadTerminals.type)
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+
+      // The wait expired with the request still pending → the same teardown
+      // the correlated-error path runs: pending panes are released and the
+      // legacy census wipes the dead handle and re-arms the create path.
+      expect((store.getState().panes as any).reconcilePendingPanes ?? {}).toEqual({})
+      const paneContent = terminalPaneContentOf(store)
+      expect(paneContent?.pendingReconcile).toBeUndefined()
+      expect(paneContent?.terminalId).toBeUndefined() // census wiped the stale handle
+      expect(paneContent?.status).toBe('creating')    // census re-armed the create path
+      expect(dispatchedTypes).toContain(clearDeadTerminals.type)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does NOT run the census when the result folds before the wait expires', async () => {
+    seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+    const store = await bootApp()
+    vi.useFakeTimers()
+    try {
+      await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
+      await receiveInventory({ liveTerminalIds: [] })
+      const req = lastSent('pane.reconcile.request')
+      // The server's single warming deferral is 2s — a fold at t=2s is a
+      // legitimate deferral, not a lost result; the timer must be disarmed.
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      await receiveServerFrame(attachResultFor(req, 'term-live'))
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+
+      expect(dispatchedTypes).not.toContain(clearDeadTerminals.type)
+      const paneContent = terminalPaneContentOf(store)
+      expect(paneContent?.terminalId).toBe('term-live') // verdict-written handle kept
+      expect(paneContent?.status).toBe('running')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels the result wait on disconnect (no offline census)', async () => {
+    seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+    const store = await bootApp()
+    vi.useFakeTimers()
+    try {
+      await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
+      await receiveInventory({ liveTerminalIds: [] })
+      expect(sentFrames.some((f) => f.type === 'pane.reconcile.request')).toBe(true)
+      expect(disconnectHandler).toBeTypeOf('function')
+      const before = { ...terminalPaneContentOf(store) }
+
+      act(() => { disconnectHandler?.() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
+
+      // While disconnected there is no socket the result could still arrive
+      // on — the timer must not fire a census from stale inventory; the next
+      // ready re-sends the request instead.
+      expect(dispatchedTypes).not.toContain(clearDeadTerminals.type)
+      expect(terminalPaneContentOf(store)).toEqual(before)
+    } finally {
+      vi.useRealTimers()
     }
   })
 })

@@ -1231,14 +1231,33 @@ async fn handle_client_text(
         // not by request/response pairing.
         ClientMessage::PaneReconcileRequest(request) => {
             // Answered ONLY on a connection that negotiated the capability
-            // (§4.2's "may I send?" gate); anything else is accept-and-strip
-            // ignored, exactly like an unknown frame — the frozen client's
-            // byte-inertness does not depend on this, since it never sends
-            // the request at all (§3).
+            // (§4.2's "may I send?" gate). A request on a NON-negotiated
+            // connection gets an explicit terminal refusal carrying the
+            // reconcileId, so the client falls back to the legacy inventory
+            // census NOW instead of wedging every pane pending-verdict until
+            // the next reconnect (the reported gray-and-dead shape). The
+            // refusal can never reach pre-reconcile ("frozen") clients — they
+            // never send the request at all (§3).
             if pane_reconcile_v1 {
                 return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
                     .await;
             }
+            // Capability not negotiated on THIS connection: answer explicitly.
+            send(
+                ws_tx,
+                &ServerMessage::Error(ErrorMsg {
+                    code: ErrorCode::ReconcileNotNegotiated,
+                    message: "pane.reconcile was not negotiated on this connection; fall back to the inventory census.".to_string(),
+                    timestamp: crate::now_iso(),
+                    actual_session_ref: None,
+                    expected_session_ref: None,
+                    request_id: Some(request.reconcile_id.clone()),
+                    retry_after_ms: None,
+                    terminal_exit_code: None,
+                    terminal_id: None,
+                }),
+            )
+            .await;
             true
         }
         ClientMessage::Ping => {
@@ -6702,5 +6721,185 @@ mod connection_span_filter_tests {
                 Some("term-xyz")
             );
         }
+    }
+}
+
+/// Task 2 (reconnect-revive): the `pane.reconcile.request` capability gate.
+/// A request arriving on a connection that did NOT negotiate `paneReconcileV1`
+/// must get an explicit terminal refusal carrying the reconcileId (the client
+/// falls back to the legacy inventory census NOW) instead of being
+/// accept-and-strip ignored — the silence used to wedge every pane
+/// pending-verdict until the next reconnect (the reported gray-and-dead
+/// shape). Pre-reconcile ("frozen") clients never send the request, so the
+/// error code can never reach them (frozen-client wire parity).
+#[cfg(test)]
+mod pane_reconcile_gate_tests {
+    use super::*;
+
+    /// A REAL loopback websocket pair: a scratch axum app upgrades the client
+    /// connection and hands its write half (the production `WsSink` type) to
+    /// the test, so `handle_client_text` runs its real serialization + send
+    /// path and the frames are asserted off the wire by a real tungstenite
+    /// client — no mocked sink. The upgrade handler parks forever so the
+    /// socket stays open for the whole assertion window; the listener task
+    /// dies with the test runtime.
+    type TestClient =
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+        let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
+        let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
+        let router = axum::Router::new().route(
+            "/ws",
+            axum::routing::any(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                let sink_tx = std::sync::Arc::clone(&sink_tx);
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        let (sink, _read) = socket.split();
+                        if let Some(tx) = sink_tx.lock().await.take() {
+                            let _ = tx.send(sink);
+                        }
+                        // Park: keep the upgraded socket (and with it the
+                        // handed-out write half) alive until the test's
+                        // runtime tears the connection down.
+                        std::future::pending::<()>().await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("loopback local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect to scratch server");
+        let sink = sink_rx
+            .await
+            .expect("upgrade handler delivered the write half");
+        (sink, client)
+    }
+
+    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("frame within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str(&text).expect("json frame")
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    fn state() -> WsState {
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-1111".to_string()),
+            boot_id: Arc::new("boot-2222".to_string()),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_reconcile_request_without_capability_gets_explicit_error() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let state = state();
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+
+        let keep_open = handle_client_text(
+            r#"{"type":"pane.reconcile.request","reconcileId":"r1","panes":[{"paneKey":"tab-1:pane-1","kind":"terminal","mode":"shell","createRequestId":"cr-1"}]}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false, // pane_reconcile_v1: NOT negotiated on this connection
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+        )
+        .await;
+        assert!(keep_open, "the refusal must answer, not tear the connection down");
+
+        // Health marker behind the request: one dispatch loop, strictly
+        // ordered, so on the OLD accept-and-strip path the FIRST frame back
+        // is this pong (silence pin), while the fixed path emits the refusal
+        // first and the connection stays healthy (pong second).
+        let pong_ok = handle_client_text(
+            r#"{"type":"ping"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+        )
+        .await;
+        assert!(pong_ok);
+
+        let refusal = next_text_frame(&mut client).await;
+        assert_eq!(refusal["type"], "error");
+        assert_eq!(refusal["code"], "RECONCILE_NOT_NEGOTIATED");
+        assert_eq!(
+            refusal["requestId"], "r1",
+            "the refusal must carry the reconcileId so the client correlates it"
+        );
+
+        let pong = next_text_frame(&mut client).await;
+        assert_eq!(pong["type"], "pong");
     }
 }

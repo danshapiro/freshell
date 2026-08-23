@@ -41,6 +41,9 @@ import { derivePaneTitle } from '@/lib/derivePaneTitle'
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
 
+/** Bounded wait for a boot `pane.reconcile.result`: > the server's single 2s warming deferral + round-trip margin. */
+export const RECONCILE_RESULT_WAIT_MS = 10_000
+
 export function paneKeyFor(tabId: string, paneId: string): string {
   return `${tabId}:${paneId}`
 }

@@ -99,6 +99,12 @@ pub enum ErrorCode {
     /// connection. The loser retries after the frame's `retryAfterMs` hint —
     /// by then it either adopts the winner's terminal or wins the next claim.
     SessionReserved,
+    /// pane.reconcile.request arrived on a connection that did not negotiate
+    /// paneReconcileV1: terminal for that request (the client falls back to the
+    /// legacy inventory census). Never emitted to pre-reconcile clients — they
+    /// never send the request.
+    #[serde(rename = "RECONCILE_NOT_NEGOTIATED")]
+    ReconcileNotNegotiated,
 }
 
 /// The frozen sessionRef-naming refusal text for the legacy `resumeSessionId`
