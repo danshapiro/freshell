@@ -597,3 +597,82 @@ async fn terminal_create_is_refused_while_a_live_sidecar_owns_the_session() {
         "no terminal may own {durable} -- the sidecar is the one writer"
     );
 }
+
+/// Reconnect-revive Task 7 (cross-kind arm): when the D7 refusal fires
+/// because a live FRESH-AGENT sidecar owns the session, no terminal id exists
+/// to name -- the refusal must OMIT `liveTerminalId` entirely
+/// (`#[serde(skip_serializing_if)]`; the field is additive and absent keeps
+/// every other error frame byte-identical for frozen clients). The revival
+/// arm stays inert: this refusal still dead-ends by design.
+#[tokio::test]
+async fn d7_cross_kind_refusal_omits_live_terminal_id() {
+    let _guard = ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+
+    let durable = "abababab-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    let (url, registry) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // 1. A fresh-agent resume of S goes live (the fake sidecar answers `created`).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "freshAgent.create",
+            "requestId": "req-fa-owner-d7",
+            "sessionType": "freshclaude",
+            "provider": "claude",
+            "cwd": "/tmp",
+            "sessionRef": { "provider": "claude", "sessionId": durable },
+        }),
+    )
+    .await;
+    await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.created" && v["requestId"] == "req-fa-owner-d7"
+    })
+    .await;
+    assert_eq!(env.create_rows().len(), 1, "the sidecar owns S now");
+
+    // 2. The D7 cross-kind refusal: RESTORE_UNAVAILABLE, message names the
+    //    session, and NO liveTerminalId (no terminal owns the session).
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-term-cross-d7",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+            "sessionRef": { "provider": "claude", "sessionId": durable },
+        }),
+    )
+    .await;
+    let frame = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        (v["type"] == "error" || v["type"] == "terminal.created")
+            && v["requestId"] == "req-term-cross-d7"
+    })
+    .await;
+    assert_eq!(
+        frame["type"], "error",
+        "a live sidecar owns {durable}: terminal.create must be refused, got {frame}"
+    );
+    assert_eq!(frame["code"], "RESTORE_UNAVAILABLE");
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(durable)),
+        "message must name the live session: {frame}"
+    );
+    assert!(
+        frame.get("liveTerminalId").is_none(),
+        "the cross-kind arm has no terminal id to name and must omit the field: {frame}"
+    );
+
+    // 3. No PTY spawned `claude --resume S`.
+    assert!(
+        !registry.directory().into_iter().any(|entry| {
+            entry.mode == "claude" && entry.resume_session_id.as_deref() == Some(durable)
+        }),
+        "no terminal may own {durable} -- the sidecar is the one writer"
+    );
+}

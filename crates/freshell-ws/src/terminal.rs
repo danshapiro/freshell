@@ -680,6 +680,7 @@ async fn handle_client_text(
                     retry_after_ms: None,
                     terminal_exit_code: None,
                     terminal_id: None,
+                    live_terminal_id: None,
                 });
                 return send(ws_tx, &reply).await;
             }
@@ -1255,6 +1256,7 @@ async fn handle_client_text(
                     retry_after_ms: None,
                     terminal_exit_code: None,
                     terminal_id: None,
+                    live_terminal_id: None,
                 }),
             )
             .await;
@@ -1732,6 +1734,7 @@ async fn send_session_reserved(
         retry_after_ms: Some(retry_after_ms),
         terminal_exit_code: None,
         terminal_id: None,
+        live_terminal_id: None,
     });
     out.send(&msg).await
 }
@@ -2596,10 +2599,13 @@ pub(crate) async fn handle_create(
         // #540 (ks38): the identity-owner + Running-row join is now the shared
         // `TerminalRegistry::live_session_owner` helper (the same join the REST
         // resume paths consult), replacing the former inline two-arm check.
-        let registry_row_live = state
+        // Reconnect-revive Task 7: keep the owner id — the refusal NAMES it
+        // (`liveTerminalId`) so the client's create-error fold can reattach
+        // the pane to the still-running session instead of dead-ending.
+        let owner = state
             .registry
-            .live_session_owner(Some(&state.identity), &mode, live_sid)
-            .is_some();
+            .live_session_owner(Some(&state.identity), &mode, live_sid);
+        let registry_row_live = owner.is_some();
         // Task 13b (cross-kind liveness): a live FRESH-AGENT sidecar owning
         // `(provider, S)` is just as much "the one writer on S's JSONL" as a live
         // PTY -- "Reopen as freshclaude"/"Reopen as Claude CLI" makes the same
@@ -2631,11 +2637,17 @@ pub(crate) async fn handle_create(
                     "create_refused: a Running terminal already owns this session (D7 live-guard)"
                 );
             }
-            return send_create_error(
+            // The refusal text stays byte-identical (frozen clients and user
+            // regexes depend on it); all novelty rides the additive
+            // `live_terminal_id` — Some on the terminal-owner arm, None on the
+            // cross-kind fresh-agent arm (no terminal id exists there, so the
+            // client-side revival arm stays inert by design).
+            return send_create_error_with_live_terminal(
                 out,
                 ErrorCode::RestoreUnavailable,
                 format!("Session {live_sid} is still running on the server."),
                 &create.request_id,
+                owner,
             )
             .await;
         }
@@ -4486,6 +4498,21 @@ pub(crate) async fn send_create_error(
     message: String,
     request_id: &str,
 ) -> bool {
+    send_create_error_with_live_terminal(out, code, message, request_id, None).await
+}
+
+/// `send_create_error` + the D7 live-owner hint (`live_terminal_id`): the
+/// terminal that still owns the refused session, so the client's create-error
+/// fold can reattach instead of dead-ending (reconnect-revive Task 7).
+/// Additive and omitted when None — every other error frame stays
+/// byte-identical on the wire (frozen-client parity).
+pub(crate) async fn send_create_error_with_live_terminal(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+    live_terminal_id: Option<String>,
+) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
         code,
         message,
@@ -4496,6 +4523,7 @@ pub(crate) async fn send_create_error(
         retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
+        live_terminal_id,
     });
     out.send(&msg).await
 }
@@ -4686,6 +4714,7 @@ fn handle_attach(
         retry_after_ms: None,
         terminal_id: Some(attach.terminal_id),
         terminal_exit_code: None,
+        live_terminal_id: None,
     }))
 }
 
@@ -4758,6 +4787,7 @@ fn input_session_identity_mismatch_error(
         retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: Some(terminal_id.to_string()),
+        live_terminal_id: None,
     })
 }
 
@@ -4794,6 +4824,7 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
         retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
+        live_terminal_id: None,
     })
 }
 
@@ -5028,6 +5059,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         retry_after_ms: None,
         terminal_id: Some(kill.terminal_id),
         terminal_exit_code: None,
+        live_terminal_id: None,
     });
     send(ws_tx, &msg).await
 }

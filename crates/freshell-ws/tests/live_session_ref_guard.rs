@@ -131,6 +131,71 @@ async fn live_session_ref_create_is_refused_loudly() {
     registry.kill(&tid1);
 }
 
+/// Reconnect-revive Task 7: the D7 refusal must NAME the live owner terminal
+/// (`liveTerminalId`) so the client's create-error fold can reattach the pane
+/// to it instead of dead-ending on "Session … is still running on the
+/// server." Additive and omitted when no live terminal is nameable: every
+/// other error frame stays byte-identical (frozen-client wire parity).
+#[tokio::test]
+async fn d7_refusal_names_the_live_owner_terminal() {
+    let (url, registry) = spawn_server().await; // sleeper claude: stays Running
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // A fresh claude terminal reaches Running, owning preallocated session S.
+    send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-d7-owner-1",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let tid1 = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let session_id = session_ref_of(&created).expect("fresh claude carries sessionRef")
+        ["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // The close-and-reopen fallback shape: a restored create whose wire
+    // sessionRef points at the STILL-RUNNING session.
+    send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-d7-reopen-1",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+            "sessionRef": { "provider": "claude", "sessionId": session_id },
+        }),
+    )
+    .await;
+
+    let err = expect_refusal_for(&mut ws, "req-d7-reopen-1").await;
+    assert_eq!(err["code"], json!("RESTORE_UNAVAILABLE"), "{err}");
+    assert_eq!(
+        err["message"],
+        json!(format!("Session {session_id} is still running on the server.")),
+        "refusal text stays byte-identical (regexes and muscle memory depend on it): {err}"
+    );
+    assert_eq!(
+        err["liveTerminalId"],
+        json!(tid1),
+        "the refusal must name the still-running owner so clients can reattach: {err}"
+    );
+
+    registry.kill(&tid1);
+}
+
 /// The legacy rung of the same doctrine (2026-08-16 duplicate-tab incident):
 /// a `terminal.create` carrying ONLY the legacy `resumeSessionId` (no
 /// `sessionRef`) used to arm D7 exactly like the sessionRef rung — a legacy

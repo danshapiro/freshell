@@ -139,6 +139,7 @@ fn waiter_error(request_id: &str) -> ServerMessage {
         retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
+        live_terminal_id: None,
     })
 }
 

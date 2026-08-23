@@ -537,6 +537,11 @@ pub struct ErrorMsg {
     pub terminal_exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// D7 (`RESTORE_UNAVAILABLE` only): the live terminal that owns the refused
+    /// session, so the client can reattach instead of dead-ending. Additive and
+    /// omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_terminal_id: Option<String>,
 }
 
 // --- extension.* ------------------------------------------------------------

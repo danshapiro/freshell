@@ -653,6 +653,22 @@ function findReconcileTerminalContent(
   return leaf.content
 }
 
+/**
+ * Shared live-handle fold (applyReconcileAttach / applyReattachToLiveTerminal):
+ * point an already-mounted pane at a live terminal and bump the volatile
+ * epoch — the lifecycle effect's ONLY re-fire signal on an unchanged
+ * createRequestId (TerminalView excludes terminalId/status from its deps by
+ * design; without the bump the fold stays invisible and the pane gray).
+ * Callers own lookup and any extra identity/bookkeeping writes.
+ */
+function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string): void {
+  content.terminalId = terminalId
+  content.streamId = undefined
+  content.status = 'running'
+  content.restoreError = undefined
+  content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
+}
+
 /** Fresh-agent + terminal finder for reconcile fold reducers. */
 function findReconcilePaneContent(
   state: PanesState,
@@ -1962,19 +1978,14 @@ export const panesSlice = createSlice({
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
 
-      content.terminalId = terminalId
+      foldLiveTerminalAttach(content, terminalId)
       content.serverInstanceId = serverInstanceId
-      content.streamId = undefined
-      content.status = 'running'
-      content.restoreError = undefined
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       if (sessionRef) {
         content.sessionRef = sessionRef
         content.resumeSessionId = undefined
       }
       content.pendingReconcile = undefined
-      // A1 fix: same-createRequestId folds are only observable via the epoch bump.
-      content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
       if (corrected) {
         content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       } else if (duplicate) {
@@ -1982,6 +1993,20 @@ export const panesSlice = createSlice({
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
       clearReconcilePendingForPane(state, tabId, paneId)
+    },
+
+    /** Close→reopen revival: a D7 refusal named the live owner terminal — reattach
+     * the pane to it. The reconcileEpoch bump is the lifecycle effect's ONLY
+     * re-fire signal (createRequestId is preserved), mirroring applyReconcileAttach. */
+    applyReattachToLiveTerminal: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; terminalId: string }>
+    ) => {
+      const { tabId, paneId, terminalId } = action.payload
+      if (!terminalId) return
+      const content = findReconcileTerminalContent(state, tabId, paneId)
+      if (!content) return
+      foldLiveTerminalAttach(content, terminalId)
     },
 
     /**
@@ -2309,6 +2334,7 @@ export const {
   clearDeadTerminals,
   clearTerminalLiveHandles,
   applyReconcileAttach,
+  applyReattachToLiveTerminal,
   resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,

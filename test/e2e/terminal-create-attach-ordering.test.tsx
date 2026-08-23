@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { Provider } from 'react-redux'
+import { Provider, useSelector } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
@@ -188,6 +188,30 @@ function lastSent(type: string, terminalId?: string) {
     if (terminalId && msg?.terminalId !== terminalId) return false
     return true
   })
+}
+
+type TestRootState = ReturnType<ReturnType<typeof createStore>['getState']>
+
+// Store-connected variant of the harness's static-prop render: the D7-refusal
+// revival fold happens INSIDE the store (a reducer), so the mounted view must
+// follow store folds for its lifecycle effect to re-fire on the epoch bump
+// (the same re-render loop App delivers in production).
+function TerminalViewFromStore({ tabId, paneId }: { tabId: string; paneId: string }) {
+  const paneContent = useSelector((state: TestRootState) => {
+    const layout = state.panes.layouts[tabId]
+    if (!layout || layout.type !== 'leaf') return null
+    return layout.content
+  })
+  if (!paneContent || paneContent.kind !== 'terminal') return null
+  return <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={false} />
+}
+
+function leafTerminalContent(store: ReturnType<typeof createStore>) {
+  const layout = store.getState().panes.layouts['tab-order']
+  if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'terminal') {
+    throw new Error('expected a terminal leaf in the harness store')
+  }
+  return layout.content
 }
 
 describe('terminal create/attach ordering (e2e)', () => {
@@ -536,5 +560,69 @@ describe('terminal create/attach ordering (e2e)', () => {
     expect(writes).toContain('before-reconnect')
     expect(writes).not.toContain('stale-after-reconnect')
     expect(writes).toContain('fresh-after-reconnect')
+  })
+
+  // D7-refusal revival, full pipeline (reconnect-revive Task 7, plan item
+  // 2b): a mounted TerminalView pane whose create draws the enriched refusal
+  // frame from the (mock-transport) wire must fold the store reattach, send a
+  // FRESH terminal.attach for the named still-running id, and announce the
+  // reconnection — never a second create, never "[Restore failed]". A
+  // Playwright browser test cannot reach this fold (on negotiated WS
+  // connections the adopt arms absorb the create, so the refusal never
+  // surfaces), which makes this jsdom real-harness level the highest tier
+  // that can exercise the revival end to end.
+  it('revives the pane onto the still-running session named by the D7 refusal', async () => {
+    const store = createStore({ status: 'creating', requestId: 'req-order-revive' })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-order" paneId="pane-order" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(lastSent('terminal.create')).toMatchObject({
+        type: 'terminal.create',
+        requestId: 'req-order-revive',
+      })
+    })
+    expect(lastSent('terminal.attach')).toBeUndefined()
+
+    // The enriched refusal frame, delivered through the mock wire:
+    // RESTORE_UNAVAILABLE + the terminal id that still owns the session.
+    wsHarness.emit({
+      type: 'error',
+      code: 'RESTORE_UNAVAILABLE',
+      message: 'Session sess-order-live is still running on the server.',
+      requestId: 'req-order-revive',
+      liveTerminalId: 'term-order-live',
+    })
+
+    // 1. The reducer folded the store reattach (terminalId + running, no
+    //    restoreError, no re-minted createRequestId).
+    await waitFor(() => {
+      expect(leafTerminalContent(store).terminalId).toBe('term-order-live')
+    })
+    const folded = leafTerminalContent(store)
+    expect(folded.status).toBe('running')
+    expect(folded.restoreError).toBeUndefined()
+    expect(folded.createRequestId).toBe('req-order-revive')
+
+    // 2. A FRESH terminal.attach for the NAMED id leaves the client — and no
+    //    second terminal.create ever goes out (never a duplicate writer).
+    await waitFor(() => {
+      expect(lastSent('terminal.attach', 'term-order-live')).toMatchObject({
+        type: 'terminal.attach',
+        terminalId: 'term-order-live',
+        attachRequestId: expect.any(String),
+      })
+    })
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(1)
+
+    // 3. The pane announces the reconnection — never the dead-end write.
+    const writes = terminalInstances[0].write.mock.calls.map(([data]) => String(data)).join('')
+    expect(writes).toContain('Reconnected to the still-running session.')
+    expect(writes).not.toContain('[Restore failed]')
+    expect(writes).not.toContain('[Launch failed]')
   })
 })

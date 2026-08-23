@@ -764,6 +764,8 @@ export type ErrorMessage = {
   actualSessionRef?: SessionLocator
   /** SESSION_RESERVED only: how long the loser should wait before re-sending its create. Additive; omitted everywhere else. */
   retryAfterMs?: number
+  /** RESTORE_UNAVAILABLE only (D7): the live terminal that owns the refused session, so the create-error fold can reattach instead of dead-ending. Additive; omitted everywhere else. */
+  liveTerminalId?: string
   timestamp: string
 }
 

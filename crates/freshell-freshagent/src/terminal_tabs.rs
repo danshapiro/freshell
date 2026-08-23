@@ -34,7 +34,8 @@ use std::collections::HashSet;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -601,6 +602,26 @@ fn validate_rest_resume(
             }
         }
     }
+}
+
+/// The D7/D8 409 refusal envelope (reconnect-revive Task 7): the exact
+/// `fail_json_code` shape plus, when the refusal can name a still-running
+/// terminal, the additive `liveTerminalId` a caller reattaches to instead of
+/// dead-ending on the message. The envelope and its message text stay
+/// byte-identical to every other RESTORE_UNAVAILABLE refusal ("still running
+/// on the server." — client regexes and muscle memory depend on it); all
+/// novelty rides the additive field, and `live_terminal_id: None` keeps the
+/// body byte-identical to the pre-feature shape (frozen-client parity).
+fn fail_json_restore_unavailable(live_sid: &str, live_terminal_id: Option<&str>) -> Response {
+    let mut body = json!({
+        "status": "error",
+        "code": "RESTORE_UNAVAILABLE",
+        "message": format!("Session {live_sid} is still running on the server."),
+    });
+    if let Some(tid) = live_terminal_id {
+        body["liveTerminalId"] = json!(tid);
+    }
+    (StatusCode::CONFLICT, Json(body)).into_response()
 }
 
 /// The successful result of [`spawn_terminal_pane`]: the `paneContent` JSON + the
@@ -1216,9 +1237,11 @@ pub(crate) async fn spawn_terminal_pane(
         });
     let mut session_ref_lease: Option<RestSessionRefLease> = None;
     if let Some(live_sid) = guard_locator.as_ref().map(|r| r.session_id.as_str()) {
-        if registry
+        // Reconnect-revive Task 7: every refusal that CAN name a live terminal
+        // carries its id (`liveTerminalId`) so the caller can reattach instead
+        // of dead-ending. The envelope and message text stay byte-identical.
+        if let Some(owner_terminal_id) = registry
             .live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
-            .is_some()
         {
             tracing::warn!(
                 target: "freshell_freshagent::terminal_tabs",
@@ -1227,10 +1250,9 @@ pub(crate) async fn spawn_terminal_pane(
                 pane_id = %pane_id,
                 "spawn_refused: a Running terminal already owns this session (D7 live-guard, REST rung)"
             );
-            return Err(fail_json_code(
-                StatusCode::CONFLICT,
-                "RESTORE_UNAVAILABLE",
-                format!("Session {live_sid} is still running on the server."),
+            return Err(fail_json_restore_unavailable(
+                live_sid,
+                Some(&owner_terminal_id),
             ));
         }
 
@@ -1259,14 +1281,25 @@ pub(crate) async fn spawn_terminal_pane(
                     create_request_id.clone(),
                 ));
             }
-            // Conservative v1 (Design Decision 6): every non-Acquired arm
-            // answers the same 409 envelope. Held = a claim is in flight;
-            // BoundElsewhere = a live winner exists (D7's own answer);
-            // ExpiredNeedsKill = crashed holder -- no kill-and-adopt logic on
-            // REST, the lease TTL is the backstop.
-            SessionRefClaim::Held { .. }
-            | SessionRefClaim::BoundElsewhere { .. }
-            | SessionRefClaim::ExpiredNeedsKill { .. } => {
+            // Conservative v1 (Design Decision 6): Held/ExpiredNeedsKill answer
+            // the nameless 409 envelope (a claim in flight / a crashed holder
+            // has no live terminal to name). BoundElsewhere = a live winner
+            // exists (D7's own answer): carry its terminal id too, so the
+            // claim-race refusal is equally attachable (fresh-eyes F5).
+            SessionRefClaim::BoundElsewhere { terminal_id } => {
+                tracing::warn!(
+                    target: "freshell_freshagent::terminal_tabs",
+                    mode = %mode,
+                    session_id = %live_sid,
+                    pane_id = %pane_id,
+                    "spawn_refused: sessionRef already bound to a live terminal (D8, REST rung)"
+                );
+                return Err(fail_json_restore_unavailable(
+                    live_sid,
+                    Some(&terminal_id),
+                ));
+            }
+            SessionRefClaim::Held { .. } | SessionRefClaim::ExpiredNeedsKill { .. } => {
                 tracing::warn!(
                     target: "freshell_freshagent::terminal_tabs",
                     mode = %mode,
@@ -1274,11 +1307,7 @@ pub(crate) async fn spawn_terminal_pane(
                     pane_id = %pane_id,
                     "spawn_refused: sessionRef lease unavailable (D8, REST rung)"
                 );
-                return Err(fail_json_code(
-                    StatusCode::CONFLICT,
-                    "RESTORE_UNAVAILABLE",
-                    format!("Session {live_sid} is still running on the server."),
-                ));
+                return Err(fail_json_restore_unavailable(live_sid, None));
             }
         }
     }
@@ -4831,6 +4860,15 @@ mod tests {
             msg.contains(LIVE_SESSION),
             "message must name the live session: {msg}"
         );
+        // Reconnect-revive Task 7: the refusal must NAME the live owner
+        // terminal so a caller (client reattach fold, CLI, MCP) can revive the
+        // still-running session instead of dead-ending. Additive field; the
+        // message text itself stays byte-identical.
+        assert_eq!(
+            body["liveTerminalId"],
+            json!("t-live-owner"),
+            "the 409 must carry the still-running owner's terminal id: {body}"
+        );
         // No duplicate spawn: only the forged owner exists.
         assert_eq!(
             registry.identity_probe_rows().len(),
@@ -4911,6 +4949,13 @@ mod tests {
 
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        // Reconnect-revive Task 7: the owner comes from the identity-store arm
+        // of the D7 join, but the refusal names it just the same.
+        assert_eq!(
+            body["liveTerminalId"],
+            json!("t-adopted"),
+            "the 409 must carry the identity-arm owner's terminal id: {body}"
+        );
 
         registry.kill("t-adopted");
     }
@@ -5971,6 +6016,63 @@ mod tests {
         );
 
         registry.kill("t-legacy-live-owner");
+    }
+
+    /// Reconnect-revive Task 7 (fresh-eyes F5): the D8 `BoundElsewhere` arm
+    /// (claim race: a completed lease binding already points at the winner,
+    /// so D7's live-row join legitimately sees nothing) must name the claim's
+    /// terminal id too, making the race refusal equally attachable.
+    #[tokio::test]
+    async fn rest_create_resume_handle_race_bound_elsewhere_409_names_the_live_terminal() {
+        let argv_file = unique_argv_file("d8-bound-elsewhere-live-terminal-id");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let rows_before = registry.identity_probe_rows().len();
+
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        // A winner completed its lease into a sessionRef->terminal binding.
+        // The winner's registry ROW is not visible to this door (the
+        // claim-race window: bound but not yet directory-registered here), so
+        // D7's live-owner join passes and the refusal comes from the binding.
+        assert!(matches!(
+            registry.claim_session_ref(
+                &locator,
+                "winner-create",
+                registry.new_connection_id(),
+                test_now_ms()
+            ),
+            SessionRefClaim::Acquired
+        ));
+        assert!(registry.complete_session_ref_claim(&locator, "winner-create", "t-claim-winner"));
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert_eq!(
+            body["liveTerminalId"],
+            json!("t-claim-winner"),
+            "the claim-race refusal names the bound winner's terminal id: {body}"
+        );
+        assert_eq!(
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no duplicate spawn"
+        );
     }
 
     #[tokio::test]
