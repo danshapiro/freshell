@@ -241,6 +241,11 @@ private abandonStaleSocket(reason: string): void {
   this.serverCapabilities = {}
   this.resetReconcileHold({ requeueHeld: true })
   this.clearLivenessWatch()
+  // Fresh-eyes F2-2: a normal close notifies disconnectHandlers (App flips
+  // Redux connection.status at App.tsx:766-773) — abandonment must too, or
+  // Redux sits at 'ready' forever and every status-keyed recovery (Task 4's
+  // disconnected→ready transition; the Task 8 freeze sampler) wedges.
+  this.disconnectHandlers.forEach((h) => h())
   log.warn(`abandoning stale socket: ${reason}`)
   this.connect().catch((err) => log.debug('reconnect after abandon failed', err))
 }
@@ -315,7 +320,7 @@ Keep constants exported only if a test import needs them; otherwise private. No 
 
 The timer/filter changes touch every ws-client behavior suite plus the offline-chip/App bootstrap path and the client activity-callback wiring.
 
-Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client.reconnect-noise.test.ts test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/lib/ws-client.liveness.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.restart-signals.test.tsx test/e2e/turn-complete-notification-flow.test.tsx test/unit/client/activity-callbacks.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client.reconnect-noise.test.ts test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/lib/ws-client.liveness.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.restart-signals.test.tsx test/e2e/turn-complete-notification-flow.test.tsx`
 
 Expected: PASS
 
@@ -562,7 +567,7 @@ Factor the three-line re-register into one local helper used by both the `termin
 
 Hidden rebind, visibility transitions, hydration queue consumers, attach policy:
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/hydration-queue.test.ts test/unit/client/lib/terminal-attach-policy.test.ts test/e2e/terminal-create-attach-ordering.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/hydration-queue.rebind.test.ts test/unit/client/lib/terminal-attach-policy.test.ts test/e2e/terminal-create-attach-ordering.test.tsx`
 
 Expected: PASS
 
@@ -637,7 +642,7 @@ None — three one-line/one-call changes at the exact seams; any dedup would hid
 
 Fresh-agent slice contracts, reconcile folds, hidden rebind (its Test 2 pins `.lost` re-create), snapshot scheduler consumers:
 
-Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.waiting-edge.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/pane-reconcile.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/pane-reconcile.test.ts`
 
 Expected: PASS
 
@@ -790,7 +795,7 @@ If locking ceremony repeats, add `fn current_status(&self) -> String` on `Claude
 
 The claude provider suite and the differential captures that pin ack CONTENT for these arms:
 
-Run: `cargo test -p freshell-freshagent claude && npm run test:vitest -- run test/integration/port/oracle/t2-invariants.test.ts test/unit/client/lib/fresh-agent-ws.test.ts`
+Run: `cargo test -p freshell-freshagent claude && npm run test:vitest -- run test/unit/port/oracle/t2-invariants.test.ts test/unit/client/lib/fresh-agent-ws.test.ts`
 
 Expected: PASS (if the oracle pins a hardcoded-idle capture on an arm whose tracked status changed, update per the oracle refresh procedure and record it).
 
@@ -814,6 +819,7 @@ Load-bearing LB-1 (falsified; `reports/load-bearing-validator-LB-1.md`): on nego
 - Modify: `src/components/TerminalView.tsx` (create-error handler :4872-4901)
 - Test: `test/unit/client/store/panesSlice.reconnect.test.ts` (or the slice's existing test home — check before creating)
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (revive fold cases)
+- Test: `test/e2e/terminal-create-attach-ordering.test.tsx` (jsdom full-pipeline revival fold — see Step 1 item 2b)
 - Test: `crates/freshell-ws/src/terminal.rs` tests; `crates/freshell-freshagent/src/terminal_tabs.rs` tests
 
 **Interfaces:**
@@ -824,11 +830,12 @@ Load-bearing LB-1 (falsified; `reports/load-bearing-validator-LB-1.md`): on nego
 
 1. panesSlice: `applyReattachToLiveTerminal` writes terminalId/status, clears restoreError, and bumps reconcileEpoch; it is a no-op for an unknown paneKey.
 2. TerminalView revive fold: create-error `{code:'RESTORE_UNAVAILABLE', liveTerminalId:'t1', requestId}` → the pane's store state gains `terminalId:'t1'`/`status:'running'` via the new reducer, its bumped `reconcileEpoch` re-fires the lifecycle effect so a `terminal.attach` for `t1` leaves the client, and the pane shows a `Reconnected to the still-running session.` notice — never `[Restore failed]`; a SECOND RESTORE_UNAVAILABLE for the same createRequestId does NOT revive again (one-shot bound) and falls through to the existing error write.
-3. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)` when `registry_row_live` (owner known) and `None` on the fresh-agent cross-kind arm. Rust REST: the D7 409 body carries `liveTerminalId` when a terminal owns the session and omits it for the cross-kind arm; the D8 BoundElsewhere 409 carries `liveTerminalId` set to the claim's `terminal_id`.
+2b. Full-pipeline proof (fresh-eyes F2-4): a jsdom-e2e case in `test/e2e/terminal-create-attach-ordering.test.tsx`'s real-App harness — a mounted TerminalView pane whose create draws the enriched refusal frame from the (mock-transport) wire → observe the reducer fold, the fresh `terminal.attach` for the named id, and the notice. A Playwright browser test cannot reach this fold: on negotiated WS connections the adopt arms absorb the create (LB-1) and the cross-kind arm correctly refuses without an id — so this jsdom full-pipeline level is the highest tier that can exercise the revival, and it joins the browser-side REST contract test (Task 8) that proves the server emits the field.
+3. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)` when `registry_row_live` (owner known), and `None` on the fresh-agent cross-kind arm (no terminal id exists there — the refusal stands, the revival arm stays inert by design). Rust REST — note the REST door has NO cross-kind refusal at all (`rest_gate_skips_sidecar_live_candidate_create_proceeds_unchanged`, terminal_tabs.rs:5400-5443, pins cross-kind → 200 OK; do not add one — fresh-eyes F2-3): its two reachable refusals are D7-terminal-owner and D8-BoundElsewhere, and BOTH carry `liveTerminalId` (the latter from the claim's `terminal_id`).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx` and `cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx` and `cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs`
 
 Expected: FAIL because the reducer/revive/payload do not exist yet (`applyReattachToLiveTerminal` undefined; refusal payload lacks the id), not harness noise.
 
@@ -844,7 +851,7 @@ Wire (`server_messages.rs`, next to `terminal_id`):
 pub live_terminal_id: Option<String>,
 ```
 
-Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the 409 JSON body from the same owner (omit for the cross-kind arm). ALSO the REST door's D8 arm: `SessionRefClaim::BoundElsewhere { terminal_id }` currently maps to a nameless 409 discarding the id (`terminal_tabs.rs:1267-1281`) — carry `liveTerminalId: terminal_id` there too, so the claim-race refusal is equally attachable (fresh-eyes F5). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
+Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the D7 409 JSON body from the same owner. ALSO the REST door's D8 arm: `SessionRefClaim::BoundElsewhere { terminal_id }` currently maps to a nameless 409 discarding the id (`terminal_tabs.rs:1267-1281`) — carry `liveTerminalId: terminal_id` there too, so the claim-race refusal is equally attachable (fresh-eyes F5). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
 
 panesSlice (next to `applyReconcileAttach`):
 
@@ -878,7 +885,7 @@ if (msg.code === 'RESTORE_UNAVAILABLE' && typeof msg.liveTerminalId === 'string'
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx && cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs && npm run typecheck`
+Run: `npm run test:vitest -- run test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx && cargo test -p freshell-ws d7 && cargo test -p freshell-freshagent terminal_tabs && npm run typecheck`
 
 Expected: PASS
 
@@ -897,7 +904,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add shared/ws-protocol.ts src/store/panesSlice.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+git add shared/ws-protocol.ts src/store/panesSlice.ts src/components/TerminalView.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs test/unit/client/store/panesSlice.reconnect.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx
 git commit -m "fix(reopen): D7 refusals name the live owner; the pane reattaches instead of dead-ending"
 ```
 
