@@ -591,6 +591,9 @@
           ],
           "type": "object"
         },
+        "liveTerminalId": {
+          "type": "string"
+        },
         "message": {
           "type": "string"
         },
