@@ -83,7 +83,8 @@ describe('WsClient liveness', () => {
 
   it('sends an app-level ping after 30s of inbound silence while ready', async () => {
     const { socket } = await connectReady(new WsClient('ws://test/ws'))
-    // Ready traffic itself was inbound activity; 30s of silence triggers the probe.
+    // Ready traffic itself was inbound activity. 10s ticks at t=10/20 skip
+    // (silence < 30s); the t=30 tick sees silence === 30s and probes.
     await vi.advanceTimersByTimeAsync(30_000)
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(true)
   })
@@ -101,6 +102,7 @@ describe('WsClient liveness', () => {
     await vi.advanceTimersByTimeAsync(30_000)          // probe sent
     expect(socket.sent.some((s) => JSON.parse(s).type === 'ping')).toBe(true)
     // The dead transport NEVER delivers onclose — that is the hazard under test.
+    // t=30 tick probes; the t=40 tick sees probe age 10s >= PONG_TIMEOUT_MS and abandons.
     await vi.advanceTimersByTimeAsync(10_000)
     expect(MockWebSocket.instances.length).toBe(2)     // fresh socket driven immediately
     const fresh = MockWebSocket.instances[1]
@@ -166,10 +168,12 @@ Expected: FAIL because `'ping'` frames are never sent, `client.poke is not a fun
 
 ```ts
 // Constants (top of file, next to CONNECTION_TIMEOUT_MS):
-// Liveness probe cadence matches both servers' 30s keepalive; the pong timeout
-// bounds "half-open" detection; the foreground recycle threshold is >2 server
-// keepalive windows — past it the server may already have reaped the peer.
-const LIVENESS_INTERVAL_MS = 30_000
+// 10s tick so a probe's 10s timeout is re-evaluated 10s after it was sent
+// (a 30s tick would delay abandonment to t=60 — fresh-eyes F1). Probe fires
+// once inbound silence reaches 30s (both servers' keepalive cadence); the
+// foreground abandon threshold is >2 server keepalive windows.
+const LIVENESS_TICK_MS = 10_000
+const PROBE_AFTER_SILENCE_MS = 30_000
 const PONG_TIMEOUT_MS = 10_000
 const FOREGROUND_RECYCLE_SILENCE_MS = 65_000
 
@@ -193,7 +197,7 @@ private socketGen = 0
 
 private startLivenessWatch(): void {
   this.clearLivenessWatch()
-  this.livenessTimer = window.setInterval(() => this.tickLiveness(), LIVENESS_INTERVAL_MS)
+  this.livenessTimer = window.setInterval(() => this.tickLiveness(), LIVENESS_TICK_MS)
 }
 
 private clearLivenessWatch(): void {
@@ -210,7 +214,7 @@ private tickLiveness(): void {
     }
     return
   }
-  if (now - this.lastInboundAt < LIVENESS_INTERVAL_MS) return
+  if (now - this.lastInboundAt < PROBE_AFTER_SILENCE_MS) return
   this.probeSentAt = now
   this.sendNow({ type: 'ping' })
 }
@@ -251,11 +255,21 @@ private abandonStaleSocket(reason: string): void {
 poke(): void {
   if (this.intentionalClose) return
   if (this._state === 'ready') {
+    if (this.probeSentAt !== null && Date.now() - this.probeSentAt >= PONG_TIMEOUT_MS) {
+      this.abandonStaleSocket('foreground poke: outstanding probe expired')
+      return
+    }
     if (Date.now() - this.lastInboundAt >= FOREGROUND_RECYCLE_SILENCE_MS) {
       this.abandonStaleSocket('foreground poke past keepalive windows')
       return
     }
-    this.tickLiveness()
+    // Foreground means "ask now": probe immediately, bypassing the 30s silence
+    // gate (fresh-eyes F1 — routing this through tickLiveness's guard could
+    // never fire the immediate probe the tests pin).
+    if (this.probeSentAt === null) {
+      this.probeSentAt = Date.now()
+      this.sendNow({ type: 'ping' })
+    }
     return
   }
   if (this.connectPromise) return
@@ -479,7 +493,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/lib/pane-reconcile.ts src/App.tsx crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs test/unit/client/components/App.reconcile-adoption.test.tsx
+git add src/lib/pane-reconcile.ts src/App.tsx crates/freshell-protocol/src/common.rs crates/freshell-ws/src/terminal.rs test/unit/client/components/App.reconcile-adoption.test.tsx
 git commit -m "fix(reconcile): bound the boot-result wait and answer non-negotiated requests explicitly"
 ```
 
@@ -580,7 +594,7 @@ Slice: `sessionSnapshotReceived` and `freshAgentSnapshotReceived` each clear `lo
 
 View fold: with a codex pane `lost=true`, no sessionId change possible (durable id already), delivering a fresh-agent `attach` verdict via the boot reconcile fold clears `lost` in the freshAgent slice and the next snapshot-fetch effect run issues the HTTP GET (spy on `fetch`).
 
-Reconnect re-drive: with the pane still `lost=true` and NO verdict (reconcile absent), flipping `connection.status` `'disconnected' → 'ready'` re-runs the `.lost` recovery effect (spy `reconcileLostPane`/`triggerRecovery`).
+Reconnect re-drive: with the pane still `lost=true` and NO verdict (reconcile absent), flipping `connection.status` `'disconnected' → 'ready'` re-runs the `.lost` recovery effect (spy `reconcileLostPane`/`triggerRecovery`). Negative case (fresh-eyes F4): flipping `'ready' → 'disconnected'` does NOT run recovery (no offline session-id clearing / create minting — recovery only acts on post-reconnect evidence).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -607,7 +621,7 @@ dispatch(clearSessionLost({ sessionId: <verdict locator sessionId>, sessionType:
 
 (Locator fields come from the verdict's `sessionRef` / pane entry following the adjacent `applyFreshAgentReconcileAttach` payload shape; import `clearSessionLost` from the slice.)
 
-`FreshAgentView.tsx` — add a selector `const connectionStatus = useAppSelector((s) => s.connection.status)` and add `connectionStatus` to the `.lost` recovery effect's dep array (:2069-2077 region), with a short comment: a fresh reconnect re-drives recovery even when lost/sessionId are unchanged.
+`FreshAgentView.tsx` — add a selector `const connectionStatus = useAppSelector((s) => s.connection.status)`, add `connectionStatus` to the `.lost` recovery effect's dep array (:2069-2077 region), AND gate the effect body: `if (connectionStatus !== 'ready') return` immediately after the provider/lost guards (fresh-eyes F4: without the gate the dep also fires on ready→disconnected, and `triggerRecovery()` could clear the pane's session id / mint a create request while offline — before any post-reconnect evidence exists).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -810,7 +824,7 @@ Load-bearing LB-1 (falsified; `reports/load-bearing-validator-LB-1.md`): on nego
 
 1. panesSlice: `applyReattachToLiveTerminal` writes terminalId/status, clears restoreError, and bumps reconcileEpoch; it is a no-op for an unknown paneKey.
 2. TerminalView revive fold: create-error `{code:'RESTORE_UNAVAILABLE', liveTerminalId:'t1', requestId}` → the pane's store state gains `terminalId:'t1'`/`status:'running'` via the new reducer, its bumped `reconcileEpoch` re-fires the lifecycle effect so a `terminal.attach` for `t1` leaves the client, and the pane shows a `Reconnected to the still-running session.` notice — never `[Restore failed]`; a SECOND RESTORE_UNAVAILABLE for the same createRequestId does NOT revive again (one-shot bound) and falls through to the existing error write.
-3. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)` when `registry_row_live` (owner known) and `None` on the fresh-agent cross-kind arm. Rust REST: the 409 body carries `liveTerminalId` when a terminal owns the session and omits it for the cross-kind arm.
+3. Rust WS: the D7 refusal frame carries `live_terminal_id: Some(<owner>)` when `registry_row_live` (owner known) and `None` on the fresh-agent cross-kind arm. Rust REST: the D7 409 body carries `liveTerminalId` when a terminal owns the session and omits it for the cross-kind arm; the D8 BoundElsewhere 409 carries `liveTerminalId` set to the claim's `terminal_id`.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -830,7 +844,7 @@ Wire (`server_messages.rs`, next to `terminal_id`):
 pub live_terminal_id: Option<String>,
 ```
 
-Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the 409 JSON body from the same owner (omit for the cross-kind arm). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
+Add `live_terminal_id: None` to every other `ErrorMsg` literal (`send_create_error` :4464-4482 etc.). WS guard: capture `let owner = state.registry.live_session_owner(...)` once, set `registry_row_live = owner.is_some()`, and emit `live_terminal_id: owner` on the refusal. REST guard: put `liveTerminalId` in the 409 JSON body from the same owner (omit for the cross-kind arm). ALSO the REST door's D8 arm: `SessionRefClaim::BoundElsewhere { terminal_id }` currently maps to a nameless 409 discarding the id (`terminal_tabs.rs:1267-1281`) — carry `liveTerminalId: terminal_id` there too, so the claim-race refusal is equally attachable (fresh-eyes F5). `shared/ws-protocol.ts`: error schema gains `liveTerminalId: z.string().optional()`.
 
 panesSlice (next to `applyReconcileAttach`):
 
@@ -971,18 +985,41 @@ test.describe('reconnect revive (rust)', () => {
     await expect(page.getByText(noDeadEndText)).toHaveCount(0)
   })
 
-  test('server-process freeze (dead-peer shape) converges after thaw', async ({ freshellPage, page, harness, terminal, testServer }) => {
-    test.slow() // ~45s freeze window: trips the 30s probe + 10s pong timeout
+  test('server-process freeze forces client-side abandonment before thaw', async ({ freshellPage, page, harness, terminal, testServer }) => {
+    test.slow() // freeze window must cover the 30s probe + 10s pong timeout
+    test.skip(process.platform === 'win32', 'SIGSTOP/SIGCONT are POSIX-only (freeze-spec gate)')
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "rr-freeze"')
     await terminal.waitForOutput('rr-freeze')
-    // SIGSTOP the SERVER (kernel holds the client sockets open; no close frame
-    // reaches the client — the true phone-background shape). Precedent:
-    // terminal-background-freeze-catchup.spec.ts (+win32 gate).
-    process.kill(testServer.info.pid, 'SIGSTOP')
-    await new Promise((r) => setTimeout(r, 45_000)) // client probe+timeout fires inside this window
-    process.kill(testServer.info.pid, 'SIGCONT')
+
+    // Fresh-eyes F3 discrimination: a stalled socket that merely RESUMES after
+    // SIGCONT passes every old assertion (ready + input), so they cannot be the
+    // discriminator. The one thing only the Task 1 watchdog produces is a
+    // client-driven status transition while NO close frame exists. Start an
+    // in-page status sampler FIRST (the browser is not frozen — only the
+    // server is), then freeze the server, then require a non-'ready' sample
+    // BEFORE thaw.
+    await page.evaluate(() => {
+      ;(window as any).__rrStatuses = []
+      ;(window as any).__rrTimer = setInterval(() => {
+        ;(window as any).__rrStatuses.push(window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status)
+      }, 1_000)
+    })
+    const pid = testServer.info.pid
+    try {
+      process.kill(pid, 'SIGSTOP')
+      // Base behavior: no inbound traffic ever forces a state change — the
+      // sampler never leaves 'ready' and this wait times out (true red-first).
+      // With Task 1: t=30s probe → no pong → t=40s abandon → status flips.
+      await page.waitForFunction(
+        () => (window as any).__rrStatuses?.some((s: string | undefined) => s !== undefined && s !== 'ready'),
+        { timeout: 50_000 },
+      )
+    } finally {
+      process.kill(pid, 'SIGCONT') // never leave the fixture server stopped
+      await page.evaluate(() => clearInterval((window as any).__rrTimer)).catch(() => {})
+    }
     await harness.waitForConnection()
     await waitReady(page)
     await terminal.executeCommand('echo "rr-thawed"')
@@ -1005,7 +1042,7 @@ test.describe('reconnect revive (rust)', () => {
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/reconnect-revive-rust.spec.ts`
 
-Expected against base: the REST-door contract test FAILS on the missing `liveTerminalId` field; the freeze test fails without the Task 1 watchdog (pane never revives inside the window); sidebar-adoption pin and plain-drop tests may already pass (documented pins). Record a per-test base-status table in the task's execution notes. In plan order this task runs last; any test still red after Tasks 1-7 is the LB-2 completeness signal — stop and attribute it before proceeding.
+Expected against base: the REST-door contract test FAILS on the missing `liveTerminalId` field; the freeze test's during-freeze sampler times out (on base nothing flips the status while no close frame exists — true red-first per fresh-eyes F3); the sidebar-adoption pin may already pass on base (documented pin); the fresh-agent drop test fails against the Task 4/5 wedges when drawn from them (lost-suppressed snapshot / placeholder-stamped ack) or passes as a pin otherwise — attribute per the table below. Record a per-test base-status table in the task's execution notes. In plan order this task runs last; any test still red after Tasks 1-7 is the LB-2 completeness signal — stop and attribute it before proceeding.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
