@@ -2524,7 +2524,8 @@
         "PROTOCOL_MISMATCH",
         "SESSION_RESERVED",
         "FRESH_AGENT_LOST_SESSION",
-        "FRESH_AGENT_CREATE_FAILED"
+        "FRESH_AGENT_CREATE_FAILED",
+        "RECONCILE_NOT_NEGOTIATED"
       ],
       "type": "string"
     },

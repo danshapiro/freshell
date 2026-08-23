@@ -35,6 +35,7 @@ export const ErrorCode = z.enum([
   'SESSION_RESERVED',
   'FRESH_AGENT_LOST_SESSION',
   'FRESH_AGENT_CREATE_FAILED',
+  'RECONCILE_NOT_NEGOTIATED',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
