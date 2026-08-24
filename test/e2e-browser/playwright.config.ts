@@ -243,6 +243,11 @@ export const RUST_ONLY_SPECS = [
   // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
   // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
   /freshagent-settings-resume-rust\.spec\.ts$/,
+  // Task 6 (the-usual/freshagent-sessionref-regression): REST fresh-agent
+  // `sessionRef` resume (durable + placeholder→durable via the pane ledger,
+  // loud 4xx failures) + the tabs.sync registry placeholder clamp. Imports
+  // RustServer directly for restartAbrupt().
+  /fresh-agent-rest-resume-rust\.spec\.ts$/,
   // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
   /sidebar-registry-sync-rust\.spec\.ts$/,
   // Lane D1: agent crash auto-resume — rust-server-only spec.
@@ -470,6 +475,9 @@ export default defineConfig({
         // codex crash memory-loss banner. Imports RustServer directly for
         // restartAbrupt().
         /freshagent-settings-resume-rust\.spec\.ts$/,
+        // Task 6 (see the RUST_ONLY_SPECS entry): REST fresh-agent resume +
+        // registry placeholder clamp. Imports RustServer for restartAbrupt().
+        /fresh-agent-rest-resume-rust\.spec\.ts$/,
         // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
         // RustServer directly; restart()/ledger semantics are rust-only.
         /sidebar-registry-sync-rust\.spec\.ts$/,
