@@ -19,7 +19,7 @@ In fresh-agent transcripts, adjacent tool-activity lines with nothing rendered b
 
 **Goal:** Adjacent fresh-agent tool-activity strips with nothing between them render as one accumulating "N tools used" line (opened once, extended in place) instead of one strip per turn; any intervening message or role-change header keeps them separate.
 
-**Architecture:** Replace per-turn `buildBlocks` strip boundaries with a transcript-level single-pass layout in `FreshAgentTranscript.tsx`. The layout walks display turns once, keeping at most one OPEN activity line: a turn's leading activity items append to the open line when the turn has the same role as the line and no message item has rendered between; any message item or role change closes the line and later activity opens a new one. The line mounts once, in the article of the turn where its first item appears; turns fully absorbed into the line render no article. Per-turn articles, fork/rewind wiring, glom indexing, and live-strip liveness all keep working: `selectLiveActivityBlockId` is re-derived from the same layout, and the empty-streaming-turn injected strip is suppressed only when an adjacent open line already carries liveness.
+**Architecture:** Replace per-turn `buildBlocks` strip boundaries with a transcript-level single-pass layout in `FreshAgentTranscript.tsx`. The layout walks display turns once, keeping at most one OPEN activity line: a turn's leading activity items append to the open line when the turn has the same role as the line and no message item has rendered between; any message item or role change closes the line and later activity opens a new one. The line mounts once, in the article of the turn where its first item appears; turns fully absorbed into the line render no article. Fork/rewind/copy affordances are preserved at line granularity: a merged line's actions resolve to the line's LAST contributing turn (the most recent point the line covers), so the existing "fork from the latest activity turn" protection stays intact. `selectLiveActivityBlockId` is re-derived from the same layout, and the empty-streaming-turn injected strip is suppressed only when an adjacent open line already carries liveness.
 
 **Tech Stack:** React 18, TypeScript, Vitest + Testing Library (unit), Playwright e2e via the repo's configured backend (`test/e2e-browser`). No server or Rust changes — both servers feed the same REST snapshot shape into this one client component (verified by exploration).
 
@@ -53,10 +53,13 @@ Append a new `test.describe('activity line collapse', ...)` block at the end of 
 
 ```ts
 test.describe('activity line collapse', () => {
-  const STRIP = '.fresh-agent-activity-strip'
-
-  async function seedCollapsePane(page: Parameters<typeof openPanePicker>[0], sessionId: string, turns: unknown[]) {
-    await terminal... // NOTE TO IMPLEMENTER: mirror the setup of the 'style setting persists' test:
+  async function seedCollapsePane(
+    page: Parameters<typeof openPanePicker>[0],
+    terminal: { waitForTerminal: () => Promise<void> },
+    sessionId: string,
+    turns: unknown[],
+  ) {
+    // NOTE TO IMPLEMENTER: mirror the setup of the 'style setting persists' test:
     // 1. await terminal.waitForTerminal(); await enableClaudeAndCodex(page)
     // 2. open the pane picker, click Freshcodex, accept the first option
     // 3. page.route(`**/api/fresh-agent/threads/freshcodex/codex/${sessionId}*`) fulfilling a snapshot with
@@ -80,7 +83,7 @@ test.describe('activity line collapse', () => {
   }
 
   test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ page, terminal }) => {
-    await seedCollapsePane(page, 'collapse-thread', [
+    await seedCollapsePane(page, terminal, 'collapse-thread', [
       { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'read files',
         items: [{ id: 'item-user', kind: 'text', text: 'read these five files' }] },
       toolTurn('turn-a', [['c1','src/a.ts'],['c2','src/b.ts'],['c3','src/c.ts']]),
@@ -88,16 +91,17 @@ test.describe('activity line collapse', () => {
     ])
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane).toBeVisible({ timeout: 10_000 })
-    await expect(pane.locator(STRIP)).toHaveCount(1)
-    await expect(pane.locator(STRIP).first()).toContainText('5 tools used')
+    const strips = pane.getByRole('region', { name: 'Activity strip' })
+    await expect(strips).toHaveCount(1)
+    await expect(strips.first()).toContainText('5 tools used')
     await pane.getByRole('button', { name: 'Toggle activity details' }).click()
-    await expect(pane.locator('.fresh-agent-tool-block')).toHaveCount(5)
-    await expect(pane.locator('.fresh-agent-tool-block').nth(0)).toContainText('src/a.ts')
-    await expect(pane.locator('.fresh-agent-tool-block').nth(4)).toContainText('src/e.ts')
+    await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
+    await expect(pane.getByText('src/a.ts')).toBeVisible()
+    await expect(pane.getByText('src/e.ts')).toBeVisible()
   })
 
   test('an intervening message keeps two tool lines separate', async ({ page, terminal }) => {
-    await seedCollapsePane(page, 'split-thread', [
+    await seedCollapsePane(page, terminal, 'split-thread', [
       toolTurn('turn-a', [['c1','src/a.ts']]),
       { id: 'turn-msg', turnId: 'turn-msg', role: 'assistant', summary: 'note',
         items: [{ id: 'item-msg', kind: 'text', text: 'First file read.' }] },
@@ -105,9 +109,10 @@ test.describe('activity line collapse', () => {
     ])
     const pane = page.locator('[data-context="fresh-agent"]').last()
     await expect(pane).toBeVisible({ timeout: 10_000 })
-    await expect(pane.locator(STRIP)).toHaveCount(2)
-    await expect(pane.locator(STRIP).nth(0)).toContainText('1 tool used')
-    await expect(pane.locator(STRIP).nth(1)).toContainText('1 tool used')
+    const strips = pane.getByRole('region', { name: 'Activity strip' })
+    await expect(strips).toHaveCount(2)
+    await expect(strips.nth(0)).toContainText('1 tool used')
+    await expect(strips.nth(1)).toContainText('1 tool used')
   })
 })
 ```
@@ -116,7 +121,7 @@ The helper prose comments marked `NOTE TO IMPLEMENTER` must be replaced with the
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts -g "activity line collapse"`
+Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "activity line collapse"`
 
 Expected: FAIL because the first test currently finds 2 strips ("3 tools used" and "2 tools used") instead of one strip with "5 tools used". The second test (intervening message) may PASS already — that is fine and expected; it guards the boundary.
 
@@ -130,7 +135,7 @@ Do NOT commit. The failing e2e is staged with Task 2's commit once green.
 
 **Interfaces:**
 - Consumes: `FreshAgentTurn`, `FreshAgentTranscriptItem` from `@shared/fresh-agent-contract`; existing `buildActivity`, `isActivityLike`, `FreshAgentActivityStrip`, `FreshAgentTurnArticle`.
-- Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[]` (module-scope pure function, not exported), `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains a `blocks: RenderBlock[]` prop and drops its internal `buildBlocks` call.
+- Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number> }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn), `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
 
 - [ ] **Step 1: Write the failing behavioral tests (new unit cases)**
 
@@ -226,7 +231,7 @@ describe('activity line collapse', () => {
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('6 tools used')
   })
 
-  it('fully absorbed turns render no article and fork targets the line origin', () => {
+  it('fully absorbed turns render no article and fork targets the line end', () => {
     const onFork = vi.fn()
     render(
       <FreshAgentTranscript
@@ -247,7 +252,7 @@ describe('activity line collapse', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument()
     const forkButtons = screen.getAllByRole('button', { name: 'Fork conversation from here' })
     fireEvent.click(forkButtons[0])
-    expect(onFork).toHaveBeenCalledWith('native-a')
+    expect(onFork).toHaveBeenCalledWith('native-b')
   })
 
   it('treats a zero-item turn as a boundary between tool lines', () => {
@@ -313,9 +318,10 @@ type TurnLayout = { blocks: RenderBlock[] }
  * provider message id; stitching keys toolUseId, which is verified unique, so
  * stitching is unaffected — only React keys need this).
  */
-function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
+function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number> } {
   const layouts: TurnLayout[] = []
   let open: { originIndex: number; role: FreshAgentTurn['role']; items: FreshAgentTranscriptItem[] } | null = null
+  const lineEndIndex = new Map<number, number>()
 
   const flushOpen = () => {
     if (!open) return
@@ -351,6 +357,7 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
             counter += 1
           }
           open.items.push(displayItem as FreshAgentTranscriptItem)
+          lineEndIndex.set(open.originIndex, turnIndex)
         } else {
           flushOpen()
           open = { originIndex: turnIndex, role: turn.role, items: [item] }
@@ -363,7 +370,7 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
     }
   }
   flushOpen()
-  return layouts
+  return { layouts, lineEndIndex }
 }
 ```
 
@@ -422,14 +429,14 @@ function selectLiveActivityBlockIdFromLayout(
 const displayTurns = useMemo(() => (
   filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming)
 ), [displayOptions, turns, isStreaming])
-const turnLayouts = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
+const { layouts: turnLayouts, lineEndIndex } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
 const liveActivityBlockId = useMemo(
   () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming),
   [turnLayouts, displayTurns, isStreaming],
 )
 ```
 
-(d) In the render loop (:765–780), pass blocks in and skip fully-absorbed turns:
+(d) In the render loop (:765–780), pass blocks in, skip fully-absorbed turns, and resolve the article's action turn to the line's LAST contributing turn so fork/rewind/context-menu affordances survive merging at line-end granularity:
 
 ```tsx
 {displayTurns.map((turn, index) => {
@@ -438,10 +445,12 @@ const liveActivityBlockId = useMemo(
   const isLastStreaming = isStreaming && index === displayTurns.length - 1
   if (absorbed) return null
   if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null) return null
+  const actionTurn = displayTurns[lineEndIndex.get(index) ?? index]
   return (
     <FreshAgentTurnArticle
       key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`}
       turn={turn}
+      actionTurn={actionTurn}
       blocks={blocksForTurn}
       actions={actions}
       agentLabel={agentLabel}
@@ -457,6 +466,8 @@ const liveActivityBlockId = useMemo(
 })}
 ```
 
+In `FreshAgentTurnArticle`, every action surface (`FreshAgentTurnActions`, the context menu handler, the long-press action sheet opener) uses the new `actionTurn` prop instead of `turn` for `onForkFromTurn`/`onRewindToTurn`/`buildTurnActionItems`/`onOpenActions` — so a merged line forks from the last point the line covers (`(none stated)` residual: mid-line fork targets between absorbed turns are removed, a required consequence of rendering one line).
+
 (e) In `FreshAgentTurnArticle`, accept `blocks` as a prop (remove its internal `buildBlocks` call and the now-unused `displayOptions` prop if it was only used for that), and change the injected-strip condition (:573) so it only fires when no open line took over liveness:
 
 ```tsx
@@ -471,7 +482,7 @@ Note the article still renders its fallback summary path only when `blocks.lengt
 
 1. `'keeps consecutive activity-only assistant turns separate while marking only the latest live'` (~:459) — replace expectation block: now ONE strip, one running indicator; click Toggle once; `src/one.ts`, `src/two.ts`, `src/three.ts` all visible; running indicator count stays 1. Rename to `'collapses consecutive activity-only assistant turns into one live strip'`.
 2. `'coalesces adjacent Claude tool-use/result exchanges without rendering synthetic You turns'` (:576) — after synthetic coalescing the two exchanges are adjacent same-role activity-only turns: change `strips` to length 1, expect `'2 tools used'`, headers still `['You', 'Freshclaude']`, still zero user-role strips.
-3. `'keeps adjacent activity-only display turns distinct and actionable'` (:892) — replace with the new absorb/fork-origin test from Step 1 (last case), delete the old two-article/two-strip assertions.
+3. `'keeps adjacent activity-only display turns distinct and actionable'` (:892) — replace with the line-end-fork test from Step 1 (last case); the protection is preserved at line granularity: the single merged article's fork resolves to the line's last contributing turn (`display-activity-2`), delete the old two-article/two-strip assertions.
 4. `'does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items'` (:1179) — new expected behavior: exactly 1 strip total (the injected empty strip is suppressed; the previous turn's line carries the live reel), one `running` indicator, and the settled text `'1 tool used'` is NOT shown while live.
 
 - [ ] **Step 4: Run the focused tests**
@@ -479,7 +490,7 @@ Note the article still renders its fallback summary path only when `blocks.lengt
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
 Expected: PASS (all new cases plus the rewritten legacy cases) then:
-Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts -g "activity line collapse"`
+Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "activity line collapse"`
 Expected: PASS (Task 1's failing test is now green).
 
 - [ ] **Step 5: Refactor while green**
@@ -544,7 +555,7 @@ git commit -m "docs: mark freshagent-activity-line tasks complete with verificat
 
 ## Risks / recorded decisions
 
-- **Fork/rewind granularity:** a turn fully absorbed into an open line is no longer a fork/rewind target (its article does not render); the line's origin turn is the target. Server fork constraints (composite `turnId`) are honored: we never synthesize composite `turnId`s; the origin turn's own `turnId` is passed through unchanged.
+- **Fork/rewind granularity:** a merged activity line exposes its fork/rewind/context-menu actions against the line's LAST contributing turn (the most recent point the line covers), so the existing protection "fork from the latest activity turn" holds verbatim. Mid-line fork targets between absorbed turns are removed — a required consequence of rendering one line. Server fork constraints (composite `turnId`) are honored: never synthesize composite `turnId`s; the last contributor's own `turnId` passes through unchanged.
 - **Streaming empty-turn suppression** only engages when the previous display turn has a trailing activity line of the same role; all other streaming-empty cases keep the current injected-strip behavior (jp70 hardening untouched).
 - **Role-change = boundary** matches the user's rule because a role change paints a visible header between strips; thinking/reasoning are line content, not boundaries.
 
