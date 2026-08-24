@@ -723,3 +723,811 @@ async fn delete_fresh_agent_tab_cleans_legacy_shadow_maps() {
     assert!(!state.tabs.lock().unwrap().contains_key(&tab_id));
     assert!(!state.pane_tabs.lock().unwrap().contains_key(&pane_id));
 }
+
+// ── Task 4: REST fresh-agent resume (`sessionRef` on POST /api/tabs {agent:'opencode'}) ──
+//
+// The REST `create_tab` resume door: a `sessionRef` on the body resumes the
+// referenced opencode session — a durable `ses_*` id directly, a
+// `freshopencode-<createRequestId>` placeholder through the pane-identity
+// ledger's `lookup_by_create_request_id` — with the resumed pane born-durable
+// (placeholder_id = durable id, durable_id set from creation, fresh
+// createRequestId) and merged settings (model/effort: body > ledger; cwd:
+// ledger > serve-directory-from-probe > body). Failures are LOUD: 400
+// malformed/provider-mismatch/unknown-shape, 404 unknown-or-unresolvable,
+// 504 bounded-probe timeout, 502 other probe errors. The ledger is read-only
+// on resume: no pending write, no binding write, and the LEDGER-BEFORE-PROBE
+// ordering is load-bearing (the probe route carries the ledger cwd when one
+// is recorded, never the body cwd — a wrong `?directory=` can fail the probe
+// of a legitimate session).
+
+use crate::identity_sink::{
+    FakeIdentitySink, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
+};
+use freshell_opencode::{
+    Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator, ServeConfig,
+    ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A `ServeHttp` fake for the REST resume probe: answers `/global/health`
+/// (so `ensure_started()` passes), serves each configured session at
+/// `GET /session/:id`, 404s unknown sessions, optionally answers a scripted
+/// error status for every session GET, optionally wedges (never resolves)
+/// session GETs, and records the raw percent-encoded `directory` query of
+/// EVERY session GET — the probe route, which proves the ledger-before-probe
+/// ordering.
+struct ResumeServeHttp {
+    /// session id → the 200 body `GET /session/:id` serves.
+    sessions: std::collections::HashMap<String, Value>,
+    /// When Some(status), every session GET answers it (never 200/404).
+    error_status: Option<u16>,
+    /// Wedged-but-accepting serve (V5 caveat b): session GETs never resolve.
+    wedged: bool,
+    /// The raw `directory=…` query value of each session GET, in order.
+    observed_directories: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl ResumeServeHttp {
+    fn with_sessions(sessions: &[(&str, Value)]) -> Self {
+        Self {
+            sessions: sessions
+                .iter()
+                .map(|(id, body)| (id.to_string(), body.clone()))
+                .collect(),
+            error_status: None,
+            wedged: false,
+            observed_directories: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn wedged() -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            error_status: None,
+            wedged: true,
+            observed_directories: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn erroring(error_status: u16) -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            error_status: Some(error_status),
+            wedged: false,
+            observed_directories: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ServeHttp for ResumeServeHttp {
+    fn request<'a>(
+        &'a self,
+        req: ServeHttpRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+    > {
+        if req.url.contains("/global/health") {
+            return Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+        }
+        // Record the probe route BEFORE any resolution branch (the wedged leg
+        // still proves which route the probe carried).
+        let id = req
+            .url
+            .split("/session/")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', '?']).next())
+            .unwrap_or("")
+            .to_string();
+        let directory = req
+            .url
+            .split("directory=")
+            .nth(1)
+            .map(|rest| rest.split('&').next().unwrap_or("").to_string());
+        self.observed_directories
+            .lock()
+            .unwrap()
+            .push(directory);
+        if self.wedged {
+            return Box::pin(std::future::pending());
+        }
+        if let Some(status) = self.error_status {
+            return Box::pin(async move { Ok(ServeHttpResponse::new(status, b"boom".to_vec())) });
+        }
+        match self.sessions.get(&id) {
+            Some(body) => {
+                let bytes = serde_json::to_vec(body).unwrap();
+                Box::pin(async move { Ok(ServeHttpResponse::new(200, bytes)) })
+            }
+            None => Box::pin(async move { Ok(ServeHttpResponse::new(404, b"not found".to_vec())) }),
+        }
+    }
+}
+
+struct ResumeNoopSpawner;
+impl freshell_opencode::ProcessSpawner for ResumeNoopSpawner {
+    fn spawn(
+        &self,
+        _req: freshell_opencode::serve::SpawnRequest,
+    ) -> Result<Box<dyn freshell_opencode::ServeProcess>, String> {
+        struct NoopProcess;
+        impl freshell_opencode::ServeProcess for NoopProcess {
+            fn exited(&self) -> Option<i32> {
+                None
+            }
+            fn take_fatal_startup_error(&self) -> Option<String> {
+                None
+            }
+            fn kill(&self) {}
+        }
+        Ok(Box::new(NoopProcess))
+    }
+}
+
+struct ResumeFakeAllocator;
+impl PortAllocator for ResumeFakeAllocator {
+    fn allocate(&self) -> Result<Endpoint, String> {
+        Ok(Endpoint {
+            hostname: "127.0.0.1".into(),
+            port: 1,
+        })
+    }
+}
+
+struct ResumeNoopHandle;
+impl EventStreamHandle for ResumeNoopHandle {}
+struct ResumeNoopEventSource;
+impl EventSource for ResumeNoopEventSource {
+    fn connect(
+        &self,
+        _url: String,
+        _sink: freshell_opencode::serve::EventSink,
+    ) -> Box<dyn EventStreamHandle> {
+        Box::new(ResumeNoopHandle)
+    }
+}
+
+/// A fresh-agent REST state whose manager is backed by `http`, with the fake
+/// pane-identity sink wired in. Mirrors `state_with_fixed_session_http`'s
+/// shape (lib.rs tests) — the fakes are module-private there, so this file
+/// carries its own copies per the brief.
+async fn state_with_resume_http(http: Arc<ResumeServeHttp>) -> (FreshAgentState, Arc<FakeIdentitySink>) {
+    let state = state_with_registry();
+    let deps = ServeDeps {
+        spawner: Arc::new(ResumeNoopSpawner),
+        http,
+        ports: Arc::new(ResumeFakeAllocator),
+        events: Arc::new(ResumeNoopEventSource),
+    };
+    let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+    manager
+        .ensure_started()
+        .await
+        .expect("healthy fake serve starts");
+    state.set_manager_for_test(manager).await;
+    let sink = Arc::new(FakeIdentitySink::default());
+    state.set_identity_sink(sink.clone());
+    (state, sink)
+}
+
+/// The body a `GET /session/:id` probe answers with (`directory: null` = the
+/// serve has no directory for this session — distinct from a recorded one).
+fn resume_session_body(id: &str, directory: Option<&str>) -> Value {
+    json!({
+        "id": id,
+        "title": "resumed session",
+        "time": { "created": 1i64, "updated": 2i64 },
+        "directory": directory,
+    })
+}
+
+/// Bounded bus drain asserting no frame contains `needle` (the Task 5
+/// bounded-drain pattern, opencode_ws.rs tests).
+async fn assert_no_frame_contains(rx: &mut tokio::sync::broadcast::Receiver<String>, needle: &str) {
+    while let Ok(frame) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        let Ok(text) = frame else { break };
+        assert!(
+            !text.contains(needle),
+            "no frame may contain {needle:?}, saw: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_resume_durable_ses_is_born_durable_with_ledger_settings_and_route() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_resumed_1",
+        resume_session_body("ses_resumed_1", Some("/serve/dir")),
+    )]));
+    let (state, sink) = state_with_resume_http(http.clone()).await;
+    // A settings-bearing ledger record (seeded directly, bypassing `seed()`
+    // whose bindings-log row would muddy the no-binding-writes assertion).
+    sink.settings.lock().unwrap().insert(
+        ("opencode".to_string(), "ses_resumed_1".to_string()),
+        FreshAgentSettings {
+            model: Some("big-model".to_string()),
+            sandbox: None,
+            permission_mode: None,
+            effort: Some("high".to_string()),
+            cwd: Some("/real/project".to_string()),
+        },
+    );
+    sink.recorded
+        .lock()
+        .unwrap()
+        .insert(("opencode".to_string(), "ses_resumed_1".to_string()));
+
+    let mut rx = state.broadcast_tx.subscribe();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_resumed_1" },
+        }),
+        true,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let data = &body["data"];
+    assert_eq!(data["sessionId"], json!("ses_resumed_1"), "{body}");
+    assert_eq!(
+        data["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": "ses_resumed_1" }),
+        "{body}"
+    );
+    assert_eq!(body["message"], json!("fresh-agent pane resumed"), "{body}");
+    let tab_id = data["tabId"].as_str().expect("tabId").to_string();
+    let pane_id = data["paneId"].as_str().expect("paneId").to_string();
+
+    // Born-durable PaneEntry: the placeholder id IS the durable id (no
+    // `freshopencode-*` id is ever minted for a resumed pane), durable_id set
+    // from creation; settings merged ledger-first; cwd ledger > serve-dir.
+    let pane = state
+        .panes
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned()
+        .expect("pane entry");
+    assert_eq!(
+        pane.placeholder_id, "ses_resumed_1",
+        "a resumed pane is born-durable: no placeholder-prefixed id"
+    );
+    assert_eq!(pane.durable_id.as_deref(), Some("ses_resumed_1"));
+    assert_eq!(
+        pane.cwd.as_deref(),
+        Some("/real/project"),
+        "ledger cwd wins over the serve directory"
+    );
+    assert_eq!(pane.model.as_deref(), Some("big-model"));
+    assert_eq!(pane.effort.as_deref(), Some("high"));
+
+    // The layout-store paneContent carries the durable identities, status
+    // "connected", and a fresh server-minted 32-hex createRequestId.
+    let snap = state
+        .layout
+        .get_pane_snapshot(&pane_id)
+        .expect("pane in store");
+    let content = snap.pane_content.expect("fresh-agent content");
+    assert_eq!(content["kind"], json!("fresh-agent"));
+    assert_eq!(content["sessionType"], json!("freshopencode"));
+    assert_eq!(content["provider"], json!("opencode"));
+    assert_eq!(content["sessionId"], json!("ses_resumed_1"));
+    assert_eq!(
+        content["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": "ses_resumed_1" })
+    );
+    assert_eq!(content["status"], json!("connected"));
+    assert_eq!(content["initialCwd"], json!("/real/project"));
+    assert_eq!(content["model"], json!("big-model"));
+    assert_eq!(content["effort"], json!("high"));
+    let crid = content["createRequestId"]
+        .as_str()
+        .expect("fresh createRequestId");
+    assert_eq!(crid.len(), 32, "expected Uuid::simple format, got {crid:?}");
+    assert!(crid.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // The `ui.command` `tab.create` broadcast carries the same content.
+    let frame = rx.recv().await.expect("tab.create broadcast");
+    let msg: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(msg["command"], json!("tab.create"));
+    assert_eq!(msg["payload"]["id"], json!(tab_id));
+    assert_eq!(msg["payload"]["paneId"], json!(pane_id));
+    assert_eq!(
+        msg["payload"]["paneContent"]["sessionId"],
+        json!("ses_resumed_1")
+    );
+    assert_eq!(
+        msg["payload"]["paneContent"]["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": "ses_resumed_1" })
+    );
+
+    // Ledger read-only on resume: NO pending marker, NO binding row; and the
+    // bus carries NO materialized frame / sessions.changed (bounded drain).
+    assert!(
+        sink.pendings.lock().unwrap().is_empty(),
+        "resume must not write a pending marker"
+    );
+    assert!(
+        sink.bindings.lock().unwrap().is_empty(),
+        "resume must not write a binding row"
+    );
+    assert_no_frame_contains(&mut rx, "session.materialized").await;
+    assert_no_frame_contains(&mut rx, "sessions.changed").await;
+
+    // LEDGER-BEFORE-PROBE: the probe route carried the recorded ledger cwd
+    // (raw percent-encoded: `/real/project` → `%2Freal%2Fproject`), never the
+    // body cwd (absent here) and never nothing.
+    let observed = http.observed_directories.lock().unwrap().clone();
+    assert_eq!(
+        observed.len(),
+        1,
+        "exactly one session GET (the resume probe): {observed:?}"
+    );
+    assert_eq!(observed[0].as_deref(), Some("%2Freal%2Fproject"));
+}
+
+#[tokio::test]
+async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_placeholder_resumed",
+        resume_session_body("ses_placeholder_resumed", None),
+    )]));
+    let (state, sink) = state_with_resume_http(http).await;
+    // A lineage-only row (all-blank settings, create_request_id lineage —
+    // exactly what the unconditional materialization write produces for a
+    // default create) still answers `lookup_by_create_request_id`.
+    sink.record_binding(FreshAgentBindingUpsert {
+        provider: "opencode".into(),
+        session_id: "ses_placeholder_resumed".into(),
+        mode: "freshopencode".into(),
+        create_request_id: Some("cr-abc123".into()),
+        resolves_pending: Some("freshopencode-cr-abc123".into()),
+        supersedes: None,
+        settings: FreshAgentSettings::default(),
+    })
+    .await
+    .expect("lineage binding write ok");
+
+    let mut rx = state.broadcast_tx.subscribe();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "freshopencode-cr-abc123" },
+        }),
+        true,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["sessionId"],
+        json!("ses_placeholder_resumed"),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": "ses_placeholder_resumed" }),
+        "{body}"
+    );
+
+    // The lineage-only resume's complement (Task 3 keying): NO SETTINGS_RESET
+    // may arm — the row was never settings-bearing, so the absence of a
+    // recoverable snapshot is routine, not an anomaly.
+    let _ = rx.recv().await; // drain tab.create
+    assert_no_frame_contains(&mut rx, "SETTINGS_RESET").await;
+
+    // The ledger is still read-only on resume: the only binding row is the
+    // seeded lineage row itself.
+    assert_eq!(sink.bindings.lock().unwrap().len(), 1);
+    assert!(sink.pendings.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rest_resume_unresolvable_placeholder_is_404_naming_it() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    // Leg 1: a sink is wired but has NO binding for this create requestId.
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "freshopencode-cr-unknown" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let msg = body["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("freshopencode-cr-unknown"),
+        "the 404 message must name the unresolvable placeholder: {msg}"
+    );
+
+    // Leg 2: NO identity sink wired at all — same loud 404, never a silent
+    // fresh-placeholder substitution.
+    let bare = state_with_registry();
+    let (status, body) = post(
+        app(bare),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "freshopencode-cr-unknown" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Loud-failure hygiene: no tab/pane was minted for either rejected resume.
+    let (rows, _) = state.layout.list_tabs();
+    assert!(rows.is_empty(), "no phantom tab on a rejected resume: {rows:?}");
+    assert!(state.panes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rest_resume_unknown_durable_ses_is_404() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_unknown_9" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (rows, _) = state.layout.list_tabs();
+    assert!(rows.is_empty(), "no phantom tab on a rejected resume: {rows:?}");
+    assert!(state.panes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rest_resume_provider_mismatch_is_400() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    for provider in ["claude", "kimi", "codex"] {
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "agent": "opencode",
+                "sessionRef": { "provider": provider, "sessionId": "ses_x" },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "provider {provider} must be rejected loudly: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rest_resume_malformed_sessionref_is_400() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    for (label, session_ref) in [
+        ("missing sessionId", json!({ "provider": "opencode" })),
+        ("non-object", json!("ses_x")),
+        // Neither a durable ses_* id nor a freshopencode- placeholder —
+        // an unknown IDENTITY shape, rejected lest it be silently ignored.
+        ("unknown id shape", json!({ "provider": "opencode", "sessionId": "thread-9" })),
+    ] {
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "agent": "opencode", "sessionRef": session_ref }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn rest_resume_dual_carrier_hits_the_frozen_legacy_refusal() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    // A body carrying BOTH `resumeSessionId` and `sessionRef` hits the frozen
+    // door-top legacy refusal BEFORE the agent gate — the resume branch never
+    // evaluates.
+    let (status, body) = post(
+        app(state),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "resumeSessionId": "ses_legacy",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_resumed_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        json!(
+            "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."
+        ),
+        "LEGACY_RESUME_IDENTITY_REFUSAL text is frozen: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_resume_probe_timeout_is_bounded_and_504() {
+    // The wedged-but-accepting serve shape (V5 caveat b): session GETs never
+    // resolve. The probe MUST be bounded — and the budget MUST come from the
+    // cfg(test) state injection (never the process-global env var, which an
+    // opencode_ws.rs test already sets/removes unsynchronized).
+    let http = Arc::new(ResumeServeHttp::wedged());
+    let (state, _sink) = state_with_resume_http(http).await;
+    state.set_resume_probe_timeout_ms_for_test(50);
+
+    let started = std::time::Instant::now();
+    let (status, body) = post(
+        app(state),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_wedged_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the probe must be bounded by the injected budget, not the 10s default ({:?})",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn rest_resume_probe_error_other_than_notfound_or_timeout_is_502() {
+    let http = Arc::new(ResumeServeHttp::erroring(500));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    let (status, body) = post(
+        app(state),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_erroring_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+}
+
+#[tokio::test]
+async fn rest_resume_probe_carries_no_directory_without_ledger_cwd_and_serve_dir_beats_body_cwd()
+ {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_unrecorded_1",
+        resume_session_body("ses_unrecorded_1", Some("/serve/dir")),
+    )]));
+    let (state, _sink) = state_with_resume_http(http.clone()).await;
+    // The sink is wired but has NO record for this session: the probe route
+    // must carry NO directory — the body cwd is LAST in cwd precedence and a
+    // wrong `?directory=` can fail the probe of a legitimate session.
+
+    let mut rx = state.broadcast_tx.subscribe();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "cwd": "/body/cwd",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_unrecorded_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let observed = http.observed_directories.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![None],
+        "the probe must carry NO directory without a ledger cwd (never the body cwd): {observed:?}"
+    );
+
+    // serve-directory-from-probe beats the body cwd.
+    let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+    let pane = state
+        .panes
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned()
+        .expect("pane entry");
+    assert_eq!(pane.cwd.as_deref(), Some("/serve/dir"));
+
+    // Never-recorded resume is ROUTINE: no SETTINGS_RESET (subscription
+    // predates the POST, so a frame emitted mid-resume could not be missed).
+    let _ = rx.recv().await; // drain tab.create
+    assert_no_frame_contains(&mut rx, "SETTINGS_RESET").await;
+}
+
+#[tokio::test]
+async fn rest_resume_uses_body_cwd_when_ledger_and_serve_directory_are_absent() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_no_dir_1",
+        resume_session_body("ses_no_dir_1", None),
+    )]));
+    let (state, _sink) = state_with_resume_http(http).await;
+
+    // No ledger record, serve answers `directory: null` — the body cwd is the
+    // FINAL fallback (an implementation that drops body cwd entirely fails
+    // this leg).
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "cwd": "/body/cwd",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_no_dir_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+    let pane = state
+        .panes
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned()
+        .expect("pane entry");
+    assert_eq!(
+        pane.cwd.as_deref(),
+        Some("/body/cwd"),
+        "body cwd is the final cwd fallback"
+    );
+    let snap = state
+        .layout
+        .get_pane_snapshot(&pane_id)
+        .expect("pane in store");
+    assert_eq!(
+        snap.pane_content.expect("content")["initialCwd"],
+        json!("/body/cwd")
+    );
+}
+
+#[tokio::test]
+async fn rest_resume_body_model_and_effort_beat_the_ledger_record() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_override_1",
+        resume_session_body("ses_override_1", None),
+    )]));
+    let (state, sink) = state_with_resume_http(http).await;
+    sink.settings.lock().unwrap().insert(
+        ("opencode".to_string(), "ses_override_1".to_string()),
+        FreshAgentSettings {
+            model: Some("big-model".to_string()),
+            sandbox: None,
+            permission_mode: None,
+            effort: Some("high".to_string()),
+            cwd: None,
+        },
+    );
+    sink.recorded
+        .lock()
+        .unwrap()
+        .insert(("opencode".to_string(), "ses_override_1".to_string()));
+
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "model": "small-model",
+            "effort": "low",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_override_1" },
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+    let pane = state
+        .panes
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned()
+        .expect("pane entry");
+    assert_eq!(
+        pane.model.as_deref(),
+        Some("small-model"),
+        "explicit request model beats the ledger"
+    );
+    assert_eq!(
+        pane.effort.as_deref(),
+        Some("low"),
+        "explicit request effort beats the ledger"
+    );
+}
+
+#[tokio::test]
+async fn rest_resume_recorded_but_unrecoverable_settings_alarm_and_proceeds() {
+    let http = Arc::new(ResumeServeHttp::with_sessions(&[(
+        "ses_reset_1",
+        resume_session_body("ses_reset_1", Some("/serve/dir")),
+    )]));
+    let (state, sink) = state_with_resume_http(http).await;
+    // was_recorded=true with load_settings=None — the V7/A10 alarm-positive
+    // fixture (the genuine "recorded but unrecoverable" anomaly).
+    sink.seed_recorded_only("opencode", "ses_reset_1");
+
+    let mut rx = state.broadcast_tx.subscribe();
+    let (status, body) = post(
+        app(state.clone()),
+        "/api/tabs",
+        json!({
+            "agent": "opencode",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_reset_1" },
+        }),
+        true,
+    )
+    .await;
+    // The alarm must NOT fail the resume (mirror opencode_ws.rs:1506-1541).
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut found = false;
+    while let Ok(frame) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        let Ok(text) = frame else { break };
+        if text.contains("SETTINGS_RESET") {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            // Top-level sessionType/provider (locator resolution) + a
+            // user-facing message (the banner shows the message, not the code).
+            assert_eq!(frame["sessionType"], "freshopencode");
+            assert_eq!(frame["provider"], "opencode");
+            assert_eq!(frame["event"]["code"], "SETTINGS_RESET");
+            assert!(frame["event"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Reconfirm your settings"));
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+    );
+
+    // …and the resume proceeded with DEFAULTS (no model/effort to recover;
+    // cwd still merges serve-dir > body).
+    let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+    let pane = state
+        .panes
+        .lock()
+        .unwrap()
+        .get(&pane_id)
+        .cloned()
+        .expect("pane entry");
+    assert_eq!(pane.model, None);
+    assert_eq!(pane.effort, None);
+    assert_eq!(pane.cwd.as_deref(), Some("/serve/dir"));
+}

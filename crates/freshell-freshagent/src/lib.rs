@@ -323,6 +323,14 @@ pub struct FreshAgentState {
     /// wired fields above, production construction is unconditional); tests
     /// install a scripted probe via [`Self::with_model_capability_probe`].
     pub(crate) model_capabilities: Arc<model_capabilities::ModelCapabilityRegistry>,
+    /// Task 4 test seam: the REST resume probe's `get_session` budget override
+    /// (a wedged fake serve must NEVER wait the real 10s). Production
+    /// resolution reads the same `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
+    /// env var the WS resume door parses, default 10_000ms — the override is
+    /// consulted BEFORE the env parse by [`Self::resume_probe_budget_ms`].
+    /// Configured via [`Self::set_resume_probe_timeout_ms_for_test`].
+    #[cfg(test)]
+    resume_probe_timeout_ms: Arc<Mutex<Option<u64>>>,
 }
 
 /// What [`terminal_tabs::spawn_terminal_pane`] hands the injected
@@ -419,6 +427,8 @@ impl FreshAgentState {
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
+            #[cfg(test)]
+            resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -766,6 +776,38 @@ impl FreshAgentState {
     #[cfg(test)]
     pub(crate) async fn set_manager_for_test(&self, manager: OpencodeServeManager) {
         *self.opencode.lock().await = Some(manager);
+    }
+
+    /// Task 4 test seam: bound the REST resume probe's `get_session` budget
+    /// WITHOUT touching the process-global `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
+    /// env var — an existing opencode_ws.rs test already sets/removes that var
+    /// unsynchronized, and parallel tokio tests would race it. Consulted BEFORE
+    /// the env parse by [`Self::resume_probe_budget_ms`].
+    #[cfg(test)]
+    pub(crate) fn set_resume_probe_timeout_ms_for_test(&self, ms: u64) {
+        *self
+            .resume_probe_timeout_ms
+            .lock()
+            .expect("resume_probe_timeout_ms mutex") = Some(ms);
+    }
+
+    /// The REST resume probe's bounded `get_session` budget, in milliseconds:
+    /// cfg(test) state override > `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
+    /// env parse > 10_000ms default — the same env/default layers the WS
+    /// resume door uses (`opencode_ws.rs:1483-1486`).
+    fn resume_probe_budget_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = *self
+            .resume_probe_timeout_ms
+            .lock()
+            .expect("resume_probe_timeout_ms mutex")
+        {
+            return ms;
+        }
+        std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000u64)
     }
 
     // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──
@@ -1662,6 +1704,15 @@ async fn create_tab(
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
+    // Task 4 (adopted kata 2, freshagent-sessionref-regression): the `sessionRef`
+    // resume branch. Placed AFTER the agent gate — and strictly after the frozen
+    // door-top `resumeSessionId` refusal, so a dual carrier (resumeSessionId +
+    // sessionRef) hits the frozen 400, never this branch. A body WITHOUT
+    // `sessionRef` takes the plain placeholder-create path below unchanged.
+    if let Some(session_ref_value) = body.get("sessionRef") {
+        return resume_session_ref_tab(&state, session_ref_value, cwd, model, effort, name).await;
+    }
+
     // A1 (naming-sweep ledger deferral): the shared LayoutStore mints
     // {tabId, paneId} -- Node does the same for fresh-agent tabs
     // (`layoutStore.createTab`, router.ts:701) -- so REST/MCP-created
@@ -1692,17 +1743,12 @@ async fn create_tab(
         pane_content["effort"] = json!(effort);
     }
 
-    state
-        .layout
-        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
-    state.tabs.lock().expect("tabs mutex").insert(
-        tab_id.clone(),
-        TabRecord {
-            title: name.clone(),
-        },
-    );
-    state.panes.lock().expect("panes mutex").insert(
-        pane_id.clone(),
+    register_fresh_agent_tab(
+        &state,
+        &tab_id,
+        &pane_id,
+        name.as_deref(),
+        &pane_content,
         PaneEntry {
             placeholder_id: placeholder.clone(),
             cwd: cwd.clone(),
@@ -1711,14 +1757,6 @@ async fn create_tab(
             durable_id: None,
         },
     );
-    // Every pane-minting path records its owning tab in the shared
-    // `pane_tabs` reverse index so `pane_ops`'s split/close/select handlers
-    // can resolve this pane's tab.
-    state
-        .pane_tabs
-        .lock()
-        .expect("pane_tabs mutex")
-        .insert(pane_id.clone(), tab_id.clone());
 
     // P1.13 (Task 3): pending identity marker at REST create (AWAITED before
     // the tab.create broadcast — durable-before-answer), mirroring the WS
@@ -1744,30 +1782,288 @@ async fn create_tab(
         }
     }
 
-    // Broadcast AFTER registration -- Node's order is createTab -> runtime
-    // create -> attachPaneContent -> broadcast -> respond (router.ts:546-589),
-    // and `create_content_tab` likewise inserts before broadcasting.
-    // Shape note (validated): Node OMITS the `title` key when no name was
-    // provided (JSON.stringify drops undefined, router.ts:704). Serialize
-    // the same shape instead of `"title": null` -- the shared client
-    // tolerates both (`payload.title ||`, tabsSlice.ts:306), but keep the
-    // broadcast Node-shaped.
+    broadcast_tab_create(&state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+
+    ok_json(
+        json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
+        "fresh-agent pane created",
+    )
+}
+
+/// The registration every fresh-agent pane-minting path needs: attach the pane
+/// content to the shared store, record the legacy shadow `TabRecord` + the
+/// [`PaneEntry`], and index pane→tab. Every pane-minting path records its owning
+/// tab in the shared `pane_tabs` reverse index so `pane_ops`'s
+/// split/close/select handlers can resolve this pane's tab.
+fn register_fresh_agent_tab(
+    state: &FreshAgentState,
+    tab_id: &str,
+    pane_id: &str,
+    name: Option<&str>,
+    pane_content: &Value,
+    pane_entry: PaneEntry,
+) {
+    state
+        .layout
+        .attach_pane_content(tab_id, pane_id, pane_content.clone());
+    state.tabs.lock().expect("tabs mutex").insert(
+        tab_id.to_string(),
+        TabRecord {
+            title: name.map(str::to_string),
+        },
+    );
+    state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .insert(pane_id.to_string(), pane_entry);
+    state
+        .pane_tabs
+        .lock()
+        .expect("pane_tabs mutex")
+        .insert(pane_id.to_string(), tab_id.to_string());
+}
+
+/// Broadcast `ui.command{tab.create}` — AFTER registration (Node's order is
+/// createTab -> runtime create -> attachPaneContent -> broadcast -> respond,
+/// router.ts:546-589, and `create_content_tab` likewise inserts before
+/// broadcasting). Shape note (validated): Node OMITS the `title` key when no
+/// name was provided (JSON.stringify drops undefined, router.ts:704). Serialize
+/// the same shape instead of `"title": null` -- the shared client tolerates
+/// both (`payload.title ||`, tabsSlice.ts:306), but keep the broadcast
+/// Node-shaped.
+fn broadcast_tab_create(
+    state: &FreshAgentState,
+    tab_id: &str,
+    pane_id: &str,
+    name: Option<&str>,
+    pane_content: &Value,
+) {
     let mut create_payload = json!({
         "id": tab_id,
         "paneId": pane_id,
         "paneContent": pane_content,
     });
-    if let Some(name) = &name {
+    if let Some(name) = name {
         create_payload["title"] = json!(name);
     }
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "tab.create".to_string(),
         payload: Some(create_payload),
     }));
+}
+
+/// Task 4 (adopted kata 2, freshagent-sessionref-regression): the `sessionRef`
+/// resume branch of [`create_tab`] — `POST /api/tabs {agent:'opencode',
+/// sessionRef}` resumes the referenced opencode session instead of minting a
+/// fresh placeholder pane.
+///
+/// DIVERGENCE FROM FROZEN NODE PARITY (deliberate, plan-authorized): the Node
+/// REST fresh-agent create (`router.ts:546-589`, `createFreshAgentPane`)
+/// ignores `sessionRef` entirely — resume identity on its fresh-agent pane
+/// surfaces rides only the WS `freshAgent.create{resumeSessionId}` door. This
+/// branch exceeds that parity so a placeholder-keyed pane snapshot can be
+/// restored in situ through REST after a restart.
+///
+/// Loud failures, never a silent placeholder substitution: malformed
+/// `sessionRef` / provider mismatch / unknown identity shape → 400; unknown
+/// durable id / unresolvable placeholder → 404; bounded-probe timeout → 504;
+/// other probe errors → 502.
+async fn resume_session_ref_tab(
+    state: &FreshAgentState,
+    session_ref_value: &Value,
+    body_cwd: Option<String>,
+    body_model: Option<String>,
+    body_effort: Option<String>,
+    name: Option<String>,
+) -> Response {
+    // 1. Parse. Presence-triggered and LOUD: a malformed locator is rejected,
+    // never silently treated as "no resume" — the silent-placeholder-
+    // substitution bug class this branch exists to close.
+    let locator: SessionLocator = match serde_json::from_value(session_ref_value.clone()) {
+        Ok(locator) => locator,
+        Err(_) => {
+            return fail_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "malformed sessionRef: expected {{\"provider\":\"...\",\"sessionId\":\"...\"}}, got {session_ref_value}"
+                ),
+            );
+        }
+    };
+    // 2. Provider gate: this route resumes opencode panes only.
+    if locator.provider != PROVIDER {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "sessionRef provider mismatch: this route resumes \"{PROVIDER}\" panes, got \"{}\"",
+                locator.provider
+            ),
+        );
+    }
+    // 3. Resolve the resume identity: a durable ses_* id resumes directly; a
+    // freshopencode-<createRequestId> placeholder resolves through the
+    // pane-identity ledger's create-requestId lineage (Task 3). Miss-or-no-sink
+    // → 404 naming the placeholder; any other shape → 400.
+    let durable_id = if locator.session_id.starts_with("ses_") {
+        locator.session_id.clone()
+    } else if let Some(create_request_id) =
+        locator.session_id.strip_prefix(OPENCODE_PLACEHOLDER_PREFIX)
+    {
+        let resolved = state
+            .identity_sink()
+            .and_then(|sink| sink.lookup_by_create_request_id(PROVIDER, create_request_id));
+        match resolved {
+            Some(id) => id,
+            None => {
+                return fail_json(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "sessionRef {} could not be resolved: no pane with create requestId {create_request_id} was materialized on this server",
+                        locator.session_id
+                    ),
+                );
+            }
+        }
+    } else {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "sessionRef sessionId \"{}\" is neither a durable ses_* id nor a {OPENCODE_PLACEHOLDER_PREFIX}<createRequestId> placeholder",
+                locator.session_id
+            ),
+        );
+    };
+
+    // 4. LEDGER BEFORE PROBE (ordering is load-bearing, review-verified):
+    // `get_session` applies the route directory as the `?directory=` query
+    // param (serve.rs:634 via `with_route`) and a route-sensitive serve can
+    // reject a wrong directory — so the probe route carries the ledger's
+    // recorded cwd when one exists, else NO directory; NEVER the body cwd
+    // (last in precedence) even when it is present.
+    let sink = state.identity_sink();
+    let recovered = sink
+        .as_ref()
+        .and_then(|s| s.load_settings(PROVIDER, &durable_id));
+    let was_recorded = sink
+        .as_ref()
+        .is_some_and(|s| s.was_recorded(PROVIDER, &durable_id));
+    let probe_route: freshell_opencode::Route =
+        recovered.as_ref().and_then(|rec| rec.cwd.clone());
+
+    // 5. Bounded probe. Budget layers: cfg(test) state override >
+    // FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS > 10_000ms — the WS resume
+    // door's knob semantics (opencode_ws.rs:1483-1486).
+    let manager = state.ensure_manager().await;
+    let budget = state.resume_probe_budget_ms();
+    let get = tokio::time::timeout(
+        Duration::from_millis(budget),
+        manager.get_session(&durable_id, &probe_route),
+    )
+    .await;
+    let info = match get {
+        Err(_elapsed) => {
+            return fail_json(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("opencode session {durable_id} did not answer within {budget}ms"),
+            );
+        }
+        Ok(Ok(value)) if value.is_object() => value,
+        Ok(Ok(_)) | Ok(Err(ServeError::Http { status: 404, .. })) => {
+            return fail_json(
+                StatusCode::NOT_FOUND,
+                format!("opencode session {durable_id} not found"),
+            );
+        }
+        Ok(Err(err)) => {
+            return fail_json(StatusCode::BAD_GATEWAY, err.to_string());
+        }
+    };
+
+    // 6. SETTINGS_RESET edge (mirror opencode_ws.rs:1506-1541): the alarm arms
+    // ONLY for a settings-bearing record that is now unrecoverable — a
+    // lineage-only row (`was_recorded == false` under the Task 3 keying) and a
+    // never-recorded session both resume silently. The alarm never blocks the
+    // resume.
+    if was_recorded && recovered.is_none() {
+        tracing::warn!(session = %durable_id, "freshagent.opencode.rest_resume_settings_record_unrecoverable");
+        state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": "freshAgent.error",
+                "sessionId": durable_id,
+                "code": "SETTINGS_RESET",
+                "message": "Session settings could not be recovered after restart - the agent is running with default model and effort. Reconfirm your settings.",
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: durable_id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+        }));
+    }
+
+    // 7. Merge AFTER probe: explicit request values win model/effort over the
+    // ledger; cwd is ledger > serve-directory-from-probe > body.
+    let rec = recovered.unwrap_or_default();
+    let serve_dir = info
+        .get("directory")
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+    let cwd = rec.cwd.or(serve_dir).or(body_cwd);
+    let model = body_model.or(rec.model);
+    let effort = body_effort.or(rec.effort);
+
+    // 8. Born-durable pane: `placeholder_id` IS the durable id (no
+    // `freshopencode-`-prefixed id is ever minted for a resumed pane — the
+    // snapshot/serve path sees a normal `ses_*` id from creation, behaving as
+    // any already-materialized durable pane) with a FRESH uuid createRequestId.
+    // The ledger stays READ-ONLY on resume: no pending marker (Task 3's
+    // pending write is create-only), no binding row, NO materialized frame, NO
+    // sessions.changed.
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    let request_id = Uuid::new_v4().simple().to_string();
+    let session_ref = json!({ "provider": PROVIDER, "sessionId": durable_id });
+    let mut pane_content = json!({
+        "kind": "fresh-agent",
+        "sessionType": SESSION_TYPE,
+        "provider": PROVIDER,
+        "sessionId": durable_id,
+        "createRequestId": request_id,
+        "status": "connected",
+        "sessionRef": session_ref,
+    });
+    if let Some(cwd) = &cwd {
+        pane_content["initialCwd"] = json!(cwd);
+    }
+    if let Some(model) = &model {
+        pane_content["model"] = json!(model);
+    }
+    if let Some(effort) = &effort {
+        pane_content["effort"] = json!(effort);
+    }
+    register_fresh_agent_tab(
+        state,
+        &tab_id,
+        &pane_id,
+        name.as_deref(),
+        &pane_content,
+        PaneEntry {
+            placeholder_id: durable_id.clone(),
+            cwd,
+            model,
+            effort,
+            durable_id: Some(durable_id.clone()),
+        },
+    );
+    broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
 
     ok_json(
-        json!({ "tabId": tab_id, "paneId": pane_id, "sessionId": placeholder }),
-        "fresh-agent pane created",
+        json!({
+            "tabId": tab_id,
+            "paneId": pane_id,
+            "sessionId": durable_id,
+            "sessionRef": session_ref,
+        }),
+        "fresh-agent pane resumed",
     )
 }
 
