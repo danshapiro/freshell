@@ -19,6 +19,18 @@
 
 **Bottom line: 66 of 74 worktrees (~89%) are done and deletable.** Real value sits in 8 worktrees: 1 ready PR candidate and 7 finish-work items (2 of which contain *uncommitted* work that would be silently lost on deletion).
 
+**Dirt audit (post-report pass, 2026-08-23):** every dirty file in every worktree was physically read (see `dirt-report/`). Outcome: 7 worktrees have `read-useful` dirt (all uncommitted content is real, coherent WIP — zero litter, zero accidental poison), 1 `read-litter` (symlink to externally-archived captures), and 2 honest `unread` disclosures (both already deleted — see Cautions). The `dirt` column in the CSV/HTML is authoritative.
+
+### Dirt corrections to earlier deep-dive claims
+
+- **freshagent-undo-redo:** the audit recorded 1 dirty file; the branch has since advanced (another agent active: tip `ce4096b62` → `cc3a3fa11`). Current uncommitted dirt is a coherent 8-file "delta-r1" batch (+812/−213): F1 claude compact busy discipline, F2 codex `compact_in_flight` window close, F6 server-authored `redoableTurnIds`, F8 literal epoch bookkeeping. All commit-to-branch.
+- **restart-recovery-hardening:** all 18 dirty files read in full — real interlocking WIP (Codex exact-recovery provider 1,445 lines + 991-line test; Claude TOCTOU-hardened snapshot provider; CLAUDE_CONFIG_DIR NFC canonicalization). **Caveat:** `coordinator.rs` holds red-phase TDD referencing a `RecoveryStoreDomain` enum that was never written — the dirty tree does not compile as-is; commit WIP as WIP, not as a passing state.
+- **df1-session-09-live-watching:** dirty `main.rs` diff now **content-confirmed poison**: carries the literal label `TEMPORARY MUTATION (black-box red proof)` and guts the per-session signature to the old blind `(len, max)` shape. Never commit. The untracked 424-line WS-wire acceptance test covers `sessions.changed` — a surface main has zero tests for.
+- **0gdd-measurement / 0gdd-observer:** verdict stays throw-away (do-not-merge per the 0gdd handoff), BUT the reader found the source capability exists nowhere else and the Level-1 campaign's measured output was destroyed by a WSL reboot — **archive both source bundles into `triage-output/archive/` before deleting**.
+- **0gdd-handoff:** the untracked observations doc is the sole surviving record of that destroyed Level-1 campaign and the hash-integrity index for the whole family (6 artifact hashes re-verified on-disk today). Highest-value docs-only landing in this report.
+- **rust-tauri-port (in-main, deleted):** pre-delete read found 4 unique unlanded plan docs → archived to `triage-output/archive/rust-tauri-port/`.
+- **gate01 postmortem:** `df1-gate-01-unchanged-suite-both` and `df1-restore-01-panel-inert` were deleted with their modified `gate01-baseline.json` judged regenerable by filename, without a content read — a process violation, honestly recorded in the CSV as `dirt=unread`. The artifact is a re-runnable gate output; no information lost. The skill now hard-blocks this.
+
 ---
 
 ## 1. Ready for landing (1)
@@ -93,10 +105,12 @@ All verified merged — 48 as ancestors of `origin/main`, 3 via squash-merge foo
 
 ## Cautions (do not skip)
 
-- `restart-recovery-hardening` — uncommitted WIP, item 4 above.
-- `df1-session-09-live-watching` — the modified `main.rs` must never be committed (it's a deliberate red proof).
+- `restart-recovery-hardening` — uncommitted WIP, item 4 above; note the red-phase TDD doesn't compile as-is.
+- `df1-session-09-live-watching` — the modified `main.rs` must never be committed (confirmed deliberate red proof by content read).
 - `ws-bootstrap-recovery-flake` — "reviving" it is a revert-of-a-revert that already failed verification once; treat via fresh investigation instead.
 - `deploy-compatibility-rollback` — unpushed; deleting the worktree pre-archive loses the work permanently.
+- `freshagent-undo-redo` — branch is being actively advanced by another agent right now (tip moved during this audit); coordinate before touching.
+- Archive-before-delete obligations for `0gdd-measurement` / `0gdd-observer` (source exists nowhere else).
 
 ## Full reference table
 
@@ -108,3 +122,6 @@ See `final-report.csv` (74 rows, machine-readable) and `final-report.html` (sort
 - `baseline-criteria.md` — triage categories & method (incl. squash-merge detection)
 - `first-pass-table.md` — all 74 worktrees, one-line assessments
 - `deep-dive/01-tabbar-freshagent-ui.md` … `deep-dive/05-0gdd-investigation.md` — per-worktree evidence and verdicts
+- `dirt-report/01-recovery.md`, `dirt-report/02-0gdd-diagnostics.md` — per-file read evidence + dispositions for every dirty file
+- `verdicts.jsonl` — machine-readable verdicts incl. `dirt` / `useful_dirt_files` (input to deterministic aggregation)
+- `archive/rust-tauri-port/` — 4 unique unlanded plan docs rescued pre-deletion
