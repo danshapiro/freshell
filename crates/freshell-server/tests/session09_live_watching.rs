@@ -205,7 +205,12 @@ async fn collect_changed_until(
 /// unified `sessions_revision` counter — `main.rs`, SESSION-09 fix-forward
 /// — is strictly monotonic, so a stale/replayed frame from an earlier leg
 /// can never satisfy a later one).
-async fn expect_change_frame(ws: &mut WsStream, prev_revision: i64, within: Duration, leg: &str) -> i64 {
+async fn expect_change_frame(
+    ws: &mut WsStream,
+    prev_revision: i64,
+    within: Duration,
+    leg: &str,
+) -> i64 {
     let deadline = Instant::now() + within;
     let observed = collect_changed_until(ws, deadline, true).await;
     let first = observed.first().copied().unwrap_or_else(|| {
@@ -291,7 +296,11 @@ async fn session09_live_watch_and_coalescing_over_ws() {
     expect_quiet(&mut ws, Duration::from_millis(6500), "quiet boot").await;
 
     // Leg 1 — CREATE: a brand-new session file lands in the watched root.
-    let session_a = format!("{}/{}", claude_projects.display(), "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl");
+    let session_a = format!(
+        "{}/{}",
+        claude_projects.display(),
+        "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl"
+    );
     write_claude_session(
         Path::new(&session_a),
         "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
@@ -308,7 +317,12 @@ async fn session09_live_watch_and_coalescing_over_ws() {
         "/tmp/s09-live/alpha",
         "2026-01-01T00:00:00.000Z",
     );
-    expect_quiet(&mut ws, Duration::from_millis(5000), "content-identical rewrite").await;
+    expect_quiet(
+        &mut ws,
+        Duration::from_millis(5000),
+        "content-identical rewrite",
+    )
+    .await;
 
     // Leg 2 — MODIFIED BELOW THE CORPUS MAX: append a newer-timestamp turn
     // (2026) to the SAME file while the anchor sits at 2030. NEITHER corpus
@@ -336,7 +350,11 @@ async fn session09_live_watch_and_coalescing_over_ws() {
     //
     // Step A: the hidden session's CREATE is itself a change (len moves),
     // so consume its frame first to isolate the flip leg.
-    let session_h = format!("{}/{}", claude_projects.display(), "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb.jsonl");
+    let session_h = format!(
+        "{}/{}",
+        claude_projects.display(),
+        "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb.jsonl"
+    );
     write_claude_session(
         Path::new(&session_h),
         "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
@@ -344,7 +362,12 @@ async fn session09_live_watch_and_coalescing_over_ws() {
         "2025-01-01T00:00:00.000Z",
     );
     let r3a = expect_change_frame(&mut ws, r2, Duration::from_secs(10), "hidden create").await;
-    expect_quiet(&mut ws, Duration::from_millis(5000), "post-hidden-create settle").await;
+    expect_quiet(
+        &mut ws,
+        Duration::from_millis(5000),
+        "post-hidden-create settle",
+    )
+    .await;
 
     // Step B: the flip. Same-timestamp second user message — every field of
     // the OLD signature is provably unmoved; the frame arrives ONLY because
@@ -401,7 +424,12 @@ async fn session09_live_watch_and_coalescing_over_ws() {
         "burst: every burst frame must exceed the previous leg's revision {r4}, got {burst_frames:?}"
     );
     // And the stream must go quiet afterwards (no endless re-deliveries).
-    expect_quiet(&mut ws, Duration::from_millis(6000), "post-burst quiescence").await;
+    expect_quiet(
+        &mut ws,
+        Duration::from_millis(6000),
+        "post-burst quiescence",
+    )
+    .await;
 
     // CLEANUP: SIGTERM — the graceful-shutdown contract (shared with
     // safe11's assertions about the same path).
@@ -411,11 +439,17 @@ async fn session09_live_watch_and_coalescing_over_ws() {
     loop {
         match boot.child.try_wait() {
             Ok(Some(status)) => {
-                assert!(status.success(), "server must exit 0 on SIGTERM, got {status:?}");
+                assert!(
+                    status.success(),
+                    "server must exit 0 on SIGTERM, got {status:?}"
+                );
                 break;
             }
             Ok(None) => {
-                assert!(Instant::now() < deadline, "server did not exit within 5s of SIGTERM");
+                assert!(
+                    Instant::now() < deadline,
+                    "server did not exit within 5s of SIGTERM"
+                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(e) => panic!("try_wait failed: {e}"),
