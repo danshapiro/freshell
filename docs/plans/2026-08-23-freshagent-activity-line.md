@@ -140,7 +140,7 @@ Do NOT commit. The failing e2e is staged with Task 2's commit once green.
 
 **Interfaces:**
 - Consumes: `FreshAgentTurn`, `FreshAgentTranscriptItem` from `@shared/fresh-agent-contract`; existing `buildActivity`, `isActivityLike`, `FreshAgentActivityStrip`, `FreshAgentTurnArticle`.
-- Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number>; tail: { blockId: string; turnIndex: number } | null }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn; `tail` names the last rendered block when it is an activity line), `rendersVisibly(...)`, `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
+- Produces: `buildTranscriptLayout(turns: DisplayTurn[], paintedSummaryKeys: PaintedSummaryStore): { layouts: TurnLayout[]; lineEndIndex: Map<number, number>; tail: { blockId: string; turnIndex: number } | null }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn; `tail` names the last rendered block when it is an activity line), `rendersVisibly(...)`, `summaryIsAuthoredContent(...)`, `recordPaintedSummary(...)`/`paintedSummaryMatches(...)` (per-turnId prefix-matched painted-summary identity), `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
 
 - [x] **Step 1: Write the failing behavioral tests (new unit cases)**
 
