@@ -247,6 +247,11 @@ function itemEchoes(item: FreshAgentTranscriptItem): string[] {
   push(rec.query)
   push(rec.path)
   push(rec.tool)
+  // Codex image_generation summarizes as its result (normalize.ts); live
+  // claude summarizes a tool_result by its string content
+  // (summarizeFreshAgentItems) — both are plain echoes of the item.
+  push(rec.result)
+  push(rec.content)
   if (typeof rec.server === 'string' && typeof rec.tool === 'string') {
     push(`${rec.server}:${rec.tool}`)
   }
@@ -258,18 +263,50 @@ function itemEchoes(item: FreshAgentTranscriptItem): string[] {
   const kind = typeof rec.kind === 'string' ? rec.kind : ''
   push(SUMMARY_LABEL_BY_KIND[kind])
   if (kind === 'tool_result') {
+    // TS normalizer: 'Tool result'/'Tool error'; Rust claude snapshot:
+    // '[tool result]' (no error variant — claude_snapshot.rs).
     push(rec.isError === true ? 'Tool error' : 'Tool result')
+    push('[tool result]')
   }
   return echoes
 }
+
+/**
+ * A summary segment is an echo when it tiles completely from the turn's item
+ * echoes joined by single spaces — the live claude summarizer space-joins
+ * per-block summaries ('Read Read'), and codex truncates each block summary,
+ * so the final tile may be a prefix of an echo.
+ */
+function segmentMatchesEchoes(segment: string, echoes: string[]): boolean {
+  if (echoes.some((echo) => echo.includes(segment))) return true
+  const n = segment.length
+  const reachable: boolean[] = new Array(n + 1).fill(false)
+  reachable[0] = true
+  for (let i = 0; i < n; i++) {
+    if (!reachable[i]) continue
+    for (const echo of echoes) {
+      if (segment.startsWith(echo, i)) {
+        const end = i + echo.length
+        if (end === n) reachable[n] = true
+        else if (segment[end] === ' ') reachable[end + 1] = true
+      }
+      if (echo.length > n - i && echo.startsWith(segment.slice(i))) {
+        reachable[n] = true
+      }
+    }
+  }
+  return reachable[n]
+}
+
 function summaryIsAuthoredContent(turn: FreshAgentTurn): boolean {
   const summary = typeof turn.summary === 'string' ? turn.summary : ''
   // Synthetic tool-result coalescing joins summaries with blank lines; judge
   // each segment against the turn's items independently.
   const segments = summary.split(/\n+/).map((segment) => segment.trim()).filter(Boolean)
   if (segments.length === 0) return false
-  return turn.items.length === 0
-    || segments.some((segment) => !turn.items.some((item) => itemEchoes(item).some((echo) => echo.includes(segment))))
+  if (turn.items.length === 0) return true
+  const echoes = turn.items.flatMap((item) => itemEchoes(item))
+  return segments.some((segment) => !segmentMatchesEchoes(segment, echoes))
 }
 
 function buildTranscriptLayout(turns: FreshAgentTurn[]): {
@@ -384,23 +421,38 @@ function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTu
   return coalesced
 }
 
+/**
+ * A turn whose items were all filtered out (e.g. hidden thinking with the
+ * default showThinking=false) still painted its summary while it was the
+ * streaming tail. That summary rendered between the surrounding tool runs,
+ * so once the turn is superseded it must leave a permanent, invisible
+ * boundary: dropping it outright would let the runs retro-collapse and the
+ * rendered summary vanish after the fact. The placeholder keeps the layout
+ * boundary (zero-item turns hard-close an open line) without rendering
+ * anything — the hidden thinking text stays hidden.
+ */
+type DisplayTurn = FreshAgentTurn & { filteredPlaceholder?: true }
+
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
   isStreaming: boolean,
-): FreshAgentTurn[] {
+): DisplayTurn[] {
   return turns
-    .map((turn, index) => {
+    .map((turn, index): DisplayTurn | null => {
       const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
       if (turn.items.length > 0 && items.length === 0) {
         if (isStreaming && index === turns.length - 1) {
           return { ...turn, items: [] }
         }
+        if (isStreaming && typeof turn.summary === 'string' && turn.summary.trim().length > 0) {
+          return { ...turn, items: [], summary: '', filteredPlaceholder: true }
+        }
         return null
       }
       return items === turn.items ? turn : { ...turn, items }
     })
-    .filter((turn): turn is FreshAgentTurn => turn !== null)
+    .filter((turn): turn is DisplayTurn => turn !== null)
 }
 
 function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[] {
@@ -918,6 +970,9 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           const absorbed = turn.items.length > 0 && blocksForTurn.length === 0
           const isLastStreaming = isStreaming && index === displayTurns.length - 1
           if (absorbed) return null
+          // Invisible boundary marker: painted its summary as the streaming
+          // tail, now superseded — it separates lines but renders nothing.
+          if (turn.filteredPlaceholder) return null
           if (isLastStreaming && blocksForTurn.length === 0 && turn.items.length === 0 && liveActivityBlockId !== null) return null
           // Fork/rewind/copy resolve to the article line's LAST contributing turn
           // (the most recent point the line covers), so the existing "fork from
