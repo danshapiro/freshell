@@ -659,10 +659,25 @@ fn derive_push_next(
     }
 
     let mut next = current.clone();
+    // Placeholder sessionRef clamp (kata item 1 server-side backstop): a
+    // pushed fresh-agent pane placeholder never regresses a durable identity
+    // ANY current registry state holds for the same (tabKey, paneId, provider,
+    // createRequestId). BOTH pushed record sets are clamped on clones BEFORE
+    // the folds below — open records AND closed records (a stale client
+    // closing a materialized tab with a re-derived placeholder payload is the
+    // closed/reopen regression surface). The folds read only
+    // event-time/identity fields the clamp never touches, so winner selection
+    // is unaffected BY the clamp while the STORED winners carry the clamped
+    // payloads. Clamp sources are the CURRENT (pre-push) state: every open
+    // snapshot ∪ every closed winner.
+    let mut open_records = prepared.open_records.clone();
+    let open_clamped = clamp_placeholder_session_refs(&mut open_records, current);
+    let mut closed_records = prepared.closed_records.clone();
+    clamp_placeholder_session_refs(&mut closed_records, current);
     // Fold closed records, event-time winner per tabKey — but a closed record
     // LOSES to a newer open winner for that tabKey across ALL snapshots
     // (`findOpenWinnerForTab`, store.ts:556-568 + :1158-1164).
-    for closed in &prepared.closed_records {
+    for closed in &closed_records {
         let Some(tab_key) = record_tab_key(closed) else {
             continue;
         };
@@ -678,7 +693,9 @@ fn derive_push_next(
         next.closed_by_tab_key.insert(tab_key, winner);
     }
     // An open record newer than a tombstone clears it (store.ts:1166-1171).
-    for open in &prepared.open_records {
+    // Reads the clamped open clone; the clamp touches only sessionRef payloads,
+    // never the event-time/identity fields this fold compares.
+    for open in &open_records {
         let Some(tab_key) = record_tab_key(open) else {
             continue;
         };
@@ -688,22 +705,18 @@ fn derive_push_next(
             }
         }
     }
-    // Placeholder sessionRef clamp (kata item 1 server-side backstop): a
-    // pushed fresh-agent pane placeholder never regresses a durable identity
-    // ANY current registry snapshot holds for the same
-    // (tabKey, paneId, provider, createRequestId). Runs on a copy of the
-    // prepared records; the tombstone folds above only read event-time/identity
-    // fields the clamp never touches.
-    //
     // HASH CORRECTNESS: the stored `open_snapshot_payload_hash` must describe
-    // the STORED records — `parse_open_snapshot` rebuilds it from them at
+    // the STORED open records — `parse_open_snapshot` rebuilds it from them at
     // reopen and rejects a mismatch as corruption (fatal at server startup).
-    // When the clamp changed anything, rebuild the hash over the CLAMPED
+    // When the open clamp changed anything, rebuild the hash over the CLAMPED
     // records with the same identity inputs used at prepare time. The
     // whole-push `last_push_payload_hash` stays RAW: it is the retry identity,
-    // so an identical raw retry after a clamped store still dedupes.
-    let mut open_records = prepared.open_records.clone();
-    let open_snapshot_hash = if clamp_placeholder_session_refs(&mut open_records, current) {
+    // so an identical raw retry after a clamped store still dedupes. The
+    // CLOSED clamp needs no hash work at all: closed records never enter a
+    // stored open snapshot (`parse_open_snapshot` accepts open records only)
+    // and closed winners carry no payload hash — closed clamping is
+    // content-only.
+    let open_snapshot_hash = if open_clamped {
         build_snapshot_payload_hash(
             device_id,
             device_label,
@@ -780,11 +793,12 @@ struct DurableSessionIdentity {
 /// pushed fresh-agent pane whose `sessionRef` re-derived a PLACEHOLDER
 /// (`freshopencode-<createRequestId>`, `freshcodex-…`, any non-canonical
 /// claude id) is rewritten to the DURABLE identity any current open snapshot
-/// already holds for the same (tabKey, paneId, provider, createRequestId),
-/// substituting `sessionRef` + `sessionId` + `resumeSessionId`. Deliberate
-/// resets — a new createRequestId — and provider switches pass through.
-/// Returns `true` when any pane was clamped (the caller must then rebuild the
-/// open-snapshot payload hash over the clamped records).
+/// or closed winner already holds for the same (tabKey, paneId, provider,
+/// createRequestId), substituting `sessionRef` + `sessionId` +
+/// `resumeSessionId`. Deliberate resets — a new createRequestId — and
+/// provider switches pass through. Returns `true` when any pane was clamped
+/// (the caller must then rebuild the open-snapshot payload hash over the
+/// clamped records — only ever needed for OPEN records, the only hashed set).
 fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState) -> bool {
     let mut clamped_any = false;
     for record in records.iter_mut() {
@@ -873,9 +887,11 @@ fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState)
 /// The newest (event-time) durable fresh-agent identity `current` holds for
 /// (tabKey, paneId, provider, createRequestId) across EVERY client's open
 /// snapshot — including the pushing client's own not-yet-replaced snapshot,
-/// the common self-regression case. Winner selection uses the registry's
-/// event-time comparator (updatedAt, then revision, then status, then
-/// sourceKey) so ties resolve deterministically regardless of map order.
+/// the common self-regression case — AND every current closed winner (the
+/// closed/reopen surface: a durable closed record must clamp a later
+/// placeholder re-close). Winner selection uses the registry's event-time
+/// comparator (updatedAt, then revision, then status, then sourceKey) so ties
+/// resolve deterministically regardless of map order.
 fn find_durable_session_identity(
     current: &CompactState,
     tab_key: &str,
@@ -885,27 +901,30 @@ fn find_durable_session_identity(
 ) -> Option<DurableSessionIdentity> {
     let mut winner: Option<&Value> = None;
     let mut identity: Option<DurableSessionIdentity> = None;
-    for snapshot in current.open_snapshots_by_client.values() {
-        for record in &snapshot.records {
-            if record_str(record, "tabKey").as_deref() != Some(tab_key) {
-                continue;
-            }
-            let Some(panes) = record.get("panes").and_then(Value::as_array) else {
-                continue;
-            };
-            let Some(candidate) = panes.iter().find_map(|pane| {
-                durable_identity_from_pane(pane, pane_id, provider, create_request_id)
-            }) else {
-                continue;
-            };
-            let newer = match winner {
-                None => true,
-                Some(incumbent) => compare_by_event_time(incumbent, record).is_lt(),
-            };
-            if newer {
-                winner = Some(record);
-                identity = Some(candidate);
-            }
+    let candidates = current
+        .open_snapshots_by_client
+        .values()
+        .flat_map(|snapshot| snapshot.records.iter())
+        .chain(current.closed_by_tab_key.values());
+    for record in candidates {
+        if record_str(record, "tabKey").as_deref() != Some(tab_key) {
+            continue;
+        }
+        let Some(panes) = record.get("panes").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(candidate) = panes.iter().find_map(|pane| {
+            durable_identity_from_pane(pane, pane_id, provider, create_request_id)
+        }) else {
+            continue;
+        };
+        let newer = match winner {
+            None => true,
+            Some(incumbent) => compare_by_event_time(incumbent, record).is_lt(),
+        };
+        if newer {
+            winner = Some(record);
+            identity = Some(candidate);
         }
     }
     identity
