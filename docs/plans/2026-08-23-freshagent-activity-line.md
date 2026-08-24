@@ -59,15 +59,20 @@ test.describe('activity line collapse', () => {
     sessionId: string,
     turns: unknown[],
   ) {
-    // NOTE TO IMPLEMENTER: mirror the setup of the 'style setting persists' test:
+    // NOTE TO IMPLEMENTER: mirror the setup of the 'style setting persists per Fresh Agent pane type
+    // and applies serif rendering' test in this same file AND copy its fixture set ({ freshellPage,
+    // page, harness, terminal } — the repository fixtures perform navigation/harness setup only when
+    // freshellPage is requested; the helper below receives page + terminal, which is sufficient once
+    // the TEST CALLBACKS request freshellPage/harness):
     // 1. await terminal.waitForTerminal(); await enableClaudeAndCodex(page)
     // 2. open the pane picker, click Freshcodex, accept the first option
     // 3. page.route(`**/api/fresh-agent/threads/freshcodex/codex/${sessionId}*`) fulfilling a snapshot with
     //    { sessionType:'freshcodex', provider:'codex', threadId:sessionId, sessionId, revision:1,
     //      latestTurnId:<last turn id>, status:'idle', summary:'', capabilities:{...true}, settings:{...},
     //      tokenUsage:{...zeros}, pendingApprovals:[], pendingQuestions:[], worktrees:[], diffs:[], turns }
-    // 4. page.evaluate dispatching panes/updatePaneContent to point the new freshcodex leaf at sessionId
-    //    (copy the findFreshcodexLeaf walk + dispatch from the serif test, minus the style filter)
+    // 4. page.evaluate dispatching panes/updatePaneContent via window.__FRESHELL_TEST_HARNESS__ to point
+    //    the new freshcodex leaf at sessionId (copy the leaf-walk + dispatch from the serif test, minus
+    //    the style filter)
   }
 
   function toolTurn(turnId: string, calls: Array<[string, string]>) {
@@ -82,7 +87,7 @@ test.describe('activity line collapse', () => {
     }
   }
 
-  test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ page, terminal }) => {
+  test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await seedCollapsePane(page, terminal, 'collapse-thread', [
       { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'read files',
         items: [{ id: 'item-user', kind: 'text', text: 'read these five files' }] },
@@ -100,7 +105,7 @@ test.describe('activity line collapse', () => {
     await expect(pane.getByText('src/e.ts')).toBeVisible()
   })
 
-  test('an intervening message keeps two tool lines separate', async ({ page, terminal }) => {
+  test('an intervening message keeps two tool lines separate', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await seedCollapsePane(page, terminal, 'split-thread', [
       toolTurn('turn-a', [['c1','src/a.ts']]),
       { id: 'turn-msg', turnId: 'turn-msg', role: 'assistant', summary: 'note',
@@ -284,6 +289,23 @@ describe('activity line collapse', () => {
     expect(screen.getByText('src/a.ts')).toBeInTheDocument()
     expect(screen.getByText('src/b.ts')).toBeInTheDocument()
   })
+
+  it('extends the open line in place as adjacent tool turns stream in (same DOM node, no regroup)', () => {
+    const userTurn = {
+      id: 'turn-user', role: 'user' as const, summary: 'req',
+      items: [{ id: 'item-user', kind: 'text' as const, text: 'read five files' }],
+    }
+    const turnA = toolTurn('turn-a', [['c1','src/a.ts'],['c2','src/b.ts'],['c3','src/c.ts']])
+    const { rerender } = render(<FreshAgentTranscript turns={[userTurn, turnA]} />)
+    const first = screen.getByRole('region', { name: 'Activity strip' })
+    expect(first).toHaveTextContent('3 tools used')
+
+    rerender(<FreshAgentTranscript turns={[userTurn, turnA, toolTurn('turn-b', [['c4','src/d.ts'],['c5','src/e.ts']])]} />)
+    const merged = screen.getByRole('region', { name: 'Activity strip' })
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    expect(merged).toBe(first)
+    expect(merged).toHaveTextContent('5 tools used')
+  })
 })
 ```
 
@@ -329,9 +351,11 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]
     if (rows.length > 0) {
       layouts[open.originIndex].blocks.push({
         kind: 'activity',
-        // originIndex prefix keeps the join-collision-free guarantee with
-        // duplicated TS-claude item ids.
-        id: `line:${open.originIndex}:${open.items.map((item) => item.id).join(':')}`,
+        // Stable per origin turn: the line keeps its React identity (and DOM
+        // node, scroll state, expanded state) while later turns' items append
+        // into it — this is the "started in the right place, extended in
+        // place" behavior, not an after-the-fact regrouping remount.
+        id: `line:${open.originIndex}`,
         rows,
       })
     }
@@ -345,10 +369,9 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]
       flushOpen()
       continue
     }
-    let messageSeenInTurn = false
     for (const item of turn.items) {
       if (isActivityLike(item)) {
-        if (open && open.role === turn.role && !messageSeenInTurn) {
+        if (open && open.role === turn.role) {
           const taken = new Set(open.items.map((openItem) => openItem.id))
           let displayItem = item
           let counter = 2
@@ -366,13 +389,14 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]
       }
       flushOpen()
       layout.blocks.push({ kind: 'item', item })
-      messageSeenInTurn = true
     }
   }
   flushOpen()
   return { layouts, lineEndIndex }
 }
 ```
+
+Note: after a message flushes the open line, `open` is null, so later activity in the SAME turn opens a fresh line whose remaining activity items absorb normally — `text → tool_use → tool_result` stays ONE line, exactly matching today's in-turn `buildBlocks` batching.
 
 (b) Replace `selectLiveActivityBlockId` (:307–339) with a layout-driven version:
 
@@ -562,6 +586,6 @@ git commit -m "docs: mark freshagent-activity-line tasks complete with verificat
 ## Validated design notes (load-bearing stage, 2026-08-24)
 
 - **Zero-item turns are real** (Rust codex `subAgentActivity` rows emit `{role:"assistant", summary:"", items:[]}`; opencode structural messages likewise) and they render real article chrome today. The layout pass hard-closes any open line on a zero-item turn — two halves of a codex tool run split by a `subAgentActivity` marker therefore stay two strips. Residual, accepted: fixing THAT split needs a provider-level turn-shape decision, out of scope for this render-rule change.
-- **TS-claude item-id reuse across turns** (one provider message id spanning multiple JSONL lines yields duplicate `turn:<msg>:item:N` ids) is handled by display-only id dedupe in the absorb path; `toolUseId` stitching is verified unique (615MB × 813 real transcripts, zero repeats) and unaffected. Validators: `reports/load-bearing-validator-c2.md`, `reports/load-bearing-validator-n1.md`.
-- **Remount parity:** the merged line's React key changes whenever items append (key = joined display ids) — identical to today's in-turn streaming growth regime; expanded state surviving mid-stream appends is not a regression vector to preserve. Recorded residual.
+- **TS-claude item-id reuse across turns** (one provider message id spanning multiple JSONL lines yields duplicate `turn:<msg>:item:N` ids) is handled by display-only id dedupe in the absorb path; `toolUseId` stitching is verified unique (615MB × 813 real transcripts, zero repeats) and unaffected. Validator evidence (external run logs, by workflow design outside the tracked tree): `/home/dan/code/freshell/.worktrees/.the-usual-logs/freshagent-activity-line/reports/load-bearing-validator-c2.md` and `.../load-bearing-validator-n1.md`.
+- **Stable line identity:** each open line's React key is `line:<originTurnIndex>`, stable while later turns' items append — the strip keeps its DOM node (verified by an incremental rerender test asserting node identity), scroll position, and expanded state across extension; this is what distinguishes an extending open line from an after-the-fact regrouping remount.
 - **Non-streaming liveness:** mirrors the old last-turn trailing-thinking rule, extended to cover a last turn that was absorbed (its items close the latest line, so the check reads that line's trailing row).
