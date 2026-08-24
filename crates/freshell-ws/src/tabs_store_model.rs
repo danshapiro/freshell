@@ -411,11 +411,45 @@ fn is_canonical_claude_session_id(s: &str) -> bool {
 
 /// `sanitizeSessionRef` (shared/session-contract.ts:55-62): `(provider,
 /// sessionId)` when both are non-empty strings.
-fn sanitize_session_ref(v: Option<&Value>) -> Option<(String, String)> {
+pub(crate) fn sanitize_session_ref(v: Option<&Value>) -> Option<(String, String)> {
     let obj = v?.as_object()?;
     let provider = obj.get("provider")?.as_str().filter(|s| !s.is_empty())?;
     let session_id = obj.get("sessionId")?.as_str().filter(|s| !s.is_empty())?;
     Some((provider.to_string(), session_id.to_string()))
+}
+
+/// `isDurableProviderSessionId` (shared/session-flavor.ts:65-77): a non-empty
+/// id the provider minted durably — a canonical UUID for claude, `ses_`-prefixed
+/// for opencode, anything not `freshcodex-`-prefixed for codex. Empty ids and
+/// unknown providers are NEVER durable: a durability claim requires knowing
+/// the provider's durable id shape.
+pub(crate) fn is_durable_provider_session_id(provider: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    match provider {
+        "claude" => is_canonical_claude_session_id(session_id),
+        "opencode" => session_id.starts_with("ses_"),
+        "codex" => !session_id.starts_with("freshcodex-"),
+        _ => false,
+    }
+}
+
+/// `isPlaceholderProviderSessionId` (shared/session-flavor.ts:86-98): a
+/// non-empty id the provider did NOT mint durably (re-derived placeholders
+/// such as `freshopencode-<createRequestId>`). Empty ids and unknown providers
+/// are NOT placeholders: a placeholder claim requires knowing the provider's
+/// durable id shape.
+pub(crate) fn is_placeholder_provider_session_id(provider: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    match provider {
+        "claude" => !is_canonical_claude_session_id(session_id),
+        "opencode" => !session_id.starts_with("ses_"),
+        "codex" => session_id.starts_with("freshcodex-"),
+        _ => false,
+    }
 }
 
 /// `readRestoreError` (shared/fresh-agent.ts:190-197): the validated reason.
