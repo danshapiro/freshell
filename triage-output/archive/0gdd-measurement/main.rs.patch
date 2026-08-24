@@ -1,0 +1,288 @@
+diff --git a/crates/freshell-server/src/main.rs b/crates/freshell-server/src/main.rs
+index 346e7d964..f6988ccc6 100644
+--- a/crates/freshell-server/src/main.rs
++++ b/crates/freshell-server/src/main.rs
+@@ -62,6 +62,7 @@ use std::net::IpAddr;
+ use std::path::{Path, PathBuf};
+ use std::process::ExitCode;
+ use std::sync::Arc;
++use std::time::Duration;
+ 
+ use freshell_api::ApiState;
+ use freshell_freshagent::FreshAgentState;
+@@ -90,6 +91,80 @@ fn load_dotenv_from(dir: &Path) {
+     let _ = dotenvy::from_path(dir.join(".env"));
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum DiagnosticRefreshMode {
++    Normal,
++    TenSeconds,
++    WarmOnly,
++}
++
++impl DiagnosticRefreshMode {
++    fn ttl(self) -> Duration {
++        match self {
++            Self::Normal => Duration::from_secs(1),
++            Self::TenSeconds => Duration::from_secs(10),
++            Self::WarmOnly => Duration::MAX,
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Level1Config {
++    active: bool,
++    session_sweep: bool,
++    auto_title_sweep: bool,
++    refresh_mode: DiagnosticRefreshMode,
++    cache_writes: bool,
++}
++
++fn resolve_level1_config() -> Result<Level1Config, String> {
++    const PREFIX: &str = "FRESHELL_0GDD_";
++    let gate = std::env::var("FRESHELL_0GDD_LEVEL1").ok();
++    if gate.is_none() {
++        if std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with(PREFIX)) {
++            return Err("FRESHELL_0GDD_* controls require FRESHELL_0GDD_LEVEL1=1".into());
++        }
++        return Ok(Level1Config {
++            active: false,
++            session_sweep: true,
++            auto_title_sweep: true,
++            refresh_mode: DiagnosticRefreshMode::Normal,
++            cache_writes: true,
++        });
++    }
++    if gate.as_deref() != Some("1") {
++        return Err("FRESHELL_0GDD_LEVEL1 must be 1".into());
++    }
++    if let Some((key, _)) = std::env::vars().find(|(key, _)| {
++        key.strip_prefix(PREFIX).is_some_and(|suffix| {
++            !matches!(
++                suffix,
++                "LEVEL1" | "SESSION_SWEEP" | "AUTO_TITLE_SWEEP" | "REFRESH_MODE" | "CACHE_WRITES"
++            )
++        })
++    }) {
++        return Err(format!("unknown diagnostic control {key}"));
++    }
++    let toggle = |name| match std::env::var(name).as_deref() {
++        Ok("on") => Ok(true),
++        Ok("off") => Ok(false),
++        _ => Err(format!("{name} must be on or off")),
++    };
++    let refresh_mode = match std::env::var("FRESHELL_0GDD_REFRESH_MODE").as_deref() {
++        Ok("normal") => DiagnosticRefreshMode::Normal,
++        Ok("10s") => DiagnosticRefreshMode::TenSeconds,
++        Ok("warm-only") => DiagnosticRefreshMode::WarmOnly,
++        _ => return Err("FRESHELL_0GDD_REFRESH_MODE must be normal, 10s, or warm-only".into()),
++    };
++    Ok(Level1Config {
++        active: true,
++        session_sweep: toggle("FRESHELL_0GDD_SESSION_SWEEP")?,
++        auto_title_sweep: toggle("FRESHELL_0GDD_AUTO_TITLE_SWEEP")?,
++        refresh_mode,
++        cache_writes: toggle("FRESHELL_0GDD_CACHE_WRITES")?,
++    })
++}
++
+ /// Task 16 (`PATCH /api/panes/:id` cascade): the production
+ /// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
+ /// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
+@@ -154,6 +229,13 @@ async fn main() -> ExitCode {
+     if let Ok(cwd) = std::env::current_dir() {
+         load_dotenv_from(&cwd);
+     }
++    let level1 = match resolve_level1_config() {
++        Ok(config) => config,
++        Err(reason) => {
++            eprintln!("{reason}");
++            return ExitCode::FAILURE;
++        }
++    };
+ 
+     // AUTH_TOKEN is mandatory — refuse to start without it (matches the original).
+     let auth_token = match std::env::var("AUTH_TOKEN") {
+@@ -677,7 +759,7 @@ async fn main() -> ExitCode {
+     // `claude_home`/`codex_home` use. `AMPLIFIER_HOME` is deliberately NOT
+     // consulted anywhere broker-side.
+     let session_index = session_directory::provider_home().as_ref().map(|h| {
+-        Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
++        let sources = vec![
+             Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
+                 session_directory::claude_home(h),
+             )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+@@ -690,7 +772,16 @@ async fn main() -> ExitCode {
+             Arc::new(freshell_sessions::amplifier::AmplifierSource::new(
+                 freshell_sessions::amplifier::amplifier_home(h),
+             )) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
+-        ]))
++        ];
++        Arc::new(if level1.active {
++            freshell_sessions::directory_index::SessionIndex::with_diagnostic_options(
++                sources,
++                level1.refresh_mode.ttl(),
++                level1.cache_writes,
++            )
++        } else {
++            freshell_sessions::directory_index::SessionIndex::new(sources)
++        })
+     });
+ 
+     // TERM-15/TERM-16: the terminal-mode CLI activity hub. Consumes the
+@@ -1239,35 +1330,41 @@ async fn main() -> ExitCode {
+         // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
+         // this borrows nothing from the `ws_state` binding consumed by the
+         // router merge below.
+-        spawn_sessions_sweep(
+-            Arc::clone(index),
+-            ws_state.clone(),
+-            terminal_identity.clone(),
+-            SESSIONS_SWEEP_INTERVAL,
+-        );
++        if level1.session_sweep {
++            spawn_sessions_sweep(
++                Arc::clone(index),
++                ws_state.clone(),
++                terminal_identity.clone(),
++                SESSIONS_SWEEP_INTERVAL,
++                level1.active,
++            );
++        }
+         // Task 5: the background auto-name pass (dir -> first-message ->
+         // Gemini AI) -- `server/index.ts:868-950`. Same cadence + index
+         // accessor as the sessions sweep above; see `auto_title_sweep`'s
+         // module doc for the full semantics (only THIS sweep honors
+         // `settings.sidebar.autoGenerateTitles`).
+-        auto_title_sweep::spawn_auto_title_sweep(
+-            auto_title_sweep::AutoTitleSweepState {
+-                settings: settings_store.clone(),
+-                identity: terminal_identity.clone(),
+-                registry: registry.clone(),
+-                broadcast_tx: Arc::clone(&broadcast_tx),
+-                sessions_revision: Arc::clone(&sessions_revision),
+-                ai_key: ai_key.clone(),
+-                gemini: gemini.clone(),
+-                pending_ai_titles: Default::default(),
+-                // Task 18: the SAME registry `ws_state.terminal_meta` holds,
+-                // so the sweep's meta refresh feeds the handshake + broadcasts.
+-                terminal_meta: terminal_meta.clone(),
+-                git_meta_cache: Default::default(),
+-            },
+-            Arc::clone(index),
+-            SESSIONS_SWEEP_INTERVAL,
+-        );
++        if level1.auto_title_sweep {
++            auto_title_sweep::spawn_auto_title_sweep(
++                auto_title_sweep::AutoTitleSweepState {
++                    settings: settings_store.clone(),
++                    identity: terminal_identity.clone(),
++                    registry: registry.clone(),
++                    broadcast_tx: Arc::clone(&broadcast_tx),
++                    sessions_revision: Arc::clone(&sessions_revision),
++                    ai_key: ai_key.clone(),
++                    gemini: gemini.clone(),
++                    pending_ai_titles: Default::default(),
++                    // Task 18: the SAME registry `ws_state.terminal_meta` holds,
++                    // so the sweep's meta refresh feeds the handshake + broadcasts.
++                    terminal_meta: terminal_meta.clone(),
++                    git_meta_cache: Default::default(),
++                },
++                Arc::clone(index),
++                SESSIONS_SWEEP_INTERVAL,
++                level1.active,
++            );
++        }
+     }
+     // One-time boot migration (Node chains it onto the coding-CLI indexer's
+     // first full index, `server/index.ts:1039-1054`, fire-and-forget). The
+@@ -2561,6 +2658,7 @@ fn spawn_sessions_sweep(
+     ws_state: WsState,
+     identity: freshell_ws::identity::TerminalIdentityRegistry,
+     interval: std::time::Duration,
++    diagnostic_events: bool,
+ ) {
+     tokio::spawn(async move {
+         let mut last_signature =
+@@ -2569,12 +2667,24 @@ fn spawn_sessions_sweep(
+         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+         loop {
+             ticker.tick().await;
++            let started = diagnostic_events.then(std::time::Instant::now);
+             let items = session_index.snapshot().await;
+-            let signature = sessions_sweep_signature(&items, &identity.list());
++            let identities = identity.list();
++            let signature = sessions_sweep_signature(&items, &identities);
++            let changed = signature != last_signature;
+             if signature != last_signature {
+                 last_signature = signature;
+                 freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
+             }
++            if let Some(started) = started {
++                tracing::info!(
++                    event = "0gdd.sessions_sweep",
++                    duration_ms = started.elapsed().as_millis() as u64,
++                    rows = items.len(),
++                    identity_count = identities.len(),
++                    changed
++                );
++            }
+         }
+     });
+ }
+@@ -3314,4 +3424,53 @@ mod tests {
+ 
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    #[test]
++    fn level1_config_is_master_gated_and_complete() {
++        let _lock = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
++        let _guards = [
++            EnvVarGuard::unset("FRESHELL_0GDD_LEVEL1"),
++            EnvVarGuard::unset("FRESHELL_0GDD_SESSION_SWEEP"),
++            EnvVarGuard::unset("FRESHELL_0GDD_AUTO_TITLE_SWEEP"),
++            EnvVarGuard::unset("FRESHELL_0GDD_REFRESH_MODE"),
++            EnvVarGuard::unset("FRESHELL_0GDD_CACHE_WRITES"),
++        ];
++        let defaults = resolve_level1_config().unwrap();
++        assert_eq!(
++            defaults,
++            Level1Config {
++                active: false,
++                session_sweep: true,
++                auto_title_sweep: true,
++                refresh_mode: DiagnosticRefreshMode::Normal,
++                cache_writes: true,
++            }
++        );
++        let _sweep = EnvVarGuard::set("FRESHELL_0GDD_SESSION_SWEEP", "off");
++        assert!(resolve_level1_config().is_err());
++        let _gate = EnvVarGuard::set("FRESHELL_0GDD_LEVEL1", "1");
++        assert!(resolve_level1_config().is_err());
++        let _auto = EnvVarGuard::set("FRESHELL_0GDD_AUTO_TITLE_SWEEP", "on");
++        let _writes = EnvVarGuard::set("FRESHELL_0GDD_CACHE_WRITES", "off");
++        let _refresh = EnvVarGuard::set("FRESHELL_0GDD_REFRESH_MODE", "normal");
++        let ttl = |value| {
++            std::env::set_var("FRESHELL_0GDD_REFRESH_MODE", value);
++            resolve_level1_config().unwrap().refresh_mode.ttl()
++        };
++        assert_eq!(ttl("normal"), Duration::from_secs(1));
++        assert_eq!(ttl("10s"), Duration::from_secs(10));
++        assert_eq!(ttl("warm-only"), Duration::MAX);
++        let _invalid = EnvVarGuard::set("FRESHELL_0GDD_CACHE_WRITES", "maybe");
++        assert!(resolve_level1_config().is_err());
++        std::env::set_var("FRESHELL_0GDD_CACHE_WRITES", "off");
++        let _unknown = EnvVarGuard::set("FRESHELL_0GDD_UNKNOWN", "on");
++        assert!(resolve_level1_config()
++            .unwrap_err()
++            .contains("unknown diagnostic control"));
++        std::env::set_var("FRESHELL_0GDD_LEVEL1", "true");
++        assert_eq!(
++            resolve_level1_config().unwrap_err(),
++            "FRESHELL_0GDD_LEVEL1 must be 1"
++        );
++    }
+ }

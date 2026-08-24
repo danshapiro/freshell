@@ -1,0 +1,549 @@
+diff --git a/crates/freshell-sessions/src/directory_index.rs b/crates/freshell-sessions/src/directory_index.rs
+index e1b4b50f1..6a575eaba 100644
+--- a/crates/freshell-sessions/src/directory_index.rs
++++ b/crates/freshell-sessions/src/directory_index.rs
+@@ -35,6 +35,7 @@
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex as StdMutex};
+ use std::time::{Duration, Instant};
+ 
+@@ -48,6 +49,8 @@ use crate::{parse_codex_session_content, parse_session_content, ParseSessionOpti
+ /// refresh. 1s keeps a burst of requests (e.g. a UI poll loop) to one scan
+ /// while still surfacing new/changed transcripts within a second of an edit.
+ const DEFAULT_TTL: Duration = Duration::from_millis(1000);
++static REFRESH_ID: AtomicU64 = AtomicU64::new(1);
++static SAVE_ID: AtomicU64 = AtomicU64::new(1);
+ 
+ /// One session, enumerated by a [`SessionSource`]. Provider-agnostic — the
+ /// superset of fields `crates/freshell-server/src/session_directory.rs`'s
+@@ -789,6 +792,13 @@ struct FileEntry {
+ ///   every time. The `file_cache`'s own `std::sync::Mutex` is locked only
+ ///   from inside the `spawn_blocking` closure (a fully synchronous context —
+ ///   no `.await` ever runs while it's held).
++#[derive(Clone, Copy)]
++struct DiagnosticState {
++    persist_writes: bool,
++    events: bool,
++    loaded_cache_entries: usize,
++}
++
+ pub struct SessionIndex {
+     sources: Vec<Arc<dyn SessionSource>>,
+     ttl: Duration,
+@@ -814,6 +824,7 @@ pub struct SessionIndex {
+     /// Read at construction to pre-populate `file_cache`; written back
+     /// opportunistically after a sweep (see `Self::take_pending_save`).
+     persist_path: Option<PathBuf>,
++    diagnostics: DiagnosticState,
+     /// `Arc`-wrapped for the same reason `snapshot` is: a detached
+     /// background refresh needs to update the save-debounce bookkeeping
+     /// without borrowing `&SessionIndex`.
+@@ -874,6 +885,36 @@ impl SessionIndex {
+         sources: Vec<Arc<dyn SessionSource>>,
+         ttl: Duration,
+         persist_path: Option<PathBuf>,
++    ) -> Self {
++        Self::with_options(sources, ttl, persist_path, true, false)
++    }
++
++    pub fn with_diagnostic_options(
++        sources: Vec<Arc<dyn SessionSource>>,
++        ttl: Duration,
++        persist_writes: bool,
++    ) -> Self {
++        Self::with_options(sources, ttl, default_persist_path(), persist_writes, true)
++    }
++
++    /// Diagnostic-only constructor with an explicit cache path. This keeps
++    /// cache-loading and cache-write suppression testable without mutating
++    /// process-global home-directory variables.
++    pub fn with_diagnostic_options_and_cache_path(
++        sources: Vec<Arc<dyn SessionSource>>,
++        ttl: Duration,
++        persist_path: Option<PathBuf>,
++        persist_writes: bool,
++    ) -> Self {
++        Self::with_options(sources, ttl, persist_path, persist_writes, true)
++    }
++
++    fn with_options(
++        sources: Vec<Arc<dyn SessionSource>>,
++        ttl: Duration,
++        persist_path: Option<PathBuf>,
++        persist_writes: bool,
++        diagnostic_events: bool,
+     ) -> Self {
+         // Pre-populate the file cache from disk, if a persisted cache exists
+         // and is readable/current -- `load_cache_file` is fully tolerant
+@@ -887,6 +928,7 @@ impl SessionIndex {
+             .as_deref()
+             .map(load_cache_file)
+             .unwrap_or_default();
++        let loaded_cache_entries = file_cache.len();
+         Self {
+             sources,
+             ttl,
+@@ -895,6 +937,11 @@ impl SessionIndex {
+             file_cache: Arc::new(StdMutex::new(file_cache)),
+             direct_cache: Arc::new(StdMutex::new(HashMap::new())),
+             persist_path,
++            diagnostics: DiagnosticState {
++                persist_writes,
++                events: diagnostic_events,
++                loaded_cache_entries,
++            },
+             persist_state: Arc::new(StdMutex::new(PersistState::default())),
+         }
+     }
+@@ -1051,6 +1098,7 @@ impl SessionIndex {
+             Arc::clone(&self.snapshot),
+             self.persist_path.clone(),
+             Arc::clone(&self.persist_state),
++            self.diagnostics,
+         )
+         .await;
+         drop(guard);
+@@ -1069,6 +1117,7 @@ impl SessionIndex {
+         let snapshot = Arc::clone(&self.snapshot);
+         let persist_path = self.persist_path.clone();
+         let persist_state = Arc::clone(&self.persist_state);
++        let diagnostics = self.diagnostics;
+         tokio::spawn(async move {
+             let _ = Self::perform_refresh(
+                 sources,
+@@ -1077,6 +1126,7 @@ impl SessionIndex {
+                 snapshot,
+                 persist_path,
+                 persist_state,
++                diagnostics,
+             )
+             .await;
+             drop(guard);
+@@ -1096,6 +1146,7 @@ impl SessionIndex {
+         snapshot: Arc<StdMutex<Option<CachedSnapshot>>>,
+         persist_path: Option<PathBuf>,
+         persist_state: Arc<StdMutex<PersistState>>,
++        diagnostics: DiagnosticState,
+     ) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
+         let sweep_result = tokio::task::spawn_blocking({
+             let file_cache = Arc::clone(&file_cache);
+@@ -1121,13 +1172,18 @@ impl SessionIndex {
+                     .as_ref()
+                     .map(|c| c.scan_failures.clone())
+                     .unwrap_or_default();
+-                let (items, changed) =
+-                    refresh_snapshot(&sources, &mut cache, &mut direct, &mut failures);
+-                (items, changed, failures)
++                let (items, changed, stats) = refresh_snapshot(
++                    &sources,
++                    &mut cache,
++                    &mut direct,
++                    &mut failures,
++                    diagnostics.events,
++                );
++                (items, changed, failures, stats)
+             }
+         })
+         .await;
+-        let (items, changed, failures) = match sweep_result {
++        let (items, changed, failures, stats) = match sweep_result {
+             Ok(result) => result,
+             Err(join_err) => {
+                 // `discover`/`parse` are documented never-panic (every
+@@ -1167,28 +1223,89 @@ impl SessionIndex {
+                 scan_failures: failures,
+             });
+         } // guard dropped here — never held across an .await.
+-          // Opportunistic persistence: gated (threshold/debounce) and, when
+-          // warranted, saved via a DETACHED task -- never awaited here, so
+-          // neither an HTTP request handler NOR this refresh itself is
+-          // delayed by a disk write.
+-        if let Some((path, cache_snapshot)) = take_pending_save_from_parts(
+-            &persist_path,
+-            &persist_state,
+-            &file_cache,
+-            changed,
+-            SAVE_DEBOUNCE,
+-        ) {
++        let pending_save = diagnostics
++            .persist_writes
++            .then(|| {
++                take_pending_save_from_parts(
++                    &persist_path,
++                    &persist_state,
++                    &file_cache,
++                    changed,
++                    SAVE_DEBOUNCE,
++                )
++            })
++            .flatten();
++        let save_event = pending_save.as_ref().and_then(|(_, cache_snapshot)| {
++            diagnostics.events.then(|| {
++                let save_id = SAVE_ID.fetch_add(1, Ordering::Relaxed);
++                tracing::info!(
++                    event = "0gdd.cache_save_started",
++                    save_id,
++                    entries = cache_snapshot.len()
++                );
++                save_id
++            })
++        });
++        if let Some(stats) = stats {
++            tracing::info!(
++                event = "0gdd.index_refresh_finished",
++                refresh_id = stats.id,
++                duration_ms = stats.started.elapsed().as_millis() as u64,
++                source_duration_ms = stats.source_ms,
++                rebuild_duration_ms = stats.rebuild_ms,
++                sort_duration_ms = stats.sort_ms,
++                discovered = stats.discovered,
++                parsed = stats.parsed,
++                rows = items.len(),
++                changed,
++                scan_failure_count = failure_names.len(),
++                loaded_cache_entries = diagnostics.loaded_cache_entries
++            );
++        }
++        // Start is emitted before refresh-finished and the save task is
++        // spawned after it. A log reader can therefore never observe a clean
++        // refresh boundary in the gap before a related detached save starts.
++        if let Some((path, cache_snapshot)) = pending_save {
+             tokio::spawn(async move {
+-                let outcome =
+-                    tokio::task::spawn_blocking(move || save_cache_file(&path, &cache_snapshot))
+-                        .await;
+-                match outcome {
+-                    Ok(Ok(())) => {}
+-                    Ok(Err(err)) => {
+-                        eprintln!("session-directory: failed to persist parse cache: {err}")
++                if let Some(save_id) = save_event {
++                    let started = Instant::now();
++                    let outcome = tokio::task::spawn_blocking(move || {
++                        save_cache_file(&path, &cache_snapshot)
++                    })
++                    .await;
++                    let (bytes, ok) = match outcome {
++                        Ok(Ok(bytes)) => (bytes, true),
++                        Ok(Err(err)) => {
++                            eprintln!("session-directory: failed to persist parse cache: {err}");
++                            (0, false)
++                        }
++                        Err(join_err) => {
++                            eprintln!("session-directory: persist task panicked: {join_err}");
++                            (0, false)
++                        }
++                    };
++                    if diagnostics.events {
++                        tracing::info!(
++                            event = "0gdd.cache_save_finished",
++                            save_id,
++                            duration_ms = started.elapsed().as_millis() as u64,
++                            bytes,
++                            ok
++                        );
+                     }
+-                    Err(join_err) => {
+-                        eprintln!("session-directory: persist task panicked: {join_err}")
++                } else {
++                    let outcome = tokio::task::spawn_blocking(move || {
++                        save_cache_file(&path, &cache_snapshot)
++                    })
++                    .await;
++                    match outcome {
++                        Ok(Ok(_)) => {}
++                        Ok(Err(err)) => {
++                            eprintln!("session-directory: failed to persist parse cache: {err}")
++                        }
++                        Err(join_err) => {
++                            eprintln!("session-directory: persist task panicked: {join_err}")
++                        }
+                     }
+                 }
+             });
+@@ -1264,6 +1381,24 @@ struct DirectEntry {
+     items: Vec<IndexedSession>,
+ }
+ 
++struct RefreshStats {
++    id: u64,
++    started: Instant,
++    source_ms: u64,
++    rebuild_ms: u64,
++    sort_ms: u64,
++    discovered: usize,
++    parsed: usize,
++}
++
++struct SourceStats {
++    provider: &'static str,
++    duration_ms: u64,
++    discovered: usize,
++    parsed: usize,
++    scan_failed: bool,
++}
++
+ /// One incremental refresh sweep across all sources:
+ ///
+ /// 1. File-based sources: `discover()` the current `(path, mtime, size)` set
+@@ -1293,15 +1428,24 @@ fn refresh_snapshot(
+     cache: &mut HashMap<PathBuf, FileEntry>,
+     direct_cache: &mut HashMap<usize, DirectEntry>,
+     scan_failures: &mut HashSet<String>,
+-) -> (Vec<IndexedSession>, usize) {
++    diagnostic_events: bool,
++) -> (Vec<IndexedSession>, usize, Option<RefreshStats>) {
++    let started = diagnostic_events.then(Instant::now);
++    let refresh_id = diagnostic_events.then(|| REFRESH_ID.fetch_add(1, Ordering::Relaxed));
++    if let Some(refresh_id) = refresh_id {
++        tracing::info!(event = "0gdd.index_refresh_started", refresh_id);
++    }
+     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+     // Count of files re-parsed + direct-listed sources re-queried this
+     // sweep -- the persistent-parse-cache save gate's "how much changed"
+     // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
+     // files/tokens don't count; only actual expensive work does.
+     let mut changed = 0usize;
++    let mut source_stats = diagnostic_events.then(Vec::<SourceStats>::new);
+ 
+     for (idx, source) in sources.iter().enumerate() {
++        let source_started = diagnostic_events.then(Instant::now);
++        let mut source_parsed = diagnostic_events.then_some(0usize);
+         if let Some(token) = source.direct_change_token() {
+             let unchanged = direct_cache.get(&idx).is_some_and(|e| e.token == token);
+             if unchanged {
+@@ -1331,6 +1475,7 @@ fn refresh_snapshot(
+                     }
+                 }
+             } else {
++                source_parsed = Some(1);
+                 match source.direct_list() {
+                     Ok(items) => {
+                         if let Some(name) = source.provider_name() {
+@@ -1357,6 +1502,18 @@ fn refresh_snapshot(
+                     }
+                 }
+             }
++            if let (Some(source_started), Some(source_stats)) =
++                (source_started, source_stats.as_mut())
++            {
++                let provider = source.provider_name().unwrap_or("unknown");
++                source_stats.push(SourceStats {
++                    provider,
++                    duration_ms: source_started.elapsed().as_millis() as u64,
++                    discovered: 0,
++                    parsed: source_parsed.expect("diagnostic source has a parsed counter"),
++                    scan_failed: scan_failures.contains(provider),
++                });
++            }
+             // Direct-listed sources never touch the per-file cache/discovery.
+             continue;
+         }
+@@ -1385,6 +1542,7 @@ fn refresh_snapshot(
+                 Vec::new()
+             }
+         };
++        let source_discovered = diagnostic_events.then_some(stats.len());
+         for stat in stats {
+             let unchanged = cache
+                 .get(&stat.path)
+@@ -1400,27 +1558,92 @@ fn refresh_snapshot(
+                     },
+                 );
+                 changed += 1;
++                if let Some(source_parsed) = source_parsed.as_mut() {
++                    *source_parsed += 1;
++                }
+             }
+             discovered.insert(stat.path);
+         }
++        if let (Some(source_started), Some(source_stats)) = (source_started, source_stats.as_mut())
++        {
++            let provider = source.provider_name().unwrap_or("unknown");
++            source_stats.push(SourceStats {
++                provider,
++                duration_ms: source_started.elapsed().as_millis() as u64,
++                discovered: source_discovered.expect("diagnostic source has a discovered counter"),
++                parsed: source_parsed.expect("diagnostic source has a parsed counter"),
++                scan_failed: scan_failures.contains(provider),
++            });
++        }
+     }
+ 
+     // Prune entries for files no longer discovered (deleted since the last sweep).
+     cache.retain(|path, _| discovered.contains(path));
+ 
+-    let mut items: Vec<IndexedSession> = cache
+-        .values()
+-        .filter_map(|entry| entry.item.clone())
+-        .collect();
+-    for entry in direct_cache.values() {
+-        items.extend(entry.items.iter().cloned());
+-    }
++    let rebuild_started = diagnostic_events.then(Instant::now);
++    let (mut items, rows_by_provider) = if diagnostic_events {
++        let mut rows = HashMap::<String, usize>::new();
++        let mut items = Vec::with_capacity(cache.len());
++        for item in cache.values().filter_map(|entry| entry.item.clone()) {
++            *rows.entry(item.provider.clone()).or_default() += 1;
++            items.push(item);
++        }
++        for entry in direct_cache.values() {
++            for item in &entry.items {
++                *rows.entry(item.provider.clone()).or_default() += 1;
++                items.push(item.clone());
++            }
++        }
++        (items, Some(rows))
++    } else {
++        let mut items: Vec<IndexedSession> = cache
++            .values()
++            .filter_map(|entry| entry.item.clone())
++            .collect();
++        for entry in direct_cache.values() {
++            items.extend(entry.items.iter().cloned());
++        }
++        (items, None)
++    };
++    let rebuild_ms = rebuild_started.map_or(0, |started| started.elapsed().as_millis() as u64);
++    let sort_started = diagnostic_events.then(Instant::now);
+     items.sort_by(|a, b| {
+         b.last_activity_at
+             .cmp(&a.last_activity_at)
+             .then_with(|| b.key().cmp(&a.key()))
+     });
+-    (items, changed)
++    if let (Some(refresh_id), Some(source_stats), Some(rows_by_provider)) =
++        (refresh_id, source_stats.as_ref(), rows_by_provider.as_ref())
++    {
++        for source in source_stats {
++            tracing::info!(
++                event = "0gdd.index_source",
++                refresh_id,
++                provider = source.provider,
++                duration_ms = source.duration_ms,
++                discovered = source.discovered,
++                parsed = source.parsed,
++                rows = rows_by_provider.get(source.provider).copied().unwrap_or(0),
++                scan_failed = source.scan_failed,
++            );
++        }
++    }
++    let stats = refresh_id.map(|id| RefreshStats {
++        id,
++        started: started.expect("diagnostic refresh has a start time"),
++        source_ms: source_stats.as_ref().map_or(0, |sources| {
++            sources.iter().map(|source| source.duration_ms).sum()
++        }),
++        rebuild_ms,
++        sort_ms: sort_started.map_or(0, |started| started.elapsed().as_millis() as u64),
++        discovered: source_stats.as_ref().map_or(0, |sources| {
++            sources.iter().map(|source| source.discovered).sum()
++        }),
++        parsed: source_stats.as_ref().map_or(0, |sources| {
++            sources.iter().map(|source| source.parsed).sum()
++        }),
++    });
++    (items, changed, stats)
+ }
+ 
+ // -- Persistent parse cache (self-hosting-readiness bake-in, "kill the cold
+@@ -1549,7 +1772,7 @@ fn load_cache_file(path: &Path) -> HashMap<PathBuf, FileEntry> {
+ /// returned (not swallowed) so the caller can log them, but a save failure
+ /// NEVER propagates to any request path -- see
+ /// `SessionIndex::take_pending_save`'s caller in `snapshot()`.
+-fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io::Result<()> {
++fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io::Result<u64> {
+     if let Some(parent) = path.parent() {
+         std::fs::create_dir_all(parent)?;
+     }
+@@ -1567,9 +1790,10 @@ fn save_cache_file(path: &Path, cache: &HashMap<PathBuf, FileEntry>) -> std::io:
+     let mut tmp_os = path.as_os_str().to_os_string();
+     tmp_os.push(".tmp");
+     let tmp_path = PathBuf::from(tmp_os);
++    let bytes = json.len() as u64;
+     std::fs::write(&tmp_path, json)?;
+     std::fs::rename(&tmp_path, path)?;
+-    Ok(())
++    Ok(bytes)
+ }
+ 
+ #[cfg(test)]
+@@ -2397,6 +2621,11 @@ mod tests {
+             Arc::clone(&snapshot),
+             None,
+             Arc::clone(&persist_state),
++            DiagnosticState {
++                persist_writes: true,
++                events: false,
++                loaded_cache_entries: 0,
++            },
+         )
+         .await;
+ 
+@@ -4067,4 +4296,63 @@ mod tests {
+              (healthy={seen_healthy}, failed={seen_failed})"
+         );
+     }
++
++    #[tokio::test]
++    async fn diagnostic_cache_can_load_without_writing() {
++        let root = unique_temp_dir("diagnostic-no-write");
++        let cache_path = root.join("cache.json");
++        let cached_path = root.join("cached.jsonl");
++        let new_path = root.join("new.jsonl");
++        let mut cache = HashMap::new();
++        cache.insert(
++            cached_path.clone(),
++            FileEntry {
++                mtime_ms: 1,
++                size: 1,
++                item: None,
++            },
++        );
++        save_cache_file(&cache_path, &cache).unwrap();
++        let before = std::fs::read(&cache_path).unwrap();
++        struct WriteEligibleSource {
++            cached_path: PathBuf,
++            new_path: PathBuf,
++        }
++        impl SessionSource for WriteEligibleSource {
++            fn discover(&self) -> Vec<FileStat> {
++                vec![
++                    FileStat {
++                        path: self.cached_path.clone(),
++                        mtime_ms: 1,
++                        size: 1,
++                    },
++                    FileStat {
++                        path: self.new_path.clone(),
++                        mtime_ms: 2,
++                        size: 2,
++                    },
++                ]
++            }
++            fn parse(&self, path: &Path) -> Option<IndexedSession> {
++                (path == self.new_path).then(|| mk("new", "claude", 2))
++            }
++            fn provider_name(&self) -> Option<&'static str> {
++                Some("claude")
++            }
++        }
++        let index = SessionIndex::with_diagnostic_options_and_cache_path(
++            vec![Arc::new(WriteEligibleSource {
++                cached_path,
++                new_path,
++            })],
++            Duration::MAX,
++            Some(cache_path.clone()),
++            false,
++        );
++        assert_eq!(index.diagnostics.loaded_cache_entries, 1);
++        assert_eq!(index.snapshot().await.len(), 1);
++        tokio::time::sleep(Duration::from_millis(50)).await;
++        assert_eq!(std::fs::read(&cache_path).unwrap(), before);
++        std::fs::remove_dir_all(root).ok();
++    }
+ }

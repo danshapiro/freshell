@@ -33,6 +33,18 @@
 
 ---
 
+## Status updates (2026-08-23, protection pass applied)
+
+1. **deploy-compatibility-rollback** — archived: `feat/deploy-compatibility-rollback` pushed to origin (tip `9a91c2f4b` verified by ls-remote). Worktree now safe to delete whenever; revival remains a product decision.
+2. **0gdd-handoff** — observations doc committed (`20acc485d`) and `docs/0gdd-handoff` pushed; the sole surviving Level-1 record is versioned, not uncommitted. Remaining: land both docs on main via PR.
+3. **restart-recovery-hardening** — all 18 WIP files checkpoint-committed as `f3233d24a` (honest red-TDD / does-not-compile note) and pushed. Worktree clean; deletable at will.
+4. **df1-session-09-live-watching** — verdict changed to **throw-away**: the acceptance test was extracted to `feat/session09-ws-acceptance-test` (`ded572266`, pushed); what remains is only the confirmed-poison `main.rs` diff, which deletion correctly discards.
+5. **0gdd-measurement / 0gdd-observer** — sources archived to `triage-output/archive/0gdd-{measurement,observer}/` (5 measurement files incl. 3 patch captures + 180KB observer source + `0gdd-ARCHIVAL-NOTES.md`). Both now deletion-safe.
+
+Net: every previously-flagged loss-risk item is now protected by a pushed branch or a committed archive. The remaining deletions (8 throw-away + 7 skipped-plan + the df1-session-09 flip) no longer risk losing anything.
+
+---
+
 ## 1. Ready for landing (1)
 
 ### slash-command-catalogs — `the-usual/slash-command-catalogs` · 2026-08-19 · +13/−99

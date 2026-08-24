@@ -1,0 +1,36 @@
+diff --git a/crates/freshell-server/src/auto_title_sweep.rs b/crates/freshell-server/src/auto_title_sweep.rs
+index 1f6d7b4d6..71f4c055c 100644
+--- a/crates/freshell-server/src/auto_title_sweep.rs
++++ b/crates/freshell-server/src/auto_title_sweep.rs
+@@ -515,13 +515,16 @@ pub fn spawn_auto_title_sweep(
+     state: AutoTitleSweepState,
+     index: Arc<freshell_sessions::directory_index::SessionIndex>,
+     interval: std::time::Duration,
++    diagnostic_events: bool,
+ ) -> tokio::task::JoinHandle<()> {
+     tokio::spawn(async move {
+         let mut ticker = tokio::time::interval(interval);
+         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+         loop {
+             ticker.tick().await;
++            let started = diagnostic_events.then(std::time::Instant::now);
+             let items = index.snapshot().await;
++            let identity_count = diagnostic_events.then(|| state.identity.list().len());
+             let overrides = state.settings.session_overrides();
+             let sessions: Vec<SweepSession> = items
+                 .iter()
+@@ -545,6 +548,14 @@ pub fn spawn_auto_title_sweep(
+                 })
+                 .collect();
+             run_auto_title_pass(&state, &sessions).await;
++            if let (Some(started), Some(identity_count)) = (started, identity_count) {
++                tracing::info!(
++                    event = "0gdd.auto_title_sweep",
++                    duration_ms = started.elapsed().as_millis() as u64,
++                    rows = items.len(),
++                    identity_count
++                );
++            }
+         }
+     })
+ }
