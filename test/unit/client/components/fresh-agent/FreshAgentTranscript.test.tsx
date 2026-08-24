@@ -1934,5 +1934,109 @@ describe('FreshAgentTranscript', () => {
       )
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
     })
+
+    it('merges a mixed thinking-plus-tool turn whose hidden thinking is part of the summary (live claude shape)', () => {
+      // Production default showThinking=false: the thinking item is filtered
+      // out, and the summary ('Considering Read', space-joined by the live
+      // summarizer) never renders — the article renders its activity block.
+      // Echo classification must still see the hidden items, or the common
+      // claude thinking→tool turn can never merge.
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[
+            toolTurn('turn-a', [['c1', 'src/a.ts']]),
+            { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Considering Read',
+              items: [
+                { id: 'think-1', kind: 'thinking', text: 'Considering' },
+                { id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+              ] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    })
+
+    it('merges a mixed thinking-plus-tool turn whose summary is the hidden thinking text (Rust snapshot shape)', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          showThinking={false}
+          turns={[
+            toolTurn('turn-a', [['c1', 'src/a.ts']]),
+            { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Considering',
+              items: [
+                { id: 'think-1', kind: 'thinking', text: 'Considering' },
+                { id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+              ] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    })
+
+    it('keeps a painted summary boundary when the same turn later gains items that echo it', () => {
+      const turnA = {
+        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
+      }
+      const turnBEmpty = {
+        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const,
+        summary: 'Wrapping up shortly', items: [],
+      }
+      // Frame 1: the summary-only streaming tail paints its summary.
+      const { rerender } = render(
+        <FreshAgentTranscript isStreaming showThinking turns={[turnA, turnBEmpty]} />,
+      )
+      expect(screen.getByText('Wrapping up shortly')).toBeInTheDocument()
+
+      // Frame 2: the same turn gains a thinking item echoing the summary plus
+      // a tool. The summary is now classifiable as an echo, but it RENDERED
+      // between the two tool runs, so the new activity keeps its own line.
+      const turnBWithItems = {
+        ...turnBEmpty,
+        items: [
+          { id: 'think-1', kind: 'thinking' as const, text: 'Wrapping up shortly' },
+          { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+        ],
+      }
+      rerender(<FreshAgentTranscript isStreaming showThinking turns={[turnA, turnBWithItems]} />)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('does not let a painted summary mark a different turn that shares its turnId', () => {
+      const thinkingTurn = (summary: string, itemId: string) => ({
+        id: `turn-dup-${itemId}`, turnId: 'turn-dup', role: 'assistant' as const,
+        summary,
+        items: [{ id: itemId, kind: 'thinking' as const, text: summary }],
+      })
+      const turnA = {
+        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
+      }
+      const turnB = {
+        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const, summary: 'Read',
+        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+      }
+      // Frame 1: one display turn with turnId 'turn-dup' paints its summary.
+      const { rerender } = render(
+        <FreshAgentTranscript isStreaming showThinking={false} turns={[thinkingTurn('First thought', 'think-1')]} />,
+      )
+      expect(screen.getByText('First thought')).toBeInTheDocument()
+
+      // Frame 2: a DIFFERENT display turn reuses turnId 'turn-dup' with a
+      // different summary that never painted (validated claude data permits
+      // duplicate display keys across JSONL rows). It must not inherit the
+      // painted boundary — the tool runs still collapse.
+      rerender(
+        <FreshAgentTranscript
+          isStreaming={false}
+          showThinking={false}
+          turns={[turnA, thinkingTurn('Second thought', 'think-2'), turnB]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    })
   })
 })

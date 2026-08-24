@@ -298,18 +298,22 @@ function segmentMatchesEchoes(segment: string, echoes: string[]): boolean {
   return reachable[n]
 }
 
-function summaryIsAuthoredContent(turn: FreshAgentTurn): boolean {
+function summaryIsAuthoredContent(turn: DisplayTurn): boolean {
   const summary = typeof turn.summary === 'string' ? turn.summary : ''
   // Synthetic tool-result coalescing joins summaries with blank lines; judge
   // each segment against the turn's items independently.
   const segments = summary.split(/\n+/).map((segment) => segment.trim()).filter(Boolean)
   if (segments.length === 0) return false
-  if (turn.items.length === 0) return true
-  const echoes = turn.items.flatMap((item) => itemEchoes(item))
+  const sourceItems = turn.echoItems ?? turn.items
+  if (sourceItems.length === 0) return true
+  const echoes = sourceItems.flatMap((item) => itemEchoes(item))
   return segments.some((segment) => !segmentMatchesEchoes(segment, echoes))
 }
 
-function buildTranscriptLayout(turns: FreshAgentTurn[]): {
+function buildTranscriptLayout(
+  turns: DisplayTurn[],
+  paintedSummaryKeys: ReadonlySet<string>,
+): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
   tail: { blockId: string; turnIndex: number } | null
@@ -338,10 +342,22 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): {
     }
     for (const item of turn.items) {
       if (isActivityLike(item)) {
-        // The authored-summary guard applies only to absorbing into a PREVIOUS
-        // turn's line. Once this turn has opened its own line, its later
-        // activity items chain into it normally.
-        if (open && open.role === turn.role && (open.originIndex === turnIndex || !summaryIsAuthoredContent(turn))) {
+        // The boundary guards apply only to absorbing into a PREVIOUS turn's
+        // line. Once this turn has opened its own line, its later activity
+        // items chain into it normally. Two cross-turn boundaries: an
+        // authored summary (no echo among the turn's items), and a summary
+        // this view already PAINTED — the echo verdict is recomputed from
+        // current items each frame, so a painted summary that later gains an
+        // echoing item must still hold its boundary or the lines
+        // retro-collapse across content that rendered.
+        if (
+          open
+          && open.role === turn.role
+          && (
+            open.originIndex === turnIndex
+            || (!paintedSummaryKeys.has(paintedSummaryKey(turn)) && !summaryIsAuthoredContent(turn))
+          )
+        ) {
           const taken = new Set(open.items.map((openItem) => openItem.id))
           let displayItem = item
           let counter = 2
@@ -437,7 +453,26 @@ function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTu
  * every later frame, while a transcript mounted already-settled — where the
  * hidden summary never rendered — still collapses freely.
  */
-type DisplayTurn = FreshAgentTurn & { filteredPlaceholder?: true }
+type DisplayTurn = FreshAgentTurn & {
+  filteredPlaceholder?: true
+  /** Pre-filter items, attached when display filtering dropped any. Echo
+   * classification judges the summary against everything the turn CONTAINS —
+   * hidden thinking is part of production summaries (live: space-joined with
+   * the tool name; Rust snapshot: the thinking text itself), and the summary
+   * never renders when an activity block does, so hidden items must still
+   * count as echoes or the common claude thinking→tool turn can never merge. */
+  echoItems?: FreshAgentTranscriptItem[]
+}
+
+/**
+ * Painted-summary identity. turnId alone is insufficient: validated claude
+ * data permits multiple display turns sharing one turnId (one provider
+ * message spanning JSONL rows), so the summary text scopes the key —
+ * painting one occurrence must not mark a different occurrence as painted.
+ */
+function paintedSummaryKey(turn: Pick<FreshAgentTurn, 'turnId' | 'id' | 'summary'>): string {
+  return `${getFreshAgentDisplayTurnKey(turn)}:${(turn.summary ?? '').trim()}`
+}
 
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
@@ -452,12 +487,13 @@ function filterTurnsForDisplay(
         if (isStreaming && index === turns.length - 1) {
           return { ...turn, items: [] }
         }
-        if (paintedSummaryKeys.has(getFreshAgentDisplayTurnKey(turn))) {
+        if (paintedSummaryKeys.has(paintedSummaryKey(turn))) {
           return { ...turn, items: [], summary: '', filteredPlaceholder: true }
         }
         return null
       }
-      return items === turn.items ? turn : { ...turn, items }
+      if (items.length === turn.items.length) return turn
+      return { ...turn, items, echoItems: turn.items }
     })
     .filter((turn): turn is DisplayTurn => turn !== null)
 }
@@ -850,7 +886,10 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       paintedSummaryKeysRef.current,
     )
   ), [displayOptions, turns, isStreaming])
-  const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
+  const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(
+    () => buildTranscriptLayout(displayTurns, paintedSummaryKeysRef.current),
+    [displayTurns],
+  )
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming, tail),
     [turnLayouts, displayTurns, isStreaming, tail],
@@ -865,7 +904,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       if (typeof turn.summary !== 'string' || turn.summary.trim().length === 0) return
       const isLastStreaming = isStreaming && index === displayTurns.length - 1
       if (isLastStreaming && liveActivityBlockId !== null) return
-      painted.add(getFreshAgentDisplayTurnKey(turn))
+      painted.add(paintedSummaryKey(turn))
     })
   }, [displayTurns, isStreaming, liveActivityBlockId])
   const transcriptSignature = useMemo(() => (
