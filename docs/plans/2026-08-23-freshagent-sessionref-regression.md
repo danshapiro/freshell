@@ -54,6 +54,7 @@ TypeScript/React/Redux Toolkit/Vitest (client + Node server), Rust (freshell-ws,
 - `docs/index.html` is unchanged (no user-UI-facing change).
 - The three enumerated base flakes are pre-existing and out of scope (see Accepted tradeoffs).
 - Coverage reading (load-bearing stage decision): with the Task 2 server clamp enabled, a placeholder record never reaches a subscribed client, so a stack-level e2e cannot distinguish which guard layer fired. Task 1's client fold guard is covered at unit level by design; Task 6's full-stack e2e asserts the user-visible invariant (registry winner keeps durable sessionRef against a placeholder push). Task 5 is a Node-side forwarding fix covered by unit tests of the tool handler; its server-side acceptance is covered by Tasks 4/6.
+- Execution order (review-required TDD sequencing): Task 1 → Task 6 Phase A (author + register + commit RED e2e) → Task 2 → Task 3 → Task 4 → Task 5 → Task 6 Phase B (GREEN + full gate). Each implementation task still runs its own unit RED→GREEN internally.
 
 ## Task 1 — Client identity guard (panes normalize + merge)
 
@@ -68,23 +69,33 @@ TypeScript/React/Redux Toolkit/Vitest (client + Node server), Rust (freshell-ws,
 
 **Interface:**
 ```ts
-// shared/session-flavor.ts
-export function isPlaceholderProviderSessionId(provider: FreshAgentProvider, sessionId: string | undefined | null): boolean
+// shared/session-flavor.ts — provider type is FreshAgentRuntimeProvider (shared/fresh-agent.ts:11;
+// there is NO `FreshAgentProvider` type). Match isDurableProviderSessionId's existing param type.
+export function isPlaceholderProviderSessionId(provider: FreshAgentRuntimeProvider, sessionId: string | undefined | null): boolean
 // claude: non-empty && !canonical-uuid; codex: startsWith('freshcodex-'); opencode: non-empty && !startsWith('ses_')
 // (mirror of isDurableProviderSessionId; returns false for empty/undefined and unknown providers)
 
-// shared/fresh-agent.ts
-// NOTE: FreshAgentPaneContent.sessionRef is a SessionLocator OBJECT `{ provider, sessionId }`
-// (paneTypes.ts:191-200, session-contract.ts SessionRefSchema :3-8) — NEVER a string.
-// sanitizeSessionRef (session-contract.ts:90-97) discards anything else, so this helper must
-// accept and preserve the object shape verbatim.
+// shared/fresh-agent.ts — DEPENDENCY DIRECTION: shared/ never imports src/store/paneTypes.ts
+// (paneTypes imports shared, not vice versa). shared/fresh-agent.ts already imports SessionRef /
+// sanitizeSessionRef from './session-contract.js' (:1-7) and already declares structural
+// `unknown`-field shapes (FreshAgentCompatibilityShape :23-40) — follow that pattern.
+// NOTE: pane sessionRef is a SessionRef OBJECT `{ provider, sessionId }` (session-contract.ts
+// SessionRefSchema :3-8; paneTypes.ts:191-200) — NEVER a string; sanitizeSessionRef
+// (session-contract.ts:90-97) discards anything else.
+export type FreshAgentIdentityFold = {
+  provider?: FreshAgentRuntimeProvider
+  createRequestId?: string
+  sessionRef?: SessionRef
+  sessionId?: string
+  resumeSessionId?: string
+}
 export function preservedDurableFreshAgentIdentity(
-  previous: Pick<FreshAgentPaneContent, 'provider' | 'createRequestId' | 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined,
-  incoming: Pick<FreshAgentPaneContent, 'provider' | 'createRequestId' | 'sessionRef' | 'sessionId' | 'resumeSessionId'>,
-): Pick<FreshAgentPaneContent, 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined
+  previous: FreshAgentIdentityFold | undefined,
+  incoming: FreshAgentIdentityFold,
+): Pick<FreshAgentIdentityFold, 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined
 // Fires iff: previous exists; previous.provider === incoming.provider (pane-level continuity,
 // and the sessionRef LOCATORS' provider must agree with the pane provider); both createRequestIds
-// defined and equal; previous.sessionRef exists (post-sanitize object) and its sessionId is
+// defined and equal; previous.sessionRef exists (object shape) and its sessionId is
 // NON-placeholder for its provider; incoming.sessionRef exists and its sessionId IS placeholder.
 // Returns previous's durable identity tuple — the sessionRef OBJECT preserved verbatim (never
 // coerced to a string, or sanitizeSessionRef would discard it downstream), plus sessionId and
@@ -116,13 +127,14 @@ export function preservedDurableFreshAgentIdentity(
 - Test: `crates/freshell-ws/src/tabs_tests.rs` (harness: `open_record(tab_key, name, updated_at)` :13-26, `replace_client_snapshot("srv-1","dev-a","Label","client-a1",rev,vec![r]) -> PushAck{accepted,..}`, `query(...)` -> remoteOpen)
 - Modify: `crates/freshell-ws/src/tabs_store_model.rs` — make `sanitize_session_ref` (:414-419) `pub(crate)`; add `pub(crate) fn is_placeholder_provider_session_id(provider, id)` mirroring shared rules (reuse `is_canonical_claude_session_id` :399-410; codex `freshcodex-` prefix; opencode `!starts_with("ses_")` && non-empty)
 - Modify: `crates/freshell-ws/src/tabs.rs` — new pure fn `clamp_placeholder_session_refs(open_records: &mut Vec<...>, current: &CompactState)` called inside `derive_push_next` (:611+) on `prepared.open_records.clone()` BEFORE the insert at :679. (`prepare_push` :492 is pre-lock and has no `current` — clamp CANNOT live there; `derive_push_next` has `current.open_snapshots_by_client`; tombstone loops :653-678 unaffected.)
-- HASH CORRECTNESS (review-verified, do not deviate): `tabs_store.rs:804-816` rebuilds `open_snapshot_payload_hash` from the STORED records on compact-state reopen and rejects a mismatch as corruption (fatal at server startup). Therefore: after clamping, REBUILD the open-snapshot payload hash from the CLAMPED records using the existing `build_snapshot_payload_hash` (make it `pub(crate)` from tabs_store.rs) with the same identity inputs (device_id, device_label, client_instance_id, snapshot_revision) used at prepare time, and store THAT hash with the snapshot. The whole-push `last_push_payload_hash`/`push_hash` remains computed on the RAW push payload — it is the retry-identity key, so a retry after a clamped store still dedupes. NEVER store records whose content differs from what `open_snapshot_payload_hash` describes.
+- HASH CORRECTNESS (review-verified twice, do not deviate): `tabs_store.rs:804-816` rebuilds `open_snapshot_payload_hash` from the STORED records on compact-state reopen and rejects a mismatch as corruption (fatal at server startup). Therefore: after clamping, REBUILD the open-snapshot payload hash from the CLAMPED records and store THAT hash with the snapshot. The hash function already exists as `pub fn build_snapshot_payload_hash` at **`tabs_store_model.rs:211`** (NOT tabs_store.rs) and is ALREADY imported by tabs.rs (:42; used at :582/:589 in prepare_push) — no visibility change; reuse the existing import with the same identity inputs (device_id, device_label, client_instance_id, snapshot_revision) used at prepare time (extend `PreparedPush` to carry those identity fields if it does not already). The whole-push `last_push_payload_hash`/`push_hash` remains computed on the RAW push payload — it is the retry-identity key, so a retry after a clamped store still dedupes. NEVER store records whose content differs from what `open_snapshot_payload_hash` describes.
 - Guard-rail (implementation check, pin with a test if a consumer exists): audit every consumer of the open-snapshot hash (PushAck fields, any client-side comparison) — retry/idempotency flows must key on the raw whole-push hash ONLY; nothing may compare the open-snapshot hash against a client-side RAW-payload recomputation.
 
 **Interface:**
 ```rust
-// tabs.rs
-fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactState)
+// tabs.rs — records are raw JSON (`PreparedPush.open_records: Vec<serde_json::Value>`); there is
+// no `OpenRecord` type. Work directly on serde_json::Value.
+fn clamp_placeholder_session_refs(records: &mut [serde_json::Value], current: &CompactState)
 // For each record's panes: pane obj has `paneId` (src/lib/tab-registry-snapshot.ts:86), `kind`, `payload`
 // (payload has NO `kind` key after normalize_registry_pane_kinds :611-641 strips it; kind lives on the pane object).
 // If payload sessionRef classifies as placeholder for its provider, scan ALL clients' current open
@@ -179,15 +191,16 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 1. `body.get("sessionRef")` → `serde_json::from_value::<SessionLocator>(…)`; malformed → 400.
 2. `locator.provider != "opencode"` → 400 (loud provider mismatch).
 3. `ses_…` → direct; `freshopencode-<crid>` → `state.identity_sink().lookup_by_create_request_id("opencode", crid)` → hit resume / miss-or-no-sink → 404 (message names the placeholder); any other shape → 400.
-4. Probe `manager.get_session(&id, &route)` bounded by `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` (default 10_000; reuse the WS door's knob parse) → NotFound 404 / timeout 504 / other 502.
-5. Settings: body model/effort > ledger `load_settings`; `was_recorded && load fails` → SETTINGS_RESET broadcast (mirror opencode_ws.rs:1506-1541). CWD: ledger > serve directory from probe > body.
+4. LEDGER BEFORE PROBE (ordering is load-bearing, verified): `get_session(&id, &route)` applies `route.directory` as the `?directory=` query param (serve.rs:201, :634, Route.directory :335) and a route-sensitive serve can reject a wrong directory — so the ledger must be consulted FIRST. Order: load ledger settings via `state.identity_sink()` (`load_settings`, and `was_recorded` for the SETTINGS_RESET edge — lineage-only rows must NOT arm it, per Task 3 semantics) → construct the probe Route with `directory = ledger.cwd` when the ledger has one, else `None` (never body cwd — body is last in precedence and a wrong directory can fail the probe of a legitimate session) → THEN probe `manager.get_session(&id, &route)` bounded by `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` (default 10_000; reuse the WS door's knob parse) → NotFound 404 / timeout 504 / other 502.
+5. Merge AFTER probe: model/effort = body > ledger; cwd = ledger > serve-directory-from-probe > body; `was_recorded && load fails` → SETTINGS_RESET broadcast (mirror opencode_ws.rs:1506-1541).
 6. Born-durable PaneEntry (placeholder_id = the durable ses id itself; durable_id: Some — no placeholder-prefixed id is ever minted for a resumed pane, so the pane behaves as any already-materialized durable pane from creation; the snapshot/serve path sees a normal `ses_*` id); NEW uuid createRequestId; paneContent sessionId/sessionRef durable, status "connected"; `ui.command` `tab.create` broadcast; response `{ tabId, paneId, sessionId, sessionRef }` + "fresh-agent pane resumed"; NO materialized frame, NO sessions.changed, NO pending write (Task 3's pending write is create-only), NO binding writes (ledger read-only on resume).
 7. Site comment documenting divergence from frozen Node parity.
 
 **Steps:**
 1. RED: `pane_ops_tab_tests.rs` tests (the matrix pins EVERY explicit resume behavior of this new code path — existing `opencode_ws.rs` tests cover the WS donor only, never this REST copy):
    - happy `ses_` resume; placeholder-resolution (seeded Fake binding) resume; no-binding placeholder → 404 (message names the placeholder); unknown `ses_` → 404; provider mismatch (claude/kimi/etc.) → 400; dual-carrier → 400 with exact frozen LEGACY text; malformed sessionRef → 400.
-   - Bounded probe: fake HTTP that never answers + tiny `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` override → 504 (asserts the env knob is honored AND the probe is bounded — never wait the real 10s in a test); probe error other than NotFound/timeout → 502.
+   - Bounded probe: fake HTTP that never answers + a TINY timeout → 504 (asserts the knob is honored AND the probe is bounded — never wait the real 10s in a test). TIMEOUT INJECTION: do NOT mutate the process-global `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` in tests — an existing opencode_ws.rs test already sets/removes it unsynchronized and parallel tokio tests would race. Inject the timeout through test state instead (cfg(test) override on FreshAgentState alongside `set_manager_for_test` :766, consulted before the env parse). Probe error other than NotFound/timeout → 502.
+   - Route-sensitive probe: fake HTTP that ASSERTS the observed `?directory=` query → with a ledger-cwd-bearing record, the probe route carries the ledger cwd; without ledger cwd, the probe carries NO directory (never body cwd). Failing probe on wrong-directory proves the ordering.
    - Settings precedence ladder: ledger model/effort apply when body omits them; body model beats ledger model; body effort beats ledger effort.
    - CWD precedence ladder: ledger cwd wins over serve-directory-from-probe; serve-directory wins over body cwd (ledger > serve dir > body).
    - SETTINGS_RESET edge: settings-bearing record + unrecoverable `load_settings` → SETTINGS_RESET broadcast and resume proceeds (mirror opencode_ws.rs:1506-1541); complement (Task 3 semantics): lineage-only binding → resume proceeds with NO SETTINGS_RESET.
@@ -208,11 +221,11 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 
 **Interface:**
 ```ts
-// Maps ONLY opencode→'opencode'; returns undefined for everything else (claude/kilroy/codex/
-// unknown). undefined means: no synthesis, fields keep their CURRENT behavior (dropped for
-// agent-only calls) — acceptable because explicit sessionRef forwarding already exists, and the
-// docs updated here say so. For agent: 'codex', feed 'codex' into the existing
-// rejectRawCodexResume so the refusal matches mode=codex exactly.
+// Maps opencode→'opencode' (synthesize) and codex→'codex' (so the existing
+// rejectRawCodexResume fires with parity to mode=codex); returns undefined for everything else
+// (claude/kilroy/unknown). undefined means: no synthesis, fields keep their CURRENT behavior
+// (dropped for agent-only calls) — acceptable because explicit sessionRef forwarding already
+// exists, and the docs updated here say so.
 function agentResumeProvider(agent: string | undefined): 'codex' | 'opencode' | undefined
 // In new-tab: const resumeProvider = mode ?? agentResumeProvider(rest.agent)
 // resumeProvider === 'opencode' → synthesize sessionRef; === 'codex' → rejectRawCodexResume fires.
@@ -238,10 +251,12 @@ function agentResumeProvider(agent: string | undefined): 'codex' | 'opencode' | 
 **Steps:**
 0. Journeys in `fresh-agent-rest-resume-rust.spec.ts` (BOTH required — request-level coverage):
    - (a) Durable-id resume: REST create opencode pane → send turn → materialize → read durable `ses_…` from the audit log (`prompt_async`) → `restartAbrupt` → `POST /api/tabs` with sessionRef `{provider:"opencode", sessionId: <ses_…>}` → 200 with durable sessionId + transcript.
-   - (b) PLACEHOLDER-resolution resume through a NATURALLY-written binding (no seeded fixtures — this is kata 2's headline behavior and depends on Task 3's unconditional lineage): REST create with DEFAULT body (no model/effort/cwd) → capture the pane's placeholder sessionRef (`freshopencode-<createRequestId>`) from the pre-materialization pane state (the create response/broadcast pane payload; harness `WsCapture`) → send turn → materialize (natural lineage binding written despite blank settings) → obtain durable ses id from the audit log → `restartAbrupt` → `POST /api/tabs` with sessionRef set to the captured PLACEHOLDER → 200, response sessionId == the materialized durable id, transcript restored.
+   - (b) PLACEHOLDER-resolution resume through a NATURALLY-written binding (no seeded fixtures — this is kata 2's headline behavior and depends on Task 3's unconditional lineage): REST create with DEFAULT body (no model/effort/cwd) → capture the pane's placeholder `sessionId` (== `freshopencode-<createRequestId>`) from the create response / `tab.create` broadcast pane payload (those carry `sessionId` and `createRequestId` but NO sessionRef object — the test CONSTRUCTS the locator `{ provider: 'opencode', sessionId: <captured placeholder sessionId> }` itself; no API change) → send turn → materialize (natural lineage binding written despite blank settings) → obtain durable ses id from the audit log → `restartAbrupt` → `POST /api/tabs` with the constructed placeholder sessionRef → 200, response sessionId == the materialized durable id, transcript restored.
    - (c) Registry clamp journey in `sidebar-registry-sync-rust.spec.ts` (or the new spec — pick the harness that already boots two WS clients): client-B pushes a placeholder payload for a tab/pane client-A holds durable → registry winner keeps durable sessionRef.
-1. RED: new spec fails (resume endpoint currently 400s / guard absent).
-2. GREEN: passes against worktree-built Rust server on a scratch port (NOT 3001).
+1. RED-FIRST SEQUENCING (review-required; the e2e RED is impossible once Tasks 2–4 have landed): this task runs in TWO phases.
+   - Phase A (executed IMMEDIATELY AFTER Task 1, BEFORE Tasks 2–5): author the spec + journeys (a)/(b)/(c), register it in both explicit lists, boot the worktree Rust server on a scratch port, and OBSERVE ALL JOURNEYS FAILING against the unchanged implementation ((a)/(b) fail at the 400/loud door; (c) fails because the placeholder push wins) — record the failing output in the run ledger, commit the red spec: `test(e2e): red specs for REST fresh-agent resume + registry placeholder clamp`.
+   - Phase B (after Tasks 2–5 land): the same spec must now go GREEN against the worktree-built Rust server on a scratch port (NOT 3001) — capture the transition RED→GREEN in the ledger.
+2. (Phase B, continued) GREEN evidence as above.
 3. Full gate: `npm run test:status` → coordinate → `npm run check` (typecheck + coordinated full suite); `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; affected e2e specs on the configured cloud backend: `npm run test:e2e:cloud -- --project=rust-chromium <exact paths to the touched specs>` = the new `fresh-agent-rest-resume-rust.spec.ts` and the extended `sidebar-registry-sync-rust.spec.ts`, at shards=1 with the attribution checks above. Do NOT include `fresh-agent-control-rust.spec.ts` (pre-existing cloud failure, see Accepted tradeoffs).
 4. Update run-state execution counts; commit: `test(e2e): cover Rust REST fresh-agent resume and registry placeholder clamp`.
 
@@ -254,3 +269,4 @@ function agentResumeProvider(agent: string | undefined): 'codex' | 'opencode' | 
 - [x] No task mutates `main`, port 3001, or frozen text; deliberate-reset exemption and forward-looking tradeoffs encoded in tasks 1/2 acceptance.
 - [x] Anchor risks flagged where code may drift (anchors verified 2026-08-23; remediation evidence re-verified 2026-08-24).
 - [x] Plan-review round 1 remediations re-reviewed (2026-08-24): Task 1 interface is object-shaped per paneTypes.ts:191-200 + session-contract.ts:3-8 (verified); Task 2 clamped-content hash rebuild satisfies tabs_store.rs:804-816 reopen validation (verified) with raw whole-push retry identity preserved; Task 3 unconditional lineage + settings-bearing `was_recorded` keying resolves the REST gate hole (lib.rs:1936-1944 verified) without re-arming false SETTINGS_RESET; Task 4 RED matrix pins every explicit resume behavior; Task 5 narrowed to opencode-only (no misleading advertising; explicit sessionRef path documented); Task 6 journey (b) covers natural placeholder→ledger→durable resolution e2e.
+- [x] Plan-review round 2 remediations re-reviewed (2026-08-24): provider type is `FreshAgentRuntimeProvider` (shared/fresh-agent.ts:11, verified) with structural `FreshAgentIdentityFold` preserving shared→client dependency direction; `build_snapshot_payload_hash` cited correctly (pub at tabs_store_model.rs:211, already imported tabs.rs:42, verified — no visibility change); clamp signature on `serde_json::Value` (no phantom `OpenRecord`); resume probe reordered LEDGER-before-PROBE with route-sensitive test (serve.rs:201/:634 directory-param routing verified); Task 6 e2e constructs the locator from captured fields (no API change) and runs RED-FIRST in a two-phase sequencing recorded in Global Constraints; probe timeout injected via cfg(test) state override (no env-var race); Task 5 codex-refusal comment contradiction fixed.
