@@ -95,9 +95,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
             effort: row.effort,
             cwd: row.cwd,
         };
-        // A fully blank snapshot is "nothing recoverable" (real creates always
-        // carry at least cwd): None here + was_recorded()==true is exactly the
-        // SETTINGS_RESET alarm condition (V7/A10).
+        // A fully blank snapshot (a lineage-only row, Task 3) is "nothing
+        // recoverable". Under the Task 3 `was_recorded` rekeying such a row
+        // answers was_recorded()==false, so the V7/A10 SETTINGS_RESET alarm
+        // (was_recorded()==true while load_settings returns None) never arms
+        // for it — the genuine recorded-but-unrecoverable anomaly is exactly
+        // what remains alarm-positive.
         if s == FreshAgentSettings::default() {
             return None;
         }
@@ -105,11 +108,28 @@ impl PaneIdentitySink for LedgerIdentitySink {
     }
 
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
-        // State-agnostic (load_binding serves Retired/GcExpired rows too, V6/A9).
+        // Task 3 rekeying: "recorded" now means a SETTINGS-BEARING fresh-agent
+        // row (the ledger predicate `fresh_agent_settings_recorded`), NOT just
+        // any fresh-agent row — lineage-only rows (all-blank settings, written
+        // unconditionally at materialization so create-requestId lineage
+        // survives) must not arm the SETTINGS_RESET gate. State-agnostic as
+        // before (`load_binding` serves Retired/GcExpired rows too, V6/A9).
+        // Schema-compatible, no migration: historical blank rows flip to false
+        // (forward-looking tradeoff, accepted by the campaign plan).
         self.ledger
-            .load_binding(provider, session_id)
-            .map(|r| r.pane_kind.as_deref() == Some("fresh-agent"))
-            .unwrap_or(false)
+            .fresh_agent_settings_recorded(provider, session_id)
+    }
+
+    fn lookup_by_create_request_id(
+        &self,
+        provider: &str,
+        create_request_id: &str,
+    ) -> Option<String> {
+        // Memory-only delegation (the ledger's Bound-or-GcExpired,
+        // newest-by-updated_at rule) — usable inline from the REST resume path.
+        self.ledger
+            .lookup_by_create_request_id(provider, create_request_id)
+            .map(|row| row.session_id)
     }
 }
 
@@ -153,5 +173,78 @@ mod tests {
         assert!(!sink.was_recorded("codex", "nope"));
         let row = ledger.load_binding("codex", "t1").unwrap();
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
+    /// Task 3: the sink's placeholder→durable lineage lookup delegates to the
+    /// ledger's `lookup_by_create_request_id` (Bound or GcExpired, newest by
+    /// updated_at) and answers the durable session id — usable from the REST
+    /// resume path (sync, memory-only read).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lookup_by_create_request_id_resolves_the_durable_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_lookup".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-1".into()),
+            resolves_pending: Some("freshopencode-cr-1".into()),
+            supersedes: None,
+            // Blank settings on purpose: lineage must resolve even for
+            // lineage-only rows (settings-bearing-ness is unrelated).
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited write succeeds");
+
+        assert_eq!(
+            sink.lookup_by_create_request_id("opencode", "cr-1").as_deref(),
+            Some("ses_lookup")
+        );
+        assert_eq!(sink.lookup_by_create_request_id("opencode", "cr-nope"), None);
+        assert_eq!(sink.lookup_by_create_request_id("codex", "cr-1"), None);
+    }
+
+    /// Task 3 semantics change (`was_recorded` rekeying): a lineage-only
+    /// fresh-agent row (all-blank settings snapshot — the shape the
+    /// now-unconditional REST/WS materialization lineage writes produce for a
+    /// default create) is NOT a "recorded" session. `was_recorded` keys off
+    /// settings-bearing rows so unconditional lineage can never arm a FALSE
+    /// SETTINGS_RESET (the `was_recorded == true` + `load_settings == None`
+    /// pair) on resume. `load_settings` is unchanged: still None for these rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lineage_only_row_does_not_count_as_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_lineage".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-9".into()),
+            resolves_pending: Some("freshopencode-cr-9".into()),
+            supersedes: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited write succeeds");
+
+        let row = ledger
+            .load_binding("opencode", "ses_lineage")
+            .expect("the lineage row itself IS recorded");
+        assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+        assert!(
+            sink.load_settings("opencode", "ses_lineage").is_none(),
+            "a lineage-only row answers no settings snapshot"
+        );
+        assert!(
+            !sink.was_recorded("opencode", "ses_lineage"),
+            "a lineage-only row must not count as recorded (false SETTINGS_RESET)"
+        );
     }
 }

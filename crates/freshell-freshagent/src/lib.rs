@@ -147,7 +147,7 @@ const PROVIDER: &str = "opencode";
 /// format, `format!("freshopencode-{request_id}")`. By construction, an id with this shape
 /// is never a real opencode `serve` session id (those are `ses_*`) -- see
 /// [`FreshAgentState::get_opencode_snapshot`]'s Fix Task #3 short-circuit.
-const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
+pub(crate) const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
 /// Fallback turn idle budget when `send-keys` carries no `timeout` (matches the harness's
 /// generous Kimi budget; the request always supplies one in the oracle path).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
@@ -1705,7 +1705,7 @@ async fn create_tab(
         pane_id.clone(),
         PaneEntry {
             placeholder_id: placeholder.clone(),
-            cwd,
+            cwd: cwd.clone(),
             model,
             effort,
             durable_id: None,
@@ -1719,6 +1719,30 @@ async fn create_tab(
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.clone(), tab_id.clone());
+
+    // P1.13 (Task 3): pending identity marker at REST create (AWAITED before
+    // the tab.create broadcast — durable-before-answer), mirroring the WS
+    // create path (`opencode_ws.rs` `handle_create`). A failed write surfaces
+    // as a user-visible LEDGER_WRITE_FAILED frame, never blocks the create.
+    if let Some(sink) = state.identity_sink() {
+        if let Err(e) = sink
+            .record_pending(&placeholder, SESSION_TYPE, cwd.as_deref())
+            .await
+        {
+            tracing::warn!(error = %e, placeholder = %placeholder, "freshagent.opencode.rest_pending_write_failed");
+            state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                event: json!({
+                    "type": "freshAgent.error",
+                    "sessionId": placeholder,
+                    "code": "LEDGER_WRITE_FAILED",
+                    "message": "Failed to persist this pane's identity marker - identity may not survive a crash.",
+                }),
+                provider: PROVIDER.to_string(),
+                session_id: placeholder.clone(),
+                session_type: SESSION_TYPE.to_string(),
+            }));
+        }
+    }
 
     // Broadcast AFTER registration -- Node's order is createTab -> runtime
     // create -> attachPaneContent -> broadcast -> respond (router.ts:546-589),
@@ -1929,25 +1953,27 @@ async fn send_keys(
         // broadcast -- durable-before-answer), resolving the pane's placeholder id.
         // Without this site, REST-created sessions (the e2e seeding surface) never get
         // a resume record (V10 A13-N1). Opencode has no sandbox/permission concepts.
-        // No-laundering guard (V7/A10, parity with `record_codex_binding` and
-        // claude's consumer arm): never persist an all-blank settings snapshot --
-        // it would make `was_recorded` true while `load_settings` returns None,
-        // arming a FALSE SETTINGS_RESET for a legitimately-default create.
-        let has_recordable_settings =
-            pane.model.is_some() || pane.effort.is_some() || pane.cwd.is_some();
-        if !has_recordable_settings {
-            tracing::debug!(
-                session = %durable_id,
-                "freshagent.opencode.rest_binding_skipped: all-blank settings snapshot"
-            );
-        }
-        if let (Some(sink), true) = (state.identity_sink(), has_recordable_settings) {
+        //
+        // Task 3: lineage recording is UNCONDITIONAL — even an all-blank settings
+        // snapshot writes the row, because its `create_request_id` lineage (derived
+        // from the pane's placeholder id) is what lets a placeholder-keyed pane
+        // resolve to this durable session via `lookup_by_create_request_id` after a
+        // restart. The false-SETTINGS_RESET hazard an all-blank row used to pose
+        // (the reason this write was once gated on settings recordability) moved to
+        // the `was_recorded` keying (`identity_sink.rs`): lineage-only rows answer
+        // was_recorded()==false, so a legitimately-default create can never alarm
+        // on a later resume. `create_request_id`: `freshopencode-<createRequestId>`
+        // strips to Some(createRequestId); a born-durable placeholder strips to None.
+        if let Some(sink) = state.identity_sink() {
             if let Err(e) = sink
                 .record_binding(identity_sink::FreshAgentBindingUpsert {
                     provider: PROVIDER.into(),
                     session_id: durable_id.clone(),
                     mode: SESSION_TYPE.into(),
-                    create_request_id: None,
+                    create_request_id: pane
+                        .placeholder_id
+                        .strip_prefix(OPENCODE_PLACEHOLDER_PREFIX)
+                        .map(str::to_string),
                     resolves_pending: Some(pane.placeholder_id.clone()),
                     supersedes: None,
                     settings: identity_sink::FreshAgentSettings {
@@ -3147,16 +3173,28 @@ mod tests {
         assert_eq!(b.settings.model.as_deref(), Some("big-model"));
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
         assert_eq!(b.settings.cwd.as_deref(), Some("/w"));
+        // Task 3 (corrected semantics): `create_request_id` is the CREATE's
+        // requestId, derived from the pane's placeholder id
+        // (`freshopencode-r1` → `r1`) — the WS path previously stamped the
+        // SEND's requestId and the REST path stamped `None`; the placeholder
+        // is the lineage source of truth on both paths now.
+        assert_eq!(b.create_request_id.as_deref(), Some("r1"));
+        // A settings-bearing row keeps "recorded" status under the new keying.
+        drop(bindings);
+        assert!(fake.was_recorded("opencode", "ses_1"));
     }
 
-    /// WAVE-B fast-follow (B4 lane review): the REST send-keys materialization
-    /// site gets the SAME no-laundering guard as `record_codex_binding` /
-    /// claude's consumer arm (V7/A10): never persist an all-blank settings
-    /// snapshot -- it would make `was_recorded` true while `load_settings`
-    /// returns None, arming a FALSE SETTINGS_RESET for a
-    /// legitimately-default create on a later resume.
+    /// Task 3 (corrected semantics — this test previously asserted the WAVE-B
+    /// no-laundering SKIP): lineage recording is UNCONDITIONAL. A REST-created
+    /// pane with NO model/effort/cwd (the all-blank shape) still records its
+    /// materialization binding — the row's `create_request_id` lineage is what
+    /// lets a placeholder-keyed pane resolve to its durable `ses_*` session via
+    /// `lookup_by_create_request_id` after a restart. The false-SETTINGS_RESET
+    /// hazard the skip was built against moved to the `was_recorded` keying:
+    /// a lineage-only row answers `was_recorded == false` and
+    /// `load_settings == None`, so no alarm arms on a later resume.
     #[tokio::test]
-    async fn rest_send_keys_materialization_skips_all_blank_settings() {
+    async fn rest_send_keys_materialization_records_lineage_for_all_blank_settings() {
         let st = state();
         let deps = ServeDeps {
             spawner: Arc::new(NoopSpawner),
@@ -3196,9 +3234,141 @@ mod tests {
         )
         .await;
 
+        // The lineage row EXISTS: unconditional recording, placeholder-derived
+        // create_request_id, blank settings payload.
+        let b = {
+            let bindings = fake.bindings.lock().unwrap();
+            bindings
+                .iter()
+                .find(|b| b.session_id == "ses_1")
+                .expect("lineage binding recorded even for an all-blank settings snapshot")
+                .clone()
+        };
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.mode, "freshopencode");
+        assert_eq!(
+            b.create_request_id.as_deref(),
+            Some("b1"),
+            "lineage key derived from the pane's placeholder id"
+        );
+        assert_eq!(b.resolves_pending.as_deref(), Some("freshopencode-b1"));
+        assert_eq!(
+            b.settings,
+            identity_sink::FreshAgentSettings::default(),
+            "blank settings payload is recorded verbatim"
+        );
+
+        // ...but a lineage-only row is NOT a settings-bearing record: the
+        // `was_recorded` keying (Task 3 semantics) keeps a later resume from
+        // arming a FALSE SETTINGS_RESET for this legitimately-default create.
         assert!(
-            fake.bindings.lock().unwrap().is_empty(),
-            "an all-blank settings snapshot must never be persisted (V7/A10 no-laundering guard)"
+            fake.load_settings("opencode", "ses_1").is_none(),
+            "lineage-only row answers no settings snapshot"
+        );
+        assert!(
+            !fake.was_recorded("opencode", "ses_1"),
+            "lineage-only row must not count as recorded (false SETTINGS_RESET)"
+        );
+    }
+
+    // -- Task 3: REST create_tab records the pending identity marker --
+
+    /// Mirrors the WS create path (`opencode_ws.rs` `handle_create`): POST
+    /// /api/tabs for a fresh-agent pane must write a pending marker under the
+    /// pane's placeholder id (`freshopencode-<createRequestId>`), AWAITED
+    /// before the tab.create broadcast (durable-before-answer). Without the
+    /// marker, a crash between create and materialization leaves no evidence
+    /// identity establishment was in flight.
+    #[tokio::test]
+    async fn create_tab_records_pending_marker() {
+        let st = state();
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let resp = create_tab(
+            State(st.clone()),
+            headers,
+            Json(json!({ "agent": "opencode", "cwd": "/w" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let placeholder = st
+            .panes
+            .lock()
+            .expect("panes mutex")
+            .values()
+            .next()
+            .expect("the pane was created")
+            .placeholder_id
+            .clone();
+        assert!(placeholder.starts_with("freshopencode-"));
+        let pendings = fake.pendings.lock().unwrap();
+        assert!(
+            pendings
+                .iter()
+                .any(|(id, mode, cwd)| id == &placeholder
+                    && mode == "freshopencode"
+                    && cwd.as_deref() == Some("/w")),
+            "pending marker recorded at REST create under the placeholder id: {pendings:?}"
+        );
+    }
+
+    /// The pending write must never block the create (failure policy parity
+    /// with the WS path): a failed write surfaces as a user-visible
+    /// `LEDGER_WRITE_FAILED` `freshAgent.error` broadcast AND the pane is
+    /// still created.
+    #[tokio::test]
+    async fn create_tab_pending_write_failure_broadcasts_ledger_write_failed_and_still_creates() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let st = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        fake.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        st.set_identity_sink(fake.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let resp = create_tab(
+            State(st.clone()),
+            headers,
+            Json(json!({ "agent": "opencode", "cwd": "/w" })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a failed marker write never blocks the create"
+        );
+
+        let placeholder = st
+            .panes
+            .lock()
+            .expect("panes mutex")
+            .values()
+            .next()
+            .expect("the pane was created despite the write failure")
+            .placeholder_id
+            .clone();
+
+        let mut saw_ledger_write_failed = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("LEDGER_WRITE_FAILED") {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["provider"], "opencode");
+                assert_eq!(v["sessionType"], "freshopencode");
+                assert_eq!(v["sessionId"], placeholder);
+                saw_ledger_write_failed = true;
+            }
+        }
+        assert!(
+            saw_ledger_write_failed,
+            "a failed pending write must surface a user-visible LEDGER_WRITE_FAILED frame"
         );
     }
 

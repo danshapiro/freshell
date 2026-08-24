@@ -947,6 +947,54 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
 }
 
 #[test]
+fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
+    // Task 3's ledger predicate behind the identity sink's `was_recorded`
+    // rekeying: a fresh-agent binding row counts as "recorded" only when it
+    // carries a SETTINGS-BEARING snapshot — at least one of
+    // model/sandbox/permission_mode/effort/cwd set (the exact complement of
+    // the fresh-agent sink `load_settings` blank guard). Lineage-only rows
+    // (all blank) answer false, so unconditional lineage writes never arm a
+    // false SETTINGS_RESET. Schema-compatible: no migration; historical blank
+    // rows flip to false (forward-looking tradeoff, accepted).
+    let root = temp_root("fresh-agent-settings-recorded");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let base = FreshAgentBindingWrite {
+        provider: "opencode",
+        session_id: "ses_full",
+        mode: "freshopencode",
+        cwd: Some("/w"),
+        create_request_id: Some("cr-1"),
+        model: None,
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        now_ms: 1_000,
+    };
+    // A cwd-only snapshot counts as settings-bearing (real creates always
+    // carry at least cwd).
+    ledger.record_fresh_agent_binding(&base).unwrap();
+    assert!(ledger.fresh_agent_settings_recorded("opencode", "ses_full"));
+    // A lineage-only row (every settings column blank) does NOT count.
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            session_id: "ses_lineage",
+            cwd: None,
+            ..base
+        })
+        .unwrap();
+    assert!(!ledger.fresh_agent_settings_recorded("opencode", "ses_lineage"));
+    // Terminal-pane rows (no pane_kind) never count, even with cwd set.
+    ledger
+        .record_binding(&write("claude", "sess-t", "t1", 2_000))
+        .unwrap();
+    assert!(!ledger.fresh_agent_settings_recorded("claude", "sess-t"));
+    // Unknown keys answer false.
+    assert!(!ledger.fresh_agent_settings_recorded("opencode", "nope"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
     let root = temp_root("fresh-agent-supersedes-missing");
     let ledger = PaneLedger::new(Some(root.clone()));

@@ -648,6 +648,29 @@ impl PaneLedger {
             .cloned()
     }
 
+    /// Fresh-agent Task 3 (`was_recorded` rekeying): true iff a FRESH-AGENT
+    /// binding row carrying a SETTINGS-BEARING snapshot exists for this key —
+    /// at least one of model/sandbox/permission_mode/effort/cwd set (the exact
+    /// complement of the identity sink's `load_settings` blank guard, so the
+    /// two predicates can never disagree). A lineage-only row (every settings
+    /// column blank) answers false: unconditional lineage recording can never
+    /// arm a false SETTINGS_RESET. Terminal-pane rows (no `pane_kind`) never
+    /// count. State-agnostic like `load_binding` (tombstones included, V6/A9).
+    /// Schema-compatible: no migration; historical blank rows flip to false
+    /// (forward-looking tradeoff, accepted by the campaign plan). Memory-only.
+    pub fn fresh_agent_settings_recorded(&self, provider: &str, session_id: &str) -> bool {
+        self.load_binding(provider, session_id)
+            .map(|r| {
+                r.pane_kind.as_deref() == Some("fresh-agent")
+                    && (r.model.is_some()
+                        || r.sandbox.is_some()
+                        || r.permission_mode.is_some()
+                        || r.effort.is_some()
+                        || r.cwd.is_some())
+            })
+            .unwrap_or(false)
+    }
+
     /// Follow the `supersededBy` chain from a claimed ref to its terminus.
     /// Chains cannot cycle (a supersession write always targets a fresh row
     /// and retires its predecessor in the same act) — the hop cap is a

@@ -701,7 +701,16 @@ impl FreshOpencodeState {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
-                create_request_id: request_id.clone(),
+                // Task 3 binding fix: the lineage key is the CREATE requestId,
+                // derived from the placeholder minted at handle_create
+                // (`freshopencode-<createRequestId>`) — NOT this send's
+                // requestId (the old bug; every materialization re-keyed the
+                // lineage to the triggering send). A born-durable placeholder
+                // strips to None.
+                create_request_id: session
+                    .placeholder_id
+                    .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                    .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
                 settings: crate::identity_sink::FreshAgentSettings {
@@ -1794,6 +1803,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // The identity-sink trait's methods (record_binding/load_settings/
+    // was_recorded/lookup_by_create_request_id) are trait methods on the fake,
+    // unlike its inherent seed/field knobs.
+    use crate::identity_sink::PaneIdentitySink;
     use freshell_opencode::serve::{
         Endpoint, EventSink, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
         ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
@@ -2949,6 +2962,14 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .starts_with("freshopencode-"));
+        // Task 3 (corrected semantics): `create_request_id` is the CREATE's
+        // requestId ("r1") — derived from the placeholder id — NOT this send's
+        // requestId ("req-hello"), which was the lineage keying bug.
+        assert_eq!(
+            b.create_request_id.as_deref(),
+            Some("r1"),
+            "lineage is keyed by the CREATE requestId (placeholder-derived), never the send's"
+        );
     }
 
     #[tokio::test]
@@ -3068,6 +3089,57 @@ mod tests {
             s.cwd.as_deref(),
             Some("/real/project"),
             "cwd from the record, not the attach message"
+        );
+    }
+
+    /// Task 3: a lineage-only ledger row (binding exists with create_request_id
+    /// lineage but an all-blank settings snapshot — exactly what the now-
+    /// unconditional materialization writes produce for a default create) must
+    /// NEVER arm the V7/A10 SETTINGS_RESET alarm on resume: `was_recorded` now
+    /// keys off settings-bearing records, so the gate's second arm is false.
+    /// Regression guard for the false-alarm shape (`was_recorded == true` with
+    /// `load_settings == None`) the old keying produced.
+    #[tokio::test]
+    async fn lineage_only_binding_does_not_arm_settings_reset_on_resume() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage".into()),
+            resolves_pending: Some("freshopencode-cr-lineage".into()),
+            supersedes: None,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        // The lineage row exists but is NOT a settings-bearing record.
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "a lineage-only row answers no settings snapshot"
+        );
+        assert!(
+            !fake.was_recorded("opencode", DURABLE_ID),
+            "a lineage-only row must not count as recorded"
+        );
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let mut saw_settings_reset = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("SETTINGS_RESET") {
+                saw_settings_reset = true;
+            }
+        }
+        assert!(
+            !saw_settings_reset,
+            "a lineage-only row must never arm SETTINGS_RESET on resume"
         );
     }
 
