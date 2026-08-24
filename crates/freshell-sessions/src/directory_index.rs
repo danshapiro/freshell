@@ -1842,8 +1842,11 @@ fn parse_scoped_path(
 ///    — stat only, no parsing. Re-`parse()` ONLY a file that's new or whose
 ///    `mtime`/`size` changed since the cached [`FileEntry`]; reuse the cached
 ///    entry (including a cached EXCLUSION, `item: None`) for everything
-///    else. Prune `cache` entries for paths no longer discovered (deleted
-///    files).
+///    else. A re-parse counts toward the sweep's `changed` total ONLY when
+///    the re-parsed item actually differs from the cached one — a
+///    content-identical rewrite (same bytes, only mtime/size moved) is pure
+///    stat-bookkeeping and must never advance the change generation. Prune
+///    `cache` entries for paths no longer discovered (deleted files).
 /// 2. Direct-listed sources (Batch C: opencode): call
 ///    [`SessionSource::direct_change_token`] — cheap, no query. If the token
 ///    matches the cached [`DirectEntry`], reuse its `items` unchanged. If it
@@ -2003,6 +2006,18 @@ fn refresh_snapshot(
                 }
             } else {
                 let item = source.parse(&stat.path);
+                // A content-IDENTICAL rewrite (editor autosave, a repeated
+                // provider write: same bytes, only mtime/size moved)
+                // re-parses to exactly the cached item. Count ONLY a re-parse
+                // whose parsed view (or ownership) actually differs as a
+                // change — a phantom cache mutation would advance the change
+                // generation, which since 6af41f272's unconditional wake-arm
+                // broadcast fans a spurious `sessions.changed` out to every
+                // client. The stat bookkeeping (mtime_ms/size) is refreshed
+                // either way so the NEXT sweep treats the file as unchanged.
+                let content_moved = cache
+                    .get(&stat.path)
+                    .is_none_or(|entry| entry.item != item || entry.source_name != source_name);
                 cache.insert(
                     stat.path.clone(),
                     FileEntry {
@@ -2012,7 +2027,9 @@ fn refresh_snapshot(
                         item,
                     },
                 );
-                changed += 1;
+                if content_moved {
+                    changed += 1;
+                }
             }
             discovered.insert(stat.path);
         }
@@ -2045,6 +2062,14 @@ fn refresh_snapshot(
                     if !unchanged {
                         let (item, resolved_source) =
                             parse_scoped_path(path, sources, Some(watcher_provider));
+                        // Same content-identical-rewrite rule as the discover
+                        // arm above: a watcher-scoped re-parse whose parsed
+                        // view matches the cached item is bookkeeping, not a
+                        // change — else it bumps the generation and wakes a
+                        // spurious `sessions.changed` broadcast.
+                        let content_moved = cache.get(path).is_none_or(|entry| {
+                            entry.item != item || entry.source_name != resolved_source
+                        });
                         cache.insert(
                             path.clone(),
                             FileEntry {
@@ -2054,7 +2079,9 @@ fn refresh_snapshot(
                                 item,
                             },
                         );
-                        changed += 1;
+                        if content_moved {
+                            changed += 1;
+                        }
                     }
                 }
                 None => {
@@ -2781,6 +2808,108 @@ pub(crate) mod tests {
             parse_calls.load(Ordering::SeqCst),
             3,
             "a post-TTL sweep of unchanged files must not re-parse ANY file"
+        );
+
+        std::fs::remove_dir_all(&claude_home).ok();
+    }
+
+    /// Phantom-generation regression pin: a content-IDENTICAL rewrite — same
+    /// bytes, only `mtime` moved — must still be re-parsed (observable sweep
+    /// work) but must NOT count as a change, so the change generation stays
+    /// put (this is what keeps `sessions.changed` silent client-side since
+    /// 6af41f272 made the wake arm broadcast on every generation advance).
+    /// The control leg then forces a REAL content change to prove the
+    /// comparison doesn't over-suppress: that must advance the generation.
+    #[tokio::test]
+    async fn content_identical_rewrite_reparses_without_bumping_generation() {
+        let claude_home = unique_temp_dir("identical-rewrite");
+        let project = claude_home.join("projects").join("-p");
+        std::fs::create_dir_all(&project).unwrap();
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+
+        let parse_calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingWrapper {
+            parse_calls: Arc::clone(&parse_calls),
+            ..CountingWrapper::new(ClaudeSource::new(claude_home.clone()))
+        };
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+
+        let mut rx = index.subscribe_changes();
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(parse_calls.load(Ordering::SeqCst), 1);
+        // Sync past the cold-publish generation so every assertion below is
+        // about SUBSEQUENT sweeps only.
+        let baseline_gen = *rx.borrow_and_update();
+
+        // A byte-identical rewrite with a provably moved stat: the sleep
+        // pushes mtime_ms forward (ms granularity across filesystems) and the
+        // rewrite re-stamps it. Same bytes → same parsed view.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:00:00.000Z",
+            "hello a",
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
+
+        // Stale-while-revalidate: trigger the background sweep, then observe
+        // it settling via the parse counter (the generation must never move
+        // on this leg, so it cannot be the settle signal).
+        let _ = index.snapshot().await;
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                parse_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "the mtime-moved rewrite must be re-parsed (observable sweep work)"
+        );
+        assert_eq!(
+            *rx.borrow(),
+            baseline_gen,
+            "a content-identical rewrite must NOT advance the change generation"
+        );
+        // And no LATE bump either (one more sweep's worth of slack).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.changed())
+                .await
+                .is_err(),
+            "no late generation bump may follow a content-identical re-parse"
+        );
+
+        // Control: a REAL content change (size differs — robust to coarse
+        // mtime) must still advance the generation: the comparison must not
+        // suppress real changes.
+        write_session_file(
+            &project,
+            "a.jsonl",
+            &synthetic_session_id(1),
+            "/p/a",
+            "2025-01-30T10:05:00.000Z",
+            "hello a, now with a genuinely longer message body",
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL
+        let _ = index.snapshot().await;
+        tokio::time::timeout(Duration::from_secs(2), rx.changed())
+            .await
+            .expect("a real content change must advance the generation")
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                parse_calls.load(Ordering::SeqCst) >= 3
+            })
+            .await,
+            "the really-changed file must be re-parsed"
         );
 
         std::fs::remove_dir_all(&claude_home).ok();
