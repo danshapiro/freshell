@@ -1207,13 +1207,17 @@ describe('FreshAgentTranscript', () => {
         />,
       )
 
-      // The injected empty strip is suppressed: the previous turn's line
-      // carries the live reel, so exactly one strip shows one running
-      // indicator, and the settled '1 tool used' text is not shown while live.
+      // The final turn has a visible summary, so it closes the line and
+      // renders its own article (summary + injected live strip) instead of
+      // handing liveness to the earlier line — the earlier turn completed
+      // before the final turn started, so its line settles. Exactly one
+      // running indicator remains, on the live strip, and none on the
+      // earlier turn.
       expect(screen.getAllByLabelText('running')).toHaveLength(1)
       const strips = screen.getAllByRole('region', { name: 'Activity strip' })
-      expect(strips).toHaveLength(1)
-      expect(strips[0]).not.toHaveTextContent('1 tool used')
+      expect(strips).toHaveLength(2)
+      expect(strips[0]).toHaveTextContent('1 tool used')
+      expect(screen.getByText('thinking')).toBeInTheDocument()
     })
 
     it('drops a non-streaming turn when all items are filtered out', () => {
@@ -1699,6 +1703,39 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByLabelText('running')).toHaveLength(1)
       expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('Read')
       expect(screen.queryByText('2 tools used')).not.toBeInTheDocument()
+    })
+
+    it('keeps a summary-only streaming turn and its injected live strip visible after an activity line', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-summary', turnId: 'turn-summary', role: 'assistant', summary: 'Wrapping up shortly', items: [] },
+          ]}
+        />,
+      )
+      expect(screen.getByText('Wrapping up shortly')).toBeInTheDocument()
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    })
+
+    it('closes the line across a role change even when the message body is invisible', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-user-invisible', turnId: 'turn-user-invisible', role: 'user', summary: '',
+              items: [{ id: 'item-invisible', kind: 'text', text: '   ' }] },
+            { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      expect(screen.getByText('You')).toBeInTheDocument()
     })
   })
 })

@@ -265,7 +265,17 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): {
         }
         continue
       }
-      if (!rendersVisibly(item)) continue
+      if (!rendersVisibly(item)) {
+        // Invisible content only. Same-role turns merge freely (nothing renders
+        // between the lines). A different-role turn still paints its header, so
+        // it closes the open line and keeps its (invisible-bodied) block,
+        // matching the pre-change renderer's chrome.
+        if (open && turn.role !== open.role) {
+          flushOpen()
+          layout.blocks.push({ kind: 'item', item })
+        }
+        continue
+      }
       flushOpen()
       layout.blocks.push({ kind: 'item', item })
     }
@@ -401,6 +411,11 @@ function selectLiveActivityBlockIdFromLayout(
 
   if (lastTurn && lastTurn.items.length > 0) return latestActivityBlockId
   if (!lastTurn || !tail) return null
+  // A summary-only last turn renders its own article (summary markdown plus
+  // the injected live strip); handing liveness to the tail line would skip
+  // that article and hide the summary. A rendered summary is a message — it
+  // closes the line.
+  if (lastTurn.summary && lastTurn.summary.trim().length > 0) return null
 
   // Last display turn streams with zero visible items: hand liveness to the
   // trailing line when nothing rendered between them (intermediate turns were
