@@ -403,7 +403,7 @@ function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
  * provider message id; stitching keys toolUseId, which is verified unique, so
  * stitching is unaffected — only React keys need this).
  */
-function buildTranscriptLayout(turns: FreshAgentTurn[]): {
+function buildTranscriptLayout(turns: DisplayTurn[], paintedSummaryKeys: PaintedSummaryStore): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
   tail: { blockId: string; turnIndex: number } | null
@@ -432,7 +432,18 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): {
     }
     for (const item of turn.items) {
       if (isActivityLike(item)) {
-        if (open && open.role === turn.role) {
+        // Cross-turn absorb is refused by either boundary guard: an authored
+        // summary (no echo among the turn's pre-filter items), or a summary
+        // this view already painted (prefix-matched per turnId). Intra-turn
+        // chaining into the turn's own line is always free.
+        if (
+          open
+          && open.role === turn.role
+          && (
+            open.originIndex === turnIndex
+            || (!paintedSummaryMatches(paintedSummaryKeys, turn) && !summaryIsAuthoredContent(turn))
+          )
+        ) {
           const taken = new Set(open.items.map((openItem) => openItem.id))
           let displayItem = item
           let counter = 2
@@ -448,7 +459,17 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): {
         }
         continue
       }
-      if (!rendersVisibly(item)) continue
+      if (!rendersVisibly(item)) {
+        // Invisible content only. Same-role turns merge freely (nothing renders
+        // between the lines). A different-role turn still paints its header, so
+        // it closes the open line and keeps its (invisible-bodied) block,
+        // matching the pre-change renderer's chrome.
+        if (open && turn.role !== open.role) {
+          flushOpen()
+          layout.blocks.push({ kind: 'item', item })
+        }
+        continue
+      }
       flushOpen()
       layout.blocks.push({ kind: 'item', item })
     }
@@ -510,6 +531,11 @@ function selectLiveActivityBlockIdFromLayout(
 
   if (lastTurn && lastTurn.items.length > 0) return latestActivityBlockId
   if (!lastTurn || !tail) return null
+  // A summary-only last turn renders its own article (summary markdown plus
+  // the injected live strip); handing liveness to the tail line would skip
+  // that article and hide the summary. A rendered summary is a message — it
+  // closes the line.
+  if (lastTurn.summary && lastTurn.summary.trim().length > 0) return null
 
   // Last display turn streams with zero visible items: hand liveness to the
   // trailing line when nothing rendered between them (intermediate turns were
@@ -529,14 +555,19 @@ function selectLiveActivityBlockIdFromLayout(
 
 ```ts
 const displayTurns = useMemo(() => (
-  filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming)
+  filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming, paintedSummaryKeysRef.current)
 ), [displayOptions, turns, isStreaming])
-const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
+const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(
+  () => buildTranscriptLayout(displayTurns, paintedSummaryKeysRef.current),
+  [displayTurns],
+)
 const liveActivityBlockId = useMemo(
   () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming, tail),
   [turnLayouts, displayTurns, isStreaming, tail],
 )
 ```
+
+(Painted-summary tracking: an effect records, per turnId, each zero-item summary this view actually rendered; `filterTurnsForDisplay` keeps an invisible placeholder for a fully-filtered turn whose summary painted, and `buildTranscriptLayout`'s absorb guard refuses a painted follower. Prefix matching on the summary text lets a growing streaming summary inherit its boundary while duplicate turnIds with unrelatable summaries do not. A transcript that mounts already-settled never painted, so its hidden summaries do not block merging.)
 
 (d) In the render loop (:765–780), pass blocks in, skip fully-absorbed turns, and resolve the article's action turn to the line's LAST contributing turn so fork/rewind/context-menu affordances survive merging at line-end granularity:
 
@@ -585,7 +616,7 @@ Note the article still renders its fallback summary path only when `blocks.lengt
 1. `'keeps consecutive activity-only assistant turns separate while marking only the latest live'` (~:459) — replace expectation block: now ONE strip, one running indicator; click Toggle once; `src/one.ts`, `src/two.ts`, `src/three.ts` all visible; running indicator count stays 1. Rename to `'collapses consecutive activity-only assistant turns into one live strip'`.
 2. `'coalesces adjacent Claude tool-use/result exchanges without rendering synthetic You turns'` (:576) — after synthetic coalescing the two exchanges are adjacent same-role activity-only turns: change `strips` to length 1, expect `'2 tools used'`, headers still `['You', 'Freshclaude']`, still zero user-role strips.
 3. `'keeps adjacent activity-only display turns distinct and actionable'` (:892) — replace with the line-end-fork test from Step 1 (last case); the protection is preserved at line granularity: the single merged article's fork resolves to the line's last contributing turn (`display-activity-2`), delete the old two-article/two-strip assertions.
-4. `'does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items'` (:1179) — new expected behavior: exactly 1 strip total (the injected empty strip is suppressed; the previous turn's line carries the live reel), one `running` indicator, and the settled text `'1 tool used'` is NOT shown while live.
+4. `'does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items'` (:1179) — final behavior: when the last turn carries a painted summary, the visible-summary guard refuses the liveness handoff, so that turn renders its own article (summary + injected live strip) and the previous turn's settled line stays: exactly 2 strips with exactly 1 running indicator (the injected strip). An EMPTY-summary fixture collapses to 1 strip whose prior line goes live.
 
 - [x] **Step 4: Run the focused tests**
 
