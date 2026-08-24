@@ -68,7 +68,7 @@ No other test code changes in this step (assertions, handler body, and expected 
 
 Run: `cargo test -p freshell-server ai_title`
 
-Expected: FAIL — `gemini_http_posts_expected_body_and_parses_candidates_excluding_thoughts` panics at `.unwrap()` because the client (still pinned to 2.5) POSTs `/v1beta/models/gemini-2.5-flash-lite:generateContent`, which the router no longer serves; `generate_content` returns `Err("gemini http 404")` and the test's `.unwrap()` fails. The failure exists because the production URL embeds the old model id.
+Expected: FAIL — `gemini_http_posts_expected_body_and_parses_candidates_excluding_thoughts` panics at `.unwrap()` because the client (still pinned to 2.5) POSTs `/v1beta/models/gemini-2.5-flash-lite:generateContent`, which the router no longer serves; `generate_content` returns `Err("gemini http 404 Not Found")` (reqwest's `StatusCode` Display appends the canonical reason) and the test's `.unwrap()` fails. The failure exists because the production URL embeds the old model id.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -183,7 +183,8 @@ In `crates/freshell-server/src/ai_title.rs`:
 /// Over `PROMPT_MESSAGE_CHAR_CAP` chars, keep the first and last 1000 chars of
 /// the message with an explicit elision marker instead of prefix-truncating.
 /// NOTE: char-counted, not byte/UTF-16 — the same deliberate divergence as the
-/// heuristic port (sessions.rs:291), consistent across surfaces.
+/// heuristic truncation in `extract_title_from_message` (sessions.rs),
+/// consistent across surfaces.
 const PROMPT_MESSAGE_WINDOW_EDGE_CHARS: usize = 1000;
 const TRIMMED_MARKER: &str = "\n...[trimmed]...\n";
 
