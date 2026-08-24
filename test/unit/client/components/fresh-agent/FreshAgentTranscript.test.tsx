@@ -2038,5 +2038,37 @@ describe('FreshAgentTranscript', () => {
       )
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
     })
+
+    it('keeps the painted boundary when a streaming summary grows after painting', () => {
+      const turnA = {
+        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
+      }
+      // Frame 1: the streaming tail paints its summary 'Considering'.
+      const turnBEmpty = {
+        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const,
+        summary: 'Considering', items: [],
+      }
+      const { rerender } = render(
+        <FreshAgentTranscript isStreaming showThinking turns={[turnA, turnBEmpty]} />,
+      )
+      expect(screen.getByText('Considering')).toBeInTheDocument()
+
+      // Frame 2: the same turn's reasoning accumulated — the summary grew to
+      // 'Considering options' and the turn now carries items echoing it
+      // (repeatedly fetched OpenCode reasoning parts have this shape). The
+      // painted text rendered between the tool runs; the new activity must
+      // keep its own line even though the summary text mutated.
+      const turnBGrown = {
+        ...turnBEmpty,
+        summary: 'Considering options',
+        items: [
+          { id: 'think-1', kind: 'thinking' as const, text: 'Considering options' },
+          { id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } },
+        ],
+      }
+      rerender(<FreshAgentTranscript isStreaming showThinking turns={[turnA, turnBGrown]} />)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
   })
 })

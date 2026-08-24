@@ -312,7 +312,7 @@ function summaryIsAuthoredContent(turn: DisplayTurn): boolean {
 
 function buildTranscriptLayout(
   turns: DisplayTurn[],
-  paintedSummaryKeys: ReadonlySet<string>,
+  paintedSummaryKeys: PaintedSummaryStore,
 ): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
@@ -355,7 +355,7 @@ function buildTranscriptLayout(
           && open.role === turn.role
           && (
             open.originIndex === turnIndex
-            || (!paintedSummaryKeys.has(paintedSummaryKey(turn)) && !summaryIsAuthoredContent(turn))
+            || (!paintedSummaryMatches(paintedSummaryKeys, turn) && !summaryIsAuthoredContent(turn))
           )
         ) {
           const taken = new Set(open.items.map((openItem) => openItem.id))
@@ -465,20 +465,46 @@ type DisplayTurn = FreshAgentTurn & {
 }
 
 /**
- * Painted-summary identity. turnId alone is insufficient: validated claude
- * data permits multiple display turns sharing one turnId (one provider
- * message spanning JSONL rows), so the summary text scopes the key —
- * painting one occurrence must not mark a different occurrence as painted.
+ * Painted-summary identity: per-turnId list of summaries this view has
+ * rendered for that turn. Two failure shapes pull in opposite directions and
+ * this structure holds both:
+ * - Streaming summaries GROW (accumulated OpenCode reasoning parts, etc.):
+ *   'Considering' paints, then becomes 'Considering options'. Matching uses a
+ *   prefix relation, so the grown summary still inherits its painted
+ *   boundary (a painted boundary must be permanent across frames).
+ * - Validated claude data permits duplicate display turnIds across JSONL
+ *   rows: painting 'First thought' must not mark a different occurrence
+ *   whose summary 'Second thought' never painted (no prefix relation).
  */
-function paintedSummaryKey(turn: Pick<FreshAgentTurn, 'turnId' | 'id' | 'summary'>): string {
-  return `${getFreshAgentDisplayTurnKey(turn)}:${(turn.summary ?? '').trim()}`
+type PaintedSummaryStore = ReadonlyMap<string, readonly string[]>
+
+function recordPaintedSummary(
+  store: Map<string, string[]>,
+  turn: Pick<FreshAgentTurn, 'turnId' | 'id' | 'summary'>,
+): void {
+  const summary = (turn.summary ?? '').trim()
+  if (!summary) return
+  const key = getFreshAgentDisplayTurnKey(turn)
+  const list = store.get(key) ?? []
+  if (!list.includes(summary)) list.push(summary)
+  store.set(key, list)
+}
+
+function paintedSummaryMatches(
+  store: PaintedSummaryStore,
+  turn: Pick<FreshAgentTurn, 'turnId' | 'id' | 'summary'>,
+): boolean {
+  const summary = (turn.summary ?? '').trim()
+  if (!summary) return false
+  const painted = store.get(getFreshAgentDisplayTurnKey(turn))
+  return painted?.some((p) => p === summary || p.startsWith(summary) || summary.startsWith(p)) ?? false
 }
 
 function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
   isStreaming: boolean,
-  paintedSummaryKeys: ReadonlySet<string>,
+  paintedSummaryKeys: PaintedSummaryStore,
 ): DisplayTurn[] {
   return turns
     .map((turn, index): DisplayTurn | null => {
@@ -487,7 +513,7 @@ function filterTurnsForDisplay(
         if (isStreaming && index === turns.length - 1) {
           return { ...turn, items: [] }
         }
-        if (paintedSummaryKeys.has(paintedSummaryKey(turn))) {
+        if (paintedSummaryMatches(paintedSummaryKeys, turn)) {
           return { ...turn, items: [], summary: '', filteredPlaceholder: true }
         }
         return null
@@ -877,7 +903,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   // Keys of summaries this mounted view has actually painted (see the
   // recording effect below). Feeds the placeholder boundary so it survives
   // the busy→idle isStreaming flip without blocking settled-history merges.
-  const paintedSummaryKeysRef = useRef<Set<string>>(new Set())
+  const paintedSummaryKeysRef = useRef<Map<string, string[]>>(new Map())
   const displayTurns = useMemo(() => (
     filterTurnsForDisplay(
       coalesceSyntheticToolResultTurns(turns),
@@ -904,7 +930,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       if (typeof turn.summary !== 'string' || turn.summary.trim().length === 0) return
       const isLastStreaming = isStreaming && index === displayTurns.length - 1
       if (isLastStreaming && liveActivityBlockId !== null) return
-      painted.add(paintedSummaryKey(turn))
+      recordPaintedSummary(painted, turn)
     })
   }, [displayTurns, isStreaming, liveActivityBlockId])
   const transcriptSignature = useMemo(() => (
