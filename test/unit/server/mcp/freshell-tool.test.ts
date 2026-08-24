@@ -170,6 +170,98 @@ describe('executeAction -- tab actions', () => {
     expect(result).toBeTruthy()
   })
 
+  // Fresh-agent shorthand resume: when `mode` is absent and the pane is a
+  // fresh agent (`agent` param), resume sugar previously dropped the resume
+  // fields silently. Only opencode is synthesized -- it is the only provider
+  // the REST create_tab resume endpoint honors; other providers must use an
+  // explicit sessionRef (which is forwarded for any provider).
+  it('new-tab with agent: opencode maps resume to a synthesized opencode sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      agent: 'opencode',
+      resume: 'ses_01JXXXXXXXXXXXXXXXXXXXXXXX',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent: 'opencode',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId: 'ses_01JXXXXXXXXXXXXXXXXXXXXXXX',
+      },
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resume')
+  })
+
+  it('new-tab with agent: opencode maps resumeSessionId alias to a synthesized opencode sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      agent: 'opencode',
+      resumeSessionId: 'ses_01JXXXXXXXXXXXXXXXXXXXXXXX',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent: 'opencode',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId: 'ses_01JXXXXXXXXXXXXXXXXXXXXXXX',
+      },
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
+  it('new-tab with agent: opencode prefers an explicit sessionRef over a synthesized one', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      agent: 'opencode',
+      resume: 'ses_SHOULD_NOT_WIN',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId: 'ses_EXPLICIT_WINS',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      agent: 'opencode',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId: 'ses_EXPLICIT_WINS',
+      },
+    }))
+  })
+
+  it('new-tab with agent: codex rejects raw resume ids (same guard as mode: codex)', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    const result = await executeAction('new-tab', {
+      agent: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(result).toEqual({
+      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
+    })
+    expect(mockClient.post).not.toHaveBeenCalled()
+  })
+
+  it.each(['claude', 'kilroy'])('new-tab with agent: %s does not synthesize a sessionRef from resume', async (agent) => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      agent,
+      resume: '550e8400-e29b-41d4-a716-446655440000',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ agent }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('sessionRef')
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resume')
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')
