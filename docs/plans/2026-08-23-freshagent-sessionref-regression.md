@@ -52,6 +52,7 @@ TypeScript/React/Redux Toolkit/Vitest (client + Node server), Rust (freshell-ws,
 - Worktree has no `node_modules`: run `npm ci` first thing in Task 1.
 - `docs/index.html` is unchanged (no user-UI-facing change).
 - The three enumerated base flakes are pre-existing and out of scope (see Accepted tradeoffs).
+- Coverage reading (load-bearing stage decision): with the Task 2 server clamp enabled, a placeholder record never reaches a subscribed client, so a stack-level e2e cannot distinguish which guard layer fired. Task 1's client fold guard is covered at unit level by design; Task 6's full-stack e2e asserts the user-visible invariant (registry winner keeps durable sessionRef against a placeholder push). Task 5 is a Node-side forwarding fix covered by unit tests of the tool handler; its server-side acceptance is covered by Tasks 4/6.
 
 ## Task 1 — Client identity guard (panes normalize + merge)
 
@@ -160,7 +161,7 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 3. `ses_…` → direct; `freshopencode-<crid>` → `state.identity_sink().lookup_by_create_request_id("opencode", crid)` → hit resume / miss-or-no-sink → 404 (message names the placeholder); any other shape → 400.
 4. Probe `manager.get_session(&id, &route)` bounded by `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` (default 10_000; reuse the WS door's knob parse) → NotFound 404 / timeout 504 / other 502.
 5. Settings: body model/effort > ledger `load_settings`; `was_recorded && load fails` → SETTINGS_RESET broadcast (mirror opencode_ws.rs:1506-1541). CWD: ledger > serve directory from probe > body.
-6. Born-durable PaneEntry (placeholder_id = ses id; durable_id: Some; `get_opencode_snapshot` short-circuits on placeholder prefix → safe); NEW uuid createRequestId; paneContent sessionId/sessionRef durable, status "connected"; `ui.command` `tab.create` broadcast; response `{ tabId, paneId, sessionId, sessionRef }` + "fresh-agent pane resumed"; NO materialized frame, NO sessions.changed, NO pending write (Task 3's pending write is create-only), NO binding writes (ledger read-only on resume).
+6. Born-durable PaneEntry (placeholder_id = the durable ses id itself; durable_id: Some — no placeholder-prefixed id is ever minted for a resumed pane, so the pane behaves as any already-materialized durable pane from creation; the snapshot/serve path sees a normal `ses_*` id); NEW uuid createRequestId; paneContent sessionId/sessionRef durable, status "connected"; `ui.command` `tab.create` broadcast; response `{ tabId, paneId, sessionId, sessionRef }` + "fresh-agent pane resumed"; NO materialized frame, NO sessions.changed, NO pending write (Task 3's pending write is create-only), NO binding writes (ledger read-only on resume).
 7. Site comment documenting divergence from frozen Node parity.
 
 **Steps:**
@@ -202,7 +203,8 @@ function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'o
 **Files:**
 - New: `test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts` — modeled on `test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts:380-428` (rust server boot harness, audit log `readJsonl` for the `prompt_async` ses id, `server.restartAbrupt`, `enableFreshAgent`, `WsCapture`) and `fresh-agent-control-rust.spec.ts` (`sendOpencodeTurn` :1674).
 - Extend or model on: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — two WS clients / tabs.sync push: client-B pushes placeholder for a pane client-A has durable; assert registry winner keeps durable ref.
-- Verify neither spec lives in `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`); if the new spec must be skipped for a REAL reason (e.g. needs real opencode binary unavailable in container), document why and keep it local-only explicitly — do not let a filter silently match zero tests.
+- REGISTER the new spec so it cannot silently match zero tests: add it to BOTH explicit lists in `test/e2e-browser/playwright.config.ts` — `RUST_ONLY_SPECS` (~:245/:283) and `rust-chromium.testMatch` (~:472/:530). The lists are explicit regex literals; no glob exists. Verified by negative control: an unregistered filename matches 0 tests ("Error: No tests found."). Donor specs were verified absent from `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`) at base; assert the same for the new spec.
+- Filtered cloud runs: run at shards=1 (or otherwise avoid the silent full-suite glob-fallback trap in the cloud entrypoint at shards≥2 when a filter matches nothing) and verify run attribution: entrypoint echo lists the intended spec files and the line reporter shows their real test titles.
 
 **Steps:**
 1. RED: new spec fails (resume endpoint currently 400s / guard absent).
