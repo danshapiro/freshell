@@ -104,11 +104,11 @@ Run, in order, from the worktree:
 
 ```bash
 cargo test -p freshell-server
-npm run typecheck:server
+cargo build --release -p freshell-server   # mandatory pre-warm — see Expected below
 npm run test:e2e -- --local --project=rust-chromium test/e2e-browser/specs/auto-title-rust.spec.ts
 ```
 
-Expected: crate tests PASS; typecheck PASS; e2e spec (5 tests) PASS against the fake-Gemini pinned at the 3.5 path. (First e2e run cold-builds `target/release/freshell-server` in the worktree via the rust-server helper — expect minutes.)
+Expected: crate tests PASS; e2e spec (5 tests) PASS against the fake-Gemini pinned at the 3.5 path. Two corrections from load-bearing validation: **(a)** `npm run typecheck:server` does NOT cover `test/` (`tsconfig.server.json` includes only `server/**`+`shared/**`; no repo tsconfig typechecks e2e specs, deliberately), so it is dropped — the spec run itself is the correctness gate (esbuild load failure is loud; the fake 404s a wrong model path); **(b)** the pre-warm is mandatory: at base state the cold first e2e run fails 5/5 because the helper's release build takes ~4m45s , exceeding the 120s per-test timeout (plus a concurrent-cargo race in `test/e2e-browser/helpers/rust-server.ts:107`); the same run passes warm. The pre-warm also protects staleness: the worktree's existing release binary predates this task's edits.
 
 - [ ] **Step 7: Commit the task**
 
