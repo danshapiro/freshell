@@ -74,12 +74,22 @@ export function isPlaceholderProviderSessionId(provider: FreshAgentProvider, ses
 // (mirror of isDurableProviderSessionId; returns false for empty/undefined and unknown providers)
 
 // shared/fresh-agent.ts
+// NOTE: FreshAgentPaneContent.sessionRef is a SessionLocator OBJECT `{ provider, sessionId }`
+// (paneTypes.ts:191-200, session-contract.ts SessionRefSchema :3-8) — NEVER a string.
+// sanitizeSessionRef (session-contract.ts:90-97) discards anything else, so this helper must
+// accept and preserve the object shape verbatim.
 export function preservedDurableFreshAgentIdentity(
-  previous: { provider?: string; createRequestId?: string; sessionRef?: string; sessionId?: string; resumeSessionId?: string } | undefined,
-  incoming: { provider?: string; createRequestId?: string; sessionRef?: string; sessionId?: string; resumeSessionId?: string },
-): { sessionRef: string; sessionId: string; resumeSessionId: string } | undefined
-// Fires iff: same provider, both createRequestIds defined and equal, previous.sessionRef durable, incoming.sessionRef placeholder.
-// Returns previous durable tuple picked into incoming shape; undefined otherwise (deliberate reset with new createRequestId naturally exempt).
+  previous: Pick<FreshAgentPaneContent, 'provider' | 'createRequestId' | 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined,
+  incoming: Pick<FreshAgentPaneContent, 'provider' | 'createRequestId' | 'sessionRef' | 'sessionId' | 'resumeSessionId'>,
+): Pick<FreshAgentPaneContent, 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined
+// Fires iff: previous exists; previous.provider === incoming.provider (pane-level continuity,
+// and the sessionRef LOCATORS' provider must agree with the pane provider); both createRequestIds
+// defined and equal; previous.sessionRef exists (post-sanitize object) and its sessionId is
+// NON-placeholder for its provider; incoming.sessionRef exists and its sessionId IS placeholder.
+// Returns previous's durable identity tuple — the sessionRef OBJECT preserved verbatim (never
+// coerced to a string, or sanitizeSessionRef would discard it downstream), plus sessionId and
+// resumeSessionId — for the caller to spread over incoming. Undefined otherwise (deliberate
+// reset with new createRequestId naturally exempt; different provider naturally exempt).
 ```
 
 **Steps:**
@@ -90,7 +100,8 @@ export function preservedDurableFreshAgentIdentity(
    - Seed a pane with durable sessionRef via `hydratePanes` (twice: second hydrate carries placeholder sessionRef for same provider+createRequestId) → pane keeps durable sessionRef/sessionId/resumeSessionId.
    - `updatePaneContent` fold: same scenario through the update path.
    - Exemption: incoming payload with a NEW createRequestId + placeholder replaces cleanly (deliberate reset not clamped).
-   - `preservedDurableFreshAgentIdentity` direct unit cases (fire / no-durable-previous / different-createRequestId).
+   - Continuity-key negative: SAME createRequestId but DIFFERENT provider (previous durable opencode, incoming placeholder codex) → NOT clamped (provider+createRequestId is the key; provider-only or crid-only matching is a defect).
+   - `preservedDurableFreshAgentIdentity` direct unit cases (fire / no-durable-previous / different-createRequestId / different-provider / incoming-sessionRef-as-string is discarded by sanitize, never matched).
    Run → FAIL.
 5. GREEN: implement `preservedDurableFreshAgentIdentity` in `shared/fresh-agent.ts`; wire into `normalizePaneContent`'s fresh-agent arm main return and `mergeTerminalState`'s same-createRequestId block. Run → PASS.
 6. REFACTOR: keep the picker in one place (helper), call sites thin.
@@ -104,7 +115,9 @@ export function preservedDurableFreshAgentIdentity(
 **Files:**
 - Test: `crates/freshell-ws/src/tabs_tests.rs` (harness: `open_record(tab_key, name, updated_at)` :13-26, `replace_client_snapshot("srv-1","dev-a","Label","client-a1",rev,vec![r]) -> PushAck{accepted,..}`, `query(...)` -> remoteOpen)
 - Modify: `crates/freshell-ws/src/tabs_store_model.rs` — make `sanitize_session_ref` (:414-419) `pub(crate)`; add `pub(crate) fn is_placeholder_provider_session_id(provider, id)` mirroring shared rules (reuse `is_canonical_claude_session_id` :399-410; codex `freshcodex-` prefix; opencode `!starts_with("ses_")` && non-empty)
-- Modify: `crates/freshell-ws/src/tabs.rs` — new pure fn `clamp_placeholder_refs(open_records: &mut Vec<...>, current: &CompactState)` called inside `derive_push_next` (:611+) on `prepared.open_records.clone()` BEFORE the insert at :679. (`prepare_push` :492 is pre-lock and has no `current` — clamp CANNOT live there; `derive_push_next` has `current.open_snapshots_by_client`. Hashes stay computed on the RAW payload so retry idempotency is preserved; tombstone loops :653-678 unaffected.)
+- Modify: `crates/freshell-ws/src/tabs.rs` — new pure fn `clamp_placeholder_session_refs(open_records: &mut Vec<...>, current: &CompactState)` called inside `derive_push_next` (:611+) on `prepared.open_records.clone()` BEFORE the insert at :679. (`prepare_push` :492 is pre-lock and has no `current` — clamp CANNOT live there; `derive_push_next` has `current.open_snapshots_by_client`; tombstone loops :653-678 unaffected.)
+- HASH CORRECTNESS (review-verified, do not deviate): `tabs_store.rs:804-816` rebuilds `open_snapshot_payload_hash` from the STORED records on compact-state reopen and rejects a mismatch as corruption (fatal at server startup). Therefore: after clamping, REBUILD the open-snapshot payload hash from the CLAMPED records using the existing `build_snapshot_payload_hash` (make it `pub(crate)` from tabs_store.rs) with the same identity inputs (device_id, device_label, client_instance_id, snapshot_revision) used at prepare time, and store THAT hash with the snapshot. The whole-push `last_push_payload_hash`/`push_hash` remains computed on the RAW push payload — it is the retry-identity key, so a retry after a clamped store still dedupes. NEVER store records whose content differs from what `open_snapshot_payload_hash` describes.
+- Guard-rail (implementation check, pin with a test if a consumer exists): audit every consumer of the open-snapshot hash (PushAck fields, any client-side comparison) — retry/idempotency flows must key on the raw whole-push hash ONLY; nothing may compare the open-snapshot hash against a client-side RAW-payload recomputation.
 
 **Interface:**
 ```rust
@@ -122,30 +135,36 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 1. RED: tests in `tabs_tests.rs`:
    - Cross-client clamp: client-A snapshot has durable sessionRef for pane (tabKey T, paneId P, opencode, crid C); client-B pushes placeholder for same T/P/C → stored record carries durable ref.
    - Negative: different createRequestId → placeholder passes through unchanged.
+   - Negative: SAME tabKey/paneId/createRequestId but DIFFERENT provider (durable opencode on A, placeholder codex push from B) → NOT clamped.
    - Negative: no durable anywhere → placeholder passes through unchanged.
+   - HASH/reopen round-trip: after a clamped push, persist the compact state and re-run the reopen/validation path (`tabs_store.rs` snapshot validation) → PASSes (fails before the clamped-content hash rebuild exists, because the stored records no longer match a raw-payload hash).
+   - Retry idempotency: re-push the identical RAW payload after a clamped store → deduped via raw whole-push hash, no double-apply, snapshot still valid on reopen.
    Run `cargo test -p freshell-ws` → FAIL.
-2. GREEN: implement classifier in `tabs_store_model.rs`, `clamp_placeholder_session_refs` in `tabs.rs`, call site in `derive_push_next` before insert. Run → PASS.
+2. GREEN: implement classifier in `tabs_store_model.rs`, `clamp_placeholder_session_refs` + clamped-content open-snapshot hash rebuild in `tabs.rs` (pub(crate) `build_snapshot_payload_hash` from tabs_store.rs), call site in `derive_push_next` before insert. Run → PASS.
 3. REFACTOR: extraction/hygiene.
 4. Impacted runs: `cargo test -p freshell-ws`; `cargo clippy -p freshell-ws --all-targets -- -D warnings`.
 5. Commit: `fix(registry): clamp placeholder fresh-agent sessionRefs in tabs.sync pushes against current snapshots`.
 
 ## Task 3 — Ledger lineage (bindings carry create requestId; lookup-by-createRequestId on sink)
 
-**Feature:** The pane-identity ledger can resolve a placeholder `freshopencode-<createRequestId>` to its durable `ses_…` session, because (a) binding rows record the CREATE requestId (not the SEND requestId — the current bug), and (b) the `PaneIdentitySink` trait exposes a synchronous lookup by createRequestId usable from the REST resume path.
+**Feature:** The pane-identity ledger can resolve a placeholder `freshopencode-<createRequestId>` to its durable `ses_…` session, because (a) binding rows record the CREATE requestId (not the SEND requestId — the current WS bug / REST `None`), (b) EVERY materialization records identity lineage unconditionally — today the REST site skips the binding ENTIRELY when body model/effort/cwd are all absent (`lib.rs:1936-1944` `has_recordable_settings` gate), while the WS site always writes (even blank settings) — the two sites are inconsistent in opposite directions, and (c) the `PaneIdentitySink` trait exposes a synchronous lookup by createRequestId usable from the REST resume path. Lineage recording must be INDEPENDENT of settings recordability, without reintroducing the false SETTINGS_RESET the REST gate was built to avoid (see semantics change below).
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/lib.rs` — make `OPENCODE_PLACEHOLDER_PREFIX` (:150) `pub(crate)`; REST materialization binding :1950 (`create_request_id: None` → derive from `pane.placeholder_id` via `strip_prefix`; born-durable strip→None); add `record_pending` at REST create_tab after PaneEntry insert, mirroring `opencode_ws.rs:441-456` (LEDGER_WRITE_FAILED broadcast, never blocks create).
-- Modify: `crates/freshell-freshagent/src/opencode_ws.rs:704` — binding bug fix: `create_request_id: request_id.clone()` (SEND's id) → `session.placeholder_id.strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX).map(str::to_string)` (placeholder minted at :421 as `format!("freshopencode-{request_id}")` where request_id is the CREATE id).
-- Modify: `crates/freshell-freshagent/src/identity_sink.rs` — trait `PaneIdentitySink` (:46-54, sync-style methods returning `SinkWrite` :38 where async) ADD `fn lookup_by_create_request_id(&self, provider: &str, create_request_id: &str) -> Option<String>`; `FakeIdentitySink` (:63-71 pub fields + `seed` :76) implements via `bindings` scan; seed helper inserts into both `bindings` and `recorded`. `FreshAgentBindingUpsert` fields :23-33 unchanged.
-- Modify: `crates/freshell-server/src/identity_sink.rs` — `LedgerIdentitySink` delegates to `PaneLedger::lookup_by_create_request_id(provider, crid) -> Option<BindingRow>` (`crates/freshell-ws/src/pane_ledger.rs:730-744`; Bound or GcExpired, newest by updated_at) mapping to `Some(session_id)`.
+- Modify: `crates/freshell-freshagent/src/lib.rs` — make `OPENCODE_PLACEHOLDER_PREFIX` (:150) `pub(crate)`; REST materialization binding :1944-1978 — REMOVE the `has_recordable_settings` write-gate (update the no-laundering comment at :1932-1937 to point at the new `was_recorded` keying): always write the binding with lineage columns, `create_request_id` derived from `pane.placeholder_id` via `strip_prefix` (born-durable strip→None), settings payload included as today (blank tuple allowed — the false-RESET hazard moves to the `was_recorded` keying, below); add `record_pending` at REST create_tab after PaneEntry insert, mirroring `opencode_ws.rs:441-456` (LEDGER_WRITE_FAILED broadcast, never blocks create).
+- Modify: `crates/freshell-freshagent/src/opencode_ws.rs:704` — binding bug fix: `create_request_id: request_id.clone()` (SEND's id) → `session.placeholder_id.strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX).map(str::to_string)` (placeholder minted at :421 as `format!("freshopencode-{request_id}")` where request_id is the CREATE id). WS write stays ungated (it already is, :700-715).
+- Modify: `crates/freshell-freshagent/src/identity_sink.rs` — trait `PaneIdentitySink` (:46-54, sync-style methods returning `SinkWrite` :38 where async):
+  - ADD `fn lookup_by_create_request_id(&self, provider: &str, create_request_id: &str) -> Option<String>`.
+  - SEMANTICS CHANGE, documented on the trait: `was_recorded(provider, session_id)` answers "was a SETTINGS-BEARING record persisted for this session" — a lineage-only row (blank settings) must NOT make `was_recorded` true. This is what keeps the false SETTINGS_RESET disarmed while lineage is unconditional. `load_settings` unchanged (returns None for lineage-only rows).
+  - `FakeIdentitySink` (:63-71 pub fields + `seed` :76): implement lookup via `bindings` scan; `was_recorded` keys off the `settings` map (a binding with blank settings does NOT enter `recorded`); seed helper inserts into `bindings` and conditionally `recorded` only when settings non-blank. `FreshAgentBindingUpsert` fields :23-33 unchanged.
+- Modify: `crates/freshell-server/src/identity_sink.rs` — `LedgerIdentitySink`: delegate lookup to `PaneLedger::lookup_by_create_request_id(provider, crid) -> Option<BindingRow>` (`crates/freshell-ws/src/pane_ledger.rs:730-744`; Bound or GcExpired, newest by updated_at) mapping to `Some(session_id)`; rekey its `was_recorded` delegation to settings-bearing rows (pane_ledger query: a settings column/JSON non-blank predicate — implementation detail settled by RED tests; keep schema-compatible, no migration of historical rows: forward-looking only per Accepted tradeoffs, historical blank rows may flip `was_recorded` false — acceptable and noted).
 - Test: `crates/freshell-freshagent/src/identity_sink.rs` cfg(test) mod (or existing tests) + WS/REST materialization tests in `opencode_ws.rs`/`lib.rs` asserting the binding row's `create_request_id` equals the CREATE requestId (existing tests asserting the buggy value must have expectations updated — with a comment noting the corrected semantics).
 
 **Steps:**
-1. RED: trait method + Fake implementation signature; tests: ledger lookup returns durable ses for a seeded binding keyed by create requestId; WS materialization binding test asserts `create_request_id == create requestId` (fails today: equals send requestId); REST materialization binding test asserts derived-from-placeholder. Run `cargo test -p freshell-freshagent` → FAIL.
-2. GREEN: implement trait method on Fake + LedgerIdentitySink; fix `:704`; fix REST `:1950`; add REST `record_pending`; update expectation-flipped legacy tests with comments. Run → PASS.
+1. RED: trait method + semantics tests: ledger lookup returns durable ses for a seeded binding keyed by create requestId; **lineage-unconditional test**: default REST create (body with NO model/effort/cwd) + materialize → binding row EXISTS with create_request_id == create crid AND was_recorded == false AND a subsequent resume (Task 4 door; here: direct sink calls) does NOT arm SETTINGS_RESET; blank-settings binding → `load_settings` None while lineage lookup hits; WS materialization binding test asserts `create_request_id == create requestId` (fails today: equals send requestId); REST materialization binding test asserts derived-from-placeholder. Run `cargo test -p freshell-freshagent` → FAIL.
+2. GREEN: implement trait method + was_recorded rekeying on Fake + LedgerIdentitySink (+ pane_ledger predicate); fix `:704`; ungate REST `:1944` write with derived create_request_id; add REST `record_pending`; update expectation-flipped legacy tests with comments. Run → PASS.
 3. REFACTOR.
 4. Impacted runs: `cargo test -p freshell-freshagent -p freshell-server -p freshell-ws`; clippy on touched crates.
-5. Commit: `fix(freshagent): key pane-identity bindings by create requestId and expose lookup_by_create_request_id`.
+5. Commit: `fix(freshagent): record pane-identity lineage unconditionally, keyed by create requestId`.
 
 ## Task 4 — Rust REST create_tab resume honoring sessionRef (opencode)
 
@@ -166,7 +185,13 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 7. Site comment documenting divergence from frozen Node parity.
 
 **Steps:**
-1. RED: `pane_ops_tab_tests.rs` tests: happy `ses_` resume; placeholder-resolution (seeded Fake binding) resume; no-binding placeholder → 404; unknown `ses_` → 404; provider mismatch (claude/kimi/etc.) → 400; dual-carrier → 400 with exact frozen LEGACY text; malformed sessionRef → 400; body model beats ledger model in spawned settings. Run `cargo test -p freshell-freshagent` → FAIL (currently 400/ignored).
+1. RED: `pane_ops_tab_tests.rs` tests (the matrix pins EVERY explicit resume behavior of this new code path — existing `opencode_ws.rs` tests cover the WS donor only, never this REST copy):
+   - happy `ses_` resume; placeholder-resolution (seeded Fake binding) resume; no-binding placeholder → 404 (message names the placeholder); unknown `ses_` → 404; provider mismatch (claude/kimi/etc.) → 400; dual-carrier → 400 with exact frozen LEGACY text; malformed sessionRef → 400.
+   - Bounded probe: fake HTTP that never answers + tiny `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` override → 504 (asserts the env knob is honored AND the probe is bounded — never wait the real 10s in a test); probe error other than NotFound/timeout → 502.
+   - Settings precedence ladder: ledger model/effort apply when body omits them; body model beats ledger model; body effort beats ledger effort.
+   - CWD precedence ladder: ledger cwd wins over serve-directory-from-probe; serve-directory wins over body cwd (ledger > serve dir > body).
+   - SETTINGS_RESET edge: settings-bearing record + unrecoverable `load_settings` → SETTINGS_RESET broadcast and resume proceeds (mirror opencode_ws.rs:1506-1541); complement (Task 3 semantics): lineage-only binding → resume proceeds with NO SETTINGS_RESET.
+   Run `cargo test -p freshell-freshagent` → FAIL (currently 400/ignored).
 2. GREEN: implement branch. Run → PASS.
 3. REFACTOR.
 4. Impacted runs: `cargo test -p freshell-freshagent`; clippy.
@@ -174,28 +199,31 @@ fn clamp_placeholder_session_refs(records: &mut [OpenRecord], current: &CompactS
 
 ## Task 5 — MCP new-tab shorthand stops dropping resume (agent path)
 
-**Feature:** `freshell` MCP `new-tab` with `agent` (no `mode`) + `resume`/`resumeSessionId` forwards a synthesized `sessionRef` to the Rust server instead of silently dropping the resume fields. Split-pane unchanged (Rust split already loudly 400s agent splits at `pane_ops.rs:168-175`, so no client-side gate is needed to stay honest).
+**Feature:** `freshell` MCP `new-tab` with `agent: "opencode"` (no `mode`) + `resume`/`resumeSessionId` forwards a synthesized `sessionRef {provider:"opencode", sessionId}` to the server instead of silently dropping the resume fields — making the Task 4 endpoint reachable from the primary agent surface. Scope is DELIBERATELY narrow (review-narrowed): only `opencode` is synthesized, because the Rust REST resume honors only opencode (Task 4), Node's `createFreshAgentPane` ignores `sessionRef`, and kilroy is not an accepted REST agent. Explicit `sessionRef` is already forwarded for any provider and stays untouched. Split-pane unchanged (Rust split already loudly 400s agent splits at `pane_ops.rs:168-175`).
 
 **Files:**
-- Modify: `server/mcp/freshell-tool.ts` (:641-663 new-tab case; `resume`/`resumeSessionId` destructured out of `...rest` :641 area; `legacyResume` :648; `rejectRawCodexResume(mode, …)` :649; synthesis :651-653 mode-keyed; `agent` flows via `...rest`). Update the tool's parameter help text to say resume works with `agent` too.
-- Modify: `AGENTS.md` Fresh-Agent Orchestration line — note resume-via-agent supported.
+- Modify: `server/mcp/freshell-tool.ts` (:641-663 new-tab case; `resume`/`resumeSessionId` destructured out of `...rest` :641 area; `legacyResume` :648; `rejectRawCodexResume(mode, …)` :649; synthesis :651-653 mode-keyed; `agent` flows via `...rest`). Help text: resume sugar is honored for `agent: "opencode"` only — say exactly that, do NOT advertise a general "resume-via-agent".
+- Modify: `AGENTS.md` Fresh-Agent Orchestration line — one sentence: new-tab resume sugar is honored for opencode agents; other providers must pass an explicit `sessionRef`.
 - Test: `test/unit/server/mcp/freshell-tool.test.ts`.
 
 **Interface:**
 ```ts
-function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'opencode' | undefined
-// opencode→opencode, claude|kilroy→claude, codex→codex, else undefined
+// Maps ONLY opencode→'opencode'; returns undefined for everything else (claude/kilroy/codex/
+// unknown). undefined means: no synthesis, fields keep their CURRENT behavior (dropped for
+// agent-only calls) — acceptable because explicit sessionRef forwarding already exists, and the
+// docs updated here say so. For agent: 'codex', feed 'codex' into the existing
+// rejectRawCodexResume so the refusal matches mode=codex exactly.
+function agentResumeProvider(agent: string | undefined): 'codex' | 'opencode' | undefined
 // In new-tab: const resumeProvider = mode ?? agentResumeProvider(rest.agent)
-// feed resumeProvider into the existing rejectRawCodexResume + sessionRef synthesis path.
-// Unknown agent → undefined → fields forward untouched → server 400s loudly (no silent drop).
+// resumeProvider === 'opencode' → synthesize sessionRef; === 'codex' → rejectRawCodexResume fires.
 ```
 
 **Steps:**
-1. RED: tests: `agent: "opencode"` + `resume: "ses_…"` → POST body contains synthesized `sessionRef {provider:"opencode", sessionId}`; explicit `sessionRef` beats synthesized; `agent: "codex"` + raw resume → same rejection error as mode=codex; unknown agent leaves forwarding intact. Run `npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts` → FAIL.
+1. RED: tests: `agent: "opencode"` + `resume: "ses_…"` → POST body contains synthesized `sessionRef {provider:"opencode", sessionId}`; explicit `sessionRef` beats synthesized; `agent: "codex"` + raw resume → same rejection error as mode=codex; `agent: "claude"`/`kilroy` + resume → NO synthesis and NO sessionRef in POST body (behavior unchanged; docs carry the truth). Run `npm run test:vitest -- run test/unit/server/mcp/freshell-tool.test.ts` → FAIL.
 2. GREEN: implement. Run → PASS.
-3. REFACTOR; update help text + AGENTS.md.
+3. REFACTOR; update help text + AGENTS.md (opencode-only wording).
 4. Impacted runs: the same spec + `npm run lint` for a11y-adjacent cleanliness (no UI change; cheap).
-5. Commit: `fix(mcp): forward resume as sessionRef on agent new-tab shorthand`.
+5. Commit: `fix(mcp): forward resume as sessionRef on opencode agent new-tab shorthand`.
 
 ## Task 6 — E2E coverage + final gate
 
@@ -208,6 +236,10 @@ function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'o
 - Filtered cloud runs: run at shards=1 (or otherwise avoid the silent full-suite glob-fallback trap in the cloud entrypoint at shards≥2 when a filter matches nothing) and verify run attribution: entrypoint echo lists the intended spec files and the line reporter shows their real test titles.
 
 **Steps:**
+0. Journeys in `fresh-agent-rest-resume-rust.spec.ts` (BOTH required — request-level coverage):
+   - (a) Durable-id resume: REST create opencode pane → send turn → materialize → read durable `ses_…` from the audit log (`prompt_async`) → `restartAbrupt` → `POST /api/tabs` with sessionRef `{provider:"opencode", sessionId: <ses_…>}` → 200 with durable sessionId + transcript.
+   - (b) PLACEHOLDER-resolution resume through a NATURALLY-written binding (no seeded fixtures — this is kata 2's headline behavior and depends on Task 3's unconditional lineage): REST create with DEFAULT body (no model/effort/cwd) → capture the pane's placeholder sessionRef (`freshopencode-<createRequestId>`) from the pre-materialization pane state (the create response/broadcast pane payload; harness `WsCapture`) → send turn → materialize (natural lineage binding written despite blank settings) → obtain durable ses id from the audit log → `restartAbrupt` → `POST /api/tabs` with sessionRef set to the captured PLACEHOLDER → 200, response sessionId == the materialized durable id, transcript restored.
+   - (c) Registry clamp journey in `sidebar-registry-sync-rust.spec.ts` (or the new spec — pick the harness that already boots two WS clients): client-B pushes a placeholder payload for a tab/pane client-A holds durable → registry winner keeps durable sessionRef.
 1. RED: new spec fails (resume endpoint currently 400s / guard absent).
 2. GREEN: passes against worktree-built Rust server on a scratch port (NOT 3001).
 3. Full gate: `npm run test:status` → coordinate → `npm run check` (typecheck + coordinated full suite); `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; affected e2e specs on the configured cloud backend: `npm run test:e2e:cloud -- --project=rust-chromium <exact paths to the touched specs>` = the new `fresh-agent-rest-resume-rust.spec.ts` and the extended `sidebar-registry-sync-rust.spec.ts`, at shards=1 with the attribution checks above. Do NOT include `fresh-agent-control-rust.spec.ts` (pre-existing cloud failure, see Accepted tradeoffs).
@@ -215,9 +247,10 @@ function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'o
 
 ## Self-review (writing-plans checklist)
 
-- [x] Verbatim User Request block re-authored by the dispatcher (original was never persisted to disk; content reconstructed from the dispatch context and recorded here verbatim as authored).
+- [x] Verbatim User Request block re-authored by the dispatcher (original was never persisted to disk; content reconstructed from the dispatch context and recorded here verbatim as authored). PRESERVED UNCHANGED through all remediation.
 - [x] Goal / Architecture / Tech Stack present.
 - [x] Global Constraints section present (worktree isolation, no-PR rule, live-server rule, TDD, coordinated testing, clippy, ESM, frozen text, flake ledger).
-- [x] 6 tasks, each with Files (exact paths + line anchors verified against source this session), Interfaces (signatures), Steps (RED run-fails → GREEN run-passes → REFACTOR → impacted runs → commit message).
+- [x] 6 tasks, each with Files (exact paths + line anchors verified against source), Interfaces (signatures), Steps (RED run-fails → GREEN run-passes → REFACTOR → impacted runs → commit message).
 - [x] No task mutates `main`, port 3001, or frozen text; deliberate-reset exemption and forward-looking tradeoffs encoded in tasks 1/2 acceptance.
-- [x] Anchor risks flagged where code may drift (all anchors re-verified 2026-08-23 immediately before writing).
+- [x] Anchor risks flagged where code may drift (anchors verified 2026-08-23; remediation evidence re-verified 2026-08-24).
+- [x] Plan-review round 1 remediations re-reviewed (2026-08-24): Task 1 interface is object-shaped per paneTypes.ts:191-200 + session-contract.ts:3-8 (verified); Task 2 clamped-content hash rebuild satisfies tabs_store.rs:804-816 reopen validation (verified) with raw whole-push retry identity preserved; Task 3 unconditional lineage + settings-bearing `was_recorded` keying resolves the REST gate hole (lib.rs:1936-1944 verified) without re-arming false SETTINGS_RESET; Task 4 RED matrix pins every explicit resume behavior; Task 5 narrowed to opencode-only (no misleading advertising; explicit sessionRef path documented); Task 6 journey (b) covers natural placeholder→ledger→durable resolution e2e.
