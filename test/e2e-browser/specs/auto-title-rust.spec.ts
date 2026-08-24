@@ -36,7 +36,7 @@ import type { TestServerInfo } from '../helpers/test-server.js'
  * `main.rs:252-255` filters empty values back to "no key").
  */
 
-const GEMINI_GENERATE_PATH = '/v1beta/models/gemini-2.5-flash-lite:generateContent'
+const GEMINI_GENERATE_PATH = '/v1beta/models/gemini-3.5-flash-lite:generateContent'
 const FAKE_GEMINI_KEY = 'e2e-task21-fake-gemini-key'
 
 interface FakeGeminiRequest {
@@ -54,7 +54,7 @@ interface FakeGemini {
 
 /**
  * A local fake Gemini: answers
- * `POST /v1beta/models/gemini-2.5-flash-lite:generateContent` with a fixed
+ * `POST /v1beta/models/gemini-3.5-flash-lite:generateContent` with a fixed
  * candidates payload and records every request's `x-goog-api-key` header so
  * tests can assert the seeded settings key actually arrived on the wire.
  */

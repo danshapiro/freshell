@@ -3,7 +3,7 @@
 //! no HTTP-mock crates; see crates/freshell-opencode for precedent).
 use std::sync::{Arc, RwLock};
 
-pub const GEMINI_MODEL: &str = "gemini-2.5-flash-lite";
+pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 pub const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const SESSION_TITLE_MAX_OUTPUT_TOKENS: u32 = 30;
 pub const TERMINAL_SUMMARY_MAX_OUTPUT_TOKENS: u32 = 120;
@@ -284,7 +284,7 @@ mod tests {
     async fn gemini_http_posts_expected_body_and_parses_candidates_excluding_thoughts() {
         use axum::{routing::post, Json, Router};
         let app = Router::new().route(
-            "/v1beta/models/gemini-2.5-flash-lite:generateContent",
+            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
             post(
                 |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| async move {
                     assert_eq!(headers.get("x-goog-api-key").unwrap(), "tok-123");
