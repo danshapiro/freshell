@@ -22,6 +22,7 @@ Fix the root cause of a Freshell regression where a client state push (tabs.sync
 - No backfill or repair of already-persisted placeholder sessionRefs (forward-looking only; the two incident panes were repaired out-of-band as terminal-mode opencode panes, not fresh-agent transcript panes).
 - D8 leases / TerminalLivenessProbe on `FreshAgentState` are explicitly OUT of scope (documented as divergence).
 - Base-gate pause rule bypassed by explicit user directive: three pre-existing flakes at base `0910d8b05801636fe7480cfb0b8a8513cc0c7cdc` (receipts `reports/base-gate-run1.log`, `reports/base-gate-run2.log`): (1) `test/integration/real/coding-cli-session-contract.test.ts` env-probe >5s, (2) `test/integration/server/test-coordinator.test.ts` gate-queue timeout, (3) `test/unit/server/coding-cli/amplifier-session-locator.test.ts` jitter-tolerance timeout. Not ours to fix.
+- Pre-existing cloud e2e failures at origin/main (verified 2026-08-24 by load-bearing validator on clean tag `6333a1e80468`, docs-only diff vs base): `test/e2e-browser/specs/fresh-agent-control-rust.spec.ts:1724` opencode compact — deterministic cloud failure (3/3 attempts, identical model-identity assertion diff; fixture served the requests), and `:866` claude questions — cloud-resource-sensitive flake (passed on retry #1). Not ours to fix; Task 6's gate deliberately excludes that spec file.
 
 ## Goal
 
@@ -201,7 +202,7 @@ function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'o
 **Feature:** End-to-end proof on the Rust server: (a) REST create→send-turn→durable-id→restart→REST resume with sessionRef restores transcript; (b) registry winner keeps a durable sessionRef against a placeholder push.
 
 **Files:**
-- New: `test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts` — modeled on `test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts:380-428` (rust server boot harness, audit log `readJsonl` for the `prompt_async` ses id, `server.restartAbrupt`, `enableFreshAgent`, `WsCapture`) and `fresh-agent-control-rust.spec.ts` (`sendOpencodeTurn` :1674).
+- New: `test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts` — modeled on `test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts:380-428` (rust server boot harness, audit log `readJsonl` for the `prompt_async` ses id, `server.restartAbrupt`, `enableFreshAgent`, `WsCapture`) — PROVEN 4/4 green on the cloud backend by the load-bearing validator (sqlite/fake-opencode harness works on the cloud image) — with only the `sendOpencodeTurn` helper pattern borrowed from `fresh-agent-control-rust.spec.ts:1674` (that spec FILE is excluded from the gate: pre-existing deterministic failure at its :1724 compact test + flake at :866, both pre-existing at origin/main — see Accepted tradeoffs).
 - Extend or model on: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — two WS clients / tabs.sync push: client-B pushes placeholder for a pane client-A has durable; assert registry winner keeps durable ref.
 - REGISTER the new spec so it cannot silently match zero tests: add it to BOTH explicit lists in `test/e2e-browser/playwright.config.ts` — `RUST_ONLY_SPECS` (~:245/:283) and `rust-chromium.testMatch` (~:472/:530). The lists are explicit regex literals; no glob exists. Verified by negative control: an unregistered filename matches 0 tests ("Error: No tests found."). Donor specs were verified absent from `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`) at base; assert the same for the new spec.
 - Filtered cloud runs: run at shards=1 (or otherwise avoid the silent full-suite glob-fallback trap in the cloud entrypoint at shards≥2 when a filter matches nothing) and verify run attribution: entrypoint echo lists the intended spec files and the line reporter shows their real test titles.
@@ -209,7 +210,7 @@ function agentResumeProvider(agent: string | undefined): 'claude' | 'codex' | 'o
 **Steps:**
 1. RED: new spec fails (resume endpoint currently 400s / guard absent).
 2. GREEN: passes against worktree-built Rust server on a scratch port (NOT 3001).
-3. Full gate: `npm run test:status` → coordinate → `npm run check` (typecheck + coordinated full suite); `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; affected e2e specs on the configured cloud backend (`npm run test:e2e:cloud` filtered to the touched specs).
+3. Full gate: `npm run test:status` → coordinate → `npm run check` (typecheck + coordinated full suite); `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; affected e2e specs on the configured cloud backend: `npm run test:e2e:cloud -- --project=rust-chromium <exact paths to the touched specs>` = the new `fresh-agent-rest-resume-rust.spec.ts` and the extended `sidebar-registry-sync-rust.spec.ts`, at shards=1 with the attribution checks above. Do NOT include `fresh-agent-control-rust.spec.ts` (pre-existing cloud failure, see Accepted tradeoffs).
 4. Update run-state execution counts; commit: `test(e2e): cover Rust REST fresh-agent resume and registry placeholder clamp`.
 
 ## Self-review (writing-plans checklist)
