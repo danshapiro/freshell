@@ -20,17 +20,36 @@ pub const SESSION_TITLE_DEFAULT_PROMPT: &str = concat!(
     "Return ONLY the title text. No quotes, no markdown, no explanation.",
 );
 
+/// Over `PROMPT_MESSAGE_CHAR_CAP` chars, keep the first and last 1000 chars of
+/// the message with an explicit elision marker instead of prefix-truncating.
+/// NOTE: char-counted, not byte/UTF-16 — the same deliberate divergence as the
+/// heuristic truncation in `extract_title_from_message` (sessions.rs),
+/// consistent across surfaces.
+const PROMPT_MESSAGE_WINDOW_EDGE_CHARS: usize = 1000;
+const TRIMMED_MARKER: &str = "\n...[trimmed]...\n";
+
+fn window_prompt_body(first_message: &str) -> String {
+    let total = first_message.chars().count();
+    if total <= PROMPT_MESSAGE_CHAR_CAP {
+        return first_message.to_string();
+    }
+    let head: String = first_message
+        .chars()
+        .take(PROMPT_MESSAGE_WINDOW_EDGE_CHARS)
+        .collect();
+    let tail: String = first_message
+        .chars()
+        .skip(total - PROMPT_MESSAGE_WINDOW_EDGE_CHARS)
+        .collect();
+    format!("{head}{TRIMMED_MARKER}{tail}")
+}
+
 pub fn build_session_title_prompt(first_message: &str, custom_prompt: Option<&str>) -> String {
     let head = custom_prompt
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(SESSION_TITLE_DEFAULT_PROMPT);
-    // NOTE: JS slices UTF-16 units; we count chars — same deliberate divergence
-    // as the existing heuristic port (sessions.rs:291), consistent across surfaces.
-    let body: String = first_message
-        .chars()
-        .take(PROMPT_MESSAGE_CHAR_CAP)
-        .collect();
+    let body = window_prompt_body(first_message);
     format!("{head}\n\nFirst message from the user:\n{body}")
 }
 
@@ -233,16 +252,43 @@ mod tests {
         assert_eq!(cell.get().as_deref(), Some("newkey"));
     }
     #[test]
-    fn session_title_prompt_uses_default_then_custom_and_caps_message_at_2000() {
-        let long = "m".repeat(3000);
-        let p = build_session_title_prompt(&long, None);
+    fn session_title_prompt_windows_long_messages_and_keeps_custom_legs() {
+        // ≤ 2000 chars: passthrough, no marker.
+        let exact = "x".repeat(PROMPT_MESSAGE_CHAR_CAP);
+        let p = build_session_title_prompt(&exact, None);
         assert!(p.starts_with("Generate a title for a tab"));
         assert!(p.contains("\n\nFirst message from the user:\n"));
+        assert!(!p.contains("...[trimmed]..."));
         let body = p.rsplit('\n').next().unwrap();
-        assert_eq!(body.chars().count(), 2000);
+        assert_eq!(body.chars().count(), PROMPT_MESSAGE_CHAR_CAP);
+
+        // 2500 chars of distinct runs: first 1000 + marker + last 1000.
+        let long = format!(
+            "{}{}{}",
+            "a".repeat(1000),
+            "b".repeat(500),
+            "c".repeat(1000)
+        );
+        let p2 = build_session_title_prompt(&long, None);
+        let expected = format!(
+            "{}\n...[trimmed]...\n{}",
+            "a".repeat(1000),
+            "c".repeat(1000)
+        );
+        assert!(p2.ends_with(&expected));
+        assert!(!p2.contains(&"b".repeat(10)));
+        assert_eq!(expected.chars().count(), 2017); // 1000 + 17 + 1000
+
+        // Char-accurate (not byte-accurate) windowing with multibyte input.
+        let mb = format!("{}{}{}", "a".repeat(1500), "é".repeat(400), "z".repeat(600));
+        let p3 = build_session_title_prompt(&mb, None);
+        let tail_expected = format!("{}{}", "é".repeat(400), "z".repeat(600));
+        assert!(p3.ends_with(&tail_expected));
+        assert!(p3.contains(&format!("{}\n...[trimmed]...\n", "a".repeat(1000))));
+
+        // Custom-prompt legs unchanged (build: customPrompt?.trim() || default).
         let c = build_session_title_prompt("hi", Some("  Custom prompt  "));
         assert!(c.starts_with("Custom prompt"));
-        // blank custom falls back to default (ai-prompts.ts build: customPrompt?.trim() || default)
         let d = build_session_title_prompt("hi", Some("   "));
         assert!(d.starts_with("Generate a title for a tab"));
     }
