@@ -140,7 +140,7 @@ Do NOT commit. The failing e2e is staged with Task 2's commit once green.
 
 **Interfaces:**
 - Consumes: `FreshAgentTurn`, `FreshAgentTranscriptItem` from `@shared/fresh-agent-contract`; existing `buildActivity`, `isActivityLike`, `FreshAgentActivityStrip`, `FreshAgentTurnArticle`.
-- Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number> }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn), `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
+- Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number>; tail: { blockId: string; turnIndex: number } | null }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn; `tail` names the last rendered block when it is an activity line), `rendersVisibly(...)`, `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
 
 - [ ] **Step 1: Write the failing behavioral tests (new unit cases)**
 
@@ -306,6 +306,56 @@ describe('activity line collapse', () => {
     expect(merged).toBe(first)
     expect(merged).toHaveTextContent('5 tools used')
   })
+
+  it('keeps two same-turn lines distinct when a message splits them (tool → text → tool)', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[{
+          id: 'turn-mixed', role: 'assistant', summary: '',
+          items: [
+            { id: 'tool-a', kind: 'tool_use', toolUseId: 'ca', name: 'Read', input: { file_path: 'src/a.ts' } },
+            { id: 'item-note', kind: 'text', text: 'first pass done' },
+            { id: 'tool-b', kind: 'tool_use', toolUseId: 'cb', name: 'Read', input: { file_path: 'src/b.ts' } },
+          ],
+        }]}
+      />,
+    )
+    const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+    expect(strips).toHaveLength(2)
+    expect(strips[0]).toHaveTextContent('1 tool used')
+    expect(strips[1]).toHaveTextContent('1 tool used')
+  })
+
+  it('an invisible (whitespace-only) text item does not split the line', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[
+          toolTurn('turn-a', [['c1','src/a.ts']]),
+          { id: 'turn-empty-text', role: 'assistant', summary: '',
+            items: [{ id: 'item-empty', kind: 'text', text: '   ' }] },
+          toolTurn('turn-b', [['c2','src/b.ts']]),
+        ]}
+      />,
+    )
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+  })
+
+  it('hands liveness to the merged line across an absorbed previous turn while the last turn streams empty', () => {
+    render(
+      <FreshAgentTranscript
+        isStreaming
+        turns={[
+          toolTurn('turn-a', [['c1','src/a.ts']]),
+          toolTurn('turn-b', [['c2','src/b.ts']]),
+          { id: 'turn-streaming', role: 'assistant', summary: '', items: [] },
+        ]}
+      />,
+    )
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    expect(screen.getAllByLabelText('running')).toHaveLength(1)
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('Read')
+    expect(screen.queryByText('2 tools used')).not.toBeInTheDocument()
+  })
 })
 ```
 
@@ -326,12 +376,25 @@ In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
 ```ts
 type TurnLayout = { blocks: RenderBlock[] }
 
+/** Mirrors FreshAgentItemCard's null-render path for text items: a text item
+ * that renders nothing must not close an open line (nothing visibly between). */
+function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
+  if (item.kind === 'text') return stripSystemReminders(item.text).trim().length > 0
+  return true
+}
+
 /**
  * One OPEN activity line per transcript state: a next turn's leading
  * activity items append to the open line when the turn has the same role and
  * no message item has rendered between (a role change paints a header, so it
  * counts as "something between"). Lines are re-built from the concatenated
  * item list so buildActivity's tool_use/tool_result stitching stays intact.
+ *
+ * Line ids use a global per-layout sequence (`line:${n}`), NOT the origin turn
+ * index: one turn can own two lines (`tool → text → tool`), and identical keys
+ * would make React reuse state/DOM across what must stay two separate strips.
+ * The key is stable while a line extends (no new line opens mid-extension), so
+ * the strip keeps its DOM node — the "started in the right place" behavior.
  *
  * Zero-item turns (Rust codex `subAgentActivity` rows, opencode structural
  * messages) render real articles today, so they hard-close any open line —
@@ -340,24 +403,22 @@ type TurnLayout = { blocks: RenderBlock[] }
  * provider message id; stitching keys toolUseId, which is verified unique, so
  * stitching is unaffected — only React keys need this).
  */
-function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number> } {
+function buildTranscriptLayout(turns: FreshAgentTurn[]): {
+  layouts: TurnLayout[]
+  lineEndIndex: Map<number, number>
+  tail: { blockId: string; turnIndex: number } | null
+} {
   const layouts: TurnLayout[] = []
   let open: { originIndex: number; role: FreshAgentTurn['role']; items: FreshAgentTranscriptItem[] } | null = null
   const lineEndIndex = new Map<number, number>()
+  let lineSeq = 0
 
   const flushOpen = () => {
     if (!open) return
     const rows = buildActivity(open.items)
     if (rows.length > 0) {
-      layouts[open.originIndex].blocks.push({
-        kind: 'activity',
-        // Stable per origin turn: the line keeps its React identity (and DOM
-        // node, scroll state, expanded state) while later turns' items append
-        // into it — this is the "started in the right place, extended in
-        // place" behavior, not an after-the-fact regrouping remount.
-        id: `line:${open.originIndex}`,
-        rows,
-      })
+      const id = `line:${lineSeq++}`
+      layouts[open.originIndex].blocks.push({ kind: 'activity', id, rows })
     }
     open = null
   }
@@ -387,16 +448,28 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]
         }
         continue
       }
+      if (!rendersVisibly(item)) continue
       flushOpen()
       layout.blocks.push({ kind: 'item', item })
     }
   }
   flushOpen()
-  return { layouts, lineEndIndex }
+
+  // tail = last rendered block overall when it is an activity line; null when
+  // the transcript visibly ends in a message.
+  let tail: { blockId: string; turnIndex: number } | null = null
+  for (let i = layouts.length - 1; i >= 0; i--) {
+    const blocks = layouts[i].blocks
+    if (blocks.length === 0) continue
+    const last = blocks[blocks.length - 1]
+    if (last.kind === 'activity') tail = { blockId: last.id, turnIndex: i }
+    break
+  }
+  return { layouts, lineEndIndex, tail }
 }
 ```
 
-Note: after a message flushes the open line, `open` is null, so later activity in the SAME turn opens a fresh line whose remaining activity items absorb normally — `text → tool_use → tool_result` stays ONE line, exactly matching today's in-turn `buildBlocks` batching.
+Note: after a message flushes the open line, `open` is null, so later activity in the SAME turn opens a fresh line whose remaining activity items absorb normally — `text → tool_use → tool_result` stays ONE line, exactly matching today's in-turn `buildBlocks` batching — while `tool → text → tool` yields two lines with distinct `line:N` identities.
 
 (b) Replace `selectLiveActivityBlockId` (:307–339) with a layout-driven version:
 
@@ -405,6 +478,7 @@ function selectLiveActivityBlockIdFromLayout(
   layouts: TurnLayout[],
   turns: FreshAgentTurn[],
   isStreaming: boolean,
+  tail: { blockId: string; turnIndex: number } | null,
 ): string | null {
   let latestActivityBlockId: string | null = null
   layouts.forEach((layout) => {
@@ -413,35 +487,39 @@ function selectLiveActivityBlockIdFromLayout(
     }
   })
 
+  const lastIndex = turns.length - 1
+  const lastTurn = turns[lastIndex]
+
   if (!isStreaming) {
     // Settled sessions mark only a trailing thinking strip as live. Mirror the
     // old last-turn rule; when the last turn was absorbed, its items live at
     // the tail of the latest line, so check that line instead.
-    const lastIndex = turns.length - 1
-    const lastBlocks = lastIndex >= 0 ? layouts[lastIndex].blocks : []
-    const candidate = lastBlocks.length > 0
-      ? lastBlocks[lastBlocks.length - 1]
-      : (turns[lastIndex]?.items.length ?? 0) > 0 && latestActivityBlockId
-        ? [...layouts.flatMap((l) => l.blocks)].at(-1)
+    const blocks = lastIndex >= 0 ? layouts[lastIndex].blocks : []
+    const lastBlock = blocks.length > 0 ? blocks[blocks.length - 1] : null
+    const candidateId = lastBlock?.kind === 'activity'
+      ? lastBlock.id
+      : (lastTurn?.items.length ?? 0) > 0 && tail && tail.turnIndex < lastIndex
+        ? tail.blockId
         : null
+    if (!candidateId) return null
+    const candidate = [...layouts.flatMap((l) => l.blocks)].find((b) => b.kind === 'activity' && b.id === candidateId)
     return candidate?.kind === 'activity' && candidate.rows.at(-1)?.type === 'thinking'
       ? candidate.id
       : null
   }
 
-  const lastTurn = turns[turns.length - 1]
   if (lastTurn && lastTurn.items.length > 0) return latestActivityBlockId
+  if (!lastTurn || !tail) return null
 
-  // Last display turn streams with zero visible items: hand liveness to an
-  // adjacent open line (same role, trailing activity) instead of injecting a
-  // second empty strip line below it.
-  const previousIndex = turns.length - 2
-  if (previousIndex >= 0 && lastTurn) {
-    const previousBlocks = layouts[previousIndex]?.blocks ?? []
-    const previousLast = previousBlocks[previousBlocks.length - 1]
-    if (previousLast?.kind === 'activity' && turns[previousIndex].role === lastTurn.role) {
-      return previousLast.id
-    }
+  // Last display turn streams with zero visible items: hand liveness to the
+  // trailing line when nothing rendered between them (intermediate turns were
+  // absorbed into that line; a zero-item or message intermediate is a real
+  // boundary) and roles match the whole way across.
+  const absorbedOnly = turns.slice(tail.turnIndex + 1, lastIndex)
+    .every((turn, offset) =>
+      turn.items.length > 0 && layouts[tail.turnIndex + 1 + offset].blocks.length === 0)
+  if (absorbedOnly && turns[tail.turnIndex].role === lastTurn.role) {
+    return tail.blockId
   }
   return null
 }
@@ -453,10 +531,10 @@ function selectLiveActivityBlockIdFromLayout(
 const displayTurns = useMemo(() => (
   filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming)
 ), [displayOptions, turns, isStreaming])
-const { layouts: turnLayouts, lineEndIndex } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
+const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
 const liveActivityBlockId = useMemo(
-  () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming),
-  [turnLayouts, displayTurns, isStreaming],
+  () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming, tail),
+  [turnLayouts, displayTurns, isStreaming, tail],
 )
 ```
 
@@ -564,9 +642,9 @@ Expected: PASS (eslint-plugin-jsx-a11y clean — no new interactive DOM added).
 
 - [ ] **Step 3: Confirm no other render callers construct turn blocks differently**
 
-Run: `grep -rn "buildBlocks\|coalesceSyntheticToolResultTurns" src/ test/unit | grep -v FreshAgentTranscript.tsx`
+Run: `grep -rn "buildBlocks\|coalesceSyntheticToolResultTurns" src/ test/unit | grep -v FreshAgentTranscript.tsx || true`
 
-Expected: only the transcript test references; `FreshAgentView.tsx`/`FreshAgentMobile` consume `FreshAgentTranscript` as a component (no direct block construction).
+Expected: EMPTY output — the transcript test and component are the only references; `FreshAgentView.tsx`/`FreshAgentMobile` consume `FreshAgentTranscript` as a component (no direct block construction). (`|| true` required: empty matches exit 1.)
 
 - [ ] **Step 4: Record outcomes and commit (only if receipts/notes were written as part of the run log)**
 
@@ -587,5 +665,6 @@ git commit -m "docs: mark freshagent-activity-line tasks complete with verificat
 
 - **Zero-item turns are real** (Rust codex `subAgentActivity` rows emit `{role:"assistant", summary:"", items:[]}`; opencode structural messages likewise) and they render real article chrome today. The layout pass hard-closes any open line on a zero-item turn — two halves of a codex tool run split by a `subAgentActivity` marker therefore stay two strips. Residual, accepted: fixing THAT split needs a provider-level turn-shape decision, out of scope for this render-rule change.
 - **TS-claude item-id reuse across turns** (one provider message id spanning multiple JSONL lines yields duplicate `turn:<msg>:item:N` ids) is handled by display-only id dedupe in the absorb path; `toolUseId` stitching is verified unique (615MB × 813 real transcripts, zero repeats) and unaffected. Validator evidence (external run logs, by workflow design outside the tracked tree): `/home/dan/code/freshell/.worktrees/.the-usual-logs/freshagent-activity-line/reports/load-bearing-validator-c2.md` and `.../load-bearing-validator-n1.md`.
-- **Stable line identity:** each open line's React key is `line:<originTurnIndex>`, stable while later turns' items append — the strip keeps its DOM node (verified by an incremental rerender test asserting node identity), scroll position, and expanded state across extension; this is what distinguishes an extending open line from an after-the-fact regrouping remount.
+- **Stable line identity:** each open line's React key is a per-layout sequence `line:<n>` unique across all lines (one turn can own two), stable while the line extends — the strip keeps its DOM node (verified by an incremental rerender test asserting node identity), scroll position, and expanded state across extension; this is what distinguishes an extending open line from an after-the-fact regrouping remount.
+- **Invisible items are not boundaries:** text items that render nothing (whitespace/system-reminder-only after `stripSystemReminders`; `FreshAgentItemCard` returns null for them) neither close the open line nor emit item blocks, so the visual rule "if anything renders between them" is evaluated on what actually renders.
 - **Non-streaming liveness:** mirrors the old last-turn trailing-thinking rule, extended to cover a last turn that was absorbed (its items close the latest line, so the check reads that line's trailing row).
