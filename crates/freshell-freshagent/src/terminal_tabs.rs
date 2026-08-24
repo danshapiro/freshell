@@ -42,7 +42,8 @@ use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostO
 use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
-    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent,
+    resolve_unix_shell_cwd, resolve_windows_shell_cwd, CliLaunchInputs, LaunchIntent,
+    ProviderTarget,
 };
 use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
@@ -1225,6 +1226,10 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 
         let target = cli_provider_target(shell_type, host_os, is_wsl, cwd.as_deref(), &RealEnv);
         mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
+        let child_cwd = match target {
+            ProviderTarget::Unix => resolve_unix_shell_cwd(cwd.as_deref(), &RealEnv, is_wsl),
+            ProviderTarget::Windows => resolve_windows_shell_cwd(cwd.as_deref(), &RealEnv, is_wsl),
+        };
 
         let mcp_injection = match generate_mcp_injection(
             &RealMcpRuntime,
@@ -1323,6 +1328,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         let inputs = CliLaunchInputs {
             mode: &mode,
             target,
+            child_cwd: child_cwd.as_deref(),
             resume_session_id: resume_session_id.as_deref(),
             // Always `Resume`: this path never mints its OWN preallocated
             // session id the way the WS path's fresh-claude special case

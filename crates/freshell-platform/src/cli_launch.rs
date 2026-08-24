@@ -7,9 +7,9 @@
 //! [`CliLaunchInputs`]. The §4 golden argv tests live in
 //! `cli_launch_goldens.rs` (`#[cfg(test)]` submodule).
 
-use std::collections::BTreeMap;
-
 use crate::Env;
+use std::collections::BTreeMap;
+use unicode_normalization::UnicodeNormalization;
 
 // ===========================================================================
 // Coding-CLI launch (mode != 'shell') — the deterministic base-command slice of
@@ -106,6 +106,10 @@ pub struct McpInjection {
 pub struct CliLaunchInputs<'a> {
     pub mode: &'a str,
     pub target: ProviderTarget,
+    /// The already-resolved cwd of the actual provider child, in the target
+    /// runtime's path syntax. Claude needs it to make an empty/relative store
+    /// root absolute without accidentally consulting the server process cwd.
+    pub child_cwd: Option<&'a str>,
     /// `normalizeResumeForSpawn` output (identity for non-empty, `tr:382-385`).
     pub resume_session_id: Option<&'a str>,
     pub launch_intent: LaunchIntent,
@@ -141,6 +145,9 @@ pub enum CliLaunchError {
     CodexNonLoopbackWsUrl,
     /// Missing/invalid opencode loopback endpoint (`tr:324-332`).
     OpencodeEndpoint,
+    /// A selected Claude store root cannot be resolved against the exact child
+    /// cwd, so reader and child resolution cannot be made identical.
+    ClaudeInvalidConfigRoot,
     /// `launchIntent === 'start'` without `createSessionArgs` (`tr:310-313`).
     StartIntentUnsupported { label: String },
 }
@@ -157,6 +164,9 @@ impl CliLaunchError {
             }
             CliLaunchError::OpencodeEndpoint => {
                 "OpenCode launch requires an allocated localhost control endpoint.".to_string()
+            }
+            CliLaunchError::ClaudeInvalidConfigRoot => {
+                "Claude launch could not resolve its store root against the child cwd.".to_string()
             }
             CliLaunchError::StartIntentUnsupported { label } => {
                 format!("Fresh {label} launch requires createSessionArgs support.")
@@ -274,6 +284,101 @@ fn merged_env_value(
         return Some(v.clone());
     }
     parent.get(key)
+}
+
+fn normalize_posix_absolute(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+fn resolve_claude_root_for_target(
+    selected: &str,
+    child_cwd: Option<&str>,
+    target: ProviderTarget,
+) -> Result<String, CliLaunchError> {
+    let selected = selected.nfc().collect::<String>();
+    let child_cwd = child_cwd.map(|cwd| cwd.nfc().collect::<String>());
+    match target {
+        ProviderTarget::Unix => {
+            if let Some(absolute) = normalize_posix_absolute(&selected) {
+                return Ok(absolute);
+            }
+            let cwd = child_cwd
+                .as_deref()
+                .and_then(normalize_posix_absolute)
+                .ok_or(CliLaunchError::ClaudeInvalidConfigRoot)?;
+            normalize_posix_absolute(&format!("{}/{selected}", cwd.trim_end_matches('/')))
+                .ok_or(CliLaunchError::ClaudeInvalidConfigRoot)
+        }
+        ProviderTarget::Windows => {
+            if let Some(absolute) = crate::path::win32_resolve(&selected) {
+                return Ok(absolute);
+            }
+            let cwd = child_cwd
+                .as_deref()
+                .and_then(crate::path::win32_resolve)
+                .ok_or(CliLaunchError::ClaudeInvalidConfigRoot)?;
+            if selected.starts_with('\\')
+                || selected.starts_with('/')
+                || selected.get(1..2) == Some(":")
+            {
+                return Err(CliLaunchError::ClaudeInvalidConfigRoot);
+            }
+            crate::path::win32_resolve(&format!("{}\\{selected}", cwd.trim_end_matches('\\')))
+                .ok_or(CliLaunchError::ClaudeInvalidConfigRoot)
+        }
+    }
+}
+
+fn resolve_claude_store_root(
+    parent: &dyn Env,
+    command_env: &BTreeMap<String, String>,
+    target: ProviderTarget,
+    child_cwd: Option<&str>,
+) -> Result<Option<String>, CliLaunchError> {
+    if let Some(config) = merged_env_value(parent, command_env, "CLAUDE_CONFIG_DIR") {
+        return resolve_claude_root_for_target(&config, child_cwd, target).map(Some);
+    }
+    if let Some(compat) = merged_env_value(parent, command_env, "CLAUDE_HOME") {
+        return resolve_claude_root_for_target(&compat, child_cwd, target).map(Some);
+    }
+    match merged_env_value(parent, command_env, "HOME") {
+        Some(home) => {
+            let selected = if home.is_empty() {
+                ".claude".to_string()
+            } else {
+                let (separator, trimmed) = match target {
+                    ProviderTarget::Unix => ('/', home.trim_end_matches('/')),
+                    ProviderTarget::Windows => ('\\', home.trim_end_matches(['/', '\\'])),
+                };
+                if trimmed.is_empty() {
+                    format!("{separator}.claude")
+                } else if target == ProviderTarget::Windows
+                    && trimmed.len() == 2
+                    && trimmed.as_bytes()[1] == b':'
+                    && !home.as_bytes().get(2).is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+                {
+                    format!("{trimmed}.claude")
+                } else {
+                    format!("{trimmed}{separator}.claude")
+                }
+            };
+            resolve_claude_root_for_target(&selected, child_cwd, target).map(Some)
+        }
+        None => Ok(None),
+    }
 }
 
 /// `resolveGoogleApiKey` (`server/opencode-launch.ts:7-9`):
@@ -430,6 +535,18 @@ pub fn resolve_coding_cli_command(
     let mut command_env: BTreeMap<String, String> = spec.base_env.clone();
     for (k, v) in &injection.env {
         command_env.insert(k.clone(), v.clone());
+    }
+    if inputs.mode == "claude" {
+        // Claude itself honors CLAUDE_CONFIG_DIR. CLAUDE_HOME is Freshell's
+        // compatibility knob, so copy the winning compatibility value into
+        // the real child variable. Materializing an explicit config value in
+        // command_env also makes the selected child root observable and keeps
+        // it dominant over compatibility settings.
+        let selected_config =
+            resolve_claude_store_root(env, &command_env, inputs.target, inputs.child_cwd)?;
+        if let Some(selected_config) = selected_config {
+            command_env.insert("CLAUDE_CONFIG_DIR".to_string(), selected_config);
+        }
     }
 
     let mut remote_args: Vec<String> = Vec::new();
@@ -591,3 +708,164 @@ pub fn resolve_cli_launch(
 #[cfg(test)]
 #[path = "cli_launch_goldens.rs"]
 mod cli_argv_goldens_file;
+
+#[cfg(test)]
+mod recovery_launch_env_tests {
+    use super::*;
+    use crate::MapEnv;
+
+    fn claude_spec() -> CliCommandSpec {
+        CliCommandSpec {
+            name: "claude".to_string(),
+            label: "Claude CLI".to_string(),
+            default_cmd: "claude".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn claude_inputs() -> CliLaunchInputs<'static> {
+        CliLaunchInputs {
+            mode: "claude",
+            target: ProviderTarget::Unix,
+            child_cwd: Some("/workspace"),
+            resume_session_id: None,
+            launch_intent: LaunchIntent::Resume,
+            permission_mode: None,
+            model: None,
+            sandbox: None,
+            codex_remote_ws_url: None,
+            opencode_server: None,
+            mcp_injection: McpInjection::default(),
+            opencode_rebind_tui_config: None,
+        }
+    }
+
+    #[test]
+    fn cli_launch_claude_compat_home_is_injected_as_config_dir() {
+        let env = MapEnv::new().with("CLAUDE_HOME", "/compat/claude");
+        let launch = resolve_coding_cli_command(&[claude_spec()], &claude_inputs(), &env)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/compat/claude"),
+            "the child writer must use the same compatibility-selected root as exact recovery"
+        );
+    }
+
+    #[test]
+    fn cli_launch_claude_explicit_config_dir_wins_over_compat_home() {
+        let env = MapEnv::new()
+            .with("CLAUDE_CONFIG_DIR", "/explicit/claude")
+            .with("CLAUDE_HOME", "/compat/claude");
+        let launch = resolve_coding_cli_command(&[claude_spec()], &claude_inputs(), &env)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/explicit/claude")
+        );
+    }
+
+    #[test]
+    fn cli_launch_claude_empty_and_relative_roots_use_the_exact_child_cwd() {
+        for (selected_key, selected, cwd, expected) in [
+            ("CLAUDE_CONFIG_DIR", "", "/one/project", "/one/project"),
+            (
+                "CLAUDE_CONFIG_DIR",
+                "../claude",
+                "/one/project",
+                "/one/claude",
+            ),
+            ("CLAUDE_HOME", "", "/two/project", "/two/project"),
+            (
+                "CLAUDE_HOME",
+                "stores/claude",
+                "/two/project",
+                "/two/project/stores/claude",
+            ),
+        ] {
+            let env = MapEnv::new().with(selected_key, selected);
+            let mut inputs = claude_inputs();
+            inputs.child_cwd = Some(cwd);
+            let launch = resolve_coding_cli_command(&[claude_spec()], &inputs, &env)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_launch_claude_empty_home_fallback_is_relative_to_the_exact_child_cwd() {
+        for (target, cwd, expected) in [
+            (
+                ProviderTarget::Unix,
+                "/one/project",
+                "/one/project/.claude",
+            ),
+            (
+                ProviderTarget::Windows,
+                r"C:\panes\one\work",
+                r"C:\panes\one\work\.claude",
+            ),
+        ] {
+            let env = MapEnv::new().with("HOME", "");
+            let mut inputs = claude_inputs();
+            inputs.target = target;
+            inputs.child_cwd = Some(cwd);
+            let launch = resolve_coding_cli_command(&[claude_spec()], &inputs, &env)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_launch_claude_relative_root_without_resolved_child_cwd_fails_closed() {
+        let env = MapEnv::new().with("CLAUDE_CONFIG_DIR", "relative/claude");
+        let mut inputs = claude_inputs();
+        inputs.child_cwd = None;
+
+        assert_eq!(
+            resolve_coding_cli_command(&[claude_spec()], &inputs, &env),
+            Err(CliLaunchError::ClaudeInvalidConfigRoot)
+        );
+    }
+
+    #[test]
+    fn cli_launch_claude_windows_relative_root_uses_windows_child_cwd_syntax() {
+        let env = MapEnv::new().with("CLAUDE_CONFIG_DIR", r"..\stores\claude");
+        let mut inputs = claude_inputs();
+        inputs.target = ProviderTarget::Windows;
+        inputs.child_cwd = Some(r"C:\panes\one\work");
+        let launch = resolve_coding_cli_command(&[claude_spec()], &inputs, &env)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(r"C:\panes\one\stores\claude")
+        );
+    }
+
+    #[test]
+    fn cli_launch_claude_selected_root_is_nfc_normalized() {
+        let env = MapEnv::new().with("CLAUDE_CONFIG_DIR", "/tmp/cafe\u{301}");
+        let launch = resolve_coding_cli_command(&[claude_spec()], &claude_inputs(), &env)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/caf\u{e9}")
+        );
+    }
+}

@@ -7,6 +7,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+freshell-recovery = { path = "../freshell-recovery" }
+freshell-protocol = { path = "../freshell-protocol" }
 # JSON line parsing for the claude/codex JSONL transcripts (JSON.parse parity,
 # skip-on-error corruption tolerance). preserve_order matches the TS object model.
 serde_json = { workspace = true }
@@ -21,7 +23,7 @@ notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
 # compiles the SQLite amalgamation so the parser is not coupled to the host's
 # libsqlite3 version (deterministic across dev/CI/Windows).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 # Batch B (`directory_index`): the refreshable session-directory cache. `sync`
 # for the refresh-serializing async Mutex, `rt`/`rt-multi-thread` for
 # `spawn_blocking` (the full-sweep scan runs off the async executor thread),
@@ -31,18 +33,27 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
 # equivalent) -- same version already used by `freshell-ws`.
 tracing = "0.1"
+toml = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 # SESSION-07: unique temp-file names for `search.rs`'s file-content search
 # tests (same version/feature set as every other crate's `uuid` dependency).
 uuid = { version = "1", features = ["v4"] }
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 # amplifier_stub's rollback-on-partial-write test needs a deterministic,
 # thread-scoped (not process-global) permission-denied write failure:
 # `unshare(CLONE_FS)` + `umask()`. Same version freshell-ws already pins
-# directly for `pane_ledger`'s `flock(2)`.
+# directly for `pane_ledger`'s `flock(2)`. Production exact recovery also
+# needs nonblocking/no-follow opens before fstat.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }

@@ -77,13 +77,19 @@ uuid = { version = "1", features = ["v4"] }
 # subscriber `freshell-server` installs (`crates/freshell-server/src/logging.rs`)
 # -- this crate only emits events, it never installs its own subscriber.
 tracing = "0.1"
+unicode-normalization = { workspace = true }
 
-# Linux /proc ownership reaper for the claude Node sidecar + its `claude` CLI grandchild
-# (SIGTERM anything carrying our FRESHELL_CLAUDE_SIDECAR_ID tag) — the claude analog of the
-# codex reaper, so a freshclaude T2 run leaves no orphan (the oracle `ownership.cleanup`
-# invariant). Linux-only (matches the reference's platform guard).
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unix no-follow/nonblocking transcript opens, plus the Linux /proc ownership
+# reaper for the Claude sidecar and its CLI grandchild. The reaper itself stays
+# Linux-gated in source; exact transcript safety applies on every Unix target.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

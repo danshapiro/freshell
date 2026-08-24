@@ -79,6 +79,7 @@ fn claude_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
     CliLaunchInputs {
         mode: "claude",
         target: ProviderTarget::Unix,
+        child_cwd: Some("/workspace"),
         resume_session_id: None,
         launch_intent: LaunchIntent::Resume,
         permission_mode: Some("default"),
@@ -137,6 +138,30 @@ fn g_c1_claude_linux_fresh_defaults_resolver_level() {
         ]
     );
     assert!(launch.env.is_empty());
+}
+
+#[test]
+fn g_c1b_claude_relative_store_uses_resolved_pane_cwd_not_server_pwd() {
+    let env = env_of(&[("CLAUDE_CONFIG_DIR", "../stores/claude")]);
+    for (raw_cwd, expected) in [
+        ("/panes/one/work", "/panes/one/stores/claude"),
+        ("/panes/two/work", "/panes/two/stores/claude"),
+    ] {
+        let resolved_child_cwd =
+            crate::spawn::resolve_mcp_cwd(Some(raw_cwd), &env, HostOs::Linux, false)
+                .expect("absolute pane cwd");
+        let mut inputs = claude_inputs(claude_mcp_unix());
+        inputs.child_cwd = Some(&resolved_child_cwd);
+
+        let launch = resolve_coding_cli_command(&specs(), &inputs, &env)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(expected)
+        );
+    }
 }
 
 /// G-C2 — claude, linux, resume + permissionMode=plan.
@@ -245,6 +270,7 @@ fn codex_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
     CliLaunchInputs {
         mode: "codex",
         target: ProviderTarget::Unix,
+        child_cwd: None,
         resume_session_id: None,
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,
@@ -370,6 +396,7 @@ fn opencode_inputs<'a>() -> CliLaunchInputs<'a> {
     CliLaunchInputs {
         mode: "opencode",
         target: ProviderTarget::Unix,
+        child_cwd: None,
         resume_session_id: None,
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,
@@ -784,6 +811,7 @@ fn amplifier_inputs<'a>(resume_session_id: Option<&'a str>) -> CliLaunchInputs<'
     CliLaunchInputs {
         mode: "amplifier",
         target: ProviderTarget::Unix,
+        child_cwd: None,
         resume_session_id,
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,

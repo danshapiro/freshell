@@ -44,7 +44,7 @@
 //! orphans.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -354,6 +354,16 @@ impl FreshClaudeState {
             }
         }
 
+        let claude_config_dir = match claude_config_dir_for_request(msg.cwd.as_deref()) {
+            Ok(root) => root,
+            Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                self.fail_create(&request_id, "CLAUDE_CONFIG_ROOT_INVALID", &err);
+                return;
+            }
+        };
         let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
             Ok(parts) => parts,
             Err(err) => {
@@ -383,7 +393,7 @@ impl FreshClaudeState {
         };
 
         // Send the create request (faithful to createClaudeSdkOptions inputs).
-        let create_req = json!({
+        let mut create_req = json!({
             "type": "create",
             "requestId": request_id,
             "cwd": msg.cwd,
@@ -392,6 +402,9 @@ impl FreshClaudeState {
             "effort": msg.effort,
             "resumeSessionId": msg.resume_session_id,
         });
+        if let Some(config_dir) = claude_config_dir {
+            create_req["claudeConfigDir"] = json!(config_dir);
+        }
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
@@ -974,6 +987,8 @@ impl FreshClaudeState {
             ),
         };
 
+        let claude_config_dir = claude_config_dir_for_request(resume_cwd.as_str())
+            .map_err(ResumeClaudeError::Transient)?;
         let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
             .await
             .map_err(ResumeClaudeError::Transient)?;
@@ -984,7 +999,7 @@ impl FreshClaudeState {
             }
         }
         let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
-        let create_req = json!({
+        let mut create_req = json!({
             "type": "create",
             "requestId": request_id,
             "cwd": resume_cwd,
@@ -995,6 +1010,9 @@ impl FreshClaudeState {
             "effort": rec.effort,
             "resumeSessionId": resume_value,
         });
+        if let Some(config_dir) = claude_config_dir {
+            create_req["claudeConfigDir"] = json!(config_dir);
+        }
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
@@ -1377,10 +1395,11 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
 
     let mut cmd = tokio::process::Command::new(&node);
     cmd.arg(&entry);
-    // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
-    // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
-    // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
-    // CLAUDECODE + ANTHROPIC_API_KEY).
+    // Each create carries its own absolute `claudeConfigDir`; never mutate the
+    // long-lived sidecar environment based on one child's cwd. Layer only the
+    // ownership tag so the /proc reaper can find our sidecar AND
+    // the claude CLI grandchild (the SDK's clean-env passes the tag through —
+    // it strips only CLAUDECODE + ANTHROPIC_API_KEY).
     cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1400,6 +1419,12 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         drain_reader(err);
     }
     Ok((child, stdin, stdout, ownership_id))
+}
+
+fn claude_config_dir_for_request(cwd: Option<&str>) -> Result<Option<String>, String> {
+    crate::claude_snapshot::resolve_effective_claude_home_for_launch(cwd.map(Path::new))
+        .map(|root| root.map(|path| path.to_string_lossy().into_owned()))
+        .map_err(|error| format!("invalid Claude store root configuration: {error}"))
 }
 
 /// Read the sidecar's stdout until the `created` (→ the nanoid placeholder) or
@@ -2055,6 +2080,63 @@ pub(crate) mod tests {
     // per-file locks would NOT serialize against each other.
     pub(crate) static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    struct ClaudeRootEnvRestore {
+        config: Option<std::ffi::OsString>,
+        compat: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    }
+
+    impl ClaudeRootEnvRestore {
+        fn capture() -> Self {
+            Self {
+                config: std::env::var_os("CLAUDE_CONFIG_DIR"),
+                compat: std::env::var_os("CLAUDE_HOME"),
+                home: std::env::var_os("HOME"),
+            }
+        }
+    }
+
+    impl Drop for ClaudeRootEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in [
+                ("CLAUDE_CONFIG_DIR", self.config.take()),
+                ("CLAUDE_HOME", self.compat.take()),
+                ("HOME", self.home.take()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    struct AdditionalEnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl AdditionalEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for AdditionalEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
     /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
     /// `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (so tests can count spawns without a global
@@ -2085,7 +2167,10 @@ rl.on('line', (line) => {
     // Log the WHOLE create request (one line per create) so tests can both count
     // spawns AND assert what the sidecar received (e.g. resumeSessionId).
     if (spawnLog) {
-      fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
+      fs.appendFileSync(spawnLog, `${JSON.stringify({
+        ...msg,
+        observedClaudeConfigDir: msg.claudeConfigDir ?? process.env.CLAUDE_CONFIG_DIR ?? null,
+      })}\n`)
     }
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
@@ -2199,6 +2284,208 @@ rl.on('line', (line) => {
             effort: None,
             plugins: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_snapshot_fresh_launch_aligns_compat_and_explicit_config_roots() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _root_env = ClaudeRootEnvRestore::capture();
+        let env = FakeClaudeSidecarEnv::install();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_HOME", "/compat/claude");
+
+        let (state, mut rx) = state_with_bus();
+        state
+            .handle_create(dedup_create_msg("req-compat-claude-root"))
+            .await;
+        await_claude_created(&mut rx, "req-compat-claude-root").await;
+
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/explicit/claude");
+        state
+            .handle_create(dedup_create_msg("req-explicit-claude-root"))
+            .await;
+        await_claude_created(&mut rx, "req-explicit-claude-root").await;
+
+        let logged: Vec<Value> = std::fs::read_to_string(env.spawn_log_path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(logged.len(), 2);
+        assert_eq!(logged[0]["observedClaudeConfigDir"], "/compat/claude");
+        assert_eq!(logged[1]["observedClaudeConfigDir"], "/explicit/claude");
+        state.shutdown().await;
+        drop(env);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claude_snapshot_fresh_relative_root_is_derived_per_concurrent_child_cwd() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _root_env = ClaudeRootEnvRestore::capture();
+        let env = FakeClaudeSidecarEnv::install();
+        let tree = tempfile::tempdir().unwrap();
+        let first_cwd = tree.path().join("one/work");
+        let second_cwd = tree.path().join("two/work");
+        std::fs::create_dir_all(&first_cwd).unwrap();
+        std::fs::create_dir_all(&second_cwd).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", "../stores/claude");
+        std::env::set_var("CLAUDE_HOME", "/ignored/compat");
+        let mut first_msg = dedup_create_msg("req-relative-root-one");
+        first_msg.cwd = Some(first_cwd.to_string_lossy().into_owned());
+        let mut second_msg = dedup_create_msg("req-relative-root-two");
+        second_msg.cwd = Some(second_cwd.to_string_lossy().into_owned());
+        let (first_state, mut first_rx) = state_with_bus();
+        let (second_state, mut second_rx) = state_with_bus();
+
+        tokio::join!(
+            first_state.handle_create(first_msg),
+            second_state.handle_create(second_msg)
+        );
+        await_claude_created(&mut first_rx, "req-relative-root-one").await;
+        await_claude_created(&mut second_rx, "req-relative-root-two").await;
+
+        let logged = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let observed = logged
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["observedClaudeConfigDir"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            observed,
+            [
+                first_cwd
+                    .parent()
+                    .unwrap()
+                    .join("stores/claude")
+                    .to_string_lossy()
+                    .into_owned(),
+                second_cwd
+                    .parent()
+                    .unwrap()
+                    .join("stores/claude")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        first_state.shutdown().await;
+        second_state.shutdown().await;
+        drop(env);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn actual_sidecar_propagates_per_create_root_to_fake_grandchild_and_keeps_absent_compat()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _root_env = ClaudeRootEnvRestore::capture();
+        let _extra_env = AdditionalEnvRestore::capture(&[
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "CLAUDE_CMD",
+            "FRESHELL_TEST_CLAUDE_GRANDCHILD_LOG",
+            "CLAUDECODE",
+            "ANTHROPIC_API_KEY",
+        ]);
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/sidecar/original");
+        std::env::set_var("CLAUDECODE", "must-be-stripped");
+        std::env::set_var("ANTHROPIC_API_KEY", "must-also-be-stripped");
+        let tree = tempfile::tempdir().unwrap();
+        let child_cwd = tree.path().join("child-cwd");
+        std::fs::create_dir_all(&child_cwd).unwrap();
+        let grandchild_log = tree.path().join("grandchild.jsonl");
+        let fake_cli = tree.path().join("fake-claude.mjs");
+        std::fs::write(
+            &fake_cli,
+            r#"#!/usr/bin/env node
+import fs from 'node:fs'
+fs.appendFileSync(process.env.FRESHELL_TEST_CLAUDE_GRANDCHILD_LOG, `${JSON.stringify({
+  cwd: process.cwd(),
+  config: process.env.CLAUDE_CONFIG_DIR ?? null,
+  claudeCode: process.env.CLAUDECODE ?? null,
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? null,
+})}\n`)
+process.stdin.resume()
+setTimeout(() => process.exit(0), 500)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_cli).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_cli, permissions).unwrap();
+        std::env::set_var("CLAUDE_CMD", &fake_cli);
+        std::env::set_var("FRESHELL_TEST_CLAUDE_GRANDCHILD_LOG", &grandchild_log);
+
+        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar().await.unwrap();
+        let mut reader = BufReader::new(stdout).lines();
+        let requests = [
+            json!({
+                "type": "create",
+                "requestId": "actual-sidecar-overlay",
+                "cwd": child_cwd,
+                "claudeConfigDir": "/per/request",
+            }),
+            json!({
+                "type": "create",
+                "requestId": "actual-sidecar-absent",
+                "cwd": child_cwd,
+            }),
+        ];
+        for request in requests {
+            write_line(&mut stdin, &request).await.unwrap();
+            let session_id = read_created(&mut reader, SIDECAR_CREATE_BUDGET)
+                .await
+                .unwrap();
+            write_line(
+                &mut stdin,
+                &json!({"type": "send", "sessionId": session_id, "text": "start"}),
+            )
+            .await
+            .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let lines = std::fs::read_to_string(&grandchild_log)
+                    .map(|contents| contents.lines().count())
+                    .unwrap_or(0);
+                if lines >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both fake Claude grandchildren must start");
+        let observed = std::fs::read_to_string(&grandchild_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let configs = observed
+            .iter()
+            .filter_map(|value| value["config"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(configs.contains("/per/request"));
+        assert!(configs.contains("/sidecar/original"));
+        for value in observed {
+            assert_eq!(value["cwd"], child_cwd.to_string_lossy().as_ref());
+            assert_eq!(value["claudeCode"], Value::Null);
+            assert_eq!(value["anthropicApiKey"], Value::Null);
+        }
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        reap_owned_claude_sidecars(&ownership_id);
     }
 
     /// Drain `rx` until the `freshAgent.created` (or `.create.failed`) frame for

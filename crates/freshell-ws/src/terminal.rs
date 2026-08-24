@@ -52,7 +52,8 @@ use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
 use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
-    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent, McpInjection,
+    resolve_unix_shell_cwd, resolve_windows_shell_cwd, CliLaunchInputs, LaunchIntent, McpInjection,
+    ProviderTarget,
 };
 use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, Env, RealEnv,
@@ -2000,6 +2001,12 @@ pub(crate) async fn handle_create(
     } else {
         resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
     };
+    let child_cwd = match target {
+        ProviderTarget::Unix => resolve_unix_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl),
+        ProviderTarget::Windows => {
+            resolve_windows_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl)
+        }
+    };
 
     // MCP injection (§3.2 IO layer). Reference parity: a throw here propagates out
     // of buildSpawnSpec BEFORE the pty.spawn try — no cleanup call on this path.
@@ -2041,6 +2048,7 @@ pub(crate) async fn handle_create(
     let inputs = CliLaunchInputs {
         mode: &mode,
         target,
+        child_cwd: child_cwd.as_deref(),
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
         permission_mode: permission_mode.as_deref(),
@@ -2654,6 +2662,12 @@ pub async fn respawn_agent_terminal(
     // `handle_create`'s error arm).
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
     let mcp_cwd = resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl);
+    let child_cwd = match target {
+        ProviderTarget::Unix => resolve_unix_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl),
+        ProviderTarget::Windows => {
+            resolve_windows_shell_cwd(resolved_cwd.as_deref(), &RealEnv, is_wsl)
+        }
+    };
     let mcp_injection = match generate_mcp_injection(
         &RealMcpRuntime,
         &mode,
@@ -2679,6 +2693,7 @@ pub async fn respawn_agent_terminal(
     let inputs = CliLaunchInputs {
         mode: &mode,
         target,
+        child_cwd: child_cwd.as_deref(),
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
         permission_mode: permission_mode.as_deref(),

@@ -7,7 +7,7 @@
 // JSON to this process:
 //
 //   Rust → sidecar (stdin, one JSON per line):
-//     { type:'create',    requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
+//     { type:'create',    requestId, cwd?, claudeConfigDir?, model?, permissionMode?, effort?, resumeSessionId? }
 //     { type:'send',      sessionId, text }
 //     { type:'interrupt', sessionId }
 //     { type:'shutdown' }
@@ -69,8 +69,9 @@ function nanoid(size = 21) {
 }
 
 // ── clean env (server/sdk-bridge.ts:64-66) ──────────────────────────────────
-function createClaudeSdkCleanEnv(env = process.env) {
+function createClaudeSdkCleanEnv(env = process.env, claudeConfigDir) {
   const { CLAUDECODE: _c, ANTHROPIC_API_KEY: _k, ...cleanEnv } = env
+  if (claudeConfigDir !== undefined) cleanEnv.CLAUDE_CONFIG_DIR = claudeConfigDir
   return cleanEnv
 }
 
@@ -213,7 +214,11 @@ function handleCreate(req) {
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         abortController: abort,
-        env: createClaudeSdkCleanEnv(process.env),
+        // Freshell resolves empty/relative selected roots against this exact
+        // request's child cwd and sends an absolute NFC value. Keep the
+        // long-lived sidecar environment immutable so concurrent sessions with
+        // different cwds cannot redirect one another.
+        env: createClaudeSdkCleanEnv(process.env, req.claudeConfigDir),
         settingSources: ['user', 'project', 'local'],
         stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
         canUseTool: async (_toolName, input) => {

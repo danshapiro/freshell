@@ -32,3 +32,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4" }
+toml = "0.9"
+unicode-normalization = "0.1"
+windows-sys = "0.61"
+zstd = "0.13"

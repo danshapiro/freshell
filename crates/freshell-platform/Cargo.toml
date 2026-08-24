@@ -11,6 +11,7 @@ publish.workspace = true
 # will add deps when implemented in a later sub-step.
 [dependencies]
 serde_json = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

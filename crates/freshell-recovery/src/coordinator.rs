@@ -329,6 +329,7 @@ mod tests {
                     session_id: session_id.to_string(),
                 },
                 cwd: Some(PathBuf::from("/project")),
+                store_domain: RecoveryStoreDomain::Host,
             },
             materialization: MaterializationState::Unknown,
         }
@@ -358,6 +359,7 @@ mod tests {
                     session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 },
                 cwd: Some(PathBuf::from("/project")),
+                store_domain: RecoveryStoreDomain::Host,
             },
             materialization: MaterializationState::Unknown,
         };
@@ -436,6 +438,7 @@ mod tests {
                 session_id: canonical.to_string(),
             },
             cwd: valid.key.cwd.clone(),
+            store_domain: RecoveryStoreDomain::Host,
         };
 
         for queries in [
@@ -480,6 +483,7 @@ mod tests {
                 session_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
             },
             cwd: unrelated.key.cwd.clone(),
+            store_domain: RecoveryStoreDomain::Host,
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = RecoveryProviderRegistry::new();
@@ -522,6 +526,7 @@ mod tests {
                     session_id: "550E8400-E29B-41D4-A716-446655440000".to_string(),
                 },
                 cwd: Some(PathBuf::from("/unknown")),
+                store_domain: RecoveryStoreDomain::Host,
             },
             materialization: MaterializationState::Unknown,
         };
@@ -533,6 +538,7 @@ mod tests {
                     session_id: "not-a-uuid".to_string(),
                 },
                 cwd: Some(PathBuf::from("/invalid-uuid")),
+                store_domain: RecoveryStoreDomain::Host,
             },
             materialization: MaterializationState::Unknown,
         };
@@ -544,6 +550,7 @@ mod tests {
                     session_id: "../escaped".to_string(),
                 },
                 cwd: Some(PathBuf::from("/traversal")),
+                store_domain: RecoveryStoreDomain::Host,
             },
             materialization: MaterializationState::Unknown,
         };
@@ -878,5 +885,167 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].key, allocated.key);
         assert_eq!(captured[0].materialization, MaterializationState::Observed);
+    }
+
+    #[test]
+    fn registry_dispatches_identical_locators_in_distinct_store_domains() {
+        let base = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        let domains = [
+            RecoveryStoreDomain::Host,
+            RecoveryStoreDomain::WindowsInterop,
+            RecoveryStoreDomain::Wsl {
+                distribution: "ubuntu".to_string(),
+            },
+            RecoveryStoreDomain::Wsl {
+                distribution: "debian".to_string(),
+            },
+        ];
+        let requested: Vec<_> = domains
+            .iter()
+            .cloned()
+            .map(|store_domain| {
+                let mut query = base.clone();
+                query.key.store_domain = store_domain;
+                query
+            })
+            .collect();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        let snapshot = registry.lookup_many_blocking(&requested);
+
+        assert_eq!(snapshot.len(), domains.len());
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), domains.len());
+        assert_eq!(
+            captured
+                .iter()
+                .map(|query| query.key.store_domain.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from(domains),
+            "domain belongs to the stable pre-provider identity"
+        );
+    }
+
+    #[test]
+    fn registry_canonicalizes_wsl_distribution_before_dedupe() {
+        let mut allocated = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        allocated.key.store_domain = RecoveryStoreDomain::Wsl {
+            distribution: " Ubuntu  22.04 ".to_string(),
+        };
+        allocated.materialization = MaterializationState::Allocated;
+        let mut observed = allocated.clone();
+        observed.key.store_domain = RecoveryStoreDomain::Wsl {
+            distribution: "ubuntu 22.04".to_string(),
+        };
+        observed.materialization = MaterializationState::Observed;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        let snapshot = registry.lookup_many_blocking(&[allocated, observed]);
+
+        assert_eq!(snapshot.len(), 1);
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].key.store_domain,
+            RecoveryStoreDomain::Wsl {
+                distribution: "ubuntu 22.04".to_string(),
+            }
+        );
+        assert_eq!(
+            captured[0].materialization,
+            MaterializationState::Observed
+        );
+    }
+
+    #[test]
+    fn invalid_wsl_domain_does_not_poison_an_identical_host_lookup() {
+        let host = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        let mut invalid = host.clone();
+        invalid.key.store_domain = RecoveryStoreDomain::Wsl {
+            distribution: "..\\Ubuntu".to_string(),
+        };
+        let invalid_key = invalid.key.clone();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        let snapshot = registry.lookup_many_blocking(&[invalid, host.clone()]);
+
+        assert_eq!(
+            snapshot.get(&invalid_key),
+            Some(&ExactRecoveryState::Invalid(
+                ExactRecoveryIssue::InvalidStoreDomain
+            ))
+        );
+        assert_eq!(
+            snapshot.get(&host.key),
+            Some(&ExactRecoveryState::ProviderUnavailable)
+        );
+        assert_eq!(captured.lock().unwrap().as_slice(), &[host]);
+    }
+
+    #[test]
+    fn materialization_advances_monotonically_within_each_domain_only() {
+        let mut host_allocated = query("claude", "550e8400-e29b-41d4-a716-446655440000");
+        host_allocated.materialization = MaterializationState::Allocated;
+        let mut host_observed = host_allocated.clone();
+        host_observed.materialization = MaterializationState::Observed;
+        let mut windows_allocated = host_allocated.clone();
+        windows_allocated.key.store_domain = RecoveryStoreDomain::WindowsInterop;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = RecoveryProviderRegistry::new();
+        registry
+            .register(
+                DurableRecoveryProvider::Claude,
+                Arc::new(CapturingProvider {
+                    queries: Arc::clone(&captured),
+                }),
+            )
+            .unwrap();
+
+        let snapshot =
+            registry.lookup_many_blocking(&[host_allocated, windows_allocated, host_observed]);
+
+        assert_eq!(snapshot.len(), 2);
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured
+                .iter()
+                .map(|query| (&query.key.store_domain, query.materialization))
+                .collect::<HashMap<_, _>>(),
+            HashMap::from([
+                (&RecoveryStoreDomain::Host, MaterializationState::Observed),
+                (
+                    &RecoveryStoreDomain::WindowsInterop,
+                    MaterializationState::Allocated,
+                ),
+            ])
+        );
     }
 }

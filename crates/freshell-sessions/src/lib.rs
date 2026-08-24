@@ -16,6 +16,7 @@
 
 pub mod amplifier;
 pub mod amplifier_stub;
+pub mod codex_exact;
 pub mod codex_locator;
 pub mod directory_index;
 pub mod indexer;
