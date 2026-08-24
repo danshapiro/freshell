@@ -430,6 +430,12 @@ function coalesceSyntheticToolResultTurns(turns: FreshAgentTurn[]): FreshAgentTu
  * rendered summary vanish after the fact. The placeholder keeps the layout
  * boundary (zero-item turns hard-close an open line) without rendering
  * anything — the hidden thinking text stays hidden.
+ *
+ * Permanence is scoped to what THIS mounted view actually painted: the
+ * caller passes the keys of summaries rendered so far (recorded from the
+ * render loop), so the boundary survives the busy→idle isStreaming flip and
+ * every later frame, while a transcript mounted already-settled — where the
+ * hidden summary never rendered — still collapses freely.
  */
 type DisplayTurn = FreshAgentTurn & { filteredPlaceholder?: true }
 
@@ -437,6 +443,7 @@ function filterTurnsForDisplay(
   turns: FreshAgentTurn[],
   options: TranscriptDisplayOptions,
   isStreaming: boolean,
+  paintedSummaryKeys: ReadonlySet<string>,
 ): DisplayTurn[] {
   return turns
     .map((turn, index): DisplayTurn | null => {
@@ -445,7 +452,7 @@ function filterTurnsForDisplay(
         if (isStreaming && index === turns.length - 1) {
           return { ...turn, items: [] }
         }
-        if (isStreaming && typeof turn.summary === 'string' && turn.summary.trim().length > 0) {
+        if (paintedSummaryKeys.has(getFreshAgentDisplayTurnKey(turn))) {
           return { ...turn, items: [], summary: '', filteredPlaceholder: true }
         }
         return null
@@ -831,14 +838,36 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
     showThinking,
   }), [showThinking])
+  // Keys of summaries this mounted view has actually painted (see the
+  // recording effect below). Feeds the placeholder boundary so it survives
+  // the busy→idle isStreaming flip without blocking settled-history merges.
+  const paintedSummaryKeysRef = useRef<Set<string>>(new Set())
   const displayTurns = useMemo(() => (
-    filterTurnsForDisplay(coalesceSyntheticToolResultTurns(turns), displayOptions, isStreaming)
+    filterTurnsForDisplay(
+      coalesceSyntheticToolResultTurns(turns),
+      displayOptions,
+      isStreaming,
+      paintedSummaryKeysRef.current,
+    )
   ), [displayOptions, turns, isStreaming])
   const { layouts: turnLayouts, lineEndIndex, tail } = useMemo(() => buildTranscriptLayout(displayTurns), [displayTurns])
   const liveActivityBlockId = useMemo(
     () => selectLiveActivityBlockIdFromLayout(turnLayouts, displayTurns, isStreaming, tail),
     [turnLayouts, displayTurns, isStreaming, tail],
   )
+  // Record every zero-item summary that reached an article (mirrors the
+  // render loop's skip conditions) so a later frame can leave a placeholder
+  // boundary where the summary once painted.
+  useEffect(() => {
+    const painted = paintedSummaryKeysRef.current
+    displayTurns.forEach((turn, index) => {
+      if (turn.filteredPlaceholder || turn.items.length > 0) return
+      if (typeof turn.summary !== 'string' || turn.summary.trim().length === 0) return
+      const isLastStreaming = isStreaming && index === displayTurns.length - 1
+      if (isLastStreaming && liveActivityBlockId !== null) return
+      painted.add(getFreshAgentDisplayTurnKey(turn))
+    })
+  }, [displayTurns, isStreaming, liveActivityBlockId])
   const transcriptSignature = useMemo(() => (
     displayTurns.map((turn) => {
       const itemSignature = turn.items.map((item) => {

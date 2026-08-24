@@ -1884,5 +1884,55 @@ describe('FreshAgentTranscript', () => {
       rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
     })
+
+    it('keeps the hidden-thinking boundary after the session goes idle (isStreaming flips false)', () => {
+      const turnA = {
+        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
+      }
+      const thinkingTurn = {
+        id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant' as const,
+        summary: 'Considering options',
+        items: [{ id: 'think-1', kind: 'thinking' as const, text: 'Considering options' }],
+      }
+      const turnB = {
+        id: 'turn-b', turnId: 'turn-b', role: 'assistant' as const, summary: 'Read',
+        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+      }
+      // The thinking turn's summary paints as the streaming tail...
+      const { rerender } = render(
+        <FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn]} />,
+      )
+      expect(screen.getByText('Considering options')).toBeInTheDocument()
+      // ...then the next tool arrives in a new turn: separated lines.
+      rerender(<FreshAgentTranscript isStreaming showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      // The session completes (FreshAgentView passes isStreaming=isBusy). The
+      // summary rendered between the two tool runs in this view, so the runs
+      // must not retro-collapse now that streaming is over.
+      rerender(<FreshAgentTranscript isStreaming={false} showThinking={false} turns={[turnA, thinkingTurn, turnB]} />)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('collapses freely across hidden-thinking turns whose summary never painted (settled history)', () => {
+      // A transcript mounted already-settled never rendered the hidden thinking
+      // turn's summary, so nothing stood between the tool runs in this view.
+      render(
+        <FreshAgentTranscript
+          isStreaming={false}
+          showThinking={false}
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-thinking', turnId: 'turn-thinking', role: 'assistant',
+              summary: 'Considering options',
+              items: [{ id: 'think-1', kind: 'thinking', text: 'Considering options' }] },
+            { id: 'turn-b', turnId: 'turn-b', role: 'assistant', summary: 'Read',
+              items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    })
   })
 })
