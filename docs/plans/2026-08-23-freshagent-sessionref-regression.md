@@ -129,6 +129,7 @@ export function preservedDurableFreshAgentIdentity(
 - Modify: `crates/freshell-ws/src/tabs.rs` — new pure fn `clamp_placeholder_session_refs(open_records: &mut Vec<...>, current: &CompactState)` called inside `derive_push_next` (:611+) on `prepared.open_records.clone()` BEFORE the insert at :679. (`prepare_push` :492 is pre-lock and has no `current` — clamp CANNOT live there; `derive_push_next` has `current.open_snapshots_by_client`; tombstone loops :653-678 unaffected.)
 - HASH CORRECTNESS (review-verified twice, do not deviate): `tabs_store.rs:804-816` rebuilds `open_snapshot_payload_hash` from the STORED records on compact-state reopen and rejects a mismatch as corruption (fatal at server startup). Therefore: after clamping, REBUILD the open-snapshot payload hash from the CLAMPED records and store THAT hash with the snapshot. The hash function already exists as `pub fn build_snapshot_payload_hash` at **`tabs_store_model.rs:211`** (NOT tabs_store.rs) and is ALREADY imported by tabs.rs (:42; used at :582/:589 in prepare_push) — no visibility change; reuse the existing import with the same identity inputs (device_id, device_label, client_instance_id, snapshot_revision) used at prepare time (extend `PreparedPush` to carry those identity fields if it does not already). The whole-push `last_push_payload_hash`/`push_hash` remains computed on the RAW push payload — it is the retry-identity key, so a retry after a clamped store still dedupes. NEVER store records whose content differs from what `open_snapshot_payload_hash` describes.
 - Guard-rail (implementation check, pin with a test if a consumer exists): audit every consumer of the open-snapshot hash (PushAck fields, any client-side comparison) — retry/idempotency flows must key on the raw whole-push hash ONLY; nothing may compare the open-snapshot hash against a client-side RAW-payload recomputation.
+- PERSIST-GENERATION CONSISTENCY (review-verified at tabs.rs:224-250): after a mutating push, `tabs_persist::persist_generation(dir, …, &prepared.open_records, now)` snaps the RAW prepared records — rolling recovery generations and the recovery-inventory endpoints would carry the placeholder even when the compact state was clamped, violating the forward-looking "registries or snapshots" invariant. The clamped records must be the SINGLE source for both consumers: persist the COMMITTED (clamped) open records — read them back from the committed snapshot in `next` for this device/client key (consistency by construction), or have `derive_push_next` return the clamped records — never from `prepared.open_records`. Recovery generations reflect registry truth, not raw client push payloads.
 
 **Interface:**
 ```rust
@@ -151,6 +152,7 @@ fn clamp_placeholder_session_refs(records: &mut [serde_json::Value], current: &C
    - Negative: no durable anywhere → placeholder passes through unchanged.
    - HASH/reopen round-trip: after a clamped push, persist the compact state and re-run the reopen/validation path (`tabs_store.rs` snapshot validation) → PASSes (fails before the clamped-content hash rebuild exists, because the stored records no longer match a raw-payload hash).
    - Retry idempotency: re-push the identical RAW payload after a clamped store → deduped via raw whole-push hash, no double-apply, snapshot still valid on reopen.
+   - Persist-generation consistency: placeholder push that gets clamped → the rolling generation persisted under a temp persist_dir carries the DURABLE identity (read the persisted generation back / query the recovery-inventory surface), never the placeholder.
    Run `cargo test -p freshell-ws` → FAIL.
 2. GREEN: implement classifier in `tabs_store_model.rs`, `clamp_placeholder_session_refs` + clamped-content open-snapshot hash rebuild in `tabs.rs` (pub(crate) `build_snapshot_payload_hash` from tabs_store.rs), call site in `derive_push_next` before insert. Run → PASS.
 3. REFACTOR: extraction/hygiene.
@@ -202,7 +204,7 @@ fn clamp_placeholder_session_refs(records: &mut [serde_json::Value], current: &C
    - Bounded probe: fake HTTP that never answers + a TINY timeout → 504 (asserts the knob is honored AND the probe is bounded — never wait the real 10s in a test). TIMEOUT INJECTION: do NOT mutate the process-global `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` in tests — an existing opencode_ws.rs test already sets/removes it unsynchronized and parallel tokio tests would race. Inject the timeout through test state instead (cfg(test) override on FreshAgentState alongside `set_manager_for_test` :766, consulted before the env parse). Probe error other than NotFound/timeout → 502.
    - Route-sensitive probe: fake HTTP that ASSERTS the observed `?directory=` query → with a ledger-cwd-bearing record, the probe route carries the ledger cwd; without ledger cwd, the probe carries NO directory (never body cwd). Failing probe on wrong-directory proves the ordering.
    - Settings precedence ladder: ledger model/effort apply when body omits them; body model beats ledger model; body effort beats ledger effort.
-   - CWD precedence ladder: ledger cwd wins over serve-directory-from-probe; serve-directory wins over body cwd (ledger > serve dir > body).
+   - CWD precedence ladder (full lattice): ledger cwd wins over serve-directory-from-probe; serve-directory wins over body cwd; AND with NO ledger record and NO probe-serve-directory, body cwd is USED (final fallback — an implementation that drops body cwd entirely must fail this); ledger > serve dir > body.
    - SETTINGS_RESET edge: settings-bearing record + unrecoverable `load_settings` → SETTINGS_RESET broadcast and resume proceeds (mirror opencode_ws.rs:1506-1541); complement (Task 3 semantics): lineage-only binding → resume proceeds with NO SETTINGS_RESET.
    Run `cargo test -p freshell-freshagent` → FAIL (currently 400/ignored).
 2. GREEN: implement branch. Run → PASS.
@@ -226,7 +228,10 @@ fn clamp_placeholder_session_refs(records: &mut [serde_json::Value], current: &C
 // (claude/kilroy/unknown). undefined means: no synthesis, fields keep their CURRENT behavior
 // (dropped for agent-only calls) — acceptable because explicit sessionRef forwarding already
 // exists, and the docs updated here say so.
-function agentResumeProvider(agent: string | undefined): 'codex' | 'opencode' | undefined
+// SIGNATURE: routeAction args are Record<string, unknown>, so rest.agent is `unknown` — the
+// helper must accept unknown and narrow internally (typeof agent === 'string' ? … : undefined),
+// or the call site fails typecheck.
+function agentResumeProvider(agent: unknown): 'codex' | 'opencode' | undefined
 // In new-tab: const resumeProvider = mode ?? agentResumeProvider(rest.agent)
 // resumeProvider === 'opencode' → synthesize sessionRef; === 'codex' → rejectRawCodexResume fires.
 ```
