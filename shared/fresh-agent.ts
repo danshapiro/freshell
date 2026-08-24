@@ -5,6 +5,10 @@ import {
   type RestoreError,
   type SessionRef,
 } from './session-contract.js'
+import {
+  isDurableProviderSessionId,
+  isPlaceholderProviderSessionId,
+} from './session-flavor.js'
 
 export type FreshAgentSessionType = 'freshclaude' | 'freshcodex' | 'kilroy' | 'freshopencode'
 
@@ -184,6 +188,66 @@ export function migrateLegacyFreshAgentDurableState({
       provider,
       sessionId: resumeSessionId,
     },
+  }
+}
+
+/**
+ * The identity-relevant fields of a fresh-agent pane content fold — the shape
+ * `preservedDurableFreshAgentIdentity` reasons over. `sessionRef` is declared
+ * as the SessionRef OBJECT; a string-typed payload is invalid input and is
+ * discarded by `sanitizeSessionRef` (never matched).
+ */
+export type FreshAgentIdentityFold = {
+  provider?: FreshAgentRuntimeProvider
+  createRequestId?: string
+  sessionRef?: SessionRef
+  sessionId?: string
+  resumeSessionId?: string
+}
+
+/**
+ * Identity guard for the persist/tabs.sync/updatePaneContent fold paths
+ * (kata item 1): when a pane already holds a DURABLE provider session
+ * identity, an incoming payload that re-derived a PLACEHOLDER sessionRef for
+ * the same provider+createRequestId must not clobber it. Both createRequestIds
+ * must be defined and equal, so deliberate resets (new createRequestId / fork)
+ * are naturally exempt; the providers must agree, so a provider switch is
+ * naturally exempt; and both sessionRef locators' providers must agree with
+ * the pane provider, so a structurally-inconsistent pane is never mutated.
+ *
+ * Returns the previous durable identity tuple — the sessionRef OBJECT
+ * preserved verbatim (never coerced to a string, which downstream
+ * `sanitizeSessionRef` would discard), plus sessionId and resumeSessionId —
+ * for the caller to spread over the incoming content. Undefined otherwise.
+ */
+export function preservedDurableFreshAgentIdentity(
+  previous: FreshAgentIdentityFold | undefined,
+  incoming: FreshAgentIdentityFold,
+): Pick<FreshAgentIdentityFold, 'sessionRef' | 'sessionId' | 'resumeSessionId'> | undefined {
+  if (!previous) return undefined
+  const provider = incoming.provider
+  if (!provider || previous.provider !== provider) return undefined
+  if (!previous.createRequestId || previous.createRequestId !== incoming.createRequestId) {
+    return undefined
+  }
+  const previousSessionRef = sanitizeSessionRef(previous.sessionRef)
+  if (!previousSessionRef || previousSessionRef.provider !== provider) return undefined
+  if (!isDurableProviderSessionId(previousSessionRef.provider, previousSessionRef.sessionId)) {
+    return undefined
+  }
+  const incomingSessionRef = sanitizeSessionRef(incoming.sessionRef)
+  if (!incomingSessionRef || incomingSessionRef.provider !== provider) return undefined
+  if (!isPlaceholderProviderSessionId(incomingSessionRef.provider, incomingSessionRef.sessionId)) {
+    return undefined
+  }
+  return {
+    sessionRef: previousSessionRef,
+    sessionId: typeof previous.sessionId === 'string' && previous.sessionId.length > 0
+      ? previous.sessionId
+      : previousSessionRef.sessionId,
+    resumeSessionId: typeof previous.resumeSessionId === 'string' && previous.resumeSessionId.length > 0
+      ? previous.resumeSessionId
+      : previousSessionRef.sessionId,
   }
 }
 

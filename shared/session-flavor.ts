@@ -76,6 +76,27 @@ export function isDurableProviderSessionId(provider: string | undefined, session
   return false
 }
 
+/**
+ * Mirror of `isDurableProviderSessionId`: true only for non-empty ids that a
+ * provider did NOT mint durably (re-derived placeholders such as
+ * `freshopencode-<createRequestId>`). Returns false for empty/missing ids and
+ * unknown providers — a placeholder claim requires knowing the provider's
+ * durable id shape.
+ */
+export function isPlaceholderProviderSessionId(provider: string | undefined, sessionId: string | undefined | null): boolean {
+  if (!provider || !sessionId) return false
+  if (provider === 'claude') {
+    return !isCanonicalClaudeSessionId(sessionId)
+  }
+  if (provider === 'opencode') {
+    return !sessionId.startsWith('ses_')
+  }
+  if (provider === 'codex') {
+    return sessionId.startsWith('freshcodex-')
+  }
+  return false
+}
+
 export function shouldApplySessionTypeMetadata(
   existing: SessionFlavorMetadata | undefined,
   incoming: Required<Pick<SessionFlavorMetadata, 'sessionType' | 'sessionTypeSource'>>,

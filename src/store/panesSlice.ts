@@ -28,7 +28,7 @@ import { createLogger } from '@/lib/client-logger'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type RestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
-import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 
 
@@ -181,17 +181,36 @@ function normalizePaneContent(
       rejectNonCanonicalClaudeSessionRef: true,
     })
     const sessionRef = durableState.sessionRef
+    const createRequestId = typeof input.createRequestId === 'string' && input.createRequestId
+      ? input.createRequestId
+      : previousCreateRequestId || nanoid()
+    // Identity guard (kata item 1): a pane that already materialized a durable
+    // provider session identity keeps it when this fold carries a re-derived
+    // placeholder for the same provider+createRequestId. New generations (a
+    // different createRequestId) are deliberately not clamped.
+    const preservedIdentity = preservedDurableFreshAgentIdentity(
+      previous?.kind === 'fresh-agent' ? previous : undefined,
+      { provider: input.provider, createRequestId, sessionRef },
+    )
+    if (preservedIdentity) {
+      log.warn('Clamped a re-derived placeholder fresh-agent sessionRef over the pane’s durable identity', {
+        source: 'normalizePaneContent',
+        provider: input.provider,
+        createRequestId,
+        preservedSessionId: preservedIdentity.sessionRef?.sessionId,
+        placeholderSessionId: sessionRef?.sessionId,
+      })
+    }
     return {
       kind: 'fresh-agent',
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
-      createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
-        ? input.createRequestId
-        : previousCreateRequestId || nanoid(),
+      createRequestId,
       status,
       ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(sessionRef ? { sessionRef } : {}),
+      ...preservedIdentity,
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       initialCwd: input.initialCwd,
@@ -862,6 +881,28 @@ function mergeTerminalState(
         return local
       }
       if (incoming.content.createRequestId === local.content.createRequestId) {
+        // Identity guard (kata item 1): a materialized durable fresh-agent
+        // session identity must never regress to a re-derived placeholder
+        // (freshopencode-<createRequestId> et al.) from a stale
+        // persisted/tabs.sync payload. Keyed on provider+createRequestId
+        // continuity; deliberate resets (new createRequestId) pass through.
+        const preservedIdentity = preservedDurableFreshAgentIdentity(local.content, incoming.content)
+        if (preservedIdentity) {
+          log.warn('Clamped a re-derived placeholder fresh-agent sessionRef over the pane’s durable identity', {
+            source: 'mergeTerminalState',
+            provider: incoming.content.provider,
+            createRequestId: incoming.content.createRequestId,
+            preservedSessionId: preservedIdentity.sessionRef?.sessionId,
+            placeholderSessionId: sanitizeSessionRef(incoming.content.sessionRef)?.sessionId,
+          })
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              ...preservedIdentity,
+            },
+          }
+        }
         if (
           shouldPreserveLocalCanonicalResumeSessionId(
             local.content.resumeSessionId,

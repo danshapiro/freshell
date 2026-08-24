@@ -27,7 +27,8 @@ import panesReducer, {
   repairCodexIdentityMismatch,
   PanesState,
 } from '../../../../src/store/panesSlice'
-import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
+import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent, FreshAgentPaneContent } from '../../../../src/store/paneTypes'
+import { preservedDurableFreshAgentIdentity } from '../../../../shared/fresh-agent.js'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -2850,6 +2851,243 @@ describe('panesSlice', () => {
       })
       expect(state.paneTitleSetByUser['tab-1']).toEqual({
         'pane-2': true,
+      })
+    })
+  })
+
+  describe('fresh-agent durable sessionRef identity guard', () => {
+    const OPENCODE_CRID = 'req-opencode-guard'
+    const OPENCODE_DURABLE_ID = 'ses_guard_durable_1'
+
+    function opencodeFreshAgentContent(overrides: Partial<FreshAgentPaneContent> = {}): FreshAgentPaneContent {
+      return {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: OPENCODE_CRID,
+        status: 'idle',
+        ...overrides,
+      }
+    }
+
+    function durableOpencodeContent(): FreshAgentPaneContent {
+      return opencodeFreshAgentContent({
+        sessionId: OPENCODE_DURABLE_ID,
+        resumeSessionId: OPENCODE_DURABLE_ID,
+        sessionRef: { provider: 'opencode', sessionId: OPENCODE_DURABLE_ID },
+      })
+    }
+
+    function placeholderOpencodeContent(createRequestId = OPENCODE_CRID): FreshAgentPaneContent {
+      const placeholderId = `freshopencode-${createRequestId}`
+      return opencodeFreshAgentContent({
+        createRequestId,
+        sessionId: placeholderId,
+        resumeSessionId: placeholderId,
+        sessionRef: { provider: 'opencode', sessionId: placeholderId },
+      })
+    }
+
+    function freshAgentLeaf(state: PanesState, tabId = 'tab-1'): FreshAgentPaneContent {
+      const node = state.layouts[tabId]
+      if (!node || node.type !== 'leaf' || node.content.kind !== 'fresh-agent') {
+        throw new Error('expected fresh-agent leaf')
+      }
+      return node.content
+    }
+
+    it('keeps a materialized durable sessionRef when a later hydrate carries a placeholder for the same provider+createRequestId', () => {
+      const seeded = panesReducer(
+        initialState,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+        })),
+      )
+      expect(freshAgentLeaf(seeded).sessionRef).toEqual({
+        provider: 'opencode',
+        sessionId: OPENCODE_DURABLE_ID,
+      })
+
+      // Regression: a stale persisted/tabs.sync payload re-derives
+      // sessionRef { provider: 'opencode', sessionId: 'freshopencode-<crid>' }
+      // for a pane that already materialized to ses_….
+      const merged = panesReducer(
+        seeded,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: placeholderOpencodeContent() },
+        })),
+      )
+
+      const content = freshAgentLeaf(merged)
+      expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+      expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+      expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
+      expect(content.createRequestId).toBe(OPENCODE_CRID)
+    })
+
+    it('keeps the durable sessionRef when updatePaneContent folds a placeholder payload for the same provider+createRequestId', () => {
+      const seeded = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: durableOpencodeContent() }),
+      )
+
+      const updated = panesReducer(
+        seeded,
+        updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: placeholderOpencodeContent() }),
+      )
+
+      const content = freshAgentLeaf(updated)
+      expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+      expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+      expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
+    })
+
+    it('does not clamp a deliberate reset: a new createRequestId carrying a placeholder replaces cleanly', () => {
+      const seeded = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: durableOpencodeContent() }),
+      )
+
+      const updated = panesReducer(
+        seeded,
+        updatePaneContent({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          content: placeholderOpencodeContent('req-reset-generation'),
+        }),
+      )
+
+      const content = freshAgentLeaf(updated)
+      expect(content.createRequestId).toBe('req-reset-generation')
+      expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: 'freshopencode-req-reset-generation' })
+      expect(content.sessionId).toBe('freshopencode-req-reset-generation')
+      expect(content.resumeSessionId).toBe('freshopencode-req-reset-generation')
+    })
+
+    it('does not clamp across providers: same createRequestId with a different incoming provider is not continuity', () => {
+      const seeded = panesReducer(
+        initialState,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+        })),
+      )
+
+      const codexPlaceholderId = `freshcodex-${OPENCODE_CRID}`
+      const incomingCodex: FreshAgentPaneContent = {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: OPENCODE_CRID,
+        status: 'idle',
+        sessionId: codexPlaceholderId,
+        resumeSessionId: codexPlaceholderId,
+        sessionRef: { provider: 'codex', sessionId: codexPlaceholderId },
+      }
+
+      const merged = panesReducer(
+        seeded,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: incomingCodex },
+        })),
+      )
+
+      const content = freshAgentLeaf(merged)
+      expect(content.provider).toBe('codex')
+      expect(content.sessionType).toBe('freshcodex')
+      expect(content.sessionRef).toEqual({ provider: 'codex', sessionId: codexPlaceholderId })
+      expect(content.sessionId).toBe(codexPlaceholderId)
+    })
+
+    describe('preservedDurableFreshAgentIdentity', () => {
+      const PREVIOUS_DURABLE = {
+        provider: 'opencode',
+        createRequestId: 'req-1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_durable_1' },
+        sessionId: 'ses_durable_1',
+        resumeSessionId: 'ses_durable_1',
+      } as const
+
+      const INCOMING_PLACEHOLDER = {
+        provider: 'opencode',
+        createRequestId: 'req-1',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
+        sessionId: 'freshopencode-req-1',
+        resumeSessionId: 'freshopencode-req-1',
+      } as const
+
+      it('returns the previous durable identity when the incoming fold is a placeholder for the same provider+createRequestId', () => {
+        const preserved = preservedDurableFreshAgentIdentity(PREVIOUS_DURABLE, INCOMING_PLACEHOLDER)
+        expect(preserved).toEqual({
+          sessionRef: { provider: 'opencode', sessionId: 'ses_durable_1' },
+          sessionId: 'ses_durable_1',
+          resumeSessionId: 'ses_durable_1',
+        })
+        // The sessionRef survives as an OBJECT — never coerced to a string,
+        // or downstream sanitizeSessionRef would discard it.
+        expect(typeof preserved?.sessionRef).toBe('object')
+      })
+
+      it('returns undefined when there is no previous fold', () => {
+        expect(preservedDurableFreshAgentIdentity(undefined, INCOMING_PLACEHOLDER)).toBeUndefined()
+      })
+
+      it('returns undefined when the previous fold has no durable sessionRef', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          { ...PREVIOUS_DURABLE, sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' } },
+          INCOMING_PLACEHOLDER,
+        )).toBeUndefined()
+        expect(preservedDurableFreshAgentIdentity(
+          { ...PREVIOUS_DURABLE, sessionRef: undefined },
+          INCOMING_PLACEHOLDER,
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when createRequestIds differ (deliberate reset)', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          { ...INCOMING_PLACEHOLDER, createRequestId: 'req-2' },
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when providers differ even with the same createRequestId', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            provider: 'codex',
+            createRequestId: 'req-1',
+            sessionRef: { provider: 'codex', sessionId: 'freshcodex-req-1' },
+            sessionId: 'freshcodex-req-1',
+          },
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when the incoming sessionRef is a string — sanitize discards it, never matches', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          { ...INCOMING_PLACEHOLDER, sessionRef: 'freshopencode-req-1' as any },
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when the incoming sessionRef is already durable (nothing to protect against)', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            ...INCOMING_PLACEHOLDER,
+            sessionRef: { provider: 'opencode', sessionId: 'ses_other_2' },
+            sessionId: 'ses_other_2',
+            resumeSessionId: 'ses_other_2',
+          },
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when the previous sessionRef locator provider disagrees with the pane provider', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          {
+            ...PREVIOUS_DURABLE,
+            sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+          },
+          INCOMING_PLACEHOLDER,
+        )).toBeUndefined()
       })
     })
   })
