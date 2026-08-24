@@ -249,6 +249,36 @@ describe('activity line collapse', () => {
     fireEvent.click(forkButtons[0])
     expect(onFork).toHaveBeenCalledWith('native-a')
   })
+
+  it('treats a zero-item turn as a boundary between tool lines', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[
+          toolTurn('turn-a', [['c1','src/a.ts']]),
+          { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant', summary: '', items: [] },
+          toolTurn('turn-b', [['c2','src/b.ts']]),
+        ]}
+      />,
+    )
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+  })
+
+  it('renders both tools when TS-claude duplicate item ids collide across merged turns', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[
+          { id: 'turn-a', turnId: 'turn:msg-1', role: 'assistant', summary: '',
+            items: [{ id: 'turn:msg-1:item:0', kind: 'tool_use', toolUseId: 'toolu_1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+          { id: 'turn-b', turnId: 'turn:msg-1', role: 'assistant', summary: '',
+            items: [{ id: 'turn:msg-1:item:0', kind: 'tool_use', toolUseId: 'toolu_2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+        ]}
+      />,
+    )
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getByText('src/a.ts')).toBeInTheDocument()
+    expect(screen.getByText('src/b.ts')).toBeInTheDocument()
+  })
 })
 ```
 
@@ -264,7 +294,7 @@ Expected: FAIL — the collapse/merge/absorb cases currently render 2/2/2/1+2/mo
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
 
-(a) After `buildBlocks` (:225), add the transcript-level layout pass:
+(a) After `buildBlocks` (:225), add the transcript-level layout pass. Two validator-driven hardening rules are baked in — see "Validated design notes" at the bottom:
 
 ```ts
 type TurnLayout = { blocks: RenderBlock[] }
@@ -275,6 +305,13 @@ type TurnLayout = { blocks: RenderBlock[] }
  * no message item has rendered between (a role change paints a header, so it
  * counts as "something between"). Lines are re-built from the concatenated
  * item list so buildActivity's tool_use/tool_result stitching stays intact.
+ *
+ * Zero-item turns (Rust codex `subAgentActivity` rows, opencode structural
+ * messages) render real articles today, so they hard-close any open line —
+ * they are "something between" by definition. Absorbed follower items get
+ * display-only id dedupe (TS claude reuses item ids across turns sharing one
+ * provider message id; stitching keys toolUseId, which is verified unique, so
+ * stitching is unaffected — only React keys need this).
  */
 function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
   const layouts: TurnLayout[] = []
@@ -286,7 +323,9 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
     if (rows.length > 0) {
       layouts[open.originIndex].blocks.push({
         kind: 'activity',
-        id: open.items.map((item) => item.id).join(':'),
+        // originIndex prefix keeps the join-collision-free guarantee with
+        // duplicated TS-claude item ids.
+        id: `line:${open.originIndex}:${open.items.map((item) => item.id).join(':')}`,
         rows,
       })
     }
@@ -296,11 +335,22 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): TurnLayout[] {
   for (const [turnIndex, turn] of turns.entries()) {
     const layout: TurnLayout = { blocks: [] }
     layouts.push(layout)
+    if (turn.items.length === 0) {
+      flushOpen()
+      continue
+    }
     let messageSeenInTurn = false
     for (const item of turn.items) {
       if (isActivityLike(item)) {
         if (open && open.role === turn.role && !messageSeenInTurn) {
-          open.items.push(item)
+          const taken = new Set(open.items.map((openItem) => openItem.id))
+          let displayItem = item
+          let counter = 2
+          while (taken.has(displayItem.id)) {
+            displayItem = { ...item, id: `${item.id}:d${counter}` }
+            counter += 1
+          }
+          open.items.push(displayItem as FreshAgentTranscriptItem)
         } else {
           flushOpen()
           open = { originIndex: turnIndex, role: turn.role, items: [item] }
@@ -326,21 +376,27 @@ function selectLiveActivityBlockIdFromLayout(
   isStreaming: boolean,
 ): string | null {
   let latestActivityBlockId: string | null = null
-  let lastBlocksTurn = -1
-  layouts.forEach((layout, index) => {
-    if (layout.blocks.length > 0) lastBlocksTurn = index
+  layouts.forEach((layout) => {
     for (const block of layout.blocks) {
       if (block.kind === 'activity') latestActivityBlockId = block.id
     }
   })
-  const lastBlocks = lastBlocksTurn >= 0 ? layouts[lastBlocksTurn].blocks : []
-  const lastBlock = lastBlocks[lastBlocks.length - 1]
-  const trailingThinkingBlockId =
-    lastBlock?.kind === 'activity' && lastBlock.rows.at(-1)?.type === 'thinking'
-      ? lastBlock.id
-      : null
 
-  if (!isStreaming) return trailingThinkingBlockId
+  if (!isStreaming) {
+    // Settled sessions mark only a trailing thinking strip as live. Mirror the
+    // old last-turn rule; when the last turn was absorbed, its items live at
+    // the tail of the latest line, so check that line instead.
+    const lastIndex = turns.length - 1
+    const lastBlocks = lastIndex >= 0 ? layouts[lastIndex].blocks : []
+    const candidate = lastBlocks.length > 0
+      ? lastBlocks[lastBlocks.length - 1]
+      : (turns[lastIndex]?.items.length ?? 0) > 0 && latestActivityBlockId
+        ? [...layouts.flatMap((l) => l.blocks)].at(-1)
+        : null
+    return candidate?.kind === 'activity' && candidate.rows.at(-1)?.type === 'thinking'
+      ? candidate.id
+      : null
+  }
 
   const lastTurn = turns[turns.length - 1]
   if (lastTurn && lastTurn.items.length > 0) return latestActivityBlockId
@@ -491,3 +547,10 @@ git commit -m "docs: mark freshagent-activity-line tasks complete with verificat
 - **Fork/rewind granularity:** a turn fully absorbed into an open line is no longer a fork/rewind target (its article does not render); the line's origin turn is the target. Server fork constraints (composite `turnId`) are honored: we never synthesize composite `turnId`s; the origin turn's own `turnId` is passed through unchanged.
 - **Streaming empty-turn suppression** only engages when the previous display turn has a trailing activity line of the same role; all other streaming-empty cases keep the current injected-strip behavior (jp70 hardening untouched).
 - **Role-change = boundary** matches the user's rule because a role change paints a visible header between strips; thinking/reasoning are line content, not boundaries.
+
+## Validated design notes (load-bearing stage, 2026-08-24)
+
+- **Zero-item turns are real** (Rust codex `subAgentActivity` rows emit `{role:"assistant", summary:"", items:[]}`; opencode structural messages likewise) and they render real article chrome today. The layout pass hard-closes any open line on a zero-item turn — two halves of a codex tool run split by a `subAgentActivity` marker therefore stay two strips. Residual, accepted: fixing THAT split needs a provider-level turn-shape decision, out of scope for this render-rule change.
+- **TS-claude item-id reuse across turns** (one provider message id spanning multiple JSONL lines yields duplicate `turn:<msg>:item:N` ids) is handled by display-only id dedupe in the absorb path; `toolUseId` stitching is verified unique (615MB × 813 real transcripts, zero repeats) and unaffected. Validators: `reports/load-bearing-validator-c2.md`, `reports/load-bearing-validator-n1.md`.
+- **Remount parity:** the merged line's React key changes whenever items append (key = joined display ids) — identical to today's in-turn streaming growth regime; expanded state surviving mid-stream appends is not a regression vector to preserve. Recorded residual.
+- **Non-streaming liveness:** mirrors the old last-turn trailing-thinking rule, extended to cover a last turn that was absorbed (its items close the latest line, so the check reads that line's trailing row).
