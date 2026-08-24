@@ -576,7 +576,13 @@ fn stored_pane_payload(reg: &TabsRegistry, device: &str, client: &str) -> Value 
     snapshot.records[0]["panes"][0]["payload"].clone()
 }
 
-fn push_opencode_durable(reg: &TabsRegistry, device: &str, client: &str, revision: i64) {
+fn push_opencode_durable(
+    reg: &TabsRegistry,
+    device: &str,
+    client: &str,
+    revision: i64,
+    updated_at: i64,
+) {
     reg.replace_client_snapshot(
         "srv-1",
         device,
@@ -586,7 +592,7 @@ fn push_opencode_durable(reg: &TabsRegistry, device: &str, client: &str, revisio
         vec![open_record_with_panes(
             "tab-1",
             "Agent tab",
-            10,
+            updated_at,
             vec![fresh_agent_pane(
                 "pane-1",
                 "opencode",
@@ -633,7 +639,7 @@ fn push_opencode_placeholder(
 fn cross_client_placeholder_push_is_clamped_to_the_durable_session_ref() {
     let reg = TabsRegistry::new();
     // Client A (device-a) holds the materialized durable identity.
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     // Client B (device-b) pushes the SAME tab/pane re-derived as a placeholder.
     let ack = reg
         .replace_client_snapshot(
@@ -681,7 +687,7 @@ fn same_client_repush_is_clamped_from_its_own_current_snapshot() {
     // The exact production regression: ONE client materializes `ses_…`, then a
     // later push of its own re-derives the placeholder.
     let reg = TabsRegistry::new();
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     push_opencode_placeholder(&reg, "device-a", "client-a1", 2, "crid-1", 20);
     let payload = stored_pane_payload(&reg, "device-a", "client-a1");
     assert_eq!(
@@ -697,7 +703,7 @@ fn placeholder_with_a_new_create_request_id_is_not_clamped() {
     // its placeholder even though the registry holds a durable identity for
     // the same tab/pane/provider.
     let reg = TabsRegistry::new();
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     push_opencode_placeholder(&reg, "device-b", "client-b1", 1, "crid-2", 20);
     let payload = stored_pane_payload(&reg, "device-b", "client-b1");
     assert_eq!(
@@ -711,7 +717,7 @@ fn placeholder_for_a_different_provider_is_not_clamped() {
     // Same tab/pane/createRequestId but a DIFFERENT provider: the durable
     // opencode identity must never leak into a codex pane.
     let reg = TabsRegistry::new();
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     reg.replace_client_snapshot(
         "srv-1",
         "device-b",
@@ -862,8 +868,10 @@ fn clamp_picks_the_newest_durable_identity_across_snapshots() {
         )],
     )
     .expect("older durable push accepted");
-    // ...and a NEWER durable identity for the same key on device-b.
-    push_opencode_durable(&reg, "device-b", "client-b1", 1);
+    // ...and a NEWER durable identity for the same key on device-b —
+    // STRICTLY greater updatedAt (20 > 10), so the winner is pinned by the
+    // event-time comparison itself, never by a sourceKey tie-break.
+    push_opencode_durable(&reg, "device-b", "client-b1", 1, 20);
     push_opencode_placeholder(&reg, "device-c", "client-c1", 1, "crid-1", 30);
     let payload = stored_pane_payload(&reg, "device-c", "client-c1");
     assert_eq!(
@@ -882,7 +890,7 @@ fn clamped_snapshot_passes_reopen_hash_validation() {
     let open_store =
         || crate::tabs_store::DurableTabsStore::open(dir.path(), default_caps(), 0).unwrap();
     let reg = TabsRegistry::with_durable_store(open_store(), None);
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     push_opencode_placeholder(&reg, "device-b", "client-b1", 1, "crid-1", 20);
     drop(reg);
 
@@ -905,7 +913,7 @@ fn identical_retry_after_a_clamped_push_is_deduped_on_the_raw_push_hash() {
     let open_store =
         || crate::tabs_store::DurableTabsStore::open(dir.path(), default_caps(), 0).unwrap();
     let reg = TabsRegistry::with_durable_store(open_store(), None);
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     let raw_placeholder = || {
         vec![open_record_with_panes(
             "tab-1",
@@ -962,7 +970,7 @@ fn persisted_generation_carries_the_clamped_records_not_the_raw_push() {
     // receive the COMMITTED (clamped) records, never the raw pushed payload.
     let dir = tempfile::tempdir().unwrap();
     let reg = TabsRegistry::with_persist_dir(dir.path().to_path_buf());
-    push_opencode_durable(&reg, "device-a", "client-a1", 1);
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
     push_opencode_placeholder(&reg, "device-b", "client-b1", 1, "crid-1", 20);
 
     let generation = crate::tabs_persist::read_generation(dir.path(), "device-b", 0)
