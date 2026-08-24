@@ -220,6 +220,58 @@ function rendersVisibly(item: FreshAgentTranscriptItem): boolean {
  * provider message id; stitching keys toolUseId, which is verified unique, so
  * stitching is unaffected — only React keys need this).
  */
+/*
+ * A non-empty turn summary is either an echo of one of the turn's own items
+ * (codex builds tool-row summaries from the first item — `summarize_codex_items`
+ * maps tool_use→name, command→command text, mcp_tool→"server:tool", etc.) or
+ * authored content with no item counterpart (e.g. claude keeps thinking text as
+ * the summary after a tool arrives, which the summary fallback paints while the
+ * turn is still empty). Only the authored kind is "something between" the tool
+ * runs: it can render, so the runs behind it are permanently separated — even
+ * later, when blocks exist and the base fallback no longer paints the summary.
+ * Echo summaries carry no extra rendering, so they never block a merge.
+ */
+const SUMMARY_LABEL_BY_KIND: Record<string, string> = {
+  file_change: 'File change',
+  context_compaction: 'Context compacted',
+}
+function itemEchoes(item: FreshAgentTranscriptItem): string[] {
+  const echoes: string[] = []
+  const push = (value: unknown) => {
+    if (typeof value === 'string' && value.trim().length > 0) echoes.push(value)
+  }
+  const rec = item as unknown as Record<string, unknown>
+  push(rec.text)
+  push(rec.name)
+  push(rec.command)
+  push(rec.query)
+  push(rec.path)
+  push(rec.tool)
+  if (typeof rec.server === 'string' && typeof rec.tool === 'string') {
+    push(`${rec.server}:${rec.tool}`)
+  }
+  if (typeof rec.event === 'string') push(`${rec.event} review mode`)
+  const joinStrings = (value: unknown) =>
+    Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string').join('\n') : ''
+  push(joinStrings(rec.summary))
+  push(joinStrings(rec.content))
+  const kind = typeof rec.kind === 'string' ? rec.kind : ''
+  push(SUMMARY_LABEL_BY_KIND[kind])
+  if (kind === 'tool_result') {
+    push(rec.isError === true ? 'Tool error' : 'Tool result')
+  }
+  return echoes
+}
+function summaryIsAuthoredContent(turn: FreshAgentTurn): boolean {
+  const summary = typeof turn.summary === 'string' ? turn.summary : ''
+  // Synthetic tool-result coalescing joins summaries with blank lines; judge
+  // each segment against the turn's items independently.
+  const segments = summary.split(/\n+/).map((segment) => segment.trim()).filter(Boolean)
+  if (segments.length === 0) return false
+  return turn.items.length === 0
+    || segments.some((segment) => !turn.items.some((item) => itemEchoes(item).some((echo) => echo.includes(segment))))
+}
+
 function buildTranscriptLayout(turns: FreshAgentTurn[]): {
   layouts: TurnLayout[]
   lineEndIndex: Map<number, number>
@@ -249,7 +301,10 @@ function buildTranscriptLayout(turns: FreshAgentTurn[]): {
     }
     for (const item of turn.items) {
       if (isActivityLike(item)) {
-        if (open && open.role === turn.role) {
+        // The authored-summary guard applies only to absorbing into a PREVIOUS
+        // turn's line. Once this turn has opened its own line, its later
+        // activity items chain into it normally.
+        if (open && open.role === turn.role && (open.originIndex === turnIndex || !summaryIsAuthoredContent(turn))) {
           const taken = new Set(open.items.map((openItem) => openItem.id))
           let displayItem = item
           let counter = 2

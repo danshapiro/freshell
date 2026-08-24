@@ -903,14 +903,14 @@ describe('FreshAgentTranscript', () => {
             id: 'native-turn',
             turnId: 'display-activity-1',
             role: 'assistant',
-            summary: 'first activity',
+            summary: 'first thought',
             items: [{ id: 'think-1', kind: 'thinking', text: 'first thought' }],
           },
           {
             id: 'native-turn',
             turnId: 'display-activity-2',
             role: 'assistant',
-            summary: 'second activity',
+            summary: 'second thought',
             items: [{ id: 'think-2', kind: 'thinking', text: 'second thought' }],
           },
         ]}
@@ -1738,7 +1738,40 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getByText('You')).toBeInTheDocument()
     })
 
-    it('pins the streaming summary cadence: summary shows while the last turn is empty, then the arriving tool joins the line', () => {
+    it('permanently separates tool runs when the follower turn carries a summary that is not an item echo', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-c', turnId: 'turn-c', role: 'assistant', summary: 'Wrapping up shortly',
+              items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+          ]}
+        />,
+      )
+      // The summary is authored content (no item says "Wrapping up shortly"), so
+      // the tool run behind it can never join the previous line — even after the
+      // base fallback stops painting the summary once blocks exist.
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('still merges a follower whose summary merely echoes one of its own items (codex tool preview)', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: '',
+              items: [{ id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-c', turnId: 'turn-c', role: 'assistant', summary: 'Read',
+              items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+    })
+
+    it('pins the streaming summary cadence: an authored summary permanently keeps the following tool run on its own line', () => {
       const turnA = {
         id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
         items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
@@ -1753,17 +1786,17 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getByText('Wrapping up shortly')).toBeInTheDocument()
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
 
-      // Frame 2: the tool arrives in the same turn. Nothing renders between the
-      // two tool runs — the summary is hidden by the long-standing fallback rule
-      // (blocks suppress it) — so the tool joins the open line in place.
+      // Frame 2: the tool arrives in the same turn. The authored summary rendered
+      // between the two tool runs, so they are permanently separated — the base
+      // fallback still hides the summary once blocks exist, but the run keeps its
+      // own line and never retro-merges into the previous one.
       const turnCWithTool = {
         ...turnCEmpty,
         items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
       }
       rerender(<FreshAgentTranscript isStreaming turns={[turnA, turnCWithTool]} />)
-      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
-      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('Read')
-      expect(screen.queryByText('Wrapping up shortly')).not.toBeInTheDocument()
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      expect(screen.getByText('Read')).toBeInTheDocument()
     })
   })
 })
