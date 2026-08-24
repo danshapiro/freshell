@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
+import type { FreshAgentTranscriptItem, FreshAgentTurn } from '@shared/fresh-agent-contract'
 
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
 // in React.lazy + Suspense; mocking it to render MarkdownRenderer directly removes
@@ -456,7 +457,7 @@ describe('FreshAgentTranscript', () => {
     expect(strips[0]).toHaveTextContent('1 tool used')
   })
 
-  it('keeps consecutive activity-only assistant turns separate while marking only the latest live', () => {
+  it('collapses consecutive activity-only assistant turns into one live strip', () => {
     render(
       <FreshAgentTranscript
         isStreaming
@@ -507,14 +508,14 @@ describe('FreshAgentTranscript', () => {
       />,
     )
 
-    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(3)
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
     expect(screen.getAllByLabelText('running')).toHaveLength(1)
-    expect(screen.getByText('src/three.ts')).toBeInTheDocument()
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[2])
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+    expect(screen.getByText('src/one.ts')).toBeInTheDocument()
+    expect(screen.getByText('src/two.ts')).toBeInTheDocument()
+    expect(screen.getByText('src/three.ts')).toBeInTheDocument()
     expect(screen.getAllByLabelText('running')).toHaveLength(1)
-    fireEvent.click(screen.getAllByRole('button', { name: 'Toggle activity details' })[0])
-    expect(screen.getAllByLabelText('complete').length).toBeGreaterThanOrEqual(1)
   })
 
   it('folds Claude user-role tool results into the assistant activity instead of attributing them to You', () => {
@@ -635,9 +636,11 @@ describe('FreshAgentTranscript', () => {
       .filter(Boolean)
     expect(visibleHeaders).toEqual(['You', 'Freshclaude'])
     expect(container.querySelectorAll('[data-turn-role="user"] .fresh-agent-activity-strip')).toHaveLength(0)
+    // The two exchanges are adjacent same-role activity-only turns after
+    // synthetic-result coalescing: one accumulating line, '2 tools used'.
     const strips = screen.getAllByRole('region', { name: 'Activity strip' })
-    expect(strips).toHaveLength(2)
-    expect(strips.every((strip) => strip.textContent?.includes('1 tool used'))).toBe(true)
+    expect(strips).toHaveLength(1)
+    expect(strips[0]).toHaveTextContent('2 tools used')
   })
 
   it('shows the speaker label once for consecutive turns from the same role', () => {
@@ -889,7 +892,7 @@ describe('FreshAgentTranscript', () => {
       .toHaveTextContent('1 tool used · 1 file changed')
   })
 
-  it('keeps adjacent activity-only display turns distinct and actionable', () => {
+  it('merges adjacent activity-only display turns into one line actionable from the line end', () => {
     const onFork = vi.fn()
     render(
       <FreshAgentTranscript
@@ -914,11 +917,13 @@ describe('FreshAgentTranscript', () => {
       />,
     )
 
-    expect(screen.getAllByRole('article', { name: 'Assistant transcript turn' })).toHaveLength(2)
-    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    expect(screen.getAllByRole('article', { name: 'Assistant transcript turn' })).toHaveLength(1)
+    expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
 
+    // Fork protection is preserved at line granularity: the merged article's
+    // fork resolves to the line's last contributing turn.
     const forkButtons = screen.getAllByRole('button', { name: 'Fork conversation from here' })
-    fireEvent.click(forkButtons[1])
+    fireEvent.click(forkButtons[0])
     expect(onFork).toHaveBeenCalledWith('display-activity-2')
   })
 
@@ -1202,10 +1207,13 @@ describe('FreshAgentTranscript', () => {
         />,
       )
 
+      // The injected empty strip is suppressed: the previous turn's line
+      // carries the live reel, so exactly one strip shows one running
+      // indicator, and the settled '1 tool used' text is not shown while live.
       expect(screen.getAllByLabelText('running')).toHaveLength(1)
       const strips = screen.getAllByRole('region', { name: 'Activity strip' })
-      expect(strips).toHaveLength(2)
-      expect(strips[0]).toHaveTextContent('1 tool used')
+      expect(strips).toHaveLength(1)
+      expect(strips[0]).not.toHaveTextContent('1 tool used')
     })
 
     it('drops a non-streaming turn when all items are filtered out', () => {
@@ -1480,6 +1488,217 @@ describe('FreshAgentTranscript', () => {
       fireEvent.contextMenu(screen.getByRole('article', { name: 'Assistant transcript turn' }))
       const item = screen.getByRole('menuitem', { name: 'Rewind code to here' })
       expect(item).toBeDisabled()
+    })
+  })
+
+  describe('activity line collapse', () => {
+    const toolTurn = (turnId: string, calls: Array<[string, string]>): FreshAgentTurn => ({
+      id: turnId,
+      turnId,
+      role: 'assistant',
+      summary: '',
+      items: calls.flatMap(([callId, filePath]): FreshAgentTranscriptItem[] => [
+        { id: `tool-${callId}`, kind: 'tool_use', toolUseId: callId, name: 'Read', input: { file_path: filePath } },
+        { id: `result-${callId}`, kind: 'tool_result', toolUseId: callId, content: 'ok', isError: false },
+      ]),
+    })
+
+    it('collapses adjacent same-role tool-only turns into one accumulating strip line', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'req',
+              items: [{ id: 'item-user', kind: 'text', text: 'read five files' }] },
+            toolTurn('turn-a', [['c1','src/a.ts'],['c2','src/b.ts'],['c3','src/c.ts']]),
+            toolTurn('turn-b', [['c4','src/d.ts'],['c5','src/e.ts']]),
+          ]}
+        />,
+      )
+      const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+      expect(strips).toHaveLength(1)
+      expect(strips[0]).toHaveTextContent('5 tools used')
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getAllByText(/^src\/[a-e]\.ts$/)).toHaveLength(5)
+      expect(screen.getByText('src/e.ts')).toBeInTheDocument()
+    })
+
+    it('keeps tool lines separate when a message renders between them', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts']]),
+            { id: 'turn-msg', turnId: 'turn-msg', role: 'assistant', summary: 'note',
+              items: [{ id: 'item-msg', kind: 'text', text: 'First file read.' }] },
+            toolTurn('turn-b', [['c2','src/b.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('does not collapse tool lines across a role change', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts']]),
+            { ...toolTurn('turn-b', [['c2','src/b.ts']]), role: 'tool' },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+      // the role change renders a header between the lines
+      expect(screen.getByText('Tool')).toBeInTheDocument()
+    })
+
+    it('a trailing text card in the earlier turn keeps the lines separate', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            { id: 'turn-a', turnId: 'turn-a', role: 'assistant', summary: 'work',
+              items: [
+                { id: 'tool-c1', kind: 'tool_use', toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } },
+                { id: 'item-msg', kind: 'text', text: 'done with a' },
+              ] },
+            toolTurn('turn-b', [['c2','src/b.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('merges a chain of three adjacent tool-only turns', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts'],['c2','src/b.ts']]),
+            toolTurn('turn-b', [['c3','src/c.ts'],['c4','src/d.ts']]),
+            toolTurn('turn-c', [['c5','src/e.ts'],['c6','src/f.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('6 tools used')
+    })
+
+    it('fully absorbed turns render no article and fork targets the line end', () => {
+      const onFork = vi.fn()
+      render(
+        <FreshAgentTranscript
+          canFork
+          onForkFromTurn={onFork}
+          turns={[
+            { id: 'turn-a', turnId: 'native-a', role: 'assistant', summary: '',
+              items: [{ id: 't1', kind: 'thinking', text: 'first thought' }] },
+            { id: 'turn-b', turnId: 'native-b', role: 'assistant', summary: '',
+              items: [{ id: 't2', kind: 'thinking', text: 'second thought' }] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('article', { name: 'Assistant transcript turn' })).toHaveLength(1)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      // merged thinking-only line settles to 'thought'
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByText('Thinking')).toBeInTheDocument()
+      const forkButtons = screen.getAllByRole('button', { name: 'Fork conversation from here' })
+      fireEvent.click(forkButtons[0])
+      expect(onFork).toHaveBeenCalledWith('native-b')
+    })
+
+    it('treats a zero-item turn as a boundary between tool lines', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts']]),
+            { id: 'turn-empty', turnId: 'turn-empty', role: 'assistant', summary: '', items: [] },
+            toolTurn('turn-b', [['c2','src/b.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+    })
+
+    it('renders both tools when TS-claude duplicate item ids collide across merged turns', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            { id: 'turn-a', turnId: 'turn:msg-1', role: 'assistant', summary: '',
+              items: [{ id: 'turn:msg-1:item:0', kind: 'tool_use', toolUseId: 'toolu_1', name: 'Read', input: { file_path: 'src/a.ts' } }] },
+            { id: 'turn-b', turnId: 'turn:msg-1', role: 'assistant', summary: '',
+              items: [{ id: 'turn:msg-1:item:0', kind: 'tool_use', toolUseId: 'toolu_2', name: 'Read', input: { file_path: 'src/b.ts' } }] },
+          ]}
+        />,
+      )
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
+      expect(screen.getByText('src/a.ts')).toBeInTheDocument()
+      expect(screen.getByText('src/b.ts')).toBeInTheDocument()
+    })
+
+    it('extends the open line in place as adjacent tool turns stream in (same DOM node, no regroup)', () => {
+      const userTurn = {
+        id: 'turn-user', turnId: 'turn-user', role: 'user' as const, summary: 'req',
+        items: [{ id: 'item-user', kind: 'text' as const, text: 'read five files' }],
+      }
+      const turnA = toolTurn('turn-a', [['c1','src/a.ts'],['c2','src/b.ts'],['c3','src/c.ts']])
+      const { rerender } = render(<FreshAgentTranscript turns={[userTurn, turnA]} />)
+      const first = screen.getByRole('region', { name: 'Activity strip' })
+      expect(first).toHaveTextContent('3 tools used')
+
+      rerender(<FreshAgentTranscript turns={[userTurn, turnA, toolTurn('turn-b', [['c4','src/d.ts'],['c5','src/e.ts']])]} />)
+      const merged = screen.getByRole('region', { name: 'Activity strip' })
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      expect(merged).toBe(first)
+      expect(merged).toHaveTextContent('5 tools used')
+    })
+
+    it('keeps two same-turn lines distinct when a message splits them (tool → text → tool)', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[{
+            id: 'turn-mixed', turnId: 'turn-mixed', role: 'assistant', summary: '',
+            items: [
+              { id: 'tool-a', kind: 'tool_use', toolUseId: 'ca', name: 'Read', input: { file_path: 'src/a.ts' } },
+              { id: 'item-note', kind: 'text', text: 'first pass done' },
+              { id: 'tool-b', kind: 'tool_use', toolUseId: 'cb', name: 'Read', input: { file_path: 'src/b.ts' } },
+            ],
+          }]}
+        />,
+      )
+      const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+      expect(strips).toHaveLength(2)
+      expect(strips[0]).toHaveTextContent('1 tool used')
+      expect(strips[1]).toHaveTextContent('1 tool used')
+    })
+
+    it('an invisible (whitespace-only) text item does not split the line', () => {
+      render(
+        <FreshAgentTranscript
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts']]),
+            { id: 'turn-empty-text', turnId: 'turn-empty-text', role: 'assistant', summary: '',
+              items: [{ id: 'item-empty', kind: 'text', text: '   ' }] },
+            toolTurn('turn-b', [['c2','src/b.ts']]),
+          ]}
+        />,
+      )
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+    })
+
+    it('hands liveness to the merged line across an absorbed previous turn while the last turn streams empty', () => {
+      render(
+        <FreshAgentTranscript
+          isStreaming
+          turns={[
+            toolTurn('turn-a', [['c1','src/a.ts']]),
+            toolTurn('turn-b', [['c2','src/b.ts']]),
+            { id: 'turn-streaming', turnId: 'turn-streaming', role: 'assistant', summary: '', items: [] },
+          ]}
+        />,
+      )
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      expect(screen.getAllByLabelText('running')).toHaveLength(1)
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('Read')
+      expect(screen.queryByText('2 tools used')).not.toBeInTheDocument()
     })
   })
 })

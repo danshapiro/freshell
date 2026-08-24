@@ -1002,3 +1002,146 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
   })
 })
+
+test.describe('activity line collapse', () => {
+  async function seedCollapsePane(
+    page: Parameters<typeof openPanePicker>[0],
+    terminal: { waitForTerminal: () => Promise<void> },
+    sessionId: string,
+    turns: unknown[],
+  ) {
+    // Mirrors the setup of the 'style setting persists per Fresh Agent pane type
+    // and applies serif rendering' test above (freshcodex picker flow, routed
+    // snapshot, leaf-walk + panes/updatePaneContent dispatch), minus the style
+    // filter and style-specific seeded content.
+    await terminal.waitForTerminal()
+    await enableClaudeAndCodex(page)
+
+    const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    await page.getByRole('option').first().click()
+    // The picker selection lands in the panes store a beat before/after the
+    // fresh-agent pane mounts; wait for the pane before seeding its session.
+    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 10_000 })
+
+    const lastTurnId = (turns[turns.length - 1] as { id?: string } | undefined)?.id ?? ''
+    await page.route(`**/api/fresh-agent/threads/freshcodex/codex/${sessionId}*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: sessionId,
+          sessionId,
+          revision: 1,
+          latestTurnId: lastTurnId,
+          status: 'idle',
+          summary: '',
+          capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+          settings: { model: 'gpt-5.4-flash', permissionMode: 'on-request', effort: 'high', plugins: [] },
+          tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          worktrees: [],
+          diffs: [],
+          turns,
+        }),
+      })
+    })
+    await expect.poll(async () => page.evaluate((sid) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const findFreshcodexLeaf = (node: any): any => {
+        if (!node) return null
+        if (
+          node.type === 'leaf'
+          && node.content?.kind === 'fresh-agent'
+          && node.content.sessionType === 'freshcodex'
+        ) {
+          return node
+        }
+        if (node.type === 'split') {
+          return findFreshcodexLeaf(node.children?.[0]) ?? findFreshcodexLeaf(node.children?.[1])
+        }
+        return null
+      }
+      let tabId: string | null = null
+      let leaf: any = null
+      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+        const candidateLeaf = findFreshcodexLeaf(layout)
+        if (candidateLeaf) {
+          tabId = candidateTabId
+          leaf = candidateLeaf
+        }
+      }
+      if (!tabId || !leaf) return false
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId,
+          paneId: leaf.id,
+          content: {
+            ...leaf.content,
+            sessionId: sid,
+            sessionRef: { provider: 'codex', sessionId: sid },
+            resumeSessionId: sid,
+            status: 'idle',
+            settingsDismissed: true,
+          },
+        },
+      })
+      return true
+    }, sessionId), { timeout: 10_000 }).toBe(true)
+  }
+
+  function toolTurn(turnId: string, calls: Array<[string, string]>) {
+    // calls: [callId, filePath] pairs; produces an assistant turn whose items are
+    // tool_use(toolUseId=callId, name:'Read', input:{file_path}) followed by its
+    // tool_result(content:'ok').
+    return {
+      id: turnId,
+      turnId,
+      role: 'assistant',
+      summary: '',
+      items: calls.flatMap(([callId, filePath]) => [
+        { id: `tool-${callId}`, kind: 'tool_use', toolUseId: callId, name: 'Read', input: { file_path: filePath } },
+        { id: `result-${callId}`, kind: 'tool_result', toolUseId: callId, content: 'ok', isError: false },
+      ]),
+    }
+  }
+
+  test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ freshellPage: _freshellPage, page, harness: _harness, terminal }) => {
+    await seedCollapsePane(page, terminal, 'collapse-thread', [
+      { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'read files',
+        items: [{ id: 'item-user', kind: 'text', text: 'read these five files' }] },
+      toolTurn('turn-a', [['c1', 'src/a.ts'], ['c2', 'src/b.ts'], ['c3', 'src/c.ts']]),
+      toolTurn('turn-b', [['c4', 'src/d.ts'], ['c5', 'src/e.ts']]),
+    ])
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
+    const strips = pane.getByRole('region', { name: 'Activity strip' })
+    await expect(strips).toHaveCount(1)
+    await expect(strips.first()).toContainText('5 tools used')
+    await pane.getByRole('button', { name: 'Toggle activity details' }).click()
+    await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
+    await expect(pane.getByText('src/a.ts')).toBeVisible()
+    await expect(pane.getByText('src/e.ts')).toBeVisible()
+  })
+
+  test('an intervening message keeps two tool lines separate', async ({ freshellPage: _freshellPage, page, harness: _harness, terminal }) => {
+    await seedCollapsePane(page, terminal, 'split-thread', [
+      toolTurn('turn-a', [['c1', 'src/a.ts']]),
+      { id: 'turn-msg', turnId: 'turn-msg', role: 'assistant', summary: 'note',
+        items: [{ id: 'item-msg', kind: 'text', text: 'First file read.' }] },
+      toolTurn('turn-b', [['c2', 'src/b.ts']]),
+    ])
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
+    const strips = pane.getByRole('region', { name: 'Activity strip' })
+    await expect(strips).toHaveCount(2)
+    await expect(strips.nth(0)).toContainText('1 tool used')
+    await expect(strips.nth(1)).toContainText('1 tool used')
+  })
+})
