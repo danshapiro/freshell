@@ -2925,6 +2925,55 @@ describe('panesSlice', () => {
       expect(content.createRequestId).toBe(OPENCODE_CRID)
     })
 
+    it('clamps at the mergeTerminalState site itself: emits the merge-sourced guard warn before normalize runs', () => {
+      // RED when ONLY the merge-site wiring is removed: the hydrate test above
+      // stays green because normalizePaneContent clamps afterward (its
+      // reference is the un-merged local node), so a pure state assertion
+      // cannot pin mergeTerminalState. What only the merge site emits is the
+      // clamp warn tagged `source: 'mergeTerminalState'` — the normalize site
+      // tags the same message with `source: 'normalizePaneContent'`.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const seeded = panesReducer(
+          initialState,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+          })),
+        )
+
+        panesReducer(
+          seeded,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: placeholderOpencodeContent() },
+          })),
+        )
+
+        const clampWarns = warnSpy.mock.calls.filter(
+          (call) => typeof call[1] === 'string'
+            && call[1].startsWith('Clamped a re-derived placeholder fresh-agent sessionRef'),
+        )
+        const sources = clampWarns.map((call) => (call[2] as { source: string }).source)
+        expect(sources).toContain('mergeTerminalState')
+        // The merge clamp runs first and resolves the identity, so normalize
+        // must NOT need its own clamp on this path (its warn would carry a
+        // placeholderSessionId only if the incoming fold still held one).
+        expect(sources).not.toContain('normalizePaneContent')
+
+        const mergeWarn = clampWarns.find(
+          (call) => (call[2] as { source: string }).source === 'mergeTerminalState',
+        )
+        expect(mergeWarn?.[2]).toMatchObject({
+          source: 'mergeTerminalState',
+          provider: 'opencode',
+          createRequestId: OPENCODE_CRID,
+          preservedSessionId: OPENCODE_DURABLE_ID,
+          placeholderSessionId: `freshopencode-${OPENCODE_CRID}`,
+        })
+      } finally {
+        warnSpy.mockRestore()
+      }
+    })
+
     it('keeps the durable sessionRef when updatePaneContent folds a placeholder payload for the same provider+createRequestId', () => {
       const seeded = panesReducer(
         initialState,
