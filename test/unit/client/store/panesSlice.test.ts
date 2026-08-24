@@ -2878,13 +2878,17 @@ describe('panesSlice', () => {
       })
     }
 
-    function placeholderOpencodeContent(createRequestId = OPENCODE_CRID): FreshAgentPaneContent {
+    function placeholderOpencodeContent(
+      createRequestId = OPENCODE_CRID,
+      overrides: Partial<FreshAgentPaneContent> = {},
+    ): FreshAgentPaneContent {
       const placeholderId = `freshopencode-${createRequestId}`
       return opencodeFreshAgentContent({
         createRequestId,
         sessionId: placeholderId,
         resumeSessionId: placeholderId,
         sessionRef: { provider: 'opencode', sessionId: placeholderId },
+        ...overrides,
       })
     }
 
@@ -2923,6 +2927,32 @@ describe('panesSlice', () => {
       expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
       expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
       expect(content.createRequestId).toBe(OPENCODE_CRID)
+    })
+
+    it('still clamps a regressed status carried by the same placeholder payload (identity clamp composes with the status arm)', () => {
+      const seeded = panesReducer(
+        initialState,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+        })),
+      )
+
+      // The stale placeholder payload also regresses status back to an early
+      // state ('starting') while local is past it ('idle'). The identity clamp
+      // must not early-return past the status-regression protection arm.
+      const merged = panesReducer(
+        seeded,
+        hydratePanes(stateWithLayout({
+          'tab-1': { type: 'leaf', id: 'pane-1', content: placeholderOpencodeContent(undefined, { status: 'starting' }) },
+        })),
+      )
+
+      const content = freshAgentLeaf(merged)
+      expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+      expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+      expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
+      expect(content.createRequestId).toBe(OPENCODE_CRID)
+      expect(content.status).toBe('idle')
     })
 
     it('clamps at the mergeTerminalState site itself: emits the merge-sourced guard warn before normalize runs', () => {

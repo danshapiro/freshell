@@ -895,42 +895,47 @@ function mergeTerminalState(
             preservedSessionId: preservedIdentity.sessionRef?.sessionId,
             placeholderSessionId: sanitizeSessionRef(incoming.content.sessionRef)?.sessionId,
           })
-          return {
-            ...incoming,
-            content: {
-              ...incoming.content,
-              ...preservedIdentity,
-            },
-          }
         }
+        // The identity clamp restores the durable identity tuple but must not
+        // early-return past the sibling arms: `status` is the one field that
+        // can still arrive regressed in the same stale payload, so the
+        // early-status protection below composes on top of the restored
+        // identity. `incomingContent` is `incoming.content` verbatim when no
+        // clamp fired, so every other path behaves byte-identically.
+        const incomingContent = preservedIdentity
+          ? { ...incoming.content, ...preservedIdentity }
+          : incoming.content
         if (
           shouldPreserveLocalCanonicalResumeSessionId(
             local.content.resumeSessionId,
-            incoming.content.resumeSessionId,
+            incomingContent.resumeSessionId,
           )
         ) {
           return {
             ...incoming,
             content: {
-              ...incoming.content,
+              ...incomingContent,
               resumeSessionId: local.content.resumeSessionId,
               sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
             },
           }
         }
         // Preserve local sessionId if incoming doesn't have it yet
-        if (local.content.sessionId && !incoming.content.sessionId) {
+        if (local.content.sessionId && !incomingContent.sessionId) {
           return { ...incoming, content: local.content }
         }
         // Don't regress back to early states (creating/starting) once past them.
         // Normal cycles like running→idle are fine and must not be blocked.
-        if (local.content.sessionId && incoming.content.sessionId === local.content.sessionId) {
+        if (local.content.sessionId && incomingContent.sessionId === local.content.sessionId) {
           const EARLY_STATES = new Set(['creating', 'starting'])
           const localStatus = local.content.status ?? ''
-          const incomingStatus = incoming.content.status ?? ''
+          const incomingStatus = incomingContent.status ?? ''
           if (!EARLY_STATES.has(localStatus) && EARLY_STATES.has(incomingStatus)) {
-            return { ...incoming, content: { ...incoming.content, status: local.content.status } }
+            return { ...incoming, content: { ...incomingContent, status: local.content.status } }
           }
+        }
+        if (preservedIdentity) {
+          return { ...incoming, content: incomingContent }
         }
       }
     }
