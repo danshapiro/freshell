@@ -1737,5 +1737,33 @@ describe('FreshAgentTranscript', () => {
       expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
       expect(screen.getByText('You')).toBeInTheDocument()
     })
+
+    it('pins the streaming summary cadence: summary shows while the last turn is empty, then the arriving tool joins the line', () => {
+      const turnA = {
+        id: 'turn-a', turnId: 'turn-a', role: 'assistant' as const, summary: '',
+        items: [{ id: 'tool-c1', kind: 'tool_use' as const, toolUseId: 'c1', name: 'Read', input: { file_path: 'src/a.ts' } }],
+      }
+      const turnCEmpty = {
+        id: 'turn-c', turnId: 'turn-c', role: 'assistant' as const,
+        summary: 'Wrapping up shortly', items: [],
+      }
+      // Frame 1: summary-only streaming tail renders its summary plus the injected
+      // live strip (matches the pre-change summary-fallback behavior).
+      const { rerender } = render(<FreshAgentTranscript isStreaming turns={[turnA, turnCEmpty]} />)
+      expect(screen.getByText('Wrapping up shortly')).toBeInTheDocument()
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(2)
+
+      // Frame 2: the tool arrives in the same turn. Nothing renders between the
+      // two tool runs — the summary is hidden by the long-standing fallback rule
+      // (blocks suppress it) — so the tool joins the open line in place.
+      const turnCWithTool = {
+        ...turnCEmpty,
+        items: [{ id: 'tool-c2', kind: 'tool_use' as const, toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+      }
+      rerender(<FreshAgentTranscript isStreaming turns={[turnA, turnCWithTool]} />)
+      expect(screen.getAllByRole('region', { name: 'Activity strip' })).toHaveLength(1)
+      expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('Read')
+      expect(screen.queryByText('Wrapping up shortly')).not.toBeInTheDocument()
+    })
   })
 })
