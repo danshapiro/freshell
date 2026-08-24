@@ -1112,7 +1112,7 @@ test.describe('activity line collapse', () => {
     }
   }
 
-  test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ freshellPage: _freshellPage, page, harness: _harness, terminal }) => {
+  test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await seedCollapsePane(page, terminal, 'collapse-thread', [
       { id: 'turn-user', turnId: 'turn-user', role: 'user', summary: 'read files',
         items: [{ id: 'item-user', kind: 'text', text: 'read these five files' }] },
@@ -1128,6 +1128,12 @@ test.describe('activity line collapse', () => {
     await expect(pane.getByRole('button', { name: 'Read tool call' })).toHaveCount(5)
     await expect(pane.getByText('src/a.ts')).toBeVisible()
     await expect(pane.getByText('src/e.ts')).toBeVisible()
+    // A merged line's fork affordance resolves to the line's LAST contributing turn.
+    const lineArticle = pane.locator('article[data-turn-index="1"]')
+    await lineArticle.hover()
+    await lineArticle.getByRole('button', { name: 'Fork conversation from here' }).click()
+    const forkFrame = ((await harness.getSentWsMessages()) as any[]).find((m) => m?.type === 'freshAgent.fork')
+    expect(forkFrame?.input?.atTurnId).toBe('turn-b')
   })
 
   test('an intervening message keeps two tool lines separate', async ({ freshellPage: _freshellPage, page, harness: _harness, terminal }) => {

@@ -47,7 +47,7 @@ In fresh-agent transcripts, adjacent tool-activity lines with nothing rendered b
 - Consumes: existing harness pattern — `page.route('**/api/fresh-agent/threads/freshcodex/codex/<session>*', ...)` fulfilling the snapshot REST call; picker flow via `openPanePicker(page)`; `panes/updatePaneContent` dispatch to point the pane at the seeded session (see the 'style setting persists per Fresh Agent pane type and applies serif rendering' test in the same file for the exact flow).
 - Produces: two failing e2e tests proving the pre-fix behavior (later turned green by Task 2).
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 Append a new `test.describe('activity line collapse', ...)` block at the end of `test/e2e-browser/specs/fresh-agent.spec.ts`, reusing the same file's picker/*route* seeding pattern:
 
@@ -124,7 +124,7 @@ test.describe('activity line collapse', () => {
 
 The helper prose comments marked `NOTE TO IMPLEMENTER` must be replaced with the actual copied setup code from the serif test (lines ~233–374 of the same file at base).
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "activity line collapse"`
 
@@ -142,7 +142,7 @@ Do NOT commit. The failing e2e is staged with Task 2's commit once green.
 - Consumes: `FreshAgentTurn`, `FreshAgentTranscriptItem` from `@shared/fresh-agent-contract`; existing `buildActivity`, `isActivityLike`, `FreshAgentActivityStrip`, `FreshAgentTurnArticle`.
 - Produces: `buildTranscriptLayout(turns: FreshAgentTurn[]): { layouts: TurnLayout[]; lineEndIndex: Map<number, number>; tail: { blockId: string; turnIndex: number } | null }` (module-scope pure function, not exported; `lineEndIndex` maps a line's origin-turn index → the index of the line's LAST contributing display turn; `tail` names the last rendered block when it is an activity line), `rendersVisibly(...)`, `selectLiveActivityBlockIdFromLayout(...)`; `FreshAgentTurnArticle` gains `blocks: RenderBlock[]` and `actionTurn: FreshAgentTurn` props and drops its internal `buildBlocks` call.
 
-- [ ] **Step 1: Write the failing behavioral tests (new unit cases)**
+- [x] **Step 1: Write the failing behavioral tests (new unit cases)**
 
 Add to `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx` (a new `describe('activity line collapse', ...)`):
 
@@ -361,13 +361,13 @@ describe('activity line collapse', () => {
 
 (Note: thinking items require `showThinking` default true — the component default is `true`; these turns are activity-only thinking runs merging into one line, matching the "second thought" gh-of the old :892 test.)
 
-- [ ] **Step 2: Run the new tests and verify the intended failure**
+- [x] **Step 2: Run the new tests and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx -t "activity line collapse"`
 
 Expected: FAIL — the collapse/merge/absorb cases currently render 2/2/2/1+2/more strips and articles because strip boundaries are per-turn (per-turn `buildBlocks` in `FreshAgentTurnArticle`, `FreshAgentTranscript.tsx:497`). The 'keeps separate' and 'trailing text' cases may pass already (they assert preserved boundaries).
 
-- [ ] **Step 3: Add the production implementation**
+- [x] **Step 3: Add the production implementation**
 
 In `src/components/fresh-agent/FreshAgentTranscript.tsx`:
 
@@ -587,7 +587,7 @@ Note the article still renders its fallback summary path only when `blocks.lengt
 3. `'keeps adjacent activity-only display turns distinct and actionable'` (:892) — replace with the line-end-fork test from Step 1 (last case); the protection is preserved at line granularity: the single merged article's fork resolves to the line's last contributing turn (`display-activity-2`), delete the old two-article/two-strip assertions.
 4. `'does not show a second running indicator on an earlier turn when the streaming last turn has no displayable items'` (:1179) — new expected behavior: exactly 1 strip total (the injected empty strip is suppressed; the previous turn's line carries the live reel), one `running` indicator, and the settled text `'1 tool used'` is NOT shown while live.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 
@@ -595,11 +595,11 @@ Expected: PASS (all new cases plus the rewritten legacy cases) then:
 Run: `npm run test:e2e -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "activity line collapse"`
 Expected: PASS (Task 1's failing test is now green).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Specific cleanups: remove the now-unused `buildBlocks` function IF nothing else uses it (check `selectLiveActivityBlockId`'s replacement consumed the last caller — delete dead code and any now-unused `options` plumbing in `FreshAgentTurnArticle`); dedupe the `messageSeenInTurn` + `flushOpen` sequence if it reads cleaner extracted; keep `buildTranscriptLayout` and the live-selection function adjacent and pure. No behavior change.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: every spec rendering `FreshAgentTranscript` or its children (the article/strip DOM contract changed: absorbed turns no longer render articles; strip mounting position unchanged otherwise).
 
@@ -611,7 +611,7 @@ Then the e2e surface that touches fresh-agent DOM: `npm run test:e2e -- test/e2e
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/components/fresh-agent/FreshAgentTranscript.tsx \
@@ -630,23 +630,23 @@ git commit -m "feat(fresh-agent): collapse adjacent tool activity into one accum
 - Consumes: the Task 2 implementation.
 - Produces: verification receipts for the recap.
 
-- [ ] **Step 1: Reading-time sanity of the browser_use script**
+- [x] **Step 1: Reading-time sanity of the browser_use script**
 
 Verify by inspection (no edit expected) that `test/browser_use/tool_coalesce.py`'s goal ("consecutive tool uses in an assistant turn appear as ONE strip showing 'N tools used'") remains satisfied: within-turn grouping is unchanged, and the script's per-turn lookups still find one strip per message turn. Record the conclusion in the task receipt.
 
-- [ ] **Step 2: Typecheck + lint the touched surface**
+- [x] **Step 2: Typecheck + lint the touched surface**
 
 Run: `npx tsc --noEmit -p .` from the worktree and `npm run lint -- src/components/fresh-agent/FreshAgentTranscript.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/e2e-browser/specs/fresh-agent.spec.ts`
 
 Expected: PASS (eslint-plugin-jsx-a11y clean — no new interactive DOM added).
 
-- [ ] **Step 3: Confirm no other render callers construct turn blocks differently**
+- [x] **Step 3: Confirm no other render callers construct turn blocks differently**
 
 Run: `grep -rn "buildBlocks\|coalesceSyntheticToolResultTurns" src/ test/unit | grep -v FreshAgentTranscript.tsx || true`
 
 Expected: EMPTY output — the transcript test and component are the only references; `FreshAgentView.tsx`/`FreshAgentMobile` consume `FreshAgentTranscript` as a component (no direct block construction). (`|| true` required: empty matches exit 1.)
 
-- [ ] **Step 4: Record outcomes and commit (only if receipts/notes were written as part of the run log)**
+- [x] **Step 4: Record outcomes and commit (only if receipts/notes were written as part of the run log)**
 
 ```bash
 git add docs/plans/2026-08-23-freshagent-activity-line.md
