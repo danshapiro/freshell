@@ -25,7 +25,8 @@
 //!   original's empty-state response really is `{ directories: [] }`.
 //! * `POST /api/files/validate-dir` \u2014 mirrors `files-router.ts:232` +
 //!   `path-utils.ts#isReachableDirectory`: normalize the user path (`~` expansion,
-//!   trailing-separator trim), `stat` it, and report `{ valid, resolvedPath }`
+//!   trailing-separator trim, lexical `.`/`..` collapse — the `path.posix.resolve`
+//!   of path-utils.ts:69-70), `stat` it, and report `{ valid, resolvedPath }`
 //!   (`valid` iff it resolves to an existing directory).
 //!
 //! Both routes are gated by the shared auth token (via [`crate::boot::is_authed`],
@@ -459,7 +460,13 @@ async fn complete(
 /// common "directory already there" case never takes that branch. This port
 /// therefore never pre-checks existence \u2014 it always attempts the create and
 /// reports `existed` purely from what `create_dir_all` tells it (i.e. never true
-/// on success), matching the original's observable behavior exactly.
+/// on success), matching the original's observable behavior exactly. Both of
+/// the original's 409 "Path exists but is not a directory" branches are mapped:
+/// EEXIST-on-a-non-directory (`files-router.ts:265-271`, the target itself is
+/// an existing file) and ENOTDIR (`files-router.ts:272-274`, an INTERMEDIATE
+/// component is a file, e.g. mkdir of `<existing-file>/sub` — the target does
+/// not exist, so this maps from `ErrorKind::NotADirectory`, never from an
+/// existence re-check).
 /// Windows-flavor inputs convert through the WSL mount before create_dir_all; inputs with no native address on this host are rejected with 400 instead of creating a literal backslash-named directory.
 async fn mkdir(
     State(state): State<FilesState>,
@@ -498,14 +505,19 @@ async fn mkdir(
         }
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => forbidden_msg("Permission denied"),
+            // Node's ENOTDIR branch (`files-router.ts:272-274`): an INTERMEDIATE
+            // path component exists but is not a directory (e.g. mkdir of
+            // `<existing-file>/sub`) → 409. The target itself does NOT exist in
+            // this case, so it must be mapped from the error kind — re-checking
+            // the target's existence (the EEXIST branch below) can never catch
+            // it and would wrongly fall through to 500.
+            std::io::ErrorKind::NotADirectory => conflict_not_a_directory(),
             _ => {
-                // A path component that exists but is not a directory \u2192 409.
+                // Node's EEXIST-on-a-non-directory branch
+                // (`files-router.ts:265-271`): the TARGET itself exists but is
+                // not a directory → 409.
                 if Path::new(&fs_path).exists() {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(json!({ "error": "Path exists but is not a directory" })),
-                    )
-                        .into_response()
+                    conflict_not_a_directory()
                 } else {
                     internal_error(&err.to_string())
                 }
@@ -580,19 +592,32 @@ fn add_unique_directory(
     directories.push(trimmed.to_string());
 }
 
-/// Normalize a user-supplied directory path: expand a leading `~`/`~/\u2026` to `$HOME`
-/// and trim trailing separators (mirrors `path-utils.ts#normalizeUserPath` for the
-/// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step,
-/// not exercised by the Linux-host e2e). Returns the path unchanged when it does
-/// not resolve.
+/// Normalize a user-supplied directory path: sanitize the raw input first
+/// (`sanitizeUserPathInput` runs on EVERY flavor at the top of Node's
+/// `normalizeUserPath`, `path-utils.ts:55` → `:24-30`: trim whitespace, strip
+/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~\\…`/`~/\u2026` to `$HOME`,
+/// trim trailing separators, and collapse `.`/`..` segments LEXICALLY
+/// — Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
+/// (path-utils.ts:69-70), so `<tmp>/nope/../real` reaches the filesystem (and is
+/// displayed) as `<tmp>/real` even when the `nope` intermediate does not exist;
+/// a raw stat on the verbatim spelling would ENOENT on that intermediate first
+/// (mirrors `path-utils.ts#normalizeUserPath` for the
+/// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step, handled in
+/// [`resolve_user_path`]). Non-absolute inputs are returned unchanged when they
+/// do not resolve (the collapse is absolute-only, fail-closed).
 pub(crate) fn normalize_user_path(input: &str) -> String {
-    let expanded = expand_tilde(input);
-    trim_trailing_separators(&expanded)
+    let cleaned = sanitize_user_path_input(input);
+    let expanded = expand_tilde(&cleaned);
+    collapse_dot_segments(&trim_trailing_separators(&expanded))
 }
 
-/// Expand a leading `~` (bare or `~/rest`) to the process `$HOME`. Other `~user`
-/// forms are left untouched (the DirectoryPicker only ever sends `~` or absolute
-/// paths).
+/// Expand a leading `~` (bare, `~/rest`, or `~\rest`) to the process `$HOME`.
+/// Node expands BOTH separator spellings (`path-utils.ts:61`:
+/// `startsWith('~/') || startsWith('~\\')`) — the backslash form is what
+/// Windows users type into the DirectoryPicker targeting a WSL host, and
+/// `~\rest` is `native` flavor (not Windows: `~` matches none of the
+/// drive/UNC/rooted prefixes), so it reaches this seam. Other `~user` forms
+/// are left untouched.
 fn expand_tilde(input: &str) -> String {
     if input == "~" {
         if let Some(home) = home_dir() {
@@ -600,9 +625,19 @@ fn expand_tilde(input: &str) -> String {
         }
         return input.to_string();
     }
-    if let Some(rest) = input.strip_prefix("~/") {
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
         if let Some(home) = home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
+            // Node's posix path.join(home, rest) (path-utils.ts:62) CONCATENATES
+            // then lexically normalizes: a rest starting with `/` (mixed
+            // separators like `~\/x` or `~//x`) folds onto home as
+            // `$HOME/rest` — never replaces it, unlike `Path::join`'s
+            // absolute-argument semantics which would root the result at `/`.
+            // Inner backslashes stay literal (`~\a\b` -> `$HOME/a\b`), and
+            // `.`/`..` collapse exactly like join's normalize.
+            return collapse_dot_segments(&format!("{}/{rest}", home.to_string_lossy()));
         }
     }
     input.to_string()
@@ -627,6 +662,33 @@ fn trim_trailing_separators(input: &str) -> String {
         "/".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+/// Lexical `path.resolve` segment collapse (`path-utils.ts:294`) for
+/// slash-absolute inputs: `.` dropped, `..` pops the last component (clamped
+/// at the filesystem root), redundant separators folded, trailing separators
+/// stripped. Non-absolute inputs are returned unchanged fail-closed: a
+/// relative or Windows-literal spelling can never prefix-match an absolute
+/// sandbox root, so collapsing here could only ever weaken the check.
+fn collapse_dot_segments(input: &str) -> String {
+    if !input.starts_with('/') {
+        return input.to_string();
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for segment in input.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(segment),
+        }
+    }
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
     }
 }
 
@@ -762,11 +824,14 @@ fn resolve_completion_input(prefix: &str, root: Option<&str>) -> String {
 }
 
 /// Port of `isAbsoluteUserPath` (`files-router.ts:38`) for the POSIX host: a `~`
-/// prefix or a POSIX/Windows absolute path.
+/// prefix or a POSIX/Windows absolute path. `path.win32.isAbsolute` is true for
+/// any leading backslash, so win32-rooted (`\rooted\x`) and UNC
+/// (`\\srv\share\dir`) forms count as absolute too.
 fn is_absolute_user_path(input: &str) -> bool {
     let cleaned = input.trim();
     cleaned.starts_with('~')
         || cleaned.starts_with('/')
+        || cleaned.starts_with('\\') // \\srv\share UNC or \rooted win32 forms
         || (cleaned.len() >= 3 && cleaned.as_bytes()[1] == b':') // C:\u2026 drive-absolute
 }
 
@@ -982,6 +1047,16 @@ fn forbidden_msg(msg: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
 }
 
+/// `409 { "error": "Path exists but is not a directory" }` — the mkdir
+/// EEXIST-non-directory / ENOTDIR shape (`files-router.ts:270,273`).
+fn conflict_not_a_directory() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "Path exists but is not a directory" })),
+    )
+        .into_response()
+}
+
 /// `404 { "error": <msg> }`.
 pub(crate) fn not_found(msg: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
@@ -1178,6 +1253,40 @@ mod tests {
         assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
     }
 
+    /// FILE-03: `normalizeUserPath` expands BOTH `~/rest` AND `~\rest` to the
+    /// home directory (path-utils.ts:61: `startsWith('~/') ||
+    /// startsWith('~\\')`) — the backslash form is what Windows users type
+    /// into the DirectoryPicker targeting a WSL host. `expand_tilde`
+    /// previously handled only `~` and `~/`, so `~\proj` stayed a literal
+    /// name that no endpoint could address (cluster tilde_expand regression).
+    #[test]
+    fn test_tilde_expand_backslash_form_expands_to_home() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        let r = resolve_user_path("~\\proj");
+        assert_eq!(r.display, "/home/tester/proj");
+        assert_eq!(r.fs_path, Some("/home/tester/proj".to_string()));
+        // The helper agrees (the `~\` prefix joins exactly like `~/`), and
+        // the bare `~\` form lands on home itself (Node path.join(home, '')).
+        assert_eq!(expand_tilde("~\\proj"), "/home/tester/proj");
+        assert_eq!(normalize_user_path("~\\"), "/home/tester");
+        // Review pin (boundary separator forms): a `~<sep>` rest that itself
+        // starts with `/` FOLDS onto home — Node's posix path.join(home,
+        // rest) concatenates then normalizes (path-utils.ts:62), so these
+        // yield `$HOME/x`; `Path::join`'s absolute-argument replacement
+        // would instead root-anchor them at `/x` (the bounced defect).
+        assert_eq!(expand_tilde("~\\/x"), "/home/tester/x");
+        assert_eq!(expand_tilde("~//x"), "/home/tester/x");
+        let r = resolve_user_path("~\\/x");
+        assert_eq!(r.display, "/home/tester/x");
+        assert_eq!(r.fs_path, Some("/home/tester/x".to_string()));
+        // Inner backslashes are NOT separators on the posix host: they stay
+        // literal, exactly like Node's join (`~\a\b` -> `$HOME/a\b`).
+        assert_eq!(expand_tilde("~\\a\\b"), "/home/tester/a\\b");
+        // …and `.`/`..` in the rest collapse like join's normalize.
+        assert_eq!(expand_tilde("~/../x"), "/home/x");
+    }
+
     // ---- validate_dir (R-WIN2: Windows input on WSL resolves via the mount) ----
 
     // Intentional: `_guard` is held across every `.await` BY DESIGN — the
@@ -1279,6 +1388,36 @@ mod tests {
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["valid"], false);
+    }
+
+    /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
+    /// (path-utils.ts:69-70), collapsing `.`/`..` segments LEXICALLY — so
+    /// `<tmp>/nope/../real` reaches the filesystem as `<tmp>/real` and
+    /// `validate-dir` reports it valid even though `nope` never exists
+    /// (files-router.ts:243). A port keeping the `..` segments verbatim would
+    /// ENOENT the raw stat on the missing `nope` intermediate and echo the
+    /// un-collapsed path; both the stat and the display string must use the
+    /// collapsed form.
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_dotseg_collapse_display() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("real")).unwrap();
+        let spelled = format!("{}/nope/../real", tmp.path().to_string_lossy());
+        let collapsed = format!("{}/real", tmp.path().to_string_lossy());
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": spelled })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true, "Node resolves `..` lexically before stat");
+        assert_eq!(v["resolvedPath"], collapsed);
     }
 
     // ---- complete (R-WIN3: suggestions rendered in the INPUT's flavor) ----
@@ -1688,6 +1827,24 @@ mod tests {
         assert!(std::path::Path::new(&target).is_dir());
     }
 
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_mkdir_enotdir_is_409_not_500() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // An INTERMEDIATE component that is a FILE: recursive mkdir fails
+        // ENOTDIR, which Node maps to 409 "Path exists but is not a directory"
+        // (`files-router.ts:272-274`) — never a 500.
+        std::fs::write(tmp.path().join("blocker"), b"x").unwrap();
+        let target = format!("{}/blocker/sub", tmp.path().to_string_lossy());
+        let resp = mkdir_resp(&target).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "Path exists but is not a directory");
+        assert!(!std::path::Path::new(&target).exists());
+    }
+
     #[test]
     fn add_unique_dedupes_and_trims() {
         let mut dirs = Vec::new();
@@ -1709,12 +1866,63 @@ mod tests {
     }
 
     #[test]
+    fn collapse_dot_segments_mirrors_node_path_resolve() {
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects/../../etc/passwd"),
+            "/home/etc/passwd" // two `..` pop `projects` and `user`
+        );
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects//../../../etc/passwd"),
+            "/etc/passwd" // three `..` pop everything down to the root
+        );
+        assert_eq!(collapse_dot_segments("/a/./b/"), "/a/b");
+        assert_eq!(collapse_dot_segments("/a/b/../b/file.txt"), "/a/b/file.txt");
+        // `..` clamps at the filesystem root, like path.resolve.
+        assert_eq!(collapse_dot_segments("/../.."), "/");
+        assert_eq!(collapse_dot_segments("/"), "/");
+        // Non-absolute / literal fallback strings stay byte-exact (fail-closed).
+        assert_eq!(
+            collapse_dot_segments("C:\\Users\\..\\x"),
+            "C:\\Users\\..\\x"
+        );
+        assert_eq!(collapse_dot_segments("rel/../x"), "rel/../x");
+    }
+
+    #[test]
     fn expand_tilde_uses_home() {
         let _guard = env_lock();
         let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
         assert_eq!(expand_tilde("~"), "/home/tester");
         assert_eq!(expand_tilde("~/proj"), "/home/tester/proj");
         assert_eq!(expand_tilde("/abs"), "/abs");
+    }
+
+    /// posix_not_sanitized regression: Node sanitizes EVERY flavor's input at
+    /// the top of `normalizeUserPath` (`path-utils.ts:55` →
+    /// `sanitizeUserPathInput` `:24-30`: trim whitespace, strip one pair of
+    /// wrapping quotes, re-trim). This port previously sanitized only
+    /// `resolve_user_path`'s Windows branch, so a space-padded or shell-quoted
+    /// POSIX path was stat'd/written verbatim.
+    #[test]
+    fn test_posix_input_trims_and_unquotes() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        // Leading/trailing whitespace padding is trimmed.
+        assert_eq!(normalize_user_path("/tmp/x "), "/tmp/x");
+        assert_eq!(normalize_user_path("  /tmp/x"), "/tmp/x");
+        // One pair of matching wrapping quotes (a shell-pasted path) is stripped.
+        assert_eq!(normalize_user_path("\"/tmp/x\""), "/tmp/x");
+        assert_eq!(normalize_user_path("'/tmp/x'"), "/tmp/x");
+        // The sanitize runs BEFORE tilde expansion (path-utils.ts:55 then
+        // `:58-63`), so a padded/quoted `~` still expands.
+        assert_eq!(normalize_user_path(" \"~/proj\" "), "/home/tester/proj");
+        // A quotes-only input sanitizes to empty, like Node's `''` return for a
+        // falsy `cleaned` (path-utils.ts:26,56).
+        assert_eq!(normalize_user_path("\"\""), "");
+        // The display/fs path every handler consumes carry the sanitized form.
+        let r = resolve_user_path(" \"/tmp/x\" ");
+        assert_eq!(r.display, "/tmp/x");
+        assert_eq!(r.fs_path, Some("/tmp/x".to_string()));
     }
 
     #[test]
@@ -1739,6 +1947,28 @@ mod tests {
         assert!(is_absolute_user_path("C:\\Users"));
         assert!(!is_absolute_user_path("rel/path"));
         assert!(!is_absolute_user_path("a.txt"));
+    }
+
+    /// FILE-03 (network shares / prefix-confusion): the legacy
+    /// `isAbsoluteUserPath` (files-router.ts:38-42) uses
+    /// `path.win32.isAbsolute`, which is TRUE for UNC (`\\srv\share\dir`) and
+    /// rooted (`\rooted\x`) forms, so `resolveCompletionInput`
+    /// (files-router.ts:46) returns them unchanged instead of anchoring them
+    /// under the caller's `root`.
+    #[test]
+    fn test_unc_classification() {
+        assert!(is_absolute_user_path("\\\\srv\\share\\dir"));
+        assert!(is_absolute_user_path("\\rooted\\x"));
+        // Observable port behavior: rooted/UNC prefixes are returned unchanged,
+        // never joined under the completion root.
+        assert_eq!(
+            resolve_completion_input("\\\\srv\\share\\dir", Some("/root")),
+            "\\\\srv\\share\\dir"
+        );
+        assert_eq!(
+            resolve_completion_input("\\rooted\\x", Some("/root")),
+            "\\rooted\\x"
+        );
     }
 
     #[test]
