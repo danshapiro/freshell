@@ -25,7 +25,8 @@
 //!   original's empty-state response really is `{ directories: [] }`.
 //! * `POST /api/files/validate-dir` \u2014 mirrors `files-router.ts:232` +
 //!   `path-utils.ts#isReachableDirectory`: normalize the user path (`~` expansion,
-//!   trailing-separator trim), `stat` it, and report `{ valid, resolvedPath }`
+//!   trailing-separator trim, lexical `.`/`..` collapse — the `path.posix.resolve`
+//!   of path-utils.ts:69-70), `stat` it, and report `{ valid, resolvedPath }`
 //!   (`valid` iff it resolves to an existing directory).
 //!
 //! Both routes are gated by the shared auth token (via [`crate::boot::is_authed`],
@@ -524,15 +525,20 @@ fn add_unique_directory(
 /// Normalize a user-supplied directory path: sanitize the raw input first
 /// (`sanitizeUserPathInput` runs on EVERY flavor at the top of Node's
 /// `normalizeUserPath`, `path-utils.ts:55` → `:24-30`: trim whitespace, strip
-/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~/\u2026` to `$HOME`
-/// and trim trailing separators (mirrors `path-utils.ts#normalizeUserPath` for the
-/// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step,
-/// not exercised by the Linux-host e2e). Returns the path unchanged when it does
-/// not resolve.
+/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~/\u2026` to `$HOME`,
+/// trim trailing separators, and collapse `.`/`..` segments LEXICALLY
+/// — Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
+/// (path-utils.ts:69-70), so `<tmp>/nope/../real` reaches the filesystem (and is
+/// displayed) as `<tmp>/real` even when the `nope` intermediate does not exist;
+/// a raw stat on the verbatim spelling would ENOENT on that intermediate first
+/// (mirrors `path-utils.ts#normalizeUserPath` for the
+/// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step, handled in
+/// [`resolve_user_path`]). Non-absolute inputs are returned unchanged when they
+/// do not resolve (the collapse is absolute-only, fail-closed).
 pub(crate) fn normalize_user_path(input: &str) -> String {
     let cleaned = sanitize_user_path_input(input);
     let expanded = expand_tilde(&cleaned);
-    trim_trailing_separators(&expanded)
+    collapse_dot_segments(&trim_trailing_separators(&expanded))
 }
 
 /// Expand a leading `~` (bare or `~/rest`) to the process `$HOME`. Other `~user`
@@ -1080,6 +1086,36 @@ mod tests {
         .into_response();
         let v = body_json(resp).await;
         assert_eq!(v["valid"], false);
+    }
+
+    /// Node's `normalizeUserPath` runs `path.posix.resolve` on POSIX inputs
+    /// (path-utils.ts:69-70), collapsing `.`/`..` segments LEXICALLY — so
+    /// `<tmp>/nope/../real` reaches the filesystem as `<tmp>/real` and
+    /// `validate-dir` reports it valid even though `nope` never exists
+    /// (files-router.ts:243). A port keeping the `..` segments verbatim would
+    /// ENOENT the raw stat on the missing `nope` intermediate and echo the
+    /// un-collapsed path; both the stat and the display string must use the
+    /// collapsed form.
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_dotseg_collapse_display() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("real")).unwrap();
+        let spelled = format!("{}/nope/../real", tmp.path().to_string_lossy());
+        let collapsed = format!("{}/real", tmp.path().to_string_lossy());
+        let resp = validate_dir(
+            State(test_state()),
+            auth_headers(),
+            Json(json!({ "path": spelled })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], true, "Node resolves `..` lexically before stat");
+        assert_eq!(v["resolvedPath"], collapsed);
     }
 
     // ---- complete (R-WIN3: suggestions rendered in the INPUT's flavor) ----
