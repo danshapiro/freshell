@@ -835,35 +835,6 @@ fn is_absolute_user_path(input: &str) -> bool {
         || (cleaned.len() >= 3 && cleaned.as_bytes()[1] == b':') // C:\u2026 drive-absolute
 }
 
-/// Lexical `path.resolve` segment collapse for slash-absolute inputs: `.`
-/// dropped, `..` pops the last component (clamped at the filesystem root),
-/// redundant separators folded, trailing separators stripped. Non-absolute
-/// inputs are returned unchanged (fail-closed: [`resolve_for_local_file`]
-/// cwd-anchors relative inputs BEFORE calling this, so everything it passes
-/// here is absolute). Used only by the `/local-file` lane — deliberately NOT
-/// wired into [`normalize_user_path`], whose existing callers' behavior is
-/// unchanged.
-fn collapse_dot_segments(input: &str) -> String {
-    if !input.starts_with('/') {
-        return input.to_string();
-    }
-    let mut components: Vec<&str> = Vec::new();
-    for segment in input.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            _ => components.push(segment),
-        }
-    }
-    if components.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", components.join("/"))
-    }
-}
-
 /// Node's `path.resolve(filePath)` (`local-file-router.ts:64`):
 ///
 /// * FILE-02: drive-absolute (`C:\…` and the client's forward-slash spelling
