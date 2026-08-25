@@ -734,11 +734,14 @@ fn resolve_completion_input(prefix: &str, root: Option<&str>) -> String {
 }
 
 /// Port of `isAbsoluteUserPath` (`files-router.ts:38`) for the POSIX host: a `~`
-/// prefix or a POSIX/Windows absolute path.
+/// prefix or a POSIX/Windows absolute path. `path.win32.isAbsolute` is true for
+/// any leading backslash, so win32-rooted (`\rooted\x`) and UNC
+/// (`\\srv\share\dir`) forms count as absolute too.
 fn is_absolute_user_path(input: &str) -> bool {
     let cleaned = input.trim();
     cleaned.starts_with('~')
         || cleaned.starts_with('/')
+        || cleaned.starts_with('\\') // \\srv\share UNC or \rooted win32 forms
         || (cleaned.len() >= 3 && cleaned.as_bytes()[1] == b':') // C:\u2026 drive-absolute
 }
 
@@ -1603,6 +1606,28 @@ mod tests {
         assert!(is_absolute_user_path("C:\\Users"));
         assert!(!is_absolute_user_path("rel/path"));
         assert!(!is_absolute_user_path("a.txt"));
+    }
+
+    /// FILE-03 (network shares / prefix-confusion): the legacy
+    /// `isAbsoluteUserPath` (files-router.ts:38-42) uses
+    /// `path.win32.isAbsolute`, which is TRUE for UNC (`\\srv\share\dir`) and
+    /// rooted (`\rooted\x`) forms, so `resolveCompletionInput`
+    /// (files-router.ts:46) returns them unchanged instead of anchoring them
+    /// under the caller's `root`.
+    #[test]
+    fn test_unc_classification() {
+        assert!(is_absolute_user_path("\\\\srv\\share\\dir"));
+        assert!(is_absolute_user_path("\\rooted\\x"));
+        // Observable port behavior: rooted/UNC prefixes are returned unchanged,
+        // never joined under the completion root.
+        assert_eq!(
+            resolve_completion_input("\\\\srv\\share\\dir", Some("/root")),
+            "\\\\srv\\share\\dir"
+        );
+        assert_eq!(
+            resolve_completion_input("\\rooted\\x", Some("/root")),
+            "\\rooted\\x"
+        );
     }
 
     #[test]
