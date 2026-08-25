@@ -1627,7 +1627,10 @@ mod tests {
         assert_eq!(collapse_dot_segments("/../.."), "/");
         assert_eq!(collapse_dot_segments("/"), "/");
         // Non-absolute / literal fallback strings stay byte-exact (fail-closed).
-        assert_eq!(collapse_dot_segments("C:\\Users\\..\\x"), "C:\\Users\\..\\x");
+        assert_eq!(
+            collapse_dot_segments("C:\\Users\\..\\x"),
+            "C:\\Users\\..\\x"
+        );
         assert_eq!(collapse_dot_segments("rel/../x"), "rel/../x");
     }
 
