@@ -437,7 +437,13 @@ async fn complete(
 /// common "directory already there" case never takes that branch. This port
 /// therefore never pre-checks existence \u2014 it always attempts the create and
 /// reports `existed` purely from what `create_dir_all` tells it (i.e. never true
-/// on success), matching the original's observable behavior exactly.
+/// on success), matching the original's observable behavior exactly. Both of
+/// the original's 409 "Path exists but is not a directory" branches are mapped:
+/// EEXIST-on-a-non-directory (`files-router.ts:265-271`, the target itself is
+/// an existing file) and ENOTDIR (`files-router.ts:272-274`, an INTERMEDIATE
+/// component is a file, e.g. mkdir of `<existing-file>/sub` — the target does
+/// not exist, so this maps from `ErrorKind::NotADirectory`, never from an
+/// existence re-check).
 /// Windows-flavor inputs convert through the WSL mount before create_dir_all; inputs with no native address on this host are rejected with 400 instead of creating a literal backslash-named directory.
 async fn mkdir(
     State(state): State<FilesState>,
@@ -476,14 +482,19 @@ async fn mkdir(
         }
         Err(err) => match err.kind() {
             std::io::ErrorKind::PermissionDenied => forbidden_msg("Permission denied"),
+            // Node's ENOTDIR branch (`files-router.ts:272-274`): an INTERMEDIATE
+            // path component exists but is not a directory (e.g. mkdir of
+            // `<existing-file>/sub`) → 409. The target itself does NOT exist in
+            // this case, so it must be mapped from the error kind — re-checking
+            // the target's existence (the EEXIST branch below) can never catch
+            // it and would wrongly fall through to 500.
+            std::io::ErrorKind::NotADirectory => conflict_not_a_directory(),
             _ => {
-                // A path component that exists but is not a directory \u2192 409.
+                // Node's EEXIST-on-a-non-directory branch
+                // (`files-router.ts:265-271`): the TARGET itself exists but is
+                // not a directory → 409.
                 if Path::new(&fs_path).exists() {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(json!({ "error": "Path exists but is not a directory" })),
-                    )
-                        .into_response()
+                    conflict_not_a_directory()
                 } else {
                     internal_error(&err.to_string())
                 }
@@ -753,6 +764,16 @@ pub(crate) fn forbidden() -> Response {
 /// `403 { "error": <msg> }` \u2014 the mkdir permission-deny shape.
 fn forbidden_msg(msg: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
+}
+
+/// `409 { "error": "Path exists but is not a directory" }` — the mkdir
+/// EEXIST-non-directory / ENOTDIR shape (`files-router.ts:270,273`).
+fn conflict_not_a_directory() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": "Path exists but is not a directory" })),
+    )
+        .into_response()
 }
 
 /// `404 { "error": <msg> }`.
@@ -1459,6 +1480,24 @@ mod tests {
         assert_eq!(v["existed"], false);
         assert_eq!(v["resolvedPath"], target);
         assert!(std::path::Path::new(&target).is_dir());
+    }
+
+    // Intentional: env lock held across `.await` BY DESIGN (see above).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_mkdir_enotdir_is_409_not_500() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // An INTERMEDIATE component that is a FILE: recursive mkdir fails
+        // ENOTDIR, which Node maps to 409 "Path exists but is not a directory"
+        // (`files-router.ts:272-274`) — never a 500.
+        std::fs::write(tmp.path().join("blocker"), b"x").unwrap();
+        let target = format!("{}/blocker/sub", tmp.path().to_string_lossy());
+        let resp = mkdir_resp(&target).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "Path exists but is not a directory");
+        assert!(!std::path::Path::new(&target).exists());
     }
 
     #[test]
