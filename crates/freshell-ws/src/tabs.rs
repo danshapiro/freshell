@@ -42,11 +42,12 @@ use crate::tabs_store_model::{
     apply_queued_maintenance, build_snapshot_payload_hash, canonical_stringify,
     client_snapshot_key, closed_at_or_updated, compare_by_event_time, default_caps, empty_state,
     is_durable_provider_session_id, is_placeholder_provider_session_id,
-    normalize_registry_pane_kinds, pick_event_winner, record_status, record_str,
-    sanitize_session_ref, sort_by_closed_desc, sort_by_updated_desc, validate_record_caps,
-    validate_registry_record, validate_state_caps, ClientOpenSnapshot, ClientRevisionWatermark,
-    CompactState, RegistryDeviceEntry, TabsStoreCaps, DAY_MS, DEFAULT_CLOSED_RETENTION_DAYS,
-    DEFAULT_DEVICE_DISPLAY_TTL_DAYS, DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES, MINUTE_MS,
+    normalize_registry_pane_kinds, pick_event_winner, read_restore_error, record_status,
+    record_str, sanitize_session_ref, sort_by_closed_desc, sort_by_updated_desc,
+    validate_record_caps, validate_registry_record, validate_state_caps, ClientOpenSnapshot,
+    ClientRevisionWatermark, CompactState, RegistryDeviceEntry, TabsStoreCaps, DAY_MS,
+    DEFAULT_CLOSED_RETENTION_DAYS, DEFAULT_DEVICE_DISPLAY_TTL_DAYS,
+    DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES, MINUTE_MS,
 };
 
 /// `'Stale snapshot revision rejected...'` (store.ts:1140, 1149) — the
@@ -790,7 +791,7 @@ struct DurableSessionIdentity {
 }
 
 /// Server-side backstop for the placeholder-regression guard (kata item 1): a
-/// pushed fresh-agent pane whose `sessionRef` re-derived a PLACEHOLDER
+/// pushed fresh-agent pane whose identity re-derived a PLACEHOLDER
 /// (`freshopencode-<createRequestId>`, `freshcodex-…`, any non-canonical
 /// claude id) is rewritten to the DURABLE identity any current open snapshot
 /// or closed winner already holds for the same (tabKey, paneId, provider,
@@ -799,6 +800,24 @@ struct DurableSessionIdentity {
 /// provider switches pass through. Returns `true` when any pane was clamped
 /// (the caller must then rebuild the open-snapshot payload hash over the
 /// clamped records — only ever needed for OPEN records, the only hashed set).
+///
+/// Staleness classification per pane (the
+/// `preservedDurableFreshAgentIdentity` staleness mirror,
+/// shared/fresh-agent.ts):
+/// - locator present: the locator alone classifies — its provider must agree
+///   with the pane provider and its id classify placeholder. A DURABLE
+///   locator means the record carries a real identity: never stale, so a
+///   restoreError on a genuinely broken durable pane passes through
+///   untouched.
+/// - locator absent (the restoreError migration strips it — the incident's
+///   normalized shape): a VALIDATED restoreError must be present AND any
+///   present scalar identity field (`sessionId` / `resumeSessionId`) classify
+///   placeholder for the provider.
+///
+/// On a durable hit, any restoreError on the record is REMOVED with the
+/// placeholder identity — a record stale in identity is stale wholesale, and
+/// the registry now carries the recoverable identity. With no durable source
+/// the record passes through untouched (a legitimate restoreError).
 fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState) -> bool {
     let mut clamped_any = false;
     for record in records.iter_mut() {
@@ -841,19 +860,10 @@ fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState)
             else {
                 continue;
             };
-            let Some((ref_provider, ref_session_id)) =
-                sanitize_session_ref(payload.get("sessionRef"))
+            let Some(placeholder_session_id) = stale_placeholder_session_id(payload, &provider)
             else {
                 continue;
             };
-            // The locator's provider must agree with the pane provider (the
-            // `preservedDurableFreshAgentIdentity` consistency rule), and the
-            // pushed id must classify as a re-derived placeholder for it.
-            if ref_provider != provider
-                || !is_placeholder_provider_session_id(&ref_provider, &ref_session_id)
-            {
-                continue;
-            }
             let Some(identity) = find_durable_session_identity(
                 current,
                 &tab_key,
@@ -866,7 +876,7 @@ fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState)
             tracing::info!(target: "freshell_ws::tabs",
                 tab_key = %tab_key, pane_id = %pane_id, provider = %provider,
                 create_request_id = %create_request_id,
-                placeholder_session_id = %ref_session_id,
+                placeholder_session_id = %placeholder_session_id,
                 durable_session_id = %identity.session_ref_session_id,
                 "clamped placeholder fresh-agent sessionRef in tabs.sync push");
             payload.insert(
@@ -878,10 +888,44 @@ fn clamp_placeholder_session_refs(records: &mut [Value], current: &CompactState)
                 "resumeSessionId".to_string(),
                 json!(identity.resume_session_id),
             );
+            payload.remove("restoreError");
             clamped_any = true;
         }
     }
     clamped_any
+}
+
+/// The pushed pane's offending placeholder id when its identity is provably
+/// stale (see [`clamp_placeholder_session_refs`] for the classification
+/// contract); `None` when the pane passes through.
+fn stale_placeholder_session_id(
+    payload: &serde_json::Map<String, Value>,
+    provider: &str,
+) -> Option<String> {
+    match sanitize_session_ref(payload.get("sessionRef")) {
+        Some((ref_provider, ref_session_id)) => {
+            // The locator's provider must agree with the pane provider (the
+            // `preservedDurableFreshAgentIdentity` consistency rule), and the
+            // pushed id must classify as a re-derived placeholder for it.
+            if ref_provider != provider
+                || !is_placeholder_provider_session_id(&ref_provider, &ref_session_id)
+            {
+                return None;
+            }
+            Some(ref_session_id)
+        }
+        None => {
+            // Locator absent (the restoreError migration strips it): the
+            // incident's identity-erased shape is stale exactly when a
+            // validated restoreError rides placeholder scalars.
+            read_restore_error(payload.get("restoreError"))?;
+            ["sessionId", "resumeSessionId"]
+                .iter()
+                .filter_map(|field| payload.get(*field).and_then(Value::as_str))
+                .find(|id| is_placeholder_provider_session_id(provider, id))
+                .map(str::to_string)
+        }
+    }
 }
 
 /// The newest (event-time) durable fresh-agent identity `current` holds for

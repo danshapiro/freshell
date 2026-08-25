@@ -453,7 +453,7 @@ pub(crate) fn is_placeholder_provider_session_id(provider: &str, session_id: &st
 }
 
 /// `readRestoreError` (shared/fresh-agent.ts:190-197): the validated reason.
-fn read_restore_error(v: Option<&Value>) -> Option<&'static str> {
+pub(crate) fn read_restore_error(v: Option<&Value>) -> Option<&'static str> {
     let obj = v?.as_object()?;
     if obj.get("code").and_then(Value::as_str) != Some("RESTORE_UNAVAILABLE") {
         return None;

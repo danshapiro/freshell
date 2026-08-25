@@ -1146,6 +1146,246 @@ fn closed_placeholder_without_any_durable_identity_passes_through() {
     );
 }
 
+// ---- restoreError-shaped placeholder clamp (kata item 1, identity-erased shape) ----
+//
+// The incident's full end-state: the client fold that applied a restoreError
+// KEPT the placeholder sessionId/resumeSessionId scalars but DROPPED the
+// sessionRef locator, so the pushed record carries restoreError + placeholder
+// scalars and NO locator — invisible to the locator-only clamp. A record
+// provably stale in identity is stale wholesale: on a durable lookup hit the
+// durable sessionRef/sessionId/resumeSessionId are substituted AND the
+// restoreError is removed (the registry carries the recoverable identity). A
+// legitimate restoreError (durable identity, deliberate reset, or no durable
+// source) passes through untouched.
+
+/// A fresh-agent pane in the incident's restoreError shape: NO sessionRef
+/// locator (the restoreError migration strips it), the placeholder id on the
+/// surviving sessionId/resumeSessionId scalars, and a validated restoreError.
+fn fresh_agent_pane_restore_error(
+    pane_id: &str,
+    provider: &str,
+    session_type: &str,
+    create_request_id: &str,
+    scalar_session_id: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "paneId": pane_id,
+        "kind": "fresh-agent",
+        "payload": {
+            "createRequestId": create_request_id,
+            "provider": provider,
+            "sessionType": session_type,
+            "sessionId": scalar_session_id,
+            "resumeSessionId": scalar_session_id,
+            "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": reason },
+            "initialCwd": "/repo",
+        }
+    })
+}
+
+#[test]
+fn open_restore_error_placeholder_record_is_clamped_and_the_error_removed() {
+    let reg = TabsRegistry::new();
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
+    reg.replace_client_snapshot(
+        "srv-1",
+        "device-b",
+        "Device B",
+        "client-b1",
+        1,
+        vec![open_record_with_panes(
+            "tab-1",
+            "Agent tab",
+            20,
+            vec![fresh_agent_pane_restore_error(
+                "pane-1",
+                "opencode",
+                "freshopencode",
+                "crid-1",
+                "freshopencode-crid-1",
+                "dead_live_handle",
+            )],
+        )],
+    )
+    .expect("stale restoreError push accepted");
+    let payload = stored_pane_payload(&reg, "device-b", "client-b1");
+    assert_eq!(
+        payload["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": DURABLE_OPENCODE_SESSION }),
+        "the identity-erased record must be re-clamped to the durable identity: {payload}"
+    );
+    assert_eq!(payload["sessionId"], json!(DURABLE_OPENCODE_SESSION));
+    assert_eq!(payload["resumeSessionId"], json!(DURABLE_OPENCODE_SESSION));
+    assert!(
+        payload.get("restoreError").is_none(),
+        "a record stale in identity is stale wholesale — restoreError removed: {payload}"
+    );
+}
+
+#[test]
+fn closed_restore_error_placeholder_record_is_clamped_and_the_error_removed() {
+    // The closed/reopen surface of the identity-erased shape: a stale client
+    // closing the materialized tab with restoreError + placeholder scalars
+    // and no locator must not become the stored closed winner. now-based so
+    // the 30-day closed retention keeps the tombstone.
+    let reg = TabsRegistry::new();
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
+    reg.replace_client_snapshot(
+        "srv-1",
+        "device-b",
+        "Device B",
+        "client-b1",
+        1,
+        vec![closed_record_with_panes(
+            "tab-1",
+            "Agent tab",
+            now_ms(),
+            now_ms(),
+            vec![fresh_agent_pane_restore_error(
+                "pane-1",
+                "opencode",
+                "freshopencode",
+                "crid-1",
+                "freshopencode-crid-1",
+                "dead_live_handle",
+            )],
+        )],
+    )
+    .expect("stale restoreError closed push accepted");
+    let payload = stored_closed_pane_payload(&reg, "tab-1");
+    assert_eq!(
+        payload["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": DURABLE_OPENCODE_SESSION }),
+        "the closed winner must be clamped to the durable identity: {payload}"
+    );
+    assert_eq!(payload["sessionId"], json!(DURABLE_OPENCODE_SESSION));
+    assert_eq!(payload["resumeSessionId"], json!(DURABLE_OPENCODE_SESSION));
+    assert!(
+        payload.get("restoreError").is_none(),
+        "the stored closed winner must not carry the stale restoreError: {payload}"
+    );
+}
+
+#[test]
+fn restore_error_record_with_durable_identity_passes_through() {
+    // A restoreError on a genuinely broken DURABLE pane is legitimate: no
+    // placeholder anywhere present, so nothing is stale and the record —
+    // restoreError included — passes through untouched.
+    let reg = TabsRegistry::new();
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
+    reg.replace_client_snapshot(
+        "srv-1",
+        "device-b",
+        "Device B",
+        "client-b1",
+        1,
+        vec![open_record_with_panes(
+            "tab-1",
+            "Agent tab",
+            20,
+            vec![json!({
+                "paneId": "pane-1",
+                "kind": "fresh-agent",
+                "payload": {
+                    "createRequestId": "crid-1",
+                    "provider": "opencode",
+                    "sessionType": "freshopencode",
+                    "sessionRef": { "provider": "opencode", "sessionId": DURABLE_OPENCODE_SESSION },
+                    "sessionId": DURABLE_OPENCODE_SESSION,
+                    "resumeSessionId": DURABLE_OPENCODE_SESSION,
+                    "restoreError": { "code": "RESTORE_UNAVAILABLE", "reason": "provider_runtime_failed" },
+                    "initialCwd": "/repo",
+                }
+            })],
+        )],
+    )
+    .expect("durable restoreError push accepted");
+    let payload = stored_pane_payload(&reg, "device-b", "client-b1");
+    assert_eq!(
+        payload["restoreError"],
+        json!({ "code": "RESTORE_UNAVAILABLE", "reason": "provider_runtime_failed" }),
+        "a legitimate restoreError must survive: {payload}"
+    );
+    assert_eq!(payload["sessionId"], json!(DURABLE_OPENCODE_SESSION));
+    assert_eq!(payload["resumeSessionId"], json!(DURABLE_OPENCODE_SESSION));
+}
+
+#[test]
+fn restore_error_placeholder_without_any_durable_identity_passes_through() {
+    // No durable source anywhere: the restoreError record is all the registry
+    // knows, so it passes through untouched (a legitimate restoreError).
+    let reg = TabsRegistry::new();
+    reg.replace_client_snapshot(
+        "srv-1",
+        "device-b",
+        "Device B",
+        "client-b1",
+        1,
+        vec![open_record_with_panes(
+            "tab-1",
+            "Agent tab",
+            20,
+            vec![fresh_agent_pane_restore_error(
+                "pane-1",
+                "opencode",
+                "freshopencode",
+                "crid-1",
+                "freshopencode-crid-1",
+                "dead_live_handle",
+            )],
+        )],
+    )
+    .expect("restoreError push accepted");
+    let payload = stored_pane_payload(&reg, "device-b", "client-b1");
+    assert_eq!(payload["sessionId"], json!("freshopencode-crid-1"));
+    assert_eq!(
+        payload["restoreError"],
+        json!({ "code": "RESTORE_UNAVAILABLE", "reason": "dead_live_handle" }),
+        "nothing durable to clamp from — the record stands: {payload}"
+    );
+}
+
+#[test]
+fn restore_error_placeholder_with_a_new_create_request_id_passes_through() {
+    // Deliberate-reset exemption on the restoreError shape: a NEW
+    // createRequestId keeps its placeholder identity AND its restoreError
+    // even though the registry holds a durable identity for the same
+    // tab/pane/provider.
+    let reg = TabsRegistry::new();
+    push_opencode_durable(&reg, "device-a", "client-a1", 1, 10);
+    reg.replace_client_snapshot(
+        "srv-1",
+        "device-b",
+        "Device B",
+        "client-b1",
+        1,
+        vec![open_record_with_panes(
+            "tab-1",
+            "Agent tab",
+            20,
+            vec![fresh_agent_pane_restore_error(
+                "pane-1",
+                "opencode",
+                "freshopencode",
+                "crid-2",
+                "freshopencode-crid-2",
+                "dead_live_handle",
+            )],
+        )],
+    )
+    .expect("restoreError push accepted");
+    let payload = stored_pane_payload(&reg, "device-b", "client-b1");
+    assert_eq!(payload["sessionId"], json!("freshopencode-crid-2"));
+    assert!(payload.get("sessionRef").is_none());
+    assert_eq!(
+        payload["restoreError"],
+        json!({ "code": "RESTORE_UNAVAILABLE", "reason": "dead_live_handle" }),
+        "a deliberate reset is never clamped: {payload}"
+    );
+}
+
+
 // ---- diagnostic_counts (DEFECT 1 + DEFECT 2 regression coverage) ----
 
 #[test]
