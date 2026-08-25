@@ -521,13 +521,17 @@ fn add_unique_directory(
     directories.push(trimmed.to_string());
 }
 
-/// Normalize a user-supplied directory path: expand a leading `~`/`~/\u2026` to `$HOME`
+/// Normalize a user-supplied directory path: sanitize the raw input first
+/// (`sanitizeUserPathInput` runs on EVERY flavor at the top of Node's
+/// `normalizeUserPath`, `path-utils.ts:55` → `:24-30`: trim whitespace, strip
+/// one pair of wrapping quotes, re-trim), then expand a leading `~`/`~/\u2026` to `$HOME`
 /// and trim trailing separators (mirrors `path-utils.ts#normalizeUserPath` for the
 /// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step,
 /// not exercised by the Linux-host e2e). Returns the path unchanged when it does
 /// not resolve.
 pub(crate) fn normalize_user_path(input: &str) -> String {
-    let expanded = expand_tilde(input);
+    let cleaned = sanitize_user_path_input(input);
+    let expanded = expand_tilde(&cleaned);
     trim_trailing_separators(&expanded)
 }
 
@@ -1547,6 +1551,34 @@ mod tests {
         assert_eq!(expand_tilde("~"), "/home/tester");
         assert_eq!(expand_tilde("~/proj"), "/home/tester/proj");
         assert_eq!(expand_tilde("/abs"), "/abs");
+    }
+
+    /// posix_not_sanitized regression: Node sanitizes EVERY flavor's input at
+    /// the top of `normalizeUserPath` (`path-utils.ts:55` →
+    /// `sanitizeUserPathInput` `:24-30`: trim whitespace, strip one pair of
+    /// wrapping quotes, re-trim). This port previously sanitized only
+    /// `resolve_user_path`'s Windows branch, so a space-padded or shell-quoted
+    /// POSIX path was stat'd/written verbatim.
+    #[test]
+    fn test_posix_input_trims_and_unquotes() {
+        let _guard = env_lock();
+        let _env = EnvGuard::set(&[("HOME", Some("/home/tester"))]);
+        // Leading/trailing whitespace padding is trimmed.
+        assert_eq!(normalize_user_path("/tmp/x "), "/tmp/x");
+        assert_eq!(normalize_user_path("  /tmp/x"), "/tmp/x");
+        // One pair of matching wrapping quotes (a shell-pasted path) is stripped.
+        assert_eq!(normalize_user_path("\"/tmp/x\""), "/tmp/x");
+        assert_eq!(normalize_user_path("'/tmp/x'"), "/tmp/x");
+        // The sanitize runs BEFORE tilde expansion (path-utils.ts:55 then
+        // `:58-63`), so a padded/quoted `~` still expands.
+        assert_eq!(normalize_user_path(" \"~/proj\" "), "/home/tester/proj");
+        // A quotes-only input sanitizes to empty, like Node's `''` return for a
+        // falsy `cleaned` (path-utils.ts:26,56).
+        assert_eq!(normalize_user_path("\"\""), "");
+        // The display/fs path every handler consumes carry the sanitized form.
+        let r = resolve_user_path(" \"/tmp/x\" ");
+        assert_eq!(r.display, "/tmp/x");
+        assert_eq!(r.fs_path, Some("/tmp/x".to_string()));
     }
 
     #[test]
