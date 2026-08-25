@@ -208,12 +208,21 @@ export type FreshAgentIdentityFold = {
 /**
  * Identity guard for the persist/tabs.sync/updatePaneContent fold paths
  * (kata item 1): when a pane already holds a DURABLE provider session
- * identity, an incoming payload that re-derived a PLACEHOLDER sessionRef for
+ * identity, an incoming payload that re-derived a PLACEHOLDER identity for
  * the same provider+createRequestId must not clobber it. Both createRequestIds
  * must be defined and equal, so deliberate resets (new createRequestId / fork)
  * are naturally exempt; the providers must agree, so a provider switch is
  * naturally exempt; and both sessionRef locators' providers must agree with
  * the pane provider, so a structurally-inconsistent pane is never mutated.
+ *
+ * Incoming staleness classification:
+ * - Locator present: the locator alone classifies — it must sanitize, agree
+ *   with the pane provider, and classify placeholder (a DURABLE locator means
+ *   the fold carries a real identity — never stale, so a restoreError on a
+ *   genuinely broken durable pane is left alone).
+ * - Locator absent (the restoreError migration strips it — the incident's
+ *   normalized shape): ANY present scalar identity field (sessionId or
+ *   resumeSessionId) classifying placeholder marks the fold stale.
  *
  * Returns the previous durable identity tuple — the sessionRef OBJECT
  * preserved verbatim (never coerced to a string, which downstream
@@ -236,8 +245,15 @@ export function preservedDurableFreshAgentIdentity(
     return undefined
   }
   const incomingSessionRef = sanitizeSessionRef(incoming.sessionRef)
-  if (!incomingSessionRef || incomingSessionRef.provider !== provider) return undefined
-  if (!isPlaceholderProviderSessionId(incomingSessionRef.provider, incomingSessionRef.sessionId)) {
+  if (incomingSessionRef) {
+    if (incomingSessionRef.provider !== provider) return undefined
+    if (!isPlaceholderProviderSessionId(incomingSessionRef.provider, incomingSessionRef.sessionId)) {
+      return undefined
+    }
+  } else if (
+    !isPlaceholderProviderSessionId(provider, incoming.sessionId)
+    && !isPlaceholderProviderSessionId(provider, incoming.resumeSessionId)
+  ) {
     return undefined
   }
   return {

@@ -3043,6 +3043,144 @@ describe('panesSlice', () => {
       expect(content.resumeSessionId).toBe('freshopencode-req-reset-generation')
     })
 
+    describe('stale restoreError folds over a durable identity', () => {
+      const DEAD_HANDLE_RESTORE_ERROR = {
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'dead_live_handle',
+      } as const
+
+      function placeholderWithRestoreError(
+        overrides: Partial<FreshAgentPaneContent> = {},
+      ): FreshAgentPaneContent {
+        return placeholderOpencodeContent(undefined, {
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+          ...overrides,
+        })
+      }
+
+      function placeholderWithRestoreErrorNoLocator(
+        overrides: Partial<FreshAgentPaneContent> = {},
+      ): FreshAgentPaneContent {
+        const { sessionRef: _droppedLocator, ...rest } = placeholderWithRestoreError(overrides)
+        return rest
+      }
+
+      function expectDurableIdentityRestoreErrorDropped(content: FreshAgentPaneContent) {
+        expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: OPENCODE_DURABLE_ID })
+        expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+        expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
+        expect(content.createRequestId).toBe(OPENCODE_CRID)
+        expect(content.restoreError).toBeUndefined()
+      }
+
+      function seedDurable() {
+        return panesReducer(
+          initialState,
+          initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: durableOpencodeContent() }),
+        )
+      }
+
+      it('updatePaneContent: restoreError + placeholder locator (raw shape) preserves the durable identity and drops the restoreError', () => {
+        const updated = panesReducer(
+          seedDurable(),
+          updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: placeholderWithRestoreError() }),
+        )
+        expectDurableIdentityRestoreErrorDropped(freshAgentLeaf(updated))
+      })
+
+      it('updatePaneContent: restoreError + placeholder sessionId/resumeSessionId without a locator (normalized shape) preserves the durable identity and drops the restoreError', () => {
+        const updated = panesReducer(
+          seedDurable(),
+          updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: placeholderWithRestoreErrorNoLocator() }),
+        )
+        expectDurableIdentityRestoreErrorDropped(freshAgentLeaf(updated))
+      })
+
+      it('hydrate: restoreError + placeholder locator (raw shape) preserves the durable identity and drops the restoreError', () => {
+        const seeded = panesReducer(
+          initialState,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+          })),
+        )
+        const merged = panesReducer(
+          seeded,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: placeholderWithRestoreError() },
+          })),
+        )
+        expectDurableIdentityRestoreErrorDropped(freshAgentLeaf(merged))
+      })
+
+      it('hydrate: restoreError + placeholder sessionId/resumeSessionId without a locator (normalized shape) preserves the durable identity and drops the restoreError', () => {
+        const seeded = panesReducer(
+          initialState,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+          })),
+        )
+        const merged = panesReducer(
+          seeded,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: placeholderWithRestoreErrorNoLocator() },
+          })),
+        )
+        expectDurableIdentityRestoreErrorDropped(freshAgentLeaf(merged))
+      })
+
+      it('restoreError on a DURABLE incoming identity applies unchanged (a genuinely broken durable pane)', () => {
+        const brokenDurable: FreshAgentPaneContent = {
+          ...durableOpencodeContent(),
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+        }
+        const updated = panesReducer(
+          seedDurable(),
+          updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: brokenDurable }),
+        )
+        const content = freshAgentLeaf(updated)
+        expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
+        expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+        expect(content.resumeSessionId).toBe(OPENCODE_DURABLE_ID)
+      })
+
+      it('hydrate: restoreError on a DURABLE incoming identity applies unchanged', () => {
+        const brokenDurable: FreshAgentPaneContent = {
+          ...durableOpencodeContent(),
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+        }
+        const seeded = panesReducer(
+          initialState,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: durableOpencodeContent() },
+          })),
+        )
+        const merged = panesReducer(
+          seeded,
+          hydratePanes(stateWithLayout({
+            'tab-1': { type: 'leaf', id: 'pane-1', content: brokenDurable },
+          })),
+        )
+        const content = freshAgentLeaf(merged)
+        expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
+        expect(content.sessionId).toBe(OPENCODE_DURABLE_ID)
+      })
+
+      it('deliberate reset: restoreError + placeholder under a NEW createRequestId applies unchanged', () => {
+        const resetStale = placeholderOpencodeContent('req-reset-generation', {
+          restoreError: DEAD_HANDLE_RESTORE_ERROR,
+        })
+        const updated = panesReducer(
+          seedDurable(),
+          updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: resetStale }),
+        )
+        const content = freshAgentLeaf(updated)
+        expect(content.createRequestId).toBe('req-reset-generation')
+        expect(content.sessionId).toBe('freshopencode-req-reset-generation')
+        expect(content.resumeSessionId).toBe('freshopencode-req-reset-generation')
+        expect(content.restoreError).toEqual(DEAD_HANDLE_RESTORE_ERROR)
+      })
+    })
+
     it('does not clamp across providers: same createRequestId with a different incoming provider is not continuity', () => {
       const seeded = panesReducer(
         initialState,
@@ -3140,10 +3278,77 @@ describe('panesSlice', () => {
         )).toBeUndefined()
       })
 
-      it('returns undefined when the incoming sessionRef is a string — sanitize discards it, never matches', () => {
+      it('returns undefined when the incoming sessionRef is a string — sanitize discards it as a locator, never matches', () => {
+        // The discriminator is the locator; with no usable locator the scalar
+        // identity fields classify. Keep them durable here so ONLY the
+        // string-locator rule is under test.
         expect(preservedDurableFreshAgentIdentity(
           PREVIOUS_DURABLE,
-          { ...INCOMING_PLACEHOLDER, sessionRef: 'freshopencode-req-1' as any },
+          {
+            ...INCOMING_PLACEHOLDER,
+            sessionRef: 'freshopencode-req-1' as any,
+            sessionId: 'ses_other_2',
+            resumeSessionId: 'ses_other_2',
+          },
+        )).toBeUndefined()
+      })
+
+      it('classifies staleness from a placeholder sessionId when the locator is absent (normalized restoreError shape)', () => {
+        const preserved = preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            provider: 'opencode',
+            createRequestId: 'req-1',
+            sessionId: 'freshopencode-req-1',
+            resumeSessionId: 'freshopencode-req-1',
+          },
+        )
+        expect(preserved).toEqual({
+          sessionRef: { provider: 'opencode', sessionId: 'ses_durable_1' },
+          sessionId: 'ses_durable_1',
+          resumeSessionId: 'ses_durable_1',
+        })
+      })
+
+      it('classifies staleness from a placeholder resumeSessionId alone when the locator is absent', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            provider: 'opencode',
+            createRequestId: 'req-1',
+            resumeSessionId: 'freshopencode-req-1',
+          },
+        )).toBeDefined()
+      })
+
+      it('classifies staleness when ANY present identity field is a placeholder (placeholder sessionId beside a durable resumeSessionId)', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            provider: 'opencode',
+            createRequestId: 'req-1',
+            sessionId: 'freshopencode-req-1',
+            resumeSessionId: 'ses_other_2',
+          },
+        )).toBeDefined()
+      })
+
+      it('returns undefined when the locator is absent and every present scalar identity field is durable', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          {
+            provider: 'opencode',
+            createRequestId: 'req-1',
+            sessionId: 'ses_other_2',
+            resumeSessionId: 'ses_other_2',
+          },
+        )).toBeUndefined()
+      })
+
+      it('returns undefined when the locator is absent and no scalar identity fields are present', () => {
+        expect(preservedDurableFreshAgentIdentity(
+          PREVIOUS_DURABLE,
+          { provider: 'opencode', createRequestId: 'req-1' },
         )).toBeUndefined()
       })
 
