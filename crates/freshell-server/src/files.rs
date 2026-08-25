@@ -560,6 +560,33 @@ fn trim_trailing_separators(input: &str) -> String {
     }
 }
 
+/// Lexical `path.resolve` segment collapse (`path-utils.ts:294`) for
+/// slash-absolute inputs: `.` dropped, `..` pops the last component (clamped
+/// at the filesystem root), redundant separators folded, trailing separators
+/// stripped. Non-absolute inputs are returned unchanged fail-closed: a
+/// relative or Windows-literal spelling can never prefix-match an absolute
+/// sandbox root, so collapsing here could only ever weaken the check.
+fn collapse_dot_segments(input: &str) -> String {
+    if !input.starts_with('/') {
+        return input.to_string();
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for segment in input.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(segment),
+        }
+    }
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
 /// A user path resolved for filesystem access: the flavor-preserving DISPLAY
 /// string (what goes back to the client in `resolvedPath` / suggestion paths)
 /// plus the native path used for actual filesystem operations.
@@ -1452,6 +1479,26 @@ mod tests {
         assert_eq!(trim_trailing_separators("/tmp/x/"), "/tmp/x");
         assert_eq!(trim_trailing_separators("/tmp/x///"), "/tmp/x");
         assert_eq!(trim_trailing_separators("/tmp/x"), "/tmp/x");
+    }
+
+    #[test]
+    fn collapse_dot_segments_mirrors_node_path_resolve() {
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects/../../etc/passwd"),
+            "/home/etc/passwd" // two `..` pop `projects` and `user`
+        );
+        assert_eq!(
+            collapse_dot_segments("/home/user/projects//../../../etc/passwd"),
+            "/etc/passwd" // three `..` pop everything down to the root
+        );
+        assert_eq!(collapse_dot_segments("/a/./b/"), "/a/b");
+        assert_eq!(collapse_dot_segments("/a/b/../b/file.txt"), "/a/b/file.txt");
+        // `..` clamps at the filesystem root, like path.resolve.
+        assert_eq!(collapse_dot_segments("/../.."), "/");
+        assert_eq!(collapse_dot_segments("/"), "/");
+        // Non-absolute / literal fallback strings stay byte-exact (fail-closed).
+        assert_eq!(collapse_dot_segments("C:\\Users\\..\\x"), "C:\\Users\\..\\x");
+        assert_eq!(collapse_dot_segments("rel/../x"), "rel/../x");
     }
 
     #[test]
