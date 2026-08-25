@@ -1969,8 +1969,7 @@ async fn resume_session_ref_tab(
     let was_recorded = sink
         .as_ref()
         .is_some_and(|s| s.was_recorded(PROVIDER, &durable_id));
-    let probe_route: freshell_opencode::Route =
-        recovered.as_ref().and_then(|rec| rec.cwd.clone());
+    let probe_route: freshell_opencode::Route = recovered.as_ref().and_then(|rec| rec.cwd.clone());
 
     // 5. Bounded probe. Budget layers: cfg(test) state override >
     // FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS > 10_000ms — resolved purely by
@@ -3624,11 +3623,9 @@ mod tests {
         assert!(placeholder.starts_with("freshopencode-"));
         let pendings = fake.pendings.lock().unwrap();
         assert!(
-            pendings
-                .iter()
-                .any(|(id, mode, cwd)| id == &placeholder
-                    && mode == "freshopencode"
-                    && cwd.as_deref() == Some("/w")),
+            pendings.iter().any(|(id, mode, cwd)| id == &placeholder
+                && mode == "freshopencode"
+                && cwd.as_deref() == Some("/w")),
             "pending marker recorded at REST create under the placeholder id: {pendings:?}"
         );
     }

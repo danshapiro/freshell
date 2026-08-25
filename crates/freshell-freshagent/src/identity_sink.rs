@@ -64,8 +64,11 @@ pub trait PaneIdentitySink: Send + Sync {
     /// Synchronous + memory-fast like `load_settings`/`was_recorded`; the REST
     /// resume path uses it to resolve `freshopencode-<createRequestId>`
     /// placeholders to their materialized `ses_*` session.
-    fn lookup_by_create_request_id(&self, provider: &str, create_request_id: &str)
-        -> Option<String>;
+    fn lookup_by_create_request_id(
+        &self,
+        provider: &str,
+        create_request_id: &str,
+    ) -> Option<String>;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -200,8 +203,7 @@ impl PaneIdentitySink for FakeIdentitySink {
             .iter()
             .rev()
             .find(|b| {
-                b.provider == provider
-                    && b.create_request_id.as_deref() == Some(create_request_id)
+                b.provider == provider && b.create_request_id.as_deref() == Some(create_request_id)
             })
             .map(|b| b.session_id.clone())
     }
@@ -313,7 +315,10 @@ mod tests {
             Some("ses_abc")
         );
         // Unknown create requestId / other provider miss.
-        assert_eq!(fake.lookup_by_create_request_id("opencode", "cr-nope"), None);
+        assert_eq!(
+            fake.lookup_by_create_request_id("opencode", "cr-nope"),
+            None
+        );
         assert_eq!(fake.lookup_by_create_request_id("codex", "cr-1"), None);
     }
 

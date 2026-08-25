@@ -201,10 +201,14 @@ mod tests {
         .expect("awaited write succeeds");
 
         assert_eq!(
-            sink.lookup_by_create_request_id("opencode", "cr-1").as_deref(),
+            sink.lookup_by_create_request_id("opencode", "cr-1")
+                .as_deref(),
             Some("ses_lookup")
         );
-        assert_eq!(sink.lookup_by_create_request_id("opencode", "cr-nope"), None);
+        assert_eq!(
+            sink.lookup_by_create_request_id("opencode", "cr-nope"),
+            None
+        );
         assert_eq!(sink.lookup_by_create_request_id("codex", "cr-1"), None);
     }
 

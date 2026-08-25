@@ -1385,7 +1385,6 @@ fn restore_error_placeholder_with_a_new_create_request_id_passes_through() {
     );
 }
 
-
 // ---- diagnostic_counts (DEFECT 1 + DEFECT 2 regression coverage) ----
 
 #[test]

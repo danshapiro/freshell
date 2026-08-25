@@ -824,10 +824,7 @@ impl ServeHttp for ResumeServeHttp {
             .split("directory=")
             .nth(1)
             .map(|rest| rest.split('&').next().unwrap_or("").to_string());
-        self.observed_directories
-            .lock()
-            .unwrap()
-            .push(directory);
+        self.observed_directories.lock().unwrap().push(directory);
         if self.wedged {
             return Box::pin(std::future::pending());
         }
@@ -891,7 +888,9 @@ impl EventSource for ResumeNoopEventSource {
 /// pane-identity sink wired in. Mirrors `state_with_fixed_session_http`'s
 /// shape (lib.rs tests) — the fakes are module-private there, so this file
 /// carries its own copies per the brief.
-async fn state_with_resume_http(http: Arc<ResumeServeHttp>) -> (FreshAgentState, Arc<FakeIdentitySink>) {
+async fn state_with_resume_http(
+    http: Arc<ResumeServeHttp>,
+) -> (FreshAgentState, Arc<FakeIdentitySink>) {
     let state = state_with_registry();
     let deps = ServeDeps {
         spawner: Arc::new(ResumeNoopSpawner),
@@ -1167,7 +1166,10 @@ async fn rest_resume_unresolvable_placeholder_is_404_naming_it() {
 
     // Loud-failure hygiene: no tab/pane was minted for either rejected resume.
     let (rows, _) = state.layout.list_tabs();
-    assert!(rows.is_empty(), "no phantom tab on a rejected resume: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "no phantom tab on a rejected resume: {rows:?}"
+    );
     assert!(state.panes.lock().unwrap().is_empty());
 }
 
@@ -1189,7 +1191,10 @@ async fn rest_resume_unknown_durable_ses_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
     let (rows, _) = state.layout.list_tabs();
-    assert!(rows.is_empty(), "no phantom tab on a rejected resume: {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "no phantom tab on a rejected resume: {rows:?}"
+    );
     assert!(state.panes.lock().unwrap().is_empty());
 }
 
@@ -1227,7 +1232,10 @@ async fn rest_resume_malformed_sessionref_is_400() {
         ("non-object", json!("ses_x")),
         // Neither a durable ses_* id nor a freshopencode- placeholder —
         // an unknown IDENTITY shape, rejected lest it be silently ignored.
-        ("unknown id shape", json!({ "provider": "opencode", "sessionId": "thread-9" })),
+        (
+            "unknown id shape",
+            json!({ "provider": "opencode", "sessionId": "thread-9" }),
+        ),
     ] {
         let (status, body) = post(
             app(state.clone()),
@@ -1317,8 +1325,7 @@ async fn rest_resume_probe_error_other_than_notfound_or_timeout_is_502() {
 }
 
 #[tokio::test]
-async fn rest_resume_probe_carries_no_directory_without_ledger_cwd_and_serve_dir_beats_body_cwd()
- {
+async fn rest_resume_probe_carries_no_directory_without_ledger_cwd_and_serve_dir_beats_body_cwd() {
     let http = Arc::new(ResumeServeHttp::with_sessions(&[(
         "ses_unrecorded_1",
         resume_session_body("ses_unrecorded_1", Some("/serve/dir")),
