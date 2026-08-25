@@ -152,6 +152,25 @@ pub(crate) const OPENCODE_PLACEHOLDER_PREFIX: &str = "freshopencode-";
 /// generous Kimi budget; the request always supplies one in the oracle path).
 const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// The resume probe's bounded `get_session` budget resolution, extracted pure
+/// (delta-r2 Fix 3 — the state-injection timeout tests prove boundedness; the
+/// lib tests pin THE KNOB's parsing/default without ever mutating process
+/// env). Layers, in order: `state_override` (the cfg(test) seam) >
+/// `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` (the raw env string, read by the
+/// caller) > 10_000ms default — the SAME env-parse semantics the WS resume
+/// door applies (`opencode_ws.rs`); both doors resolve through this ONE
+/// function so they can never drift. A `u64` parse rejects empty, garbage,
+/// negative, overflowing, and whitespace-padded values alike; they all fall
+/// to the default.
+pub(crate) fn resolve_probe_timeout_ms(state_override: Option<u64>, env_raw: Option<&str>) -> u64 {
+    if let Some(ms) = state_override {
+        return ms;
+    }
+    env_raw
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(10_000u64)
+}
+
 /// Shared, cheaply-cloneable fresh-agent REST state (mergeable into the server app).
 #[derive(Clone)]
 pub struct FreshAgentState {
@@ -793,21 +812,23 @@ impl FreshAgentState {
 
     /// The REST resume probe's bounded `get_session` budget, in milliseconds:
     /// cfg(test) state override > `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
-    /// env parse > 10_000ms default — the same env/default layers the WS
-    /// resume door uses (`opencode_ws.rs:1483-1486`).
+    /// env parse > 10_000ms default — resolved purely by
+    /// [`resolve_probe_timeout_ms`], the same function the WS resume door
+    /// uses (`opencode_ws.rs`), so both doors share one parse semantics.
     fn resume_probe_budget_ms(&self) -> u64 {
         #[cfg(test)]
-        if let Some(ms) = *self
+        let state_override = *self
             .resume_probe_timeout_ms
             .lock()
-            .expect("resume_probe_timeout_ms mutex")
-        {
-            return ms;
-        }
-        std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000u64)
+            .expect("resume_probe_timeout_ms mutex");
+        #[cfg(not(test))]
+        let state_override = None;
+        resolve_probe_timeout_ms(
+            state_override,
+            std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        )
     }
 
     // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──
@@ -1952,8 +1973,8 @@ async fn resume_session_ref_tab(
         recovered.as_ref().and_then(|rec| rec.cwd.clone());
 
     // 5. Bounded probe. Budget layers: cfg(test) state override >
-    // FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS > 10_000ms — the WS resume
-    // door's knob semantics (opencode_ws.rs:1483-1486).
+    // FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS > 10_000ms — resolved purely by
+    // `resolve_probe_timeout_ms`, shared with the WS resume door.
     let manager = state.ensure_manager().await;
     let budget = state.resume_probe_budget_ms();
     let get = tokio::time::timeout(
@@ -3826,6 +3847,47 @@ mod tests {
         assert_eq!(items[1]["text"], json!("Ran the command."));
         // Summary joins the (single) text item's text.
         assert_eq!(turn["summary"], json!("Ran the command."));
+    }
+
+    // ── resolve_probe_timeout_ms (Task 4 knob, pinned purely) ────────────────
+    // The resume probe's budget layers: state override >
+    // `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS` parse > 10_000ms default —
+    // the SAME env-parse semantics the WS resume door applies
+    // (`opencode_ws.rs`). The state-injection timeout tests prove boundedness;
+    // these pin the KNOB's parsing/default. Pure: NO process env is mutated
+    // (the caller reads `std::env::var` and hands the raw Option<&str> in).
+
+    #[test]
+    fn resolve_probe_timeout_ms_state_override_beats_env() {
+        assert_eq!(resolve_probe_timeout_ms(Some(250), Some("5000")), 250);
+        assert_eq!(resolve_probe_timeout_ms(Some(250), None), 250);
+    }
+
+    #[test]
+    fn resolve_probe_timeout_ms_env_parse_wins_over_default() {
+        assert_eq!(resolve_probe_timeout_ms(None, Some("7500")), 7500);
+        // "0" parses: an explicit zero budget is the operator's choice.
+        assert_eq!(resolve_probe_timeout_ms(None, Some("0")), 0);
+    }
+
+    #[test]
+    fn resolve_probe_timeout_ms_garbage_env_falls_to_default() {
+        assert_eq!(resolve_probe_timeout_ms(None, Some("not-a-number")), 10_000);
+        assert_eq!(resolve_probe_timeout_ms(None, Some("")), 10_000);
+        // Negative and overflowing values fail the u64 parse, same as garbage.
+        assert_eq!(resolve_probe_timeout_ms(None, Some("-50")), 10_000);
+        assert_eq!(
+            resolve_probe_timeout_ms(None, Some("99999999999999999999999999")),
+            10_000
+        );
+        // Whitespace is NOT trimmed (the parse semantics the WS door has
+        // always had — no silent behavior drift).
+        assert_eq!(resolve_probe_timeout_ms(None, Some(" 7500")), 10_000);
+    }
+
+    #[test]
+    fn resolve_probe_timeout_ms_missing_env_is_default() {
+        assert_eq!(resolve_probe_timeout_ms(None, None), 10_000);
     }
 }
 

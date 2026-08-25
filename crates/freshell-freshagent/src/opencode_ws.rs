@@ -1479,11 +1479,16 @@ impl FreshOpencodeState {
 
         // V5 caveat (b): `RequestOptions.timeout` defaults to `None`, so a
         // wedged-but-accepting `opencode serve` would hang this await forever and hold
-        // the sessionRef reserved until restart. Bound it (env-tunable for tests).
-        let budget = std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000u64);
+        // the sessionRef reserved until restart. Bound it (env-tunable for tests) —
+        // resolved through the SAME pure function the REST resume door uses
+        // (`crate::resolve_probe_timeout_ms`: env parse > 10_000ms default) so the
+        // two doors can never drift.
+        let budget = crate::resolve_probe_timeout_ms(
+            None,
+            std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        );
         let get = tokio::time::timeout(
             std::time::Duration::from_millis(budget),
             manager.get_session(session_id, &route),
