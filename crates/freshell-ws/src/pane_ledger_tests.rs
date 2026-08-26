@@ -200,10 +200,11 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     let next = PaneLedger::new_locked(Some(root.clone()));
     assert!(
         next.ever_bound("claude", "s1"),
-        "third new_locked came up blind despite the lock being acquirable and \
-         s1.json on disk ({s1_on_disk}): load_index silently returned empty \
-         (H2, pane_ledger.rs:299-321 swallows I/O errors) or a second \
-         acquire Err raced in after the probe"
+        "third new_locked came up empty despite the lock being acquirable and \
+         s1.json on disk ({s1_on_disk}): silent-empty load_index is no longer \
+         constructible (qzka), so `next` came up DISABLED — check this run's \
+         stderr for pane_ledger_scan_unavailable (scan fault) or a lock race \
+         with the holder's drop"
     );
     std::fs::remove_dir_all(&root).ok();
 }
