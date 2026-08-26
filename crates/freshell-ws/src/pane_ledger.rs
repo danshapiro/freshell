@@ -25,7 +25,13 @@
 //!
 //! Corruption policy: fail loud PER-ROW, never per-store — an unparsable row
 //! is quarantined (renamed aside + logged), never silently dropped, and never
-//! causes healthy rows to be skipped.
+//! causes healthy rows to be skipped. STORE-level faults are the mirror
+//! image (kata qzka): a scan directory that exists but cannot be read
+//! disables the ledger loudly at construction
+//! (`pane_ledger_scan_unavailable`) — an ENABLED ledger ALWAYS guarantees a
+//! complete construction scan, and a blind ENABLED ledger is never
+//! constructed. First boot is not a fault: absent scan dirs map to an
+//! ENABLED empty index.
 //!
 //! Write-failure policy: a ledger write failure never blocks the
 //! create/identity event, but it is never silent — see
@@ -185,13 +191,31 @@ pub struct Resolution {
 /// construction by a single directory scan; every successful file write
 /// updates it in the same locked section. Unparsable / wrong-version files
 /// are skipped here silently — the boot scan (Task 4) is what quarantines
-/// them loudly.
+/// them loudly. Scan-level I/O faults (unreadable dir, errored entry) are
+/// NOT skipped: they propagate out of `load_index` and disable the ledger.
 #[derive(Default)]
 struct LedgerIndex {
     /// (provider, session_id) -> row. Bound AND retired (tombstones stay).
     bindings: std::collections::HashMap<(String, String), BindingRow>,
     /// terminal_id -> marker.
     pending: std::collections::HashMap<String, PendingMarker>,
+}
+
+/// Read a scan directory, mapping `NotFound` to "absent" (`Ok(None)`) and
+/// propagating every other error with the faulted path attached. The
+/// `std::io::Error` `Display` already carries the errno text (f3wp lesson:
+/// the errno is what names the mechanism), so both `kind()` and the OS
+/// detail survive the wrap. Shared by `load_index` (propagates) and the
+/// boot-scan quarantine walk (records + continues).
+fn read_dir_existing(dir: &Path) -> std::io::Result<Option<std::fs::ReadDir>> {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => Ok(Some(rd)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(std::io::Error::new(
+            err.kind(),
+            format!("read {}: {err}", dir.display()),
+        )),
+    }
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -215,16 +239,42 @@ impl PaneLedger {
     /// Lock-free construction — tests and the integration harness use this
     /// (verification handles over a live server's dir must not fight the
     /// server's flock). Production uses [`PaneLedger::new_locked`].
+    ///
+    /// An ENABLED ledger guarantees its index reflects a COMPLETE
+    /// construction scan of the on-disk store: a store region that exists
+    /// but cannot be fully read (I/O error, unreadable subdir, errored
+    /// entry) logs a loud structured ERROR and comes up DISABLED — never
+    /// silently ENABLED-but-blind (kata qzka; a blind `None` from
+    /// `bound_session_ref_for_terminal` is indistinguishable from
+    /// "retired", which is why [`PaneLedger::is_enabled`] gates the
+    /// auto-resume guard). A store whose scan dirs are simply ABSENT is the
+    /// expected first-boot shape: ENABLED with an empty index.
     pub fn new(root: Option<PathBuf>) -> Self {
-        let index = root
-            .as_ref()
-            .map(|r| Self::load_index(r))
-            .unwrap_or_default();
-        Self {
-            root,
-            index: Mutex::new(index),
-            lock_file: None,
-            quarantined: RwLock::new(Vec::new()),
+        let Some(r) = root else {
+            return Self {
+                root: None,
+                index: Mutex::new(LedgerIndex::default()),
+                lock_file: None,
+                quarantined: RwLock::new(Vec::new()),
+            };
+        };
+        match Self::load_index(&r) {
+            Ok(index) => Self {
+                root: Some(r),
+                index: Mutex::new(index),
+                lock_file: None,
+                quarantined: RwLock::new(Vec::new()),
+            },
+            Err(err) => {
+                tracing::error!(
+                    target: "freshell_ws::pane_ledger",
+                    root = %r.display(),
+                    error = %err,
+                    "pane_ledger_scan_unavailable: store exists but could not \
+                     be fully read; ledger DISABLED (never a blind ledger)"
+                );
+                Self::disabled()
+            }
         }
     }
 
@@ -232,8 +282,13 @@ impl PaneLedger {
     /// exclusive advisory `flock(2)` on `<root>/lock` (the `ConfigLock`
     /// pattern, `settings_store.rs:385-417`). If another process holds it,
     /// log a loud structured ERROR and come up DISABLED (no-op) — never two
-    /// writers on one store. Non-unix: no flock primitive is wired;
-    /// construct normally (ConfigLock's non-unix parity).
+    /// writers on one store. The scan then runs under [`PaneLedger::new`]'s
+    /// completeness guarantee: a store that EXISTS but cannot be fully read
+    /// also comes up DISABLED with a loud structured ERROR
+    /// (`pane_ledger_scan_unavailable`), while an absent (first-boot) store
+    /// comes up ENABLED and empty — absence is not a fault. Non-unix: no
+    /// flock primitive is wired; construct normally (ConfigLock's non-unix
+    /// parity).
     pub fn new_locked(root: Option<PathBuf>) -> Self {
         let Some(r) = root.clone() else {
             return Self::new(None);
@@ -311,14 +366,31 @@ impl PaneLedger {
     }
 
     /// The ONE directory scan — construction-time only (V1.md).
-    fn load_index(root: &Path) -> LedgerIndex {
+    ///
+    /// Scan-level fault policy (kata qzka): a scan directory that exists
+    /// but cannot be read, a provider subdirectory that cannot be read, or
+    /// an entry that errors mid-iteration is a STORE-LEVEL fault and
+    /// propagates as `Err`; the constructors turn it into a loudly-logged
+    /// DISABLED ledger, never a blind ENABLED one. `NotFound` maps to
+    /// "absent" — the expected first-boot shape — and contributes nothing.
+    /// Anything under `bindings/` that is not a readable directory of row
+    /// files is therefore also a fault. ROW-level faults stay per-row:
+    /// unparsable / wrong-version files are skipped here, and the boot scan
+    /// quarantines them loudly (module doc, fail-loud-per-row).
+    fn load_index(root: &Path) -> std::io::Result<LedgerIndex> {
+        fn entry_err(err: std::io::Error, dir: &Path) -> std::io::Error {
+            std::io::Error::new(err.kind(), format!("list {}: {err}", dir.display()))
+        }
         let mut index = LedgerIndex::default();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
-                    continue;
+        if let Some(providers) = read_dir_existing(&Self::bindings_dir(root))? {
+            for provider in providers {
+                let provider = provider.map_err(|err| entry_err(err, &Self::bindings_dir(root)))?;
+                let provider_dir = provider.path();
+                let Some(files) = read_dir_existing(&provider_dir)? else {
+                    continue; // provider dir vanished mid-scan — absent
                 };
-                for file in files.flatten() {
+                for file in files {
+                    let file = file.map_err(|err| entry_err(err, &provider_dir))?;
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue; // *.tmp-* and *.quarantined-* residue
@@ -333,8 +405,9 @@ impl PaneLedger {
                 }
             }
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            for file in files.flatten() {
+        if let Some(files) = read_dir_existing(&Self::pending_dir(root))? {
+            for file in files {
+                let file = file.map_err(|err| entry_err(err, &Self::pending_dir(root)))?;
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
@@ -346,7 +419,7 @@ impl PaneLedger {
                 }
             }
         }
-        index
+        Ok(index)
     }
 
     /// Poison-tolerant lock (the `with_persist_lock` idiom) over the

@@ -1154,3 +1154,83 @@ fn session_missing_serde_round_trips() {
     let deserialized: RetiredReason = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized, RetiredReason::SessionMissing);
 }
+
+#[test]
+fn new_comes_up_disabled_when_bindings_dir_is_unreadable() {
+    // kata qzka: a scan-level fault must NEVER yield a blind ENABLED
+    // ledger. `bindings` as a regular FILE fails read_dir with ENOTDIR on
+    // every platform — uid-independent, no chmod.
+    let root = temp_root("new-blind");
+    std::fs::write(root.join("bindings"), b"not a directory").unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(
+        !ledger.is_enabled(),
+        "a store whose bindings dir cannot be read must come up DISABLED, \
+         never ENABLED-and-blind"
+    );
+    assert!(
+        !ledger.ever_bound("claude", "s1"),
+        "a disabled ledger's reads answer empty"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn new_locked_comes_up_disabled_when_bindings_dir_is_unreadable() {
+    // The kata's headline scenario: a REAL, durably-written store exists;
+    // the restarted process cannot read it. Today the restart comes up
+    // ENABLED and blind to s1; after the fix it comes up DISABLED (loud).
+    // gen1 uses the lock-free constructor so this test performs exactly ONE
+    // flock acquisition (gen2) — no drop/re-acquire ordering involved
+    // (f3wp flake lesson).
+    let root = temp_root("locked-blind");
+    let gen1 = PaneLedger::new(Some(root.clone()));
+    gen1.record_binding(&write("claude", "s1", "t1", 1))
+        .unwrap();
+    assert!(gen1.ever_bound("claude", "s1"));
+    let bindings = root.join("bindings");
+    let stash = root.join("bindings.stash");
+    std::fs::rename(&bindings, &stash).unwrap();
+    std::fs::write(&bindings, b"not a directory").unwrap();
+    let gen2 = PaneLedger::new_locked(Some(root.clone()));
+    assert!(
+        !gen2.is_enabled(),
+        "restart over an unreadable bindings dir must come up DISABLED \
+         (loud), not ENABLED-and-blind to the durably-written s1"
+    );
+    assert!(!gen2.ever_bound("claude", "s1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn new_comes_up_disabled_when_pending_dir_is_unreadable() {
+    let root = temp_root("new-blind-pending");
+    std::fs::write(root.join("pending"), b"not a directory").unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(
+        !ledger.is_enabled(),
+        "an unreadable pending dir is a scan-level fault: DISABLED, never blind"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn new_locked_first_boot_absent_dirs_is_enabled_and_empty() {
+    // The other half of the kata's distinction: "no index yet" (first boot —
+    // the scan dirs are simply absent) is NOT a fault. NotFound must map to
+    // an ENABLED empty index, or every first boot would self-disable.
+    let root = temp_root("first-boot");
+    let ledger = PaneLedger::new_locked(Some(root.clone()));
+    assert!(
+        ledger.is_enabled(),
+        "absent bindings/pending dirs (first boot) is not a fault"
+    );
+    assert!(ledger.list_bindings().is_empty());
+    assert!(!ledger.ever_bound("claude", "s1"));
+    // ...and the ENABLED first-boot ledger is fully functional.
+    ledger
+        .record_binding(&write("claude", "s1", "t1", 1))
+        .unwrap();
+    assert!(ledger.ever_bound("claude", "s1"));
+    std::fs::remove_dir_all(&root).ok();
+}
