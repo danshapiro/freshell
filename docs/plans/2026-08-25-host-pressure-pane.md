@@ -226,14 +226,14 @@ import {
 } from '../../../shared/ws-protocol'
 
 const live = {
-  machine: { cores: 12, memTotalBytes: 34_000_000_000, platform: 'linux', wsl: true, kernel: '6.6', hostname: 'h' },
+  machine: { cores: 12, memTotalBytes: 34_000_000_000, platform: 'linux', wsl: true, kernel: '6.6', hostname: 'h', psi: true, cgroup: 'v2', thermalCount: 1, batteryPresent: false, gpu: 'none' },
   cpu: { available: true, usagePct: 12.5, stealPct: 0, perCorePct: [1, 2], freqMHz: 3400 },
   load: { available: true, load1: 0.5, load5: 1, load15: 1.2, cores: 12 },
   memory: { available: true, source: 'host', totalBytes: 1, usedBytes: 1, availableBytes: 1, cgroupLimitBytes: null, swapTotalBytes: 0, swapUsedBytes: 0 },
   paging: { available: true, swapInKbps: 0, swapOutKbps: 0, majFaultsPerSec: 0, oomKillsDelta: 0, oomKillsTotal: 0 },
   psi: { available: true, cpuSome10: 0.1, memSome10: null, memFull10: null, ioSome10: 0.2, ioFull10: 0 },
   diskIo: { available: true, readBps: 0, writeBps: 0, utilPct: null, weightedAwaitMs: null },
-  network: { available: true, rxBps: 0, txBps: 0, rxErrorsTotal: 0, txErrorsTotal: 0, rxDroppedTotal: 0, txDroppedTotal: 0 },
+  network: { available: true, rxBps: 0, txBps: 0, rxErrorsTotal: 0, txErrorsTotal: 0, rxDroppedTotal: 0, txDroppedTotal: 0, rxErrorsDelta: 0, txErrorsDelta: 0, rxDroppedDelta: 0, txDroppedDelta: 0 },
   limits: { available: true, fdsUsed: 128, fdsMax: 1048576, pidsUsed: 900, pidsMax: 4194304, timeWait: 42, ephemeralPorts: 28232 },
   freshell: { available: true, source: 'node', ptysRunning: 1, ptysMax: 50, wsClients: 2, wsClientsMax: 50, eventLoopLagP99Ms: 3.2, rssBytes: 900_000_000, uptimeSec: 100 },
 }
@@ -289,9 +289,9 @@ In `crates/freshell-protocol/src/client_messages.rs`: add serde-tagged variants:
     HostStatsRefresh(HostStatsRefresh),   // struct { request_id: String }
 ```
 
-(`request_id` with `#[serde(rename = "requestId")]`), append the three type strings to `CLIENT_MESSAGE_TYPES` in inventory order, bump its length to 34. In `server_messages.rs`: add `HostStatsSnapshot(HostStatsSnapshot)` and `HostStatsRefreshResponse(HostStatsRefreshResponse)` variants + full payload structs mirroring the zod shapes (every field `Option<…>` where the zod side uses `.nullable()`/`.optional()`; rates `f64`, counts `u64`/`i64`; `sectionErrors` as `HashMap<String,String>`; serde field casing default = the TS camelCase keys only if the file's existing structs use `#[serde(rename_all = "camelCase")]` — CHECK the convention in server_messages.rs first and match it) — append to `SERVER_MESSAGE_TYPES` → 60. Update `crates/freshell-protocol/tests/inventory.rs` counts: 31→34, 58→60, 89→94.
+(`request_id` with `#[serde(rename = "requestId")]`), append the three type strings to `CLIENT_MESSAGE_TYPES` in inventory order, bump its length to 34. In `server_messages.rs`: add `HostStatsSnapshot(HostStatsSnapshot)` and `HostStatsRefreshResponse(HostStatsRefreshResponse)` variants + full payload structs mirroring the zod shapes. **Serde discipline (critical, LB14 + review finding):** fields that are zod `.nullable()` (ie. REQUIRED-but-may-be-null on the wire: `freqMHz`, `stealPct`, `cgroupLimitBytes`, `swapTotalBytes`/`swapUsedBytes`, PSI avg fields, `utilPct`, `weightedAwaitMs`, all `limits.*Used/*Max`, `eventLoopLagP99Ms`, `rssBytes`, `kernel`, `hostname`, `battery`, `manualAt`, `manual`) map to `Option<T>` that ALWAYS serialize (null allowed) with NO skip attr; fields that are zod `.optional()` (ie. MAY-be-absent: `refresh.response.at/manual/error`) map to `Option<T>` PLUS `#[serde(skip_serializing_if = "Option::is_none", default)]` — never serialized as explicit null. `sectionErrors`: `HashMap<String,String>`; casing: match the file's existing convention (`rename_all = "camelCase"` if that's what the neighbors use — verify; the shape-pin test below pins it either way). Append the two server discriminants to `SERVER_MESSAGE_TYPES` → 60. Update `crates/freshell-protocol/tests/inventory.rs` counts: 31→34, 58→60, 89→94.
 
-Also add a FIELD-LEVEL drift pin (LB14 — the inventory test only pins discriminant names, not shapes): new test file `crates/freshell-protocol/tests/hoststats_shape.rs` — construct a fully-populated `HostStatsSnapshot` + `HostStatsRefresh`, serialize with `serde_json::to_value`, and assert the exact key set + camelCase spelling against a committed expected JSON literal (nested sections included: every section key, every subfield). Any serde casing slip on either side fails this test at CI, before it can ship to the production Rust server.
+Also add a FIELD-LEVEL drift pin (LB14 — the inventory test only pins discriminant names, not shapes): new test file `crates/freshell-protocol/tests/hoststats_shape.rs` — TWO cases: (a) a fully-populated `HostStatsSnapshot` asserting the exact key set + camelCase spelling (nested sections included) against a committed expected JSON literal, and (b) a bare `HostStatsRefreshResponse { request_id, ok:true }` asserting `at`/`manual`/`error` keys are ABSENT (not null) and a `HostStatsSnapshot` with `manual_at: None` asserting `"manualAt": null` IS present — pinning the nullable-vs-optional serde split from both sides.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -353,7 +353,8 @@ export function readMachineInfo(procRoot?: string, sysRoot?: string): HostStatsM
 export function statfsInfo(mount: string): { totalBytes: number; freeBytes: number; usedPct: number; inodesTotal: number | null; inodesFree: number | null } | null
 export function readThermals(sysRoot?: string): { label: string; celsius: number }[] | null   // ≤16 zones; null if missing dir
 export function readBattery(sysRoot?: string): { pct: number; status: string } | null
-export async function scanProcessTable(procRoot: string | null, dwellMs: number): Promise<{ top: { pid: number; name: string; cpuPct: number; rssBytes: number; state: string }[]; zombies: number; dState: number; total: number } | null>
+export async function scanProcessTable(procRoot: string | null, dwellMs: number, deadlineMs: number): Promise<{ top: { pid: number; name: string; cpuPct: number; rssBytes: number; state: string }[]; zombies: number; dState: number; total: number } | null>
+// deadlineMs is an absolute epoch-ms budget from the caller (service section budget): checked BEFORE each pid unit of work; on expiry throws DeadlineExceeded.
 export const __testInternals: { computeCpuPct(deltaJiffies: number, dwellMs: number): number; parsePsOutput(text: string): …; isWholeDevice(name: string): boolean }
 ```
 
@@ -441,7 +442,7 @@ export class HostStatsService {
 
 Behavior contract (the test file asserts every line):
 1. `start()` installs two `.unref?.()`'d intervals; slow tier reads only the slow readers; rates (cpu%, paging rates, disk r/w Bps, net rx/tx Bps) computed from cumulative reader deltas over dt; first tick populates with null-safe zeros where a delta isn't possible yet.
-2. Memory precedence: cgroup v2 leaf (`memory.current` + `memory.max` at the path resolved from `/proc/self/cgroup`), else cgroup v1 leaf, else host `/proc/meminfo`, else darwin `os.totalmem()/freemem()` (`source` records which). `cgroupLimitBytes` only set when source is cgroup and max≠'max'.
+2. Memory precedence (VALIDATED on the real service: the running Freshell itself sits in an unlimited cgroup — `memory.current=16.2GB, memory.max=max` — so this rule is exercised daily): cgroup leaf resolved from `/proc/self/cgroup`; when the finite limit exists (`memory.max` ≠ 'max'), `source='cgroup'`, `totalBytes=limitBytes`, `usedBytes=currentBytes`, `availableBytes=max(0, limit−current)`, `cgroupLimitBytes=limitBytes`; when unlimited (max='max') or absent, `source='host'` and ALL totals come from host `/proc/meminfo` (`totalBytes=MemTotal`, `availableBytes=MemAvailable`, `usedBytes=total−avail`, `cgroupLimitBytes=null`) — never mix a cgroup `current` with a host total. Darwin: `os.totalmem()/freemem()` same shape, source 'host'.
 3. `freshell.eventLoopLagP99Ms` — own histogram: enable at start; each fast tick read p99 → `histogram.reset()`; darwin/win… only while running.
 4. `freshell.ptys*/ws*` come from `setSources`-injected (or constructor-seeded) providers — `getWsClientCounts` is wired with the real WsHandler in index.ts via `hostStats.setSources(...)` after handler construction.
 5. Nothing is collected while stopped: test spies on reader functions (vi.mock the readers module) → after `stop()`, advancing fake timers calls zero reader fns.
@@ -577,7 +578,9 @@ Node test asserts `detectFeatureFlags()['hostStatsAvailable'] === (process.platf
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/platform-flags.test.ts --config config/vitest/vitest.server.config.ts && cargo test -p freshell-server --locked host_stats_flag_present_in_platform_payload`
+Run (TWO commands; BOTH must show RED — never chain RED evidence with `&&`):
+1. `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/platform-flags.test.ts --config config/vitest/vitest.server.config.ts` → FAIL (flag absent)
+2. `cargo test -p freshell-server --locked host_stats_flag_present_in_platform_payload` → FAIL (flag absent; the named test exists)
 
 Expected: RED — flag absent; the named Rust test EXISTS and fails (never accept a filter matching zero tests).
 
@@ -636,8 +639,11 @@ export type HostStatsState = {
   manual: HostStatsManual | null
   refresh: { inFlight: boolean; requestId: string | null; error: string | null }
 }
-// reducers: hostStatsPaneMounted(), hostStatsPaneUnmounted(), hostStatsSnapshotReceived({at, live, manualAt, manual}) — also sets
-//   clockOffsetMs = Date.now() - at (clamped ≥0 drift guard: allow small negatives → clamp to 0), keeping age math skew-safe over LAN/VPN,
+// reducers: hostStatsPaneMounted(), hostStatsPaneUnmounted(), hostStatsSubscribedSet(true|false)  ← the ONLY writer of `subscribed`;
+//   activated by the thunks at the exact 0→1 / 1→0 transition (optimistic=true; on ws error state, hostStatsReset clears),
+//   hostStatsSnapshotReceived({at, live, manualAt, manual}) — also sets
+//   clockOffsetMs = Date.now() - at with NO zero-clamp (client-behind-server yields a correctly NEGATIVE offset so
+//   serverNow = Date.now() - clockOffsetMs stays skew-correct; only reject |offset|>10min as unparseable garbage → keep previous),
 // hostStatsRefreshStarted({requestId}), hostStatsRefreshResolved({at, manual}), hostStatsRefreshFailed({error}),
 //           hostStatsReset()  // on ws disconnect/'ready' — keeps last manual+live but subscribed=false
 // thunks (in the slice file, following repo thunk conventions): activateHostStats() / deactivateHostStats() — PURE reducer
@@ -731,7 +737,7 @@ git commit -m "feat(host-stats): client slice, status helpers, and ws folding fo
 **Component structure (exact):**
 
 ```tsx
-export default function HostStatsPane({ tabId, paneId }: Props) {
+export default function HostStatsPane(_props: HostStatsPaneProps) {
   const dispatch = useAppDispatch()
   const live = useAppSelector((s) => s.hostStats.live)
   const liveAt = useAppSelector((s) => s.hostStats.liveAt)
@@ -742,7 +748,7 @@ export default function HostStatsPane({ tabId, paneId }: Props) {
     dispatch(activateHostStats())                    // thunk: refcount++, sends hoststats.subscribe iff 0→1
     return () => { dispatch(deactivateHostStats()) } // thunk: refcount--, sends hoststats.unsubscribe iff 1→0
   }, [dispatch])
-  // …render per contract
+  // …render per contract (a11y: unused props object is taken whole — `no-unused-vars` clean without `_`-prefixed destructuring)
 }
 ```
 
@@ -854,17 +860,25 @@ git commit -m "feat(host-stats): registry/REST/MCP surface for host-stats pane k
 
 ---
 
-### Task 9: Rust collector parity (`crates/freshell-server/src/host_stats.rs`)
+### Task 9: Rust collector parity
 
 **Files:**
-- Create: `crates/freshell-server/src/host_stats.rs`
-- Modify: `crates/freshell-ws/src/` — new `host_stats_interest.rs` cloned from `subagent_interest.rs` (set/remove/any/count) — INCLUDING spawn/abort ownership of the cadence task: the cadence loop is **spawned on 0→1 interest and its JoinHandle aborted on 1→0** (NOT an always-running zero-work ticker like subagent_cadence's — the frozen contract is "all timers stop at zero subscribers", so the task itself must not exist at zero). Interest transitions live in the ws message handlers.
-- Modify: `crates/freshell-ws/src/lib.rs` `WsState` field area (140-145): add the interest registry + a `Mutex<Option<JoinHandle<()>>>` for the cadence task (pattern: clone `SubagentInterestRegistry` wiring from `main.rs:328`)
-- Modify: `crates/freshell-ws/src/lib.rs` message dispatch: handle `hoststats.subscribe`/`unsubscribe` (set interest + immediate snapshot send on this connection + spawn/abort cadence per the transition rule) and `hoststats.refresh` (invoke collector refresh in `tokio::spawn` with per-section `tokio::time::timeout`+ cooperative budget; send `hoststats.refresh.response` on THIS connection). **Per-connection 1s rate floor, mirroring Node:** each connection records `host_stats_last_refresh_at: tokio::time::Instant`; a refresh <1s after that connection's previous one gets `{ok:false, error:"rate_limited"}` WITHOUT invoking the collector.
-- Test: in-module `#[cfg(test)]` tests in `host_stats.rs` + interest registry tests cloned from subagent_interest tests; one integration test proving subscribe→frame on broadcast bus (model on the subagent cadence test near `subagent_cadence.rs`)
+- Create: `crates/freshell-platform/src/host_stats_readers.rs` (pure path-injected readers, mirroring Node `readers.ts`; registered via `pub mod` in `crates/freshell-platform/src/lib.rs`)
+- Create: `crates/freshell-ws/src/host_stats_interest.rs` (interest registry cloned from `subagent_interest.rs`: set/remove/any/count + spawn/abort ownership of the cadence task — the cadence task is spawned on 0→1 interest and aborted on 1→0; NOT an always-running ticker)
+- Create: `crates/freshell-ws/src/host_stats_collector.rs` (`pub trait HostStatsCollector: Send + Sync` — snapshot()/refresh(...) — so freshell-ws never touches /proc)
+- Create: `crates/freshell-server/src/host_stats.rs` (concrete collector implementing the trait using freshell-platform readers)
+- Modify: `crates/freshell-server/src/main.rs` (construct `Arc<dyn HostStatsCollector>` near the subagent-cadence spawn ~1311; inject into `WsState` construction ~328)
+- Modify: `crates/freshell-ws/src/lib.rs` (`WsState` field area 140-145: interest registry + `Mutex<Option<JoinHandle<()>>>` cadence handle + `Arc<dyn HostStatsCollector>`)
+- Modify: `crates/freshell-ws/src/terminal.rs` — the actual authenticated-message dispatch + disconnect cleanup live HERE (not lib.rs): add `hoststats.subscribe`/`hoststats.unsubscribe`/`hoststats.refresh` cases; per-connection `host_stats_last_refresh_at: Instant`; **1s floor → `{ok:false, error:"rate_limited"}` without invoking the collector**; on socket teardown: remove interest; at count 0 abort the cadence JoinHandle.
+- Test: `crates/freshell-server/src/host_stats.rs` `#[cfg(test)]` tests (fixture readers, refresh single-flight + budget), `host_stats_interest.rs` spawn/abort lifecycle tests, `terminal.rs`-level test (or nearest harness: check existing ws message tests in freshell-ws) asserting subscribe→targeted frame and the rate_limited floor.
 
-**Interfaces:**
-- Produces: same wire shapes as Task 1 Rust types; frames: `hoststats.snapshot` broadcast over `broadcast_tx` ONLY while `interest.any()` (gating on sampling, per plan-collector.md §6 bus note — all authed sockets receive; clients ignore when no pane mounted, same trust domain); `hoststats.refresh.response` targeted.
+**Crate architecture (correcting the dependency direction — freshell-ws canNOT depend on freshell-server):**
+- `crates/freshell-platform/src/host_stats_readers.rs` (New): pure `/proc`+`/sys` readers + parsers (path-injected root, like `detect.rs`).
+- `crates/freshell-ws/src/host_stats_collector.rs` (New): `pub trait HostStatsCollector: Send + Sync { fn snapshot(&self) -> HostStatsSnapshotPayload; fn refresh(&self, deadline: Duration) -> … }` + unit struct `HostStatsShare`; freshell-ws owns ZERO /proc knowledge.
+- `crates/freshell-server/src/host_stats.rs`: the concrete collector (cadences 2000/5000ms, `MissedTickBehavior::Skip`, interest-spawn/abort, filepath-pure reader integration) implementing the freshell-ws trait; constructed and `Arc`'d in `main.rs` near the subagent-cadence spawn (~1311-1315), injected into `WsState` at construction.
+- `crates/freshell-ws/src/terminal.rs` — AUTHENTICATED MESSAGE DISPATCH + disconnect cleanup ACTUALLY live here (not lib.rs): `hoststats.subscribe`/`hoststats.unsubscribe`/`hoststats.refresh` cases; per-connection `host_stats_last_refresh_at: Instant` field; **per-conn 1s floor returns `{"type":"hoststats.refresh.response", ok:false, error:"rate_limited"}` WITHOUT invoking the collector**; on connection teardown the interest record is removed AND the cadence JoinHandle aborted when count hits 0.
+
+Rust delivery targeting: snapshots flow ONLY to subscribed connections — mirroring Node's subscriber-targeted send (frozen contract: non-watchers get zero traffic). The shared `broadcast_tx` fans out to every connection, so it is NOT the delivery mechanism; the cadence task instead iterates the interest registry's live connections and uses the per-connection outbound sender that terminal.rs already owns for its socket write loop (the reviewer-verified location of the per-conn channel — implementer: locate the exact sender field name in `freshell-ws/src/terminal.rs` during RED step, e.g. `out_tx`/`ws_tx`; the interest registry stores the sender alongside each connection id at subscribe time). If no per-connection sender proves available at that site, `host_stats_interest.rs` additionally stores an `mpsc::UnboundedSender<String>` per connection created at subscribe time and drained into the socket's existing outbound path — either way, frames never touch `broadcast_tx`.
 
 Behavior: identical cadences (2000/5000ms, `MissedTickBehavior::Skip`), same readers over `/proc` (reuse path-injection style from `shutdown_forensics.rs:56`; pure fns + fixture tests), same sections with `{available:false}` degradation, `eventLoopLagP99Ms` = scheduler-drift p99 in ms per the units contract above (`freshell.source = 'rust'`), connection count from `freshell-terminal` registry `connection_count()` (`crates/freshell-terminal/src/registry.rs:774-780`) → `wsClients`; **`wsClientsMax: 0`** (freshell-ws has no connection cap — verified LB9) and **`ptysMax: 0`** (the Rust spawn gate is a concurrency gate `CreateProtectConfig::from_env()`, not a PTY-count cap — verified LB9); client renders both as '—' per Task 7. PTY running count sourced from the terminal registry the same way `diag.rs` surfaces it (follow its access pattern), RSS from `/proc/self/statm`, `uptimeSec` = seconds since server boot anchor passed in from `main.rs`.
 
@@ -874,7 +888,10 @@ Behavior: identical cadences (2000/5000ms, `MissedTickBehavior::Skip`), same rea
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-server --locked host_stats && cargo test -p freshell-ws --locked host_stats_interest` — plus the two parity tests added in this task: (1) spawn/abort lifecycle — interest `false→true` spawns the cadence task, `true→false` aborts it (assert handle absence), (2) the per-connection 1s refresh floor returns `rate_limited` on repeat.
+Run (separately — both must show RED, no `&&` chaining of RED evidence):
+1. `cargo test -p freshell-server --locked host_stats` → FAIL (module absent)
+2. `cargo test -p freshell-ws --locked host_stats_interest` → FAIL (registry absent)
+Plus the two parity tests added in this task: (1) spawn/abort lifecycle — interest `false→true` spawns the cadence task, `true→false` aborts it (assert handle absence), (2) the per-connection 1s refresh floor returns `rate_limited` on repeat.
 
 Expected: FAIL — module/functions absent.
 
@@ -908,28 +925,28 @@ git commit -m "feat(host-stats): Rust collector parity — host_stats module, in
 ### Task 10: Playwright e2e smoke (`host-stats-pane.spec.ts`)
 
 **Files:**
-- Test: `test/e2e-browser/specs/host-stats-pane.spec.ts` (new)
-
-**Prereq (MANDATORY):** `FRESHELL_E2E_BACKEND` is unset in this session — per AGENTS.md the coordinator MUST have asked the user which backend to use before this task runs, and persisted the choice to `~/.bashrc`. Record the answer in run-state.md; run via the chosen backend (`npm run test:e2e:local` or `npm run test:e2e:cloud`). The spec must NOT be added to `CLOUD_SKIP_SPECS`.
+- Test: `test/e2e-browser/specs/host-stats-pane.spec.ts` (new, ONE file)
+- Modify: `test/e2e-browser/playwright.config.ts` — add `/host-stats-pane\.spec\.ts$/` to `MATRIX_SPECS` (the list `rust-chromium` actually `testMatch`es on, ~L353; RUST_ONLY_SPECS is an exclusion list for the Node legs — listing there alone would run ZERO Rust tests)
 
 Spec content (model: `browser-pane.spec.ts`; fixtures import `../helpers/fixtures.js`; open the picker via `openPanePicker(page)` from `test/e2e-browser/helpers/pane-picker.ts` — the repo-supported, harness-driven path, not a `.xterm` class dance — then click `getByRole('button', { name: /^Host Stats$/ })`):
 1. Boot `freshellPage` → open Host Stats via the picker helper → assert leaf `content.kind === 'host-stats'` via `harness.getPaneLayout`.
 2. Smoke: verdict strip `getByRole('status')` non-empty; CPU tile shows `/\d+(\.\d+)?%/` within 5s.
-3. Refresh interaction — NO try/catch: click `getByRole('button', { name: 'Refresh on-request measurements' })`; assert the age label (`aria-live` span in the ON REQUEST header) matches `/updated \d+s ago|just now/`; then probe the Disks tile body text ONCE: if it contains the exact lowercase word `unavailable` (zero-shape rendering — implementor must render that word on available:false sections), the test accepts the age-label evidence as the refresh proof; otherwise it asserts `/\d+%/` under the Disks tile within 8s. The branch is chosen by an explicit text probe, never by swallowing failed assertions. Also assert the button returns to enabled state (not stuck in Collecting…).
-4. Persistence: switch tab away and back → live tiles still render non-placeholder values within 5s; kind still host-stats.
+3. Refresh interaction — NO try/catch, NO environment-branch text probes. Assert the ALWAYS-TRUE products of a successful refresh: (a) while awaiting the response, the button shows the Collecting state (disabled + 'Collecting…' text); (b) the button returns to enabled; (c) the age label in the ON-REQUEST header shows `/updated .*ago|just now/`. This is backend-agnostic (the refresh always resolves — degraded sections still resolve with zero-shape). Additionally assert the per-design fallback: Disks tile value is EITHER `/\d+%/` OR the em-dash placeholder — via `await expect(diskValue).toHaveText(/\d+%|—/)` (the em dash is the frozen '—' contract, not a guess).
+4. Persistence: switch tab away and back → live tiles still render `/\d/` within 5s; kind still host-stats.
 5. Reload page → pane restores as host-stats (proves paneTreeValidation survives reload).
 
-**Rust e2e coverage (mandatory):** `test/e2e-browser/playwright.config.ts` splits projects (`chromium` = legacy Node server; `rust-chromium` runs specs listed in `RUST_ONLY_SPECS`/`MATRIX_SPECS`). A second spec file `host-stats-pane-rust.spec.ts` with the same steps 1-3 (dropping reload if the rust harness differs) MUST be created and listed in `RUST_ONLY_SPECS` so the Rust lane runs it. If local e2e infra cannot boot the Rust server, that becomes an UNRESOLVED COVERAGE GAP at the top of this plan — investigate `helpers/fixtures.ts` `e2eServerKind` first; prefer the real fix.
+Since the spec runs under `MATRIX_SPECS`, it executes under BOTH `legacy-chromium` (Node server) and `rust-chromium` — Rust parity coverage is therefore inherent; the Rust lane must show the refresh resolve + placeholder behavior identically (Rust collector zero-shape contract is the same). If a Rust-lane only divergence surfaces during implementation, handle it like the existing matrix specs do (the spec file gets a doc comment + assertion split by `testServer.info.kind`) — never split into a second file.
 
-- [ ] **Steps**: (1) write both specs, (2) RED: on a build before Task 7 the picker button is absent — both specs fail there for that exact reason (verification of intended failure), (3) after Tasks 1-9 GREEN both specs, (4) refactor: role/label selectors only, (5) impacted set: re-run `pane-picker.spec.ts` (option count changed), (6) commit.
-
-Run: `npm run test:e2e:local -- specs/host-stats-pane.spec.ts specs/host-stats-pane-rust.spec.ts specs/pane-picker.spec.ts --project=chromium --project=rust-chromium` (project list per actual config project names — verify with `rg "name: '" test/e2e-browser/playwright.config.ts`)
+- [ ] **Steps**: RED is only honest if the spec runs against a build THAT PREDATES the feature being available end-to-end: therefore, within Task 10, FIRST write the spec + `MATRIX_SPECS` registration alone on a checkpoint commit, run `npm run test:e2e:local -- specs/host-stats-pane.spec.ts --project=chromium` and verify it FAILS at the picker click ('Host Stats' option absent — that's the intended missing-behavior RED), THEN confirm GREEN after the tasks are in. (Do NOT assert RED for steps that only became implementable in this task — the picker RED is the real one.) GREEN runs must show BOTH `legacy-chromium` AND `rust-chromium` legs green: `npm run test:e2e:local -- specs/host-stats-pane.spec.ts specs/pane-picker.spec.ts` (all matrix projects; e2e backend choice = local per the recorded user decision).
 
 Expected: PASS.
 
 ```bash
-git add test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/host-stats-pane-rust.spec.ts test/e2e-browser/playwright.config.ts
-git commit -m "test(host-stats): e2e pane smoke + refresh + persistence (Node lane + Rust lane)"
+# Commit 1 (RED checkpoint): spec + matrix registration only
+git add test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/playwright.config.ts
+git commit -m "test(host-stats): e2e pane spec RED — picker option not yet implemented"
+# Commit 2 (GREEN, after the e2e pass confirms):
+git commit --allow-empty -m "test(host-stats): e2e pane GREEN — both matrix legs"   # or fold into the T10 evidence
 ```
 
 ---
