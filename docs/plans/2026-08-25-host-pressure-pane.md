@@ -86,6 +86,12 @@ export const HostStatsMachineSchema = z.object({
   wsl: z.boolean(),
   kernel: z.string().nullable(),                 // uname release; null on darwin fallback
   hostname: z.string().nullable(),
+  // capability snapshot, computed once at service start (cheap dir listings/probes):
+  psi: z.boolean(),                              // /proc/pressure readable
+  cgroup: z.enum(['v1', 'v2', 'none']),
+  thermalCount: z.number().int().nonnegative(),
+  batteryPresent: z.boolean(),
+  gpu: z.literal('none'),                        // GPU detection out of scope; chip renders 'n/a' truthfully
 })
 
 export const HostStatsLiveSchema = z.object({
@@ -120,6 +126,8 @@ export const HostStatsLiveSchema = z.object({
     ...Avail, rxBps: z.number().nonnegative(), txBps: z.number().nonnegative(),
     rxErrorsTotal: z.number().int().nonnegative(), txErrorsTotal: z.number().int().nonnegative(),
     rxDroppedTotal: z.number().int().nonnegative(), txDroppedTotal: z.number().int().nonnegative(),
+    rxErrorsDelta: z.number().int().nonnegative(), txErrorsDelta: z.number().int().nonnegative(),      // last-tick deltas — server keeps prev tick
+    rxDroppedDelta: z.number().int().nonnegative(), txDroppedDelta: z.number().int().nonnegative(),
   }),
   limits: z.object({
     ...Avail, fdsUsed: z.number().int().nonnegative().nullable(), fdsMax: z.number().int().nonnegative().nullable(),
@@ -162,6 +170,8 @@ export const HostStatsManualSchema = z.object({
 })
 ```
 
+**Degraded-section rule (frozen):** a section that times out, throws, or is unsupported on the current platform returns its **FULL shape** with `available:false` and zero/empty/null/`[]` for every other field — never a bare `{available:false}` (per-section fields stay schema-required). UI renders '—' for every value when `available:false`. Live sections follow the same rule (`HostStatsLiveSchema` fields are non-optional with zero values when `available:false`).
+
 ### Cadence + cost contract
 
 All timestamps are server wall-clock ms (epoch); all durations/rates are SI ms/KB(units named in the field). `eventLoopLagP99Ms` is **milliseconds of scheduler delay p99** per implementation: Node = `monitorEventLoopDelay` ns → ms conversion (÷1e6) folded per fast tick; Rust = drift p99 (expected interval vs actual wake) in ms per fast tick. The 50/500ms UI thresholds apply identically to both — both quantities mean "how late the runtime was to run its own timer".
@@ -178,8 +188,8 @@ All timestamps are server wall-clock ms (epoch); all durations/rates are SI ms/K
 
 - Verdict strip (`role="status"`) computes overall status from the latest live snapshot: `ALL GOOD` (green) / `ELEVATED` (amber, names offenders) / `TROUBLE` (red). Offenders use the same per-tile status words: CPU `OK|BUSY|MAXED`, Memory `OK|TIGHT|FULL`, Paging `OK|SWAPPING|THRASHING`, PSI `OK|STALLED`, Disk I/O `OK|SLOW|STALLED`, Network `OK|ERRORS`, Limits `OK|TIGHT|FULL`, Freshell `OK|LAGGING|BLOCKED`.
 - Status word mapping is a PURE function module `src/lib/host-stats-status.ts` (thresholds below), fully unit-tested; the component never embeds threshold logic.
-- Thresholds: cpu.busy ≥80, cpu.maxed ≥95; memory.tight ≥85%, full ≥97%; paging.swapping any pswap rate >0 sustained 2 ticks, thrashing pswpin+out > 5_000 KB/s; psi.stalled any full10 > 1.0; diskIo.slow weightedAwaitMs>20, stalled >100; network.errors delta errs+drops>0 in last tick; limits.tight ≥70% of max, full ≥90%; freshell.lagging lagP99>50ms, blocked >500ms. Load tile presentational only (no pill color), shows load1/cores.
-- On-request group renders fully grey with zeros/empty lists when `manualAt === null` (no implicit refresh on pane open/mount — EVER).
+- Thresholds: cpu.busy ≥80, cpu.maxed ≥95; memory.tight ≥85%, full ≥97%; paging.swapping when `swapInKbps+swapOutKbps > 0` (rate already smoothed over the 2s fast interval — single-snapshot semantics, no cross-tick state anywhere), thrashing when combined rate > 5000 KB/s; psi.stalled any full10 > 1.0; diskIo.slow weightedAwaitMs>20, stalled >100 (`weightedAwaitMs = (ΔreadMs+ΔwriteMs)/(ΔreadsCompleted+ΔwritesCompleted)` over the slow interval — real average request await, NOT field-11 weighted-io-time; `utilPct = ΔtimeDoingIosMs/Δt*100`; null when no ios in window); network.errors when `rxErrorsDelta+txErrorsDelta+rxDroppedDelta+txDroppedDelta > 0`; limits.tight ≥70% of max, full ≥90%; freshell.lagging lagP99>50ms, blocked >500ms. Load tile presentational only (no pill color), shows load1/cores.
+- On-request group renders fully grey (saturate(0)) when `manualAt === null` — data values render as '—' placeholders, never literal zeros (zeros would lie: 0% used ≠ never measured). Degraded sections (`available:false` inside a filled manual) ALSO render '—' per value. This overrides any "zeros" phrasing elsewhere in this plan.
 - Machine summary: native `<details>` disclosure (chips: PSI yes/no, cgroup v1/v2/no, thermals count, battery present, GPU n/a) built from `live.machine`; expanded body shows exact numbers.
 - e2e tolerance: gVisor/Cloud Run may lack `/proc/pressure` — every section carries `available`; the e2e spec asserts structure + at least ONE of {cpu, memory, load} `available: true`, never PSI specifically.
 
@@ -330,7 +340,7 @@ export function readMeminfo(procRoot?: string): { totalKB: number; availKB: numb
 export function readCgroupMemory(cgroupRoot?: string, procRoot?: string): { limitBytes: number | null; currentBytes: number } | null  // resolves THIS process's cgroup leaf from <procRoot>/self/cgroup (v2: '0::/path' → <cgroupRoot><path>/memory.current+memory.max ('max'→null); v1: 'memory' controller line → <cgroupRoot>/memory<path>/usage_in_bytes+limit_in_bytes with garbage filter limit ≥ 2^60 → null); root-of-cgroup2 has NO limit files by design — never read the fs root; none/unreadable → null
 export function readVmstat(procRoot?: string): { pswpin: number; pswpout: number; pgmajfault: number; oomKill: number | null } | null
 export function readPsi(procRoot?: string): { cpuSome10: number | null; memSome10: number | null; memFull10: number | null; ioSome10: number | null; ioFull10: number | null } | null
-export function readDiskStats(procRoot?: string): Map<string, { readSectors: number; writtenSectors: number; timeDoingIosMs: number; weightedIoMs: number }> | null
+export function readDiskStats(procRoot?: string): Map<string, { readsCompleted: number; readMs: number; writesCompleted: number; writeMs: number; readSectors: number; writtenSectors: number; timeDoingIosMs: number }> | null  // /proc/diskstats fields 1,4,5,8,3,7,10 (1-indexed per kernel iostats doc); whole devices only (skip partitions/loop/ram)
 export function readNetDev(procRoot?: string): { rxBytes: number; txBytes: number; rxErr: number; txErr: number; rxDrop: number; txDrop: number } | null
 export function readTcpStateCounts(procRoot?: string): { timeWait: number } | null  // state '06' across tcp+tcp6
 export function readEphemeralPortRange(procRoot?: string): { start: number; end: number } | null
@@ -347,7 +357,7 @@ export async function scanProcessTable(procRoot: string | null, dwellMs: number)
 export const __testInternals: { computeCpuPct(deltaJiffies: number, dwellMs: number): number; parsePsOutput(text: string): …; isWholeDevice(name: string): boolean }
 ```
 
-`scanProcessTable` (procRoot `null` → darwin path): Linux/WSL — enumerate numeric `/proc` dirs (cap 100k), read `/proc/<pid>/stat` bounded 4096B, comm-split after LAST `)` (precedent `server/coding-cli/codex-child-registry.ts:143-154`), sample A utime+stime, wait `dwellMs`, sample B, `cpuPct = (b-a)/100/(dwell/1000)*100` — USER_HZ=100 is the kernel ABI for `/proc` stat fields on ALL Linux arches (independent of CONFIG_HZ), so the constant is portable by construction; sort desc, top 12; zombies/D-state from state char field; **rssBytes from `/proc/<pid>/status` `VmRSS` (kB → bytes), NOT stat rss pages × 4096** — VmRSS removes the page-size assumption entirely (aarch64 16K/64K pages would silently 16×-inflate RSS via stat). Per-proc cost: 2 bounded reads (stat + status) at on-request cadence only — well within the 2000ms section budget. Darwin — ONLY subprocess in the whole feature: `ps -Aceo pid,pcpu,rss,stat,comm` with 2000ms hard timeout, top 12 by pcpu (rss KB→bytes), zombies = STAT contains 'Z', dState = contains 'U' or 'D'.
+`scanProcessTable` (procRoot `null` → darwin path): Linux/WSL — enumerate numeric `/proc` dirs (cap 100k), read `/proc/<pid>/stat` bounded 4096B (via async `fsp.readFile` between-cooperative-deadline-checks per pid — see Task 3 deadline contract), comm-split after LAST `)` (precedent `server/coding-cli/codex-child-registry.ts:143-154`), sample A utime+stime, wait `dwellMs`, sample B, `cpuPct = (b-a)/USER_HZ/(dwell/1000)*100` — USER_HZ=100 holds on every Linux arch this project targets (it is the field's documented ABI exposure in practice; document as an assumption comment, clamp computed cpuPct to [0, 100*cores] defensively); sort desc, top 12; zombies/D-state from state char field; **rssBytes from `/proc/<pid>/status` `VmRSS` (kB → bytes), NOT stat rss pages × 4096** — VmRSS removes the page-size assumption entirely (aarch64 16K/64K pages would silently 16×-inflate RSS via stat). Per-proc cost: 2 bounded reads (stat + status) at on-request cadence only — well within the 2000ms section budget. Darwin — ONLY subprocess in the whole feature: `ps -Aceo pid,pcpu,rss,stat,comm` with 2000ms hard timeout, top 12 by pcpu (rss KB→bytes), zombies = STAT contains 'Z', dState = contains 'U' or 'D'.
 
 `statfsInfo` uses `statfsSync(mount)` (Node ≥22.5; returns `{bsize,blocks,bavail,files,ffree}`): `totalBytes = bsize*blocks`, `freeBytes = bsize*bavail` (unprivileged view), `usedPct = (1 - bavail/blocks)*100`, inodes from `files/ffree` (null when 0/0).
 
@@ -359,7 +369,7 @@ Fixtures under `test/fixtures/host-stats/`: `proc/stat` (16 cores, steal>0), `lo
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts`
+Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: FAIL — `server/host-stats/readers.js` does not exist.
 
@@ -369,7 +379,7 @@ Implement `readers.ts` per contract; write the fixture trees (they are part of t
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts`
+Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: PASS.
 
@@ -412,12 +422,13 @@ export interface HostStatsServiceDeps {
   slowMs?: number              // default env FRESHELL_HOST_STATS_SLOW_MS || 5000
   sectionBudgetMs?: number     // default 2000
   overallBudgetMs?: number     // default 4000
-  getPtyCounts?: () => { running: number; max: number }        // injected later by Task 4 wiring (registry)
-  getWsClientCounts?: () => { clients: number; max: number }   // injected (wsHandler)
+  getPtyCounts?: () => { running: number; max: number }        // OPTIONAL seed; real wiring comes via setSources (below)
+  getWsClientCounts?: () => { clients: number; max: number }   // OPTIONAL seed; same
   now?: () => number           // test injection
 }
 export class HostStatsService {
-  constructor(deps?: HostStatsServiceDeps)
+  constructor(deps?: HostStatsServiceDeps)   // probes machine capabilities once: psi readable?, cgroup v1/v2/none (via /proc/self/cgroup + leaf files), thermalCount (dir listing, cheap), batteryPresent (dir listing, cheap) — all degraded-safe
+  setSources(src: { getPtyCounts?: () => { running: number; max: number }; getWsClientCounts?: () => { clients: number; max: number } }): void  // called AFTER WsHandler exists (chicken-egg fix); seeds used until then
   start(): void                // begins fast+slow timers; enables own event-loop histogram (perf_hooks.monitorEventLoopDelay)
   stop(): void                 // clears all timers, disables+nulls histogram. Idempotent.
   isRunning(): boolean
@@ -432,10 +443,10 @@ Behavior contract (the test file asserts every line):
 1. `start()` installs two `.unref?.()`'d intervals; slow tier reads only the slow readers; rates (cpu%, paging rates, disk r/w Bps, net rx/tx Bps) computed from cumulative reader deltas over dt; first tick populates with null-safe zeros where a delta isn't possible yet.
 2. Memory precedence: cgroup v2 leaf (`memory.current` + `memory.max` at the path resolved from `/proc/self/cgroup`), else cgroup v1 leaf, else host `/proc/meminfo`, else darwin `os.totalmem()/freemem()` (`source` records which). `cgroupLimitBytes` only set when source is cgroup and max≠'max'.
 3. `freshell.eventLoopLagP99Ms` — own histogram: enable at start; each fast tick read p99 → `histogram.reset()`; darwin/win… only while running.
-4. `freshell.ptys*/ws*` come from injected `getPtyCounts`/`getWsClientCounts` (default implementations return zeros when no deps injected — this keeps Task 3 decoupled and testable).
+4. `freshell.ptys*/ws*` come from `setSources`-injected (or constructor-seeded) providers — `getWsClientCounts` is wired with the real WsHandler in index.ts via `hostStats.setSources(...)` after handler construction.
 5. Nothing is collected while stopped: test spies on reader functions (vi.mock the readers module) → after `stop()`, advancing fake timers calls zero reader fns.
-6. `refresh()` single-flight: two concurrent calls return the SAME promise; a second call that arrives <1s after completion re-runs (no caching beyond in-flight). Per section: `withTimeout(sectionFn(), sectionBudgetMs)`; timeout/throw → section `{available:false}`, `sectionErrors[section]=message`. Whole refresh never exceeds `overallBudgetMs` (`Promise.allSettled` with an outer race guard). Darwin: topProcesses via ps subprocess (2000ms timeout), disks via `statfsInfo('/')` only, inotify `{available:false}`, thermals/battery: thermals `{available:false}`, battery via `pmset`? NO — darwin battery `{available:false}` v1 (do not add another subprocess).
-7. On Linux/WSL, `macOsOnly` paths are never attempted; on darwin, `/proc`-dependent sections return `{available:false}` without attempting reads.
+6. `refresh()` single-flight: two concurrent calls return the SAME promise; a second call that arrives <1s after completion re-runs (no caching beyond in-flight). **Budgets are COOPERATIVE, not `Promise.race`-around-sync:** every section implementation is async (`fsp.*` / awaited dwell), receives a shared `deadline = now()+sectionBudgetMs`, checks `Date.now() > deadline` before each unit of work (per pid in the table scan, per fd in the fdinfo scan), and throws `DeadlineExceeded` early when exceeded — synchronous preemption of a single 30-line file parse is unnecessary (each unit is microseconds), so this pattern bounds overrun to one unit of work. A final `overallBudgetMs` watchdog (`4000ms`) marks any still-running section failed at that point even if a section misbehaves; its timer is cleared in `finally`. On section failure the OTHER sections still complete with data; failed section → full zero-shape + `available:false` + `sectionErrors` entry. Darwin: topProcesses via ps subprocess (2000ms exec timeout, its own hard bound), disks via `statfsInfo('/')` only, inotify/thermals/battery → zero-shape `available:false` (no additional subprocesses).
+7. On Linux/WSL, `darwin`-only paths are never attempted; on darwin, `/proc`-dependent sections return their full zero-shape with `available:false` without attempting reads.
 8. `getSnapshot()` before `start()` or with zero ticks returns a structurally valid snapshot with every section `available:false` (machine filled) — this is what a fresh subscriber receives.
 9. A successful `refresh()` immediately fires the `onSnapshot` listener with the merged snapshot (live cache may be one tick stale; `manual`/`manualAt` fresh), so watching clients update without waiting for the next fast tick.
 
@@ -445,7 +456,7 @@ Behavior contract (the test file asserts every line):
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/hostStats/service.test.ts --config config/vitest/vitest.server.config.ts` (fix path spelling to actual: `test/unit/server/host-stats/service.test.ts`)
+Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/service.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: FAIL — module absent.
 
@@ -488,7 +499,7 @@ git commit -m "feat(host-stats): subscriber-gated two-tier collector service wit
 
 **Interfaces:**
 - Consumes: `HostStatsService` (Task 3); `HostStats*Schema`s (Task 1).
-- Produces: `WsHandlerOptions.hostStats?: HostStatsService` (+ internal providers for pty/ws counts injected from index.ts: `registry.getDiagnosticCounts()` → `{ running, max }` via a tiny adapter, `this.connectionCount()` + `maxConnections` for ws counts — wire these as the service's `getPtyCounts`/`getWsClientCounts` deps at construction site in index.ts).
+- Produces: `WsHandlerOptions.hostStats?: HostStatsService`. index.ts constructs the service (no providers), passes it in options, then — AFTER the handler exists — calls `hostStats.setSources({ getPtyCounts, getWsClientCounts })` where `getPtyCounts` uses `registry.getDiagnosticCounts().terminals.running` + `registry.getMaxTerminals()` (getter added in this task) and `getWsClientCounts` closes over the handler's `connectionCount()` + configured max (same source as :240).
 
 Behavior contract:
 1. `case 'hoststats.subscribe'`: set `state.hostStatsSubscribed = true`; if the handler-level subscriber count went 0→1, call `service.start()`; immediately `send` the current snapshot to THIS socket (validate via `HostStatsSnapshotSchema.safeParse`, warn+log on failure).
@@ -518,7 +529,7 @@ Expected: FAIL — `hoststats.subscribe` rejected by `rebuildClientMessageSchema
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-The three switch cases + ClientState fields (`hostStatsSubscribed`, `hostStatsLastRefreshAt`) + onClose/onClose sweep + union registration + `sendSnapshotTo` helper, per the contract; index.ts: construct `const hostStats = new HostStatsService()` after registry, inject `{ hostStats }` into WsHandler options, `hostStats.stop()` in teardown. Wire `getPtyCounts: () => ({ running: registry.getDiagnosticCounts().terminals.running, max: registry.getMaxTerminals() })`; `getWsClientCounts` is internal to ws-handler (self-provided).
+The three switch cases + ClientState fields (`hostStatsSubscribed`, `hostStatsLastRefreshAt`) + onClose sweep + union registration + `sendSnapshotTo` helper, per the contract; index.ts: construct `const hostStats = new HostStatsService()` after registry, pass in WsHandler options, then `hostStats.setSources({ getPtyCounts: () => ({ running: registry.getDiagnosticCounts().terminals.running, max: registry.getMaxTerminals() }), getWsClientCounts: () => ({ clients: wsHandler.connectionCount(), max: wsHandlerMaxConnections }) })` after the handler is built; `hostStats.stop()` in teardown. (`wsHandlerMaxConnections` = the same `maxConnections` value the handler is constructed with.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -541,8 +552,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add server/ws-handler.ts server/index.ts server/host-stats test/server/ws-hoststats.test.ts
-git commit -m "feat(host-stats): ws subscribe/unsubscribe/refresh wiring with subscriber-gated sampling"
+git add server/ws-handler.ts server/index.ts server/terminal-registry.ts server/host-stats test/server/ws-hoststats.test.ts test/unit/server
+git commit -m "feat(host-stats): ws subscribe/unsubscribe/refresh wiring with subscriber-gated sampling + registry getMaxTerminals"
 ```
 
 ---
@@ -562,13 +573,13 @@ Behavior: Node — `hostStatsAvailable: process.platform !== 'win32'` (linux/wsl
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Node test asserts `detectFeatureFlags()['hostStatsAvailable'] === (process.platform !== 'win32')` for the current platform AND a stubbed-win32 call if the implementation takes an injectable platform param (prefer: `detectFeatureFlags(platform = process.platform)` — pure + testable). Rust test asserts the `featureFlags.hostStatsAvailable` key exists and equals `cfg!(not(target_os = "windows"))` in the payload built by `build_platform_payload`.
+Node test asserts `detectFeatureFlags()['hostStatsAvailable'] === (process.platform !== 'win32')` for the current platform AND a stubbed-win32 call (`detectFeatureFlags(platform = process.platform)` injectable param). Rust: NEW test `host_stats_flag_present_in_platform_payload` in the module that owns the existing payload tests (near `main.rs:3516/3592/3606`) asserting `payload["featureFlags"]["hostStatsAvailable"] == json!(cfg!(not(target_os = "windows")))`. **All existing exact-equality payload assertions must also gain the new key** (there are several; find them with `rg -n "featureFlags" crates/freshell-server/src/main.rs`) — the red test must fail for the reason "flag missing", and exact-equality tests fail until the production edit lands.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/platform-flags.test.ts --config config/vitest/vitest.server.config.ts && cargo test -p freshell-server --locked build_platform_payload`
+Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/platform-flags.test.ts --config config/vitest/vitest.server.config.ts && cargo test -p freshell-server --locked host_stats_flag_present_in_platform_payload`
 
-Expected: RED — flag absent.
+Expected: RED — flag absent; the named Rust test EXISTS and fails (never accept a filter matching zero tests).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -629,9 +640,11 @@ export type HostStatsState = {
 //   clockOffsetMs = Date.now() - at (clamped ≥0 drift guard: allow small negatives → clamp to 0), keeping age math skew-safe over LAN/VPN,
 // hostStatsRefreshStarted({requestId}), hostStatsRefreshResolved({at, manual}), hostStatsRefreshFailed({error}),
 //           hostStatsReset()  // on ws disconnect/'ready' — keeps last manual+live but subscribed=false
-// thunks (in the slice file, following repo thunk conventions): activateHostStats()/deactivateHostStats() send ws frames
-// when mountedPanes transitions 0→1 / 1→0; requestHostStatsRefresh() mints requestId `hsr-${Date.now()}-${rand36}`,
-// sets inFlight, sends frame, arms 6000ms acceptance deadline → on timeout dispatches hostStatsRefreshFailed('refresh timed out — showing previous values').
+// thunks (in the slice file, following repo thunk conventions): activateHostStats() / deactivateHostStats() — PURE reducer
+//   actions hostStatsPaneMounted/hostStatsPaneUnmounted mutate the refcount ONLY; the thunks wrap them and perform the WS
+//   side effect exactly on the 0→1 / 1→0 transition (reading the state after dispatch). Components NEVER dispatch the raw
+//   reducers — always the thunks. requestHostStatsRefresh() mints requestId `hsr-${Date.now()}-${rand36}`,
+//   sets inFlight, sends frame, arms 6000ms acceptance deadline → on timeout dispatches hostStatsRefreshFailed('refresh timed out — showing previous values').
 ```
 
 ```ts
@@ -658,7 +671,7 @@ Folding rules in App.tsx: `hoststats.snapshot` → validate-then-dispatch is NOT
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Status/format tests are pure-table tests covering EVERY threshold boundary (79.9/80/95, 84.99/85/97, psi 1.0, await 20/100, lag 50/500, exact null availability paths). Slice tests: mount refcount (mount twice → single subscribe send once), unmount→zero sends unsubscribe, snapshot reducer replaces live+manual semantics (manual absent in snapshot MUST NOT clear existing manual — only `manualAt: null` + nothing), refresh start/resolve/fail/timeout paths, reset clears subscribed but keeps data. App test: inject frames via captured handler per `App.reconcile-adoption.test.tsx` — a snapshot frame lands in `store.getState().hostStats.live`; a refresh.response with unknown requestId is ignored (no throw).
+Status/format tests are pure-table tests covering EVERY threshold boundary (79.9/80/95, 84.99/85/97, psi 1.0, await 20/100, lag 50/500, exact null availability paths). Slice tests (with `vi.mock('@/lib/ws-client')` send spy — the repo thunk pattern calls the real `getWsClient()`): thunk-ed mount refcount (activate twice → ONE subscribe frame; deactivate once → no unsubscribe; second deactivate → unsubscribe frame), snapshot reducer merge semantics (a snapshot without manual MUST NOT clear existing manual/manualAt; reducer installs `clockOffsetMs = Date.now() - at`), refresh start/resolve/fail/timeout paths (fake timers cover the 6000ms client deadline), reset keeps data but clears subscribed. App test: inject frames via captured handler per `App.reconcile-adoption.test.tsx` — snapshot lands in `store.getState().hostStats.live`; refresh.response with unknown requestId ignored without throw; on `ready`, subscribe is re-sent iff mountedPanes>0.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -726,8 +739,8 @@ export default function HostStatsPane({ tabId, paneId }: Props) {
   const manual = useAppSelector((s) => s.hostStats.manual)
   const refresh = useAppSelector((s) => s.hostStats.refresh)
   useEffect(() => {
-    dispatch(hostStatsPaneMounted())
-    return () => { dispatch(hostStatsPaneUnmounted()) }
+    dispatch(activateHostStats())                    // thunk: refcount++, sends hoststats.subscribe iff 0→1
+    return () => { dispatch(deactivateHostStats()) } // thunk: refcount--, sends hoststats.unsubscribe iff 1→0
   }, [dispatch])
   // …render per contract
 }
@@ -740,7 +753,7 @@ Render contract (structure mirrors the prototype semantically):
 4. Group label `LIVE` (`text-xs text-muted-foreground uppercase tracking-wide`) + tile grid: `grid grid-cols-2 gap-2 @3xl:grid-cols-3` (use repo's existing responsive utility pattern if container queries unavailable — check `rg "grid-cols" src/components/OverviewView.tsx`; fall back to `grid-cols-2 xl:grid-cols-3`).
 5. Tile component (local, not exported): `<div className="rounded-lg border border-border bg-card p-2">`, header row = title `text-xs text-muted-foreground` + pill `<span className={pillClasses(severity)}>{word}</span>` where `pillClasses = ok→'bg-success/15 text-success', warn→'bg-warning/15 text-warning', bad→'bg-destructive/10 text-destructive'` with `rounded-full px-1.5 text-[10px] font-medium`; body = big value `text-xl font-semibold tabular-nums` + rows (use `tabular-nums` for ALL numbers).
 6. Live tiles (in order): CPU, Load, Memory, Paging, Pressure(PSI), Disk I/O, Network, Limits, Freshell Itself. Each tile maps 1:1 to a status helper (Task 6) + renders its key rows exact per prototype semantics: CPU `usagePct%` + mini per-core bar row (12 tiny `<span className="inline-block h-3 w-2 rounded-sm">` colored by pct bucket — pure presentational, severity color classes) + `steal %` row when stealPct>1; Memory `usedPct%` + `source` hint ('VM limit' when cgroup) + swap row when swapTotal>0; Paging rows swap in/out KB/s + majflt/s + oom_kills; PSI rows some/full avg10 per class; Disk I/O r/w Bps + util%/await; Network rx/tx Bps + err/drop counters; Limits fds, pids, TIME_WAIT/ephemeral — any `*Max === 0` means "no cap on this server implementation" and renders as '—' (Rust sends 0; see Task 9); Freshell `ptysRunning/ptysMax` (same '—' rule), `wsClients`, lag p99, RSS MB.
-7. On-request group: header row = group label `ON REQUEST` + refresh `<button aria-label="Refresh on-request measurements">` (real button, shows spinner glyph + 'Collecting…' while `refresh.inFlight`, disabled while inFlight) + age label `<span aria-live="polite">` ('updated 12s ago'; EMPTY string when never). Group container carries `style={{ filter: \`saturate(${sat})\` }}` where `sat` from the contract formula, recomputed by a local 1s `setInterval` (cleared on unmount) reading `manualAt`. Tiles: Top Processes (rows name/cpu%/rss/state badge), Process Health (zombies, D-state), Inotify (watches /max), Disks (per-mount used% + inode free), Thermals & Battery. NEVER-updated state renders the same tiles with `available:false`-equivalent blanks (em-dash values), NOT hidden.
+7. On-request group: header row = group label `ON REQUEST` + refresh `<button aria-label="Refresh on-request measurements">` (real button, shows spinner glyph + 'Collecting…' while `refresh.inFlight`, disabled while inFlight) + age label `<span aria-live="polite">` ('updated 12s ago' computed against server-clock `manualAt` via `clockOffsetMs`; EMPTY string when never). Group container carries `style={{ filter: \`saturate(${sat})\` }}` where `sat` uses the contract formula computed against server-now (`Date.now() - clockOffsetMs`), recomputed by a local 1s `setInterval` (cleared on unmount) reading `manualAt`. Tiles: Top Processes (rows name/cpu%/rss/state badge), Process Health (zombies, D-state), Inotify (watches /max), Disks (per-mount used% + inode free), Thermals & Battery. Never-measured state (`manualAt === null`) renders these tiles with '—' values (not zeros — frozen contract above); degraded sections (`available:false`) likewise render '—'.
 8. Refresh flow: button onClick → `dispatch(requestHostStatsRefresh())`. Error from slice → small `<div role="alert" className="text-xs text-destructive">` inside the on-request header row. Old values + original `manualAt` MUST remain (this is slice behavior, Task 6, but the component test asserts no visual blanking).
 9. No implicit data fetch on mount beyond subscription; if `live === null` render tiles with '—' placeholders (pre-first-snapshot frame).
 
@@ -810,7 +823,7 @@ Node: REST hostStats:true tab returns layout whose leaf content is `{kind:'host-
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/agent-api --config config/vitest/vitest.server.config.ts && env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/lib/tab-registry && cargo test -p freshell-ws --locked tabs_persist`
+Run (two lanes — do NOT mix configs): server lane `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/agent-api test/unit/server/tabs-registry --config config/vitest/vitest.server.config.ts`, client lane `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/lib/tab-registry` (default config), Rust `cargo test -p freshell-ws --locked tabs_persist`
 
 Expected: RED — kind rejected / fallback to picker.
 
@@ -828,7 +841,7 @@ None expected.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/agent-api test/unit/server/tabs-registry test/unit/client/lib --config config/vitest/vitest.server.config.ts` (split client lib part out of server config if that config doesn't include it: then two invocations) + `cargo test -p freshell-ws --locked && cargo test -p freshell-freshagent --locked`
+Run (three lanes, no config mixing): server lane `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/agent-api test/unit/server/tabs-registry --config config/vitest/vitest.server.config.ts`; client lane `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/lib`; Rust `cargo test -p freshell-ws --locked && cargo test -p freshell-freshagent --locked`
 
 Expected: PASS.
 
@@ -845,9 +858,9 @@ git commit -m "feat(host-stats): registry/REST/MCP surface for host-stats pane k
 
 **Files:**
 - Create: `crates/freshell-server/src/host_stats.rs`
-- Modify: `crates/freshell-ws/src/` — new `host_stats_interest.rs` cloned from `subagent_interest.rs` (set/remove/any/count); wire registry into `WsState` (`crates/freshell-ws/src/lib.rs:140-145` field area) exactly like `SubagentInterestRegistry` (`main.rs:328`)
-- Modify: `crates/freshell-server/src/main.rs` (spawn cadences ~1311-1315 next to `spawn_subagent_cadence`; broadcast_tx already at 312-316)
-- Modify: `crates/freshell-ws/src/lib.rs` message dispatch: handle `hoststats.subscribe`/`unsubscribe` (set interest + immediate snapshot send on this connection) and `hoststats.refresh` (invoke collector refresh in `tokio::spawn` with per-section `tokio::time::timeout`; send `hoststats.refresh.response` on THIS connection)
+- Modify: `crates/freshell-ws/src/` — new `host_stats_interest.rs` cloned from `subagent_interest.rs` (set/remove/any/count) — INCLUDING spawn/abort ownership of the cadence task: the cadence loop is **spawned on 0→1 interest and its JoinHandle aborted on 1→0** (NOT an always-running zero-work ticker like subagent_cadence's — the frozen contract is "all timers stop at zero subscribers", so the task itself must not exist at zero). Interest transitions live in the ws message handlers.
+- Modify: `crates/freshell-ws/src/lib.rs` `WsState` field area (140-145): add the interest registry + a `Mutex<Option<JoinHandle<()>>>` for the cadence task (pattern: clone `SubagentInterestRegistry` wiring from `main.rs:328`)
+- Modify: `crates/freshell-ws/src/lib.rs` message dispatch: handle `hoststats.subscribe`/`unsubscribe` (set interest + immediate snapshot send on this connection + spawn/abort cadence per the transition rule) and `hoststats.refresh` (invoke collector refresh in `tokio::spawn` with per-section `tokio::time::timeout`+ cooperative budget; send `hoststats.refresh.response` on THIS connection). **Per-connection 1s rate floor, mirroring Node:** each connection records `host_stats_last_refresh_at: tokio::time::Instant`; a refresh <1s after that connection's previous one gets `{ok:false, error:"rate_limited"}` WITHOUT invoking the collector.
 - Test: in-module `#[cfg(test)]` tests in `host_stats.rs` + interest registry tests cloned from subagent_interest tests; one integration test proving subscribe→frame on broadcast bus (model on the subagent cadence test near `subagent_cadence.rs`)
 
 **Interfaces:**
@@ -861,7 +874,7 @@ Behavior: identical cadences (2000/5000ms, `MissedTickBehavior::Skip`), same rea
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-server --locked host_stats && cargo test -p freshell-ws --locked host_stats_interest`
+Run: `cargo test -p freshell-server --locked host_stats && cargo test -p freshell-ws --locked host_stats_interest` — plus the two parity tests added in this task: (1) spawn/abort lifecycle — interest `false→true` spawns the cadence task, `true→false` aborts it (assert handle absence), (2) the per-connection 1s refresh floor returns `rate_limited` on repeat.
 
 Expected: FAIL — module/functions absent.
 
@@ -899,22 +912,24 @@ git commit -m "feat(host-stats): Rust collector parity — host_stats module, in
 
 **Prereq (MANDATORY):** `FRESHELL_E2E_BACKEND` is unset in this session — per AGENTS.md the coordinator MUST have asked the user which backend to use before this task runs, and persisted the choice to `~/.bashrc`. Record the answer in run-state.md; run via the chosen backend (`npm run test:e2e:local` or `npm run test:e2e:cloud`). The spec must NOT be added to `CLOUD_SKIP_SPECS`.
 
-Spec content (model: `browser-pane.spec.ts` with fixtures import `../helpers/fixtures.js`):
-1. Boot `freshellPage`; right-click `.xterm` → menuitem 'Split horizontally' → picker button `/^Host Stats$/` visible (flag true in e2e servers: linux containers) → click.
-2. Smoke: verdict strip visible (`getByRole('status')`), at least one tile shows a non-placeholder value (regex `/\d/` in CPU or Memory tile) within 5s; layout tree asserts leaf `content.kind === 'host-stats'` via `harness.getPaneLayout`.
-3. Refresh interaction: click `getByRole('button', { name: 'Refresh on-request measurements' })` → within 8s the Disks tile shows `/\d+%/` AND age label matches `/updated \d+s ago|just now/`; gVisor tolerance: assert via `data` tolerance — if refresh response lands with sections unavailable, the assert target becomes the header age label only (try/catch around the disks assert → fall back to age-label assert).
-4. Persistence: switch tab away and back → pane still shows host-stats (layout survives), live tiles still tick (value can change; assert not blank).
-5. Reload page → pane restores as host-stats (proves paneTreeValidation work survives reload).
+Spec content (model: `browser-pane.spec.ts`; fixtures import `../helpers/fixtures.js`; open the picker via `openPanePicker(page)` from `test/e2e-browser/helpers/pane-picker.ts` — the repo-supported, harness-driven path, not a `.xterm` class dance — then click `getByRole('button', { name: /^Host Stats$/ })`):
+1. Boot `freshellPage` → open Host Stats via the picker helper → assert leaf `content.kind === 'host-stats'` via `harness.getPaneLayout`.
+2. Smoke: verdict strip `getByRole('status')` non-empty; CPU tile shows `/\d+(\.\d+)?%/` within 5s.
+3. Refresh interaction — NO try/catch: click `getByRole('button', { name: 'Refresh on-request measurements' })`; assert the age label (`aria-live` span in the ON REQUEST header) matches `/updated \d+s ago|just now/`; then probe the Disks tile body text ONCE: if it contains the exact lowercase word `unavailable` (zero-shape rendering — implementor must render that word on available:false sections), the test accepts the age-label evidence as the refresh proof; otherwise it asserts `/\d+%/` under the Disks tile within 8s. The branch is chosen by an explicit text probe, never by swallowing failed assertions. Also assert the button returns to enabled state (not stuck in Collecting…).
+4. Persistence: switch tab away and back → live tiles still render non-placeholder values within 5s; kind still host-stats.
+5. Reload page → pane restores as host-stats (proves paneTreeValidation survives reload).
 
-- [ ] **Steps**: standard TDD loop — (1) write spec, (2) watch it fail on the picker step pre-Task 7 or skip ahead batched after Task 7 (this task is sequenced after 7; the failure-first requirement is satisfied by pointing the spec at a build without the MCP/registration polish: run it once expecting the smoke to pass but capture REAL behavior), (3) fix any genuine failures, (4) pass on the configured backend, (5) refactor selectors to role-based only, (6) surrounding impacted set = the e2e pane-picker spec (`test/e2e-browser/specs/pane-picker.spec.ts` must still pass — option count changed), (7) commit.
+**Rust e2e coverage (mandatory):** `test/e2e-browser/playwright.config.ts` splits projects (`chromium` = legacy Node server; `rust-chromium` runs specs listed in `RUST_ONLY_SPECS`/`MATRIX_SPECS`). A second spec file `host-stats-pane-rust.spec.ts` with the same steps 1-3 (dropping reload if the rust harness differs) MUST be created and listed in `RUST_ONLY_SPECS` so the Rust lane runs it. If local e2e infra cannot boot the Rust server, that becomes an UNRESOLVED COVERAGE GAP at the top of this plan — investigate `helpers/fixtures.ts` `e2eServerKind` first; prefer the real fix.
 
-Run: `npm run test:e2e:local -- specs/host-stats-pane.spec.ts` (or cloud equivalent per recorded backend choice); also `npm run test:e2e:local -- specs/pane-picker.spec.ts`
+- [ ] **Steps**: (1) write both specs, (2) RED: on a build before Task 7 the picker button is absent — both specs fail there for that exact reason (verification of intended failure), (3) after Tasks 1-9 GREEN both specs, (4) refactor: role/label selectors only, (5) impacted set: re-run `pane-picker.spec.ts` (option count changed), (6) commit.
+
+Run: `npm run test:e2e:local -- specs/host-stats-pane.spec.ts specs/host-stats-pane-rust.spec.ts specs/pane-picker.spec.ts --project=chromium --project=rust-chromium` (project list per actual config project names — verify with `rg "name: '" test/e2e-browser/playwright.config.ts`)
 
 Expected: PASS.
 
 ```bash
-git add test/e2e-browser/specs/host-stats-pane.spec.ts
-git commit -m "test(host-stats): e2e pane smoke + refresh + persistence + reload"
+git add test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/host-stats-pane-rust.spec.ts test/e2e-browser/playwright.config.ts
+git commit -m "test(host-stats): e2e pane smoke + refresh + persistence (Node lane + Rust lane)"
 ```
 
 ---
