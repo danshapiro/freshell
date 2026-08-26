@@ -43,6 +43,12 @@ pub struct BootScanReport {
     pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>,
     pub gc_tombstoned: Vec<SessionLocator>,
     pub tombstones_deleted: Vec<SessionLocator>,
+    /// Directory-walk faults hit by the quarantine rescan (`"<path>: <os
+    /// error>"`, each already ERROR-logged at fault time). An ENABLED
+    /// ledger's store was fully readable at construction (kata qzka), so any
+    /// entry here means the store DEGRADED between construction and this
+    /// pass — always loud, never silently skipped.
+    pub scan_errors: Vec<String>,
 }
 
 impl PaneLedger {
@@ -426,16 +432,83 @@ impl PaneLedger {
     }
 
     fn quarantine_unparsable(&self, root: &Path, now_ms: i64, report: &mut BootScanReport) {
+        // Scan-level fault policy, one notch weaker than `load_index`'s
+        // (kata qzka): the walk never dies per-store — a fault is
+        // ERROR-logged and recorded on the report (the OS-error text
+        // carries the errno), then the walk continues. `NotFound` = absent
+        // = not a fault (a first-boot store writes nothing before the boot
+        // scan runs). The record names the faulted path exactly once:
+        // `read_dir_existing` errors already carry their path, raw
+        // entry-iteration errors do not.
+        fn scan_fault(
+            log_path: &Path,
+            record: String,
+            err: &std::io::Error,
+            report: &mut BootScanReport,
+        ) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %log_path.display(),
+                error = %err,
+                "pane_ledger_scan_fault: quarantine walk could not fully read the store"
+            );
+            report.scan_errors.push(record);
+        }
         let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                if let Ok(files) = std::fs::read_dir(provider.path()) {
-                    candidates.extend(files.flatten().map(|f| f.path()));
+        match read_dir_existing(&Self::bindings_dir(root)) {
+            Ok(Some(providers)) => {
+                for provider in providers {
+                    let provider = match provider {
+                        Ok(p) => p,
+                        Err(err) => {
+                            scan_fault(
+                                &Self::bindings_dir(root),
+                                format!("{}: {err}", Self::bindings_dir(root).display()),
+                                &err,
+                                report,
+                            );
+                            continue;
+                        }
+                    };
+                    let provider_dir = provider.path();
+                    match read_dir_existing(&provider_dir) {
+                        Ok(Some(files)) => {
+                            for file in files {
+                                match file {
+                                    Ok(f) => candidates.push(f.path()),
+                                    Err(err) => scan_fault(
+                                        &provider_dir,
+                                        format!("{}: {err}", provider_dir.display()),
+                                        &err,
+                                        report,
+                                    ),
+                                }
+                            }
+                        }
+                        Ok(None) => {} // provider dir vanished mid-scan — absent
+                        Err(err) => scan_fault(&provider_dir, err.to_string(), &err, report),
+                    }
                 }
             }
+            Ok(None) => {} // no bindings dir — nothing to scan
+            Err(err) => scan_fault(&Self::bindings_dir(root), err.to_string(), &err, report),
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            candidates.extend(files.flatten().map(|f| f.path()));
+        match read_dir_existing(&Self::pending_dir(root)) {
+            Ok(Some(files)) => {
+                for file in files {
+                    match file {
+                        Ok(f) => candidates.push(f.path()),
+                        Err(err) => scan_fault(
+                            &Self::pending_dir(root),
+                            format!("{}: {err}", Self::pending_dir(root).display()),
+                            &err,
+                            report,
+                        ),
+                    }
+                }
+            }
+            Ok(None) => {} // no pending dir — nothing to scan
+            Err(err) => scan_fault(&Self::pending_dir(root), err.to_string(), &err, report),
         }
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");

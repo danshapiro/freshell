@@ -1235,3 +1235,37 @@ fn new_locked_first_boot_absent_dirs_is_enabled_and_empty() {
     assert!(ledger.ever_bound("claude", "s1"));
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn boot_scan_records_scan_faults_and_still_quarantines_each_bad_row() {
+    // kata qzka: the quarantine walk must never silently skip a store
+    // region — a region that turned unreadable AFTER construction is
+    // recorded in the report (and ERROR-logged), while healthy regions
+    // still get their per-row quarantine (never per-store).
+    let root = temp_root("scan-fault-report");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(ledger.is_enabled());
+    // Healthy region: a corrupt PENDING row to quarantine.
+    let pending_dir = root.join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    std::fs::write(pending_dir.join("t-bad.json"), b"not json").unwrap();
+    // Faulted region: bindings becomes unreadable after construction.
+    std::fs::write(root.join("bindings"), b"not a directory").unwrap();
+    let never_absent = |_: &str, _: &str| false;
+    let report = ledger.boot_scan(2_000, &never_absent);
+    assert!(
+        report.scan_errors.iter().any(|e| e.contains("bindings")),
+        "scan_errors must name the faulted bindings dir, got: {:?}",
+        report.scan_errors
+    );
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the healthy pending region's corrupt row must still be quarantined"
+    );
+    assert!(
+        !pending_dir.join("t-bad.json").exists(),
+        "the corrupt row was renamed aside"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
