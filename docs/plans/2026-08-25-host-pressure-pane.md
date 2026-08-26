@@ -164,6 +164,8 @@ export const HostStatsManualSchema = z.object({
 
 ### Cadence + cost contract
 
+All timestamps are server wall-clock ms (epoch); all durations/rates are SI ms/KB(units named in the field). `eventLoopLagP99Ms` is **milliseconds of scheduler delay p99** per implementation: Node = `monitorEventLoopDelay` ns → ms conversion (÷1e6) folded per fast tick; Rust = drift p99 (expected interval vs actual wake) in ms per fast tick. The 50/500ms UI thresholds apply identically to both — both quantities mean "how late the runtime was to run its own timer".
+
 - Fast tier `FRESHELL_HOST_STATS_FAST_MS` (default **2000**): `/proc/stat` CPU deltas, `/proc/loadavg`, `/proc/meminfo`, `/proc/vmstat` (paging rates, oom_kill), `/proc/pressure/*`, memory (cgroup-aware), event-loop lag histogram fold, `process.memoryUsage()`, PTY/WS counts.
 - Slow tier `FRESHELL_HOST_STATS_SLOW_MS` (default **5000**): `/proc/diskstats`, `/proc/net/dev`, `/proc/net/tcp{,6}` state counts, fd count (`/proc/self/fd` dir walk, capped 1M), pids count (numeric `/proc` dirs, capped), cpu freq, ephemeral-port range read.
 - On-request refresh (never automatic, never on pane open/subscribe): process-table scan (two samples, 300ms dwell — top CPU + zombies/D-state in ONE scan), `fs.statfs` on `/` and `/dev/shm` (skip shm on darwin), fdinfo inotify scan (bounded 4096 fds), thermal zones, battery. Per-section budget **2000ms** (Promise.race; timeout → `{available:false}` + `sectionErrors` entry), overall server cap **4000ms**, single in-flight (`this.pendingRefresh` promise shared), snapshot with `manual` broadcast to subscribers after completion.
@@ -277,7 +279,9 @@ In `crates/freshell-protocol/src/client_messages.rs`: add serde-tagged variants:
     HostStatsRefresh(HostStatsRefresh),   // struct { request_id: String }
 ```
 
-(`request_id` with `#[serde(rename = "requestId")]`), append the three type strings to `CLIENT_MESSAGE_TYPES` in inventory order, bump its length to 34. In `server_messages.rs`: add `HostStatsSnapshot(HostStatsSnapshot)` and `HostStatsRefreshResponse(HostStatsRefreshResponse)` variants + full payload structs mirroring the zod shapes (every field `Option<…>` where the zod side uses `.nullable()`/`.optional()`; rates `f64`, counts `u64`/`i64` per existing conventions in that file), append to `SERVER_MESSAGE_TYPES` → 60. Update `crates/freshell-protocol/tests/inventory.rs` counts: 31→34, 58→60, 89→94.
+(`request_id` with `#[serde(rename = "requestId")]`), append the three type strings to `CLIENT_MESSAGE_TYPES` in inventory order, bump its length to 34. In `server_messages.rs`: add `HostStatsSnapshot(HostStatsSnapshot)` and `HostStatsRefreshResponse(HostStatsRefreshResponse)` variants + full payload structs mirroring the zod shapes (every field `Option<…>` where the zod side uses `.nullable()`/`.optional()`; rates `f64`, counts `u64`/`i64`; `sectionErrors` as `HashMap<String,String>`; serde field casing default = the TS camelCase keys only if the file's existing structs use `#[serde(rename_all = "camelCase")]` — CHECK the convention in server_messages.rs first and match it) — append to `SERVER_MESSAGE_TYPES` → 60. Update `crates/freshell-protocol/tests/inventory.rs` counts: 31→34, 58→60, 89→94.
+
+Also add a FIELD-LEVEL drift pin (LB14 — the inventory test only pins discriminant names, not shapes): new test file `crates/freshell-protocol/tests/hoststats_shape.rs` — construct a fully-populated `HostStatsSnapshot` + `HostStatsRefresh`, serialize with `serde_json::to_value`, and assert the exact key set + camelCase spelling against a committed expected JSON literal (nested sections included: every section key, every subfield). Any serde casing slip on either side fails this test at CI, before it can ship to the production Rust server.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -323,7 +327,7 @@ export type CpuTimes = { total: number; busy: number; steal: number; perCore: { 
 export function readCpuTimes(procRoot?: string): CpuTimes | null                  // '/proc/stat' aggregated + per-core, steal jiffies
 export function readLoadavg(procRoot?: string): { load1: number; load5: number; load15: number } | null  // mac: os.loadavg()
 export function readMeminfo(procRoot?: string): { totalKB: number; availKB: number; swapTotalKB: number; swapFreeKB: number } | null  // mac: null (caller uses os)
-export function readCgroupMemory(cgroupRoot?: string): { limitBytes: number | null; currentBytes: number } | null  // v2: memory.current+memory.max ('max'→null); v1: memory.usage_in_bytes+memory.limit_in_bytes (0x7fff... garbage → null); none → null
+export function readCgroupMemory(cgroupRoot?: string, procRoot?: string): { limitBytes: number | null; currentBytes: number } | null  // resolves THIS process's cgroup leaf from <procRoot>/self/cgroup (v2: '0::/path' → <cgroupRoot><path>/memory.current+memory.max ('max'→null); v1: 'memory' controller line → <cgroupRoot>/memory<path>/usage_in_bytes+limit_in_bytes with garbage filter limit ≥ 2^60 → null); root-of-cgroup2 has NO limit files by design — never read the fs root; none/unreadable → null
 export function readVmstat(procRoot?: string): { pswpin: number; pswpout: number; pgmajfault: number; oomKill: number | null } | null
 export function readPsi(procRoot?: string): { cpuSome10: number | null; memSome10: number | null; memFull10: number | null; ioSome10: number | null; ioFull10: number | null } | null
 export function readDiskStats(procRoot?: string): Map<string, { readSectors: number; writtenSectors: number; timeDoingIosMs: number; weightedIoMs: number }> | null
@@ -343,11 +347,11 @@ export async function scanProcessTable(procRoot: string | null, dwellMs: number)
 export const __testInternals: { computeCpuPct(deltaJiffies: number, dwellMs: number): number; parsePsOutput(text: string): …; isWholeDevice(name: string): boolean }
 ```
 
-`scanProcessTable` (procRoot `null` → darwin path): Linux/WSL — enumerate numeric `/proc` dirs (cap 100k), read `/proc/<pid>/stat` bounded 4096B, comm-split after LAST `)` (precedent `server/coding-cli/codex-child-registry.ts:143-154`), sample A utime+stime, wait `dwellMs`, sample B, `cpuPct = (b-a)/100/(dwell/1000)*100` (CLK_TCK=100 on every supported Linux target), sort desc, top 12; zombies/D-state from state char field; rssBytes = stat rss pages × 4096. Darwin — ONLY subprocess in the whole feature: `ps -Aceo pid,pcpu,rss,stat,comm` with 2000ms hard timeout, top 12 by pcpu (rss KB→bytes), zombies = STAT contains 'Z', dState = contains 'U' or 'D'.
+`scanProcessTable` (procRoot `null` → darwin path): Linux/WSL — enumerate numeric `/proc` dirs (cap 100k), read `/proc/<pid>/stat` bounded 4096B, comm-split after LAST `)` (precedent `server/coding-cli/codex-child-registry.ts:143-154`), sample A utime+stime, wait `dwellMs`, sample B, `cpuPct = (b-a)/100/(dwell/1000)*100` — USER_HZ=100 is the kernel ABI for `/proc` stat fields on ALL Linux arches (independent of CONFIG_HZ), so the constant is portable by construction; sort desc, top 12; zombies/D-state from state char field; **rssBytes from `/proc/<pid>/status` `VmRSS` (kB → bytes), NOT stat rss pages × 4096** — VmRSS removes the page-size assumption entirely (aarch64 16K/64K pages would silently 16×-inflate RSS via stat). Per-proc cost: 2 bounded reads (stat + status) at on-request cadence only — well within the 2000ms section budget. Darwin — ONLY subprocess in the whole feature: `ps -Aceo pid,pcpu,rss,stat,comm` with 2000ms hard timeout, top 12 by pcpu (rss KB→bytes), zombies = STAT contains 'Z', dState = contains 'U' or 'D'.
 
 `statfsInfo` uses `statfsSync(mount)` (Node ≥22.5; returns `{bsize,blocks,bavail,files,ffree}`): `totalBytes = bsize*blocks`, `freeBytes = bsize*bavail` (unprivileged view), `usedPct = (1 - bavail/blocks)*100`, inodes from `files/ffree` (null when 0/0).
 
-Fixtures under `test/fixtures/host-stats/`: `proc/stat` (16 cores, steal>0), `loadavg`, `meminfo` (64GB + swap), `vmstat`, `pressure/{cpu,memory,io}`, `diskstats` (sda + sda1 + loop0 + nvme0n1 + nvme0n1p1 → whole-device filter assertion), `net/dev` (lo+eth0+docker0), `net/tcp`+`net/tcp6` (exactly 3 TIME_WAIT), `sys/net/ipv4/ip_local_port_range`, `sys/kernel/pid_max`, `self/limits`, `procmini/<pid>/stat` ×7 (incl. one Z, one D, one comm-with-parens), cgroup v2 tree `sys/fs/cgroup/{memory.current,memory.max}`, cgroup-absent empty dir, `sys/class/thermal/thermal_zone0/{temp,type}`, `sys/class/power_supply/BAT0/{type,capacity,status}`, `sys/devices/system/cpu/cpu{0,1}/cpufreq/scaling_cur_freq`.
+Fixtures under `test/fixtures/host-stats/`: `proc/stat` (16 cores, steal>0), `loadavg`, `meminfo` (64GB + swap), `vmstat`, `pressure/{cpu,memory,io}`, `diskstats` (sda + sda1 + loop0 + nvme0n1 + nvme0n1p1 → whole-device filter assertion), `net/dev` (lo+eth0+docker0), `net/tcp`+`net/tcp6` (exactly 3 TIME_WAIT), `sys/net/ipv4/ip_local_port_range`, `sys/kernel/pid_max`, `self/limits`, `procmini/<pid>/stat` + `procmini/<pid>/status` (VmRSS) ×7 (incl. one Z, one D, one comm-with-parens), `procmini/self/cgroup` v2 leaf sample (`0::/user.slice/.../app.slice/freshell-rust.service`), cgroup v2 leaf tree `sys/fs/cgroup/user.slice/.../freshell-rust.service/{memory.current,memory.max}` (matching leaf, proves leaf resolution; fs root deliberately has NO memory.* files), cgroup-absent empty dir, `sys/class/thermal/thermal_zone0/{temp,type}`, `sys/class/power_supply/BAT0/{type,capacity,status}`, `sys/devices/system/cpu/cpu{0,1}/cpufreq/scaling_cur_freq`.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -426,7 +430,7 @@ export class HostStatsService {
 
 Behavior contract (the test file asserts every line):
 1. `start()` installs two `.unref?.()`'d intervals; slow tier reads only the slow readers; rates (cpu%, paging rates, disk r/w Bps, net rx/tx Bps) computed from cumulative reader deltas over dt; first tick populates with null-safe zeros where a delta isn't possible yet.
-2. Memory precedence: cgroup v2 (`memory.current` + `memory.max`), else cgroup v1, else host `/proc/meminfo`, else darwin `os.totalmem()/freemem()` (`source` records which). `cgroupLimitBytes` only set when source is cgroup and max≠'max'.
+2. Memory precedence: cgroup v2 leaf (`memory.current` + `memory.max` at the path resolved from `/proc/self/cgroup`), else cgroup v1 leaf, else host `/proc/meminfo`, else darwin `os.totalmem()/freemem()` (`source` records which). `cgroupLimitBytes` only set when source is cgroup and max≠'max'.
 3. `freshell.eventLoopLagP99Ms` — own histogram: enable at start; each fast tick read p99 → `histogram.reset()`; darwin/win… only while running.
 4. `freshell.ptys*/ws*` come from injected `getPtyCounts`/`getWsClientCounts` (default implementations return zeros when no deps injected — this keeps Task 3 decoupled and testable).
 5. Nothing is collected while stopped: test spies on reader functions (vi.mock the readers module) → after `stop()`, advancing fake timers calls zero reader fns.
@@ -478,6 +482,7 @@ git commit -m "feat(host-stats): subscriber-gated two-tier collector service wit
 
 **Files:**
 - Modify: `server/ws-handler.ts` (ClientState 474-491; onConnection init 1177-1194; onClose 1227-1264; `rebuildClientMessageSchema` 820-852; switch 2059+; `close()`)
+- Modify: `server/terminal-registry.ts` (add a public getter `getMaxTerminals(): number { return this.maxTerminals }` — the cap is currently a private field with no exposure; one-line getter, no behavior change; plus a one-line unit test in the nearest registry test that the getter returns the constructed max)
 - Modify: `server/index.ts` (construct service near `sessionsSync` ~537; inject into `new WsHandler(...)` options object ~406-443; shutdown step near :1263)
 - Test: `test/server/ws-hoststats.test.ts` (new)
 
@@ -489,7 +494,7 @@ Behavior contract:
 1. `case 'hoststats.subscribe'`: set `state.hostStatsSubscribed = true`; if the handler-level subscriber count went 0→1, call `service.start()`; immediately `send` the current snapshot to THIS socket (validate via `HostStatsSnapshotSchema.safeParse`, warn+log on failure).
 2. `case 'hoststats.unsubscribe'`: clear the flag; count 1→0 → `service.stop()`.
 3. Snapshot fan-out: the handler owns the tick subscription — implement `service.onSnapshot(listener)` hot path? NO — simpler: handler passes an `onSnapshot` callback in `WsHandlerOptions.hostStats`: Task 3's service emits each freshly-ticked snapshot to a single registered listener; the handler listener iterates `clientStates` and `safeSend`s to subscribed+authenticated sockets (`broadcastSessionStatus` shape, ws-handler.ts:867-875). Add `onSnapshot(cb)` public method to the service (single listener, set at wiring time; fine with a one-listener field — assert in service test).
-4. `case 'hoststats.refresh'`: `service.refresh()` → on resolve `send` `hoststats.refresh.response {ok:true, at, manual}`; on reject `{ok:false, error}`. Every requester gets its own response with its OWN requestId even when the underlying refresh is shared (handler keeps a per-request closure — trivially true with async/await).
+4. `case 'hoststats.refresh'`: `service.refresh()` → on resolve `send` `hoststats.refresh.response {ok:true, at, manual}`; on reject `{ok:false, error}`. Every requester gets its own response with its OWN requestId even when the underlying refresh is shared (handler keeps a per-request closure — trivially true with async/await). Per-connection rate floor: if the same connection sent a refresh <1000ms before the new one, respond `{ok:false, error:'rate_limited'}` WITHOUT invoking the service (track `state.hostStatsLastRefreshAt`; resets in onClose implicitly with state) — refresh is heavy (300ms table dwell) and must not sustain a 100% duty cycle from one socket.
 5. `onClose`: if `state.hostStatsSubscribed`, clear + decrement; 1→0 stops service. Mirror in `close()` (server shutdown path) → `service.stop()` also added to index.ts teardown near sessionsSync.shutdown().
 6. Auth gate: hoststats messages are non-hello → covered by existing NOT_AUTHENTICATED gate (verify by test).
 
@@ -502,7 +507,8 @@ Behavior contract:
   (d) socket close mid-subscription → service stops (assert `service.isRunning() === false` after a second socket unsubscribes/closes as last subscriber);
   (e) refresh → response with matching requestId, `manual.disks.list` non-empty for fixture mounts… note: statfs runs against the real host (mounts '/', plus '/dev/shm' if present) — assert shape+numerically sane, not fixture-exact; section timeout path: bump `sectionBudgetMs: 1` with a process table fixture forcing dwell > budget → `topProcesses.available === false`, response still ok:true;
   (f) unauthenticated socket sending subscribe → no snapshot (existing auth gate);
-  (g) zero-subscriber zero-cost: with no subscription, spy not applicable cross-process — instead assert `service.isRunning() === false` before subscribe.
+  (g) zero-subscriber zero-cost: with no subscription assert `service.isRunning() === false` before subscribe; and
+  (h) refresh rate floor: two refreshes from the same socket 100ms apart → second yields `{ok:false, error:'rate_limited'}` and the service refresh spy was called once.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -512,7 +518,7 @@ Expected: FAIL — `hoststats.subscribe` rejected by `rebuildClientMessageSchema
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-The three switch cases + ClientState field + onClose/onClose sweep + union registration + `sendSnapshotTo` helper, per the contract; index.ts: construct `const hostStats = new HostStatsService()` after registry, inject `{ hostStats }` into WsHandler options, `hostStats.stop()` in teardown. Also wire `getPtyCounts: () => { const d = registry.getDiagnosticCounts(); return { running: d.terminals.running, max: <env MAX_TERMINALS default 50 — read same source registry uses> } }` — if the registry exposes `maxTerminals` use that getter; add one if trivially absent; `getWsClientCounts` is internal to ws-handler (self-provided).
+The three switch cases + ClientState fields (`hostStatsSubscribed`, `hostStatsLastRefreshAt`) + onClose/onClose sweep + union registration + `sendSnapshotTo` helper, per the contract; index.ts: construct `const hostStats = new HostStatsService()` after registry, inject `{ hostStats }` into WsHandler options, `hostStats.stop()` in teardown. Wire `getPtyCounts: () => ({ running: registry.getDiagnosticCounts().terminals.running, max: registry.getMaxTerminals() })`; `getWsClientCounts` is internal to ws-handler (self-provided).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -546,7 +552,7 @@ git commit -m "feat(host-stats): ws subscribe/unsubscribe/refresh wiring with su
 **Files:**
 - Modify: `server/platform-router.ts` (`detectFeatureFlags` 20-29)
 - Modify: `crates/freshell-server/src/main.rs` (`build_platform_payload` 2436-2449)
-- Test: `test/unit/server/platform-flags.test.ts` (new or extend nearest existing platform-router test if one exists — check first: `rg -l "detectFeatureFlags" test/`)
+- Test: `test/unit/server/platform-flags.test.ts` (new; runs under the SERVER vitest config per LB5 — `config/vitest/vitest.server.config.ts:29` includes `test/unit/server/**/*.test.ts`)
 - Test: the existing Rust payload tests near `main.rs:3516/3592/3606` — extend nearest one to assert flag present-and-boolean.
 
 **Interfaces:**
@@ -614,12 +620,14 @@ export type HostStatsState = {
   subscribed: boolean                        // true after subscribe acked optimistically on send
   live: HostStatsLive | null
   liveAt: number | null
+  clockOffsetMs: number | null               // Date.now() - snapshot.at, refreshed per snapshot; age math uses server-consistent now: serverNow = Date.now() - clockOffsetMs
   manualAt: number | null
   manual: HostStatsManual | null
   refresh: { inFlight: boolean; requestId: string | null; error: string | null }
 }
-// reducers: hostStatsPaneMounted(), hostStatsPaneUnmounted(), hostStatsSnapshotReceived({at, live, manualAt, manual}),
-//           hostStatsRefreshStarted({requestId}), hostStatsRefreshResolved({at, manual}), hostStatsRefreshFailed({error}),
+// reducers: hostStatsPaneMounted(), hostStatsPaneUnmounted(), hostStatsSnapshotReceived({at, live, manualAt, manual}) — also sets
+//   clockOffsetMs = Date.now() - at (clamped ≥0 drift guard: allow small negatives → clamp to 0), keeping age math skew-safe over LAN/VPN,
+// hostStatsRefreshStarted({requestId}), hostStatsRefreshResolved({at, manual}), hostStatsRefreshFailed({error}),
 //           hostStatsReset()  // on ws disconnect/'ready' — keeps last manual+live but subscribed=false
 // thunks (in the slice file, following repo thunk conventions): activateHostStats()/deactivateHostStats() send ws frames
 // when mountedPanes transitions 0→1 / 1→0; requestHostStatsRefresh() mints requestId `hsr-${Date.now()}-${rand36}`,
@@ -731,7 +739,7 @@ Render contract (structure mirrors the prototype semantically):
 3. Machine `<details>` summary: `<summary className="text-xs text-muted-foreground">` with `"{cores} cores · {GiB} GiB RAM{wsl ? ' · WSL2' : ''}"` + capability chips (`rounded-full bg-muted px-2 text-xs`); `<details>` body shows kernel/hostname/cgroup/PSI/thermal/battery presence read from `live.machine` + section availability.
 4. Group label `LIVE` (`text-xs text-muted-foreground uppercase tracking-wide`) + tile grid: `grid grid-cols-2 gap-2 @3xl:grid-cols-3` (use repo's existing responsive utility pattern if container queries unavailable — check `rg "grid-cols" src/components/OverviewView.tsx`; fall back to `grid-cols-2 xl:grid-cols-3`).
 5. Tile component (local, not exported): `<div className="rounded-lg border border-border bg-card p-2">`, header row = title `text-xs text-muted-foreground` + pill `<span className={pillClasses(severity)}>{word}</span>` where `pillClasses = ok→'bg-success/15 text-success', warn→'bg-warning/15 text-warning', bad→'bg-destructive/10 text-destructive'` with `rounded-full px-1.5 text-[10px] font-medium`; body = big value `text-xl font-semibold tabular-nums` + rows (use `tabular-nums` for ALL numbers).
-6. Live tiles (in order): CPU, Load, Memory, Paging, Pressure(PSI), Disk I/O, Network, Limits, Freshell Itself. Each tile maps 1:1 to a status helper (Task 6) + renders its key rows exact per prototype semantics: CPU `usagePct%` + mini per-core bar row (12 tiny `<span className="inline-block h-3 w-2 rounded-sm">` colored by pct bucket — pure presentational, severity color classes) + `steal %` row when stealPct>1; Memory `usedPct%` + `source` hint ('VM limit' when cgroup) + swap row when swapTotal>0; Paging rows swap in/out KB/s + majflt/s + oom_kills; PSI rows some/full avg10 per class; Disk I/O r/w Bps + util%/await; Network rx/tx Bps + err/drop counters; Limits fds, pids, TIME_WAIT/ephemeral; Freshell `ptysRunning/ptysMax`, `wsClients`, lag p99, RSS MB.
+6. Live tiles (in order): CPU, Load, Memory, Paging, Pressure(PSI), Disk I/O, Network, Limits, Freshell Itself. Each tile maps 1:1 to a status helper (Task 6) + renders its key rows exact per prototype semantics: CPU `usagePct%` + mini per-core bar row (12 tiny `<span className="inline-block h-3 w-2 rounded-sm">` colored by pct bucket — pure presentational, severity color classes) + `steal %` row when stealPct>1; Memory `usedPct%` + `source` hint ('VM limit' when cgroup) + swap row when swapTotal>0; Paging rows swap in/out KB/s + majflt/s + oom_kills; PSI rows some/full avg10 per class; Disk I/O r/w Bps + util%/await; Network rx/tx Bps + err/drop counters; Limits fds, pids, TIME_WAIT/ephemeral — any `*Max === 0` means "no cap on this server implementation" and renders as '—' (Rust sends 0; see Task 9); Freshell `ptysRunning/ptysMax` (same '—' rule), `wsClients`, lag p99, RSS MB.
 7. On-request group: header row = group label `ON REQUEST` + refresh `<button aria-label="Refresh on-request measurements">` (real button, shows spinner glyph + 'Collecting…' while `refresh.inFlight`, disabled while inFlight) + age label `<span aria-live="polite">` ('updated 12s ago'; EMPTY string when never). Group container carries `style={{ filter: \`saturate(${sat})\` }}` where `sat` from the contract formula, recomputed by a local 1s `setInterval` (cleared on unmount) reading `manualAt`. Tiles: Top Processes (rows name/cpu%/rss/state badge), Process Health (zombies, D-state), Inotify (watches /max), Disks (per-mount used% + inode free), Thermals & Battery. NEVER-updated state renders the same tiles with `available:false`-equivalent blanks (em-dash values), NOT hidden.
 8. Refresh flow: button onClick → `dispatch(requestHostStatsRefresh())`. Error from slice → small `<div role="alert" className="text-xs text-destructive">` inside the on-request header row. Old values + original `manualAt` MUST remain (this is slice behavior, Task 6, but the component test asserts no visual blanking).
 9. No implicit data fetch on mount beyond subscription; if `live === null` render tiles with '—' placeholders (pre-first-snapshot frame).
@@ -748,7 +756,7 @@ Expected: FAIL — `./HostStatsPane` does not exist.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Component + all plumbing edits per the Files list. `PanePicker` option: `{ type: 'host-stats', label: 'Host Stats', icon: Gauge, shortcut: 'H' }` inserted before `nonShellOptions` when `featureFlags.hostStatsAvailable === true || platform !== 'win32'` — READ the report note: gate is `featureFlags.hostStatsAvailable === true && platform !== 'win32'` (plan-pane-types.md §3c exact snippet).
+Component + all plumbing edits per the Files list. `PanePicker` option: `{ type: 'host-stats', label: 'Host Stats', icon: Gauge, shortcut: 'H' }` inserted before `nonShellOptions` — gate is `featureFlags.hostStatsAvailable === true && platform !== 'win32'` (exactly the plan-pane-types.md §3c snippet; the flag already encodes platform, the second clause is belt-and-braces). Shortcut collision tolerance: first-match-wins is the existing dispatch semantic — 'H' collision with an H-named extension is cosmetic; accepted.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -845,7 +853,7 @@ git commit -m "feat(host-stats): registry/REST/MCP surface for host-stats pane k
 **Interfaces:**
 - Produces: same wire shapes as Task 1 Rust types; frames: `hoststats.snapshot` broadcast over `broadcast_tx` ONLY while `interest.any()` (gating on sampling, per plan-collector.md §6 bus note — all authed sockets receive; clients ignore when no pane mounted, same trust domain); `hoststats.refresh.response` targeted.
 
-Behavior: identical cadences (2000/5000ms, `MissedTickBehavior::Skip`), same readers over `/proc` (reuse path-injection style from `shutdown_forensics.rs:56`; pure fns + fixture tests), same sections with `{available:false}` degradation, eventLoopLagP99Ms = scheduler-drift p99 measured inside the fast cadence task (expected-vs-actual tick drift; `freshell.source = 'rust'`), PTYs from `freshell-terminal` registry `connection_count()`/spawn-gate permits (env `FRESHELL_SPAWN_GATE_CONCURRENCY` default 4 → `ptysMax` = permits… if that mapping proves awkward, ptysMax = 0 with available true and rows rendering '—' server-side-unknown: DECISION — prefer `ptysRunning: connection_count(), ptysMax: 0` and client renders max as '—' when 0), RSS from `/proc/self/statm`, uptime from `/proc/uptime` minus? NO — process uptime via `std::time::Instant` boot anchor in main.rs is wrong across restarts of sidecars — use `procfs`-free approach: `/proc/self/stat` starttime vs `/proc/uptime`… KEEP SIMPLE: `uptimeSec` = seconds since the collector's own registration (server boot anchor passed in from main.rs — main already knows its boot Instant; pass `boot_instant` in).
+Behavior: identical cadences (2000/5000ms, `MissedTickBehavior::Skip`), same readers over `/proc` (reuse path-injection style from `shutdown_forensics.rs:56`; pure fns + fixture tests), same sections with `{available:false}` degradation, `eventLoopLagP99Ms` = scheduler-drift p99 in ms per the units contract above (`freshell.source = 'rust'`), connection count from `freshell-terminal` registry `connection_count()` (`crates/freshell-terminal/src/registry.rs:774-780`) → `wsClients`; **`wsClientsMax: 0`** (freshell-ws has no connection cap — verified LB9) and **`ptysMax: 0`** (the Rust spawn gate is a concurrency gate `CreateProtectConfig::from_env()`, not a PTY-count cap — verified LB9); client renders both as '—' per Task 7. PTY running count sourced from the terminal registry the same way `diag.rs` surfaces it (follow its access pattern), RSS from `/proc/self/statm`, `uptimeSec` = seconds since server boot anchor passed in from `main.rs`.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
