@@ -279,12 +279,14 @@ mod tests {
             terminal_id: "t".to_string(),
             attach_request_id: Some("req-1".to_string()),
             source: None,
+            runtime: None,
         });
         assert!(q.route(output).is_none(), "output frame is queued");
 
         let exit = ServerMessage::TerminalExit(freshell_protocol::TerminalExit {
             exit_code: 1,
             terminal_id: "t".to_string(),
+            runtime: None,
         });
         assert!(
             q.route(exit).is_none(),
@@ -317,6 +319,7 @@ mod tests {
             terminal_id: "t".to_string(),
             attach_request_id: None,
             source: None,
+            runtime: None,
         });
         assert!(
             q.route(output).is_none(),
@@ -355,6 +358,7 @@ mod tests {
             terminal_id: "t".to_string(),
             attach_request_id: None,
             source: None,
+            runtime: None,
         });
         assert!(q.route(output).is_none(), "output frame is queued");
 

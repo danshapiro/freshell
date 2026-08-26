@@ -328,6 +328,10 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
+          ...(content.runtimeId && content.runtimeGeneration !== undefined ? {
+            expectedRuntimeId: content.runtimeId,
+            expectedGeneration: content.runtimeGeneration,
+          } : {}),
           ...(cwd ? { cwd } : {}),
         })
       } else {

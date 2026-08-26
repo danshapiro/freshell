@@ -1,10 +1,10 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, setActivePane, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
-import { findTabIdForSession } from '@/lib/session-utils'
+import { findPaneForSession, findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -672,6 +672,37 @@ export const openSessionTab = createAsyncThunk(
       }))
     }
 
+    // A durable provider session is a workspace singleton. `forceNew` remains
+    // meaningful for live-only terminal handles, but must never bypass the
+    // canonical provider/session identity check.
+    if (terminalId && !liveTerminalOnly) {
+      const existing = findPaneForSession(
+        state,
+        { provider: resolvedProvider, sessionId },
+        localServerInstanceId,
+      )
+      if (existing) {
+        const existingTab = state.tabs.tabs.find((tab) => tab.id === existing.tabId)
+        updateExistingTabMetadata(existingTab)
+        if (existingTab && title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
+          dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+        }
+        if (existing.paneId && hasTitle && title) {
+          dispatch(updatePaneTitle({
+            tabId: existing.tabId,
+            paneId: existing.paneId,
+            title,
+            setByUser: false,
+          }))
+        }
+        dispatch(setActiveTab(existing.tabId))
+        if (existing.paneId) {
+          dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
+        }
+        return
+      }
+    }
+
     if (terminalId) {
       if (!forceNew) {
         const existingTabId = selectTabIdByTerminalId(state, terminalId)
@@ -718,7 +749,7 @@ export const openSessionTab = createAsyncThunk(
       return
     }
 
-    if (!forceNew) {
+    if (!liveTerminalOnly) {
       const existingTabId = findTabIdForSession(
         state,
         { provider: resolvedProvider, sessionId },

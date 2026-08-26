@@ -265,6 +265,41 @@ describe('applyFreshAgentReconcileAttach', () => {
     }))
     expect(next).toEqual(state)
   })
+
+  it('adopts attach runtime and clears it before a respawn create', () => {
+    let state = stateWithFreshAgentPane({ runtimeId: 'fresh-old', runtimeGeneration: 7 })
+    state = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+    }))
+    expect(leafContent(state, tabId)).toMatchObject({ runtimeId: 'fresh-new', runtimeGeneration: 8 })
+    state = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'respawn', sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }))
+    expect(leafContent(state, tabId).runtimeId).toBeUndefined()
+    expect(leafContent(state, tabId).runtimeGeneration).toBeUndefined()
+  })
+
+  it('does not let a stale same-server attach downgrade a replacement runtime', () => {
+    const state = stateWithFreshAgentPane({
+      sessionId: DURABLE, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtimeId: 'fresh-new', runtimeGeneration: 8, serverInstanceId: 'server-current',
+    })
+    const stale = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'server-current', runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    expect(leafContent(stale, tabId)).toMatchObject({ runtimeId: 'fresh-new', runtimeGeneration: 8 })
+
+    const currentServer = panesReducer(stale, applyFreshAgentReconcileAttach({
+      tabId, paneId, sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'server-next', runtime: { runtimeId: 'fresh-server-next', generation: 0 },
+    }))
+    expect(leafContent(currentServer, tabId)).toMatchObject({
+      runtimeId: 'fresh-server-next', runtimeGeneration: 0, serverInstanceId: 'server-next',
+    })
+  })
 })
 
 describe('resetFreshAgentPaneForReconcileCreate', () => {

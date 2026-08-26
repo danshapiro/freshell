@@ -10,6 +10,7 @@ import {
   requestPaneRename,
   requestTabRefresh,
   resetSplit,
+  setActivePane,
   splitPane as splitPaneAction,
   swapSplit,
   updatePaneContent,
@@ -26,8 +27,8 @@ import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { openExternalUrl } from '@/lib/open-url'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
-import { collectSessionRefsFromNode } from '@/lib/session-utils'
+import { collectPaneEntries, collectTerminalIds, findPaneContent, resolveAgentRestartTarget } from '@/lib/pane-utils'
+import { collectSessionRefsFromNode, findPaneForSession, findUnopenedProjectSessions } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
@@ -201,8 +202,45 @@ export function ContextMenuProvider({
   const previousFocusRef = useRef<HTMLElement | null>(null)
   const suppressNextFocusRestoreRef = useRef(false)
   const menuOpenedAtRef = useRef(0)
+  const requestedRestartsRef = useRef(new Set<string>())
 
   const ws = useMemo(() => getWsClient(), [])
+
+  useEffect(() => ws.onMessage((message) => {
+    if (
+      (message.type !== 'agent.restart.replaced' && message.type !== 'agent.restart.failed')
+      || !requestedRestartsRef.current.has(message.requestId)
+    ) {
+      return
+    }
+    const recoveryPending = message.type === 'agent.restart.failed'
+      && message.retryable
+      && ws.isAgentRestartRecoveryPending(message.requestId)
+    if (message.type === 'agent.restart.replaced' || !recoveryPending) {
+      requestedRestartsRef.current.delete(message.requestId)
+    }
+    if (message.type === 'agent.restart.failed') {
+      const retriesExhausted = recoveryPending
+        && ws.isAgentRestartRetryExhausted(message.requestId)
+      setConfirmState({
+        title: 'Pane restart failed',
+        body: retriesExhausted
+          ? `${message.message} Automatic restart recovery retries are exhausted.`
+          : recoveryPending
+            ? `${message.message} Freshell will retry this restart automatically.`
+            : message.message,
+        confirmLabel: retriesExhausted ? 'Retry now' : 'OK',
+        onConfirm: () => {
+          if (retriesExhausted) {
+            ws.retryAgentRestart(message.requestId)
+          }
+          setConfirmState(null)
+        },
+      })
+    } else {
+      setConfirmState(null)
+    }
+  }), [ws])
 
   const closeMenu = useCallback(() => {
     setMenuState(null)
@@ -323,6 +361,32 @@ export function ContextMenuProvider({
     dispatch(requestPaneRefresh({ tabId, paneId }))
   }, [dispatch])
 
+  const restartPaneAction = useCallback((tabId: string, paneId: string) => {
+    const state = appStore.getState()
+    const layout = state.panes.layouts[tabId]
+    const content = layout ? findPaneContent(layout, paneId) : null
+    const target = content ? resolveAgentRestartTarget(content) : null
+    if (!target) return
+
+    const requestId = nanoid()
+    try {
+      requestedRestartsRef.current.add(requestId)
+      ws.requestAgentRestart({
+        type: 'agent.restart',
+        requestId,
+        ...target,
+      })
+    } catch (error) {
+      requestedRestartsRef.current.delete(requestId)
+      setConfirmState({
+        title: 'Pane restart unavailable',
+        body: error instanceof Error ? error.message : 'This pane cannot be restarted right now.',
+        confirmLabel: 'OK',
+        onConfirm: () => setConfirmState(null),
+      })
+    }
+  }, [appStore, ws])
+
   const refreshTabAction = useCallback((tabId: string) => {
     dispatch(requestTabRefresh({ tabId }))
   }, [dispatch])
@@ -431,7 +495,24 @@ export function ContextMenuProvider({
     }
   }, [dispatch, tabsState.tabs])
 
+  const focusExistingSession = useCallback((sessionId: string, provider?: string) => {
+    const state = appStore.getState()
+    const existing = findPaneForSession(
+      state,
+      { provider: provider || 'claude', sessionId },
+      state.connection?.serverInstanceId,
+    )
+    if (!existing) return false
+    dispatch(setActiveTab(existing.tabId))
+    if (existing.paneId) {
+      dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
+    }
+    onViewChange('terminal')
+    return true
+  }, [appStore, dispatch, onViewChange])
+
   const openSessionInNewTab = useCallback((sessionId: string, provider?: string) => {
+    if (focusExistingSession(sessionId, provider)) return
     const target = menuState?.target
     const info = getSessionInfo(sessionId, provider, target)
     if (!info) return
@@ -450,15 +531,15 @@ export function ContextMenuProvider({
       provider: mode,
       sessionType,
       terminalId: runningTerminalId,
-      forceNew: true,
       firstUserMessage: session.firstUserMessage,
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
       hasTitle: !!session.title,
     }))
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, focusExistingSession, getSessionInfo, menuState?.target])
 
   const openSessionInThisTab = useCallback((sessionId: string, provider?: string) => {
+    if (focusExistingSession(sessionId, provider)) return
     const activeTabId = tabsState.activeTabId
     if (!activeTabId) {
       openSessionInNewTab(sessionId, provider)
@@ -486,7 +567,7 @@ export function ContextMenuProvider({
       }),
     }))
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
+  }, [tabsState.activeTabId, dispatch, focusExistingSession, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -681,14 +762,48 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const openAllSessionsInProject = useCallback((projectPath: string) => {
+    const currentProject = getProjectInfo(projectPath, menuState?.target)
+    const currentState = appStore.getState()
+    const currentUnopened = currentProject
+      ? findUnopenedProjectSessions(
+          currentState,
+          currentProject,
+          currentState.connection?.serverInstanceId,
+        )
+      : []
+    if (currentUnopened.length === 0) {
+      setConfirmState({
+        title: 'All sessions already open',
+        confirmLabel: 'OK',
+        body: 'Every session in this project is already open in the current workspace.',
+        onConfirm: () => setConfirmState(null),
+      })
+      return
+    }
+
     setConfirmState({
-      title: 'Open all sessions?',
+      title: 'Open unopened sessions?',
       confirmLabel: 'Open tabs',
-      body: 'This will open every session in the project in its own tab.',
+      body: `This will open ${currentUnopened.length} unopened ${currentUnopened.length === 1 ? 'session' : 'sessions'} in ${currentUnopened.length === 1 ? 'a new tab' : 'new tabs'}.`,
       onConfirm: () => {
         const project = getProjectInfo(projectPath, menuState?.target)
         if (project) {
-          for (const session of project.sessions) {
+          const state = appStore.getState()
+          const unopened = findUnopenedProjectSessions(
+            state,
+            project,
+            state.connection?.serverInstanceId,
+          )
+          if (unopened.length === 0) {
+            setConfirmState({
+              title: 'All sessions already open',
+              confirmLabel: 'OK',
+              body: 'Every session in this project is already open in the current workspace.',
+              onConfirm: () => setConfirmState(null),
+            })
+            return
+          }
+          for (const session of unopened) {
             const provider = (session.provider || 'claude') as CodingCliProviderName
             dispatch(openSessionTab({
               sessionId: session.sessionId,
@@ -699,7 +814,6 @@ export function ContextMenuProvider({
               firstUserMessage: session.firstUserMessage,
               isSubagent: session.isSubagent,
               isNonInteractive: session.isNonInteractive,
-              forceNew: true,
               hasTitle: !!session.title,
             }))
           }
@@ -707,7 +821,7 @@ export function ContextMenuProvider({
         setConfirmState(null)
       },
     })
-  }, [dispatch, getProjectInfo, menuState?.target])
+  }, [appStore, dispatch, getProjectInfo, menuState?.target])
 
   const copyProjectPath = useCallback(async (projectPath: string) => {
     await copyText(projectPath)
@@ -987,6 +1101,10 @@ export function ContextMenuProvider({
         sessionId: latest.content.sessionId,
         sessionType: latest.content.sessionType,
         provider: latest.content.provider,
+        ...(latest.content.runtimeId && latest.content.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: latest.content.runtimeId,
+          expectedGeneration: latest.content.runtimeGeneration,
+        } : {}),
         ...(cwd ? { cwd } : {}),
       })
     }
@@ -1302,17 +1420,22 @@ export function ContextMenuProvider({
 
   const menuItems = useMemo(() => {
     if (!menuState) return []
+    const menuSessions = menuState.target.kind === 'history-project'
+      || menuState.target.kind === 'history-session'
+      ? historySessions
+      : sidebarSessions
     return buildMenuItems(menuState.target, {
       view,
       sidebarCollapsed,
       tabs: tabsState.tabs,
       paneLayouts: panes,
-      sessions,
+      sessions: menuSessions,
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
       aiEnabled: Boolean(appSettings.ai?.geminiApiKey) || Boolean(featureFlags.aiEnabled),
       platform,
+      localServerInstanceId: appStore.getState().connection?.serverInstanceId,
       extensions: extensionEntries,
       reopenActivityByPaneId,
       tabRegistryGroups,
@@ -1335,6 +1458,7 @@ export function ContextMenuProvider({
         moveTab,
         renamePane,
         refreshPane: refreshPaneAction,
+        restartPane: restartPaneAction,
         replacePane: replacePaneAction,
         splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => {
           dispatch(splitPaneAction({ tabId, paneId, direction, newContent: { kind: 'picker' } }))
@@ -1388,11 +1512,13 @@ export function ContextMenuProvider({
     })
   }, [
     menuState,
+    appStore,
     view,
     sidebarCollapsed,
     tabsState.tabs,
     panes,
-    sessions,
+    sidebarSessions,
+    historySessions,
     expandedProjects,
     platform,
     extensionEntries,
@@ -1416,12 +1542,13 @@ export function ContextMenuProvider({
     moveTab,
     renamePane,
     refreshPaneAction,
+    restartPaneAction,
     replacePaneAction,
-    ws,
     dispatch,
     openSessionInNewTab,
     openSessionInThisTab,
     renameSession,
+    generateSessionTitle,
     toggleArchiveSession,
     deleteSession,
     copySessionId,

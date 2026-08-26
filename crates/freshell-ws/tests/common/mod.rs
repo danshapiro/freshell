@@ -185,6 +185,7 @@ pub async fn spawn_server_with_specs_and_shared_settings(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -264,6 +265,7 @@ pub async fn spawn_server_with_specs(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -345,6 +347,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -430,6 +433,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -512,6 +516,7 @@ pub async fn spawn_server_with_specs_and_state(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -550,6 +555,22 @@ pub async fn spawn_server_with_ledger(
     String,
     freshell_terminal::TerminalRegistry,
     std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+) {
+    let (url, registry, pane_ledger, _state) =
+        spawn_server_with_ledger_and_state(cli_commands, ledger_dir).await;
+    (url, registry, pane_ledger)
+}
+
+/// Ledger-backed server variant that also exposes the shared state for
+/// coordinator/recovery integration tests.
+pub async fn spawn_server_with_ledger_and_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    ledger_dir: &std::path::Path,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+    WsState,
 ) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
@@ -602,6 +623,7 @@ pub async fn spawn_server_with_ledger(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -611,7 +633,7 @@ pub async fn spawn_server_with_ledger(
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -624,6 +646,7 @@ pub async fn spawn_server_with_ledger(
         format!("ws://{addr}/ws", addr = addr),
         registry,
         pane_ledger,
+        state,
     )
 }
 
@@ -688,6 +711,7 @@ pub async fn spawn_server_with_specs_and_activity(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -773,6 +797,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: Some(std::sync::Arc::new(
@@ -880,6 +905,7 @@ pub async fn spawn_server_with_create_protect_probes(
         spawn_gate: std::sync::Arc::clone(&gate),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,
@@ -908,19 +934,27 @@ pub type TestWs =
 /// handshake frame (the 4th handshake message; `config_fallback` is None in
 /// this harness, so the handshake is exactly 4 frames).
 pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Value) {
+    connect_and_capture_inventory_with_capabilities(url, None).await
+}
+
+pub async fn connect_and_capture_inventory_with_capabilities(
+    url: &str,
+    capabilities: Option<serde_json::Value>,
+) -> (TestWs, serde_json::Value) {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
-    ws.send(WsMessage::Text(
-        serde_json::json!({
-            "type": "hello",
-            "token": AUTH_TOKEN,
-            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send hello");
+    let mut hello = serde_json::json!({
+        "type": "hello",
+        "token": AUTH_TOKEN,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+    });
+    if let Some(capabilities) = capabilities {
+        hello["capabilities"] = capabilities;
+    }
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
     for _ in 0..4u8 {

@@ -16,7 +16,13 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
-import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import {
+  clearReconcilePendingPane,
+  consumePaneRefreshRequest,
+  mergePaneContent,
+  restartFreshAgentCreate,
+  updatePaneContent,
+} from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
@@ -568,6 +574,9 @@ export function FreshAgentView({
   const dispatch = useAppDispatch()
   const ws = getWsClient()
   const appStore = useAppStore()
+  useEffect(() => {
+    ws.bindAgentRestartStore?.(appStore)
+  }, [appStore, ws])
   const terminalFontSize = useAppSelector(
     (state) => state.settings.settings.terminal?.fontSize,
   ) ?? 16
@@ -1076,6 +1085,10 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(current.runtimeId && current.runtimeGeneration !== undefined ? {
+        expectedRuntimeId: current.runtimeId,
+        expectedGeneration: current.runtimeGeneration,
+      } : {}),
       ...(cwd ? { cwd } : {}),
       text,
       settings: {
@@ -1206,6 +1219,28 @@ export function FreshAgentView({
     } as const
   }, [providerDefaults, tabRestoreSource])
 
+  const restartPaneForIntentionalCreate = useCallback((
+    current: FreshAgentPaneContent,
+    content: FreshAgentPaneContent,
+  ) => {
+    const sessionIds = new Set<string>()
+    if (current.sessionId) sessionIds.add(current.sessionId)
+    if (current.sessionRef?.provider === current.provider) sessionIds.add(current.sessionRef.sessionId)
+    if (current.resumeSessionId) sessionIds.add(current.resumeSessionId)
+    dispatch(restartFreshAgentCreate({
+      tabId,
+      paneId,
+      content: {
+        ...content,
+        runtimeId: undefined,
+        runtimeGeneration: undefined,
+      },
+      sessionIds: [...sessionIds],
+      sessionType: current.sessionType,
+      provider: current.provider,
+    }))
+  }, [dispatch, paneId, tabId])
+
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
     if (current.sessionId) {
@@ -1215,6 +1250,10 @@ export function FreshAgentView({
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(current.runtimeId && current.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: current.runtimeId,
+          expectedGeneration: current.runtimeGeneration,
+        } : {}),
         ...(cwd ? { cwd } : {}),
       })
     }
@@ -1224,22 +1263,20 @@ export function FreshAgentView({
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
     pendingAutoTitleBySessionIdRef.current.clear()
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        createRequestId: nanoid(),
-        sessionId: undefined,
-        sessionRef: undefined,
-        resumeSessionId: undefined,
-        restoreError: undefined,
-        createError: undefined,
-        status: 'creating',
-        pendingLocalEcho: undefined,
-      },
-    }))
-  }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+    restartPaneForIntentionalCreate(current, {
+      ...current,
+      createRequestId: nanoid(),
+      sessionId: undefined,
+      runtimeId: undefined,
+      runtimeGeneration: undefined,
+      sessionRef: undefined,
+      resumeSessionId: undefined,
+      restoreError: undefined,
+      createError: undefined,
+      status: 'creating',
+      pendingLocalEcho: undefined,
+    })
+  }, [commitSnapshot, restartPaneForIntentionalCreate, sendFreshAgentMessage, setLocalEcho])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -1337,38 +1374,30 @@ export function FreshAgentView({
       const hadLegacyRestoreTarget = current.provider === 'codex'
         ? Boolean(current.resumeSessionId)
         : Boolean(getPreferredResumeSessionId(claudeSession) || current.resumeSessionId)
-      dispatch(updatePaneContent({
-        tabId,
-        paneId,
-        content: {
-          ...current,
-          sessionId: undefined,
-          resumeSessionId: undefined,
-          sessionRef: undefined,
-          restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
-          createRequestId: nextRequestId,
-          status: 'idle',
-          createError: undefined,
-        },
-      }))
+      restartPaneForIntentionalCreate(current, {
+        ...current,
+        sessionId: undefined,
+        resumeSessionId: undefined,
+        sessionRef: undefined,
+        restoreError: buildRestoreError(hadLegacyRestoreTarget ? 'invalid_legacy_restore_target' : 'dead_live_handle'),
+        createRequestId: nextRequestId,
+        status: 'idle',
+        createError: undefined,
+      })
       return
     }
 
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        sessionId: undefined,
-        resumeSessionId: canonicalResumeSessionId,
-        sessionRef: { provider: current.provider, sessionId: canonicalResumeSessionId },
-        restoreError: undefined,
-        createRequestId: nextRequestId,
-        status: 'creating',
-        createError: undefined,
-      },
-    }))
-  }, [claudeSession, dispatch, paneId, tabId])
+    restartPaneForIntentionalCreate(current, {
+      ...current,
+      sessionId: undefined,
+      resumeSessionId: canonicalResumeSessionId,
+      sessionRef: { provider: current.provider, sessionId: canonicalResumeSessionId },
+      restoreError: undefined,
+      createRequestId: nextRequestId,
+      status: 'creating',
+      createError: undefined,
+    })
+  }, [claudeSession, restartPaneForIntentionalCreate])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
@@ -1584,6 +1613,10 @@ export function FreshAgentView({
     paneId,
     paneContent.provider,
     paneContent.resumeSessionId,
+    // A replacement preserves the durable sessionId, so runtime fence changes
+    // are the edge that must rebind the new runtime to that durable route.
+    paneContent.runtimeGeneration,
+    paneContent.runtimeId,
     paneContent.sessionId,
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,
@@ -1644,6 +1677,30 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
+      const currentRuntimeGeneration = paneContentRef.current.runtimeGeneration
+      const messageRuntime = 'runtime' in message ? message.runtime : undefined
+      const isRuntimeBearingFreshAgentFrame = message.type === 'freshAgent.created'
+        || message.type === 'freshAgent.session.materialized'
+        || message.type === 'freshAgent.event'
+      // Once a pane has accepted a server-owned runtime fence, every
+      // fresh-agent lifecycle/event frame must prove which runtime emitted it.
+      // Legacy untagged frames are only safe for unfenced panes; otherwise a
+      // delayed pre-restart response can repopulate state the replacement
+      // deliberately cleared.
+      if (currentRuntimeGeneration !== undefined && isRuntimeBearingFreshAgentFrame && !messageRuntime) {
+        return
+      }
+      if (
+        currentRuntimeGeneration !== undefined
+        && isRuntimeBearingFreshAgentFrame
+        && messageRuntime
+        && (
+          messageRuntime.runtimeId !== paneContentRef.current.runtimeId
+          || messageRuntime.generation !== currentRuntimeGeneration
+        )
+      ) {
+        return
+      }
       if (message.type === 'pane.reconcile.result') {
         // Fold-ownership rule (pane-reconcile.ts): fold ONLY the result whose
         // reconcileId this view minted for its .lost reconcile; foreign
@@ -1671,6 +1728,9 @@ export function FreshAgentView({
         return
       }
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
+        if (paneContentRef.current.runtimeGeneration !== undefined && !message.runtime) {
+          return
+        }
         releasePendingRebind()
         clearReserveRedrive() // Task 14: a completed create ends the reservation window
         const current = paneContentRef.current
@@ -1681,6 +1741,12 @@ export function FreshAgentView({
           content: {
             ...current,
             sessionId: message.sessionId,
+            ...(message.runtime
+              ? {
+                runtimeId: message.runtime.runtimeId,
+                runtimeGeneration: message.runtime.generation,
+              }
+              : {}),
             sessionRef: message.sessionRef ?? current.sessionRef,
             resumeSessionId: getCreatedResumeSessionId(current, {
               sessionId: message.sessionId,
@@ -1740,6 +1806,12 @@ export function FreshAgentView({
           content: {
             ...current,
             sessionId: message.sessionId,
+            ...(message.runtime
+              ? {
+                runtimeId: message.runtime.runtimeId,
+                runtimeGeneration: message.runtime.generation,
+              }
+              : {}),
             sessionRef,
             resumeSessionId: message.sessionId,
             restoreError: undefined,
@@ -1857,6 +1929,10 @@ export function FreshAgentView({
             sessionId: paneContent.sessionId,
             sessionType: paneContent.sessionType,
             provider: paneContent.provider,
+            ...(paneContent.runtimeId && paneContent.runtimeGeneration !== undefined ? {
+              expectedRuntimeId: paneContent.runtimeId,
+              expectedGeneration: paneContent.runtimeGeneration,
+            } : {}),
             ...(cwd ? { cwd } : {}),
           })
         }
@@ -1896,11 +1972,15 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
+    const requestRuntimeId = paneContent.runtimeId
+    const requestRuntimeGeneration = paneContent.runtimeGeneration
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
       || paneContentRef.current.provider !== provider
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
+      || paneContentRef.current.runtimeId !== requestRuntimeId
+      || paneContentRef.current.runtimeGeneration !== requestRuntimeGeneration
     )
     // A1: resolve the cwd ONCE (route cwd falls through initialCwd -> session
     // cwd) and use the SAME value for both the scheduler key and the request,
@@ -2050,39 +2130,31 @@ export function FreshAgentView({
         const fresh = paneContentRef.current
         setLoadError(null)
         commitSnapshot(null)
-        dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            ...fresh,
-            sessionId: undefined,
-            sessionRef: undefined,
-            createRequestId: nanoid(),
-            status: 'idle',
-            createError: undefined,
-            restoreError: buildRestoreError('durable_artifact_missing'),
-          },
-        }))
+        restartPaneForIntentionalCreate(fresh, {
+          ...fresh,
+          sessionId: undefined,
+          sessionRef: undefined,
+          createRequestId: nanoid(),
+          status: 'idle',
+          createError: undefined,
+          restoreError: buildRestoreError('durable_artifact_missing'),
+        })
         return
       }
       if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
         const fresh = paneContentRef.current
         setLoadError(null)
         commitSnapshot(null)
-        dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            ...fresh,
-            sessionId: undefined,
-            sessionRef: undefined,
-            resumeSessionId: undefined,
-            createRequestId: nanoid(),
-            status: 'idle',
-            createError: undefined,
-            restoreError: buildRestoreError('durable_artifact_missing'),
-          },
-        }))
+        restartPaneForIntentionalCreate(fresh, {
+          ...fresh,
+          sessionId: undefined,
+          sessionRef: undefined,
+          resumeSessionId: undefined,
+          createRequestId: nanoid(),
+          status: 'idle',
+          createError: undefined,
+          restoreError: buildRestoreError('durable_artifact_missing'),
+        })
         return
       }
       setLoadError(error instanceof Error ? error.message : 'Failed to load session')
@@ -2134,12 +2206,15 @@ export function FreshAgentView({
     dispatch,
     paneContent.provider,
     paneContent.createRequestId,
+    paneContent.runtimeGeneration,
+    paneContent.runtimeId,
     paneContent.sessionId,
     paneContent.sessionType,
     paneId,
     commitSnapshot,
     migratePendingAutoTitle,
     requestSnapshotRefresh,
+    restartPaneForIntentionalCreate,
     setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
@@ -2514,6 +2589,10 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(paneContent.runtimeId && paneContent.runtimeGeneration !== undefined ? {
+          expectedRuntimeId: paneContent.runtimeId,
+          expectedGeneration: paneContent.runtimeGeneration,
+        } : {}),
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }
@@ -2574,17 +2653,14 @@ export function FreshAgentView({
                       className="fresh-agent-error-action rounded border border-border/70 px-2 py-1"
                       onClick={() => {
                         const nextRequestId = nanoid()
-                        dispatch(updatePaneContent({
-                          tabId,
-                          paneId,
-                          content: {
-                            ...paneContentRef.current,
-                            sessionId: undefined,
-                            createRequestId: nextRequestId,
-                            status: 'creating',
-                            createError: undefined,
-                          },
-                        }))
+                        const current = paneContentRef.current
+                        restartPaneForIntentionalCreate(current, {
+                          ...current,
+                          sessionId: undefined,
+                          createRequestId: nextRequestId,
+                          status: 'creating',
+                          createError: undefined,
+                        })
                       }}
                     >
                       Retry
@@ -2780,6 +2856,7 @@ export function FreshAgentView({
     pendingCreateFailure,
     queuedMessages,
     rewindToTurn,
+    restartPaneForIntentionalCreate,
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,

@@ -1,7 +1,10 @@
 import type { AppDispatch } from '@/store/store'
-import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
+import { makeFreshAgentSessionKey, type FreshAgentRuntimeProvider, type FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
+import type { RuntimeDescriptor } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
+import { collectPaneContents } from '@/lib/pane-utils'
+import type { PaneNode } from '@/store/paneTypes'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
@@ -39,6 +42,7 @@ type FreshAgentCreatedMessage = {
   sessionType: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
   runtimeProvider?: FreshAgentRuntimeProvider
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentCreateFailedMessage = {
@@ -56,6 +60,7 @@ type FreshAgentSessionMaterializedMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionRef?: SessionRef
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentKilledMessage = {
@@ -64,6 +69,7 @@ type FreshAgentKilledMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   success: boolean
+  runtime?: RuntimeDescriptor
 }
 
 type FreshAgentClientMessage =
@@ -76,12 +82,26 @@ interface FreshAgentMessageSink {
   send: (msg: unknown) => void
 }
 
+/** The minimal live store projection required to validate transport fences. */
+export type FreshAgentTransportState = {
+  freshAgent?: {
+    sessions?: Record<string, {
+      runtimeId?: string
+      runtimeGeneration?: number
+    }>
+  }
+  panes?: {
+    layouts?: Record<string, PaneNode | undefined>
+  }
+}
+
 type FreshAgentEventMessage = {
   type: 'freshAgent.event'
   sessionId: string
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   event: Record<string, unknown>
+  runtime?: RuntimeDescriptor
 }
 
 export function registerFreshAgentCreate(
@@ -106,10 +126,16 @@ export function registerFreshAgentCreate(
   dispatch(clearPendingCreateFailure({ requestId }))
 }
 
-export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<string, unknown>, ws?: FreshAgentMessageSink): boolean {
+export function handleFreshAgentMessage(
+  dispatch: AppDispatch,
+  msg: Record<string, unknown>,
+  ws?: FreshAgentMessageSink,
+  getState?: () => FreshAgentTransportState,
+): boolean {
   switch (msg.type) {
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
+      if (!isFreshAgentLifecycleMessageCurrent(created, getState?.())) return true
       const provider = created.provider ?? created.runtimeProvider
       const route = consumeCreateRoute(created.requestId)
       if (consumeCancelledCreate(created.requestId)) {
@@ -119,6 +145,10 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
+            ...(created.runtime ? {
+              expectedRuntimeId: created.runtime.runtimeId,
+              expectedGeneration: created.runtime.generation,
+            } : {}),
             ...(route?.cwd ? { cwd: route.cwd } : {}),
           })
         }
@@ -129,6 +159,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
         sessionId: created.sessionId,
         sessionType: created.sessionType,
         provider,
+        runtime: created.runtime,
       }))
       return true
     }
@@ -153,6 +184,7 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.session.materialized': {
       const materialized = msg as FreshAgentSessionMaterializedMessage
+      if (!isFreshAgentLifecycleMessageCurrent(materialized, getState?.())) return true
       dispatch(materializeFreshAgentSessionState({
         previousSessionId: materialized.previousSessionId,
         sessionId: materialized.sessionId,
@@ -174,18 +206,156 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
+      if (!isFreshAgentKilledMessageCurrent(killed, getState?.())) return true
       dispatch(removeSession({
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
+        runtime: killed.runtime,
       }))
       return true
     }
     case 'freshAgent.event':
+      // Reducers guard their own stored runtime too, but this is the only
+      // boundary that can see a pane fence before an event creates/mutates a
+      // session. Completion/waiting events mutate a separate activity slice,
+      // so they must be stopped here as well.
+      if (!isFreshAgentTransportEventCurrent(msg as FreshAgentEventMessage, getState?.())) {
+        return true
+      }
       return handleFreshAgentTransportEvent(dispatch, msg as FreshAgentEventMessage)
     default:
       return false
   }
+}
+
+function isFreshAgentKilledMessageCurrent(
+  msg: FreshAgentKilledMessage,
+  state: FreshAgentTransportState | undefined,
+): boolean {
+  if (!state) return true
+
+  const fences: Array<{ runtimeId?: string, runtimeGeneration?: number }> = []
+  const session = state.freshAgent?.sessions?.[makeFreshAgentSessionKey({
+    sessionId: msg.sessionId,
+    sessionType: msg.sessionType,
+    provider: msg.provider,
+  })]
+  if (session && isRuntimeFenced(session)) fences.push(session)
+
+  for (const layout of Object.values(state.panes?.layouts ?? {})) {
+    if (!layout) continue
+    for (const content of collectPaneContents(layout)) {
+      if (
+        content.kind === 'fresh-agent'
+        && content.sessionId === msg.sessionId
+        && content.sessionType === msg.sessionType
+        && content.provider === msg.provider
+        && isRuntimeFenced(content)
+      ) {
+        fences.push(content)
+      }
+    }
+  }
+
+  return fences.every((fence) => matchesRuntimeFence(msg.runtime, fence))
+}
+
+function isRuntimeFenced(value: { runtimeId?: string, runtimeGeneration?: number }): boolean {
+  return typeof value.runtimeId === 'string' && Number.isFinite(value.runtimeGeneration)
+}
+
+function matchesRuntimeFence(runtime: RuntimeDescriptor | undefined, fence: { runtimeId?: string, runtimeGeneration?: number }): boolean {
+  return runtime?.runtimeId === fence.runtimeId && runtime?.generation === fence.runtimeGeneration
+}
+
+/**
+ * Lifecycle acknowledgements mutate before a session event can reach the
+ * reducer fence. Resolve the pane/session they target first, then require the
+ * same exact descriptor as ordinary transport frames once that target is
+ * fenced. This keeps delayed create/materialize acknowledgements from
+ * resurrecting an old runtime after a restart replacement.
+ */
+function isFreshAgentLifecycleMessageCurrent(
+  msg: FreshAgentCreatedMessage | FreshAgentSessionMaterializedMessage,
+  state: FreshAgentTransportState | undefined,
+): boolean {
+  if (!state) return true
+
+  const fences: Array<{ runtimeId?: string, runtimeGeneration?: number }> = []
+  const targetSessionId = msg.type === 'freshAgent.session.materialized'
+    ? msg.previousSessionId
+    : undefined
+  const provider = msg.type === 'freshAgent.created'
+    ? (msg.provider ?? msg.runtimeProvider)
+    : msg.provider
+
+  if (targetSessionId && provider) {
+    const session = state.freshAgent?.sessions?.[makeFreshAgentSessionKey({
+      sessionId: targetSessionId,
+      sessionType: msg.sessionType,
+      provider,
+    })]
+    if (session && isRuntimeFenced(session)) fences.push(session)
+  }
+
+  for (const layout of Object.values(state.panes?.layouts ?? {})) {
+    if (!layout) continue
+    for (const content of collectPaneContents(layout)) {
+      if (content.kind !== 'fresh-agent' || !isRuntimeFenced(content)) continue
+      const targetsCreatedPane = msg.type === 'freshAgent.created'
+        && content.createRequestId === msg.requestId
+      const targetsMaterializedPane = msg.type === 'freshAgent.session.materialized'
+        && content.sessionId === msg.previousSessionId
+        && content.sessionType === msg.sessionType
+        && content.provider === msg.provider
+      if (targetsCreatedPane || targetsMaterializedPane) fences.push(content)
+    }
+  }
+
+  return fences.every((fence) => matchesRuntimeFence(msg.runtime, fence))
+}
+
+/**
+ * A durable fresh-agent session id survives restarts; it is never sufficient
+ * to authorize a transport frame once the pane/session has a live runtime
+ * descriptor. Missing runtime metadata is therefore stale, not legacy-safe.
+ */
+export function isFreshAgentTransportEventCurrent(
+  msg: FreshAgentEventMessage,
+  state: FreshAgentTransportState | undefined,
+): boolean {
+  if (!state) return true
+
+  const fences: Array<{ runtimeId?: string, runtimeGeneration?: number }> = []
+  const sessionId = typeof msg.sessionId === 'string'
+    ? msg.sessionId
+    : (typeof msg.event.sessionId === 'string' ? msg.event.sessionId : undefined)
+  if (!sessionId) return true
+
+  const session = state.freshAgent?.sessions?.[makeFreshAgentSessionKey({
+    sessionId,
+    sessionType: msg.sessionType,
+    provider: msg.provider,
+  })]
+  if (session && isRuntimeFenced(session)) fences.push(session)
+
+  for (const layout of Object.values(state.panes?.layouts ?? {})) {
+    if (!layout) continue
+    for (const content of collectPaneContents(layout)) {
+      if (
+        content.kind === 'fresh-agent'
+        && content.sessionId === sessionId
+        && content.sessionType === msg.sessionType
+        && content.provider === msg.provider
+        && isRuntimeFenced(content)
+      ) {
+        fences.push(content)
+      }
+    }
+  }
+
+  return fences.every((fence) => matchesRuntimeFence(msg.runtime, fence))
 }
 
 export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: FreshAgentEventMessage): boolean {
@@ -199,6 +369,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     sessionId,
     sessionType: msg.sessionType,
     provider: msg.provider,
+    runtime: msg.runtime,
   }
 
   switch (event.type) {

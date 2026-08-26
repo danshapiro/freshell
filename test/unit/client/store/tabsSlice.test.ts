@@ -665,6 +665,34 @@ describe('tabsSlice', () => {
       expect(state.tabs.activeTabId).toBe('foreign-tab')
     })
 
+    it('does not let forceNew duplicate a durable session already open in the workspace', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({ id: 'existing-tab', mode: 'codex' }))
+      store.dispatch(initLayout({
+        tabId: 'existing-tab',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          terminalId: 'terminal-existing',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'shared',
+          },
+        },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'shared',
+        provider: 'codex',
+        forceNew: true,
+      }))
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      expect(state.tabs.activeTabId).toBe('existing-tab')
+    })
+
     it('seeds a new coding-agent tab title with the working-directory basename', async () => {
       const store = createOpenSessionStore()
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Resume-invocation record (campaign plan §4.2): exactly what the
 /// provider-native resume command needs.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FreshAgentSettings {
     pub model: Option<String>,
     pub sandbox: Option<String>,

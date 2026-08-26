@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 31 discriminants).
+//! Client → server messages (`ClientMessage`, 32 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -8,14 +8,17 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::common::{
-    double_option, AgentProvider, CodexDurability, PermissionMode, Sandbox, SessionLocator,
-    SessionType, Shell, StringOrNumber, TerminalAttachIntent, TerminalAttachPriority,
+    double_option, AgentProvider, AgentRuntimeKind, CodexDurability, PermissionMode, Sandbox,
+    SessionLocator, SessionType, Shell, StringOrNumber, TerminalAttachIntent,
+    TerminalAttachPriority,
 };
 
 /// A message sent from a client to the server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentRestart),
     #[serde(rename = "hello")]
     Hello(Hello),
     #[serde(rename = "ping")]
@@ -85,7 +88,8 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 32] = [
+    "agent.restart",
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -139,6 +143,14 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    /// Explicit opt-in for the additive restart transaction surface. Because
+    /// protocol v7 servers accept-and-strip unknown hello capabilities, a new
+    /// client can connect to an older v7 server and must wait for the matching
+    /// `ready.capabilities.agentRestartV1` advertisement before sending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_restart_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +187,19 @@ pub struct Hello {
 }
 
 // --- client.diagnostic ------------------------------------------------------
+
+/// Fenced request to restart one Rust-owned coding-agent runtime while
+/// retaining its canonical durable conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestart {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    pub live_id: String,
+    pub expected_generation: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -597,6 +622,10 @@ pub struct FreshAgentSend {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -614,6 +643,10 @@ pub struct FreshAgentInterrupt {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
@@ -664,6 +697,10 @@ pub struct FreshAgentKill {
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }

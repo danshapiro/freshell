@@ -1441,7 +1441,7 @@ export default function App() {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
-        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
+        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws, appStore.getState)
       })
 
       cleanup = () => {

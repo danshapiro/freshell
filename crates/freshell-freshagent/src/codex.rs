@@ -77,7 +77,10 @@ use freshell_terminal::FrameSink;
 use crate::summary::{
     truncate_summary, SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL,
 };
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
+use crate::{
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshRuntimeIdentity,
+    SharedFreshRuntimeRegistry, SharedPaneIdentitySink,
+};
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
@@ -97,6 +100,8 @@ const DEAD_THREAD_CACHE_TTL: Duration = Duration::from_secs(30);
 /// bookkeeping" without anything actually enforcing a bound). Enforced on insert in
 /// [`FreshCodexState::mark_thread_dead`].
 const DEAD_THREADS_CAP: usize = 256;
+const RESTART_CONSUMER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+const RESTART_WATCHER_JOIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
@@ -175,6 +180,12 @@ pub struct FreshCodexState {
     /// round-3). The RAII guard releases on every terminal leg (success, refusal,
     /// and the post-archive containment alike).
     fork_in_flight: crate::InFlightRegistry,
+    runtime_identity: FreshRuntimeIdentity,
+    /// Exact runtimes removed from the live map whose restart teardown has
+    /// not yet crossed every quiescence barrier. Durable leases remain bound
+    /// and same-request retries continue these handles instead of seeing a
+    /// stale runtime.
+    restart_retirements: Arc<TokioMutex<HashMap<String, CodexRestartRetirement>>>,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -185,12 +196,20 @@ pub struct FreshCodexState {
 #[derive(Clone)]
 struct CodexCreateRecord {
     session_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
 }
 
 /// One live freshcodex session: the app-server client, its owned sidecar, and the
 /// normalized create-time settings a later `send` re-uses.
 struct CodexSession {
+    runtime: freshell_protocol::RuntimeDescriptor,
     client: Arc<CodexAppServerClient>,
+    /// Capture-before-kill identity for boot-safe restart recovery. The
+    /// watcher owns the child handle, so these immutable spawn values are the
+    /// only way preflight can durably snapshot its exact process tree before
+    /// the server process itself disappears.
+    root_pid: u32,
+    ownership_id: String,
     /// Normalized model (`normalizeFreshcodexModel`), reused verbatim on `send`.
     model: String,
     /// Normalized menu effort (`normalizeFreshAgentEffort`); wire-mapped on `send`.
@@ -209,19 +228,36 @@ struct CodexSession {
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
     /// `freshAgent.kill`); single-shot, so `None` once sent.
-    kill_tx: Option<oneshot::Sender<()>>,
+    kill_tx: Option<oneshot::Sender<CodexKillRequest>>,
     /// Owns the sidecar child. An UNREQUESTED exit self-heals (adapter.ts:935-946): the
     /// watcher broadcasts the terminal `exited` status with NO chime, flips [`Self::exited`],
     /// and does NOT remove the session (stays mapped, matching the reference's "lazy restart
     /// on next send" invariant \u2014 PR-4 implements the actual restart, see
     /// [`FreshCodexState::ensure_session_alive`]).
-    watcher: tokio::task::JoinHandle<()>,
+    watcher: tokio::task::JoinHandle<bool>,
     /// PR-4: flipped `true` by the exit-watcher's self-heal (UNREQUESTED-exit) branch;
     /// consulted by [`FreshCodexState::ensure_session_alive`] on the next `freshAgent.send`/
     /// `freshAgent.attach` to decide whether a transparent respawn is needed (the
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+}
+
+struct CodexKillRequest {
+    captured: oneshot::Sender<()>,
+}
+
+struct CodexRestartRetirement {
+    session_id: String,
+    runtime_id: String,
+    client: Arc<CodexAppServerClient>,
+    consumer: Option<tokio::task::JoinHandle<()>>,
+    watcher: Option<tokio::task::JoinHandle<bool>>,
+    capture_rx: Option<oneshot::Receiver<()>>,
+    capture_confirmed: bool,
+    consumer_quiesced: bool,
+    transport_closed: bool,
+    tree_quiesced: bool,
 }
 
 /// The result of [`FreshCodexState::ensure_session_alive`].
@@ -311,7 +347,13 @@ impl FreshCodexState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
+            runtime_identity: FreshRuntimeIdentity::default(),
+            restart_retirements: Arc::new(TokioMutex::new(HashMap::new())),
         }
+    }
+
+    pub fn set_runtime_registry(&self, registry: SharedFreshRuntimeRegistry) {
+        self.runtime_identity.set_registry(registry);
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -419,6 +461,7 @@ impl FreshCodexState {
             provider: PROVIDER.to_string(),
             session_id: session_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
         }));
     }
 
@@ -451,14 +494,7 @@ impl FreshCodexState {
             guard.drain().map(|(_, s)| s).collect()
         };
         for session in drained {
-            session.consumer.abort();
-            session.client.close().await;
-            if let Some(kill_tx) = session.kill_tx {
-                let _ = kill_tx.send(());
-            }
-            // The exit-watcher performs start_kill + reap_owned_codex_sidecars on this
-            // requested-kill path; wait for it so shutdown() only returns once torn down.
-            let _ = session.watcher.await;
+            let _ = stop_codex_session(session).await;
         }
     }
 
@@ -475,6 +511,24 @@ impl FreshCodexState {
     /// (or `freshAgent.create.failed`). Long-running (cold sidecar spawn), so the WS loop
     /// dispatches this as a detached task and keeps fanning out the bus meanwhile.
     pub async fn handle_create(&self, msg: FreshAgentCreate) {
+        self.handle_create_with_replacement_ownership(msg, None)
+            .await;
+    }
+
+    pub async fn handle_create_for_restart(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: &str,
+    ) {
+        self.handle_create_with_replacement_ownership(msg, Some(replacement_ownership_id))
+            .await;
+    }
+
+    async fn handle_create_with_replacement_ownership(
+        &self,
+        msg: FreshAgentCreate,
+        replacement_ownership_id: Option<&str>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -490,6 +544,7 @@ impl FreshCodexState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.session_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: Some(cached.runtime),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.session_id,
@@ -633,13 +688,17 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 lease_guard,
+                replacement_ownership_id,
             )
             .await;
             return;
         }
 
         // Spawn + initialize the app-server sidecar.
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar(cwd.as_deref(), replacement_ownership_id)
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
@@ -718,6 +777,7 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        replacement_ownership_id: Option<&str>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
@@ -731,7 +791,10 @@ impl FreshCodexState {
             return;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+        let (client, notifs, ownership_id, child) = match self
+            .spawn_sidecar(cwd.as_deref(), replacement_ownership_id)
+            .await
+        {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -876,6 +939,9 @@ impl FreshCodexState {
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &thread_id);
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
         // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
@@ -895,6 +961,7 @@ impl FreshCodexState {
             thread_id.clone(),
             active_turn.clone(),
             Some(created_rx),
+            runtime.clone(),
         );
 
         // The exit-watcher owns the sidecar child: a REQUESTED kill (via `kill_tx`) tears it
@@ -902,6 +969,8 @@ impl FreshCodexState {
         // and flips `exited` so the next send/attach lazily respawns (PR-4).
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -910,12 +979,16 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         self.sessions.lock().await.insert(
             thread_id.clone(),
             CodexSession {
+                runtime: runtime.clone(),
                 client,
+                root_pid,
+                ownership_id: restart_ownership_id,
                 model: model.clone(),
                 effort: effort.clone(),
                 cwd: cwd.clone(),
@@ -934,15 +1007,13 @@ impl FreshCodexState {
         // down our own tree and answer failed.
         if let Some(mut g) = lease_guard.take() {
             if !g.complete(&thread_id) {
+                let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    stopped = stop_codex_session(session).await;
                 }
-                g.fail(); // own tree torn down -- reopen the key
+                if stopped {
+                    g.fail(); // confirmed own tree down -- reopen the key
+                }
                 self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
@@ -988,6 +1059,7 @@ impl FreshCodexState {
                 &request_id,
                 CodexCreateRecord {
                     session_id: thread_id.clone(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -999,6 +1071,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id,
@@ -1048,11 +1121,19 @@ impl FreshCodexState {
     /// `freshAgent.created` naming the live durable threadId under the loser's own
     /// `requestId` — no spawn, no rollout clobber.
     async fn adopt_live_create(&self, request_id: &str, thread_id: &str) {
+        let runtime = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|session| session.runtime.clone())
+            .unwrap_or_else(|| self.runtime_identity.mint_and_register(PROVIDER, thread_id));
         self.create_dedup
             .record_success(
                 request_id,
                 CodexCreateRecord {
                     session_id: thread_id.to_string(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -1062,6 +1143,7 @@ impl FreshCodexState {
             runtime_provider: PROVIDER.to_string(),
             session_id: thread_id.to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
@@ -1083,6 +1165,26 @@ impl FreshCodexState {
         let request_id = msg.request_id.clone();
         let mut session_id = msg.session_id.clone();
         let cwd = msg.cwd.clone();
+
+        {
+            let sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get(&session_id) else {
+                self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+                return;
+            };
+            if !crate::control_targets_runtime(
+                msg.expected_runtime_id.as_deref(),
+                msg.expected_generation,
+                &session.runtime,
+            ) {
+                self.send_error(
+                    &request_id,
+                    "STALE_RUNTIME",
+                    "codex control targets a replaced runtime",
+                );
+                return;
+            }
+        }
 
         match self.ensure_session_alive(&session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) => {}
@@ -1115,8 +1217,15 @@ impl FreshCodexState {
         // Look up the session; extract the client + settings under the lock (Child isn't Clone).
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| {
-                (
+            guard.get(&session_id).and_then(|s| {
+                if !crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &s.runtime,
+                ) {
+                    return None;
+                }
+                Some((
                     s.client.clone(),
                     s.model.clone(),
                     s.effort.clone(),
@@ -1124,13 +1233,17 @@ impl FreshCodexState {
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
                     s.active_turn.clone(),
-                )
+                ))
             })
         };
         let Some((client, model, effort, turn_cwd, sandbox, permission_mode, active_turn)) =
             looked_up
         else {
-            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+            self.send_error(
+                &request_id,
+                "STALE_RUNTIME",
+                "codex runtime changed before control dispatch",
+            );
             return;
         };
 
@@ -1222,12 +1335,21 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard.get(&session_id).and_then(|s| {
+                crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &s.runtime,
+                )
+                .then(|| (s.client.clone(), s.active_turn.clone()))
+            })
         };
         let Some((client, active_turn)) = looked_up else {
-            self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+            self.send_error(
+                &None,
+                "STALE_RUNTIME",
+                "codex control targets a missing or replaced runtime",
+            );
             return;
         };
 
@@ -1584,7 +1706,7 @@ impl FreshCodexState {
         }
 
         // ── post-archive (failure containment applies to every step below) ──
-        let child_parts = match self.spawn_sidecar(eff_cwd.as_deref()).await {
+        let child_parts = match self.spawn_sidecar(eff_cwd.as_deref(), None).await {
             Ok(parts) => parts,
             Err(err) => {
                 self.fail_fork_after_archive(
@@ -1743,20 +1865,45 @@ impl FreshCodexState {
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
         let session_id = msg.session_id.clone();
 
-        let removed = self.sessions.lock().await.remove(&session_id);
-        if let Some(session) = removed {
-            session.consumer.abort();
-            session.client.close().await;
-            if let Some(kill_tx) = session.kill_tx {
-                let _ = kill_tx.send(());
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(&session_id) {
+                Some(session)
+                    if crate::control_targets_runtime(
+                        msg.expected_runtime_id.as_deref(),
+                        msg.expected_generation,
+                        &session.runtime,
+                    ) =>
+                {
+                    sessions.remove(&session_id)
+                }
+                Some(_) => {
+                    drop(sessions);
+                    self.send_error(
+                        &None,
+                        "STALE_RUNTIME",
+                        "codex control targets a replaced runtime",
+                    );
+                    return;
+                }
+                None if msg.expected_runtime_id.is_some() || msg.expected_generation.is_some() => {
+                    drop(sessions);
+                    self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
+                    return;
+                }
+                None => None,
             }
-            // The exit-watcher performs start_kill + reap on this requested-kill path; wait
-            // for it so the sidecar is actually gone before we broadcast success.
-            let _ = session.watcher.await;
-        }
+        };
+        let killed_runtime = removed.as_ref().map(|session| session.runtime.clone());
+        let quiesced = match removed {
+            Some(session) => stop_codex_session(session).await,
+            None => true,
+        };
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
-        self.leases.clear_binding(PROVIDER, &session_id);
+        if quiesced {
+            self.leases.clear_binding(PROVIDER, &session_id);
+        }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
@@ -1773,7 +1920,190 @@ impl FreshCodexState {
             session_id,
             session_type: SESSION_TYPE.to_string(),
             success: true,
+            runtime: killed_runtime,
         }));
+    }
+
+    /// Restart-only teardown fenced to the exact runtime selected by the
+    /// coordinator. The descriptor check and map removal share one lock scope,
+    /// so a stale restart can never remove a newer route for the same thread.
+    pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
+        self.shutdown_for_restart_detailed(session_id, expected_runtime_id)
+            .await
+            == crate::RestartShutdownOutcome::Stopped
+    }
+
+    pub async fn shutdown_for_restart_detailed(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let quarantined = {
+            let retirements = self.restart_retirements.lock().await;
+            match retirements.get(expected_runtime_id) {
+                Some(retirement) if retirement.session_id == session_id => true,
+                Some(_) => return crate::RestartShutdownOutcome::Stale,
+                None => {
+                    if retirements
+                        .values()
+                        .any(|retirement| retirement.session_id == session_id)
+                    {
+                        return crate::RestartShutdownOutcome::Stale;
+                    }
+                    false
+                }
+            }
+        };
+        if quarantined {
+            return self
+                .continue_codex_restart_retirement(expected_runtime_id)
+                .await;
+        }
+
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get(session_id) {
+                Some(session) if session.runtime.runtime_id == expected_runtime_id => {
+                    sessions.remove(session_id)
+                }
+                _ => None,
+            }
+        };
+        let Some(session) = removed else {
+            return crate::RestartShutdownOutcome::Stale;
+        };
+        let CodexSession {
+            runtime,
+            client,
+            consumer,
+            kill_tx,
+            watcher,
+            ..
+        } = session;
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let capture_rx = kill_tx.and_then(|kill_tx| {
+            kill_tx
+                .send(CodexKillRequest {
+                    captured: captured_tx,
+                })
+                .is_ok()
+                .then_some(captured_rx)
+        });
+        self.restart_retirements.lock().await.insert(
+            expected_runtime_id.to_string(),
+            CodexRestartRetirement {
+                session_id: session_id.to_string(),
+                runtime_id: runtime.runtime_id,
+                client,
+                consumer: Some(consumer),
+                watcher: Some(watcher),
+                capture_rx,
+                capture_confirmed: false,
+                consumer_quiesced: false,
+                transport_closed: false,
+                tree_quiesced: false,
+            },
+        );
+        self.continue_codex_restart_retirement(expected_runtime_id)
+            .await
+    }
+
+    async fn continue_codex_restart_retirement(
+        &self,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let Some(mut retirement) = self
+            .restart_retirements
+            .lock()
+            .await
+            .remove(expected_runtime_id)
+        else {
+            return crate::RestartShutdownOutcome::Stale;
+        };
+
+        if !retirement.capture_confirmed {
+            if let Some(mut captured) = retirement.capture_rx.take() {
+                if tokio::time::timeout(Duration::from_secs(1), &mut captured)
+                    .await
+                    .is_ok()
+                {
+                    retirement.capture_confirmed = true;
+                } else {
+                    retirement.capture_rx = Some(captured);
+                }
+            }
+        }
+
+        // Only after the watcher has captured the pid/start-time tree may
+        // transport closure or consumer cancellation make the direct sidecar
+        // exit. Retain unfinished handles in quarantine for a same-request
+        // coordinator retry.
+        if retirement.capture_confirmed {
+            if !retirement.consumer_quiesced {
+                if let Some(mut consumer) = retirement.consumer.take() {
+                    consumer.abort();
+                    if tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
+                        .await
+                        .is_ok()
+                    {
+                        retirement.consumer_quiesced = true;
+                    } else {
+                        retirement.consumer = Some(consumer);
+                    }
+                } else {
+                    retirement.consumer_quiesced = true;
+                }
+            }
+            if !retirement.transport_closed {
+                retirement.client.close().await;
+                retirement.transport_closed = true;
+            }
+            if !retirement.tree_quiesced {
+                if let Some(mut watcher) = retirement.watcher.take() {
+                    match tokio::time::timeout(RESTART_WATCHER_JOIN_BUDGET, &mut watcher).await {
+                        Ok(Ok(true)) => retirement.tree_quiesced = true,
+                        Ok(_) => {}
+                        Err(_) => retirement.watcher = Some(watcher),
+                    }
+                }
+            }
+        }
+
+        if !(retirement.capture_confirmed
+            && retirement.consumer_quiesced
+            && retirement.transport_closed
+            && retirement.tree_quiesced)
+        {
+            tracing::error!(
+                provider = PROVIDER,
+                session_id = %retirement.session_id,
+                runtime_id = %retirement.runtime_id,
+                capture_confirmed = retirement.capture_confirmed,
+                consumer_quiesced = retirement.consumer_quiesced,
+                transport_closed = retirement.transport_closed,
+                tree_quiesced = retirement.tree_quiesced,
+                "freshagent.codex.restart_shutdown_not_quiescent"
+            );
+            let message = format!(
+                "Codex predecessor {} is not yet fully quiescent \
+                 (capture_confirmed={}, consumer_quiesced={}, transport_closed={}, tree_quiesced={})",
+                retirement.runtime_id,
+                retirement.capture_confirmed,
+                retirement.consumer_quiesced,
+                retirement.transport_closed,
+                retirement.tree_quiesced
+            );
+            self.restart_retirements
+                .lock()
+                .await
+                .insert(expected_runtime_id.to_string(), retirement);
+            return crate::RestartShutdownOutcome::RetirementIncomplete { message };
+        }
+        self.leases.clear_binding(PROVIDER, &retirement.session_id);
+        self.create_dedup
+            .clear_for_session(|record| record.session_id == retirement.session_id)
+            .await;
+        crate::RestartShutdownOutcome::Stopped
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -1787,6 +2117,57 @@ impl FreshCodexState {
         guard
             .get(session_id)
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
+
+    /// Provider-authoritative restart inputs for the live Codex runtime.
+    /// These values are the normalized settings actually retained by
+    /// `handle_send`; a failed identity-sink write must never make restart
+    /// substitute mutable server defaults.
+    pub async fn capture_restart_resume_plan(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<crate::FreshAgentRestartResumePlan> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.runtime.runtime_id != expected_runtime_id
+            || session.exited.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(crate::FreshAgentRestartResumePlan {
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            settings: crate::FreshAgentSettings {
+                model: Some(session.model.clone()),
+                sandbox: session.sandbox.clone(),
+                permission_mode: session.permission_mode.clone(),
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        })
+    }
+
+    /// Snapshot the sidecar and every currently-readable descendant before
+    /// restart closes its transport or transfers the child to quarantine.
+    /// The immutable spawn identity follows transparent respawns, so this is
+    /// fenced to the exact runtime currently in the sessions map.
+    pub async fn capture_restart_process_barrier(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<freshell_codex::transport::OwnedProcessTreeBarrier> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        if session.runtime.runtime_id != expected_runtime_id
+            || session.exited.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+            session.root_pid,
+            CODEX_SIDECAR_OWNERSHIP_ENV,
+            &session.ownership_id,
+        ))
     }
 
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
@@ -1916,7 +2297,13 @@ impl FreshCodexState {
             status,
             revision: None,
         };
-        if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
+        let runtime = self
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .map(|session| session.runtime.clone());
+        if let Some(frame) = adapter_event_to_frame(&event, &session_id, runtime.as_ref()) {
             let _ = self.broadcast_tx.send(frame);
         }
     }
@@ -2106,15 +2493,16 @@ impl FreshCodexState {
                 .await;
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (client, notifs, ownership_id, child) =
+            match self.spawn_sidecar(cwd.as_deref(), None).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(err));
                 }
-                return Err(EnsureAliveError::RespawnFailed(err));
-            }
-        };
+            };
         // Arm the lease's TTL tree-kill path now that the child + its tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -2225,8 +2613,18 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, session_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            session_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -2235,6 +2633,7 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -2248,7 +2647,10 @@ impl FreshCodexState {
             guard.insert(
                 session_id.to_string(),
                 CodexSession {
+                    runtime,
                     client,
+                    root_pid,
+                    ownership_id: restart_ownership_id,
                     model: model.clone(),
                     effort: effort.clone(),
                     cwd: cwd.clone(),
@@ -2321,15 +2723,16 @@ impl FreshCodexState {
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if let Some(mut g) = lease_guard.take() {
-                    g.fail();
+        let (client, notifs, ownership_id, child) =
+            match self.spawn_sidecar(cwd.as_deref(), None).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if let Some(mut g) = lease_guard.take() {
+                        g.fail();
+                    }
+                    return Err(EnsureAliveError::RespawnFailed(err));
                 }
-                return Err(EnsureAliveError::RespawnFailed(err));
-            }
-        };
+            };
         // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
         if let Some(g) = lease_guard.as_mut() {
             if let Some(pid) = child.id() {
@@ -2362,8 +2765,18 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, new_thread_id.clone(), active_turn.clone());
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &new_thread_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            new_thread_id.clone(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -2372,6 +2785,7 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
 
         {
@@ -2380,7 +2794,10 @@ impl FreshCodexState {
             guard.insert(
                 new_thread_id.clone(),
                 CodexSession {
+                    runtime: runtime.clone(),
                     client,
+                    root_pid,
+                    ownership_id: restart_ownership_id,
                     model: model.clone(),
                     effort: effort.clone(),
                     cwd: cwd.clone(),
@@ -2443,6 +2860,7 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: new_thread_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
+                runtime: Some(runtime),
                 session_ref: Some(SessionLocator {
                     provider: PROVIDER.to_string(),
                     session_id: new_thread_id.clone(),
@@ -2478,6 +2896,7 @@ impl FreshCodexState {
     async fn spawn_sidecar(
         &self,
         cwd: Option<&str>,
+        replacement_ownership_id: Option<&str>,
     ) -> Result<
         (
             Arc<CodexAppServerClient>,
@@ -2516,6 +2935,15 @@ impl FreshCodexState {
         // our sidecar).
         for (key, value) in &spec.env {
             cmd.env(key, value);
+        }
+        // Restart tagging: a replacement sidecar spawned during a restart
+        // transaction carries the coordinator's pre-spawn ownership id so a
+        // later boot can find and quiesce it (restart-recovery quarantine).
+        if let Some(replacement_ownership_id) = replacement_ownership_id {
+            cmd.env(
+                crate::RESTART_REPLACEMENT_OWNERSHIP_ENV,
+                replacement_ownership_id,
+            );
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2589,8 +3017,9 @@ impl FreshCodexState {
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+        self.spawn_consumer_after(notifs, thread_id, active_turn, None, runtime)
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -2608,6 +3037,7 @@ impl FreshCodexState {
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         gate: Option<oneshot::Receiver<()>>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         tokio::spawn(async move {
@@ -2623,7 +3053,7 @@ impl FreshCodexState {
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
                         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
                     }
-                    let frame = adapter_event_to_frame(&event, &thread_id);
+                    let frame = adapter_event_to_frame(&event, &thread_id, Some(&runtime));
                     if let Some(frame) = frame {
                         let _ = broadcast_tx.send(frame);
                     }
@@ -2868,7 +3298,7 @@ impl FreshCodexState {
             }
         }
 
-        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd).await {
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd, None).await {
             Ok(parts) => parts,
             Err(err) => {
                 if let Some(mut g) = lease_guard.take() {
@@ -2977,6 +3407,8 @@ impl FreshCodexState {
         // record's settings snapshot -- blank only when no record was recoverable
         // (never-recorded historical sessions resume on defaults, exactly as before
         // this fix). (Lease completion happens right after the insert -- see below.)
+        // The runtime identity is minted + registered INSIDE the shared tail, so the
+        // consumer, exit-watcher, and session row all fence on the SAME descriptor.
         let active_turn = self
             .register_live_session(
                 thread_id,
@@ -2997,15 +3429,13 @@ impl FreshCodexState {
             if !g.complete(thread_id) {
                 // Revoked mid-resume (expired holder): tear our own session down and
                 // reopen the key -- never keep a session a contender may replace.
+                let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    stopped = stop_codex_session(session).await;
                 }
-                g.fail();
+                if stopped {
+                    g.fail();
+                }
                 return Err(ResumeSessionError::Transient(
                     "session lease revoked during attach-resume; torn down".to_string(),
                 ));
@@ -3040,9 +3470,12 @@ impl FreshCodexState {
     /// The shared "register a freshly-resumed/forked session on its new sidecar" tail of
     /// [`Self::ensure_session_resumable`] and [`Self::handle_fork`]: notification
     /// consumer + exit-watcher + insert, built from the caller-resolved settings
-    /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
-    /// AROUND this insert (watcher ownership of the child, lease completion in
-    /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
+    /// snapshot. Mints and registers the session's runtime identity (restart
+    /// fencing) and threads the SAME descriptor into the consumer, the exit
+    /// watcher, and the session row. Returns the new session's `active_turn`
+    /// handle. Callers own everything AROUND this insert (watcher ownership of
+    /// the child, lease completion in [`Self::ensure_session_resumable`], the
+    /// binding row in [`Self::handle_fork`]).
     #[allow(clippy::too_many_arguments)]
     async fn register_live_session(
         &self,
@@ -3059,8 +3492,16 @@ impl FreshCodexState {
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let runtime = self.runtime_identity.mint_and_register(PROVIDER, thread_id);
+        let consumer = self.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
+        let root_pid = child.id().unwrap_or(0);
+        let restart_ownership_id = ownership_id.clone();
         let watcher = spawn_exit_watcher(
             child,
             ownership_id,
@@ -3069,11 +3510,15 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
+                root_pid,
+                ownership_id: restart_ownership_id,
                 model,
                 effort,
                 cwd,
@@ -3120,19 +3565,29 @@ impl FreshCodexState {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
+        let root_pid = child.id().unwrap_or(0);
+        let ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
         let watcher = spawn_exit_watcher(
             child,
-            format!("codex-sidecar-test-snapshot-router-{thread_id}"),
+            ownership_id.clone(),
             thread_id.to_string(),
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            runtime.clone(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
+                root_pid,
+                ownership_id,
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -3854,17 +4309,47 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///   `exited` status with NO chime (a crash is not a positive completion). The session is
 ///   intentionally left mapped by the caller (this fn does not touch `sessions`) — matching
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
-/// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
-///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
+/// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: capture the tagged
+///   pid/start-time tree before transport close, terminate + confirm it, and
+///   reap the direct child, with NO self-heal event (the caller broadcasts its
+///   own `freshAgent.killed`).
+async fn stop_codex_session(mut session: CodexSession) -> bool {
+    let (captured_tx, captured_rx) = oneshot::channel();
+    let capture_requested = session.kill_tx.take().is_some_and(|kill_tx| {
+        kill_tx
+            .send(CodexKillRequest {
+                captured: captured_tx,
+            })
+            .is_ok()
+    });
+    let capture_confirmed = capture_requested
+        && tokio::time::timeout(Duration::from_secs(1), captured_rx)
+            .await
+            .is_ok();
+    session.consumer.abort();
+    let consumer_quiesced =
+        tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut session.consumer)
+            .await
+            .is_ok();
+    session.client.close().await;
+    let tree_quiesced = matches!(
+        tokio::time::timeout(RESTART_WATCHER_JOIN_BUDGET, session.watcher).await,
+        Ok(Ok(true))
+    );
+    capture_confirmed && consumer_quiesced && tree_quiesced
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_exit_watcher(
     mut child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
-    kill_rx: oneshot::Receiver<()>,
+    kill_rx: oneshot::Receiver<CodexKillRequest>,
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
-) -> tokio::task::JoinHandle<()> {
+    runtime: freshell_protocol::RuntimeDescriptor,
+) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -3875,13 +4360,41 @@ fn spawn_exit_watcher(
         // Checking `kill_rx` first every time both are ready eliminates that race.
         tokio::select! {
             biased;
-            _ = kill_rx => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                reap_owned_codex_sidecars(&ownership_id);
-                // Task 12: the bound session is gone -- reopen its durable id.
-                leases.clear_binding(PROVIDER, &thread_id);
-                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
+            request = kill_rx => {
+                // Capture the ownership-tagged tree while the direct child and
+                // transport are still intact. The caller waits for this ack
+                // before closing the app-server client, preventing a YAMA
+                // reparent window.
+                let mut barrier = freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+                    child.id().unwrap_or(0),
+                    CODEX_SIDECAR_OWNERSHIP_ENV,
+                    &ownership_id,
+                );
+                if let Ok(request) = request {
+                    let _ = request.captured.send(());
+                }
+                let tree_dead = barrier.terminate_and_confirm().await;
+                let child_reaped = matches!(
+                    tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+                    Ok(Ok(_))
+                );
+                if tree_dead && child_reaped {
+                    // Task 12: the bound session is gone -- reopen its durable id
+                    // (`handle_kill` also clears on quiescence; idempotent).
+                    leases.clear_binding(PROVIDER, &thread_id);
+                    tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
+                    true
+                } else {
+                    tracing::error!(
+                        provider = PROVIDER,
+                        session_id = %thread_id,
+                        ownership_id,
+                        tree_dead,
+                        child_reaped,
+                        "freshagent.codex.restart_shutdown_not_quiescent"
+                    );
+                    false
+                }
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
@@ -3902,9 +4415,12 @@ fn spawn_exit_watcher(
                     session_id: thread_id.clone(),
                     status: CodexStatus::Exited,
                 };
-                if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
+                if let Some(frame) =
+                    adapter_event_to_frame(&event, &thread_id, Some(&runtime))
+                {
                     let _ = broadcast_tx.send(frame);
                 }
+                true
             }
         }
     })
@@ -3982,7 +4498,11 @@ fn reduce_notification(
 
 /// Map an adapter event to a `freshAgent.event` wire frame (sdk-events.ts normalization:
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
-fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
+fn adapter_event_to_frame(
+    event: &CodexAdapterEvent,
+    thread_id: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> Option<String> {
     let inner = match event {
         CodexAdapterEvent::StatusSnapshot {
             session_id,
@@ -4016,6 +4536,7 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
         provider: PROVIDER.to_string(),
         session_id: thread_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: runtime.cloned(),
     });
     serde_json::to_string(&msg).ok()
 }
@@ -4034,6 +4555,7 @@ fn lost_session_frame(session_id: &str) -> ServerMessage {
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     })
 }
 
@@ -4061,6 +4583,7 @@ fn fork_error_frame_with_code(session_id: &str, code: &str, message: &str) -> Se
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     })
 }
 
@@ -4595,6 +5118,7 @@ pub(crate) mod tests {
                 at: 42,
             },
             "t-1",
+            None,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -4615,6 +5139,7 @@ pub(crate) mod tests {
                 revision: None,
             },
             "t-1",
+            None,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -4640,7 +5165,7 @@ pub(crate) mod tests {
         );
         let inner_types: Vec<String> = events
             .iter()
-            .filter_map(|e| adapter_event_to_frame(e, "t-1"))
+            .filter_map(|e| adapter_event_to_frame(e, "t-1", None))
             .map(|f| {
                 serde_json::from_str::<Value>(&f).unwrap()["event"]["type"]
                     .as_str()
@@ -4734,6 +5259,11 @@ pub(crate) mod tests {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
+        let root_pid = child.id().unwrap_or(0);
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4742,11 +5272,15 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            runtime.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
+                root_pid,
+                ownership_id: ownership_id.to_string(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -4786,9 +5320,19 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
-        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
+        let consumer = state.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            runtime.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        let root_pid = child.id().unwrap_or(0);
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4797,11 +5341,15 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            runtime.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
             CodexSession {
+                runtime,
                 client,
+                root_pid,
+                ownership_id: ownership_id.to_string(),
                 model: "gpt-5.3-codex-spark".to_string(),
                 effort: None,
                 cwd: None,
@@ -4924,6 +5472,8 @@ pub(crate) mod tests {
             let st = st.clone();
             tokio::spawn(async move {
                 st.handle_interrupt(FreshAgentInterrupt {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: "thread-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4973,8 +5523,9 @@ pub(crate) mod tests {
             "codex-sidecar-test-no-turn",
         )
         .await;
-
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -4998,6 +5549,8 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -5029,6 +5582,8 @@ pub(crate) mod tests {
         .await;
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "thread-1".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -5055,12 +5610,301 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn stale_codex_controls_cannot_mutate_or_stop_a_replacement_runtime() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (st, mut rx) = state_with_bus();
+        let child = spawn_sleeper();
+        let pid = child.id().expect("pid");
+        insert_fake_session(
+            &st,
+            "thread-replaced",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-stale-kill",
+        )
+        .await;
+        let replacement = {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut("thread-replaced").unwrap();
+            session.runtime.generation = 2;
+            session.runtime.clone()
+        };
+
+        st.handle_send(FreshAgentSend {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "stale turn".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("stale-codex-send".to_string()),
+            settings: None,
+        })
+        .await;
+        let send_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(send_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let interrupt_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(interrupt_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-replaced".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(st.sessions.lock().await.contains_key("thread-replaced"));
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["message"].as_str().unwrap().contains("STALE_RUNTIME"));
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_removes_only_the_exact_codex_runtime() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        insert_fake_session(
+            &st,
+            "thread-restart",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-restart",
+        )
+        .await;
+        drop(peer);
+
+        assert!(
+            !st.shutdown_for_restart("thread-restart", "fresh-runtime-stale")
+                .await
+        );
+        assert!(st.has_live_session("thread-restart").await);
+        assert!(
+            st.shutdown_for_restart("thread-restart", "fresh-runtime-test-thread-restart")
+                .await
+        );
+        assert!(!st.has_live_session("thread-restart").await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_shutdown_captures_and_kills_reparent_prone_codex_descendants_before_releasing_the_lease(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        let temp = tempfile::tempdir().unwrap();
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let ownership_id = format!("codex-restart-tree-{}", uuid::Uuid::new_v4());
+        // The direct child exits as soon as it is killed. Its descendant ignores
+        // SIGTERM and inherits the ownership tag. Once reparented, Linux/YAMA may
+        // deny a fresh /proc/<pid>/environ scan, so restart must capture the
+        // pid/start-time pair before touching the direct child and retain it until
+        // confirmed dead.
+        let script = r#"
+(
+  trap '' TERM
+  echo "$BASHPID" > "$FRESHELL_TEST_DESCENDANT_PID"
+  while true; do read -r -t 1 _ || true; done
+) &
+while true; do read -r -t 1 _ || true; done
+"#;
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .env(CODEX_SIDECAR_OWNERSHIP_ENV, &ownership_id)
+            .env("FRESHELL_TEST_DESCENDANT_PID", &descendant_pid_file)
+            .kill_on_drop(true);
+        let child = command.spawn().expect("spawn reparent-prone codex fixture");
+        insert_fake_session(
+            &st,
+            "thread-tree-restart",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            &ownership_id,
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-tree-restart", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-tree-restart",
+            "original",
+            "thread-tree-restart"
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !descendant_pid_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "codex descendant fixture did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let descendant_pid: i32 = std::fs::read_to_string(&descendant_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let stopped = st
+            .shutdown_for_restart(
+                "thread-tree-restart",
+                "fresh-runtime-test-thread-tree-restart",
+            )
+            .await;
+        let descendant_alive = unsafe { libc::kill(descendant_pid, 0) == 0 };
+        if descendant_alive {
+            // Keep the red regression run from leaking its intentionally stubborn
+            // fixture when exercising the old best-effort teardown.
+            unsafe {
+                libc::kill(descendant_pid, libc::SIGKILL);
+            }
+        }
+
+        assert!(
+            stopped,
+            "restart must not report success before the captured tree is dead"
+        );
+        assert!(
+            !descendant_alive,
+            "restart success left a reparented SIGTERM-ignoring codex descendant alive"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-tree-restart", "replacement", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease may reopen only after descendant death is confirmed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incomplete_codex_restart_retirement_is_quarantined_for_same_runtime_retry() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        insert_fake_session(
+            &st,
+            "thread-retirement-incomplete",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-retirement-incomplete",
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-retirement-incomplete", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-retirement-incomplete",
+            "original",
+            "thread-retirement-incomplete"
+        ));
+
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut("thread-retirement-incomplete")
+                .expect("inserted session");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(
+                "thread-retirement-incomplete",
+                "fresh-runtime-test-thread-retirement-incomplete",
+            )
+            .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert!(!st.has_live_session("thread-retirement-incomplete").await);
+        assert!(matches!(
+            st.leases.claim(
+                PROVIDER,
+                "thread-retirement-incomplete",
+                "replacement-too-early",
+                2
+            ),
+            crate::session_lease::FreshSessionClaim::BoundLive { .. }
+        ));
+
+        {
+            let (released, wake) = &*blocker_release;
+            *released.lock().unwrap() = true;
+            wake.notify_one();
+        }
+        assert_eq!(
+            st.shutdown_for_restart_detailed(
+                "thread-retirement-incomplete",
+                "fresh-runtime-test-thread-retirement-incomplete",
+            )
+            .await,
+            crate::RestartShutdownOutcome::Stopped,
+            "same-runtime retry must finish the quarantined retirement"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-retirement-incomplete", "replacement", 3),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+    }
+
+    #[tokio::test]
     async fn handle_kill_of_unknown_session_still_broadcasts_success() {
         // adapter.kill() is unconditional (adapter.ts:1211-1215) -- idempotent kill of a
         // session that doesn't exist still yields `success:true`.
         let (st, mut rx) = state_with_bus();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: "does-not-exist".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -6972,6 +7816,8 @@ pub(crate) mod tests {
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: killed_session_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -7055,6 +7901,8 @@ pub(crate) mod tests {
 
             if let Some(session_id) = session_id {
                 st.handle_kill(FreshAgentKill {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id,
                     session_type: freshell_protocol::SessionType::Freshcodex,
@@ -8048,15 +8896,15 @@ pub(crate) mod tests {
                 request_id: "req-ledger-fail".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: None,
+                cwd: Some("/tmp".to_string()),
                 legacy_restore_context: None,
                 resume_session_id: None,
                 session_ref: None,
                 model: Some("gpt-5.3-codex-spark".to_string()),
                 model_selection: None,
-                permission_mode: None,
-                sandbox: None,
-                effort: None,
+                permission_mode: Some("on-request".to_string()),
+                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                effort: Some("high".to_string()),
                 plugins: None,
             })
             .await;
@@ -8097,10 +8945,50 @@ pub(crate) mod tests {
         // The create still succeeded: the session exists under the created id.
         let created = created_frame.expect("the create still succeeded");
         let thread_id = created["sessionId"].as_str().unwrap().to_string();
-        let guard = state.sessions.lock().await;
         assert!(
-            guard.contains_key(&thread_id),
+            state.sessions.lock().await.contains_key(&thread_id),
             "a write failure never blocks the identity event"
+        );
+        assert!(
+            !fake
+                .settings
+                .lock()
+                .unwrap()
+                .contains_key(&("codex".to_string(), thread_id.clone())),
+            "the fixture must reproduce the missing-ledger-row condition"
+        );
+        let runtime_id = state
+            .sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .expect("live session")
+            .runtime
+            .runtime_id
+            .clone();
+        let plan = state
+            .capture_restart_resume_plan(&thread_id, &runtime_id)
+            .await
+            .expect("the live runtime remains authoritative after the ledger failure");
+        assert_eq!(
+            plan,
+            crate::FreshAgentRestartResumePlan {
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                settings: crate::FreshAgentSettings {
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    sandbox: Some("workspace-write".to_string()),
+                    permission_mode: Some("on-request".to_string()),
+                    effort: Some("high".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                },
+            }
+        );
+        assert!(
+            state
+                .capture_restart_resume_plan(&thread_id, "stale-runtime")
+                .await
+                .is_none(),
+            "restart preflight must stay fenced to the selected runtime"
         );
     }
 
@@ -8133,6 +9021,8 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -8204,6 +9094,8 @@ pub(crate) mod tests {
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -8286,6 +9178,8 @@ pub(crate) mod tests {
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -8356,6 +9250,8 @@ pub(crate) mod tests {
         );
 
         st.handle_send(FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             request_id: Some("req-2".to_string()),
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
@@ -8462,6 +9358,8 @@ pub(crate) mod tests {
         let send_task = tokio::spawn(async move {
             st_send
                 .handle_send(FreshAgentSend {
+                    expected_runtime_id: None,
+                    expected_generation: None,
                     request_id: Some("req-race-send".to_string()),
                     provider: freshell_protocol::AgentProvider::Codex,
                     session_id: send_thread_id,

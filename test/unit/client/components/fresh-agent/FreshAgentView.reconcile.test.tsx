@@ -3,6 +3,7 @@ import { act, cleanup, render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, {
+  applyAgentRestartReplaced,
   applyFreshAgentReconcileAttach,
   initLayout,
   resetFreshAgentPaneForReconcileCreate,
@@ -308,6 +309,81 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     // sessionRef only — the legacy duplicate is no longer sent.
     expect(attach.resumeSessionId).toBeUndefined()
     expect(attach.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+  })
+
+  it('a runtime replacement attaches the durable provider session and does not create', async () => {
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'running',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+      runtimeId: 'runtime-old',
+      runtimeGeneration: 7,
+    })
+    await flush()
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(applyAgentRestartReplaced({
+        type: 'agent.restart.replaced',
+        requestId: 'restart-1',
+        provider: 'claude',
+        sessionId: DURABLE,
+        kind: 'fresh-agent',
+        oldRuntimeId: 'runtime-old',
+        oldGeneration: 7,
+        runtimeId: 'runtime-new',
+        generation: 8,
+      }))
+    })
+    await flush()
+
+    expect(leafContent(store.getState())).toMatchObject({
+      sessionId: DURABLE,
+      runtimeId: 'runtime-new',
+      runtimeGeneration: 8,
+    })
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+    expect(sentOfType('freshAgent.attach')).toEqual([expect.objectContaining({
+      sessionId: DURABLE,
+      resumeSessionId: DURABLE,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    })])
+  })
+
+  it('ignores a replacement for a legacy pane without a runtime fence', async () => {
+    renderFreshAgentPane({
+      sessionId: DURABLE,
+      status: 'running',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+    })
+    await flush()
+    wsMock.send.mockClear()
+
+    act(() => {
+      store.dispatch(applyAgentRestartReplaced({
+        type: 'agent.restart.replaced',
+        requestId: 'restart-legacy',
+        provider: 'claude',
+        sessionId: DURABLE,
+        kind: 'fresh-agent',
+        // sessionId must not substitute for an opaque old runtime id.
+        oldRuntimeId: DURABLE,
+        oldGeneration: 7,
+        runtimeId: 'runtime-new',
+        generation: 8,
+      }))
+    })
+    await flush()
+
+    expect(leafContent(store.getState())).toMatchObject({
+      sessionId: DURABLE,
+      runtimeId: undefined,
+      runtimeGeneration: undefined,
+    })
+    expect(sentOfType('freshAgent.create')).toHaveLength(0)
+    expect(sentOfType('freshAgent.attach')).toHaveLength(0)
   })
 
   it('the mount create defers while reconcile-pending and falls back after the bound', async () => {

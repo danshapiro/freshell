@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
-    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
+    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator, Shell,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
     TerminalRunStatus,
 };
@@ -265,6 +265,10 @@ struct TerminalShared {
     /// handshake design §5.1). `None` for creates that carried no key (e.g.
     /// REST ingress, which mints none — design §5.5 precondition 2).
     create_request_id: Option<String>,
+    /// Exact launch inputs needed to recreate this terminal after a
+    /// restart-specific teardown. Captured from the values that built the
+    /// running PTY rather than re-reading mutable server defaults later.
+    restart_launch: Option<TerminalRestartLaunch>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
     /// Whether the client EXPLICITLY released its last reference to this
@@ -313,6 +317,7 @@ impl TerminalShared {
             description: self.description.clone(),
             runtime_status: None,
             session_ref: None,
+            runtime: None,
         }
     }
 }
@@ -336,6 +341,19 @@ pub struct IdentityProbeRow {
     /// The terminal's working directory — carried so the §5.4 adopt branch can
     /// echo the EXISTING terminal's cwd on its `terminal.created` frame.
     pub cwd: Option<String>,
+    pub restart_launch: Option<TerminalRestartLaunch>,
+}
+
+/// Runtime-authoritative terminal launch values retained for exact restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRestartLaunch {
+    pub shell: Shell,
+    pub permission_mode: Option<String>,
+    pub model: Option<String>,
+    pub sandbox: Option<String>,
+    /// `None` for non-Codex/legacy records, `Some(false)` for plain Codex,
+    /// and `Some(true)` when settings were routed through the app-server plan.
+    pub codex_managed: Option<bool>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -621,6 +639,13 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// Boot-scoped tombstones for terminals whose PTY exit is owned by an
+    /// explicit `agent.restart` transaction. These intentionally outlive the
+    /// registry row: a natural-exit CrashEvent may already be queued when the
+    /// restart begins and wake after `kill()` removes the predecessor. Terminal
+    /// ids are never reused within a boot, so retaining the id is the only
+    /// fail-closed answer; the set resets with the process.
+    restart_retiring_terminals: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -761,6 +786,7 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            restart_retiring_terminals: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1078,6 +1104,7 @@ impl TerminalRegistry {
             mode: mode.to_string(),
             resume_session_id: resume_session_id.map(str::to_string),
             create_request_id: create_request_id.map(str::to_string),
+            restart_launch: None,
             subscribers: HashMap::new(),
             released_by_client: true,
         }));
@@ -1278,6 +1305,7 @@ impl TerminalRegistry {
             replay_reset_reason: None,
             requested_since_seq: Some(since_seq),
             session_ref,
+            runtime: None,
         });
         sink(ready);
 
@@ -1343,6 +1371,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: s.exit_code.unwrap_or(0),
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             sink(exit);
             s.subscribers.remove(&conn_id);
@@ -1619,6 +1648,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: 0,
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             for sub in s.subscribers.values() {
                 (sub.sink)(exit.clone());
@@ -1693,6 +1723,38 @@ impl TerminalRegistry {
             .contains_key(terminal_id)
     }
 
+    /// Classify this terminal's next PTY exit as restart-owned before any
+    /// action (such as closing a managed Codex proxy) can make the PTY exit.
+    ///
+    /// Returns `false` only for an unknown terminal. The row may already have
+    /// reached `Exited` in a natural-exit race; it is still fenced because its
+    /// CrashEvent may be waiting in the auto-resume queue.
+    pub fn mark_restart_retiring(&self, terminal_id: &str) -> bool {
+        let exists = self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id);
+        if !exists {
+            return false;
+        }
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .insert(terminal_id.to_string());
+        true
+    }
+
+    /// Whether auto-resume and the PTY exit hook must treat `terminal_id` as
+    /// owned by an explicit restart transaction rather than a natural crash.
+    pub fn is_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .contains(terminal_id)
+    }
+
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
     /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
     /// removes the record first so this lookup misses, mirroring the original's
@@ -1745,6 +1807,7 @@ impl TerminalRegistry {
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
+            runtime: None,
         });
         for sub in s.subscribers.values() {
             (sub.sink)(exit.clone());
@@ -1823,6 +1886,7 @@ impl TerminalRegistry {
                     created_at: s.created_at,
                     resume_session_id: s.resume_session_id.clone(),
                     cwd: s.cwd.clone(),
+                    restart_launch: s.restart_launch.clone(),
                 }
             })
             .collect()
@@ -1988,6 +2052,7 @@ impl TerminalRegistry {
             mode,
             resume_session_id: opts.resume_session_id,
             create_request_id,
+            restart_launch: None,
             subscribers: HashMap::new(),
             released_by_client: true,
         }));
@@ -2096,8 +2161,26 @@ impl TerminalRegistry {
                 created_at: s.created_at,
                 resume_session_id: s.resume_session_id.clone(),
                 cwd: s.cwd.clone(),
+                restart_launch: s.restart_launch.clone(),
             }
         })
+    }
+
+    /// Stamp the exact provider/shell inputs used for a newly-created PTY.
+    /// Called before the corresponding `terminal.created` frame is exposed.
+    pub fn set_restart_launch(&self, terminal_id: &str, launch: TerminalRestartLaunch) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|handle| Arc::clone(&handle.shared))
+        };
+        let Some(shared) = shared else {
+            return false;
+        };
+        shared.lock().expect("terminal lock").restart_launch = Some(launch);
+        true
     }
 
     /// A terminal's stamped `createRequestId`, if any.
@@ -3085,6 +3168,7 @@ mod tests {
             terminal_id: "T".to_string(),
             attach_request_id: None,
             source: Some(OutputSource::Live),
+            runtime: None,
         }
     }
 
@@ -3470,6 +3554,31 @@ mod tests {
         assert!(got_exit);
         // Killing an unknown terminal is a no-op false.
         assert!(!reg.kill("T"));
+    }
+
+    #[test]
+    fn restart_retirement_fence_survives_terminal_removal_without_affecting_siblings() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-restarting", "S-restarting");
+        reg.insert_headless("T-unrelated", "S-unrelated");
+
+        assert!(
+            reg.mark_restart_retiring("T-restarting"),
+            "a live terminal must accept the restart-retiring fence"
+        );
+        assert!(reg.is_restart_retiring("T-restarting"));
+        assert!(
+            !reg.is_restart_retiring("T-unrelated"),
+            "the fence must be terminal-scoped"
+        );
+
+        assert!(reg.kill("T-restarting"));
+        assert!(
+            reg.is_restart_retiring("T-restarting"),
+            "the tombstone must outlive row removal so a crash event already queued \
+             before restart cannot auto-resume after the backoff"
+        );
+        assert!(!reg.mark_restart_retiring("T-missing"));
     }
 
     #[test]
@@ -5617,6 +5726,7 @@ mod tests {
             created_at: 0,
             resume_session_id: resume_session_id.map(str::to_string),
             cwd: None,
+            restart_launch: None,
         }
     }
 

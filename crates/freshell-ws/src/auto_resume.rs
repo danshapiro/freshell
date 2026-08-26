@@ -414,6 +414,18 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         let _ = driver.take_cancel(&ev.terminal_id);
                         continue;
                     }
+                    // Serialize the complete claim→spawn→bind pipeline with
+                    // explicit restart and every other durable-session
+                    // admission path. A restart can begin during the
+                    // backoff, after the cheap guard above; only this shared
+                    // coordinator permit closes that race atomically.
+                    let Some(_restart_admission) = driver
+                        .acquire_restart_admission(&provider, &session_id)
+                        .await
+                    else {
+                        driver.log_settled(&ev.terminal_id, "restart_recovery_pending");
+                        continue;
+                    };
                     if !driver.claim_session(&provider, &session_id, &key).await {
                         driver.emit_settled(&ev.terminal_id, "session_lease_held", None);
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
@@ -435,6 +447,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                 .await
                             {
                                 driver.emit_replaced(
+                                    &provider,
+                                    &session_id,
                                     &ev.terminal_id,
                                     &new_tid,
                                     ev.exit_code,
@@ -495,6 +509,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
 /// like the create ingress does (`terminal.rs` claim rounds / complete==false
 /// path). A sync signature would force blocking a runtime worker.
 pub(crate) trait AutoResumeDriver: Send + 'static {
+    type RestartAdmission: Send;
+
     fn cap_exhausted(&self, create_request_id: &str) -> bool;
     /// (provider, session_id, cwd)
     fn resumable_session_ref(&self, terminal_id: &str) -> Option<(String, String, Option<String>)>;
@@ -508,6 +524,14 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         session_id: &str,
         old_terminal_id: &str,
     ) -> Option<&'static str>;
+    /// Acquire the restart coordinator's cross-kind durable-session permit.
+    /// The hub retains it through final lease completion and replacement
+    /// registration.
+    fn acquire_restart_admission(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> impl std::future::Future<Output = Option<Self::RestartAdmission>> + Send;
     /// Acquire the session-ref lease for this holder; false = not acquirable → abort.
     /// The PRODUCTION impl runs the create ingress's full bounded claim
     /// discipline internally — the hub only sees the outcome.
@@ -542,7 +566,17 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         attempt: u32,
         max_attempts: u32,
     );
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32);
+    #[allow(clippy::too_many_arguments)]
+    fn emit_replaced(
+        &self,
+        provider: &str,
+        session_id: &str,
+        old: &str,
+        new: &str,
+        exit_code: i64,
+        attempt: u32,
+        max_attempts: u32,
+    );
     /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
     /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
     /// it: the client clears the recovering notice on a FRAME, never on a
@@ -577,6 +611,8 @@ fn session_locator(provider: &str, session_id: &str) -> freshell_protocol::Sessi
 }
 
 impl AutoResumeDriver for WsAutoResumeDriver {
+    type RestartAdmission = crate::restart::RestartSessionAdmission;
+
     fn cap_exhausted(&self, create_request_id: &str) -> bool {
         self.state.registry.respawn_exhausted(create_request_id)
     }
@@ -585,6 +621,9 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     /// the entry before the CrashEvent is handled), pane-ledger binding as
     /// the fallback home.
     fn resumable_session_ref(&self, terminal_id: &str) -> Option<(String, String, Option<String>)> {
+        if self.state.registry.is_restart_retiring(terminal_id) {
+            return None;
+        }
         if let Some(entry) = self.state.identity.get(terminal_id) {
             if let (Some(provider), Some(session_id)) = (entry.provider, entry.session_id) {
                 return Some((provider, session_id, entry.cwd));
@@ -610,6 +649,12 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         session_id: &str,
         old_terminal_id: &str,
     ) -> Option<&'static str> {
+        // A restart may begin after the CrashEvent was dequeued but before
+        // this post-backoff check. Its boot-scoped tombstone survives removal
+        // of the predecessor registry row.
+        if self.state.registry.is_restart_retiring(old_terminal_id) {
+            return Some("restart_retiring");
+        }
         // The user already relaunched this session during the backoff.
         if self
             .state
@@ -636,6 +681,22 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             return Some("pane_closed");
         }
         None
+    }
+
+    fn acquire_restart_admission(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> impl std::future::Future<Output = Option<Self::RestartAdmission>> + Send {
+        let restart = self.state.restart.clone();
+        let provider = provider.to_string();
+        let session_id = session_id.to_string();
+        async move {
+            restart
+                .acquire_session_admission(provider, session_id)
+                .await
+                .ok()
+        }
     }
 
     /// The create ingress's FULL bounded claim discipline, headless
@@ -799,7 +860,24 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         broadcast_frame(&self.state, terminal_id, "recovering", &msg);
     }
 
-    fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32) {
+    fn emit_replaced(
+        &self,
+        provider: &str,
+        session_id: &str,
+        old: &str,
+        new: &str,
+        exit_code: i64,
+        attempt: u32,
+        max_attempts: u32,
+    ) {
+        let runtime = self.state.restart.register_initial(
+            crate::restart::RuntimeLocator::new(
+                freshell_protocol::AgentRuntimeKind::Terminal,
+                provider,
+                session_id,
+            ),
+            new,
+        );
         let msg = freshell_protocol::ServerMessage::TerminalReplaced(
             freshell_protocol::TerminalReplaced {
                 old_terminal_id: old.to_string(),
@@ -807,6 +885,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 exit_code,
                 attempt,
                 max_attempts,
+                runtime: Some(runtime),
             },
         );
         broadcast_frame(&self.state, old, "replaced", &msg);
@@ -1149,6 +1228,7 @@ mod tests {
         /// respawn await, i.e. after the hub's post-sleep take_cancel check
         /// (the leak window the fresh-eyes review flagged).
         insert_cancel_on_respawn: bool,
+        restart_admission_ok: bool,
         claim_ok: bool,
         complete_ok: bool,
         panic_next_recovering: bool,
@@ -1182,6 +1262,7 @@ mod tests {
                     guard: None,
                     cancels: std::collections::HashSet::new(),
                     insert_cancel_on_respawn: false,
+                    restart_admission_ok: true,
                     claim_ok: true,
                     complete_ok: true,
                     panic_next_recovering: false,
@@ -1210,6 +1291,9 @@ mod tests {
         }
         fn set_guard(&self, v: Option<&'static str>) {
             self.lock().guard = v;
+        }
+        fn set_restart_admission_ok(&self, v: bool) {
+            self.lock().restart_admission_ok = v;
         }
         fn set_claim_ok(&self, v: bool) {
             self.lock().claim_ok = v;
@@ -1265,6 +1349,8 @@ mod tests {
     }
 
     impl AutoResumeDriver for FakeDriver {
+        type RestartAdmission = ();
+
         fn cap_exhausted(&self, _create_request_id: &str) -> bool {
             self.lock().cap_exhausted
         }
@@ -1281,6 +1367,13 @@ mod tests {
             _old_terminal_id: &str,
         ) -> Option<&'static str> {
             self.lock().guard
+        }
+        fn acquire_restart_admission(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+        ) -> impl std::future::Future<Output = Option<Self::RestartAdmission>> + Send {
+            std::future::ready(self.lock().restart_admission_ok.then_some(()))
         }
         fn claim_session(
             &self,
@@ -1362,6 +1455,8 @@ mod tests {
         }
         fn emit_replaced(
             &self,
+            _provider: &str,
+            _session_id: &str,
             old: &str,
             new: &str,
             _exit_code: i64,
@@ -1529,6 +1624,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn restart_admission_denial_aborts_before_claim_or_respawn() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_restart_admission_ok(false);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+
+        assert!(fake.claim_calls().is_empty());
+        assert!(fake.respawn_calls().is_empty());
+        assert_eq!(
+            fake.settled_reasons(),
+            vec!["restart_recovery_pending".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pane_closed_during_backoff_settles_pane_closed() {
         // pre_respawn_guard -> Some("pane_closed") (ledger binding retired during
         // the backoff): no respawn, no claim, settled("pane_closed").
@@ -1550,6 +1666,51 @@ mod tests {
             fake.settled_frames(),
             vec![("t1".to_string(), "pane_closed".to_string(), None)]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_retiring_terminal_is_rejected_after_backoff_without_affecting_unrelated_crash()
+    {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash(
+            "t-restart-retiring",
+            137,
+            "codex",
+            Some("cr-restart"),
+            1_000,
+        ))
+        .unwrap();
+        drain().await;
+        // The proxy-triggered non-zero exit entered the queue before the
+        // restart transaction marked its predecessor. Teardown remains slow
+        // beyond the auto-resume delay, so the post-backoff guard is the
+        // load-bearing fence.
+        fake.set_guard(Some("restart_retiring"));
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert!(fake.respawn_calls().is_empty());
+        assert!(fake.claim_calls().is_empty());
+        assert_eq!(fake.settled_reasons(), vec!["restart_retiring".to_string()]);
+
+        // The fence is locator/terminal scoped: an unrelated crash still
+        // follows the ordinary auto-resume path.
+        fake.set_guard(None);
+        tx.send(crash(
+            "t-unrelated",
+            1,
+            "claude",
+            Some("cr-unrelated"),
+            1_000,
+        ))
+        .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert_eq!(fake.respawn_calls()[0].create_request_id, "cr-unrelated");
     }
 
     #[tokio::test(start_paused = true)]

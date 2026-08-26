@@ -1,8 +1,107 @@
-import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
+import type {
+  FreshAgentPaneContent,
+  PaneContent,
+  PaneNode,
+  PaneRefreshTarget,
+  TerminalPaneContent,
+} from '@/store/paneTypes'
+import type { AgentRestartReplacedMessage, AgentRuntimeKind } from '@shared/ws-protocol'
 
 export interface PaneEntry {
   paneId: string
   content: PaneContent
+}
+
+type RestartablePaneContent = TerminalPaneContent | FreshAgentPaneContent
+
+export type AgentRestartTarget = {
+  provider: string
+  sessionId: string
+  kind: AgentRuntimeKind
+  liveId: string
+  expectedGeneration: number
+}
+
+const RESTARTABLE_TERMINAL_PROVIDERS = new Set([
+  'claude',
+  'codex',
+  'opencode',
+  'amplifier',
+])
+const RESTARTABLE_FRESH_AGENT_PROVIDERS = new Set([
+  'claude',
+  'codex',
+  'opencode',
+])
+
+function paneRuntimeKind(content: RestartablePaneContent): AgentRuntimeKind {
+  return content.kind === 'terminal' ? 'terminal' : 'fresh-agent'
+}
+
+function paneRuntimeProvider(content: RestartablePaneContent): string {
+  return content.kind === 'terminal' ? content.mode : content.provider
+}
+
+/**
+ * Resolve the immutable server target for a user-requested pane restart.
+ * Restart intentionally fails closed: only built-in Rust adapters with a
+ * canonical provider-matching session reference and a live generation fence
+ * are eligible. Extension resume templates are command helpers, not proof
+ * that the server can safely replace the extension runtime.
+ */
+export function resolveAgentRestartTarget(content: PaneContent): AgentRestartTarget | null {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return null
+
+  const provider = paneRuntimeProvider(content)
+  const supported = content.kind === 'terminal'
+    ? RESTARTABLE_TERMINAL_PROVIDERS.has(provider)
+    : RESTARTABLE_FRESH_AGENT_PROVIDERS.has(provider)
+  if (!supported) return null
+
+  const sessionRef = content.sessionRef
+  if (
+    !sessionRef
+    || sessionRef.provider !== provider
+    || sessionRef.sessionId.length === 0
+    || !content.runtimeId
+    || !Number.isInteger(content.runtimeGeneration)
+    || (content.runtimeGeneration ?? -1) < 0
+  ) {
+    return null
+  }
+
+  return {
+    provider,
+    sessionId: sessionRef.sessionId,
+    kind: paneRuntimeKind(content),
+    liveId: content.runtimeId,
+    expectedGeneration: content.runtimeGeneration!,
+  }
+}
+
+/**
+ * A restart broadcast names durable identity plus the exact old runtime
+ * identity and generation. Only panes viewing that same fully-fenced runtime
+ * may follow the replacement. Legacy persisted panes lacking either fence
+ * fail closed: durable/session-facing IDs are never runtime identities.
+ */
+export function paneMatchesAgentRuntimeReplacement(
+  content: PaneContent,
+  replacement: AgentRestartReplacedMessage,
+): content is RestartablePaneContent {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return false
+  if (paneRuntimeKind(content) !== replacement.kind) return false
+  if (paneRuntimeProvider(content) !== replacement.provider) return false
+  if (
+    content.sessionRef?.provider !== replacement.provider
+    || content.sessionRef.sessionId !== replacement.sessionId
+  ) {
+    return false
+  }
+  if (replacement.generation <= replacement.oldGeneration) return false
+  if (content.runtimeId !== replacement.oldRuntimeId) return false
+  if (content.runtimeGeneration !== replacement.oldGeneration) return false
+  return true
 }
 
 /**

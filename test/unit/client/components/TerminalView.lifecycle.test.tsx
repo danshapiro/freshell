@@ -2147,6 +2147,8 @@ describe('TerminalView lifecycle updates', () => {
       mode: 'claude',
       shell: 'system',
       terminalId: 'term-3',
+      runtimeId: 'runtime-invalid-old',
+      runtimeGeneration: 3,
       sessionRef: {
         provider: 'claude',
         sessionId: '550e8400-e29b-41d4-a716-446655440000',
@@ -2210,6 +2212,8 @@ describe('TerminalView lifecycle updates', () => {
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
       expect(layout.content.terminalId).toBeUndefined()
       expect(layout.content.createRequestId).not.toBe('req-3')
+      expect(layout.content.runtimeId).toBeUndefined()
+      expect(layout.content.runtimeGeneration).toBeUndefined()
     })
 
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
@@ -2235,6 +2239,23 @@ describe('TerminalView lifecycle updates', () => {
       msg?.type === 'terminal.create' && msg.requestId === newRequestId
     )
     expect(createCalls).toHaveLength(1)
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: newRequestId,
+        terminalId: 'term-3-recreated',
+        createdAt: Date.now(),
+        runtime: { runtimeId: 'runtime-invalid-new', generation: 4 },
+      })
+    })
+
+    await waitFor(() => {
+      const recreated = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(recreated.content.terminalId).toBe('term-3-recreated')
+      expect(recreated.content.runtimeId).toBe('runtime-invalid-new')
+      expect(recreated.content.runtimeGeneration).toBe(4)
+    })
   })
 
   // Branch-5 / reconcile-verdict interaction (design invariant 7): once the
@@ -4200,6 +4221,8 @@ describe('TerminalView lifecycle updates', () => {
       mode: 'claude',
       shell: 'system',
       terminalId: 'term-clear',
+      runtimeId: 'runtime-fresh-old',
+      runtimeGeneration: 7,
       initialCwd: '/tmp',
     }
 
@@ -4236,7 +4259,7 @@ describe('TerminalView lifecycle updates', () => {
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     try {
-      render(
+      const { rerender } = render(
         <Provider store={store}>
           <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
         </Provider>
@@ -4270,6 +4293,8 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.content.serverInstanceId).toBeUndefined()
       expect(layout.content.status).toBe('creating')
       expect(layout.content.restoreError).toBeUndefined()
+      expect(layout.content.runtimeId).toBeUndefined()
+      expect(layout.content.runtimeGeneration).toBeUndefined()
       expect(layout.content.createRequestId).not.toBe('req-clear')
       expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
         layout.content.createRequestId,
@@ -4297,6 +4322,36 @@ describe('TerminalView lifecycle updates', () => {
         paneId,
         mode: 'claude',
         hasSessionRef: false,
+      })
+
+      const replacementRequestId = layout.content.createRequestId
+      rerender(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>,
+      )
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.create',
+          requestId: replacementRequestId,
+        }))
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: replacementRequestId,
+          terminalId: 'term-clear-recreated',
+          createdAt: Date.now(),
+          runtime: { runtimeId: 'runtime-fresh-new', generation: 8 },
+        })
+      })
+
+      await waitFor(() => {
+        const recreated = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+        expect(recreated.content.terminalId).toBe('term-clear-recreated')
+        expect(recreated.content.runtimeId).toBe('runtime-fresh-new')
+        expect(recreated.content.runtimeGeneration).toBe(8)
       })
     } finally {
       warnSpy.mockRestore()
@@ -4560,6 +4615,7 @@ describe('TerminalView lifecycle updates', () => {
       sessionRef?: TerminalPaneContent['sessionRef']
       serverInstanceId?: string
       streamId?: string
+      runtime?: { runtimeId: string; generation: number }
       waitForMessageHandler?: boolean
       waitForTerminalInstance?: boolean
     }) {
@@ -4582,6 +4638,10 @@ describe('TerminalView lifecycle updates', () => {
         ...(terminalId ? { terminalId } : {}),
         ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
         ...(opts?.streamId ? { streamId: opts.streamId } : {}),
+        ...(opts?.runtime ? {
+          runtimeId: opts.runtime.runtimeId,
+          runtimeGeneration: opts.runtime.generation,
+        } : {}),
       }
 
       const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -8836,6 +8896,7 @@ describe('TerminalView lifecycle updates', () => {
         clearSends: false,
         requestId: 'req-opencode-focus-gap',
         sessionRef,
+        runtime: { runtimeId: 'runtime-opencode-old', generation: 11 },
       })
 
       wsMocks.send.mockClear()
@@ -8862,6 +8923,7 @@ describe('TerminalView lifecycle updates', () => {
           replayFromSeq: 42,
           replayToSeq: 120,
           attachRequestId: attach.attachRequestId,
+          runtime: { runtimeId: 'runtime-opencode-old', generation: 11 },
         })
       })
       act(() => {
@@ -8872,6 +8934,7 @@ describe('TerminalView lifecycle updates', () => {
           toSeq: 41,
           reason: 'replay_window_exceeded',
           attachRequestId: attach.attachRequestId,
+          runtime: { runtimeId: 'runtime-opencode-old', generation: 11 },
         } as any)
       })
 
@@ -8887,6 +8950,7 @@ describe('TerminalView lifecycle updates', () => {
           type: 'terminal.exit',
           terminalId,
           exitCode: 0,
+          runtime: { runtimeId: 'runtime-opencode-old', generation: 11 },
         })
       })
 
@@ -8900,6 +8964,8 @@ describe('TerminalView lifecycle updates', () => {
         expect(layout.content.terminalId).toBeUndefined()
         expect(layout.content.status).toBe('creating')
         expect(layout.content.sessionRef).toEqual(sessionRef)
+        expect(layout.content.runtimeId).toBeUndefined()
+        expect(layout.content.runtimeGeneration).toBeUndefined()
         replacementRequestId = layout.content.createRequestId
         expect(replacementRequestId).not.toBe('req-opencode-focus-gap')
       })
@@ -8912,6 +8978,27 @@ describe('TerminalView lifecycle updates', () => {
           sessionRef,
           restore: true,
         }))
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: replacementRequestId!,
+          terminalId: 'term-opencode-focus-gap-recreated',
+          createdAt: Date.now(),
+          runtime: { runtimeId: 'runtime-opencode-new', generation: 12 },
+        })
+      })
+
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId]
+        expect(layout?.type).toBe('leaf')
+        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
+          throw new Error('expected terminal pane')
+        }
+        expect(layout.content.terminalId).toBe('term-opencode-focus-gap-recreated')
+        expect(layout.content.runtimeId).toBe('runtime-opencode-new')
+        expect(layout.content.runtimeGeneration).toBe(12)
       })
     })
 

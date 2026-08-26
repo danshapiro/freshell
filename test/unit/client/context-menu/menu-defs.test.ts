@@ -20,6 +20,7 @@ function createActions(): MenuActions {
     moveTab: vi.fn(),
     renamePane: vi.fn(),
     refreshPane: vi.fn(),
+    restartPane: vi.fn(),
     replacePane: vi.fn(),
     splitPane: vi.fn(),
     resetSplit: vi.fn(),
