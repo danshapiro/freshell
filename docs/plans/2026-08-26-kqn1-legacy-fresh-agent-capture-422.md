@@ -78,7 +78,7 @@ for Rust; Playwright for the kata's e2e oracle.
   (`test/server/**` belongs to the server config). Raw `npx vitest` is not a
   coordinated workflow.
 - Rust changes must pass `cargo fmt --all --check` and
-  `cargo clippy -workspace --exclude freshell-tauri --all-targets -- -D warnings`
+  `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`
   (both are part of the full QA gate).
 - The full QA gate is `darkforge qa --repo '/home/dan/code/freshell' --id
   'kqn1'` and runs `npm run check` (typecheck + coordinated full vitest suite)
@@ -259,16 +259,14 @@ no shared code worth extracting.
 - [ ] **Step 6: Run impacted-test verification**
 
 Impacted set: every suite that exercises the agent-API router's
-capture/fresh-agent behavior and error mapping — the fresh-agent REST
-specs, the wait-for/send-keys specs sharing `agentRouteErrorStatus`, and the
-screenshot route specs (the only other 422 user). Run the task file plus those
-neighbors together:
+capture/fresh-agent behavior and error mapping — the fresh-agent REST agent-API
+specs and the screenshot route specs (the only other 422 user). The
+`server/fresh-agent/router.ts` read-model parity suite
+(`test/integration/server/fresh-agent-claude-history-route-parity.test.ts`)
+pins `RESTORE_NOT_FOUND → 404` on a DIFFERENT router that this task does not
+touch; it is covered by the full-suite gate instead.
 
-Run: `npm run test:vitest -- run test/server/agent-capture-pane.test.ts test/server/agent-api-fresh-agent.test.ts test/server/agent-api.test.ts --config config/vitest/vitest.server.config.ts`
-
-(If `test/server/agent-api.test.ts` does not exist on disk at execution time,
-drop it from the command and state that in the task evidence; the first two
-files are the obligatory set.)
+Run: `npm run test:vitest -- run test/server/agent-capture-pane.test.ts test/server/agent-api-fresh-agent.test.ts test/server/agent-screenshot-api.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: PASS.
 
