@@ -87,9 +87,13 @@ repo file layout keeps ledger code in `crates/freshell-ws/src/pane_ledger.rs`
 - Rust toolchain 1.96.0 (`cargo --version` == 1.96.0 on this host; CI pins
   the same in `.github/workflows/rust-clippy.yml`). Gates per task:
   `cargo fmt --all --check`, `cargo clippy -p freshell-ws --all-targets -- -D warnings`;
-  final whole-branch gate additionally runs
-  `cargo clippy --workspace --all-targets -- -D warnings` (CI parity) and
-  `cargo test -p freshell-server`.
+  final whole-branch gate additionally runs the host-valid workspace clippy
+  form `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`
+  (the bare `--workspace` form cannot run on this host: `freshell-tauri`'s
+  WRY build needs GTK/WebKit system libraries that are not installed —
+  `pkg-config --exists webkit2gtk-4.1` is absent — which is why the repo's
+  own QA gate excludes that crate; CI installs the apt deps, so the exclude
+  form plus unchanged CI is the parity story) and `cargo test -p freshell-server`.
 - `crates/freshell-ws/src/pane_ledger.rs` is at 1027 lines against a repo
   ≤1K-lines convention: the change must not grow that file materially
   (doc edits and small refactors only; the scan-fault helper is shared,
@@ -688,10 +692,13 @@ walk itself still never dies per-store."
 
 ## Whole-branch verification (after both tasks, before the delta review)
 
-1. `cargo clippy --workspace --all-targets -- -D warnings` — CI parity gate.
-2. `cargo test -p freshell-server` — full server crate (includes the
-   `recovery_inventory` `new_locked` consumer beyond the `--lib` filter run
-   per task).
+1. `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings` —
+   the host-valid workspace clippy gate (see Global Constraints for the
+   GTK/WebKit rationale; `freshell-tauri` is untouched by this change).
+2. `cargo test -p freshell-server` — full server crate: the per-task
+   `--lib` runs already cover the `recovery_inventory` `new_locked` consumer
+   (a `#[cfg(test)] #[path]` lib-test module); the unfiltered run adds the
+   crate's remaining targets (bins/doc-tests) for the final state.
 3. Full repository QA gate: `darkforge qa --repo '/home/dan/code/freshell' --id 'qzka'`
    (runs the assigned `/home/dan/.local/share/darkforge/sources/freshell-qa.sh`
    in this worktree and records an exact-commit observation). Accept zero
