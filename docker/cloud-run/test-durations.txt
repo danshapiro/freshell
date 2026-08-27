@@ -1,9 +1,9 @@
 # Estimated durations for e2e spec files (seconds).
 #
 # These estimates reflect the TOTAL time each spec file takes when run under
-# the cloud config (test/e2e-browser/playwright.cloud.config.ts) with ALL
-# active projects (chromium + legacy-chromium + rust-chromium). Matrix specs
-# that run under 3 projects have proportionally higher estimates.
+# the cloud config (test/e2e-browser/playwright.cloud.config.ts) with the
+# single Chromium project. The browser selection is intentionally identical
+# for local and Cloud Run jobs so shard estimates remain comparable.
 #
 # The entrypoint reads this file to perform greedy duration-aware shard
 # assignment instead of Playwright's count-based --shard round-robin. Specs

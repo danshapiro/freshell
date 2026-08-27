@@ -30,3 +30,9 @@ jobs:
 
       - name: Run client typecheck
         run: npm run typecheck:client
+
+      # Keep the default Vitest lane nonempty while its config excludes tests
+      # that own Rust/artifact setup. Those prerequisites belong to their
+      # dedicated jobs rather than this fast client check.
+      - name: Run default Vitest lane
+        run: npm run test:vitest -- run --config config/vitest/vitest.config.ts

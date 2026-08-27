@@ -20,6 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript tooling
+        run: npm ci
+
       # Pinned toolchain (NOT @stable): keeps green-local <=> green-CI deterministic.
       # Current stable (1.97.x) already adds default-warn lints this branch was not
       # validated against. Bump this pin deliberately: update the version, re-run the
@@ -45,19 +53,27 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # --all-targets does not imply --all-features: the real-transport
       # backends are default-off and would otherwise go unlinted.
       - name: cargo clippy (feature-gated backends)
         run: |
-          cargo clippy -p freshell-codex --features real-transport --all-targets -- -D warnings
-          cargo clippy -p freshell-opencode --features real-transport --all-targets -- -D warnings
+          cargo clippy -p freshell-codex --features real-transport --all-targets --locked -- -D warnings
+          cargo clippy -p freshell-opencode --features real-transport --all-targets --locked -- -D warnings
 
       # The Tauri shell must launch and reap the real Rust server binary. Build
       # it explicitly so a missing-artifact test can never pass by omission.
       - name: Build Rust server for Tauri smoke
         run: cargo build -p freshell-server --locked
+
+      - name: Rust workspace tests
+        env:
+          FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
+        run: cargo test --workspace --locked
+
+      - name: Source-runtime smoke
+        run: npm run test:source-runtime
 
       - name: Tauri app-bound server spawn smoke
         env:
