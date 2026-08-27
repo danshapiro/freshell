@@ -1,9 +1,6 @@
 /**
- * HARNESS-14 — the controllable server clock, proven over the wire on BOTH
- * server implementations (`retired Node browser lane` + `Rust browser lane` via
- * `retired matrix list`; legacy is the true parity control: identical paths,
- * envelopes, and seam semantics by construction — see
- * `docs/plans/df1/HARNESS-14.md`).
+ * HARNESS-14 — the controllable server clock, proven over the wire against the
+ * owned Rust baseline (see `docs/plans/df1/HARNESS-14.md`).
  *
  * What this spec proves (the checklist acceptance, verbatim):
  *   "Advance/freeze/reset the clock from one serial spec, assert fixture
@@ -17,7 +14,7 @@
  *     step carries it past `safety.autoKillIdleMinutes`, while a terminal
  *     created at a later frozen instant survives — then a further step
  *     reaps it too (fixture timers firing in deterministic order). The idle
- *     sweep cadence under the gate is 250ms on both servers, so the poll
+ *     sweep cadence under the gate is 250ms, so the poll
  *     budgets here observe virtual crossings in ~1s of real time, not the
  *     30s production cadence and never 15 real minutes.
  *   - ABSENCE: the worker-scoped default fixture (booted WITHOUT the env
@@ -93,8 +90,7 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
  *  (reject on an explicit error frame / timeout). The terminal is NEVER
  *  attached: a never-referenced terminal starts orphan reap-eligible on
  *  BOTH servers (rust stamps `released_by_client: true` at create,
- *  `crates/freshell-terminal/src/registry.rs`; legacy reaps any
- *  `clients.size === 0` row, `server/terminal-registry.ts`). */
+ *  `crates/freshell-terminal/src/registry.rs`). */
 function createDetachedTerminal(ws: WebSocket, requestId: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -144,7 +140,7 @@ function lastLineOf(
  * fixture BEFORE the clock is frozen would leave the spawn output capable
  * of landing after an advance — refreshing the activity stamp at the
  * ADVANCED virtual instant (fresh output at a virtual time genuinely is
- * activity on both servers) and defeating the idle math. A shell sitting
+ * activity and defeating the idle math. A shell sitting
  * at a prompt with no input is truly silent, so post-freeze nothing
  * re-stamps and virtual age is exact.
  */
@@ -189,8 +185,8 @@ test.describe('HARNESS-14 controllable server clock', () => {
   test.describe.configure({ mode: 'serial' })
   test.setTimeout(180_000)
 
-  /** Boot an owned server of the CURRENT project's kind with the clock gate on. */
-  async function startGatedServer(rustFixture: string): Promise<E2eServerHandle> {
+  /** Boot an owned Rust server with the clock gate on. */
+  async function startGatedServer(): Promise<E2eServerHandle> {
     const server = await createE2eServerHandle(process.env, {
       construct: { env: { FRESHELL_TEST_CLOCK: '1' } },
     })
@@ -199,7 +195,7 @@ test.describe('HARNESS-14 controllable server clock', () => {
   }
 
   test('advance/freeze/resume/reset round-trip + validation + auth', async () => {
-    const server = await startGatedServer(rustFixture)
+    const server = await startGatedServer()
     try {
       const info = server.info
 
@@ -264,9 +260,8 @@ test.describe('HARNESS-14 controllable server clock', () => {
     }
   })
 
-  test('fixture timers fire in deterministic virtual order (idle cleanup, zero wall sleeps)', async ({
-    }) => {
-    const server = await startGatedServer(rustFixture)
+  test('fixture timers fire in deterministic virtual order (idle cleanup, zero wall sleeps)', async () => {
+    const server = await startGatedServer()
     try {
       const info = server.info
 
