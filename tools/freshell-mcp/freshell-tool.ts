@@ -9,7 +9,12 @@ import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../node-client-runtime/keys.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
-import { unsupportedActionResult } from '../node-client-runtime/action-capabilities.js'
+import {
+  ACTION_ALIASES,
+  resolveCanonicalAction,
+  supportedActionCapabilities,
+  unsupportedInvocationResult,
+} from '../node-client-runtime/action-capabilities.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -25,24 +30,17 @@ function client(): ApiClient {
 // Exports: TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction
 // ---------------------------------------------------------------------------
 
+const supportedCapabilities = supportedActionCapabilities()
+const supportedActionNames = supportedCapabilities.flatMap((capability) => [capability.action, ...(capability.aliases ?? [])])
+const actionDescription = supportedCapabilities.map((capability) => capability.action).join(', ')
+
 export const TOOL_DESCRIPTION = `Freshell terminal multiplexer -- orchestrate tabs, panes, and terminals.
 
 Use action dispatch: freshell({ action: "help" }) to see all commands.
 
-Key actions:
-- Tab: new-tab, list-tabs, select-tab, kill-tab, rename-tab, next-tab, prev-tab, has-tab
-- Pane: split-pane, list-panes, select-pane, kill-pane, rename-pane, resize-pane, swap-pane, respawn-pane
-- Terminal I/O: send-keys, capture-pane, wait-for, run, summarize, display, list-terminals, attach
-- Browser: open-browser, navigate
-- Screenshot: screenshot (scope: pane|tab|view)
-- Session: list-sessions, search-sessions
-- Info: lan-info
-- Meta: health, help
+Supported actions: ${actionDescription}.
 
-Common params: target (ID or name), name, mode, direction, keys, url, scope.
-
-Fresh agents (in-app): use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
-  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }`
+Common params: target (ID or name), name, mode, direction, keys, url, scope.`
 
 export const INSTRUCTIONS = `Freshell is a browser-accessible terminal multiplexer and session organizer.
 
@@ -59,7 +57,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 
 ## Fresh agents (in-app)
 
-- Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
+- Use new-tab with agent="opencode", optional model=, effort=, cwd=. For direct Claude or Codex terminals, use mode="claude" or mode="codex". Then drive the pane with send-keys and read it with capture-pane. Example:
   new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
 
 ## Choosing the right action
@@ -85,25 +83,21 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - **Tab and pane IDs are ephemeral.** IDs from open-browser, new-tab, and split-pane are valid only within the current session. If the Freshell server restarts or the agent conversation resumes after a disconnect, previously returned IDs may no longer exist. Always call open-browser or list-tabs fresh rather than reusing stale IDs.
 - **Always screenshot with \`screenshot({ scope: "tab", target: tabId })\` after open-browser.** Network errors, CORS issues, or server problems can cause blank pages. open-browser returns a tabId — use it immediately to screenshot and confirm the page rendered before proceeding.
 - send-keys: use literal mode (literal: true + keys as a string) for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text -- send the command with literal:true, then send ["ENTER"] as a separate call in token mode.
-- wait-for with stable (seconds of no output) is more reliable than pattern matching across different CLI providers.
+- wait-for requires a literal output pattern; stable, exit, and prompt conditions are not available on the Rust baseline.
 - Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
 - Browser pane screenshots: proxied localhost URLs render actual content in the iframe. Truly cross-origin URLs (e.g. https://example.com) render a placeholder with the source URL instead of a blank region.
 - Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Clean up with list-terminals and kill unneeded tabs/panes.
 
 ## tmux compatibility
 
-tmux aliases are supported: new-window/new-session -> new-tab, list-windows -> list-tabs, select-window -> select-tab, kill-window -> kill-tab, rename-window -> rename-tab, next-window -> next-tab, previous-window/prev-window -> prev-tab, split-window -> split-pane, display-message -> display.
+tmux aliases are supported: ${Object.entries(ACTION_ALIASES).map(([alias, action]) => `${alias} -> ${action}`).join(', ')}.
 
 Key differences from tmux: HTTP transport (not local socket), multiple pane types (not terminal-only), ID/title/index target resolution (not tmux session:window.pane grammar), browser-first and remote-friendly.
 
 Use action "help" for the full command reference with params, examples, and playbooks.`
 
 export const INPUT_SCHEMA = {
-  action: z.string().describe(
-    'Command: help, new-tab, list-tabs, select-tab, kill-tab, rename-tab, '
-    + 'split-pane, list-panes, select-pane, kill-pane, send-keys, capture-pane, '
-    + 'wait-for, screenshot, run, health, ...',
-  ),
+  action: z.enum(supportedActionNames as [string, ...string[]]).describe(`Supported command: ${actionDescription}.`),
   params: z.record(z.string(), z.unknown()).optional().describe(
     'Named parameters for the action. Common: target, name, mode, direction, keys, url, scope',
   ),
@@ -302,41 +296,9 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // Parameter validation: known params per action
 // ---------------------------------------------------------------------------
 
-const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
-  'list-tabs':       { required: [],                          optional: [] },
-  'select-tab':      { required: ['target'],                  optional: [] },
-  'kill-tab':        { required: ['target'],                  optional: [] },
-  'rename-tab':      { required: ['name'],                    optional: ['target'] },
-  'has-tab':         { required: ['target'],                  optional: [] },
-  'next-tab':        { required: [],                          optional: [] },
-  'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
-  'list-panes':      { required: [],                          optional: ['target'] },
-  'select-pane':     { required: ['target'],                  optional: [] },
-  'rename-pane':     { required: ['name'],                    optional: ['target'] },
-  'kill-pane':       { required: ['target'],                  optional: [] },
-  'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
-  'swap-pane':       { required: ['target', 'with'],          optional: [] },
-  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'resume', 'sessionRef'] },
-  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal', 'sessionRef'] },
-  'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
-  'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
-  'run':             { required: ['command'],                 optional: ['capture', 'detached', 'timeout', 'name', 'cwd'] },
-  'summarize':       { required: [],                          optional: ['target'] },
-  'display':         { required: [],                          optional: ['target', 'format'] },
-  'list-terminals':  { required: [],                          optional: [] },
-  'attach':          { required: ['target', 'terminalId'],    optional: ['sessionRef'] },
-  'open-browser':    { required: ['url'],                     optional: ['name'] },
-  'navigate':        { required: ['target', 'url'],           optional: [] },
-  'screenshot':      { required: ['scope'],                   optional: ['target', 'name'] },
-  'list-sessions':   { required: [],                          optional: [] },
-  'search-sessions': { required: ['query'],                   optional: [] },
-  'lan-info':        { required: [],                          optional: [] },
-  'fresh-send':      { required: ['sessionId', 'sessionType', 'provider', 'text'], optional: [] },
-  'health':          { required: [],                          optional: [] },
-  'help':            { required: [],                          optional: [] },
-}
+export const ACTION_PARAMS: Readonly<Record<string, { required: readonly string[]; optional: readonly string[] }>> = Object.freeze(
+  Object.fromEntries(supportedCapabilities.map((capability) => [capability.action, capability.params])),
+)
 
 const RAW_CODEX_RESUME_HINT = 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.'
 
@@ -409,7 +371,7 @@ function agentResumeProvider(agent: unknown): 'codex' | 'opencode' | undefined {
 // Action router
 // ---------------------------------------------------------------------------
 
-const HELP_TEXT = `Freshell MCP tool -- full reference
+const LEGACY_HELP_TEXT = `Freshell MCP tool -- full reference
 
 ## Decision guide: which action and pane type to use
 
@@ -604,6 +566,35 @@ These tmux action names are supported as aliases:
   split-window -> split-pane
   display-message -> display`
 
+const HELP_TEXT = [
+  'Freshell MCP tool -- supported Rust-server reference',
+  '',
+  '## Command reference',
+  ...supportedCapabilities.map((capability) => {
+    const required = capability.params.required.join(', ')
+    const optional = capability.params.optional.map((name) => `${name}?`).join(', ')
+    const parameterText = [required, optional].filter(Boolean).join(', ') || '(none)'
+    return `  ${capability.action}\tParams: ${parameterText}`
+  }),
+  '',
+  'capture-pane accepts J and e as Rust-compatible no-op parameters.',
+  'wait-for requires a literal pattern; stable, exit, and prompt are unavailable.',
+  '',
+  '## Playbook',
+  'Use literal: true with send-keys for natural-language prompts.',
+  'create, split, and rename without manual UI interaction using new-tab, split-pane, rename-tab, and rename-pane.',
+  "Playbook: open a URL — use 'open-browser' for a new browser tab.",
+  '',
+  '## Screenshot guidance',
+  'Use a canary tab and screenshot it after opening a URL.',
+  '',
+  '## Gotchas',
+  'Freshell has a 50 PTY limit. Picker panes are transient.',
+  '',
+  '## tmux aliases',
+  ...Object.entries(ACTION_ALIASES).map(([alias, action]) => `  ${alias} -> ${action}`),
+].join('\n')
+
 function requireParam(params: Record<string, unknown> | undefined, name: string): string {
   const value = params?.[name]
   if (value === undefined || value === null || value === '') {
@@ -623,20 +614,15 @@ export async function executeAction(
   params?: Record<string, unknown>,
 ): Promise<any> {
   try {
-    const unsupported = unsupportedActionResult(action)
+    const unsupported = unsupportedInvocationResult(action, params)
     if (unsupported) return unsupported
-    if (action === 'new-tab' && params?.agent !== undefined && params.agent !== 'opencode') {
-      return { error: "Only agent 'opencode' is supported with the Rust Freshell server.", hint: 'Use mode for direct Claude or Codex terminals.' }
-    }
-    if (action === 'split-pane' && ['agent', 'model', 'effort'].some((key) => params?.[key] !== undefined)) {
-      return { error: 'Fresh-agent split parameters are unavailable with the Rust Freshell server.', hint: 'Use a supported mode pane instead.' }
-    }
-    if (action === 'wait-for' && (!params?.pattern || ['stable', 'exit', 'prompt'].some((key) => params?.[key] !== undefined))) {
-      return { error: 'wait-for requires pattern with the Rust Freshell server.', hint: 'Use a literal output pattern.' }
-    }
-    const paramError = validateParams(action, params)
+    const canonicalAction = resolveCanonicalAction(action) ?? action
+    const effectiveParams = action.startsWith('screenshot-')
+      ? { ...params, scope: action.replace('screenshot-', '') }
+      : params
+    const paramError = validateParams(canonicalAction, effectiveParams)
     if (paramError) return paramError
-    return await routeAction(action, params)
+    return await routeAction(canonicalAction, effectiveParams)
   } catch (err: any) {
     if (err instanceof MissingParamError) {
       return { error: err.message, hint: `Run action 'help' to see required parameters for '${action}'.` }
@@ -956,37 +942,6 @@ async function routeAction(
       return HELP_TEXT
 
     default: {
-      // tmux alias resolution (mirrors CLI aliases).
-      const TMUX_ALIASES: Record<string, string> = {
-        'new-window': 'new-tab',
-        'new-session': 'new-tab',
-        'list-windows': 'list-tabs',
-        'select-window': 'select-tab',
-        'kill-window': 'kill-tab',
-        'rename-window': 'rename-tab',
-        'next-window': 'next-tab',
-        'previous-window': 'prev-tab',
-        'prev-window': 'prev-tab',
-        'split-window': 'split-pane',
-        'display-message': 'display',
-        'screenshot-pane': 'screenshot',
-        'screenshot-tab': 'screenshot',
-        'screenshot-view': 'screenshot',
-      }
-      const resolved = TMUX_ALIASES[action]
-      if (resolved) {
-        // For screenshot aliases, inject scope from the alias name
-        if (action.startsWith('screenshot-')) {
-          const scope = action.replace('screenshot-', '')
-          const mergedParams = { ...params, scope }
-          const aliasParamError = validateParams(resolved, mergedParams)
-          if (aliasParamError) return aliasParamError
-          return routeAction(resolved, mergedParams)
-        }
-        const aliasParamError = validateParams(resolved, params)
-        if (aliasParamError) return aliasParamError
-        return routeAction(resolved, params)
-      }
       return {
         error: `Unknown action '${action}'. Run action 'help' for available commands.`,
         hint: 'Valid actions include: new-tab, list-tabs, send-keys, capture-pane, screenshot, help, ...',

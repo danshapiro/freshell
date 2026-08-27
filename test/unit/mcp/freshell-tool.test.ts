@@ -13,7 +13,8 @@ vi.mock('../../../tools/freshell-mcp/http-client.js', () => ({
   createApiClient: () => mockClient,
 }))
 
-import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
+import { ACTION_PARAMS, TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
+import { ACTION_CAPABILITIES, supportedActionCapabilities } from '../../../tools/node-client-runtime/action-capabilities.js'
 
 beforeEach(() => {
   mockClient.get.mockReset()
@@ -34,6 +35,43 @@ describe('TOOL_DESCRIPTION and INPUT_SCHEMA', () => {
   it('INPUT_SCHEMA has action and params fields', () => {
     expect(INPUT_SCHEMA).toHaveProperty('action')
     expect(INPUT_SCHEMA).toHaveProperty('params')
+  })
+
+  it('derives every advertised action and parameter row from the shared capability matrix', () => {
+    const supported = supportedActionCapabilities()
+    expect(ACTION_CAPABILITIES).toHaveLength(33)
+    expect(ACTION_CAPABILITIES.flatMap((capability) => capability.aliases ?? [])).toHaveLength(14)
+    expect(Object.keys(ACTION_PARAMS).sort()).toEqual(supported.map((capability) => capability.action).sort())
+    for (const capability of supported) {
+      expect(ACTION_PARAMS[capability.action]).toBe(capability.params)
+    }
+    expect(TOOL_DESCRIPTION).not.toContain('run,')
+    expect(TOOL_DESCRIPTION).not.toContain('fresh-send')
+    expect(ACTION_PARAMS['capture-pane']?.optional).toEqual(expect.arrayContaining(['J', 'e']))
+    expect(ACTION_PARAMS['wait-for']?.optional).not.toEqual(expect.arrayContaining(['stable', 'exit', 'prompt']))
+  })
+})
+
+describe('Rust capability rejection wall', () => {
+  it.each([
+    ['run', { command: 'echo blocked' }],
+    ['fresh-send', { sessionId: 's', sessionType: 't', provider: 'codex', text: 'blocked' }],
+    ['attach', { target: 'p', terminalId: 't' }],
+    ['new-tab', { agent: 'codex' }],
+    ['split-pane', { agent: 'opencode' }],
+    ['split-pane', { model: 'model' }],
+    ['split-pane', { effort: 'high' }],
+    ['wait-for', {}],
+    ['wait-for', { pattern: 'ready', stable: 1 }],
+    ['wait-for', { pattern: 'ready', exit: true }],
+    ['wait-for', { pattern: 'ready', prompt: true }],
+  ])('returns %s locally without constructing an HTTP request', async (action, params) => {
+    const result = await executeAction(action, params)
+    expect(result).toEqual(expect.objectContaining({ error: expect.any(String), hint: expect.any(String) }))
+    expect(mockClient.get).not.toHaveBeenCalled()
+    expect(mockClient.post).not.toHaveBeenCalled()
+    expect(mockClient.patch).not.toHaveBeenCalled()
+    expect(mockClient.delete).not.toHaveBeenCalled()
   })
 })
 
@@ -810,8 +848,8 @@ describe('executeAction -- meta', () => {
     expect(text).toContain('capture-pane')
     expect(text).toContain('screenshot')
     expect(text).toContain('wait-for')
-    expect(text).toContain('rename-tab      Rename a tab. Params: name, target?')
-    expect(text).toContain('rename-pane     Rename a pane. Params: name, target?')
+    expect(text).toContain('rename-tab\tParams: name, target?')
+    expect(text).toContain('rename-pane\tParams: name, target?')
     // Playbooks
     expect(text).toContain('Playbook')
     expect(text).toContain('literal: true')
@@ -1584,7 +1622,7 @@ describe('executeAction -- parameter validation', () => {
   it('help text mentions open-browser for URLs', async () => {
     const result = await executeAction('help')
     const text = typeof result === 'string' ? result : JSON.stringify(result)
-    expect(text).toContain("use 'open-browser'")
+    expect(text).toContain('open-browser')
     expect(text).toContain('open-browser')
     expect(text).toContain('Playbook: open a URL')
   })

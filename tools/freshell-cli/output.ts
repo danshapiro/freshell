@@ -12,9 +12,8 @@ export function writeJson(data: unknown, pretty = true) {
 }
 
 export function writeError(err: unknown) {
-  if (err instanceof Error) {
-    process.stderr.write(`${err.message}\n`)
-    return
-  }
-  process.stderr.write(`${String(err)}\n`)
+  const message = err instanceof Error ? err.message : String(err)
+  // stderr is intentionally machine-readable JSONL. CLI command results still
+  // own stdout, so diagnostics never corrupt piping/JSON output there.
+  process.stderr.write(`${JSON.stringify({ severity: 'error', event: 'cli.error', message })}\n`)
 }

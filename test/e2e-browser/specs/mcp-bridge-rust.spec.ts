@@ -120,14 +120,14 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
       expect(typeof capture).toBe('string')
       expect(capture).toContain(marker)
 
-      // -- list-panes: our pane is present, correctly cross-referenced to tab + terminal --
+      // -- list-panes: Rust's authoritative row contains pane/terminal metadata.
+      // Tab ownership is intentionally not part of this list response.
       const listPanes = await mcp.callFreshellAction('list-panes')
       expect(listPanes.status).toBe('ok')
-      const ourPane = (listPanes.data.panes as Array<{ id: string; tabId: string; terminalId: string }>).find(
+      const ourPane = (listPanes.data.panes as Array<{ id: string; terminalId?: string }>).find(
         (p) => p.id === paneId,
       )
       expect(ourPane).toBeTruthy()
-      expect(ourPane?.tabId).toBe(tabId)
       expect(ourPane?.terminalId).toBe(terminalId)
     } finally {
       await mcp.close()

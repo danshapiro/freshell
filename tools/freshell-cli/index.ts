@@ -8,7 +8,7 @@ import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
-import { unsupportedActionResult } from '../node-client-runtime/action-capabilities.js'
+import { resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -37,23 +37,6 @@ type CliCommandWriter = {
   writeJson: (value: unknown) => void
   writeError: (value: unknown) => void
   setExitCode: (code: number) => void
-}
-
-const aliases: Record<string, string> = {
-  'new-window': 'new-tab',
-  'new-session': 'new-tab',
-  'list-windows': 'list-tabs',
-  'select-window': 'select-tab',
-  'kill-window': 'kill-tab',
-  'rename-window': 'rename-tab',
-  'next-window': 'next-tab',
-  'previous-window': 'prev-tab',
-  'prev-window': 'prev-tab',
-  'split-window': 'split-pane',
-  'display-message': 'display',
-  'screenshot-pane': 'screenshot',
-  'screenshot-tab': 'screenshot',
-  'screenshot-view': 'screenshot',
 }
 
 const aliasNotices: Partial<Record<string, string>> = {
@@ -392,8 +375,8 @@ async function main() {
   const aliasNotice = aliasNotices[parsed.command]
   if (aliasNotice) writeError(aliasNotice)
 
-  const command = aliases[parsed.command] || parsed.command
-  const unsupported = unsupportedActionResult(parsed.command)
+  const command = resolveCanonicalAction(parsed.command) ?? parsed.command
+  const unsupported = unsupportedInvocationResult(parsed.command, parsed.flags)
   if (unsupported) {
     writeError(unsupported.error)
     writeError(unsupported.hint)
@@ -402,6 +385,8 @@ async function main() {
   }
   const flags = parsed.flags
   const args = parsed.args
+  // Local capability validation deliberately happens before client creation:
+  // unsupported variants must not resolve a target or make any HTTP request.
   const client = createHttpClient()
 
   switch (command) {
@@ -414,6 +399,9 @@ async function main() {
       const cwd = getFlag(flags, 'cwd') as string | undefined
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
+      const agent = getFlag(flags, 'agent') as string | undefined
+      const model = getFlag(flags, 'model') as string | undefined
+      const effort = getFlag(flags, 'effort') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
       const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
@@ -429,6 +417,9 @@ async function main() {
         cwd,
         browser,
         editor,
+        agent,
+        model,
+        effort,
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       const data = unwrap(res)
