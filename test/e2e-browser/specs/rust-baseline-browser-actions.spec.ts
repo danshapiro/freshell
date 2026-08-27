@@ -26,7 +26,7 @@ async function createBrowserPane(page: import('@playwright/test').Page) {
 }
 
 test.describe('Rust baseline browser actions', () => {
-  test('keeps localhost HTTP proxying and blocks remote HTTPS loopback without forwarding', async ({ page, terminal }) => {
+  test('keeps localhost HTTP proxying and blocks remote HTTPS loopback without forwarding', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     const input = await createBrowserPane(page)
@@ -36,7 +36,7 @@ test.describe('Rust baseline browser actions', () => {
     expect(forbidden).toEqual([])
   })
 
-  test('does not expose Node-only external editor actions', async ({ page, terminal }) => {
+  test('does not expose Node-only external editor actions', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     await page.locator('.xterm').first().click({ button: 'right' })
@@ -44,19 +44,19 @@ test.describe('Rust baseline browser actions', () => {
     expect(forbidden).toEqual([])
   })
 
-  test('does not load client or server extension assets', async ({ page, terminal }) => {
+  test('does not load client or server extension assets', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     expect(forbidden).toEqual([])
   })
 
-  test('keeps markdown editor operations on supported Rust editor routes', async ({ page, terminal }) => {
+  test('keeps markdown editor operations on supported Rust editor routes', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     expect(forbidden).toEqual([])
   })
 
-  test('removes fresh-agent attachment, shell, and expandable-diff actions', async ({ page, terminal }) => {
+  test('removes fresh-agent attachment, shell, and expandable-diff actions', async ({ freshellPage, page, terminal }) => {
     const forbidden = captureForbiddenRequests(page)
     await terminal.waitForTerminal()
     expect(forbidden).toEqual([])
