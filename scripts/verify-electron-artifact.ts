@@ -13,6 +13,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
   FORBIDDEN_RUNTIME_NAMES,
+  findUnapprovedRuntimePaths,
+  getRuntimeAllowlist,
   getRuntimePaths,
   type ElectronRuntimePlatform,
 } from './prepare-electron-runtime.js'
@@ -47,29 +49,6 @@ export interface ElectronArtifactVerificationReceipt {
   executed: boolean
   requiredFiles: string[]
   forbiddenFiles: string[]
-}
-
-const REQUIRED_RELATIVE_PATHS = [
-  'client/index.html',
-  'claude-sidecar/index.mjs',
-  'claude-sidecar/package.json',
-  'claude-sidecar/package-lock.json',
-  'claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk/package.json',
-  'mcp/server.js',
-  'mcp/package.json',
-  'mcp/package-lock.json',
-  'mcp/node_modules/@modelcontextprotocol/sdk/package.json',
-  'mcp/node_modules/zod/package.json',
-  'node-client-runtime/keys.js',
-  'node-client-runtime/action-capabilities.js',
-]
-
-function binaryRelativePath(platform: ElectronRuntimePlatform): string {
-  return platform === 'win32' ? 'bin/freshell-server.exe' : 'bin/freshell-server'
-}
-
-function nodeRelativePath(platform: ElectronRuntimePlatform): string {
-  return platform === 'win32' ? 'node/bin/node.exe' : 'node/bin/node'
 }
 
 function walkFiles(root: string): string[] {
@@ -166,11 +145,8 @@ export function verifyElectronArtifact(
   const root = path.resolve(artifactPath)
   if (!existsSync(root) || !statSync(root).isDirectory()) throw new Error(`Electron artifact directory is missing: ${root}`)
   const paths = getRuntimePaths(root, platform)
-  const required = [
-    binaryRelativePath(platform),
-    nodeRelativePath(platform),
-    ...REQUIRED_RELATIVE_PATHS,
-  ]
+  const allowlist = getRuntimeAllowlist(platform)
+  const required = [...allowlist.requiredFiles]
   for (const relative of required) {
     if (!existsSync(path.join(root, relative))) throw new Error(`Electron artifact is missing required file: ${relative}`)
   }
@@ -194,10 +170,13 @@ export function verifyElectronArtifact(
     throw new Error('MCP package-lock metadata is invalid')
   }
 
-  const forbidden = walkFiles(root).filter(isForbidden)
+  const artifactFiles = walkFiles(root)
+  const forbidden = artifactFiles.filter(isForbidden)
   if (forbidden.length > 0) throw new Error(`Electron artifact contains forbidden files: ${forbidden.join(', ')}`)
+  const unapproved = findUnapprovedRuntimePaths(artifactFiles, platform)
+  if (unapproved.length > 0) throw new Error(`Electron artifact contains unapproved files: ${unapproved.join(', ')}`)
 
-  const serverBinary = path.join(root, binaryRelativePath(platform))
+  const serverBinary = path.join(root, allowlist.serverBinary)
   checkBinaryFormat(serverBinary, platform)
   if (platform !== 'win32' && (statSync(serverBinary).mode & 0o111) === 0) {
     throw new Error('Rust server binary is not executable')
