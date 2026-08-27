@@ -3,7 +3,7 @@ import { act, render, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { setActivePane } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
@@ -262,6 +262,46 @@ describe('TerminalView background focus yield', () => {
     await act(async () => { flushRaf(pending) })
     // A fresh activation effect re-run is out of scope here; the important
     // half is that nothing threw and the terminal remains usable.
+  })
+
+  it('does NOT steal focus from an inline editor when the pane is re-activated (active-pane effect)', async () => {
+    // Isolate the active-pane rAF effect (TerminalView.tsx:1276): on mount the
+    // effect early-returns on the null termRef, so focus must come through
+    // once via the mount layout flush before the activation path is testable.
+    const { pending } = captureRaf()
+    const { store, paneContent } = createTestStore('term-1')
+    renderActiveTerminal(store, paneContent)
+    await act(async () => { flushRaf(pending) })
+    expect(capturedTerminal?.focus).toHaveBeenCalled() // mount flush (CONTROL proof)
+    capturedTerminal?.focus.mockClear()
+
+    // Focus a foreign inline editor AFTER all mount frames drained, so only
+    // the re-activation frame below can attempt the steal.
+    focusForeignInput()
+
+    // Re-trigger the activation effect: `shouldFocusActiveTerminal` must flip
+    // false -> true across two separate commits (a single batched render would
+    // leave the deps unchanged and never re-run the effect).
+    await act(async () => {
+      store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+    })
+    await act(async () => {
+      store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+    })
+    await act(async () => { flushRaf(pending) })
+    expect(capturedTerminal?.focus).not.toHaveBeenCalled()
+
+    // Control counterpart: with the editor blurred, the same deactivation /
+    // re-activation pair must focus the terminal again.
+    ;(document.activeElement as HTMLElement | null)?.blur?.()
+    await act(async () => {
+      store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+    })
+    await act(async () => {
+      store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+    })
+    await act(async () => { flushRaf(pending) })
+    expect(capturedTerminal?.focus).toHaveBeenCalledTimes(1)
   })
 
   it('still focuses when xterm\'s own helper textarea holds focus', async () => {
