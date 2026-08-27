@@ -1,7 +1,6 @@
-// Dedicated vitest config for E2E helper unit tests (e.g., test-server.test.ts).
-// These tests verify the E2E test infrastructure itself and run in a Node
-// environment. They are NOT run by `npm test` (which uses the root vitest
-// configs); instead, they are run explicitly during E2E helper development.
+// Dedicated Vitest config for Rust fixture, shared-support, external-target,
+// selection, and perf helper tests. These infrastructure tests run in Node,
+// outside the root Vitest configs, during E2E helper development.
 import { defineConfig } from 'vitest/config'
 import path from 'path'
 import { fileURLToPath } from 'url'
