@@ -11,7 +11,7 @@ export type RuntimeSurface = {
   id: string
   path: string
   role: string
-  listener?: 'non-backend' | 'legacy-backend'
+  listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
   entries?: string[]
 }
 
@@ -171,6 +171,10 @@ function isFixtureServerPath(relativePath: string): boolean {
     || relativePath.startsWith('test/e2e-browser/helpers/')
 }
 
+function isExampleExtensionServerPath(relativePath: string): boolean {
+  return /^examples\/extensions\/[^/]+\/server\.(?:cjs|js|mjs|ts|tsx)$/.test(relativePath)
+}
+
 /** Read and validate the manifest without allowing malformed rows to vanish. */
 export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeSurfaceManifest> {
   const manifestPath = path.join(root, ...MANIFEST_RELATIVE_PATH.split('/'))
@@ -188,15 +192,23 @@ export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeS
     if (typeof row.id !== 'string' || !row.id || typeof row.path !== 'string' || !row.path || typeof row.role !== 'string' || !row.role) {
       throw new Error(`Runtime surface manifest row ${index} requires id, path, and role.`)
     }
-    if (row.listener !== undefined && row.listener !== 'non-backend' && row.listener !== 'legacy-backend') {
+    if (row.listener !== undefined && row.listener !== 'non-backend' && row.listener !== 'legacy-backend' && row.listener !== 'assertion-only') {
       throw new Error(`Runtime surface manifest row ${row.id} has an invalid listener role.`)
     }
     if (row.entries !== undefined && (!Array.isArray(row.entries) || row.entries.some((entry) => typeof entry !== 'string'))) {
       throw new Error(`Runtime surface manifest row ${row.id} has invalid entries.`)
     }
+    const normalizedPath = validateManifestPath(row.path, row.id)
+    if (row.listener === 'assertion-only' && (
+      row.role !== 'test-listener-assertion'
+      || !normalizedPath.startsWith('test/')
+      || !isTestFilePath(normalizedPath)
+    )) {
+      throw new Error(`Runtime surface manifest assertion-only row ${row.id} must classify a test implementation.`)
+    }
     surfaces.push({
       id: row.id,
-      path: validateManifestPath(row.path, row.id),
+      path: normalizedPath,
       role: row.role,
       ...(row.listener ? { listener: row.listener } : {}),
       ...(row.entries ? { entries: [...row.entries].sort() } : {}),
@@ -250,6 +262,7 @@ async function discoverOwners(root: string, allFiles: string[]): Promise<string[
       || isContainerResourcePath(relativePath)
       || isReleaseJobPath(relativePath)
       || isFixtureServerPath(relativePath)
+      || isExampleExtensionServerPath(relativePath)
     ) {
       owners.add(relativePath)
     }
@@ -351,14 +364,11 @@ function hasListenerCapability(contents: string): boolean {
 
 function isCapabilityScanPath(relativePath: string): boolean {
   if (isIgnoredRelativePath(relativePath) || !isSourcePath(relativePath)) return false
-  // Test cases may create throwaway listeners for assertions. Runtime helpers
-  // and fixtures are the executable test surfaces, so scan every non-test
-  // source file below test/ while excluding test/spec implementations.
-  if (relativePath.startsWith('test/') && isTestFilePath(relativePath)) return false
   return [
     'config/',
     'crates/',
     'electron/',
+    'examples/',
     'port/',
     'scripts/',
     'server/',
@@ -367,6 +377,13 @@ function isCapabilityScanPath(relativePath: string): boolean {
     'test/',
     'tools/',
   ].some((prefix) => relativePath.startsWith(prefix))
+}
+
+function isReviewedAssertionOnlyListener(row: RuntimeSurface | undefined, relativePath: string): boolean {
+  return row?.listener === 'assertion-only'
+    && row.role === 'test-listener-assertion'
+    && relativePath.startsWith('test/')
+    && isTestFilePath(relativePath)
 }
 
 async function detectUnexpectedNodeBackend(
@@ -387,14 +404,18 @@ async function detectUnexpectedNodeBackend(
     // it by relabeling an arbitrary listener as non-backend.
     if (nonBackendListenerPaths.has(relativePath)) continue
     if (row?.listener === 'legacy-backend') continue
+    if (isReviewedAssertionOnlyListener(row, relativePath)) continue
     unexpected.push(relativePath)
   }
 
   return unexpected.sort()
 }
 
-async function detectLegacyDebt(root: string): Promise<string[]> {
+async function detectLegacyDebt(root: string, manifest: RuntimeSurfaceManifest): Promise<string[]> {
   const debt: string[] = []
+  for (const row of manifest.surfaces) {
+    if (row.listener === 'legacy-backend') debt.push(rowPath(row))
+  }
   for (const check of legacyDebtChecks) {
     const absolutePath = path.join(root, ...check.relativePath.split('/'))
     try {
@@ -420,7 +441,7 @@ export async function analyzeRuntimeBoundary(root: string): Promise<RuntimeBound
 
   const [manifestDrift, legacyDebt, unexpectedNodeBackend] = await Promise.all([
     reconcileManifest(normalizedRoot, manifest, discoveredOwners),
-    detectLegacyDebt(normalizedRoot),
+    detectLegacyDebt(normalizedRoot, manifest),
     detectUnexpectedNodeBackend(normalizedRoot, allFiles, manifest),
   ])
 

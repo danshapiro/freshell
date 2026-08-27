@@ -11,7 +11,7 @@ type RuntimeSurface = {
   id: string
   path: string
   role: string
-  listener?: 'non-backend' | 'legacy-backend'
+  listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
 }
 
 const ALLOWED_LISTENER_PATHS = [
@@ -97,6 +97,45 @@ describe('runtime boundary analyzer', () => {
     ])
   })
 
+  it('rejects an unlisted Node listener in a test implementation', async () => {
+    const root = await createSyntheticRoot(
+      [],
+      {
+        'test/e2e-browser/helpers/rogue-listener.test.ts': [
+          "import http from 'node:http'",
+          "http.createServer((_req, res) => res.end('nope')).listen(0)",
+        ].join('\n'),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.unexpectedNodeBackend).toEqual([
+      'test/e2e-browser/helpers/rogue-listener.test.ts',
+    ])
+  })
+
+  it('rejects an unlisted Node listener in a supported extension example', async () => {
+    const root = await createSyntheticRoot(
+      [],
+      {
+        'examples/extensions/rogue/server.js': [
+          "import http from 'node:http'",
+          "http.createServer((_req, res) => res.end('nope')).listen(0)",
+        ].join('\n'),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.unexpectedNodeBackend).toEqual([
+      'examples/extensions/rogue/server.js',
+    ])
+    expect(result.manifestDrift).toContain(
+      'unlisted owner: examples/extensions/rogue/server.js',
+    )
+  })
+
   it('preserves explicitly recorded legacy test listeners without allowing adjacent helpers', async () => {
     const root = await createSyntheticRoot(
       [{
@@ -116,6 +155,45 @@ describe('runtime boundary analyzer', () => {
     expect(result.unexpectedNodeBackend).toEqual([
       'test/e2e-browser/helpers/rogue-listener.ts',
     ])
+  })
+
+  it('requires an exact assertion-only row for a test implementation listener', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'assertion-listener',
+        path: 'test/unit/assertion-listener.test.ts',
+        role: 'test-listener-assertion',
+        listener: 'assertion-only',
+      }],
+      {
+        'test/unit/assertion-listener.test.ts': "require('node:http').createServer().listen(0)\n",
+        'test/unit/rogue-listener.test.ts': "require('node:http').createServer().listen(0)\n",
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.unexpectedNodeBackend).toEqual([
+      'test/unit/rogue-listener.test.ts',
+    ])
+  })
+
+  it('does not allow assertion-only listener rows outside test implementations', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'misclassified',
+        path: 'scripts/misclassified.ts',
+        role: 'test-listener-assertion',
+        listener: 'assertion-only',
+      }],
+      {
+        'scripts/misclassified.ts': "require('node:http').createServer().listen(0)\n",
+      },
+    )
+
+    await expect(analyzeRuntimeBoundary(root)).rejects.toThrow(
+      'Runtime surface manifest assertion-only row misclassified must classify a test implementation.',
+    )
   })
 
   it('allows sanctioned Node roles and the exact non-backend listener rows', async () => {
@@ -277,6 +355,8 @@ describe('runtime boundary inventory for the current checkout', () => {
       'test/e2e-browser/playwright.config.ts:legacy-chromium',
       'run-rust-server.sh:legacy-comment',
       'port/laptop-bootstrap/2-bootstrap-wsl.sh:inherited-build-path',
+      'examples/extensions/live-counter/server.js',
+      'examples/extensions/status-dashboard/server.js',
     ]))
   })
 })
