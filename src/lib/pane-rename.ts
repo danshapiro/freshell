@@ -7,6 +7,10 @@
  * error). Only that transient no-op is retried; it is the one response
  * that provably means "mirror not landed yet" rather than a user error.
  */
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('pane-rename')
+
 export type PaneRenameResponse =
   | { data?: { paneId?: string; tabId?: string; tabRenamed?: boolean }; message?: string }
   | null
@@ -40,6 +44,12 @@ export async function renamePaneWithMirrorRetry(
       typeof response?.message === 'string' && response.message ? response.message : GENERIC_FAILURE_MESSAGE
     const retryable = message === MIRROR_NOT_FOUND_MESSAGE && attempt < retryDelaysMs.length
     if (!retryable) return { ok: false, message }
-    await sleep(retryDelaysMs[attempt])
+    const delayMs = retryDelaysMs[attempt]
+    log.debug('retrying pane rename after transient pane-not-found (layout mirror not landed yet)', {
+      paneId,
+      attempt: attempt + 1,
+      delayMs,
+    })
+    await sleep(delayMs)
   }
 }

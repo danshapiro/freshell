@@ -1,4 +1,17 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Repo-standard hoisted logger double: every test gets a no-op logger; only
+// the retry test asserts on the calls.
+const logSpies = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}))
+
+vi.mock('@/lib/client-logger', () => ({
+  createLogger: () => logSpies,
+}))
 
 import { renamePaneWithMirrorRetry } from '@/lib/pane-rename'
 
@@ -6,6 +19,10 @@ const patchOk = () => Promise.resolve({ status: 'ok', data: { paneId: 'pane-1', 
 const patchNotFound = () => Promise.resolve({ status: 'ok', message: 'pane not found' } as object) as never
 
 describe('renamePaneWithMirrorRetry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
   it('succeeds on the first attempt without sleeping', async () => {
     const patch = vi.fn().mockImplementation(patchOk)
     const sleep = vi.fn().mockResolvedValue(undefined)
@@ -24,6 +41,15 @@ describe('renamePaneWithMirrorRetry', () => {
     expect(patch).toHaveBeenCalledTimes(2)
     expect(sleep).toHaveBeenCalledTimes(1)
     expect(sleep).toHaveBeenCalledWith(5)
+    // Review M2: a retried attempt must be observable in the field. Exactly one
+    // debug event, emitted before/at the sleep, carrying the retry evidence.
+    expect(logSpies.debug).toHaveBeenCalledTimes(1)
+    expect(logSpies.debug).toHaveBeenCalledWith(
+      expect.stringContaining('pane-not-found'),
+      { paneId: 'pane-1', attempt: 1, delayMs: 5 },
+    )
+    expect(logSpies.debug.mock.invocationCallOrder[0])
+      .toBeLessThanOrEqual(sleep.mock.invocationCallOrder[0])
   })
 
   it('gives up after the retry budget with the last pane-not-found message', async () => {
