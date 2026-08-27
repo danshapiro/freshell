@@ -5,42 +5,104 @@ on:
     tags: ['v*']
   pull_request:
     paths:
+      - 'src/**'
+      - 'shared/**'
       - 'electron/**'
+      - 'tools/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'assets/electron/**'
       - 'config/electron-builder.yml'
-      - 'scripts/prepare-bundled-node.ts'
-      - 'scripts/bundled-node-version.json'
+      - 'config/vite/**'
+      - 'config/vitest/vitest.electron-runtime.config.ts'
+      - 'scripts/prepare-electron-runtime.ts'
+      - 'scripts/verify-electron-artifact.ts'
+      - 'scripts/assert-native-windows-build.ts'
+      - 'package.json'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15-intel, macos-latest, ubuntu-latest, windows-2022]
+        include:
+          - os: macos-15-intel
+            installer: release/*.dmg
+          - os: macos-latest
+            installer: release/*.dmg
+          - os: ubuntu-latest
+            installer: |-
+              release/*.AppImage
+              release/*.deb
+          - os: windows-2022
+            installer: release/*.exe
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
+          cache: npm
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Run Electron tests
+      - name: Run Electron unit tests
         run: npm run test:electron
 
-      - name: Build Electron app
+      # Build the host-native server before staging. The Windows job is always
+      # native Windows, so its executable has the correct PE format.
+      - name: Build native Rust server
+        run: cargo build --release -p freshell-server --locked
+
+      - name: Build and verify Electron installer (Unix)
+        if: matrix.os != 'windows-2022'
         run: npm run electron:build
 
-      - name: Upload artifacts
+      - name: Build and verify Electron installer (Windows)
+        if: matrix.os == 'windows-2022'
+        run: npm run electron:build:win
+
+      # The package scripts verify as part of the build; repeat the explicit
+      # verifier as the CI receipt immediately before checkout-free testing.
+      - name: Verify unpacked native artifact
+        run: npm run verify:electron-artifact
+
+      - name: Checkout-free native runtime acceptance
+        run: npm run test:electron:runtime
+
+      - name: Upload verified installer (Unix)
+        if: matrix.os != 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
           name: electron-${{ matrix.os }}
-          path: release/*
+          path: ${{ matrix.installer }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload verified installer (Windows)
+        if: matrix.os == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-${{ matrix.os }}
+          path: ${{ matrix.installer }}
+          if-no-files-found: error
           retention-days: 14

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Verify the small, explicit artifact layout used by Rust-only containers.
+#
+# This checker is intentionally independent of Docker. CI and local tests can
+# run it against a staged directory before building an image, and its JSONL
+# diagnostics make missing/forbidden paths straightforward to diagnose.
+set -euo pipefail
+
+usage() {
+  echo 'Usage: scripts/verify-container-layout.sh --fixture DIRECTORY' >&2
+}
+
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//"/\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+json_array() {
+  local separator=''
+  local value
+  for value in "$@"; do
+    printf '%s"%s"' "$separator" "$(json_escape "$value")"
+    separator=','
+  done
+}
+
+emit() {
+  local severity="$1"
+  local event="$2"
+  shift 2
+  printf '{"severity":"%s","event":"%s"' "$(json_escape "$severity")" "$(json_escape "$event")"
+  while (($# > 1)); do
+    local key="$1"
+    local value="$2"
+    shift 2
+    printf ',"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+  done
+  if (($# == 1)); then
+    # The final argument is the sorted evidence array encoded by the caller.
+    printf ',"evidence":[%s]' "$1"
+  fi
+  printf '}\n'
+}
+
+fixture=''
+while (($# > 0)); do
+  case "$1" in
+    --fixture)
+      if (($# < 2)); then
+        usage
+        exit 2
+      fi
+      fixture="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$fixture" ]]; then
+  usage
+  exit 2
+fi
+if [[ ! -d "$fixture" ]]; then
+  emit error container_layout_fixture_missing "path" "$fixture" '[]'
+  exit 1
+fi
+
+mapfile -t evidence < <(
+  find "$fixture" -type f -o -type l |
+    sed "s#^${fixture%/}/##" |
+    LC_ALL=C sort -u
+)
+
+required_paths=(
+  'dist/client/index.html'
+  'dist/tools/freshell-mcp/server.js'
+)
+missing_paths=()
+for required in "${required_paths[@]}"; do
+  if [[ ! -f "$fixture/$required" ]]; then
+    missing_paths+=("$required")
+  fi
+done
+
+server_candidates=(
+  'freshell-server'
+  'target/release/freshell-server'
+)
+server_binary=''
+for candidate in "${server_candidates[@]}"; do
+  if [[ -f "$fixture/$candidate" ]]; then
+    server_binary="$fixture/$candidate"
+    break
+  fi
+done
+if [[ -z "$server_binary" ]]; then
+  missing_paths+=("freshell-server (or target/release/freshell-server)")
+fi
+
+if ((${#missing_paths[@]} > 0)); then
+  mapfile -t missing_paths < <(printf '%s\n' "${missing_paths[@]}" | LC_ALL=C sort -u)
+  emit error container_layout_required_artifacts_missing "path" "$fixture" "$(json_array "${missing_paths[@]}")"
+  exit 1
+fi
+
+if [[ ! -x "$server_binary" ]]; then
+  emit error container_layout_server_not_executable "path" "$server_binary" '[]'
+  exit 1
+fi
+
+forbidden_paths=()
+for relative in "${evidence[@]}"; do
+  case "/$relative" in
+    */dist/server|*/dist/server/*|*/server-node-modules|*/server-node-modules/*|*/bundled-node|*/bundled-node/*|*/native-modules|*/native-modules/*|*/node-pty|*/node-pty/*|*/node-gyp|*/node-gyp/*)
+      forbidden_paths+=("$relative")
+      ;;
+  esac
+done
+
+if ((${#forbidden_paths[@]} > 0)); then
+  mapfile -t forbidden_paths < <(printf '%s\n' "${forbidden_paths[@]}" | LC_ALL=C sort -u)
+  emit error container_layout_forbidden_artifacts "path" "$fixture" "$(json_array "${forbidden_paths[@]}")"
+  exit 1
+fi
+
+mapfile -t evidence < <(printf '%s\n' "${evidence[@]}" | LC_ALL=C sort -u)
+emit info container_layout_verified "path" "$fixture" "$(json_array "${evidence[@]}")"

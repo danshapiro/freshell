@@ -1,38 +1,49 @@
-# Minimal Docker image demonstrating that server extensions work
-# through freshell's HTTP proxy without exposing extension ports.
+# Minimal image demonstrating Freshell's Rust server and static client.
 #
 # Build:  docker build -t freshell-docker-test -f examples/docker/Dockerfile .
-# Run:    docker run --rm -p 3001:3001 freshell-docker-test
-# Open:   The startup URL (with token) is printed to stdout
+# Run:    docker run --rm -e AUTH_TOKEN=<at-least-16-characters> -p 3001:3001 freshell-docker-test
+# Open:   http://localhost:3001/
 #
-# Only port 3001 is exposed. Server extensions (status-dashboard,
-# live-counter) allocate dynamic ports *inside* the container, but
-# their iframes load through /api/proxy/http/:port/ on port 3001,
-# so the browser never needs direct access to those ports.
+# The example image intentionally contains no application Node dependency tree.
+# Node is not the backend process; the final image starts the native server.
 
-FROM node:24-slim
+# ---------------------------------------------------------------------------
+# Stage 1: compile the native backend.
+# ---------------------------------------------------------------------------
+FROM rust:1-bookworm AS rust-builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY extensions/ ./extensions/
+RUN cargo build --release -p freshell-server --locked
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the browser client with the retained JavaScript toolchain.
+# ---------------------------------------------------------------------------
+FROM node:24-slim AS client-builder
 
 WORKDIR /app
-
-# Install dependencies first (layer cache)
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts 2>/dev/null; exit 0
-RUN npm ci
-
-# Copy source and build
+RUN npm ci --ignore-scripts
 COPY . .
-RUN npm run build
+RUN npm run build:client
 
-# Install example extensions and configure network access
-RUN mkdir -p /root/.freshell/extensions && \
-    ln -s /app/examples/extensions/status-dashboard /root/.freshell/extensions/status-dashboard && \
-    ln -s /app/examples/extensions/live-counter /root/.freshell/extensions/live-counter && \
-    ln -s /app/examples/extensions/notepad /root/.freshell/extensions/notepad && \
-    echo '{"version":1,"settings":{"network":{"configured":true,"host":"0.0.0.0"}}}' > /root/.freshell/config.json
+# ---------------------------------------------------------------------------
+# Stage 3: only the Rust executable and static client are shipped.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim
 
-ENV NODE_ENV=production
-ENV PORT=3001
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+COPY --from=rust-builder /build/target/release/freshell-server /app/freshell-server
+COPY --from=client-builder /app/dist/client /app/dist/client
+
+ENV PORT=3001 \
+    FRESHELL_BIND_HOST=0.0.0.0
 EXPOSE 3001
 
-CMD ["node", "dist/server/index.js"]
+CMD ["/app/freshell-server"]
