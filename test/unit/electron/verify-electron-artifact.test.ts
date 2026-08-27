@@ -9,16 +9,17 @@ function artifactRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-artifact-'))
 }
 
-function writeArtifact(root: string): string {
-  const binary = path.join(root, 'bin', 'freshell-server')
+function writeArtifact(root: string, platform: 'linux' | 'win32' = 'linux'): string {
+  const binary = path.join(root, 'bin', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
   mkdirSync(path.dirname(binary), { recursive: true })
-  writeFileSync(binary, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
+  writeFileSync(binary, platform === 'win32'
+    ? Buffer.concat([Buffer.from('MZ'), Buffer.alloc(32)])
+    : Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
   chmodSync(binary, 0o755)
   mkdirSync(path.join(root, 'client'), { recursive: true })
   writeFileSync(path.join(root, 'client', 'index.html'), '<!doctype html>')
   mkdirSync(path.join(root, 'node', 'bin'), { recursive: true })
-  writeFileSync(path.join(root, 'node', 'bin', 'node'), 'node')
-  writeFileSync(path.join(root, 'node', 'bin', 'node.exe'), 'node')
+  writeFileSync(path.join(root, 'node', 'bin', platform === 'win32' ? 'node.exe' : 'node'), 'node')
   mkdirSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
   writeFileSync(path.join(root, 'claude-sidecar', 'index.mjs'), 'process.stdin.resume()')
   writeFileSync(path.join(root, 'claude-sidecar', 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
@@ -41,6 +42,9 @@ describe('verify-electron-artifact', () => {
   it('checks required files and runs the native probe in a sanitized empty cwd', () => {
     const root = artifactRoot()
     const binary = writeArtifact(root)
+    mkdirSync(path.join(root, 'client', 'assets'), { recursive: true })
+    writeFileSync(path.join(root, 'client', 'assets', 'index-hash.js'), 'export {}\n')
+    writeFileSync(path.join(root, '.electron-runtime-receipt.json'), '{}\n')
     const probe = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => {
       expect(command).toBe(binary)
       expect(options.cwd).not.toBe(root)
@@ -65,12 +69,21 @@ describe('verify-electron-artifact', () => {
     }
   })
 
-  it('performs structural checks for a foreign platform without executing it', () => {
+  it('rejects unapproved runtime files even when they are not forbidden names', () => {
     const root = artifactRoot()
     writeArtifact(root)
-    const foreignBinary = path.join(root, 'bin', 'freshell-server.exe')
-    writeFileSync(path.join(root, 'bin', 'freshell-server'), Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
-    writeFileSync(foreignBinary, Buffer.concat([Buffer.from('MZ'), Buffer.alloc(32)]))
+    const extra = path.join(root, 'unapproved-runtime', 'server.js')
+    mkdirSync(path.dirname(extra), { recursive: true })
+    writeFileSync(extra, 'export {}\n')
+
+    expect(() => verifyElectronArtifact(root, 'linux', {
+      probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }),
+    })).toThrow(/unapproved/i)
+  })
+
+  it('performs structural checks for a foreign platform without executing it', () => {
+    const root = artifactRoot()
+    writeArtifact(root, 'win32')
     const probe = () => { throw new Error('foreign binary must not execute locally') }
     expect(verifyElectronArtifact(root, 'win32', { probe })).toMatchObject({ ok: true, executed: false })
   })

@@ -66,7 +66,113 @@ export const RUNTIME_LAYOUT = Object.freeze({
   mcpLock: 'mcp/package-lock.json',
   mcpDependencies: 'mcp/node_modules',
   nodeClientRuntime: 'node-client-runtime',
+  receipt: '.electron-runtime-receipt.json',
+  electronArchive: 'app.asar',
+  electronUnpackedClaudeSdk: 'app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk',
+  launchChooser: 'launch-chooser',
+  trayAssets: 'assets',
 })
+
+export interface RuntimeAllowlist {
+  /** Platform-specific executable paths. */
+  serverBinary: string
+  nodeBinary: string
+  /** Files which may exist at the runtime root or outside recursive trees. */
+  exactFiles: readonly string[]
+  /** Directory prefixes whose complete contents are part of the runtime. */
+  recursiveDirectories: readonly string[]
+  /** Files required before an artifact can be considered runnable. */
+  requiredFiles: readonly string[]
+}
+
+/**
+ * The single runtime/artifact path contract shared by the producer and verifier.
+ *
+ * Recursive entries are intentional: client assets and the locked sidecar/MCP
+ * dependency trees contain many files. Everything else must be named here or
+ * the verifier rejects it, including an otherwise innocuous extra script. The
+ * Electron-only entries account for the app archive, tray/chooser resources,
+ * and the SDK package that electron-builder unpacks from the app archive.
+ */
+export function getRuntimeAllowlist(
+  platform: ElectronRuntimePlatform | string,
+): RuntimeAllowlist {
+  assertPlatform(platform)
+  const serverBinary = platform === 'win32'
+    ? RUNTIME_LAYOUT.serverBinaryWindows
+    : RUNTIME_LAYOUT.serverBinary
+  const nodeBinary = platform === 'win32'
+    ? RUNTIME_LAYOUT.nodeBinaryWindows
+    : RUNTIME_LAYOUT.nodeBinary
+  const requiredFiles = [
+    serverBinary,
+    nodeBinary,
+    RUNTIME_LAYOUT.clientIndex,
+    RUNTIME_LAYOUT.claudeEntry,
+    RUNTIME_LAYOUT.claudePackage,
+    RUNTIME_LAYOUT.claudeLock,
+    `${RUNTIME_LAYOUT.claudeDependencies}/@anthropic-ai/claude-agent-sdk/package.json`,
+    RUNTIME_LAYOUT.mcpEntry,
+    RUNTIME_LAYOUT.mcpPackage,
+    RUNTIME_LAYOUT.mcpLock,
+    `${RUNTIME_LAYOUT.mcpDependencies}/@modelcontextprotocol/sdk/package.json`,
+    `${RUNTIME_LAYOUT.mcpDependencies}/zod/package.json`,
+    `${RUNTIME_LAYOUT.nodeClientRuntime}/keys.js`,
+    `${RUNTIME_LAYOUT.nodeClientRuntime}/action-capabilities.js`,
+  ]
+  return Object.freeze({
+    serverBinary,
+    nodeBinary,
+    exactFiles: Object.freeze([
+      serverBinary,
+      nodeBinary,
+      RUNTIME_LAYOUT.receipt,
+      RUNTIME_LAYOUT.electronArchive,
+    ]),
+    recursiveDirectories: Object.freeze([
+      path.posix.dirname(RUNTIME_LAYOUT.clientIndex),
+      path.posix.dirname(RUNTIME_LAYOUT.claudeEntry),
+      path.posix.dirname(RUNTIME_LAYOUT.mcpEntry),
+      RUNTIME_LAYOUT.nodeClientRuntime,
+      RUNTIME_LAYOUT.electronUnpackedClaudeSdk,
+      RUNTIME_LAYOUT.launchChooser,
+      RUNTIME_LAYOUT.trayAssets,
+    ]),
+    requiredFiles: Object.freeze(requiredFiles),
+  })
+}
+
+function normalizeRuntimePath(relativePath: string): string | undefined {
+  const slashPath = relativePath.replaceAll('\\', '/')
+  if (!slashPath || slashPath.startsWith('/') || slashPath.includes('\u0000')) return undefined
+  const normalized = path.posix.normalize(slashPath)
+  if (normalized !== slashPath || normalized === '..' || normalized.startsWith('../')) return undefined
+  return normalized
+}
+
+function matchesRuntimeAllowlist(relativePath: string, allowlist: RuntimeAllowlist): boolean {
+  const normalized = normalizeRuntimePath(relativePath)
+  if (!normalized) return false
+  if (allowlist.exactFiles.includes(normalized)) return true
+  return allowlist.recursiveDirectories.some((directory) => normalized.startsWith(`${directory}/`))
+}
+
+export function isRuntimePathAllowed(
+  relativePath: string,
+  platform: ElectronRuntimePlatform | string,
+): boolean {
+  return matchesRuntimeAllowlist(relativePath, getRuntimeAllowlist(platform))
+}
+
+export function findUnapprovedRuntimePaths(
+  relativePaths: string[],
+  platform: ElectronRuntimePlatform | string,
+): string[] {
+  const allowlist = getRuntimeAllowlist(platform)
+  return relativePaths
+    .filter((relativePath) => !matchesRuntimeAllowlist(relativePath, allowlist))
+    .sort((a, b) => a.localeCompare(b))
+}
 
 /**
  * These names are rejected by the verifier even when nested below a benign
@@ -654,6 +760,10 @@ export async function stageElectronRuntime(
   copyMcp(mcpDistDir, paths.mcpDir, paths.nodeClientRuntimeDir, rootNodeModulesDir, sourceRootLock, rootPackageJson, releaseVersion, platform, arch)
 
   const files = listFiles(runtimeDir)
+  const unapproved = findUnapprovedRuntimePaths(files, platform)
+  if (unapproved.length > 0) {
+    throw new Error(`Electron runtime staging produced unapproved files: ${unapproved.join(', ')}`)
+  }
   const fileHashes = Object.fromEntries(
     files.map((relativePath) => [relativePath, sha256File(path.join(runtimeDir, relativePath))]),
   )
