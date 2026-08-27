@@ -53,12 +53,12 @@
  *   CFG  src: ~/.codex/config.toml      (user, READ-ONLY)
  *   AUTH dst: <isoHOME>/.codex/auth.json     (isolated copy)
  *   CFG  dst: <isoHOME>/.codex/config.toml   (isolated copy)
- *   HOME    : TestServer(runtimeRootMode:'isolated') sets HOME=<isoHOME>. codex resolves
- *             CODEX_HOME as `process.env.CODEX_HOME || $HOME/.codex`
- *             (server/coding-cli/providers/codex.ts:26) and neither the server nor the
- *             app-server child sets CODEX_HOME (verified: parent env has it unset), so
- *             the codex app-server authenticates from and writes ALL rollout/session
- *             data under the isolated `<isoHOME>/.codex` — NEVER the user's real ~/.codex.
+ *   HOME    : `startExternalServer` creates <isoHOME> and applies HOME plus
+ *             CODEX_HOME=<isoHOME>/.codex to the owned Rust server process.
+ *             Its setupHome callback copies the credential and config before
+ *             startup, so the codex app-server authenticates from and writes ALL
+ *             rollout/session data under the isolated `<isoHOME>/.codex` — NEVER
+ *             the user's real ~/.codex.
  *   SANDBOX : permissionMode='never' (→ approvalPolicy 'never') + sandbox='read-only',
  *             so a pure-text turn can never hang on an interactive approval prompt nor
  *             write to the workspace while unattended.
