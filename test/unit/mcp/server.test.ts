@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createRequire } from 'module'
 import { resolve, dirname } from 'path'
@@ -27,7 +28,7 @@ vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
 vi.mock('@modelcontextprotocol/sdk/server/stdio.js', () => ({
   StdioServerTransport: mockStdioTransport,
 }))
-vi.mock('../../../../server/mcp/freshell-tool.js', () => ({
+vi.mock('../../../tools/freshell-mcp/freshell-tool.js', () => ({
   TOOL_DESCRIPTION: 'Test tool description',
   INSTRUCTIONS: 'Test instructions',
   INPUT_SCHEMA: {
@@ -61,7 +62,7 @@ describe('MCP server initialization', () => {
     vi.doMock('@modelcontextprotocol/sdk/server/stdio.js', () => ({
       StdioServerTransport: mockStdioTransport,
     }))
-    vi.doMock('../../../../server/mcp/freshell-tool.js', () => ({
+    vi.doMock('../../../tools/freshell-mcp/freshell-tool.js', () => ({
       TOOL_DESCRIPTION: 'Test tool description',
       INSTRUCTIONS: 'Test instructions',
       INPUT_SCHEMA: {
@@ -70,7 +71,7 @@ describe('MCP server initialization', () => {
       },
       executeAction: mockExecuteAction,
     }))
-    return import('../../../../server/mcp/server.js')
+    return import('../../../tools/freshell-mcp/server.js')
   }
 
   it('creates McpServer with name "freshell"', async () => {
@@ -143,8 +144,8 @@ describe('MCP server process-level smoke test', () => {
   it('spawns real MCP server and responds to JSON-RPC initialize', async () => {
     const { spawn } = await import('child_process')
     const __dirname = dirname(fileURLToPath(import.meta.url))
-    const repoRoot = resolve(__dirname, '..', '..', '..', '..')
-    const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
+    const repoRoot = resolve(__dirname, '..', '..', '..')
+    const serverPath = resolve(repoRoot, 'tools/freshell-mcp/server.ts')
     const tsxLoaderPath = resolveTsxLoaderPath()
 
     const child = spawn(process.execPath, ['--import', pathToFileURL(tsxLoaderPath).href, serverPath], {
@@ -237,8 +238,8 @@ describe('MCP server process-level smoke test', () => {
   it('MCP server does not write to stdout outside JSON-RPC', async () => {
     const { spawn } = await import('child_process')
     const __dirname = dirname(fileURLToPath(import.meta.url))
-    const repoRoot = resolve(__dirname, '..', '..', '..', '..')
-    const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
+    const repoRoot = resolve(__dirname, '..', '..', '..')
+    const serverPath = resolve(repoRoot, 'tools/freshell-mcp/server.ts')
     const tsxLoaderPath = resolveTsxLoaderPath()
 
     const child = spawn(process.execPath, ['--import', pathToFileURL(tsxLoaderPath).href, serverPath], {

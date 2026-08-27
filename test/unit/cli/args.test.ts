@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest'
-import { parseArgs } from '../../../server/cli/args'
+import { parseArgs } from '../../../tools/freshell-cli/args'
 
 it('parses subcommand and options', () => {
   const parsed = parseArgs(['send-keys', '-t', 'alpha.0', 'C-c'])

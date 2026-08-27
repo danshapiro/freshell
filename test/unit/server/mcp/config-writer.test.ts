@@ -243,11 +243,11 @@ describe('generateMcpInjection -- per-agent config', () => {
 
     it('returns production path when NODE_ENV=production and the built server exists', async () => {
       process.env.NODE_ENV = 'production'
-      mockFs.existsSync.mockImplementation((filePath: string) => toPosixPath(filePath).endsWith('dist/server/mcp/server.js'))
+      mockFs.existsSync.mockImplementation((filePath: string) => toPosixPath(filePath).endsWith('dist/tools/freshell-mcp/server.js'))
       const { buildMcpServerCommandArgs } = await importModule()
       const args = buildMcpServerCommandArgs()
       expect(args).toHaveLength(1)
-      expect(toPosixPath(args[0])).toMatch(/dist\/server\/mcp\/server\.js$/)
+      expect(toPosixPath(args[0])).toMatch(/dist\/tools\/freshell-mcp\/server\.js$/)
     })
 
     it('falls back to the source server when NODE_ENV=production but dist is absent', async () => {
@@ -256,8 +256,8 @@ describe('generateMcpInjection -- per-agent config', () => {
       const { buildMcpServerCommandArgs } = await importModule()
       const args = buildMcpServerCommandArgs()
       expect(args).toContain('--import')
-      expect(args.some((a: string) => toPosixPath(a).includes('server/mcp/server.ts'))).toBe(true)
-      expect(args.some((a: string) => toPosixPath(a).includes('dist/server/mcp/server.js'))).toBe(false)
+      expect(args.some((a: string) => toPosixPath(a).includes('tools/freshell-mcp/server.ts'))).toBe(true)
+      expect(args.some((a: string) => toPosixPath(a).includes('dist/tools/freshell-mcp/server.js'))).toBe(false)
     })
   })
 })
@@ -283,7 +283,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
 
   it('uses built path when NODE_ENV is production', async () => {
     process.env.NODE_ENV = 'production'
-    mockFs.existsSync.mockImplementation((filePath: string) => toPosixPath(filePath).endsWith('dist/server/mcp/server.js'))
+    mockFs.existsSync.mockImplementation((filePath: string) => toPosixPath(filePath).endsWith('dist/tools/freshell-mcp/server.js'))
     const { generateMcpInjection } = await importModule()
     generateMcpInjection('claude', 'term-prod')
     const writeCall = mockFs.writeFileSync.mock.calls.find(
@@ -292,7 +292,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
     expect(writeCall).toBeDefined()
     const parsed = JSON.parse(writeCall![1])
     const args = parsed.mcpServers.freshell.args as string[]
-    expect(args.some((a: string) => toPosixPath(a).includes('dist/server/mcp/server.js'))).toBe(true)
+    expect(args.some((a: string) => toPosixPath(a).includes('dist/tools/freshell-mcp/server.js'))).toBe(true)
     expect(args).not.toContain('--import')
   })
 
@@ -308,7 +308,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
     const args = parsed.mcpServers.freshell.args as string[]
     expect(args).toContain('--import')
     expect(args[args.indexOf('--import') + 1]).toContain('tsx')
-    expect(args.some((a: string) => toPosixPath(a).includes('server/mcp/server.ts'))).toBe(true)
+    expect(args.some((a: string) => toPosixPath(a).includes('tools/freshell-mcp/server.ts'))).toBe(true)
   })
 })
 

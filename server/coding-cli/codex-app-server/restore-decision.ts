@@ -1,4 +1,6 @@
 import type { SessionRef } from '../../../shared/session-contract.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../../tools/node-client-runtime/codex-restore-contract.js'
+export { INVALID_RAW_CODEX_RESUME_MESSAGE }
 import type { CodexCandidateIdentity, CodexDurabilityRef } from '../../../shared/codex-durability.js'
 
 type MaybePromise<T> = T | Promise<T>
@@ -24,8 +26,6 @@ export type CodexCreateRestorePlan =
 export type CodexCreateRestoreDecision<TLiveTerminal extends CodexLiveRestoreTerminal = CodexLiveRestoreTerminal> =
   | CodexCreateRestorePlan
 
-export const INVALID_RAW_CODEX_RESUME_MESSAGE =
-  'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.'
 
 export const MISSING_CODEX_SESSION_REF_MESSAGE = 'Restore requires a canonical session reference.'
 

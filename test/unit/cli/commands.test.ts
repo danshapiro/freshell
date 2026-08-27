@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
-import { runCommand } from '../../../server/cli/commands/sendKeys'
+import { runCommand } from '../../../tools/freshell-cli/commands/sendKeys'
 import {
   runListSessionsCommand,
   runSearchSessionsCommand,
-} from '../../../server/cli/index.js'
+} from '../../../tools/freshell-cli/index.js'
 import { createCliCommandHarness } from '../../helpers/visible-first/cli-command-harness.js'
 
 describe('CLI commands', () => {

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 describe('resolveConfig', () => {
@@ -11,7 +12,7 @@ describe('resolveConfig', () => {
   it('reads FRESHELL_URL and FRESHELL_TOKEN from environment', async () => {
     process.env.FRESHELL_URL = 'http://myhost:4000'
     process.env.FRESHELL_TOKEN = 'abc123'
-    const { resolveConfig } = await import('../../../../server/mcp/http-client.js')
+    const { resolveConfig } = await import('../../../tools/freshell-mcp/http-client.js')
     const config = resolveConfig()
     expect(config).toEqual({ url: 'http://myhost:4000', token: 'abc123' })
   })
@@ -19,7 +20,7 @@ describe('resolveConfig', () => {
   it('defaults to http://localhost:3001 when FRESHELL_URL not set', async () => {
     delete process.env.FRESHELL_URL
     delete process.env.FRESHELL_TOKEN
-    const { resolveConfig } = await import('../../../../server/mcp/http-client.js')
+    const { resolveConfig } = await import('../../../tools/freshell-mcp/http-client.js')
     const config = resolveConfig()
     expect(config.url).toBe('http://localhost:3001')
     expect(config.token).toBe('')
@@ -28,7 +29,7 @@ describe('resolveConfig', () => {
   it('defaults token to empty string when FRESHELL_TOKEN not set', async () => {
     process.env.FRESHELL_URL = 'http://host:3001'
     delete process.env.FRESHELL_TOKEN
-    const { resolveConfig } = await import('../../../../server/mcp/http-client.js')
+    const { resolveConfig } = await import('../../../tools/freshell-mcp/http-client.js')
     const config = resolveConfig()
     expect(config.token).toBe('')
   })
@@ -53,7 +54,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: 'mytoken' })
     await client.get('/api/health')
     expect(mockFetch).toHaveBeenCalledOnce()
@@ -66,7 +67,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     await client.get('/api/health')
     const [, init] = mockFetch.mock.calls[0]
@@ -78,7 +79,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/health')
     expect(result).toEqual({ ok: true })
@@ -89,7 +90,7 @@ describe('createApiClient', () => {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     try {
       await client.get('/api/health')
@@ -105,7 +106,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     await client.post('/api/tabs', { name: 'Test' })
     const [, init] = mockFetch.mock.calls[0]
@@ -119,7 +120,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     await client.patch('/api/tabs/t1', { name: 'New' })
     const [, init] = mockFetch.mock.calls[0]
@@ -131,7 +132,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     await client.delete('/api/tabs/t1')
     const [, init] = mockFetch.mock.calls[0]
@@ -143,7 +144,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001/', token: '' })
     await client.get('/api/health')
     const [url] = mockFetch.mock.calls[0]
@@ -155,7 +156,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/tabs')
     // data should be unwrapped, but status should be preserved for callers
@@ -175,7 +176,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/search')
     expect(result).toHaveProperty('status', 'approximate')
@@ -189,7 +190,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/health')
     expect(result).toEqual({ ok: true })
@@ -200,7 +201,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'text/plain' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/panes/p1/capture')
     expect(result).toBe('terminal output')
@@ -215,7 +216,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/panes/p1/navigate')
     // Must not be null/undefined -- should return the message or an empty object
@@ -230,7 +231,7 @@ describe('createApiClient', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const { createApiClient } = await import('../../../../server/mcp/http-client.js')
+    const { createApiClient } = await import('../../../tools/freshell-mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/some-action')
     expect(result).not.toBeNull()

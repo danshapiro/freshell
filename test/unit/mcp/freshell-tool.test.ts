@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const mockClient = vi.hoisted(() => ({
@@ -7,12 +8,12 @@ const mockClient = vi.hoisted(() => ({
   delete: vi.fn(),
 }))
 
-vi.mock('../../../../server/mcp/http-client.js', () => ({
+vi.mock('../../../tools/freshell-mcp/http-client.js', () => ({
   resolveConfig: () => ({ url: 'http://localhost:3001', token: 'test' }),
   createApiClient: () => mockClient,
 }))
 
-import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../../server/mcp/freshell-tool.js'
+import { TOOL_DESCRIPTION, INPUT_SCHEMA, executeAction } from '../../../tools/freshell-mcp/freshell-tool.js'
 
 beforeEach(() => {
   mockClient.get.mockReset()
@@ -233,7 +234,7 @@ describe('executeAction -- tab actions', () => {
     }))
   })
 
-  it('new-tab with agent: codex rejects raw resume ids (same guard as mode: codex)', async () => {
+  it('new-tab with agent: codex is locally rejected by the Rust capability contract', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
     const result = await executeAction('new-tab', {
@@ -241,14 +242,11 @@ describe('executeAction -- tab actions', () => {
       resume: 'thread-pre-durable',
     })
 
-    expect(result).toEqual({
-      error: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
-      hint: 'Use sessionRef: { provider: "codex", sessionId } after Codex identity is durable.',
-    })
+    expect(result).toEqual(expect.objectContaining({ error: "Only agent 'opencode' is supported with the Rust Freshell server." }))
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 
-  it.each(['claude', 'kilroy'])('new-tab with agent: %s does not synthesize a sessionRef from resume', async (agent) => {
+  it.each(['claude', 'kilroy'])('new-tab with agent: %s is locally rejected by the Rust capability contract', async (agent) => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
     await executeAction('new-tab', {
@@ -256,10 +254,7 @@ describe('executeAction -- tab actions', () => {
       resume: '550e8400-e29b-41d4-a716-446655440000',
     })
 
-    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ agent }))
-    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('sessionRef')
-    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resume')
-    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 
   it('list-tabs calls GET /api/tabs', async () => {
@@ -605,13 +600,10 @@ describe('executeAction -- terminal I/O', () => {
     expect(mockClient.get).toHaveBeenCalledWith(expect.stringMatching(/\/api\/panes\/p1\/wait-for/))
   })
 
-  it('run calls POST /api/run with command and options', async () => {
+  it('run is locally rejected without an HTTP call', async () => {
     mockClient.post.mockResolvedValue({ output: 'ok', exitCode: 0 })
     await executeAction('run', { command: 'npm test', capture: true })
-    expect(mockClient.post).toHaveBeenCalledWith(
-      '/api/run',
-      expect.objectContaining({ command: 'npm test', capture: true }),
-    )
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 
   it('summarize resolves pane to terminalId and calls POST /api/ai/terminals/:terminalId/summary', async () => {
@@ -644,13 +636,10 @@ describe('executeAction -- additional terminal I/O', () => {
     expect(mockClient.get).toHaveBeenCalledWith('/api/terminals')
   })
 
-  it('attach calls POST /api/panes/:id/attach with terminalId', async () => {
+  it('attach is locally rejected without an HTTP call', async () => {
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('attach', { target: 'p1', terminalId: 'term-1' })
-    expect(mockClient.post).toHaveBeenCalledWith(
-      expect.stringContaining('/api/panes/p1/attach'),
-      expect.objectContaining({ terminalId: 'term-1' }),
-    )
+    expect(mockClient.post).not.toHaveBeenCalled()
   })
 
   it('lan-info calls GET /api/lan-info', async () => {

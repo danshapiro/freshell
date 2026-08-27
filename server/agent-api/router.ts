@@ -12,7 +12,7 @@ import {
   getCodexSessionBindingReason,
   normalizeCodexSandboxSetting,
 } from '../coding-cli/codex-launch-config.js'
-import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../../tools/node-client-runtime/codex-restore-contract.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { buildSessionIdentityMismatchDetails, terminalMatchesExpectedSession } from '../terminal-session-identity.js'
@@ -25,7 +25,7 @@ import { resolveScreenshotOutputPath } from './screenshot-path.js'
 import { sanitizeSessionRef } from '../../shared/session-contract.js'
 import type { LayoutStore } from './layout-store.js'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
-import { translateKeys } from '../cli/keys.js'
+import { translateKeys } from '../../tools/node-client-runtime/keys.js'
 import type {
   FreshAgentSessionLocator,
   FreshAgentThreadLocator,

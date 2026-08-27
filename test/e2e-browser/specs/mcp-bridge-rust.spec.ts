@@ -11,8 +11,8 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76 "QA-Lever Design",
  * \u00a78.3 "One MCP smoke").
  *
- * Proves the legacy Node MCP stdio binary (`server/mcp/` -- FROZEN, consumed
- * here ONLY as the already-BUILT `dist/server/mcp/server.js`, never edited)
+ * Proves the retained standalone MCP stdio binary under `tools/freshell-mcp/`
+ * through its built `dist/tools/freshell-mcp/server.js` entrypoint.
  * drives an OWNED, ephemeral Rust `freshell-server` end-to-end over its REAL
  * stdio JSON-RPC wire protocol, with ZERO Rust-side MCP code. This is the
  * "zero-Rust-MCP" QA lever the spec's \u00a76.2 describes: the moment the Rust
@@ -48,7 +48,7 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
   test('unmodified legacy MCP stdio binary drives an ephemeral Rust server end-to-end', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-bridge-rust] npm run build:server completed in ${buildMs}ms (dist/server/mcp/server.js)`)
+    console.error(`[mcp-bridge-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()

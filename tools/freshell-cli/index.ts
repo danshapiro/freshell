@@ -3,11 +3,11 @@ import { pathToFileURL } from 'node:url'
 import { parseArgs } from './args.js'
 import { createHttpClient } from './http.js'
 import { writeError, writeJson, writeText } from './output.js'
-import { resolveConfig } from './config.js'
+import { resolveClientConfig } from '../node-client-runtime/config.js'
 import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
-import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -148,7 +148,7 @@ function resolveSessionRefFlag(mode: unknown, raw: unknown): { rejected: boolean
 
 // `--resume <sid>` is promoted to the canonical `sessionRef {provider: mode,
 // sessionId}` before it hits the wire — exactly like the MCP freshell tool
-// (server/mcp/freshell-tool.ts new-tab) — so the CLI never sends the legacy
+// (the MCP freshell tool's new-tab action) — so the CLI never sends the legacy
 // `resumeSessionId` field. An explicit `--session-ref` wins; codex is
 // rejected earlier by rejectRawCodexResume. Without a mode there is no
 // provider to promote with, so the flag combination is refused loudly rather
@@ -311,7 +311,7 @@ export async function runSearchSessionsCommand(
 }
 
 async function handleDisplay(format: string, target: string | undefined, client: ReturnType<typeof createHttpClient>) {
-  const config = resolveConfig()
+  const config = resolveClientConfig()
   const resolved = await resolvePaneTarget(client, target)
   const tab = resolved.tab
   const pane = resolved.pane

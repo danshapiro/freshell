@@ -60,7 +60,7 @@ fn mcp_unix_args() -> Vec<McpServerArg> {
     vec![
         McpServerArg::Literal("--import".to_string()),
         McpServerArg::Path("/repo/node_modules/tsx/dist/loader.mjs".to_string()),
-        McpServerArg::Path("/repo/server/mcp/server.ts".to_string()),
+        McpServerArg::Path("/repo/tools/freshell-mcp/server.ts".to_string()),
     ]
 }
 
@@ -87,7 +87,7 @@ fn claude_writes_tmp_json_0600_pretty_two_space() {
     );
     assert!(inj.env.is_empty());
     let written = std::fs::read_to_string(&expected_path).unwrap();
-    let expected_json = "{\n  \"mcpServers\": {\n    \"freshell\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"--import\",\n        \"/repo/node_modules/tsx/dist/loader.mjs\",\n        \"/repo/server/mcp/server.ts\"\n      ]\n    }\n  }\n}";
+    let expected_json = "{\n  \"mcpServers\": {\n    \"freshell\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"--import\",\n        \"/repo/node_modules/tsx/dist/loader.mjs\",\n        \"/repo/tools/freshell-mcp/server.ts\"\n      ]\n    }\n  }\n}";
     assert_eq!(written, expected_json);
     #[cfg(unix)]
     {
@@ -145,7 +145,7 @@ fn g_x4_codex_windows_target_on_wsl_unc_toml() {
     assert_eq!(inj.args[2], "-c");
     assert_eq!(
         inj.args[3],
-        "mcp_servers.freshell.args=[\"--import\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\server\\\\mcp\\\\server.ts\"]"
+        "mcp_servers.freshell.args=[\"--import\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\tools\\\\freshell-mcp\\\\server.ts\"]"
     );
 }
 
@@ -157,7 +157,7 @@ fn codex_unix_target_on_wsl_keeps_host_paths() {
     let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
     assert_eq!(
         inj.args[3],
-        "mcp_servers.freshell.args=[\"--import\", \"/repo/node_modules/tsx/dist/loader.mjs\", \"/repo/server/mcp/server.ts\"]"
+        "mcp_servers.freshell.args=[\"--import\", \"/repo/node_modules/tsx/dist/loader.mjs\", \"/repo/tools/freshell-mcp/server.ts\"]"
     );
 }
 
@@ -258,7 +258,7 @@ fn opencode_merge_refcount_and_cleanup_lifecycle() {
             "node",
             "--import",
             "/repo/node_modules/tsx/dist/loader.mjs",
-            "/repo/server/mcp/server.ts"
+            "/repo/tools/freshell-mcp/server.ts"
         ])
     );
     let sidecar = read_sidecar(&cwd).unwrap();

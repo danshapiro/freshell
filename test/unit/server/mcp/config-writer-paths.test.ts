@@ -62,7 +62,7 @@ describe('config-writer path verification', () => {
       expect(loaderPath).toContain('tsx')
       expect(fs.existsSync(loaderPath)).toBe(true)
 
-      const serverPath = args.find((a: string) => toPosixPath(a).includes('server/mcp/server.ts'))
+      const serverPath = args.find((a: string) => toPosixPath(a).includes('tools/freshell-mcp/server.ts'))
       expect(serverPath).toBeDefined()
       expect(fs.existsSync(serverPath!)).toBe(true)
 

@@ -88,7 +88,7 @@ pub enum LaunchIntent {
     Resume,
 }
 
-/// `McpInjection` (`server/mcp/config-writer.ts:247-250`) — the per-mode MCP
+/// `McpInjection` (the retained standalone MCP client) — the per-mode MCP
 /// config injection result, precomputed by the IO layer
 /// ([`crate::mcp_inject::generate_mcp_injection`]) and consumed by
 /// [`resolve_coding_cli_command`].

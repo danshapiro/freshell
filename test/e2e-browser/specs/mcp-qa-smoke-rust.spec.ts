@@ -11,8 +11,8 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * MCP QA SMOKE -- the full-mode-matrix payoff of the QA lever (Slice 2 of
  * `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76/\u00a78.3, which
  * `mcp-bridge-rust.spec.ts` pins for `mode:"shell"` only). This spec drives
- * the SAME unmodified legacy Node MCP stdio binary (`dist/server/mcp/server.js`,
- * built from the FROZEN `server/mcp/` -- never edited) against ONE owned,
+ * the retained standalone Node MCP stdio binary (`dist/tools/freshell-mcp/server.js`)
+ * against one owned,
  * ephemeral Rust `freshell-server`, but exercises EVERY pane mode the Rust
  * Slice-1/3a/3b REST surface now supports: shell, amplifier (fresh + resume),
  * opencode (fresh), codex (fresh + resume-via-sessionRef), browser, editor,
@@ -68,7 +68,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
   test('the unmodified legacy MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-qa-smoke-rust] npm run build:server completed in ${buildMs}ms (dist/server/mcp/server.js)`)
+    console.error(`[mcp-qa-smoke-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-mcp-qa-smoke-'))
     const binDir = path.join(sharedRoot, 'bin')
@@ -119,7 +119,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       // -----------------------------------------------------------------
       // 1. SHELL (control) -- already pinned end-to-end by
       //    `mcp-bridge-rust.spec.ts`; one quick assertion here just proves
-      //    this suite's OWN server/mcp wiring is sound before moving to the
+      //    this suite's standalone MCP wiring is sound before moving to the
       //    modes that suite doesn't cover.
       // -----------------------------------------------------------------
       const shellTab = await mcp.callFreshellAction('new-tab', { mode: 'shell', cwd: sharedRoot })
@@ -246,7 +246,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       // -----------------------------------------------------------------
       // 4. CODEX -- fresh launch, THEN resume via the `sessionRef` param
       //    directly (NOT the raw `resume` string -- `rejectRawCodexResume`
-      //    in `server/mcp/freshell-tool.ts` rejects a raw codex
+      //    in the standalone MCP tool rejects a raw codex
       //    `resume`/`resumeSessionId` with no matching `sessionRef` outright,
       //    mirrored by the Rust `requested_resume_session_id_for_mode`).
       //    The current dist MCP binary's `new-tab` DOES accept an explicit
