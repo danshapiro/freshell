@@ -174,6 +174,11 @@ export const MATRIX_SPECS = [
 // Exported (no behavior change) so test/e2e-browser/playwright.gate01.config.ts
 // (GATE-01) can testIgnore the SAME array instead of drifting a copy.
 export const RUST_ONLY_SPECS = [
+  // Task 2 retirement coverage: drives the compiled standalone CLI against
+  // an owned Rust server and asserts its Rust-only unsupported-action wall.
+  // Keep it out of match-all legacy projects until the temporary dual-project
+  // layout is collapsed in Task 4.
+  /cli-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
@@ -381,6 +386,10 @@ export default defineConfig({
         // against an owned, ephemeral Rust server. Rust-only (no legacy
         // equivalent needed -- see the spec's own doc comment in that file).
         /mcp-bridge-rust\.spec\.ts$/,
+        // Task 2 retirement proof: compiled standalone CLI against an owned
+        // Rust backend. It is also listed in RUST_ONLY_SPECS so match-all
+        // legacy projects can never collect it.
+        /cli-rust\.spec\.ts$/,
         // MCP QA smoke (the QA-lever payoff): full mode-matrix coverage
         // (shell/amplifier/opencode/codex/browser/editor/pane-ops) driven
         // through the same unmodified legacy MCP stdio binary. See

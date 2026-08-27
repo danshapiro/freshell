@@ -80,7 +80,7 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 
-  // Regression coverage for a production incident: the CLI (server/cli/index.ts)
+  // Regression coverage for a production incident: the CLI (tools/freshell-cli/index.ts)
   // and the REST route (POST /api/tabs) both use the field name `resumeSessionId`
   // -- and it's the exact field name the server itself returns/broadcasts on
   // created panes (see server/agent-api/router.ts `paneContent?.resumeSessionId`).
@@ -1242,7 +1242,7 @@ describe('executeAction -- pane title matching', () => {
 
 describe('executeAction -- new-tab with prompt sends keys', () => {
   it('new-tab with prompt sends keys to the newly created pane', async () => {
-    // The CLI (server/cli/index.ts:318) sends the prompt via send-keys after tab creation.
+    // The CLI (tools/freshell-cli/index.ts) sends the prompt via send-keys after tab creation.
     // The MCP tool must replicate this behavior.
     mockClient.post.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
@@ -1297,7 +1297,7 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
 
 describe('executeAction -- ambiguous pane title error', () => {
   it('resolvePaneTarget returns error when multiple panes share the same title and suggests using pane ID', async () => {
-    // CLI returns an explicit ambiguity error (server/cli/targets.ts:68).
+    // CLI returns an explicit ambiguity error (tools/freshell-cli/targets.ts).
     // MCP tool must do the same, not silently pick the first match.
     // Review fix: error message must suggest using the pane ID directly, NOT tab.pane syntax.
     mockClient.get.mockImplementation((path: string) => {

@@ -8,6 +8,7 @@ import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
+import { unsupportedActionResult } from '../node-client-runtime/action-capabilities.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -275,6 +276,37 @@ export function sessionDirectoryPageToSearchResponse(page: SessionDirectoryPage,
   }
 }
 
+/**
+ * The Rust session directory is cursor-paged. CLI list/search are user-facing
+ * complete views, so consume each cursor rather than silently presenting only
+ * the first page. A repeated cursor is a broken server contract; stop loudly
+ * instead of looping forever in an unattended CLI invocation.
+ */
+async function fetchAllSessionDirectoryPages(
+  client: ReturnType<typeof createHttpClient>,
+  initialPath: string,
+  maxPages = 100,
+): Promise<SessionDirectoryPage> {
+  const items: SessionDirectoryItem[] = []
+  const seenCursors = new Set<string>()
+  let path = initialPath
+  let revision = 0
+
+  for (let pageCount = 0; pageCount < maxPages; pageCount += 1) {
+    const page = await client.get<SessionDirectoryPage>(path)
+    items.push(...page.items)
+    revision = page.revision
+    if (!page.nextCursor) return { items, nextCursor: null, revision }
+    if (seenCursors.has(page.nextCursor)) {
+      throw new Error('session-directory returned a repeated cursor')
+    }
+    seenCursors.add(page.nextCursor)
+    path = `${initialPath}&cursor=${encodeURIComponent(page.nextCursor)}`
+  }
+
+  throw new Error(`session-directory exceeded ${maxPages} pages`)
+}
+
 export async function runListSessionsCommand(
   client: ReturnType<typeof createHttpClient>,
   writer: CliCommandWriter = {
@@ -285,7 +317,7 @@ export async function runListSessionsCommand(
     },
   },
 ) {
-  const page = await client.get<SessionDirectoryPage>('/api/session-directory?priority=visible')
+  const page = await fetchAllSessionDirectoryPages(client, '/api/session-directory?priority=visible')
   writer.writeJson(sessionDirectoryPageToProjects(page))
 }
 
@@ -306,7 +338,10 @@ export async function runSearchSessionsCommand(
     return
   }
 
-  const page = await client.get<SessionDirectoryPage>(`/api/session-directory?priority=visible&query=${encodeURIComponent(query)}`)
+  const page = await fetchAllSessionDirectoryPages(
+    client,
+    `/api/session-directory?priority=visible&query=${encodeURIComponent(query)}`,
+  )
   writer.writeJson(sessionDirectoryPageToSearchResponse(page, query))
 }
 
@@ -358,6 +393,13 @@ async function main() {
   if (aliasNotice) writeError(aliasNotice)
 
   const command = aliases[parsed.command] || parsed.command
+  const unsupported = unsupportedActionResult(parsed.command)
+  if (unsupported) {
+    writeError(unsupported.error)
+    writeError(unsupported.hint)
+    process.exitCode = 2
+    return
+  }
   const flags = parsed.flags
   const args = parsed.args
   const client = createHttpClient()
