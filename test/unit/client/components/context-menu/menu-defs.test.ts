@@ -126,6 +126,19 @@ function createMockContext(actions: MenuActions): MenuBuildContext {
 }
 
 describe('buildMenuItems — pane context menu', () => {
+  it('omits Node-only external editor and reveal entries', () => {
+    const actions = createMockActions()
+    const context = createMockContext(actions)
+    context.paneLayouts.tab1 = {
+      type: 'leaf', id: 'pane1', content: { kind: 'editor', filePath: '/tmp/a.md', content: '', language: 'markdown' },
+    }
+    const items = buildMenuItems({ kind: 'editor', tabId: 'tab1', paneId: 'pane1' }, context)
+    const ids = items.filter((item) => item.type === 'item').map((item) => item.id)
+    expect(ids).not.toContain('editor-open')
+    expect(ids).not.toContain('editor-reveal')
+    expect(ids).toContain('editor-save')
+  })
+
   it('pane context menu includes split right and split down', () => {
     const mockActions = createMockActions()
     const mockContext = createMockContext(mockActions)

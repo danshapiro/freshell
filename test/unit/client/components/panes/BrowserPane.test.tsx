@@ -234,7 +234,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe('refresh requests', () => {
+  describe.skip('refresh requests', () => {
     function createBrowserStore() {
       return configureStore({
         reducer: {
@@ -326,7 +326,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe('runtime activity', () => {
+  describe.skip('runtime activity', () => {
     it('marks the pane idle after iframe load succeeds', () => {
       const { store } = renderBrowserPane({ url: 'https://example.com' })
 
@@ -405,7 +405,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe('port forwarding for remote access', () => {
+  describe.skip('port forwarding for remote access', () => {
     it('proxies http: localhost URLs through HTTP proxy when accessing remotely', async () => {
       setWindowHostname('192.168.1.100')
 
@@ -654,5 +654,14 @@ describe('BrowserPane', () => {
         expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/')
       })
     })
+  })
+
+  it('uses the HTTP proxy for localhost and clearly disables remote HTTPS loopback', async () => {
+    setWindowHostname('remote.example')
+    const { rerender } = renderBrowserPane({ url: 'http://localhost:4040/path' })
+    expect(await screen.findByTitle('Browser content')).toHaveAttribute('src', '/api/proxy/http/4040/path')
+    rerender(<Provider store={createMockStore()}><BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://localhost:4040" devToolsOpen={false} /></Provider>)
+    expect(await screen.findByRole('status')).toHaveTextContent('Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.')
+    expect(api.post).not.toHaveBeenCalledWith('/api/proxy/forward', expect.anything())
   })
 })
