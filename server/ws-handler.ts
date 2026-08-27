@@ -11,6 +11,7 @@ import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCom
 import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
+import { isReachableDirectorySync } from './path-utils.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { makeSessionKey, type CodingCliProviderName, type ProjectGroup } from './coding-cli/types.js'
 import { isOpencodeSubagentSessionWithDeadline } from './coding-cli/providers/opencode-subagent-query.js'
@@ -322,6 +323,29 @@ function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
   if (!cleaned) return undefined
   if (cleaned.length <= TERMINAL_FAILURE_SUMMARY_MAX_CHARS) return cleaned
   return `...${cleaned.slice(-TERMINAL_FAILURE_SUMMARY_MAX_CHARS)}`
+}
+
+/**
+ * Replayed creates (restore after a server restart, or fresh recovery after a
+ * restore became unavailable) carry the client-persisted pane `initialCwd`,
+ * which can point at a directory that no longer exists (for example a prior
+ * server's HOME). Passing it through verbatim dies later in provider spawn
+ * prep — OpenCode MCP config injection throws `cwd directory does not exist`
+ * and the pane never recovers. Interactive creates keep the deliberate
+ * clear-error behavior, so validation is scoped to replays: an unreachable
+ * replayed cwd is dropped here and the registry's default chain
+ * (configured defaultCwd → home) supplies a live directory instead.
+ */
+function resolveReplayedCreateCwd(input: {
+  cwd: string | undefined
+  restoreRequested: boolean
+  recoveryIntent: 'fresh_after_restore_unavailable' | undefined
+}): { cwd: string | undefined; droppedStaleCwd: string | undefined } {
+  if (!input.cwd) return { cwd: input.cwd, droppedStaleCwd: undefined }
+  const replayed = input.restoreRequested || input.recoveryIntent != null
+  if (!replayed) return { cwd: input.cwd, droppedStaleCwd: undefined }
+  if (isReachableDirectorySync(input.cwd).ok) return { cwd: input.cwd, droppedStaleCwd: undefined }
+  return { cwd: undefined, droppedStaleCwd: input.cwd }
 }
 
 function formatExitedTerminalAttachMessage(record: Pick<TerminalRecord, 'title' | 'mode' | 'exitCode' | 'buffer'>): string {
@@ -2726,10 +2750,25 @@ export class WsHandler {
               const resumeTargetIsSubagent = requestedOpencodeTarget
                 ? await isOpencodeSubagentSessionWithDeadline(requestedOpencodeTarget)
                 : undefined
+              const replayedCwd = resolveReplayedCreateCwd({
+                cwd: m.cwd,
+                restoreRequested: m.restore === true,
+                recoveryIntent: m.recoveryIntent,
+              })
+              if (replayedCwd.droppedStaleCwd) {
+                log.warn({
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  mode: m.mode,
+                  staleCwd: replayedCwd.droppedStaleCwd,
+                  restore: m.restore === true,
+                  recoveryIntent: m.recoveryIntent ?? null,
+                }, 'terminal.create replay cwd no longer exists; falling back to default/home')
+              }
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
-                cwd: m.cwd,
+                cwd: replayedCwd.cwd,
                 resumeSessionId: effectiveResumeSessionId,
                 resumeTargetIsSubagent,
                 ...(terminalSessionBindingReason ? { sessionBindingReason: terminalSessionBindingReason } : {}),
@@ -2758,7 +2797,7 @@ export class WsHandler {
               }
               this.assertTerminalCreateAccepted()
 
-              if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
+              if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim() && !replayedCwd.droppedStaleCwd) {
                 const recentDirectory = m.cwd.trim()
                 void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
                   log.warn({ err, recentDirectory }, 'Failed to record recent directory')
