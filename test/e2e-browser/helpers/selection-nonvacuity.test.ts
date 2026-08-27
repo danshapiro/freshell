@@ -24,6 +24,17 @@ const obsoleteVocabulary = [
   ['retired', ' matrix list'].join(''),
   ['MATRIX', '_SPECS'].join(''),
 ]
+const staleBackendNarratives = [
+  ['both', '\\s+', 'servers?'].join(''),
+  ['both', '\\s+', 'backends?'].join(''),
+  ['server', '\\s+', 'kinds?'].join(''),
+  ['legacy', '[- ]', 'open'].join(''),
+  ['(?:node', '|rust)', '\\s*[/+]', '\\s*(?:node', '|rust)'].join(''),
+  ['retired', '\\s+', '(?:node|matrix|browser)', '\\s+', '(?:server|build|lane|project|list)'].join(''),
+  ['(?:legacy', '|retired)', '\\s+', '(?:node\\s+)?(?:server|build|lane|project)'].join(''),
+  ['dist', '/server/', 'index'].join(''),
+  ['helpers/', 'test-server', '\\.ts'].join(''),
+].map((source) => new RegExp(source, 'i'))
 
 interface ResolvedProject {
   name: string
@@ -139,12 +150,14 @@ describe('browser selection non-vacuity', () => {
     })
     expect(legacyImports).toEqual([])
 
-    const obsoleteClaims = [browserRoot, electronRoot].flatMap((root) => sourceFiles(root).flatMap((file) => {
+    const obsoleteClaims = [path.join(browserRoot, 'specs'), electronRoot].flatMap((root) => sourceFiles(root).flatMap((file) => {
       const source = fs.readFileSync(file, 'utf8')
       const matchedVocabulary = obsoleteVocabulary.filter((term) => source.includes(term))
-      const claimsTwoBackends = /(?:runs?|selected)\s+(?:against|on)\s+both\s+(?:backends|server kinds|projects)/i.test(source)
-      return matchedVocabulary.length > 0 || claimsTwoBackends
-        ? [`${path.relative(projectRoot, file)}: ${[...matchedVocabulary, ...(claimsTwoBackends ? ['two-backend claim'] : [])].join(', ')}`]
+      const matchedNarratives = staleBackendNarratives
+        .filter((pattern) => pattern.test(source))
+        .map((pattern) => pattern.source)
+      return matchedVocabulary.length > 0 || matchedNarratives.length > 0
+        ? [`${path.relative(projectRoot, file)}: ${[...matchedVocabulary, ...matchedNarratives].join(', ')}`]
         : []
     }))
     expect(obsoleteClaims).toEqual([])

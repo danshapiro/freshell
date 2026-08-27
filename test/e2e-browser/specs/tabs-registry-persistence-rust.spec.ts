@@ -356,14 +356,14 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     }
   })
 
-  test('corruption recovery matches Node semantics', async () => {
+  test('corruption recovery preserves established registry semantics', async () => {
     // Explicit homeDir (RustServer never deletes a caller-provided home), so
     // a SECOND server can boot on the same home after the first stops.
     const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-tabs-registry-e2e-'))
     const registryRoot = path.join(homeRoot, '.freshell', 'tabs-registry')
     const v1Dir = path.join(registryRoot, 'v1')
-    // `<store root>/tabs-registry.jsonl` (tabs_store.rs:215, Node
-    // store.ts:692). The sibling `<home>/.freshell/tabs-registry.jsonl` is
+    // `<store root>/tabs-registry.jsonl` (tabs_store.rs:215). The sibling
+    // `<home>/.freshell/tabs-registry.jsonl` is
     // asserted too, so the accounting holds even against a path regression.
     const legacyJsonlCandidates = [
       path.join(registryRoot, 'tabs-registry.jsonl'),

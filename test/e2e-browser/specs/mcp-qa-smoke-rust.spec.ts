@@ -61,7 +61,7 @@ async function readArgvLines(logPath: string): Promise<Array<{ argv: string[] }>
 test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
   test.setTimeout(170_000)
 
-  test('the unmodified legacy MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
+  test('the retained MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
     console.error(`[mcp-qa-smoke-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)

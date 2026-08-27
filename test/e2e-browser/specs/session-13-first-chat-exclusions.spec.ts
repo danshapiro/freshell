@@ -14,8 +14,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *   controls in A, assert exact membership in A and B, reload/restart, and
  *   verify the shared values and results persist."
  *
- * owned Rust server depending on the active project. Fixture shapes are
- * both servers' real parsers): a Claude `system/init` + user/assistant turn
+ * owned Rust server. Fixture shapes match the Rust session readers: a Claude `system/init` + user/assistant turn
  * pair + `summary` JSONL, a Codex `session_meta` + `response_item` pair, an
  * Amplifier `metadata.json` + `transcript.jsonl` pair, and an OpenCode
  * `opencode.db` row.

@@ -89,7 +89,7 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
 /** Send one terminal.create; resolve with the `terminal.created` terminalId
  *  (reject on an explicit error frame / timeout). The terminal is NEVER
  *  attached: a never-referenced terminal starts orphan reap-eligible on
- *  BOTH servers (rust stamps `released_by_client: true` at create,
+ *  the Rust server (which stamps `released_by_client: true` at create,
  *  `crates/freshell-terminal/src/registry.rs`). */
 function createDetachedTerminal(ws: WebSocket, requestId: string): Promise<string> {
   return new Promise((resolve, reject) => {
