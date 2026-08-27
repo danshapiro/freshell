@@ -47,9 +47,9 @@ impl McpRuntime for FakeRt {
     fn is_wsl_environment(&self) -> bool {
         self.wsl
     }
-    fn convert_to_windows_path(&self, linux_path: &str) -> String {
+    fn convert_to_windows_path(&self, linux_path: &str) -> Result<String, McpInjectError> {
         // Deterministic wslpath -w stand-in: /repo/... → \\wsl.localhost\Ubuntu\repo\...
-        format!("\\\\wsl.localhost\\Ubuntu{}", linux_path.replace('/', "\\"))
+        Ok(format!("\\\\wsl.localhost\\Ubuntu{}", linux_path.replace('/', "\\")))
     }
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
         Ok(self.args.clone())
@@ -70,6 +70,56 @@ fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
         wsl,
         args: mcp_unix_args(),
     }
+}
+
+struct FailingConversionRt(FakeRt);
+impl McpRuntime for FailingConversionRt {
+    fn tmp_dir(&self) -> PathBuf { self.0.tmp_dir() }
+    fn is_wsl_environment(&self) -> bool { true }
+    fn convert_to_windows_path(&self, _linux_path: &str) -> Result<String, McpInjectError> {
+        Err(McpInjectError::new("test conversion failure"))
+    }
+    fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> { self.0.server_command_args() }
+}
+
+#[test]
+fn conversion_errors_are_fatal_for_command_args_and_config_selectors() {
+    let scratch = Scratch::new("conversion-error");
+    let rt = FailingConversionRt(fake_rt(scratch.path(), true));
+    let command_error = build_mcp_server_command(&rt, ProviderTarget::Windows).unwrap_err();
+    assert!(command_error.message.contains("test conversion failure"));
+    let selector_error = generate_mcp_injection(&rt, "claude", "term1", None, ProviderTarget::Windows).unwrap_err();
+    assert!(selector_error.message.contains("test conversion failure"));
+}
+
+#[cfg(unix)]
+fn conversion_script(scratch: &Scratch, name: &str, contents: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch.path().join(name);
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn live_wslpath_conversion_fails_closed_for_spawn_nonzero_timeout_and_empty_output() {
+    let scratch = Scratch::new("live-conversion-errors");
+    let missing = scratch.path().join("missing-wslpath");
+    assert!(convert_to_windows_path_with_command(missing.to_string_lossy().as_ref(), "/repo/file")
+        .unwrap_err().message.contains("Failed to start wslpath"));
+
+    let nonzero = conversion_script(&scratch, "nonzero", "#!/bin/sh\nexit 9\n");
+    assert!(convert_to_windows_path_with_command(nonzero.to_string_lossy().as_ref(), "/repo/file")
+        .unwrap_err().message.contains("exited with status"));
+
+    let empty = conversion_script(&scratch, "empty", "#!/bin/sh\nexit 0\n");
+    assert!(convert_to_windows_path_with_command(empty.to_string_lossy().as_ref(), "/repo/file")
+        .unwrap_err().message.contains("empty path"));
+
+    let timeout = conversion_script(&scratch, "timeout", "#!/bin/sh\nsleep 10\n");
+    assert!(convert_to_windows_path_with_command(timeout.to_string_lossy().as_ref(), "/repo/file")
+        .unwrap_err().message.contains("timed out"));
 }
 
 #[test]
