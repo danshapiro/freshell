@@ -46,6 +46,27 @@ describe('standalone CLI capability contract', () => {
     ])).toThrow('Every action capability must be classified')
   })
 
+  it('renders supported CLI help from the capability matrix without unsupported actions or variants', async () => {
+    const result = await runCli(['help'], 'http://127.0.0.1:1')
+
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe('')
+    for (const capability of ACTION_CAPABILITIES.filter((candidate) => candidate.supported)) {
+      expect(result.stdout).toContain(`  ${capability.action}`)
+      for (const alias of capability.aliases ?? []) expect(result.stdout).toContain(alias)
+      for (const parameter of [...capability.params.required, ...capability.params.optional]) {
+        expect(result.stdout).toContain(`--${parameter}`)
+      }
+    }
+    expect(result.stdout).not.toMatch(/^  (?:run|fresh-send|attach)\b/m)
+    expect(result.stdout).toContain(
+      '  split-pane (aliases: split-window)\n    required: (none)\n    optional: --target, --direction, --mode, --shell, --cwd, --browser, --editor, --resume, --sessionRef',
+    )
+    expect(result.stdout).toContain(
+      '  wait-for\n    required: --pattern\n    optional: --target, --timeout\n  summarize',
+    )
+  })
+
   it.each([
     ['run', 'echo', 'blocked'],
     ['fresh-send', 'blocked'],
