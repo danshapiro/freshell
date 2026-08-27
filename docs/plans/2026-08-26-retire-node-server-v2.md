@@ -185,6 +185,8 @@ Docker, and GitHub Actions.
 - Modify: `scripts/precheck.ts`
 - Modify: `test/unit/vite-config.test.ts`
 - Modify: `test/e2e-browser/helpers/session-corpus/session-corpus.test.ts`
+- Delete: `test/e2e/update-flow.test.ts` with the retired interactive updater
+  skip-contract fixtures
 - Modify: existing coordinator/precheck/tab-registry tests that import the moved owners
 
 **Interfaces:**
@@ -195,10 +197,19 @@ Docker, and GitHub Actions.
   returns stable sorted repo-relative evidence. Every tracked executable,
   package command, service/template, container entrypoint, fixture server,
   release job, root launcher, and surviving `port/**` bootstrap owner must map to
-  exactly one manifest row; every row must resolve. Sanctioned Node roles are
-  explicit entrypoint/module rules, not directory-wide exclusions: backend
-  listeners, WebSocket servers, Freshell PTY ownership, or imports from
-  `server/**` still fail when placed under Electron, tools, scripts, or tests.
+  exactly one manifest row; every row must resolve. Each row declares its role.
+  Sanctioned Node roles are explicit entrypoint/module rules, not directory-wide
+  exclusions: Vite/Vitest/Electron-main/CLI/MCP/Claude-sidecar modules plus the
+  explicitly listed non-backend test infrastructure listeners are allowed. The
+  listener rows are `scripts/testing/coordinator-endpoint.ts`,
+  `test/e2e-browser/helpers/echo-ws-fixture.ts`,
+  `test/e2e-browser/helpers/harness-06/{target-server,update-feed,fake-ai}.ts`,
+  `test/e2e-browser/fixtures/providers/{fake-codex-app-server.mjs,fake-opencode-server.mjs}`,
+  `test/e2e-browser/fixtures/fake-opencode.cjs`, the individual
+  `scripts/proofs/browser-*-probe.ts` files, and `electron/port-check.ts`.
+  Those rows own only test coordination, probes, or fake targets and no Freshell
+  PTY/backend state. Backend listeners, WebSocket servers, Freshell PTY
+  ownership, or imports from `server/**` still fail outside those exact rows.
 - `getFreshellHomeDir(env)` and `getFreshellConfigDir(env)` preserve the current
   `FRESHELL_HOME`-then-home behavior without relying on the `NodeJS` global type;
   the two legacy `server/**` modules are temporary re-exports until Task 10.
@@ -217,9 +228,10 @@ Docker, and GitHub Actions.
 
   Add `rust-only-server-runtime.test.ts` with a synthetic-tree test proving an
   invented Node HTTP listener is `unexpectedNodeBackend`, an allowlist test for
-  Vite/Vitest/Electron-main/CLI/MCP/Claude-sidecar Node roles, and manifest
-  reconciliation tests for an unlisted tracked owner, a stale row, and duplicate
-  ownership. The current-tree test requires the known debt entries
+  Vite/Vitest/Electron-main/CLI/MCP/Claude-sidecar roles and each exact
+  coordinator/fixture/probe listener row above, and manifest reconciliation tests
+  for an unlisted tracked owner, a stale row, and duplicate ownership. The
+  current-tree test requires the known debt entries
   `server/index.ts`, `package.json:scripts.start`,
   `config/electron-builder.yml:dist/server`,
   `test/e2e-browser/playwright.config.ts:legacy-chromium`, the stale legacy
@@ -248,7 +260,10 @@ Docker, and GitHub Actions.
   moving the neutral code without changing its data semantics. Discovery is
   deliberately broader than the manifest and fails closed on a new root
   executable, package script, service resource, container command, test server,
-  workflow launch step, or retained `port/**` bootstrap path. Replace the
+  workflow launch step, or retained `port/**` bootstrap path. Classify the
+  explicitly listed coordinator/fixture/probe listeners as non-backend rows;
+  an unlisted listener or any listener that owns Freshell backend state remains
+  unexpected. Replace the
   coordinator import of `server/coding-cli/utils.ts`, the
   Vite import of `server/get-network-host.ts`, and the client import of
   `server/tabs-registry/types.ts`. Make `server/freshell-home.ts` and
@@ -256,8 +271,11 @@ Docker, and GitHub Actions.
   neutral owners so the intermediate backend consumes the same contracts. Remove
   only the interactive update-check block/import from `scripts/precheck.ts`;
   preserve its serve-branch and port protections and record the removed flow for
-  Task 11 triage. Remove the two Node provider-reader imports/assertions from the
-  session-corpus helper test while preserving writer/schema/hash coverage; do not
+  Task 11 triage. Delete `test/e2e/update-flow.test.ts` and its
+  `--skip-update-check`/`SKIP_UPDATE_CHECK` fixtures because the interactive
+  updater no longer exists; do not leave a passing test for a removed behavior.
+  Remove the two Node provider-reader imports/assertions from the session-corpus
+  helper test while preserving writer/schema/hash coverage; do not
   move deleted backend readers into a neutral namespace. Keep a temporary
   explicit debt list so
   later tasks can remove entries one by one; manifest rows remain after their
@@ -305,7 +323,7 @@ Docker, and GitHub Actions.
 - [ ] **Step 7: Commit the task**
 
   ```bash
-  git add scripts/retirement test/unit/architecture shared/tab-registry-types.ts shared/freshell-home.ts config/vite/get-network-host.ts scripts/testing/repo-context.ts src/store/tabRegistryTypes.ts server/tabs-registry/types.ts server/freshell-home.ts config/vite/vite.config.ts scripts/testing/test-coordinator.ts scripts/precheck.ts test/unit/vite-config.test.ts test/e2e-browser/helpers/session-corpus
+  git add scripts/retirement test/unit/architecture shared/tab-registry-types.ts shared/freshell-home.ts config/vite/get-network-host.ts scripts/testing/repo-context.ts src/store/tabRegistryTypes.ts server/tabs-registry/types.ts server/freshell-home.ts config/vite/vite.config.ts scripts/testing/test-coordinator.ts scripts/precheck.ts test/unit/vite-config.test.ts test/e2e/update-flow.test.ts test/e2e-browser/helpers/session-corpus
   git commit -m "refactor: isolate neutral code from Node server"
   ```
 
@@ -357,8 +375,10 @@ Docker, and GitHub Actions.
 - Unsupported rows/variants are: `run`; `fresh-send`; `attach`; `new-tab` with
   `agent` other than Rust-supported `opencode`; `split-pane` with any of
   `agent`, `model`, or `effort`; `wait-for` without a pattern or with
-  `stable|exit|prompt`; and legacy `capture` `J`/`e` arguments whose semantics
-  Rust ignores. Help and MCP parameter schemas do not advertise them. Direct
+  `stable|exit|prompt`. Rust-supported `capture` `J`/`e` arguments remain
+  accepted and advertised as no-op parameters, matching the current Rust
+  baseline. Help and MCP parameter schemas do not advertise the unsupported
+  rows above. Direct
   Claude/Codex terminals continue through supported `mode` values rather than
   the rejected `agent` sugar.
 - Replace the hard-coded-`node` args-only seam with
@@ -634,6 +654,10 @@ Docker, and GitHub Actions.
 - Modify: `port/oracle/harness/external-server.ts`
 - Create temporarily: `port/oracle/harness/legacy-node-server.ts` from the
   oracle-only process-owning portion of `test-server.ts`; Task 5 deletes it
+- Modify: the closed current set returned by
+  `rg -l "kind\\s*:\\s*['\"]legacy['\"]" test/e2e-browser/specs | sort`;
+  convert each remaining literal legacy server selection to the Rust baseline
+  fixture or delete the obsolete assertion
 - Modify: the closed current set of specs returned by
   `rg -l '\be2eServerKind\b' test/e2e-browser/specs | sort`; remove the obsolete
   fixture parameter and convert any executable legacy conditional to one
@@ -661,9 +685,13 @@ Docker, and GitHub Actions.
   `port/oracle/harness/legacy-node-server.ts` so Task 4 stays green; Task 5
   deletes that explicitly while converting oracles to Rust.
 - `playwright.config.ts` exposes one primary application project named
-  `chromium` with Rust fixtures. CI-only `firefox`/`webkit` projects inherit the
-  same Rust fixture contract, and `continuity-smoke` remains a Rust-only
-  specialized project without `e2eServerKind`; none is a Node/Rust split lane.
+  `chromium` with Rust fixtures. Its match-all application projects use an exact
+  `continuity-smoke.spec.ts` exclusion only; all other Rust-only specs formerly
+  covered by `RUST_ONLY_SPECS` run in the primary project. CI-only
+  `firefox`/`webkit` projects inherit the same Rust fixture contract and the same
+  continuity exclusion. `continuity-smoke` remains a separately selected,
+  Rust-only specialized project without `e2eServerKind`; none is a Node/Rust
+  split lane.
   There is no `legacy-chromium`, `rust-chromium`, `MATRIX_SPECS`, or browser-E2E
   Node `TestServer`.
 - Selection inspection requires at least 308 tests in at least 86 files (the
@@ -681,9 +709,10 @@ Docker, and GitHub Actions.
 
   Add `selection-nonvacuity.test.ts` to import local/cloud configs and fixture
   factories, asserting the primary-project/literal-Rust contract across
-  chromium/firefox/webkit/continuity projects, positive floors, no browser legacy
-  helper import (including the visible-first audit runner), no unexplained cloud
-  skip, and a provenance failure when a fake healthy process reports a non-Rust
+  chromium/firefox/webkit/continuity projects, the exact continuity-only
+  exclusion on match-all projects, positive floors, no browser legacy helper
+  import (including the visible-first audit runner), no unexplained cloud skip,
+  and a provenance failure when a fake healthy process reports a non-Rust
   runtime. Require the mcp-qa skip to carry its local-only classification and
   local test selector. Update browser helper tests to expect only `RustServer`
   construction.
@@ -705,9 +734,12 @@ Docker, and GitHub Actions.
 - [ ] **Step 3: Add the minimal implementation**
 
   Make Rust the only owned constructor, retain the external-target no-stop seam,
-  and move/rename shared types out of `test-server.ts`. Collapse Playwright to one
-  `chromium` project; convert conditional Rust branches to unconditional current
-  baseline assertions and delete legacy-only expectations/spec registrations.
+  and move/rename shared types out of `test-server.ts`. Collapse the application
+  lane to a match-all `chromium` project and replace `RUST_ONLY_SPECS` on every
+  match-all project with an exact `continuity-smoke.spec.ts` exclusion; keep the
+  separately selected `continuity-smoke` project so no Rust-only spec disappears.
+  Convert conditional Rust branches to unconditional current-baseline assertions
+  and delete legacy-only expectations/spec registrations.
   Build `dist/client` and `target/release/freshell-server` in global setup. Point
   Electron remote-connect E2E and `perf:audit:visible-first`'s owned sample server
   at `RustServer`. Move the oracle-only Node process constructor beside the oracle
@@ -744,14 +776,17 @@ Docker, and GitHub Actions.
   Run:
 
   ```bash
-  ! rg -n "legacy-chromium|e2eServerKind|TestServer|test-server\.js|dist/server/index" test/e2e-browser test/e2e-electron --glob '!gate01-baseline.json'
+  ! rg -n "legacy-chromium|e2eServerKind|TestServer|test-server\.js|dist/server/index|kind[[:space:]]*:[[:space:]]*['\"]legacy['\"]" test/e2e-browser test/e2e-electron --glob '!gate01-baseline.json'
   npm run test:vitest -- run test/unit/port/oracle/external-handshake-t0.test.ts --config config/vitest/vitest.port.config.ts
   npm run test:e2e -- --project=chromium test/e2e-browser/specs/auth.spec.ts test/e2e-browser/specs/terminal-lifecycle.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts test/e2e-browser/specs/rust-baseline-browser-actions.spec.ts
+  npm run test:e2e -- --project=chromium
   ```
 
-  Expected: search returns no executable legacy path; configured E2E reports a
-  positive count and PASSes, and server-info provenance in every worker identifies
-  the owned Rust binary on a non-3001 port.
+  Expected: search returns no executable legacy path; the focused and full
+  Chromium project runs report positive counts and PASS, and server-info
+  provenance in every worker identifies the owned Rust binary on a non-3001 port.
+  The full Chromium run excludes only `continuity-smoke.spec.ts`; its specialized
+  project remains separately selected and is not silently dropped.
 
 - [ ] **Step 7: Commit the task**
 
@@ -863,6 +898,9 @@ Docker, and GitHub Actions.
   prove a changed expected verdict fails, without importing the deleted Node
   manifest generator. Rewrite the client fresh-agent WS cases to feed literal
   normalized Rust-baseline frames instead of importing Node provider adapters.
+  Delete the `acceptance-contract.test.ts` case that reads `package.json` and
+  pins the exact focused-lane script string; retain its behavioral contract
+  constant assertions and verify the real script by running it in Step 4.
   Add `rust-only-oracle-boundary.test.ts` as an always-running source/exports
   guard: it rejects a `node` target, warm-proxy module, legacy build command, or
   active read of `port/oracle/baselines/t2/*.json` even when live-provider gates
@@ -878,6 +916,7 @@ Docker, and GitHub Actions.
   ```bash
   npm run test:vitest -- run test/unit/client/lib/api.test.ts --config config/vitest/vitest.config.ts
   npm run test:vitest -- run test/unit/visible-first/acceptance-contract.test.ts --config config/vitest/vitest.config.ts
+  npm run test:visible-first:contract
   npm run test:vitest -- run test/unit/port --config config/vitest/vitest.port.config.ts
   cargo test -p freshell-protocol -p freshell-ws -p freshell-terminal -p freshell-extensions --locked
   env -u FRESHELL_RUN_REAL_PROVIDER_CONTRACTS npm run test:oracle
@@ -919,6 +958,9 @@ Docker, and GitHub Actions.
 - [ ] **Step 4: Run the focused GREEN command**
 
   Run the Step 2 commands again.
+
+  The `test:visible-first:contract` command is executed as a real lane; no test
+  reads package.json merely to assert the command's spelling.
 
   Expected: PASS; schema generation has no drift, the Rust crates reject removed
   messages, client exports are gone, and every active always-running oracle
@@ -996,6 +1038,12 @@ Docker, and GitHub Actions.
 - Delete: `test/integration/extension-system.test.ts`
 - Move: retained files from `test/unit/server/claude-sidecar/**` to `test/unit/claude-sidecar/**`
 - Move: retained coordinator/global-setup tests from `test/unit/server/testing/**` to `test/unit/tooling/testing/**`
+- Create: `test/unit/shared/title-utils.test.ts` from the shared
+  `extractTitleFromMessage` subject in `test/unit/server/title-utils.test.ts`
+- Move: `test/unit/server/tabs-registry/types.test.ts` to
+  `test/unit/shared/tab-registry-types.test.ts`
+- Modify: `test/unit/server/title-utils.test.ts` to leave only the
+  backend-owned JSONL extraction subject for Task 10 disposition
 - Move: `test/unit/server/deploy-tab-diff-coverage-gate.test.ts` to `test/unit/tooling/deploy-tab-diff-coverage-gate.test.ts`
 - Move: `test/unit/server/prebuild-guard.test.ts` to `test/unit/tooling/prebuild-guard.test.ts`
 - Move: `test/unit/server/run-standard-tests.test.ts` to `test/unit/tooling/run-standard-tests.test.ts`
@@ -1045,6 +1093,13 @@ Docker, and GitHub Actions.
   `freshell-server` child before exact-PID teardown. It uses
   `// @vitest-environment node` because it owns a child process and filesystem
   fixture.
+- Every retained subject formerly under `test/unit/server/**` is re-homed before
+  this task removes the server Vitest config. The current subject inventory
+  explicitly splits the shared `extractTitleFromMessage` cases into
+  `test/unit/shared/title-utils.test.ts` and moves the tab-registry schema test to
+  `test/unit/shared/tab-registry-types.test.ts`; backend-only JSONL title parsing
+  remains a Task 10 deletion candidate. Any additional retained subject found by
+  the inventory must be moved in this task or it blocks config deletion.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1056,7 +1111,9 @@ Docker, and GitHub Actions.
   default lane and both artifact-dependent integration trees to be excluded from
   it. Require the dedicated runtime config/wrapper to select the source smoke and
   the broad coordinator to execute that phase. Require the closed runtime manifest to reconcile root launchers
-  and `port/**` bootstrap owners. Add the owned source-runtime integration test
+  and `port/**` bootstrap owners. Require the subject inventory to report no
+  retained implementation owner left under `test/unit/server/**`, including the
+  title-utils split and tab-registry schema move. Add the owned source-runtime integration test
   described above. Change the Tauri smoke unit path to panic, not print SKIP,
   when no binary can be resolved.
 
@@ -1078,7 +1135,14 @@ Docker, and GitHub Actions.
 
 - [ ] **Step 3: Add the minimal implementation**
 
-  Move retained non-server tests before removing exclusions/config. Implement the
+  Move retained non-server tests before removing exclusions/config. Split
+  `test/unit/server/title-utils.test.ts` by subject, moving only the
+  `extractTitleFromMessage` cases to `test/unit/shared/title-utils.test.ts`; keep
+  backend-owned `extractTitleFromJsonlObject` cases recorded for Task 10 deletion.
+  Move `test/unit/server/tabs-registry/types.test.ts` to
+  `test/unit/shared/tab-registry-types.test.ts`. The subject-level inventory must
+  then show no additional retained owner under `test/unit/server/**` before this
+  task removes the server config. Implement the
   Rust phases and source scripts, delete server TypeScript build/typecheck/start
   scripts/config/global setup, and make cloud Vitest one truthful default-config
   lane. Exclude artifact-dependent integration trees from default discovery;
@@ -1107,7 +1171,7 @@ Docker, and GitHub Actions.
   npm run build:client
   npm run build:tools
   cargo build --release -p freshell-server --locked
-  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling test/unit/claude-sidecar test/unit/contracts test/unit/provider-fixtures test/unit/visible-first/cli-command-harness.test.ts test/unit/vite-config.test.ts --config config/vitest/vitest.config.ts
+  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling test/unit/claude-sidecar test/unit/contracts test/unit/provider-fixtures test/unit/shared/title-utils.test.ts test/unit/shared/tab-registry-types.test.ts test/unit/visible-first/cli-command-harness.test.ts test/unit/vite-config.test.ts --config config/vitest/vitest.config.ts
   npm run test:source-runtime
   bash scripts/test/cloud-vitest-wrapper.test.sh
   cargo build -p freshell-server --locked
@@ -1309,7 +1373,10 @@ Docker, and GitHub Actions.
   `electron-runtime/claude-sidecar/**`, and
   `electron-runtime/mcp/**`. The MCP directory contains
   `dist/tools/freshell-mcp`, shared compiled client modules, and only the locked
-  production dependency closure for `@modelcontextprotocol/sdk` and `zod`.
+  production dependency closure for `@modelcontextprotocol/sdk` and `zod`, plus
+  a minimal `package.json` whose `name` is `freshell` and whose version matches
+  the packaged release. The metadata is required because the checkout-free MCP
+  entry reports its version by walking to package metadata.
 - The Node binary is sanctioned for the Claude sidecar and standalone MCP client
   only. Staging contains no `node-pty`, Freshell Node backend entrypoint,
   `dist/server`, `server-node-modules`, or native-module rebuild output. The MCP
@@ -1353,7 +1420,9 @@ Docker, and GitHub Actions.
   writes non-JSON-RPC stdout, or any owned PID survives. Change the Windows
   platform check message to require native Rust `.exe` production, not native
   `node-pty` compilation. Assert the dedicated config selects this integration
-  test and the default config does not; assert the staging directory is ignored.
+  test and the default config does not; assert the staging directory is ignored,
+  the staged MCP package metadata is present, and the checkout-free MCP
+  initialize response reports the staged package version rather than `0.0.0`.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -1373,7 +1442,9 @@ Docker, and GitHub Actions.
   Refactor the verified Node download to the new staging script, delete header and
   `node-pty` rebuild/pruned-server-dependency logic, copy the host-native Cargo
   binary, build/copy `dist/tools`, and stage the two permitted Node consumers with
-  their locked dependency closures. Preserve the locked archive libraries and
+  their locked dependency closures. Write the staged MCP `package.json` with the
+  release's `name: freshell` and version metadata so its initialize response is
+  stable outside a checkout. Preserve the locked archive libraries and
   extraction checks. Rewrite electron-builder resources and npm Electron scripts
   to use the staging directory and invoke the verifier on the unpacked result;
   package only app-bound resources, with no Electron daemon templates. Add the
@@ -1574,8 +1645,8 @@ Docker, and GitHub Actions.
 - Delete: remaining `test/unit/server/**`
 - Delete: `test/integration/server/**`
 - Delete: `test/integration/session-repair.test.ts`
-- Move: `test/unit/server/title-utils.test.ts` to
-  `test/unit/shared/title-utils.test.ts`
+- Delete: backend-only remainder of `test/unit/server/title-utils.test.ts` after
+  the shared `extractTitleFromMessage` subject is re-homed in Task 6
 - Modify: `test/unit/architecture/fresh-agent-only-runtime.test.ts`
 - Delete: `test/helpers/coding-cli/fake-codex-launch-planner.ts`
 - Delete: `test/fixtures/fresh-agent/claude/thread.ts`
@@ -1618,7 +1689,7 @@ Docker, and GitHub Actions.
 - A test's directory does not decide its fate. Before deleting
   `test/unit/server/**`, any subject whose implementation owner survives under
   `shared/**`, `tools/**`, or another retained namespace is re-homed and kept;
-  `title-utils.test.ts` is the first explicit case. The disposition verifier
+  the shared `title-utils` subject is the first explicit case. The disposition verifier
   rejects treating a retained shared subject as obsolete merely because its old
   test lived under `server/`.
 - `node-test-disposition.json` is a committed deletion ledger for the complete
@@ -1628,9 +1699,15 @@ Docker, and GitHub Actions.
   old path/title/subject, retained-or-deleted decision, exact surviving test,
   required lane, selector, and latest receipt. Optional real-provider T2 checks
   are marked supplemental and cannot satisfy a required replacement. Unknown,
-  duplicate, stale, or unresolved rows block deletion and the final gate.
+  duplicate, stale, or unresolved rows block deletion and the final gate. The
+  ledger also records the earlier Task 1 deletion of
+  `test/e2e/update-flow.test.ts` as an obsolete interactive-updater subject with
+  no replacement requirement.
 - Runtime guard debt shrinks to active documentation-only items left for Task 11;
-  `unexpectedNodeBackend` stays empty.
+  `unexpectedNodeBackend` stays empty. Its detector treats the exact
+  manifest-listed coordinator/fixture/probe listener rows from Task 1 as
+  sanctioned non-backend infrastructure; only an unlisted backend listener or
+  any listener that owns Freshell PTY/backend state is unexpected.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1639,7 +1716,9 @@ Docker, and GitHub Actions.
   set absent from root direct dependencies, and require zero imports into
   `server/**`. Add a fixture that proves the allowed CLI/MCP/Claude Node packages
   and their locked transitive dependencies do not satisfy a Node-backend
-  detector unless an entrypoint actually listens or owns backend state. Add the
+  detector unless an unlisted entrypoint listens as a backend or owns backend
+  state; manifest-listed coordinator/fixture/probe listeners remain explicitly
+  allowed. Add the
   disposition verifier with a synthetic mixed test whose second subject is
   unresolved, a zero-test selector receipt, and a skipped optional T2 receipt;
   all three must fail required replacement closure. Update
@@ -1664,8 +1743,10 @@ Docker, and GitHub Actions.
   title/subject, bind each retained subject to an exact surviving test/lane and a
   positive-count receipt, mark obsolete Node-implementation subjects explicitly,
   and resolve every row; the verifier refuses an unresolved or vacuous row or a
-  deleted test of retained shared behavior. Re-home `title-utils.test.ts` and any
-  other ledger-identified retained shared/tool subject before the blanket delete.
+  deleted test of retained shared behavior. Reconcile the Task 6 subject moves,
+  including the split `title-utils` test and tab-registry schema test, and verify
+  every other ledger-identified retained shared/tool subject was re-homed before
+  the blanket delete.
   Update the fresh-agent architecture walk to scan only existing retained roots
   and remove server-only allowances. Then
   run a retained-fixture import scan and move any provider fixture still
@@ -1766,10 +1847,10 @@ Docker, and GitHub Actions.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-  Tighten `rust-only-server-runtime.test.ts` to require all three arrays empty and add
-  active-document assertions for Rust commands, retained standalone clients, and
-  forbidden Node-backend wording/paths. Add assertions that `docs/index.html` and
-  `.kata.toml` are unchanged from `origin/main`.
+  Tighten `rust-only-server-runtime.test.ts` to require all three arrays empty
+  based on executable/runtime manifest evidence. Do not add tests that only read
+  prose or configuration text; the final structural/document search and the
+  `git diff --exit-code` checks remain command-level gates in Steps 4 and 6.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -1818,9 +1899,9 @@ Docker, and GitHub Actions.
   messages/tests represented in active source; the receipt classifies each match
   and fails if it finds a request sender or advertised supported action.
 
-  If and only if contrary implementation evidence establishes a reachable or
-  safety-critical gap with independent Rust-only product value and all three
-  owner searches are empty, create one acceptance-sized Kata using priority 1, labels
+  If and only if contrary implementation evidence identifies an important
+  Rust-absent capability that is not tracked by any of the three owner searches,
+  create one acceptance-sized Kata using priority 1, labels
   `enhancement` and `rust-gap`, metadata
   `source=retire-node-server-v2`. Derive the idempotency-key slug from the
   lowercase ASCII capability name, collapse non-alphanumerics to single hyphens,
