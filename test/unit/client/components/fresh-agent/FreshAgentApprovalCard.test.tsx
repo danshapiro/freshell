@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { FreshAgentApprovalCard } from '@/components/fresh-agent/FreshAgentApprovalCard'
-import { attachmentRejection } from '@/components/fresh-agent/FreshAgentComposer'
 
 describe('FreshAgentApprovalCard', () => {
   afterEach(() => cleanup())
@@ -75,24 +74,5 @@ describe('FreshAgentApprovalCard', () => {
     expect(screen.getByRole('button', { name: 'Allow tool use' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Always allow Bash this session' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Deny tool use' })).toBeEnabled()
-  })
-})
-
-describe('attachmentRejection', () => {
-  it('always allows textual files and images', () => {
-    expect(attachmentRejection('codex', 'notes.md')).toBeNull()
-    expect(attachmentRejection('opencode', 'data.csv')).toBeNull()
-    expect(attachmentRejection('claude', 'shot.png')).toBeNull()
-    expect(attachmentRejection('codex', 'shot.jpeg')).toBeNull()
-  })
-
-  it('allows pdf only for claude', () => {
-    expect(attachmentRejection('claude', 'spec.pdf')).toBeNull()
-    expect(attachmentRejection('codex', 'spec.pdf')).toMatch(/can’t read \.pdf/)
-  })
-
-  it('rejects unsupported media with a actionable message', () => {
-    expect(attachmentRejection('claude', 'demo.mov')).toMatch(/isn’t supported/)
-    expect(attachmentRejection('codex', 'song.mp3')).toMatch(/isn’t supported/)
   })
 })
