@@ -2,7 +2,7 @@
  * HARNESS-04 — on-disk git fixtures (hand-written, no git binary required).
  *
  * Shapes mirror `test/unit/server/coding-cli/resolve-git-root.test.ts` and were
- * validated against the production resolvers in `server/coding-cli/utils.ts`
+ * validated against the shared repository-context resolvers
  * (load-bearing L1):
  *  - a VALID `.git` directory = directory containing a `HEAD` file
  *    (`isGitDirectory`); nested repos resolve to the innermost valid root.

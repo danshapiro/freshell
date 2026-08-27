@@ -5,7 +5,9 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const repoRoot = process.cwd()
-const productionRuntimeRoots = ['src', 'server', 'shared'] as const
+// The browser architecture scan follows retained runtime roots only.  The
+// legacy Node backend is intentionally not an allowed production root.
+const productionRuntimeRoots = ['src', 'shared'] as const
 
 const runtimeExtensions = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'])
 
@@ -62,44 +64,12 @@ const legacyMigrationBoundaryAllowances: LegacyBoundaryAllowance[] = [
     ],
   },
   {
-    file: 'server/config-store.ts',
-    reason: 'config input migration and patch rejection normalize old agentChat settings without exposing them live',
-    patterns: [
-      /^\s*const existingAgentChat = isRecord\(migrated\.agentChat\) \? \{ \.\.\.migrated\.agentChat \} : \{\}$/,
-      /^\s*const existingProviders = isRecord\(existingAgentChat\.providers\) \? \{ \.\.\.existingAgentChat\.providers \} : \{\}$/,
-      /^\s*existingAgentChat\.providers = existingProviders$/,
-      /^\s*migrated\.agentChat = existingAgentChat$/,
-      /^\s*delete \(migratedSettings as Record<string, unknown>\)\.agentChat$/,
-      /^\s*&& Object\.prototype\.hasOwnProperty\.call\(patch, 'agentChat'\)$/,
-      /^\s*const error = new Error\('agentChat settings have been migrated; use freshAgent'\)$/,
-      /^\s*'Rejected legacy agentChat settings patch',$/,
-    ],
-  },
-  {
-    file: 'server/settings-router.ts',
-    reason: 'settings route rejects legacy agentChat input at the boundary',
-    patterns: [
-      /^\s*if \(Object\.prototype\.hasOwnProperty\.call\(req\.body \|\| \{\}, 'agentChat'\)\) \{$/,
-      /^\s*res\.status\(400\)\.json\(\{ error: 'agentChat settings have been migrated; use freshAgent' \}\)$/,
-    ],
-  },
-  {
-    file: 'server/tabs-registry/types.ts',
-    reason: 'explicit legacy tab-registry kind constant is used only to normalize old records',
+    file: 'shared/tab-registry-types.ts',
+    reason: 'tab-registry input migration recognizes old pane kind before normalizing it to fresh-agent',
     patterns: [
       /^const LEGACY_AGENT_CHAT_PANE_KIND = 'agent-chat'$/,
     ],
   },
-]
-
-const sdkInternalFiles = new Set([
-  'server/sdk-bridge.ts',
-  'server/sdk-bridge-types.ts',
-  'server/fresh-agent/sdk-events.ts',
-])
-
-const sdkInternalPrefixes = [
-  'server/fresh-agent/adapters/',
 ]
 
 function toRepoRelativePath(filePath: string): string {
@@ -162,10 +132,6 @@ function legacyAllowanceFor(file: string, line: string): LegacyBoundaryAllowance
     allowance.file === file
     && allowance.patterns.some((pattern) => pattern.test(line))
   ))
-}
-
-function isSdkInternalPath(file: string): boolean {
-  return sdkInternalFiles.has(file) || sdkInternalPrefixes.some((prefix) => file.startsWith(prefix))
 }
 
 function formatWindowSnippet(lines: SourceLine[]): string {
@@ -244,10 +210,6 @@ function findLegacyRuntimeReferences(file: string, contents: string): Finding[] 
 }
 
 function findSdkPublicReferences(file: string, contents: string): Finding[] {
-  if (isSdkInternalPath(file)) {
-    return []
-  }
-
   return contents
     .split(/\r?\n/)
     .flatMap((line, index): Finding[] => {
@@ -278,6 +240,12 @@ function formatFindings(findings: Finding[]): string {
 }
 
 describe('fresh-agent-only runtime architecture', () => {
+  it('scans only existing retained production runtime roots', () => {
+    for (const root of productionRuntimeRoots) {
+      expect(fs.existsSync(path.join(repoRoot, root))).toBe(true)
+    }
+  })
+
   describe('legacy reference detection', () => {
     it('detects direct and obviously split legacy references', () => {
       const snippets = [
@@ -299,8 +267,8 @@ describe('fresh-agent-only runtime architecture', () => {
         "  return isRecord(candidate.agentChat)\n    ? candidate.agentChat as LegacyFreshAgentSettingsInput",
       )).toEqual([])
       expect(findLegacyRuntimeReferences(
-        'server/settings-router.ts',
-        "    res.status(400).json({ error: 'agentChat settings have been migrated; use freshAgent' })",
+        'shared/tab-registry-types.ts',
+        "const LEGACY_AGENT_CHAT_PANE_KIND = 'agent-chat'",
       )).toEqual([])
     })
 
@@ -348,12 +316,11 @@ describe('fresh-agent-only runtime architecture', () => {
 
     it('does not let migration-boundary lines trigger multiline findings', () => {
       expect(findLegacyRuntimeReferences(
-        'server/config-store.ts',
+        'shared/settings.ts',
         [
-          '  const existingAgentChat = isRecord(migrated.agentChat) ? { ...migrated.agentChat } : {}',
-          '  const existingProviders = isRecord(existingAgentChat.providers) ? { ...existingAgentChat.providers } : {}',
-          '  existingAgentChat.providers = existingProviders',
-          '  migrated.agentChat = existingAgentChat',
+          '  return isRecord(candidate.agentChat)',
+          '    ? candidate.agentChat as LegacyFreshAgentSettingsInput',
+          "  const next = omitKeys(raw, ['theme', 'uiScale', 'notifications', 'agentChat'])",
         ].join('\n'),
       )).toEqual([])
     })

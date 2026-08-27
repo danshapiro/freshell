@@ -4,7 +4,9 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { execFileSync } from 'node:child_process'
-import { getNetworkHost } from '../../server/get-network-host.js'
+import { getFreshellConfigDir } from '../../shared/freshell-home.js'
+import { isWSL } from '../../server/platform.js'
+import { getNetworkHost } from './get-network-host.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -64,7 +66,8 @@ function silenceStartupErrors(proxy: HttpProxy.Server) {
 }
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, projectRoot, '')
+  // Vite reads .env into `env`; process.env remains the explicit override.
+  const env = { ...loadEnv(mode, projectRoot, ''), ...process.env }
   const backendPort = process.env.PORT || env.PORT || '3001'
   const backendHost = process.env.VITE_BACKEND_HOST || process.env.BACKEND_HOST || env.VITE_BACKEND_HOST || env.BACKEND_HOST || '127.0.0.1'
   const backendUrl = `http://${backendHost}:${backendPort}`
@@ -93,7 +96,11 @@ export default defineConfig(({ mode }) => {
       chunkSizeWarningLimit: 1400,
     },
     server: {
-      host: getNetworkHost(),
+      host: getNetworkHost({
+        env,
+        configDir: getFreshellConfigDir(env),
+        isWsl: isWSL(),
+      }),
       allowedHosts,
       port: vitePort,
       watch: {
