@@ -306,6 +306,7 @@ export const RUST_ONLY_SPECS = [
   // Reconnect-revive acceptance: socket-drop/freeze revival; drives
   // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
   /reconnect-revive-rust\.spec\.ts$/,
+  /rust-baseline-browser-actions\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -361,6 +362,7 @@ export default defineConfig({
       // not a parity gap to gate per-assertion.
       testMatch: [
         ...MATRIX_SPECS,
+        /rust-baseline-browser-actions\.spec\.ts$/,
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,

@@ -759,35 +759,6 @@ export default function EditorPane({
     }
   }, [filePath, readOnly, resolvePath, isExpectedOutageFailure])
 
-  const openInEditor = useCallback(async (reveal: boolean) => {
-    const resolved = resolvePath(filePath)
-    if (!resolved) return
-
-    // Read cursor position from Monaco editor
-    const position = editorRef.current?.getPosition()
-
-    try {
-      await api.post('/api/files/open', {
-        path: resolved,
-        reveal,
-        line: position?.lineNumber,
-        column: position?.column,
-      })
-    } catch (err) {
-      // A transient failure while the server is unreachable is expected — the
-      // user can retry once it's back; only unexpected failures are logged.
-      if (isExpectedOutageFailure(err)) return
-      const message = err instanceof Error ? err.message : String(err)
-      log.error(
-        JSON.stringify({
-          severity: 'error',
-          event: 'editor_open_external_failed',
-          error: message,
-        })
-      )
-    }
-  }, [filePath, resolvePath, isExpectedOutageFailure])
-
   const handleEditorChange = useCallback(
     (value: string | undefined) => {
       const newValue = value ?? ''
@@ -933,10 +904,8 @@ export default function EditorPane({
         const resolved = resolvePath(filePath)
         if (resolved) await copyText(resolved)
       },
-      revealInExplorer: () => openInEditor(true),
-      openInEditor: () => openInEditor(false),
     })
-  }, [paneId, performSave, handleToggleViewMode, filePath, resolvePath, openInEditor])
+  }, [paneId, performSave, handleToggleViewMode, filePath, resolvePath])
 
   return (
     <div
