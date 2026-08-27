@@ -54,7 +54,7 @@ const ISO_TIMESTAMP_MILLIS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const STALE_REVISION_MESSAGE = 'Stale snapshot revision rejected for tabs registry client snapshot'
 const DUPLICATE_CONTENT_MESSAGE = 'Duplicate snapshot revision has different tabs registry content'
 
-/** Open a raw WS connection and complete the harness-token `hello` handshake.
+/** Open a raw WS connection and complete the harness-token `hello` handshake. */
 function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl)
@@ -84,7 +84,7 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
   })
 }
 
-/** Resolve with the next message matching `predicate`, or reject on timeout.
+/** Resolve with the next message matching `predicate`, or reject on timeout. */
 function nextMessage(ws: WebSocket, predicate: (message: unknown) => boolean, timeoutMs = 5_000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {

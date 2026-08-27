@@ -1,45 +1,11 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 /**
- * HARNESS-02 mutation negative-proof (the "bite" test).
+ * HARNESS-02 mutation negative-proof for the owned Rust baseline.
  *
- * implementation for the other.
- *
- * ## History (pre-CFG-07)
- *
- * This bite test originally keyed its node-vs-rust discriminator on
- * (`server/instance-id.ts`), Rust REGENERATED it fresh on every boot (no
- * on-disk persistence) -- a real, already-present behavioral difference.
- *
- * ## CFG-07 changed the ground truth (the conflict this rewiring resolves)
- *
- * CFG-07 (`docs/plans/2026-07-18-wave8-specs.md`, SPEC A) makes the Rust
- * server ALSO persist `serverInstanceId` per home (`crates/freshell-server/src/instance_id.rs`,
- * a port of `server/instance-id.ts`'s `loadOrCreateServerInstanceId`) --
- * implementations persist, `instanceId` stability across a restart is no
- * that secretly booted (or reused) a Node server would now ALSO show a
- * stable `instanceId` and incorrectly PASS the old assertion.
- *
- * ## The resolution: split "did a real restart happen" from "which binary is it"
- *
- * 1. **`serverInstanceId` equal + restart genuinely happened** -- now a
- *    CORRECTNESS assertion true on BOTH kinds post-CFG-07 (not a
- *    discriminator): across a same-home restart, `instanceId` is STABLE
- *    (installation identity, CFG-07) while the OS pid changes (a REAL
- *    process restart, not the same process still running).
- * 2. **Which binary actually booted** -- re-keyed to the PERMANENT,
- *    structural node/rust discriminator: `GET /api/server-info` (DIAG-05,
- *    SPEC D, `crates/freshell-server/src/diag.rs`). The Rust port emits
- *    `nodeVersion` string (`server/server-info-router.ts`) and no `runtime`
- *    field at all. Unlike `instanceId` regeneration (an incidental gap
- *    CFG-07 legitimately closes), "has a real Node version string" vs "is
- *    the Rust runtime" can never converge -- this is the discriminator that
- *
- * (A permanent RED demonstration of this property lives in the HARNESS-02
- * implementation report/commit: the `runtime`/`nodeVersion` branch below was
- * temporarily inverted for the 'rust' case, run under
- * runtime-mismatch assertion error, before being restored to the correct
- * direction captured here.)
+ * It proves a restart replaces the owned process while preserving the
+ * installation identifier, then verifies the replacement advertises the
+ * Rust runtime through the authenticated server-info endpoint.
  */
 
 async function fetchHealthInstanceId(baseUrl: string): Promise<string> {
@@ -110,20 +76,10 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
 
     const instanceIdAfterRestart = await fetchHealthInstanceId(restartedInfo.baseUrl)
 
-    // --- (3) CFG-07 correctness assertion (NOT the discriminator): post
-    // CFG-07, `serverInstanceId` is STABLE installation identity across a
-    // same-home restart on BOTH implementations. This alone no longer proves
-    // which binary is running (that's assertion (4) below) -- it only proves
-    // the restart didn't lose the persisted identity.
+    // --- (3) A same-home restart preserves its installation identity. ---
     expect(instanceIdAfterRestart).toBe(instanceIdBeforeRestart)
 
-    // --- (4) the REAL identity oracle: `GET /api/server-info`'s permanent,
-    // structural node/rust discriminator (DIAG-05). This is the mutation
-    // boots (or reuses) a Node server would fail HERE, because a real Node
-    // process always reports a `nodeVersion` string and never `runtime`,
-    // while the Rust binary always reports `runtime: "rust"` and never
-    // `nodeVersion` -- a property of the binary itself, unaffected by
-    // whether CFG-07 makes `instanceId` stable on both sides.
+    // --- (4) The server-info response must identify the owned Rust binary. ---
     const runtimeInfoAfterRestart = await fetchServerInfo(restartedInfo.baseUrl, restartedInfo.token)
     for (const info of [runtimeInfoBeforeRestart, runtimeInfoAfterRestart]) {
       expect(info.runtime).toBe('rust')
