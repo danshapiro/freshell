@@ -85,6 +85,7 @@ function createServerOptions(input: {
     env: {
       PATH: `${input.binDir}${path.delimiter}${process.env.PATH ?? ''}`,
       FAKE_OPENCODE_AUDIT_LOG: input.auditLogPath,
+      FAKE_OPENCODE_BUSY_AT_LAUNCH: '1',
       ...(input.fakeOpencodeSessionEventGatePath ? { FAKE_OPENCODE_SESSION_EVENT_GATE_PATH: input.fakeOpencodeSessionEventGatePath } : {}),
       FRESHELL_LOG_DIR: input.logsDir,
       ...(input.env ?? {}),
