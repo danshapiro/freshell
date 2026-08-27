@@ -84,7 +84,7 @@ describe('Preload API', () => {
 
   it('completeSetup invokes correct IPC channel with config', () => {
     const config = {
-      serverMode: 'daemon' as const,
+      serverMode: 'app-bound' as const,
       port: 3001,
       remoteUrl: '',
       remoteToken: '',

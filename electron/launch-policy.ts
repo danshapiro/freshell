@@ -72,7 +72,7 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'auto-connect', candidate: candidates[0] }
   }
 
-  if (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon') {
+  if (desktopConfig.serverMode === 'app-bound') {
     return { type: 'start-local' }
   }
 

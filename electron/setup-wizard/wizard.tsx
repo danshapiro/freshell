@@ -44,7 +44,7 @@ export function Wizard({ onComplete }: WizardProps) {
     // Validate current step before proceeding
     if (step === 'configuration') {
       if (serverMode === 'remote' && !validateUrl(remoteUrl)) return
-      if ((serverMode === 'daemon' || serverMode === 'app-bound') && !validatePort(port)) return
+      if (serverMode === 'app-bound' && !validatePort(port)) return
     }
     if (currentStep < STEPS.length - 1) {
       setCurrentStep(currentStep + 1)
@@ -126,25 +126,6 @@ export function Wizard({ onComplete }: WizardProps) {
 
               <label
                 className={`block p-4 rounded-lg border cursor-pointer transition-colors ${
-                  serverMode === 'daemon' ? 'border-primary bg-muted' : 'border-border hover:border-muted-foreground'
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="serverMode"
-                  value="daemon"
-                  checked={serverMode === 'daemon'}
-                  onChange={() => setServerMode('daemon')}
-                  className="sr-only"
-                />
-                <div className="font-medium">Always-running daemon</div>
-                <div className="text-sm text-muted-foreground">
-                  Server runs as an OS service. Terminals survive app restarts and reboots. Best for power users.
-                </div>
-              </label>
-
-              <label
-                className={`block p-4 rounded-lg border cursor-pointer transition-colors ${
                   serverMode === 'remote' ? 'border-primary bg-muted' : 'border-border hover:border-muted-foreground'
                 }`}
               >
@@ -168,7 +149,7 @@ export function Wizard({ onComplete }: WizardProps) {
         {step === 'configuration' && (
           <div className="space-y-4">
             <h2 className="text-lg font-semibold">Configuration</h2>
-            {(serverMode === 'daemon' || serverMode === 'app-bound') && (
+            {serverMode === 'app-bound' && (
               <div className="space-y-2">
                 <label htmlFor="port" className="block text-sm font-medium">
                   Port number

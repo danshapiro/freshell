@@ -4,7 +4,7 @@
 // registration is done via the registerPreloadApi function.
 
 export interface WizardSetupConfig {
-  serverMode: string
+  serverMode: 'app-bound' | 'remote'
   port: number
   remoteUrl: string
   remoteToken: string

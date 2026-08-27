@@ -21,7 +21,6 @@ const __dirname = path.dirname(__filename)
 
 import { readDesktopConfig, patchDesktopConfig } from './desktop-config.js'
 import { getDefaultDesktopConfig } from './desktop-config.js'
-import { createDaemonManager } from './daemon/create-daemon-manager.js'
 import { createServerSpawner } from './server-spawner.js'
 import { createHotkeyManager } from './hotkey.js'
 import { createWindowStatePersistence } from './window-state.js'
@@ -283,7 +282,6 @@ async function main(): Promise<void> {
 
   // Create DI implementations
   const resourcesPath = isDev ? undefined : process.resourcesPath
-  const daemonManager = await createDaemonManager(resourcesPath)
   const serverSpawner = createServerSpawner()
   const hotkeyManager = createHotkeyManager(globalShortcut)
   const windowStatePersistence = createWindowStatePersistence()
@@ -319,7 +317,6 @@ async function main(): Promise<void> {
   const ctx: StartupContext = {
     desktopConfig,
     forcedLaunch,
-    daemonManager,
     serverSpawner,
     hotkeyManager,
     windowStatePersistence,
@@ -391,6 +388,12 @@ async function main(): Promise<void> {
         return undefined
       }
     },
+    // Electron E2E fixtures set this only when they own every test port. It
+    // prevents the normal local-server discovery sweep from touching another
+    // developer's server while the fixture exercises an explicit launch.
+    discoverLaunchCandidates: process.env.FRESHELL_ELECTRON_TEST_NO_LOCAL_DISCOVERY === '1'
+      ? async () => []
+      : undefined,
     createBrowserWindow: (options) => {
       return createRecoverableEntryWindow(
         options,
@@ -517,8 +520,11 @@ async function main(): Promise<void> {
     remoteToken: string
     globalHotkey: string
   }) => {
+    if (config.serverMode !== 'app-bound' && config.serverMode !== 'remote') {
+      throw new Error('Unsupported desktop server mode')
+    }
     await patchDesktopConfig({
-      serverMode: config.serverMode as 'daemon' | 'app-bound' | 'remote',
+      serverMode: config.serverMode,
       port: config.port,
       remoteUrl: config.remoteUrl || undefined,
       remoteToken: config.remoteToken || undefined,
