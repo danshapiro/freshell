@@ -234,7 +234,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe.skip('refresh requests', () => {
+  describe('refresh requests', () => {
     function createBrowserStore() {
       return configureStore({
         reducer: {
@@ -294,39 +294,9 @@ describe('BrowserPane', () => {
       expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
     })
 
-    it('retries a failed forwarded page when a matching refresh request arrives without an iframe', async () => {
-      const store = createBrowserStore()
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post)
-        .mockRejectedValueOnce(new Error('Connection refused'))
-        .mockResolvedValueOnce({ forwardedPort: 45678 })
-
-      await act(async () => {
-        // Use https: URL — http: uses same-origin proxy, not TCP forwarding
-        renderBrowserPane({ url: 'https://localhost:3000' }, store)
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      act(() => {
-        store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
-      })
-
-      await waitFor(() => {
-        expect(api.post).toHaveBeenCalledTimes(2)
-      })
-      await waitFor(() => {
-        expect(screen.queryByText('Failed to connect')).not.toBeInTheDocument()
-      })
-      // Protocol preserved — TCP forward passes bytes verbatim
-      expect(document.querySelector('iframe')?.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
-    })
   })
 
-  describe.skip('runtime activity', () => {
+  describe('runtime activity', () => {
     it('marks the pane idle after iframe load succeeds', () => {
       const { store } = renderBrowserPane({ url: 'https://example.com' })
 
@@ -339,38 +309,6 @@ describe('BrowserPane', () => {
       })
     })
 
-    it('marks the pane as error when port forwarding fails for https: URL', async () => {
-      setWindowHostname('remote-host')
-      vi.mocked(api.post).mockRejectedValueOnce(new Error('forward failed'))
-      // Use https: — http: uses same-origin proxy, not TCP forwarding
-      const { store } = renderBrowserPane({ url: 'https://127.0.0.1:3000' })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
-          source: 'browser',
-          phase: 'error',
-        })
-      })
-    })
-
-    it('marks remote localhost forwarding as busy while the proxy request is pending', async () => {
-      setWindowHostname('remote-host')
-      let resolveForward: ((value: { forwardedPort: number }) => void) | null = null
-      vi.mocked(api.post).mockReturnValueOnce(new Promise((resolve) => {
-        resolveForward = resolve
-      }))
-      // Use https: — http: uses same-origin proxy, not TCP forwarding
-      const { store } = renderBrowserPane({ url: 'https://127.0.0.1:3000' })
-
-      expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
-        source: 'browser',
-        phase: 'forwarding',
-      })
-
-      await act(async () => {
-        resolveForward?.({ forwardedPort: 45678 })
-      })
-    })
   })
 
   describe('file:// URL handling', () => {
@@ -405,7 +343,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe.skip('port forwarding for remote access', () => {
+  describe('localhost HTTP proxying', () => {
     it('proxies http: localhost URLs through HTTP proxy when accessing remotely', async () => {
       setWindowHostname('192.168.1.100')
 
@@ -457,23 +395,6 @@ describe('BrowserPane', () => {
       })
     })
 
-    it('preserves https: protocol for forwarded https: localhost URLs', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000/app' })
-      })
-
-      expect(api.post).toHaveBeenCalledWith('/api/proxy/forward', { port: 3000 })
-
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        // Protocol preserved — TCP proxy passes bytes verbatim (including TLS handshake)
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/app')
-      })
-    })
 
     it('proxies localhost URLs through HTTP proxy when accessing locally', async () => {
       setWindowHostname('localhost')
@@ -517,143 +438,6 @@ describe('BrowserPane', () => {
       )
     })
 
-    it('shows connecting state while port forward is pending for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      let resolveForward!: (value: { forwardedPort: number }) => void
-      vi.mocked(api.post).mockReturnValue(
-        new Promise((resolve) => {
-          resolveForward = resolve
-        }),
-      )
-
-      renderBrowserPane({ url: 'https://localhost:3000' })
-
-      // Should show connecting state (no iframe yet)
-      expect(screen.getByText(/Connecting/i)).toBeInTheDocument()
-      expect(document.querySelector('iframe')).toBeNull()
-
-      // Resolve the forward
-      await act(async () => {
-        resolveForward({ forwardedPort: 45678 })
-      })
-
-      // Now the iframe should appear
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      })
-    })
-
-    it('clears forwarding state when navigating to a non-forward URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockReturnValue(new Promise(() => {}))
-
-      renderBrowserPane({ url: 'https://localhost:3000' })
-
-      expect(screen.getByText(/Connecting/i)).toBeInTheDocument()
-
-      const input = screen.getByPlaceholderText('Enter URL...')
-      fireEvent.change(input, { target: { value: 'https://example.com' } })
-      fireEvent.keyDown(input, { key: 'Enter' })
-
-      await waitFor(() => {
-        expect(screen.queryByText(/Connecting/i)).not.toBeInTheDocument()
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://example.com')
-      })
-    })
-
-    it('releases port forward when navigating away from a forwarded URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-      })
-
-      // Navigate away
-      const input = screen.getByPlaceholderText('Enter URL...')
-      fireEvent.change(input, { target: { value: 'https://example.com' } })
-      fireEvent.keyDown(input, { key: 'Enter' })
-
-      await waitFor(() => {
-        expect(api.delete).toHaveBeenCalledWith('/api/proxy/forward/3000')
-      })
-    })
-
-    it('shows error when port forwarding fails for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockRejectedValue(
-        new Error('Failed to create port forward'),
-      )
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        // Use exact string to avoid matching the description which also contains "Failed to connect"
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-    })
-
-    it('clears loading state when port forwarding fails for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockRejectedValue(new Error('Connection refused'))
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      // Toolbar should show Refresh (not Stop), meaning isLoading is false
-      expect(screen.getByTitle('Refresh')).toBeInTheDocument()
-      expect(screen.queryByTitle('Stop')).not.toBeInTheDocument()
-    })
-
-    it('retries port forwarding when Try Again is clicked after failure', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post)
-        .mockRejectedValueOnce(new Error('Connection refused'))
-        .mockResolvedValueOnce({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      expect(api.post).toHaveBeenCalledTimes(1)
-
-      // Click Try Again
-      await act(async () => {
-        fireEvent.click(screen.getByText('Try Again'))
-      })
-
-      // Should have made a second API call
-      await waitFor(() => {
-        expect(api.post).toHaveBeenCalledTimes(2)
-      })
-
-      // Should now show the iframe (https: protocol preserved through TCP forward)
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      })
-    })
   })
 
   it('uses the HTTP proxy for localhost and clearly disables remote HTTPS loopback', async () => {
