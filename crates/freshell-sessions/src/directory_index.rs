@@ -469,11 +469,20 @@ fn item_from_meta(
     source_file: Option<PathBuf>,
     legacy_session_id: Option<String>,
 ) -> IndexedSession {
+    // Session transcripts record the checkout as `cwd`. For a linked git
+    // worktree, the sidebar's project grouping follows the common repository
+    // root, while `cwd` remains the checkout for resume and display details.
+    // This is the same resolver used by terminal metadata.
+    let project_path = meta
+        .cwd
+        .as_deref()
+        .and_then(freshell_platform::git_meta::resolve_git_repo_root)
+        .unwrap_or_else(|| meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()));
     IndexedSession {
         session_id,
         legacy_session_id,
         provider: provider.to_string(),
-        project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
+        project_path,
         title: meta.title.clone(),
         title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),

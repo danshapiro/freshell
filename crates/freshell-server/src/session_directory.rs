@@ -203,6 +203,15 @@ impl DirItem {
         }
         if let Some(v) = &self.cwd {
             o.insert("cwd".into(), json!(v));
+            // A linked worktree is grouped under its common repository but
+            // must retain its checkout for the client’s worktree-aware
+            // sidebar presentation. Ordinary checkouts omit this redundant
+            // field when checkout and project paths are identical.
+            if let Some(checkout_path) = freshell_platform::git_meta::resolve_git_checkout_root(v)
+                .filter(|checkout_path| checkout_path != &self.project_path)
+            {
+                o.insert("checkoutPath".into(), json!(checkout_path));
+            }
         }
         if self.is_subagent {
             o.insert("isSubagent".into(), json!(true));
