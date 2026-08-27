@@ -35,10 +35,22 @@ import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-serve
  *   startup normalization      the boot persist in `SettingsStore::load`
  *                              (knownProviders seed + legacy-seed strip)
  *   recent-directory update    NOT a Rust writer (CFG-09 open) — the CFG-01
- *   title migration            obligation for `recentDirectories`/
- *                              `completedMigrations` is PRESERVATION across
- *                              every other writer, asserted as sentinels in
- *                              every leg below.
+ *                              obligation for `recentDirectories` is
+ *                              PRESERVATION across every writer, asserted
+ *                              as a sentinel in every leg below.
+ *   title migration            IS a Rust boot writer since the Node-parity
+ *                              port: main.rs spawns the one-time
+ *                              `run_ai_title_shadow_cleanup`
+ *                              (`crates/freshell-server/src/migrations.rs`),
+ *                              which appends its `completedMigrations`
+ *                              marker whenever the marker is absent — even
+ *                              when it clears zero keys, so a clean home
+ *                              never re-scans. The seeded config must
+ *                              therefore PRESERVE boot 1's real marker
+ *                              (same treatment `serverSecrets` already
+ *                              gets), or the restart boot re-appends it —
+ *                              the exact drift this spec's restart leg
+ *                              once reported as a product wedge.
  *
  * Why rust-only (not MATRIX_SPECS): the acceptance is `PW-RUST`, and the
  * Rust writer is a deliberate strict SUPERSET of the frozen legacy store —
@@ -258,14 +270,25 @@ function fmt(p: DiffPath): string {
 }
 
 /** Assert every actual diff path is contained under one of the allowed
- * (prefix) paths — "only that writer's intended paths differ". */
+ * (prefix) paths — "only that writer's intended paths differ". On failure
+ * the unexpected set is named TWICE: in the expect message and on a
+ * `[cfg01-lossless]` console line, because cloud runs retain only the line
+ * reporter's stdout (no HTML report) and the reporter can abbreviate the
+ * Received block. */
 function expectDiffWithin(actual: DiffPath[], allowed: DiffPath[], context: string): void {
   const unexpected = actual.filter(
     (p) => !allowed.some((a) => a.length <= p.length && a.every((seg, i) => seg === p[i])),
   )
+  if (unexpected.length > 0) {
+    console.error(
+      `[cfg01-lossless] UNEXPECTED DRIFT (${context}): ${unexpected.map(fmt).join(', ')}` +
+        ` — allowed: ${allowed.length > 0 ? allowed.map(fmt).join(', ') : '(none)'}`,
+    )
+  }
   expect(
     unexpected.map(fmt),
-    `${context}: unexpected config.json drift beyond the writer's intended paths`,
+    `${context}: unexpected config.json drift beyond the writer's intended paths` +
+      ` (unexpected: ${unexpected.map(fmt).join(', ') || 'none'})`,
   ).toEqual([])
 }
 
@@ -327,8 +350,11 @@ function expectSentinelsIntact(
 
 /** Sentinel top-level block injected into a server-written default config.
  * (The codex secret is NOT here: the server's own minted value is preserved
- * from its first write and asserted alongside.) */
-function sentinelBlock(): Record<string, unknown> {
+ * from its first write and asserted alongside. `completedMigrations` is
+ * likewise a MERGE: the server's real boot-migration markers must survive
+ * seeding — erasing them makes the next boot re-run the marker append, a
+ * correct idempotent writer the restart leg would misread as drift.) */
+function sentinelBlock(existingCompletedMigrations: readonly string[]): Record<string, unknown> {
   return {
     sessionOverrides: {
       'claude:cfg01-sentinel-sess': { summaryOverride: 'CFG-01 sentinel summary', archived: true },
@@ -338,7 +364,7 @@ function sentinelBlock(): Record<string, unknown> {
     },
     projectColors: { '/cfg01/sentinel-project': '#aa00bb' },
     recentDirectories: ['/cfg01/recent/a', '/cfg01/recent/b', '/cfg01/recent/c'],
-    completedMigrations: ['cfg01-sentinel-migration'],
+    completedMigrations: [...existingCompletedMigrations, 'cfg01-sentinel-migration'],
     legacyLocalSettingsSeed: {
       theme: 'light',
       uiScale: 1.25,
@@ -352,6 +378,34 @@ function sentinelBlock(): Record<string, unknown> {
 
 async function readConfig(homeDir: string): Promise<any> {
   return JSON.parse(await fsp.readFile(path.join(homeDir, '.freshell', 'config.json'), 'utf8'))
+}
+
+/** The marker `crates/freshell-server/src/migrations.rs` appends on every
+ * boot where it is absent (Node parity; see the file-header inventory). */
+const AI_TITLE_SHADOW_CLEANUP_MARKER = 'ai-title-shadow-cleanup'
+
+/** Snapshot config.json only AFTER the detached boot writers have landed.
+ * The boot persist inside `SettingsStore::load` is synchronous before the
+ * listener binds, but the one-time `ai-title-shadow-cleanup` migration is
+ * `tokio::spawn`'d (`main.rs`) and appends its marker on a fresh/erased
+ * home; seeding must not snapshot before that append or it would seed a
+ * file the next boot must (correctly) rewrite. Timeout fails LOUDLY with
+ * the observed migrations — a stopped boot writer is a bug this spec
+ * wants to know about. */
+async function readConfigAfterBootWrites(homeDir: string, timeoutMs = 10_000): Promise<any> {
+  const start = Date.now()
+  let last: any
+  for (;;) {
+    last = await readConfig(homeDir)
+    const done = last?.completedMigrations
+    if (Array.isArray(done) && done.includes(AI_TITLE_SHADOW_CLEANUP_MARKER)) return last
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `Timed out waiting for the ai-title-shadow-cleanup boot marker; completedMigrations=${JSON.stringify(done)}`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, 100))
+  }
 }
 
 async function writeConfig(homeDir: string, doc: unknown): Promise<void> {
@@ -388,15 +442,17 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
 
     // ── Boot 1 (fresh install): the startup-normalization first write lands.
     let server = await spawnRustServer(homeDir, emptyExtDir)
-    const afterFirstWrite = await readConfig(homeDir)
+    const afterFirstWrite = await readConfigAfterBootWrites(homeDir)
     expect(afterFirstWrite.version).toBe(1)
     expect(afterFirstWrite.settings?.codingCli?.knownProviders).toEqual([])
 
     // ── Inject the sentinel block (stands in for keys written by writers
-    // that don't exist in Rust: recent-directory MRU (CFG-09), title
-    // migrations, and future tools). The running server must copy them
-    // forward from disk on every subsequent persist.
-    const seeded = { ...afterFirstWrite, ...sentinelBlock() }
+    // that don't exist in Rust: recent-directory MRU (CFG-09) and future
+    // tools — title migration is intentionally absent: it IS a Rust boot
+    // writer, so sentinelBlock preserves its marker; see the file-header
+    // inventory). The running server must copy them forward from disk on
+    // every subsequent persist.
+    const seeded = { ...afterFirstWrite, ...sentinelBlock(afterFirstWrite.completedMigrations ?? []) }
     // Keep the server's own minted codex secret; add an unknown sibling.
     seeded.serverSecrets = {
       ...(afterFirstWrite.serverSecrets ?? {}),
@@ -530,7 +586,7 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
 
     // Boot 1: fresh install produces the canonical default file.
     let server = await spawnRustServer(homeDir, emptyExtDir)
-    const firstWrite = await readConfig(homeDir)
+    const firstWrite = await readConfigAfterBootWrites(homeDir)
     await stopProcessGracefully(server.proc)
 
     // Corrupt the normalization inputs the way a legacy/pre-split config does:
@@ -538,7 +594,7 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     // INSIDE settings (seed-strip trigger) + the full sentinel block.
     const regressed: any = {
       ...firstWrite,
-      ...sentinelBlock(),
+      ...sentinelBlock(firstWrite.completedMigrations ?? []),
       settings: {
         ...firstWrite.settings,
         theme: 'dark',
