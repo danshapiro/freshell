@@ -23,26 +23,16 @@ import { TestHarness } from '../helpers/test-harness.js'
  * the bytes are still on disk, but the UI shows nothing.
  *
  * `amplifier` is the mode used to trigger this: it is accepted as a
- * REGISTERED terminal-launch target by BOTH servers' extension-manifest
- * discovery (`extensions/amplifier/freshell.json`, `category: "cli"`) --
- * proven by `amplifier-restore-rust.spec.ts` on the Rust side -- yet it was
+ * registered terminal-launch target by the owned Rust server's extension
+ * discovery (`extensions/amplifier/freshell.json`, `category: "cli"`) -- yet it was
  * never added to `zTabMode`'s hardcoded client-side enum. The mismatch
  * between "the server will happily create this" and "the client's persisted-
  * state schema doesn't know this mode exists" is the actual bug shape.
  *
- * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * identical divergence note already established by
- * FROZEN for this task) predates `origin/main` commit `05c6b1fa`
- * ("feat(amplifier): durable session tracking via events.jsonl", #514).
- * Verified two independent ways before writing this gate: (1) `git
- * merge-base --is-ancestor 05c6b1fa HEAD` on this branch returns false, and
- * (2) `playwright.config.ts` already documents, for the sibling
- * cannot even create the poisoned tab via REST in the first place -- this is
- * an absent feature on this branch, not a parity gap to gate per-assertion.
- * The underlying CLIENT bug this spec proves (`persistedState.ts`'s
- * `zTabMode` enum going stale relative to server-side extension discovery)
- * through any OTHER writer of `freshell.tabs.v2` that isn't gated by this
- * registration, or manual localStorage manipulation) -- this spec just
+ * This spec exercises the registered mode through the Rust REST API. The
+ * underlying client bug is the persisted-tabs schema falling behind the modes
+ * the current server can create; it remains reproducible through any writer of
+ * `freshell.tabs.v2`, including manual localStorage setup.
  *
  * ---
  * FLIP INSTRUCTION for whoever lands the client fix (main commit range

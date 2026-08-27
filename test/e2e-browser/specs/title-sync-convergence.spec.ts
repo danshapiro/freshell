@@ -9,16 +9,15 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * Pins EDEV-09 (`port/oracle/DEVIATIONS.md`): the Task 19 client
  * title-convergence fixes -- sidebar/history/terminal-menu/Overview renames
  * now mirror into pane titles via `applySessionRenameCascade`
- * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`
- * regression control proving the client fixes didn't regress Node behavior.
+ * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`.
  *
  * Each test drives a REAL UI journey (or the automation REST surface, where
  * the scenario is about automation) on its OWN dedicated seeded claude
  * session, then asserts BOTH surfaces (pane header + sidebar/tab) converge.
- * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI
- * server kinds). `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so neither
- * server's auto-name pass can reach a real Gemini: with no key, both servers'
- * sweeps settle sessions on the first-message heuristic, and every rename
+ * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI on
+ * the owned Rust baseline. `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so
+ * its auto-name pass cannot reach a real Gemini: with no key, the session
+ * sweep settles on the first-message heuristic, and every rename
  * below writes the finalized `user` ladder rung which the sweeps never
  * clobber.
  */
@@ -261,12 +260,11 @@ test.describe('Title sync convergence', () => {
 
     // The server-side layout mirror is client-pushed (`ui.layout.sync`,
     // 200 ms trailing debounce, layoutMirrorMiddleware.ts) — until it lands,
-    // BOTH servers answer a rename of the not-yet-mirrored pane with the
-    // Node-parity no-op 200 `{message:'pane not found'}` (router.ts:1411 /
-    // rename_pane lib.rs:1516-1521) and skip the broadcast + cascade
+    // The Rust server answers a rename of a not-yet-mirrored pane with the
+    // no-op 200 `{message:'pane not found'}` and skips the broadcast + cascade
     // entirely. That miss is a real automation-contract outcome, not a
     // convergence failure, so arrange like a real automation client: target
-    // a pane the server actually lists (GET /api/panes on both kinds).
+    // a pane the server actually lists (GET /api/panes).
     await expect.poll(async () => {
       const listRes = await page.request.get(`${serverInfo.baseUrl}/api/panes?tabId=${encodeURIComponent(tabId)}`, {
         headers: { 'x-auth-token': serverInfo.token },

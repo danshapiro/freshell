@@ -7,8 +7,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *
  * Seeds the isolated HOME with real Claude Code session JSONL files (before
  * the server boots, via `construct.setupHome`) and asserts the sidebar's
- * session list discovers and renders them. Routed through the same
- * the owned Rust server depending on the active project.
+ * session list discovers and renders them through the owned Rust server.
  *
  * Session-file shape is a trimmed version of
  * `perf/seed-server-home.ts`'s `buildSessionJsonl`: a `system`/`init` line,
@@ -99,7 +98,8 @@ function buildSessionJsonl(input: {
   return `${lines.join('\n')}\n`
 }
 
-// Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
+// Use the generalized E2eServerHandle seam (HARNESS-02) with the owned Rust
+// fixture so each worker receives an isolated server and home.
 const test = base.extend({
   testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
@@ -182,11 +182,10 @@ const test = base.extend({
           // read by the SAME `OpencodeSource`, so this seed is exercised by
           // the real production reader, not a test-only shape.
           // `default_opencode_data_home()` resolves `$XDG_DATA_HOME/opencode`
-          // (else `<realHome>/.local/share/opencode`). Both owned fixtures'
-          // `applyIsolatedHomeEnvironment` (`helpers/test-server.ts`) already
-          // sets `XDG_DATA_HOME` to `<homeDir>/.local/share` for every spawned
-          // server, so writing the DB there keeps it inside the isolated
-          // sandbox with no extra env override needed.
+          // (else `<realHome>/.local/share/opencode`). The Rust fixture's
+          // isolated-home environment sets `XDG_DATA_HOME` to
+          // `<homeDir>/.local/share`, so writing the DB there keeps it inside
+          // the isolated sandbox with no extra env override needed.
           const opencodeDataDir = path.join(homeDir, '.local', 'share', 'opencode')
           await fs.mkdir(opencodeDataDir, { recursive: true })
           const Database = (await import('node:sqlite')).DatabaseSync
@@ -234,26 +233,8 @@ const test = base.extend({
           // the Codex/OpenCode seeds above; the isolated `homeDir` IS the
           // real home for the spawned server).
           //
-          // KNOWN DIVERGENCE (codex-first triage note): this checked-out
-          // this task) predates upstream `origin/main` commit `05c6b1fa`
-          // ("feat(amplifier): durable session tracking via events.jsonl"),
-          // where `server/coding-cli/providers/amplifier.ts` was introduced
-          // -- verified via `git log --oneline HEAD..origin/main --
-          // server/coding-cli/providers/amplifier.ts` (6 commits touch that
-          // path; the unfiltered `git log --oneline HEAD..origin/main`,
-          // with no path filter, is 49 -- that broader count is NOT specific
-          // to this file and should not be quoted as if it were) and by
-          // grepping for zero "amplifier" occurrences under `server/` or
-          // `shared/` in this checkout (`retired Node build entry.js` is a
-          // gitignored build artifact, absent in a fresh checkout/worktree
-          // until a build is run, so it is NOT part of this verification --
-          // only present here because this worktree happens to have been
-          // at all in this branch -- not a home-layout mismatch to align, an
-          // absent feature. The seed below is still written unconditionally
-          // (same as every other provider seed in this hook) so a future
-          // merge of that upstream commit into this branch picks it up for
-          // free; the per-assertion `true` guards below
-          // are where the divergence is actually handled.
+          // The seed is written unconditionally so the owned Rust session
+          // directory indexes Amplifier alongside the other provider homes.
           const amplifierSessionDir = path.join(
             homeDir, '.amplifier', 'projects', 'matrix-epsilon-project', 'sessions', AMPLIFIER_SESSION_ID,
           )
@@ -315,7 +296,7 @@ test.describe('Session Directory Matrix', () => {
   // SESSION-01 -- "Index Claude, Codex, OpenCode, and Amplifier histories."
   // Extends the Claude-only assertion above to the seeded Codex + OpenCode +
   // Amplifier sessions, proving the sidebar surfaces all four provider
-  // families in one page against the SAME server (either project kind).
+  // families in one page against the owned Rust server.
   test('seeded Codex, OpenCode, and Amplifier sessions appear in the sidebar alongside Claude', async ({ freshellPage, page }) => {
     const sessionList = page.getByTestId('sidebar-session-list')
     await expect(sessionList).toBeVisible({ timeout: 15_000 })
@@ -330,32 +311,9 @@ test.describe('Session Directory Matrix', () => {
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText(/harness-02 matrix delta/i)).toBeVisible({ timeout: 15_000 })
 
-    // SESSION-01's 4th provider family: Amplifier -- this is the first e2e
-    // proof of the Rust-side Amplifier indexing feature
-    // (`crates/freshell-sessions/src/amplifier.rs`, wired as the fourth
-    // session source in `crates/freshell-server/src/main.rs`).
-    //
-    // implementation, FROZEN for this task) predates upstream
-    // `origin/main` commit `05c6b1fa` ("feat(amplifier): durable session
-    // tracking via events.jsonl"), which is where
-    // `server/coding-cli/providers/amplifier.ts` was introduced --
-    // verified via `git log --oneline HEAD..origin/main --
-    // server/coding-cli/providers/amplifier.ts` (6 commits touch that path,
-    // at time of writing; the unfiltered `git log --oneline
-    // HEAD..origin/main`, with no path filter, is 49 -- that broader count
-    // is NOT specific to this file) and by grepping for zero "amplifier"
-    // occurrences under `server/` or `shared/` in this checkout
-    // fixture used to run, is a gitignored build artifact -- absent in a
-    // fresh checkout/worktree until a build is run, so it's confirmatory
-    // only for an already-built checkout, not a standalone proof). So on
-    // registered at all and will never surface this seed -- that is not a
-    // `~/.amplifier` is the right home; see `amplifier_home()` in
-    // `amplifier.rs` vs `defaultAmplifierHome()` referenced in its doc
-    // comment), it is an absent feature on this branch, outside this task's
-    // frozen `server/` ownership. A follow-up merge of that upstream commit
-    // into this branch (or a Codex-driven port pass) would close the gap;
-    // flagging it here rather than silently asserting only what happens to
-    // pass.
+    // SESSION-01's fourth provider family: this checks the Rust-side
+    // Amplifier indexer (`crates/freshell-sessions/src/amplifier.rs`) through
+    // the same sidebar list as the other seeded providers.
     await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
   })
 

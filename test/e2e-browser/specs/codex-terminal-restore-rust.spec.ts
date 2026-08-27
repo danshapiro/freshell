@@ -17,7 +17,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
  * `opencode-terminal-restore-rust.spec.ts`'s identical divergence note):
  * identity there depended on the client's `terminal.codex.durability.updated`
- * candidate path, which the Rust server retired server-side. This is not a
+ * candidate path, which the Rust implementation no longer exposes. This is not a
  * parity gap to gate per-assertion; it is a capability that exists only on
  * the Rust port, designed by analogy to the amplifier/opencode locator
  * precedents, and this spec is scoped to the Rust project only rather than

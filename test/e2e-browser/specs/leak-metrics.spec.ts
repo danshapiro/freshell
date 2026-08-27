@@ -23,14 +23,14 @@ import {
  * process or port behind, and fails with a retained process-tree artifact if
  * the bound is exceeded."
  *
- * fixture):
+ * owned Rust fixture:
  *  1. The `leak-metrics` collector (helpers/leak-metrics.ts — logic unit-
  *     tested fixture-driven in leak-metrics.test.ts) captures the OWNED
  *     server's resource reality mid-stress: the REST-created PTY shells show
  *     up as descendant processes with RSS/fd/thread counts, the server's
  *     single LISTEN port is attributed, and per-socket queue bytes are read.
  *  2. A bounded create→send→close×6 loop, followed by a WS `terminal.kill`
- *     per tab (the canonical server-side reap path on both servers —
+ *     per tab (the canonical server-side reap path —
  *     `DELETE /api/tabs/:id` deliberately only drops layout bookkeeping),
  *     leaves NO process behind that was not already in the steady-state
  *     baseline: no new listening ports, no survivor outside the baseline
@@ -54,7 +54,7 @@ test.describe.configure({ mode: 'serial' })
 const ITERATIONS = 6
 
 /**
- * Live (non-zombie) processes. Both servers transiently reap children through
+ * Live (non-zombie) processes. The owned Rust server can transiently reap children through
  * tab create — observed as a `git:Z` descendant under load); a zombie holds
  * no RSS/fds and is a reap-latency artifact, not a leak, so growth/settle
  * comparisons run on live processes only. A zombie that NEVER reaps would
@@ -64,7 +64,7 @@ function liveProcesses(snap: ResourceSnapshot): ResourceSnapshot['processes'] {
   return snap.processes.filter((p) => p.state !== 'Z')
 }
 
-/** Envelope shared by both servers: `{status:"ok", data:{...}}` (rust ok_json / legacy mirror). */
+/** Rust REST envelope: `{status:"ok", data:{...}}`. */
 function unwrapData(body: unknown): any {
   if (body && typeof body === 'object' && 'data' in (body as object)) return (body as any).data
   return body
@@ -121,11 +121,11 @@ async function deleteTab(baseUrl: string, token: string, tabId: string): Promise
 }
 
 /**
- * The canonical server-side PTY reap path on BOTH servers: a raw WS client
+ * The owned Rust server's canonical PTY reap path: a raw WS client
  * sends `hello`, ATTACHES to the terminal (uniform `terminal.attach.ready`
  * crates/freshell-ws/src/terminal.rs attach flow), then `terminal.kill`
  * SIGKILL + reap) and waits for the `terminal.exit` edge. The attach step is
- * clients in `record.clients` (terminal-registry.ts:1542), so an unattached
+ * clients in its attached-client set, so an unattached
  * observer would wait forever for a frame that never comes.
  */
 async function killTerminalViaWs(wsUrl: string, token: string, terminalId: string): Promise<void> {
@@ -240,8 +240,8 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
         const marker = `H12-${i}`
         const created = await createShellTab(baseUrl, token)
 
-        // The measurement must SEE the provider/PTY child mid-stress on both
-        // server kinds (live ppid descendant of the owned server pid).
+        // The measurement must see the provider/PTY child mid-stress as a live
+        // descendant of the owned Rust server pid.
         const during = await expect
           .poll(
             () => liveProcesses(captureResourceSnapshot([pid])).length,

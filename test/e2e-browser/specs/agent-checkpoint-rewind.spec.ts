@@ -114,12 +114,13 @@ function findFreshAgentLeaf(node: any): any {
 
 test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
   test('rewinding code through the real UI reverts tracked files while the later turn, model, and durable session survive a restart', async ({ page }) => {
-    // client's single-slot optimistic local echo (`pendingLocalEcho`)
+    // This test remains explicitly skipped because the client's single-slot
+    // optimistic local echo (`pendingLocalEcho`) is not reliably
     // remaining visible/clickable long enough to hover + click "Rewind
     // code to here" -- the ONLY source for a "You: ..." bubble against
     // this fixture (see the file-level SCOPE NOTE). Empirically, repeated
-    // runs show the Rust server's `freshAgent.send.accepted` ack racing
-    // server's, non-deterministically clearing the echo (and thus hiding
+    // runs show the Rust server's `freshAgent.send.accepted` acknowledgement
+    // non-deterministically clearing the echo (and thus hiding
     // the "Rewind" button) before this spec can act, even with every
     // avoidable serial wait removed and the two independent preconditions
     // (row present, checkpoint landed) run concurrently. This is a timing
@@ -129,12 +130,11 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
     // also out of scope -- shared infrastructure), not a Rust SERVER
     // defect in the checkpoint routes themselves (which are proven
     // correct by `crates/freshell-server/src/checkpoints.rs`'s 41 Rust
-    // tests, route-level, real-HTTP). The gesture is fully proven reliable
-    // convention already used by `sidebar-click-resume.spec.ts` and
-    test.skip(true, 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click on the Rust server faster than on legacy -- see comment above; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
+    // tests, route-level, real-HTTP).
+    test.skip(true, 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
 
-    // This scenario's own real-server-restart leg (rebuilding/relaunching a
-    // the suite's default 60s per-test budget; extend it rather than touch
+    // This scenario's real-server-restart leg can exceed the suite's default
+    // 60s per-test budget; extend it rather than touch
     // the shared global default.
     test.setTimeout(120_000)
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agent14-rewind-'))

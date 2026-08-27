@@ -40,7 +40,7 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
+test.describe('HARNESS-02: owned Rust restart mutation negative-proof', () => {
   test.setTimeout(90_000)
 
   test('the fixture-owned server is the one THIS project claims to own, across a restart', async ({

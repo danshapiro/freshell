@@ -46,8 +46,8 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
  * `ERR_MODULE_NOT_FOUND`. Re-execing node against the ORIGINAL path (still
  * inside the real project tree) avoids both problems.
  *
- * `CODEX_CMD` pointed at this wrapper's path works identically for BOTH
- * server kinds:
+ * `CODEX_CMD` pointed at this wrapper's path works with the owned Rust
+ * server:
  *     spawns `CODEX_CMD` directly as the executable (no shell, no splitting) --
  *     the wrapper's own `#!/usr/bin/env node` shebang (and its +x bit) handles
  *     the rest;

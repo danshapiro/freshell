@@ -108,7 +108,7 @@ function findTerminalLeaf(node: any): any {
 
 /** The plain create frame — byte-identical on every send, exactly what the
  * frozen client mints and resends (TerminalView.tsx); mode claude rides the
- * same dispatch arm as shell and reaches the fake CLI on both servers. */
+ * same dispatch arm as shell and reaches the fake CLI on the Rust server. */
 function plainCreateFrame(requestId: string, cwd: string) {
   return { type: 'terminal.create', requestId, mode: 'claude', shell: 'system', cwd }
 }

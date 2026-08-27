@@ -32,13 +32,11 @@ import { TestHarness } from '../helpers/test-harness.js'
  *     note left open ("resuming a session through the UI" via a deliberate
  *     click, not a restart-driven re-launch) is proven for this provider.
  *   - Codex (`codex resume <id>`, per `extensions/codex-cli/freshell.json`'s
- *     `resumeArgs` and `server/terminal-registry.ts:105`/
  *     `crates/freshell-platform/src/cli_launch_goldens.rs`'s G-X2):
- *     DIAGNOSTIC ONLY (`test.fixme`), NOT a green assertion, on EITHER
- *     server kind -- see the DISCOVERED comment on the test itself for the
- *     `status: 'error'`; rust: the actual resume happens through the
- *     FreshCodex JSON-RPC app-server sidecar, not a plain `codex resume
- *     <id>` CLI argv, so this fixture's premise doesn't match reality).
+ *     DIAGNOSTIC ONLY (`test.fixme`), NOT a green assertion. The Rust
+ *     baseline resumes through the FreshCodex JSON-RPC app-server sidecar,
+ *     not a plain `codex resume <id>` CLI argv, so this fixture's premise
+ *     does not match the current runtime.
  */
 
 const __filename = fileURLToPath(import.meta.url)

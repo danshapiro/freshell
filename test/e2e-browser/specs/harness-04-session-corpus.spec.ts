@@ -14,6 +14,7 @@
  *     REAL provider homes were untouched (marker tripwires + absent-dir
  *     strictness, the attributable layers from harness-01's live-host idiom).
  *
+ *   Leg B (owned Rust server): seed the corpus into the fixture's isolated
  *     home and drive the real `/api/session-directory` read model through
  *     `page.request` — >1 page via nextCursor, exact identity/title/summary/
  *     projectPath/checkoutPath/archived/fractional-order matching vs the
@@ -241,10 +242,10 @@ test.describe('HARNESS-04: session corpus builder', () => {
   })
 
   /* ---------------------------------------------------------------- */
-  /* Leg B — legacy-open expected semantics                             */
+  /* Leg B — owned Rust server manifest semantics                       */
   /* ---------------------------------------------------------------- */
 
-  test('leg B: legacy server pages the corpus with exact manifest semantics', async ({ page, corpusWorker, serverInfo }) => {
+  test('leg B: owned Rust server pages the corpus with exact manifest semantics', async ({ page, corpusWorker, serverInfo }) => {
     const manifest = corpusWorker.manifest
     const listed = listedSessions(manifest)
     const pageLimit = manifest.pagination.pageLimit
