@@ -33,7 +33,6 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
  * browser page has EVER synced a layout into -- none of which can share a
  * worker-scoped server under `fullyParallel`. Registered rust-only in
  * `playwright.config.ts` (the LayoutStore-backed automation routes are this
- * sweep's Rust work; the frozen legacy `server/` tree is not under test).
  */
 
 interface BootedServer {

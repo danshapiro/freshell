@@ -14,10 +14,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *   controls in A, assert exact membership in A and B, reload/restart, and
  *   verify the shared values and results persist."
  *
- * Routed through the generalized `E2eServerHandle`/`rustFixture` seam
- * (HARNESS-02) so this SAME spec exercises the legacy Node server or the
  * owned Rust server depending on the active project. Fixture shapes are
- * copied from `session-directory-matrix.spec.ts` (themselves pinned against
  * both servers' real parsers): a Claude `system/init` + user/assistant turn
  * pair + `summary` JSONL, a Codex `session_meta` + `response_item` pair, an
  * Amplifier `metadata.json` + `transcript.jsonl` pair, and an OpenCode
@@ -54,7 +51,6 @@ const AMP_PLAIN_ID = 'amp-s13-plain-0003'
 const OPENCODE_CONTROL_ID = 'oc-s13-control-0001'
 
 // Two turns per Claude session (not one, copied from
-// session-directory-matrix.spec.ts): legacy `claude.ts:478` classifies a
 // session with <= 1 user message as NON-interactive, and the sidebar's
 // default `showNoninteractiveSessions: false` would hide it regardless of
 // any exclusion knobs — the first user message stays line 1 of the
@@ -172,7 +168,6 @@ async function seedAmplifierSession(
       JSON.stringify({ role: 'assistant', content: `${input.name} reply` }),
     ].join('\n') + '\n',
   )
-  // FIXTURE REALISM (copied from session-directory-matrix.spec.ts): the
   // amplifier recency formula folds sidecar mtimes into lastActivityAt; pin
   // them to the seeded metadata timestamp so the fixture matches what it
   // claims.
@@ -332,7 +327,6 @@ async function pollServerSidebarSettings(page: any) {
   })
 }
 
-// Exact-membership assertion over the whole seeded matrix.
 async function assertMembership(
   page: any,
   expected: { visible: string[]; hidden: string[] },

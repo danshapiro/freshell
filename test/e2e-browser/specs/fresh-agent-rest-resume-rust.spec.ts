@@ -47,7 +47,6 @@
 //     `tabs.sync.query` harness is modeled on
 //     tabs-registry-persistence-rust.spec.ts.
 //
-// Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch
 // (restartAbrupt exists only on RustServer).
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -66,7 +65,6 @@ const __dirname = path.dirname(__filename)
 const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 
 // ---------------------------------------------------------------------------
-// Copied helpers (donor: freshagent-settings-resume-rust.spec.ts / agent-continuity-matrix.spec.ts)
 // ---------------------------------------------------------------------------
 
 /** Parse a JSONL file, tolerating absence (returns []). */
@@ -109,7 +107,6 @@ function seedWallConfig(input: {
  * Successful REST responses on this surface are enveloped as
  * `{status:'ok', data:{…}, message}` (Rust `ok_json`). Unwrap `data` —
  * falling back to the bare body for resilience.
- * (donor: agent-continuity-matrix.spec.ts :46-48)
  */
 function unwrapData(body: any): any {
   return body && typeof body === 'object' && 'data' in body ? body.data : body

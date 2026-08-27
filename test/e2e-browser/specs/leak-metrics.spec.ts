@@ -23,8 +23,6 @@ import {
  * process or port behind, and fails with a retained process-tree artifact if
  * the bound is exceeded."
  *
- * What this spec proves on BOTH server kinds (retired Node browser lane +
- * Rust browser lane matrix projects, routed by the HARNESS-02 `rustFixture`
  * fixture):
  *  1. The `leak-metrics` collector (helpers/leak-metrics.ts — logic unit-
  *     tested fixture-driven in leak-metrics.test.ts) captures the OWNED
@@ -57,7 +55,6 @@ const ITERATIONS = 6
 
 /**
  * Live (non-zombie) processes. Both servers transiently reap children through
- * a brief Z-state window (e.g. the legacy server’s `git rev-parse` probe per
  * tab create — observed as a `git:Z` descendant under load); a zombie holds
  * no RSS/fds and is a reap-latency artifact, not a leak, so growth/settle
  * comparisons run on live processes only. A zombie that NEVER reaps would
@@ -126,11 +123,8 @@ async function deleteTab(baseUrl: string, token: string, tabId: string): Promise
 /**
  * The canonical server-side PTY reap path on BOTH servers: a raw WS client
  * sends `hello`, ATTACHES to the terminal (uniform `terminal.attach.ready`
- * ack — legacy server/terminal-stream/broker.ts:505; rust
  * crates/freshell-ws/src/terminal.rs attach flow), then `terminal.kill`
- * (legacy ws-handler.ts:3073 → registry.killAndWait; rust terminal.rs:4482 —
  * SIGKILL + reap) and waits for the `terminal.exit` edge. The attach step is
- * not optional on legacy: its registry only `safeSend`s `terminal.exit` to
  * clients in `record.clients` (terminal-registry.ts:1542), so an unattached
  * observer would wait forever for a frame that never comes.
  */
@@ -152,7 +146,6 @@ async function killTerminalViaWs(wsUrl: string, token: string, terminalId: strin
         }
         if (frame.type === 'ready' && !attached) {
           // Client-shaped attach (src/components/terminal-view-utils.ts
-          // buildTerminalAttachMessage): legacy schema-validates intent/cols/
           // rows, and the same shape is accepted by the rust attach flow.
           ws.send(JSON.stringify({
             type: 'terminal.attach',
@@ -209,7 +202,6 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
     // Baseline must be the server's STEADY STATE, captured at a fixed point
     // of the live-pid set — NOT the first moment no zombie exists. Gate B003
     // (2026-08-09) proved the zombies==0-only gate unsound on the plain
-    // chromium project: the legacy server's WSL2 startup children
     // (`ipconfig.exe` from bootstrap.ts LAN-IP detection, awaited pre-listen;
     // `netsh.exe` from firewall.ts detectFirewall via the fire-and-forget
     // startup getStatus() banner — measured alive in S-state at ~0.8-1.0s

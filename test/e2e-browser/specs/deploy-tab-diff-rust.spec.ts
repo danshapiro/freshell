@@ -25,8 +25,6 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  *       partial-coverage set-difference guard -- with a fake `curl` proving
  *       verify makes ZERO network calls in --after mode.
  *
- * Rust-only: legacy has no persisted snapshot generations. Registered ONLY
- * under `Rust browser lane`; testIgnore'd via RUST_ONLY_SPECS everywhere else.
  *
  * EPHEMERAL-ONLY SAFETY: the server is constructed DIRECTLY via `new
  * RustServer(...)` -- throwaway binary, ephemeral loopback port, mkdtemp HOME.

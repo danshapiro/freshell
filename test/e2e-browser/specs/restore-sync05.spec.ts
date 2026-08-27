@@ -30,7 +30,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  *   2. The CODEX/APP-BOUND deliberate-restart case (2026-07-19, this task):
  *      a FreshCodex pane, backed by the JSON-RPC app-server sidecar (the
  *      SAME `fake-app-server.mjs` fixture and `freshAgent.create`/
- *      `freshAgent.attach` wire observables `restore-matrix.spec.ts`'s
  *      "targets the same durable thread ... after a full server restart"
  *      scenario already proves session-continuity for), reconnects quietly
  *      AND targets the SAME durable session after the restart. This became
@@ -59,9 +58,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * "[Reconnecting...]" scrollback notice (`TerminalView.tsx`), which is
  * expected chrome for an in-flight reconnect, not user-facing error noise.
  *
- * Routed through the generic `E2eServerHandle`/`rustFixture` seam (HARNESS-02)
  * -- no server-kind-specific assertions -- so this SAME spec runs against
- * both the legacy Node server and the owned Rust server per retired matrix list.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -73,7 +70,6 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
 )
 
 /**
- * Same re-exec wrapper `restore-matrix.spec.ts`'s `installFakeCodexAppServer`
  * uses (duplicated locally -- not exported there, and this spec owns only
  * `test/e2e-browser/**`): re-execs `node <original fixture path>` rather than
  * copying the fixture's content (which would break its `import { WebSocketServer }
@@ -150,7 +146,7 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
       await expect(page.getByRole('alert')).toHaveCount(0)
 
       if (!server.restart) {
-        throw new Error(`$() E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
 
       // --- THE DELIBERATE, EXPECTED RESTART. This is an intentional
@@ -215,7 +211,6 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
   // half of SYNC-05 for a FreshCodex pane, backed by the JSON-RPC
   // app-server sidecar (NOT a plain-CLI terminal). Reuses the exact
   // `fake-app-server.mjs` fixture and `freshAgent.create`/`freshAgent.attach`
-  // wire-observable pattern `restore-matrix.spec.ts`'s "targets the same
   // durable thread ... after a full server restart" scenario already
   // proves session-continuity with -- this leg ADDS the SYNC-05 "quiet"
   // assertions (no role="alert", no auth modal, no plain-text error
@@ -254,7 +249,6 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
         await harness.waitForHarness()
         await harness.waitForConnection()
         // Select a plain shell for the FIRST pane -- matching
-        // `restore-matrix.spec.ts`'s `bootAndConnect` default -- so
         // `openPanePicker` below takes the "split an existing pane" path
         // (right-click > split horizontally) rather than the bare "Add
         // pane" path a picker-less empty tab would otherwise use.
@@ -262,7 +256,6 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
         await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
         // Client-only concern: the picker only shows Freshcodex if the
-        // codex CLI appears available (same pattern `restore-matrix
         // .spec.ts` uses -- the fixture stands in for a real codex binary
         // on PATH).
         await page.evaluate(() => {
@@ -304,7 +297,6 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
 
         // One real, independently-confirmed live turn -- establishes
         // genuine functional content (not a blank/placeholder pane) before
-        // the restart, mirroring `restore-matrix.spec.ts`'s pattern.
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
         const sendButton = paneRoot.getByRole('button', { name: 'Send' })
         await expect.poll(async () => {
@@ -321,7 +313,7 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
         await expect(page.getByRole('alert')).toHaveCount(0)
 
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
 
         await harness.clearSentWsMessages()
@@ -349,7 +341,6 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
 
         // (b) SAME DURABLE SESSION -- every `freshAgent.create`/
         // `freshAgent.attach` sent after the restart targets the ORIGINAL
-        // session (the wire-level proof `restore-matrix.spec.ts`'s TERM-02
         // scenario establishes), never a fresh/unrelated one.
         await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 20_000 })
         await expect.poll(async () => {

@@ -7,17 +7,13 @@
  * PTY PID, one terminal ID, one pane owner, and one fixture launch record."
  *
  * The dedupe is a SERVER-side contract with byte-identical semantics on both
- * implementations (legacy parity source: `server/ws-handler.ts` global
  * `createdTerminalByRequestId` settled cache :575/:891-936 + per-connection
  * `REPAIR_PENDING_SENTINEL` :2329-:2704 + create lock :2218; rust answer:
  * `crates/freshell-ws/src/create_dedupe.rs` + the dispatch arm at
  * `crates/freshell-ws/src/terminal.rs:564-624`). This spec therefore runs in
- * BOTH matrix projects — Rust browser lane is the PW-RUST proof leg,
- * retired Node browser lane is a true parity control.
  *
  * Fixture launcher: HARNESS-03's `fake-claude.mjs` wired in via the
  * established `CLAUDE_CMD` server-env seam (same pattern as
- * `truly-idle-alerting.spec.ts`, matrix-green). Every provider spawn appends
  * one JSONL row to `FRESHELL_FAKE_LEDGER` — "one fixture launch record" is
  * `rows === 1`, and the row's `pid` is THE PTY PID.
  *
@@ -211,7 +207,6 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     // this server, nothing else spawned).
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
     // Linux-hosted, but keep the assert honest off-Linux ([] there).
     if (process.platform === 'linux') {
       expect(childPidsOf(info.pid)).toContain(rows[0].pid)
@@ -261,7 +256,6 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
 
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
     // Linux-hosted, but keep the assert honest off-Linux ([] there).
     if (process.platform === 'linux') {
       expect(childPidsOf(info.pid)).toContain(rows[0].pid)

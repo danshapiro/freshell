@@ -351,7 +351,6 @@ test.describe('HARNESS-14 controllable server clock', () => {
 
   test('the control surface is absent in a normal build (ungated fixture)', async ({ serverInfo }) => {
     // The worker-scoped default fixture boots WITHOUT FRESHELL_TEST_CLOCK on
-    // BOTH projects — that boot IS the "normal build" launch: every clock
     // verb must answer the catch-all's indistinguishable 404.
     expect(typeof serverInfo.token).toBe('string')
     for (const [method, path] of [

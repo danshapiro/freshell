@@ -4,8 +4,6 @@ import { TestHarness } from '../helpers/test-harness.js'
 
 // Override the worker-scoped testServer so this spec manages its own lifecycle,
 // but keep it routed through the generalized E2eServerHandle seam (HARNESS-02)
-// so this SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `rustFixture` option.
 const test = base.extend({
   testServer: [async ({}, use) => {
     // Provide a dummy -- the test creates its own server handle.
@@ -97,7 +95,7 @@ test.describe('Server Restart Recovery', () => {
       // terminals that no longer exist, triggering INVALID_TERMINAL_ID ->
       // recreate for each pane.
       if (!server1.restart) {
-        throw new Error(`$() E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
       await server1.restart()
 

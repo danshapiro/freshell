@@ -14,7 +14,6 @@ import net from 'node:net'
  * finishReason, usageMetadata), proven by the real-SDK vitest legs.
  *
  * NOTE (verified): the SDK only redirects via `createGoogleGenerativeAI({
- * baseURL })`; there is NO environment override, and the frozen legacy server
  * constructs the default provider. Specs therefore drive this fixture
  * directly (or via a server seam added by a later item).
  */

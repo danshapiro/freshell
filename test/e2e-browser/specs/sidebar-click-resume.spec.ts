@@ -20,7 +20,6 @@ import { TestHarness } from '../helpers/test-harness.js'
  * historical session in the sidebar, and assert the newly-opened pane's
  * spawned CLI process actually receives `resume <sessionId>` in its argv
  * (not just that a pane opens with a plausible title, which
- * `restore-matrix.spec.ts`'s "opening a seeded historical session..."
  * scenario already covers for Claude without an argv-level check).
  *
  * Two provider legs:
@@ -37,7 +36,6 @@ import { TestHarness } from '../helpers/test-harness.js'
  *     `crates/freshell-platform/src/cli_launch_goldens.rs`'s G-X2):
  *     DIAGNOSTIC ONLY (`test.fixme`), NOT a green assertion, on EITHER
  *     server kind -- see the DISCOVERED comment on the test itself for the
- *     two independent findings (legacy: terminal-create settles into
  *     `status: 'error'`; rust: the actual resume happens through the
  *     FreshCodex JSON-RPC app-server sidecar, not a plain `codex resume
  *     <id>` CLI argv, so this fixture's premise doesn't match reality).
@@ -147,7 +145,6 @@ test.describe('Sidebar Click Resume', () => {
               },
             }, null, 2))
 
-            // Same real-reader shape as `session-directory-matrix.spec.ts`'s
             // codex seed: a `session_meta` record carrying `payload.id`/`cwd`
             // plus a `response_item`/`message` record so a real title is
             // extracted.
@@ -293,7 +290,6 @@ test.describe('Sidebar Click Resume', () => {
               },
             }, null, 2))
 
-            // Same shape as `session-directory-matrix.spec.ts`'s amplifier
             // seed: `metadata.json` + sibling `transcript.jsonl` under
             // `<amplifier_home>/projects/<slug>/sessions/<id>/`.
             const amplifierSessionDir = path.join(

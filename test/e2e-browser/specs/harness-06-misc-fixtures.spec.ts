@@ -36,7 +36,6 @@ import {
 } from '../helpers/harness-06/https.js'
 
 /**
- * HARNESS-06 fixture smoke (retired matrix list-registered, server-kind-agnostic).
  *
  * Acceptance mirror (checklist Playwright validation text): a fixture smoke
  * that reaches every target directly, records editor/Kilroy invocations,
@@ -48,7 +47,6 @@ import {
  * This spec requests ONLY Playwright's built-in page/browser fixtures; the
  * shared harness's `testServer` is worker-lazy, so NO Freshell server boots
  * (load-bearing ledger L1). It therefore runs identically under
- * `chromium`, `retired Node browser lane`, and `Rust browser lane`.
  *
  * Each named `test(...)` is one acceptance leg; per-leg observed outcomes are
  * recorded in docs/plans/df1-evidence/HARNESS-06.md.

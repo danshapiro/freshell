@@ -180,7 +180,6 @@ async function expectFreshAgentSubmitButtonContrasted(
 
 /** Convert the active leaf terminal pane into a freshclaude pane carrying the
  * strip-relevant wiring: a canonical (UUID) durable session id chain so the
- * restore machinery never trips the "legacy name" restore error, and the
  * static default model ('opus[1m]') so the chip label is deterministic.
  * Network effects are suppressed BEFORE the conversion so the attach effect
  * records instead of sending; the REST snapshot is served by

@@ -10,7 +10,6 @@
  *      sessionRef (transcripts deleted server-side) yields the LOUD
  *      dead_session adjudication flow -- never a silent wrong-session attach
  *      and never a silent fresh.
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch.
  * Helpers copied, not imported, per this suite's per-spec-ownership
  * convention (donor: restore-contract-wall-rust.spec.ts).
  */

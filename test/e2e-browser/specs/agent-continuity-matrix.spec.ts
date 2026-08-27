@@ -21,8 +21,6 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * (`crates/freshell-freshagent/src/lib.rs`'s `send_keys`: "create the
  * durable session ONLY the FIRST time this pane sends") lives entirely in
  * that HTTP handler, independent of any client rendering. Routed through
- * the `rustFixture`/`E2eServerHandle` seam (HARNESS-02) so the SAME spec
- * exercises the legacy Node server and the owned Rust server.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -37,9 +35,7 @@ async function installFakeOpencode(binDir: string): Promise<void> {
 }
 
 /**
- * Both server kinds wrap successful responses on this surface as
  * `{status:"ok", data:{...}, message:"..."}` (Rust's `ok_json` helper,
- * `crates/freshell-freshagent/src/lib.rs`; the legacy Node router mirrors
  * the same envelope). Unwrap `data` -- falling back to the bare body for
  * resilience if a future response ever flattens the envelope.
  */
@@ -76,11 +72,7 @@ async function sendKeys(baseUrl: string, token: string, paneId: string, data: st
 }
 
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
-// SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `rustFixture` option.
-const test = base.extend<{ auditLogPath: string; sharedCwd: string }, {
-  rustFixture: 'legacy' | 'rust'
-}>({
+const test = base.extend<{ auditLogPath: string; sharedCwd: string }>({
   testServer: [async ({}, use) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agent-continuity-'))
     const binDir = path.join(sharedRoot, 'bin')

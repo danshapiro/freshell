@@ -32,7 +32,6 @@ import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
  * drives the brief's exact REST flow (`POST /api/tabs {cwd}`): the
  * `freshell-freshagent` spawn pipeline now fires the terminal-created hook
  * `main.rs` wires to `freshell_ws::terminal_meta::seed_from_terminal`
- * (Node `seedFromTerminal` parity, `server/index.ts:647-655` -- legacy
  * seeds off the registry's 'terminal.created' event for EVERY terminal,
  * REST creates included). Test 2 was a `test.fail()` KNOWN-GAP pin until
  * the hook landed; its flip instruction has been executed.
@@ -164,7 +163,6 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
   // `freshell_ws::terminal_meta::seed_from_terminal` -- the SAME seed ->
   // async git enrich -> `commit_if_changed` -> `terminal.meta.updated`
   // pipeline the WS `terminal.create` handler runs. Node parity:
-  // legacy seeds off the registry's 'terminal.created' EVENT for EVERY
   // terminal (`server/index.ts:647-655` -> `seedFromTerminal`), REST
   // creates included. This leg was a `test.fail()` KNOWN-GAP pin until the
   // hook landed (rest-tab-persistence.spec.ts flip regime).

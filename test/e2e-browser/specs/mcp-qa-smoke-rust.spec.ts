@@ -9,7 +9,6 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
 
 /**
- * MCP QA SMOKE -- the full-mode-matrix payoff of the QA lever (Slice 2 of
  * `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76/\u00a78.3, which
  * `mcp-bridge-rust.spec.ts` pins for `mode:"shell"` only). This spec drives
  * the retained standalone Node MCP stdio binary (`dist/tools/freshell-mcp/server.js`)
@@ -23,10 +22,6 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
  * the post-restart assertions are deliberately negative (documenting a real
  * gap, not fabricating persistence that does not exist).
  *
- * Rust-only (gated via `playwright.config.ts`'s `Rust browser lane`-only
- * `testMatch`, same as `mcp-bridge-rust.spec.ts`): the legacy MCP<->legacy-REST
- * path is legacy's own already-tested path. This pins RUST-SERVER REST
- * compatibility with the unmodified MCP client across the full mode matrix.
  *
  * No browser `page` needed -- like `mcp-bridge-rust.spec.ts`, this drives pure
  * REST (over MCP-over-stdio); it reuses only the process-supervision half of

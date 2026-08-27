@@ -5,7 +5,6 @@ import type { E2eServerHandle } from '../helpers/external-target.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
- * SAFE-03 -- matrix spec.
  *
  * Full acceptance text: "Enforce WebSocket Origin policy. Accept configured
  * trusted origins and reject hostile/malformed origins before session state
@@ -22,7 +21,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * test).
  *
  * KNOWN DIVERGENCE (documented in `origin.rs`'s own module doc comment, not
- * a new finding): the legacy Node server's Origin check
  * (`server/auth.ts#isOriginAllowed`, `ws-handler.ts`) is explicitly
  * ADVISORY-ONLY -- it never closes a socket for a bad Origin, only logs a
  * warning, and still authenticates via the hello token. The Rust port
@@ -30,9 +28,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * 4011 code before any session state is sent) because the Rust server's
  * production bind is `0.0.0.0` (LAN-reachable), where advisory-only leaves a
  * DNS-rebinding path open. This spec therefore runs the SAME connection
- * attempts against BOTH `retired Node browser lane` and `Rust browser lane`, but asserts
  * the DIFFERENT, per-kind-correct outcome for the reject-path cases:
- * legacy is the CONTROL that empirically proves the pre-hardening gap this
  * checklist item exists to close, rust proves the fix.
  *
  * NOT covered here:

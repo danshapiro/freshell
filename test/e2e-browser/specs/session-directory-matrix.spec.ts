@@ -4,13 +4,10 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * HARNESS-02 Finding 1 -- the "session" matrix scenario category.
  *
  * Seeds the isolated HOME with real Claude Code session JSONL files (before
  * the server boots, via `construct.setupHome`) and asserts the sidebar's
  * session list discovers and renders them. Routed through the same
- * `E2eServerHandle`/`rustFixture` seam as `settings-persistence-split.spec.ts`
- * (HARNESS-02) so this SAME spec exercises both the legacy Node server and
  * the owned Rust server depending on the active project.
  *
  * Session-file shape is a trimmed version of
@@ -23,7 +20,6 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 const SESSION_ALPHA_ID = '00000000-0000-4000-8000-0000000a1111'
 const SESSION_BETA_ID = '00000000-0000-4000-8000-0000000b2222'
 // SESSION-01 extension -- codex + opencode seeds, sharing the same
-// `matrix-*` naming convention as the Claude alpha/beta seeds above so a
 // single sidebar assertion can look for all three providers.
 const CODEX_SESSION_ID = 'codex-matrix-gamma-0001'
 const OPENCODE_SESSION_ID = 'oc-matrix-delta-0001'
@@ -104,8 +100,6 @@ function buildSessionJsonl(input: {
 }
 
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
-// SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `rustFixture` option.
 const test = base.extend({
   testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
@@ -241,7 +235,6 @@ const test = base.extend({
           // real home for the spawned server).
           //
           // KNOWN DIVERGENCE (codex-first triage note): this checked-out
-          // branch's `server/` tree (legacy Node implementation, FROZEN for
           // this task) predates upstream `origin/main` commit `05c6b1fa`
           // ("feat(amplifier): durable session tracking via events.jsonl"),
           // where `server/coding-cli/providers/amplifier.ts` was introduced
@@ -255,7 +248,6 @@ const test = base.extend({
           // gitignored build artifact, absent in a fresh checkout/worktree
           // until a build is run, so it is NOT part of this verification --
           // only present here because this worktree happens to have been
-          // built already). So legacy has NO Amplifier provider registered
           // at all in this branch -- not a home-layout mismatch to align, an
           // absent feature. The seed below is still written unconditionally
           // (same as every other provider seed in this hook) so a future
@@ -343,8 +335,6 @@ test.describe('Session Directory Matrix', () => {
     // (`crates/freshell-sessions/src/amplifier.rs`, wired as the fourth
     // session source in `crates/freshell-server/src/main.rs`).
     //
-    // KNOWN DIVERGENCE (codex-first triage note): scoped to `Rust browser lane`
-    // only. This checked-out branch's `server/` tree (legacy Node
     // implementation, FROZEN for this task) predates upstream
     // `origin/main` commit `05c6b1fa` ("feat(amplifier): durable session
     // tracking via events.jsonl"), which is where
@@ -355,13 +345,10 @@ test.describe('Session Directory Matrix', () => {
     // HEAD..origin/main`, with no path filter, is 49 -- that broader count
     // is NOT specific to this file) and by grepping for zero "amplifier"
     // occurrences under `server/` or `shared/` in this checkout
-    // (`retired Node build entry.js`, which the `retired Node browser lane` project's
     // fixture used to run, is a gitignored build artifact -- absent in a
     // fresh checkout/worktree until a build is run, so it's confirmatory
     // only for an already-built checkout, not a standalone proof). So on
-    // `retired Node browser lane` the legacy indexer has NO Amplifier provider
     // registered at all and will never surface this seed -- that is not a
-    // home-layout mismatch to align (legacy and Rust already agree
     // `~/.amplifier` is the right home; see `amplifier_home()` in
     // `amplifier.rs` vs `defaultAmplifierHome()` referenced in its doc
     // comment), it is an absent feature on this branch, outside this task's
@@ -369,9 +356,7 @@ test.describe('Session Directory Matrix', () => {
     // into this branch (or a Codex-driven port pass) would close the gap;
     // flagging it here rather than silently asserting only what happens to
     // pass.
-    if (true) {
-      await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
-    }
+    await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
   })
 
   // SESSION-01 narrowed-MISSING closure -- provider ICON assertion. Each
@@ -428,13 +413,10 @@ test.describe('Session Directory Matrix', () => {
     // DIFFERENT icon from every other, not a shared fallback.
     expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox]).size).toBe(3)
 
-    // Amplifier (Rust browser lane only -- see the KNOWN DIVERGENCE note in the
     // sibling test above): the 4th provider family's icon.
-    if (true) {
-      const epsilonViewBox = await iconViewBox(AMPLIFIER_SESSION_ID)
-      expect(epsilonViewBox).toBe(PROVIDER_ICON_VIEWBOX.amplifier)
-      expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox, epsilonViewBox]).size).toBe(4)
-    }
+    const epsilonViewBox = await iconViewBox(AMPLIFIER_SESSION_ID)
+    expect(epsilonViewBox).toBe(PROVIDER_ICON_VIEWBOX.amplifier)
+    expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox, epsilonViewBox]).size).toBe(4)
   })
 
   // SESSION-01 -- API-level field-parity + ordering proof. Cheaper and more
@@ -443,7 +425,6 @@ test.describe('Session Directory Matrix', () => {
   // `server/session-directory/service.ts`; same route path on the Rust side
   // at `crates/freshell-server/src/session_directory.rs:315`) and asserts
   // identity (provider+sessionId), cwd/project, and lastActivityAt for each
-  // seeded session, plus that the matrix sessions come back ordered by
   // lastActivityAt DESC -- the acceptance text's "ordering" clause.
   //
   // Scope note (honesty per SESSION-01's Playwright validation, which also
@@ -532,29 +513,24 @@ test.describe('Session Directory Matrix', () => {
     expect(alphaIdx).toBeLessThan(deltaIdx)
     expect(betaIdx).toBeLessThan(deltaIdx)
 
-    // Amplifier (Rust browser lane only -- see the KNOWN DIVERGENCE note in the
     // previous test): exact identity/cwd/lastActivityAt match, computed
     // directly from the metadata.json fixture seeded above -- this is this
     // task's field-parity proof for the 4th provider family. Seeded newest
     // of the five, so it must sort before gamma.
-    if (true) {
-      const epsilon = findItem('amplifier', AMPLIFIER_SESSION_ID)
-      expect(epsilon.projectPath).toBe('/tmp/freshell-matrix/epsilon-project')
-      expect(epsilon.cwd).toBe('/tmp/freshell-matrix/epsilon-project')
-      expect(epsilon.lastActivityAt).toBe(Date.parse(AMPLIFIER_LAST_ACTIVITY_AT_ISO))
+    const epsilon = findItem('amplifier', AMPLIFIER_SESSION_ID)
+    expect(epsilon.projectPath).toBe('/tmp/freshell-matrix/epsilon-project')
+    expect(epsilon.cwd).toBe('/tmp/freshell-matrix/epsilon-project')
+    expect(epsilon.lastActivityAt).toBe(Date.parse(AMPLIFIER_LAST_ACTIVITY_AT_ISO))
 
-      const epsilonIdx = orderedIds.indexOf(`amplifier:${AMPLIFIER_SESSION_ID}`)
-      expect(epsilonIdx).toBeGreaterThanOrEqual(0)
-      expect(epsilonIdx).toBeLessThan(gammaIdx)
-    }
+    const epsilonIdx = orderedIds.indexOf(`amplifier:${AMPLIFIER_SESSION_ID}`)
+    expect(epsilonIdx).toBeGreaterThanOrEqual(0)
+    expect(epsilonIdx).toBeLessThan(gammaIdx)
   })
 
   // SESSION-09 -- live sidebar updates. A session written to the isolated
   // HOME's provider directory AFTER boot (not via `setupHome`, which only
   // seeds BEFORE the server starts) must appear in the sidebar without a
-  // page reload. Legacy's `SessionsSyncService` (a real filesystem watcher,
   // `server/sessions-sync/service.ts`) already does this -- this spec's
-  // `retired Node browser lane` run is the CONTROL proving the assertion itself is
   // sound. The Rust port has no filesystem watcher (see
   // `crates/freshell-server/src/main.rs`'s `spawn_sessions_sweep` doc
   // comment); it substitutes a periodic sweep that broadcasts
@@ -606,10 +582,7 @@ test.describe('Session Directory Matrix', () => {
   // (`src/components/Sidebar.tsx`'s `<input placeholder="Search...">`,
   // `filter`/`setFilter` state) actually filters the rendered session list
   // to matching titles only, across TWO different provider kinds (claude's
-  // "harness-02 matrix beta" and codex's "harness-02 matrix gamma"), and
   // that clearing the search (`aria-label="Clear search"`) restores the
-  // full list -- on BOTH projects, with `retired Node browser lane` as the control
-  // proving the assertions themselves are sound (legacy already has full
   // title-tier search; this proves the Rust port's pre-existing title-tier
   // search reaches the same real UI element identically, not just a raw
   // API check).
@@ -657,7 +630,6 @@ test.describe('Session Directory Matrix', () => {
   // unit-proves pruning a deleted file from its cache/snapshot
   // (`deleted_file_pruned`, `directory_index.rs`) -- this spec is the
   // outer, browser-level proof that the same removal reaches the rendered
-  // sidebar with no reload. `retired Node browser lane` is the control (its real
   // filesystem watcher, `SessionsSyncService`, already handles deletions).
   //
   // Writes its OWN session (not alpha/beta/gamma, which earlier tests in

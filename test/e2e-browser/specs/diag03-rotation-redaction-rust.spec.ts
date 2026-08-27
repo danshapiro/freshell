@@ -1,10 +1,8 @@
 /**
  * DIAG-03 — Redact secrets and rotate logs safely (PW-RUST).
  *
- * Rust-only Playwright spec. The frozen legacy `server/` tree does not support
  * `FRESHELL_LOG_MAX_BYTES` / `FRESHELL_LOG_MAX_BACKUPS` env-var-configurable
  * rotation limits, so small-limit-rotation and rotation-count assertions have
- * no legacy equivalent — this is a deliberate Rust-only hardening feature.
  *
  * The Rust integration test `diag01_diag03_logging.rs` covers the same
  * behaviors at the crate level; this spec adds the Playwright-layer proof the

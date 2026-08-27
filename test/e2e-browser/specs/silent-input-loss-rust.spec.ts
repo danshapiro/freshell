@@ -8,7 +8,6 @@
  * guarantee here is ARRIVAL (the visible input-loss notice is the fallback
  * for overflow/timeout paths, covered by unit tests).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch,
  * because it imports RustServer directly for restart() (same-home/same-port/
  * same-token revival -- the browser's WS auto-reconnect targets the original
  * port, so only a same-port restart lets the existing page reconnect).

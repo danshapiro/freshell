@@ -28,7 +28,6 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  * `crates/freshell-ws/tests/codex_candidate_inert.rs` (the accept-and-ignore
  * contract).
  *
- * Rust-only (`playwright.config.ts` registers this under `Rust browser lane`).
  */
 
 const __filename = fileURLToPath(import.meta.url)

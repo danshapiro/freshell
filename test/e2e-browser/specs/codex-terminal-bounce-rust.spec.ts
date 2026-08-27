@@ -19,7 +19,6 @@ import { TestHarness } from '../helpers/test-harness.js'
  * every codex create -- bounce restores AND sidebar reopens -- spawned plain
  * `codex` with no resume args. In the 19:25 incident batch, 3 amplifier panes
  * (same client path, generic derivation) resumed correctly while all 6 codex
- * panes came back fresh. Legacy parity: `server/ws-handler.ts:2040-2047`
  * derives the codex resume id from the sessionRef too (via
  * `planCodexCreateRestoreDecision`'s `durable_session_ref_resume`).
  *
@@ -34,7 +33,6 @@ import { TestHarness } from '../helpers/test-harness.js'
  *      AND that no `terminal_identity_unresolved` WARN
  *      (`crates/freshell-ws/src/invariants.rs`) ever fires in the server log.
  *
- * Rust-only: this drives the Rust server's WS create path; the frozen legacy
  * `server/` tree derives codex resume correctly already (the anchor above)
  * and is not the subject of this regression.
  *
@@ -135,7 +133,6 @@ test.describe('Codex Terminal Bounce (Rust only)', () => {
             }, null, 2))
 
             // Same real-reader seed shape as `sidebar-click-resume.spec.ts` /
-            // `session-directory-matrix.spec.ts`: a `session_meta` record
             // carrying `payload.id`/`cwd` plus message records for a title.
             const codexSessionsDir = path.join(homeDir, '.codex', 'sessions')
             await fs.mkdir(codexSessionsDir, { recursive: true })
@@ -235,7 +232,7 @@ test.describe('Codex Terminal Bounce (Rust only)', () => {
         // shape: pre-fix, the re-spawn was plain `codex` (no resume).
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 

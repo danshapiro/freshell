@@ -23,8 +23,6 @@
  * Rust-only: the auto-resume orchestrator lives in the Rust server
  * (crates/freshell-ws/src/auto_resume.rs); owns one RustServer per test rig
  * (ephemeral loopback port — NEVER 3001/3002). Registered ONLY under
- * `Rust browser lane` and testIgnore'd on every match-all project (see
- * playwright.config.ts's RUST_ONLY_SPECS).
  */
 import { test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'

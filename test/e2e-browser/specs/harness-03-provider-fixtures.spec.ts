@@ -17,7 +17,6 @@
  *   5. resume: each provider's real resume argv shape yields a resume event.
  *
  * Server-kind independence: the spec uses bare `@playwright/test` (no
- * `testServer`, no `page`), so both matrix projects run byte-identical
  * assertions against the fixtures — that sameness IS the fixture-only proof.
  */
 import { test, expect } from '@playwright/test'

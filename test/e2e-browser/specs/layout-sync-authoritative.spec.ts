@@ -9,8 +9,6 @@
  * layout snapshot and assert exact tab IDs/order, pane tree/ratios, titles,
  * content, active tab, and active pane.
  *
- * Runs in BOTH matrix projects (`retired Node browser lane` parity control +
- * `Rust browser lane`): the legacy Node `LayoutStore` and the Rust layout store
  * (AUTO-01's port) must produce byte-identical read surfaces for the same
  * mirrored UI layout. Authored under the df1 deferred-Playwright policy
  * (probe-executable: run once per leg); see docs/plans/df1-evidence/AUTO-01.md.
@@ -240,7 +238,6 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     // this page keeps emitting its own syncs (layoutMirrorMiddleware, 200ms
     // debounce) on every tabs/panes-affecting Redux action — e.g. the
     // terminal-spawn/boot burst after page load. Any such sync that lands
-    // AFTER this injection REPLACES the store and erases tab-legacy-remote.
     // The poll below therefore re-asserts the injection on every iteration,
     // so the normalized read is observed from an iteration that is the last
     // writer (converges once the client's boot burst settles, deterministically).

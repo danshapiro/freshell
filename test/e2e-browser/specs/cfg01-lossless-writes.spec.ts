@@ -11,7 +11,6 @@ import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-serve
 /**
  * CFG-01 — rust-only spec: "Make every `config.json` write lossless. Preserve
  * `sessionOverrides`, `terminalOverrides`, `projectColors`, `recentDirectories`,
- * `completedMigrations`, `legacyLocalSettingsSeed`, Codex secrets, and unknown
  * future keys on every writer."
  *
  * Checklist validation (`PW-RUST`): "Seed unique sentinels and parameterize
@@ -33,18 +32,13 @@ import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-serve
  *                              listener risk on the owned server)
  *   provider migration +
  *   startup normalization      the boot persist in `SettingsStore::load`
- *                              (knownProviders seed + legacy-seed strip)
  *   recent-directory update    NOT a Rust writer (CFG-09 open) — the CFG-01
  *   title migration            obligation for `recentDirectories`/
  *                              `completedMigrations` is PRESERVATION across
  *                              every other writer, asserted as sentinels in
  *                              every leg below.
  *
- * Why rust-only (not retired matrix list): the acceptance is `PW-RUST`, and the
- * Rust writer is a deliberate strict SUPERSET of the frozen legacy store —
- * legacy's `loadInternal` normalization REBUILDS `serverSecrets` down to
  * only `codexDisplayIdSecret` (`server/config-store.ts:348-355`), so the
- * sibling-secret sentinel below would legitimately fail on legacy. Legacy
  * cannot be a parity control for a guarantee it never provided.
  *
  * Why this spec spawns the binary directly (cfg03 precedent): it must seed
@@ -533,7 +527,6 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     const firstWrite = await readConfig(homeDir)
     await stopProcessGracefully(server.proc)
 
-    // Corrupt the normalization inputs the way a legacy/pre-split config does:
     // knownProviders REMOVED (provider-seed trigger) + stray browser-local keys
     // INSIDE settings (seed-strip trigger) + the full sentinel block.
     const regressed: any = {

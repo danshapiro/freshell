@@ -32,8 +32,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * (`io::ErrorKind::NotFound`, surfaced via the existing `wrap_terminal_spawn_error`
  * -> `PTY_SPAWN_FAILED` path) when no `$PATH` entry has a match.
  *
- * This spec is registered ONLY under the `Rust browser lane` project
- * (`playwright.config.ts`): the bug is unix-portable-pty-specific and legacy
  * node-pty is unaffected (bare names go straight to PATH search, no cwd-first
  * branch) -- not a parity gap to gate per-assertion, a Rust-only regression.
  */
@@ -240,7 +238,6 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
     // UI-driven test could never reach the pane-creation code path at all.
     // The fix under test is entirely server-side (`crates/freshell-platform`
     // / `crates/freshell-terminal`), so exercising the WS protocol directly
-    // -- the same pattern `ws-ping-pong-matrix.spec.ts` uses -- proves the
     // real behavior without fighting UI availability heuristics that exist
     // purely as a UX nicety, not a server-side guarantee.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-term28-missing-'))

@@ -10,9 +10,7 @@ import { TestHarness } from '../helpers/test-harness.js'
 /**
  * SIDEBAR OPENCODE RAIL -- the user-level proof for the two sidebar bugs
  * fixed in `fix/sidebar-opencode-rail-fixes`. Runs against BOTH real
- * servers (default `chromium` project = Node, `Rust browser lane` = Rust);
  * Node parity is part of the fix, so this spec is registered in the
- * Rust browser lane `testMatch` rather than `RUST_ONLY_SPECS`.
  *
  *   - Bug 2: OpenCode's catch-all "global" project stores `worktree = '/'`.
  *     Treating that placeholder as a real checkout put every global-project
@@ -32,7 +30,6 @@ import { TestHarness } from '../helpers/test-harness.js'
  * This spec NEVER touches a live/self-hosted server: `createE2eServerHandle`
  * boots an isolated instance on an ephemeral port with its own HOME.
  *
- * STATUS (2026-08-07): GREEN on BOTH projects. The `chromium` (Node) leg
  * was RED at authoring on a real product gap: the Node server's
  * `buildLiveTerminalSessionItem` (`server/session-directory/service.ts`)
  * fabricated a session item for every running terminal without ever

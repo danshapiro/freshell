@@ -360,7 +360,6 @@ describe('session-corpus codex writer', () => {
       lastActivityAt: Date.parse('2026-08-02T10:00:00.002Z'),
       archivedByProvider: true,
     })
-    // NOT under sessions/** — the legacy glob never sees it, on purpose.
     expect(ctx.files[0].path.startsWith('.codex/archived_sessions/2026/08/02/')).toBe(true)
     expect(exp.visibility).toBe('absent')
     expect(exp.title).toBeUndefined() // never indexed: no wire semantics

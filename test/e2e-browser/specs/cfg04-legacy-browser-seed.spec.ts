@@ -6,31 +6,21 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 
 /**
- * CFG-04 — Restore automatic legacy browser-preference seeding.
  *
  * Checklist validation text (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md):
- * "Start with seeded legacy settings and empty browser storage, open Rust,
  * assert every visible preference, reload twice, and verify the one-time
  * migration marker prevents stale seed values from overwriting a later user
  * change."
  *
- * The seeded home below is a genuine PRE-SPLIT legacy `config.json`: the
  * browser-local preferences still live INSIDE `settings` (no top-level
- * `legacyLocalSettingsSeed` key), in all five categories the item names —
  * theme, browser-local sidebar presentation, scale, terminal font, and sound —
  * alongside the server-backed `sidebar.excludeFirstChat*` knobs (those must
  * REMAIN in `config.json`; SESSION-13's surface, not this item's).
  *
  * Routed through the generalized E2eServerHandle seam (HARNESS-02), so the
- * SAME spec exercises the legacy Node server (parity source) and the owned
- * Rust server depending on the active project's `rustFixture` —
- * `retired Node browser lane` proves the fixture/assertions pin real legacy behavior,
- * `Rust browser lane` proves the port.
  *
  * df1 campaign posture: `deferred` — authored but intentionally NOT executed by
  * the CFG-04 worker (see docs/plans/df1-evidence/CFG-04.md); the close-out
- * campaign runs it through retired matrix list. Crate-level proofs for the same
- * semantics are green in `crates/freshell-server/src/legacy_local_seed.rs` and
  * `settings_store.rs` (`frs-cfg04-*` tests).
  */
 const test = base.extend({
@@ -67,7 +57,6 @@ const test = base.extend({
               // the user-change step below needs. `sortMode`+`width` fully
               // represent the "browser-local sidebar presentation" category;
               // the collapsed member IS covered at crate level
-              // (`legacy_local_seed.rs` / `settings_store.rs` fixtures).
               sidebar: {
                 excludeFirstChatSubstrings: ['welcome'],
                 excludeFirstChatMustStart: false,

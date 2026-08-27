@@ -95,7 +95,6 @@ function collectLeaves(node: any): any[] {
 }
 
 function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string): string {
-  // Donor shape: session-directory-matrix.spec.ts:36 (buildSessionJsonl).
   // Field names verified against the donor (system/init: session_id, uuid,
   // timestamp, cwd; turns: parentUuid, sessionId, cwd, message, uuid, timestamp).
   const t0 = '2026-07-20T08:00:00.000Z'

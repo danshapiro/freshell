@@ -7,7 +7,6 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 /**
- * SESSION-05 — project colors on History project headers (matrix leg).
  *
  * Acceptance text (docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md):
  * "Choose a project color in one browser, assert the History project header
@@ -18,11 +17,8 @@ import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-of
  * PUT /api/project-colors → config `projectColors` → `sessions.changed`
  * broadcast → every open context refetches `/api/session-directory` whose
  * page now carries `projectColors` → the client's group overlay recolors
- * the History header swatch. Runs against BOTH server kinds via the
- * HARNESS-02 seam (`rustFixture`); legacy is a true parity control.
  *
  * Seeds reuse the trimmed Claude-JSONL shape from
- * session-directory-matrix.spec.ts (the upstream corpus builder HARNESS-04
  * is not required — two single-file projects suffice for the color claim).
  */
 
@@ -245,7 +241,7 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
 
       // --- Full server restart, SAME isolated home: still there. ---
       if (!server.restart) {
-        throw new Error(`$() E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
       await server.restart()
       await expect(async () => {

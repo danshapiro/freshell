@@ -9,8 +9,6 @@
  *         failure class cannot re-emerge at the server boundary.
  *
  * Owns a RustServer directly (ephemeral loopback port — NEVER 3001/3002),
- * in RUST_ONLY_SPECS because the DELETE route exists only on the Rust server
- * (under the legacy server the delete leg exercises a different write path).
  */
 import { test, expect } from '@playwright/test'
 import { promises as fs } from 'node:fs'

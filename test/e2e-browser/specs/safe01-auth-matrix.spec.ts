@@ -4,7 +4,6 @@ import { RustServer } from '../helpers/rust-server.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
- * SAFE-01 -- matrix spec.
  *
  * Full acceptance text: "Match token validation and authentication rules.
  * Reject empty, weak, default, malformed, and conflicting token sources
@@ -17,14 +16,11 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * `crates/freshell-server/src/main.rs`'s `validate_auth_token()` and
  * `crates/freshell-server/src/boot.rs`'s `is_authed()` precedence fix are
  * unit/real-socket tested at the Rust level, but never driven from a
- * Playwright `PW-RUST` spec (browser/API/WS matrix, and the bad-token
  * STARTUP rejection, were both unproven at this layer).
  *
  * This spec closes that gap for every CHEAPLY PROVABLE clause, run against
- * BOTH `retired Node browser lane` and `Rust browser lane` (`server/auth.ts` and
  * `crates/freshell-server/src/main.rs::validate_auth_token` share the exact
  * same messages/order/`DEFAULT_BAD_TOKENS` set, confirmed by direct
- * source read of both, so legacy is a true parity control here -- NOT a
  * "known divergence" case like SAFE-03/SAFE-05).
  *
  * NOT covered here (see the SAFE-01 checklist entry for why):
@@ -46,7 +42,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  *     `password`/`token`) are all under 16 characters, and the "too short"
  *     check runs BEFORE the weak-value check in both `server/auth.ts` and
  *     `main.rs::validate_auth_token`, so any of those literal values always
- *     hits "too short" first. The "too-short" matrix case below uses
  *     `changeme` itself to PROVE this empirically (see the
  *     `weak-default-token-is-actually-caught-by-the-too-short-check` case)
  *     rather than silently skip the weak-value clause.
@@ -130,8 +125,6 @@ test.describe('SAFE-01 startup token-validation matrix (bad tokens refuse to boo
     expect(result.message).not.toContain('default/weak value')
   })
 
-  // Rust-only hardening beyond legacy: a whitespace-only token is JS-truthy
-  // (legacy's `!token` check passes it through) but Rust additionally
   // rejects it via `token.trim().is_empty()`. KNOWN DIVERGENCE, not a bug:
   // documented directly in `main.rs::validate_auth_token`'s doc comment.
   test('whitespace-only token: Rust hardens beyond legacy (rejected on Rust, accepted on legacy)', async () => {

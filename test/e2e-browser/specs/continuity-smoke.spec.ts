@@ -28,9 +28,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  * pre-fix binary) isolates the `136b9e94` resume regression from that
  * commit's concurrent `terminal.created` logging change.
  *
- * Outside the default matrix by design: registered ONLY under the
  * `continuity-smoke` project (npm run smoke:continuity) and listed in
- * playwright.config.ts's RUST_ONLY_SPECS testIgnore for every match-all
  * project.
  *
  * ## Probe findings (Task 6, sdd/task-6-report.md)

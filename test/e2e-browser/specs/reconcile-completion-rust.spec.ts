@@ -15,7 +15,6 @@
  *      identity; live panes across reloads take attach verdicts -- zero
  *      spawns).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * this spec imports RustServer directly (restartAbrupt()).
  *
  * Helpers are copied, not imported, per the e2e suite's per-spec-ownership
