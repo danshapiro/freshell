@@ -42,6 +42,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # correlation refusal (`amplifier-session-locator.ts:727-733`'s `log.warn`
 # equivalent) -- same version already used by `freshell-ws`.
 tracing = "0.1"
+# Session-directory project grouping follows the shared git-root resolution
+# used by terminal metadata, so linked worktree sessions group under their
+# parent repository while preserving the checkout as `cwd`.
+freshell-platform = { path = "../freshell-platform" }
 
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection
