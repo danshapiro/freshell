@@ -79,6 +79,45 @@ describe('runtime boundary analyzer', () => {
     expect(result.unexpectedNodeBackend).toContain('scripts/invented-listener.ts')
   })
 
+  it('rejects an unlisted Node listener in an e2e helper regardless of its filename', async () => {
+    const root = await createSyntheticRoot(
+      [],
+      {
+        'test/e2e-browser/helpers/rogue-listener.ts': [
+          "import http from 'node:http'",
+          "http.createServer((_req, res) => res.end('nope')).listen(0)",
+        ].join('\n'),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.unexpectedNodeBackend).toEqual([
+      'test/e2e-browser/helpers/rogue-listener.ts',
+    ])
+  })
+
+  it('preserves explicitly recorded legacy test listeners without allowing adjacent helpers', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'legacy-helper',
+        path: 'test/e2e-browser/helpers/legacy-listener.ts',
+        role: 'legacy-test-backend',
+        listener: 'legacy-backend',
+      }],
+      {
+        'test/e2e-browser/helpers/legacy-listener.ts': "require('node:http').createServer().listen(0)\n",
+        'test/e2e-browser/helpers/rogue-listener.ts': "require('node:http').createServer().listen(0)\n",
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.unexpectedNodeBackend).toEqual([
+      'test/e2e-browser/helpers/rogue-listener.ts',
+    ])
+  })
+
   it('allows sanctioned Node roles and the exact non-backend listener rows', async () => {
     const roleFiles: Record<string, string> = {
       'config/vite/vite.config.ts': "export default { server: { host: '127.0.0.1' } }\n",

@@ -138,6 +138,10 @@ function isSourcePath(relativePath: string): boolean {
   return sourceExtensions.has(path.posix.extname(relativePath))
 }
 
+function isTestFilePath(relativePath: string): boolean {
+  return /\.(?:test|spec)\.(?:cjs|js|jsx|mjs|ts|tsx)$/.test(relativePath)
+}
+
 function isExecutableMode(mode: number): boolean {
   return (mode & 0o111) !== 0
 }
@@ -347,7 +351,10 @@ function hasListenerCapability(contents: string): boolean {
 
 function isCapabilityScanPath(relativePath: string): boolean {
   if (isIgnoredRelativePath(relativePath) || !isSourcePath(relativePath)) return false
-  if (relativePath.startsWith('test/')) return nonBackendListenerPaths.has(relativePath)
+  // Test cases may create throwaway listeners for assertions. Runtime helpers
+  // and fixtures are the executable test surfaces, so scan every non-test
+  // source file below test/ while excluding test/spec implementations.
+  if (relativePath.startsWith('test/') && isTestFilePath(relativePath)) return false
   return [
     'config/',
     'crates/',
@@ -357,6 +364,7 @@ function isCapabilityScanPath(relativePath: string): boolean {
     'server/',
     'shared/',
     'src/',
+    'test/',
     'tools/',
   ].some((prefix) => relativePath.startsWith(prefix))
 }

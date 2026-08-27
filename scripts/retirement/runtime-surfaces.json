@@ -88,6 +88,10 @@
     { "id": "legacy-test-agent-cli-screenshot", "path": "test/e2e/agent-cli-screenshot-smoke.test.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
     { "id": "legacy-test-extension-system", "path": "test/integration/extension-system.test.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
     { "id": "legacy-test-codex-remote", "path": "test/integration/real/codex-remote-fork-contract.test.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
+    { "id": "legacy-test-coding-cli-session-harness", "path": "test/helpers/coding-cli/real-session-contract-harness.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
+    { "id": "legacy-test-visible-first-protocol-harness", "path": "test/helpers/visible-first/protocol-harness.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
+    { "id": "legacy-test-visible-first-read-model-harness", "path": "test/helpers/visible-first/read-model-route-harness.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
+    { "id": "legacy-test-remote-proxy-forward-child", "path": "test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts", "role": "legacy-test-backend", "listener": "legacy-backend" },
 
     { "id": "port-laptop-bootstrap", "path": "port/laptop-bootstrap/2-bootstrap-wsl.sh", "role": "port-bootstrap" },
     { "id": "port-vm-bridge-bootstrap", "path": "port/vm-bridge/agent-console-wsl.sh", "role": "port-bootstrap" },
