@@ -29,6 +29,8 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
 
   let mainWindow: any = null
   let isQuitting = false
+  let quitAfterServerStop = false
+  let serverStopInProgress: Promise<void> | undefined
 
   await app.whenReady()
 
@@ -47,9 +49,43 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
   }
 
   // Cleanup on quit
-  app.on('before-quit', async () => {
+  app.on('before-quit', (event?: { preventDefault: () => void }) => {
+    // Electron does not await async event listeners. Prevent the first quit
+    // request, then explicitly resume it after the exact server child has
+    // stopped. The resumed app.quit() fires before-quit again; the guard lets
+    // that one through without stopping the server twice.
+    if (quitAfterServerStop) return
+
+    event?.preventDefault()
     isQuitting = true
-    await deps.stopServer()
+    if (serverStopInProgress) return
+
+    try {
+      serverStopInProgress = deps.stopServer()
+        .then(() => {
+          quitAfterServerStop = true
+          app.quit()
+        })
+        .catch((error: unknown) => {
+          serverStopInProgress = undefined
+          isQuitting = false
+          console.error(JSON.stringify({
+            severity: 'error',
+            component: 'electron-main',
+            event: 'server_stop_before_quit_failed',
+            error: error instanceof Error ? error.message : String(error),
+          }))
+        })
+    } catch (error) {
+      serverStopInProgress = undefined
+      isQuitting = false
+      console.error(JSON.stringify({
+        severity: 'error',
+        component: 'electron-main',
+        event: 'server_stop_before_quit_failed',
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
   })
 
   // macOS: re-show window on activate
