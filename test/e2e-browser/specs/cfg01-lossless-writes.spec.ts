@@ -447,9 +447,11 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     expect(afterFirstWrite.settings?.codingCli?.knownProviders).toEqual([])
 
     // ── Inject the sentinel block (stands in for keys written by writers
-    // that don't exist in Rust: recent-directory MRU (CFG-09), title
-    // migrations, and future tools). The running server must copy them
-    // forward from disk on every subsequent persist.
+    // that don't exist in Rust: recent-directory MRU (CFG-09) and future
+    // tools — title migration is intentionally absent: it IS a Rust boot
+    // writer, so sentinelBlock preserves its marker; see the file-header
+    // inventory). The running server must copy them forward from disk on
+    // every subsequent persist.
     const seeded = { ...afterFirstWrite, ...sentinelBlock(afterFirstWrite.completedMigrations ?? []) }
     // Keep the server's own minted codex secret; add an unknown sibling.
     seeded.serverSecrets = {
