@@ -13,50 +13,61 @@ directories:
 #   - dist/electron/** (main process code)
 #   - dist/wizard/**  (wizard renderer bundle)
 #
-# Everything the standalone bundled Node.js binary needs is placed in
+# Everything the standalone Node.js client runtimes need is placed in
 # extraResources, which lives on the REAL filesystem. A vanilla Node.js
 # process cannot read from ASAR archives -- it would get ENOENT/MODULE_NOT_FOUND.
 # This includes:
-#   - dist/server/** (the Freshell server code)
-#   - dist/client/** (static web assets served by Express)
-#   - server-node-modules/** (pruned runtime dependencies for the server)
-#   - bundled-node/bin/** (the standalone Node.js binary)
-#   - bundled-node/native-modules/** (recompiled node-pty)
+#   - electron-runtime/bin/** (the native Rust server)
+#   - electron-runtime/client/** (static web assets served by Rust)
+#   - electron-runtime/node/** (the sanctioned standalone Node runtime)
+#   - electron-runtime/claude-sidecar/** (the Claude SDK client)
+#   - electron-runtime/mcp/** (the checkout-free stdio MCP client)
+#   - electron-runtime/node-client-runtime/** (the MCP client support modules)
 
 files:
   - dist/electron/**
   - dist/wizard/**
   - package.json
+  # The root lock still carries the retired server's node-pty until the
+  # dependency-retirement task removes it. The Rust app has no native Node
+  # addon, so it must never enter the packaged app or be rebuilt by the packer.
+  - "!node_modules/node-pty{,/**}"
+
+# Electron's app-bound process is Rust; there are no native Node addons to
+# rebuild for Electron's ABI.
+npmRebuild: false
 
 extraResources:
-  # The standalone Node.js binary
-  - from: bundled-node/${os}/${arch}
-    to: bundled-node/bin
+  # The app-bound backend is always the host-native Rust executable.
+  - from: electron-runtime/bin
+    to: bin
     filter:
       - "**/*"
-  # Recompiled native modules (node-pty against bundled Node ABI)
-  - from: bundled-node/native-modules
-    to: bundled-node/native-modules
-    filter:
-      - "**/*"
-  # The Freshell server (runs under bundled Node, NOT Electron)
-  - from: dist/server
-    to: server
-    filter:
-      - "**/*"
-  # Static client assets (served by Express in production)
-  - from: dist/client
+  # Static client assets served by the Rust backend.
+  - from: electron-runtime/client
     to: client
     filter:
       - "**/*"
-  # Launch chooser assets (loaded from the real filesystem before connecting)
-  - from: dist/launch-chooser
-    to: launch-chooser
+  # Node is present only for the sanctioned Claude and MCP clients.
+  - from: electron-runtime/node
+    to: node
     filter:
       - "**/*"
-  # Pruned server runtime dependencies (see prepare-bundled-node.ts Step 4)
-  - from: server-node-modules
-    to: server-node-modules
+  - from: electron-runtime/claude-sidecar
+    to: claude-sidecar
+    filter:
+      - "**/*"
+  - from: electron-runtime/mcp
+    to: mcp
+    filter:
+      - "**/*"
+  - from: electron-runtime/node-client-runtime
+    to: node-client-runtime
+    filter:
+      - "**/*"
+  # Launch chooser assets (loaded from the real filesystem before connecting).
+  - from: dist/launch-chooser
+    to: launch-chooser
     filter:
       - "**/*"
   # Tray icons (needed at runtime for system tray)

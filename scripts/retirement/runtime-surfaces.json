@@ -5,11 +5,11 @@
       "id": "package-scripts",
       "path": "package.json:scripts",
       "role": "package-commands",
-      "commandEvidence": "sha256:f34db9229ec3fcc5cb4464029ce31c724a08513b5c9387578693be17a2cfa3fc",
+      "commandEvidence": "sha256:b3329e1084426fc275143025220869faf21abc140411320ec879d694abf44ab4",
       "entries": [
         "predev", "dev", "dev:client", "dev:server", "typecheck", "typecheck:client", "typecheck:tools",
         "prebuild", "build", "build:client", "build:rust", "check:rust", "build:tools", "build:electron", "build:wizard", "build:launch-chooser",
-        "dev:wizard", "dev:launch-chooser", "electron:dev", "electron:build", "electron:build:win", "prepare:bundled-node",
+        "dev:wizard", "dev:launch-chooser", "electron:dev", "electron:build", "electron:build:win", "prepare:electron-runtime", "verify:electron-artifact", "test:electron:runtime",
         "start", "serve:precheck", "serve", "test", "test:balanced", "test:sequential", "test:aggressive",
         "test:client:standard", "test:source-runtime", "test:rust", "test:client:aggressive", "test:electron",
         "verify", "check", "test:watch", "test:ui", "test:server", "test:coverage", "test:unit", "test:integration",

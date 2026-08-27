@@ -1,0 +1,83 @@
+import { describe, expect, it } from 'vitest'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
+import { verifyElectronArtifact } from '../../../scripts/verify-electron-artifact.js'
+
+function artifactRoot(): string {
+  return mkdtempSync(path.join(tmpdir(), 'freshell-electron-artifact-'))
+}
+
+function writeArtifact(root: string): string {
+  const binary = path.join(root, 'bin', 'freshell-server')
+  mkdirSync(path.dirname(binary), { recursive: true })
+  writeFileSync(binary, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
+  chmodSync(binary, 0o755)
+  mkdirSync(path.join(root, 'client'), { recursive: true })
+  writeFileSync(path.join(root, 'client', 'index.html'), '<!doctype html>')
+  mkdirSync(path.join(root, 'node', 'bin'), { recursive: true })
+  writeFileSync(path.join(root, 'node', 'bin', 'node'), 'node')
+  writeFileSync(path.join(root, 'node', 'bin', 'node.exe'), 'node')
+  mkdirSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
+  writeFileSync(path.join(root, 'claude-sidecar', 'index.mjs'), 'process.stdin.resume()')
+  writeFileSync(path.join(root, 'claude-sidecar', 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
+  writeFileSync(path.join(root, 'claude-sidecar', 'package-lock.json'), JSON.stringify({ lockfileVersion: 3 }))
+  writeFileSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), '{}')
+  mkdirSync(path.join(root, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk'), { recursive: true })
+  mkdirSync(path.join(root, 'mcp', 'node_modules', 'zod'), { recursive: true })
+  writeFileSync(path.join(root, 'mcp', 'server.js'), 'process.stdin.resume()')
+  writeFileSync(path.join(root, 'mcp', 'package.json'), JSON.stringify({ name: 'freshell', version: '0.7.5' }))
+  writeFileSync(path.join(root, 'mcp', 'package-lock.json'), JSON.stringify({ name: 'freshell', version: '0.7.5', lockfileVersion: 3, packages: {} }))
+  writeFileSync(path.join(root, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk', 'package.json'), '{}')
+  writeFileSync(path.join(root, 'mcp', 'node_modules', 'zod', 'package.json'), '{}')
+  mkdirSync(path.join(root, 'node-client-runtime'), { recursive: true })
+  writeFileSync(path.join(root, 'node-client-runtime', 'keys.js'), 'export {}\n')
+  writeFileSync(path.join(root, 'node-client-runtime', 'action-capabilities.js'), 'export {}\n')
+  return binary
+}
+
+describe('verify-electron-artifact', () => {
+  it('checks required files and runs the native probe in a sanitized empty cwd', () => {
+    const root = artifactRoot()
+    const binary = writeArtifact(root)
+    const probe = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => {
+      expect(command).toBe(binary)
+      expect(options.cwd).not.toBe(root)
+      expect(options.env.AUTH_TOKEN).toBeUndefined()
+      expect(Object.keys(options.env).some((key) => key.startsWith('FRESHELL_'))).toBe(false)
+      expect(options.timeout).toBeGreaterThan(0)
+      return { status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.\n' }
+    }
+
+    expect(verifyElectronArtifact(root, 'linux', { probe })).toMatchObject({ ok: true, platform: 'linux' })
+  })
+
+  it('rejects every forbidden backend or native-module path', () => {
+    const forbidden = ['dist/server/index.js', 'server-node-modules/index.js', 'bundled-node/bin/node', 'native-modules/pty.node', 'node_modules/node-pty/index.js']
+    for (const relative of forbidden) {
+      const root = artifactRoot()
+      writeArtifact(root)
+      const target = path.join(root, relative)
+      mkdirSync(path.dirname(target), { recursive: true })
+      writeFileSync(target, 'forbidden')
+      expect(() => verifyElectronArtifact(root, 'linux', { probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }) })).toThrow(/forbidden/i)
+    }
+  })
+
+  it('performs structural checks for a foreign platform without executing it', () => {
+    const root = artifactRoot()
+    writeArtifact(root)
+    const foreignBinary = path.join(root, 'bin', 'freshell-server.exe')
+    writeFileSync(path.join(root, 'bin', 'freshell-server'), Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
+    writeFileSync(foreignBinary, Buffer.concat([Buffer.from('MZ'), Buffer.alloc(32)]))
+    const probe = () => { throw new Error('foreign binary must not execute locally') }
+    expect(verifyElectronArtifact(root, 'win32', { probe })).toMatchObject({ ok: true, executed: false })
+  })
+
+  it('rejects a native probe that listens or returns the wrong authentication failure', () => {
+    const root = artifactRoot()
+    writeArtifact(root)
+    expect(() => verifyElectronArtifact(root, 'linux', { probe: () => ({ status: 0, stdout: 'listening', stderr: '' }) })).toThrow(/authentication|listen|exit with code/i)
+  })
+})

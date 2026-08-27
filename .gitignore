@@ -27,9 +27,7 @@ test-results/
 playwright-report/
 blob-report/
 # Electron build artifacts
-bundled-node/
-server-node-modules/
-server-node-modules-staging/
+electron-runtime/
 release/
 dist/wizard/
 artifacts/perf/
