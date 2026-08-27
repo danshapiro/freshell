@@ -8,12 +8,12 @@ import { test, expect } from '../helpers/fixtures.js'
 // Rust port wires the SAME shared `TerminalRegistry` into the
 // `PATCH /api/settings` handler (`crates/freshell-server/src/settings_store.rs`).
 //
-// This spec is the CONTROL for both servers (`legacy-chromium` AND
-// `rust-chromium` -- no `test.fail` gate): the scrollback knob is
+// This spec is the CONTROL for both servers (`retired Node browser lane` AND
+// `Rust browser lane` -- no `test.fail` gate): the scrollback knob is
 // deterministic and fast to prove end-to-end, unlike the idle-kill knob
 // (which requires waiting out a 30s sweep interval on both servers). If
 // legacy ever regressed to boot-only for this knob too, this spec would
-// catch it on `legacy-chromium` as well, which is the intended parity bar.
+// catch it on `retired Node browser lane` as well, which is the intended parity bar.
 test.describe('Settings Live Reload (narrow: scrollback)', () => {
   async function selectShell(page: any): Promise<void> {
     const alreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)

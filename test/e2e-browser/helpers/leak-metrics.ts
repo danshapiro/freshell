@@ -256,7 +256,7 @@ function readFdInfo(procRoot: string, pid: number): { fdCount: number | null; so
 
 /**
  * Snapshot the process trees rooted at `rootPids` (typically one owned server
- * PID from a TestServer/RustServer fixture's `info.pid`). Roots that are no
+ * PID from an owned Rust fixture's `info.pid`). Roots that are no
  * longer alive yield an empty snapshot rather than an error — callers compare
  * `processCount` against their own baseline.
  */

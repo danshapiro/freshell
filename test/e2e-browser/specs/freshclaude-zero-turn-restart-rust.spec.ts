@@ -17,14 +17,15 @@
  * spec covers the VISIBLE one. DO NOT add a turn before the restart --
  * zero-turn is the entire point.
  *
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch,
+ * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch,
  * because restartAbrupt() exists only on RustServer.
  *
  * Helpers are COPIED from hidden-pane-rebind-rust.spec.ts, not imported,
  * per this suite's per-spec-ownership convention.
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
@@ -100,7 +101,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -165,8 +166,7 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
 test.describe('freshclaude zero-turn restart (kata 09v1)', () => {
   test.setTimeout(180_000)
 
-  test('visible zero-turn freshclaude pane resumes after abrupt restart', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('visible zero-turn freshclaude pane resumes after abrupt restart', async ({ page }) => {
     // Sidecar REQUEST log: the post-restart resume proof reads it.
     const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
     const { server, harness } = await bootWall(page, {

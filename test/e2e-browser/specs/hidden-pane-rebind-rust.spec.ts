@@ -20,14 +20,15 @@
  *
  * Do not weaken any conjunct in either poll.
  *
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch, because
+ * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * restartAbrupt() exists only on RustServer.
  *
  * Helpers are COPIED from restore-contract-wall-rust.spec.ts, not imported,
  * per this suite's per-spec-ownership convention (see that file's header).
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
@@ -103,7 +104,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -129,12 +130,12 @@ function findFreshAgentLeaf(node: any): any {
 
 // --- REST helpers (donor: restore-contract-wall-rust.spec.ts:255-271) ---
 
-function restApiHeaders(info: TestServerInfo): Record<string, string> {
+function restApiHeaders(info: E2eServerInfo): Record<string, string> {
   return { 'x-auth-token': info.token, 'content-type': 'application/json' }
 }
 
 /** POST /api/tabs; returns the created tabId (envelope is {status,data}). */
-async function createTabViaRest(info: TestServerInfo, body: object): Promise<string> {
+async function createTabViaRest(info: E2eServerInfo, body: object): Promise<string> {
   const res = await fetch(`${info.baseUrl}/api/tabs`, {
     method: 'POST',
     headers: restApiHeaders(info),
@@ -206,8 +207,7 @@ async function revealTab(page: Page, harness: TestHarness, tabId: string): Promi
 test.describe('hidden-pane rebind (F8 / P1.11)', () => {
   test.setTimeout(180_000)
 
-  test('hidden BUSY terminal pane un-wedges after abrupt restart without reveal', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('hidden BUSY terminal pane un-wedges after abrupt restart without reveal', async ({ page }) => {
     const { server, harness, info } = await bootWall(page)
     try {
       await selectShellIfPickerShowing(page)
@@ -272,8 +272,7 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
     }
   })
 
-  test('hidden fresh-agent pane recovers after abrupt restart without reveal', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('hidden fresh-agent pane recovers after abrupt restart without reveal', async ({ page }) => {
     // Sidecar REQUEST log (FAKE_CLAUDE_SIDECAR_LOG, fake-claude-sidecar.mjs
     // Task 7 knob): the post-restart resume proof below reads it. NOT the
     // terminal-CLI argv log -- the fresh-agent path never spawns the CLI.

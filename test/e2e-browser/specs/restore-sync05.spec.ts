@@ -59,9 +59,9 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * "[Reconnecting...]" scrollback notice (`TerminalView.tsx`), which is
  * expected chrome for an in-flight reconnect, not user-facing error noise.
  *
- * Routed through the generic `E2eServerHandle`/`e2eServerKind` seam (HARNESS-02)
+ * Routed through the generic `E2eServerHandle`/`rustFixture` seam (HARNESS-02)
  * -- no server-kind-specific assertions -- so this SAME spec runs against
- * both the legacy Node server and the owned Rust server per MATRIX_SPECS.
+ * both the legacy Node server and the owned Rust server per retired matrix list.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -125,8 +125,8 @@ async function selectShellIfPickerShowing(page: import('@playwright/test').Page)
 test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () => {
   test.setTimeout(120_000)
 
-  test('a live terminal pane reconnects quietly after a deliberate server restart, with no user-facing error noise', async ({ page, terminal, e2eServerKind }) => {
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+  test('a live terminal pane reconnects quietly after a deliberate server restart, with no user-facing error noise', async ({ page, terminal }) => {
+    const server = await createE2eServerHandle(process.env, undefined)
     const info = await server.start()
 
     try {
@@ -150,7 +150,7 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
       await expect(page.getByRole('alert')).toHaveCount(0)
 
       if (!server.restart) {
-        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+        throw new Error(`$() E2eServerHandle does not implement restart()`)
       }
 
       // --- THE DELIBERATE, EXPECTED RESTART. This is an intentional
@@ -222,13 +222,12 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
   // language) on top of that same restart, closing the "Codex/app-bound
   // restart leg" the file-level doc comment above previously left open.
   // -------------------------------------------------------------------
-  test('a FreshCodex pane reconnects quietly after a deliberate server restart, targeting the same durable session with no user-facing error noise', async ({ page, e2eServerKind }) => {
+  test('a FreshCodex pane reconnects quietly after a deliberate server restart, targeting the same durable session with no user-facing error noise', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-sync05-codex-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           setupHome: async (homeDir) => {
@@ -322,7 +321,7 @@ test.describe('SYNC-05 -- quiet reconnect after an expected server restart', () 
         await expect(page.getByRole('alert')).toHaveCount(0)
 
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
 
         await harness.clearSentWsMessages()

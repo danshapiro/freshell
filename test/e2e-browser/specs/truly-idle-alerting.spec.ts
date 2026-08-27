@@ -73,7 +73,7 @@ function findTerminalLeaf(node: any): any {
 test.describe('Truly-idle alerting (terminal.idle)', () => {
   test.setTimeout(180_000)
 
-  test('claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade', async ({ page, e2eServerKind }) => {
+  test('claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade', async ({ page }) => {
     // Rust leg live since feat/rust-terminal-activity-idle: the Rust server's
     // activity hub (`crates/freshell-ws/src/activity.rs`) emits the same
     // pinned `terminal.idle` contract the legacy TrulyIdleEmitter does.
@@ -83,7 +83,6 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRoot, 'bin'))
 
       server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CLAUDE_CMD: fakeClaudePath,

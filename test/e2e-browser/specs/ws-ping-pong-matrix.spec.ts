@@ -16,7 +16,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * app-level `{type:"ping"}` and gets back the exact `{type:"pong",
  * timestamp}` shape -- byte-identical between the legacy Node server
  * (`server/ws-handler.ts:1832-1835`) and the Rust port. It runs against
- * BOTH `legacy-chromium` and `rust-chromium` via `MATRIX_SPECS` in
+ * BOTH `retired Node browser lane` and `Rust browser lane` via `retired matrix list` in
  * `playwright.config.ts`, with legacy as the control.
  *
  * NOT covered here (see the SAFE-05 checklist entry for why each is
@@ -24,7 +24,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  *   - hello-timeout enforcement (delay past/just-before the deadline) --
  *     the Rust port has no hello-timeout implementation at all (confirmed
  *     by exhaustive grep across `crates/`), so this clause cannot pass on
- *     rust-chromium today; it is a genuine implementation gap, not a test
+ *     Rust browser lane today; it is a genuine implementation gap, not a test
  *     gap.
  *   - transport control-frame heartbeat independently closing dead peers
  *     via a controllable proxy that can suppress/respond to pings at will

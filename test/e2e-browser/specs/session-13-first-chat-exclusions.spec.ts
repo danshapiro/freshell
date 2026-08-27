@@ -14,7 +14,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *   controls in A, assert exact membership in A and B, reload/restart, and
  *   verify the shared values and results persist."
  *
- * Routed through the generalized `E2eServerHandle`/`e2eServerKind` seam
+ * Routed through the generalized `E2eServerHandle`/`rustFixture` seam
  * (HARNESS-02) so this SAME spec exercises the legacy Node server or the
  * owned Rust server depending on the active project. Fixture shapes are
  * copied from `session-directory-matrix.spec.ts` (themselves pinned against
@@ -182,9 +182,8 @@ async function seedAmplifierSession(
 }
 
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           // Standard settings boilerplate (network configured + one provider
@@ -193,7 +192,7 @@ const test = base.extend({
           // IDEMPOTENT on purpose: `RustServer.restart()` re-runs `boot()`,
           // which re-invokes `setupHome` (`rust-server.ts:466`; its own
           // comment claims "the isolated HOME is never touched" — an
-          // asymmetry vs `TestServer.restart()`'s `bootProcess`, which skips
+          // the former Node fixture restart path, which skipped
           // setupHome entirely). A blind rewrite here would CLOBBER the
           // PATCHed `config.json` the restart leg exists to verify. The
           // transcript seeds below are byte-identical rewrites and safe to

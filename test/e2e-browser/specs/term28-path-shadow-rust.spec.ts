@@ -32,7 +32,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * (`io::ErrorKind::NotFound`, surfaced via the existing `wrap_terminal_spawn_error`
  * -> `PTY_SPAWN_FAILED` path) when no `$PATH` entry has a match.
  *
- * This spec is registered ONLY under the `rust-chromium` project
+ * This spec is registered ONLY under the `Rust browser lane` project
  * (`playwright.config.ts`): the bug is unix-portable-pty-specific and legacy
  * node-pty is unaffected (bare names go straight to PATH search, no cwd-first
  * branch) -- not a parity gap to gate per-assertion, a Rust-only regression.
@@ -147,9 +147,7 @@ async function enableAmplifierProvider(homeDir: string): Promise<void> {
 test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
   test.setTimeout(120_000)
 
-  test('a same-named directory in the launch cwd never shadows the real $PATH CLI', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('a same-named directory in the launch cwd never shadows the real $PATH CLI', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-term28-shadow-'))
     const argLogPath = path.join(sharedRoot, 'fake-amplifier-argv.jsonl')
     try {
@@ -170,7 +168,6 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
       await fs.mkdir(path.join(launchCwd, 'amplifier'), { recursive: true })
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             // Prepend the fixture's bin dir so the bare "amplifier" default
@@ -233,9 +230,7 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
     }
   })
 
-  test('a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('a genuinely missing bare CLI command surfaces a clean, legacy-compatible spawn error (never a raw abort)', async () => {
     // This scenario is driven over a RAW WebSocket connection
     // (`terminal.create`), not the browser UI/PanePicker: the picker only
     // offers a CLI option when the server's OWN boot-time `which`/`where.exe`
@@ -260,7 +255,6 @@ test.describe('TERM-28: bare-command $PATH resolution (Rust only)', () => {
       const missingCommandName = 'totally-missing-freshell-cli-term28'
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: missingCommandName,

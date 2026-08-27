@@ -15,7 +15,7 @@
  * assertion run as a normal (green) expectation. Never widen a pin; never
  * convert a pin to test.fixme (fixme'd tests produce no evidence).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch, because
+ * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * restartAbrupt() exists only on RustServer.
  *
  * Helpers are copied, not imported, per this suite's per-spec-ownership
@@ -24,7 +24,8 @@
  * freshopencode-restart-recovery.spec.ts).
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
@@ -166,7 +167,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -268,12 +269,12 @@ function leafDurableIdentity(leaf: any): string | undefined {
 
 // --- REST helpers (donor: continuity-smoke.spec.ts / agent-continuity-matrix) ---
 
-function restApiHeaders(info: TestServerInfo): Record<string, string> {
+function restApiHeaders(info: E2eServerInfo): Record<string, string> {
   return { 'x-auth-token': info.token, 'content-type': 'application/json' }
 }
 
 /** POST /api/tabs; returns the created tabId (envelope is {status,data}). */
-async function createTabViaRest(info: TestServerInfo, body: object): Promise<string> {
+async function createTabViaRest(info: E2eServerInfo, body: object): Promise<string> {
   const res = await fetch(`${info.baseUrl}/api/tabs`, {
     method: 'POST',
     headers: restApiHeaders(info),
@@ -556,9 +557,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('shell terminal: SIGKILL restore yields a fresh shell in initialCwd', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-shell-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -626,9 +625,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('claude terminal: pre-allocated session resumes with --resume after SIGKILL', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-claude-term-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -775,9 +772,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('codex terminal: sessionRef-bound pane resumes with `resume <id>` after SIGKILL', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const CODEX_SESSION_ID = '11111111-2222-4333-8444-555555555555'
     const SESSION_TITLE = 'wall codex session'
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-codex-term-'))
@@ -867,9 +862,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('opencode terminal: locator-resolved session resumes with --session after SIGKILL', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-opencode-term-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
     const fakeOpencodePath = await installFakeCli(
@@ -961,9 +954,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // reply) and a non-wedged status.
   test('freshcodex: SIGKILL restore rebinds the same thread with history rehydrated', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshcodex-'))
     const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
@@ -1037,9 +1028,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // mint NO new session.
   test('freshopencode: SIGKILL restore keeps the ses_* identity and rehydrates history', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // HISTORY: this test was pinned `test.fail()` as P1.8/P1.13 (observed
     // 2026-07-24): after SIGKILL+restart+RELOAD the pane re-minted a
     // lazy-create `freshopencode-<requestId>` placeholder instead of
@@ -1160,9 +1149,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // today's reality.
   test('freshclaude: SIGKILL restore rebinds with history rehydrated and status not wedged', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // HISTORY: the P0.2 pin was FLIPPED 2026-07-27 by lane D4
     // (freshclaude-identity-persistence). Investigation showed the durable
     // identity ALREADY survives reload: FreshAgentView's merge effect folds
@@ -1344,9 +1331,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   // must be intact. First-ever reload/restart coverage for these pane kinds.
   test('browser and editor panes: state intact after SIGKILL restart', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-broweditor-'))
     // FILE-BACKED editor pane: content.content never survives persistence
     // (stripEditorContent blanks it at flush AND load, persistMiddleware.ts:
@@ -1450,9 +1435,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('THE RULER: all pane types live, one SIGKILL, every §2 contract holds', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // DEFLAKE (f3wp refresh): 300 s timed out twice back-to-back under
     // concurrent-suite load (2026-07-28, runs at 01:28 and 01:37; both
     // failure screenshots show a healthy, still-progressing page -- slow,
@@ -1798,9 +1781,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('SIGKILL-within-5s-of-pane-creation: identity survives without client state', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
     // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
     // SIGKILL moments after spawn (before any snapshot cadence) still leaves
@@ -1913,9 +1894,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('SIGKILL-inside-locator-window: never silently fresh', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // P1.8 (§2.4/§4.2 pending markers) LANDED -- pin flipped: killing the
     // server inside the opencode locator's ~2s correlation window is no
     // longer silently fresh. The server derives a loud Fresh{fresh_by_race}
@@ -2008,9 +1987,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
   test('two-clients-same-sessionRef: duplicate respawn must yield exactly 1 PTY', async ({
     page,
     browser,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // Cloud (2-worker shard) wall-clock: SIGKILL + dual-client recovery + a
     // stable-count settle on the arg log exceeds the describe-level 180s.
     test.setTimeout(300_000)
@@ -2105,9 +2082,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('freshclaude busy-restart: a pane that was BUSY at SIGKILL must not wedge BUSY', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // PREDICTED-FAIL P0.2 (§2.8.1) but OBSERVED GREEN (run of 2026-07-24), so
     // per the decision rule this test is NOT pinned. The plan predicted a
     // forever-BUSY wedge (freshAgent.attach for claude is silently swallowed,
@@ -2179,9 +2154,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('double-restart mid-recovery: a second SIGKILL during recovery must not duplicate or wedge', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
     // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
     // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
@@ -2301,9 +2274,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
   test('hidden-pane rebind: a background tab pane must rebind without being revealed', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     // PREDICTED-FAIL P1.11 (F8) but OBSERVED GREEN (run of 2026-07-24), so
     // per the decision rule this test is NOT pinned. The plan predicted that
     // hidden panes never send create/attach on reconnect; observed instead

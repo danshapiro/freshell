@@ -31,7 +31,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  * state schema doesn't know this mode exists" is the actual bug shape.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `rust-chromium`-only `testMatch` entry for this file, matching the
+ * `Rust browser lane`-only `testMatch` entry for this file, matching the
  * identical divergence note already established by
  * `amplifier-restore-rust.spec.ts` and `session-directory-matrix.spec.ts`):
  * this checked-out branch's `server/` tree (legacy Node implementation,
@@ -96,8 +96,8 @@ async function createTab(
   return { status: res.status, tabId: data?.tabId, paneId: data?.paneId, body: rawBody }
 }
 
-const test = base.extend<Record<string, never>, { e2eServerKind: 'legacy' | 'rust' }>({
-  testServer: [async ({ e2eServerKind }, use) => {
+const test = base.extend<Record<string, never>, { rustFixture: 'legacy' | 'rust' }>({
+  testServer: [async ({}, use) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rest-tab-persistence-'))
     const binDir = path.join(sharedRoot, 'bin')
     const cwd = path.join(sharedRoot, 'project')
@@ -105,7 +105,6 @@ const test = base.extend<Record<string, never>, { e2eServerKind: 'legacy' | 'rus
     await fs.mkdir(cwd, { recursive: true })
 
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
@@ -133,13 +132,11 @@ const test = base.extend<Record<string, never>, { e2eServerKind: 'legacy' | 'rus
 test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
   test.setTimeout(60_000)
 
-  test('creating a tab via REST with an out-of-enum mode materializes it in the tab strip and persists to localStorage, but the tab strip goes empty on reload while localStorage still holds the data', async ({ page, e2eServerKind, serverInfo, testServer }) => {
-    // Registered ONLY under the `rust-chromium` project (see this file's
+  test('creating a tab via REST with an out-of-enum mode materializes it in the tab strip and persists to localStorage, but the tab strip goes empty on reload while localStorage still holds the data', async ({ page, serverInfo, testServer }) => {
+    // Registered ONLY under the `Rust browser lane` project (see this file's
     // doc comment + `playwright.config.ts`) -- assert the precondition
-    // explicitly so an accidental `MATRIX_SPECS` inclusion fails loudly
+    // explicitly so an accidental `retired matrix list` inclusion fails loudly
     // instead of silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
     const { baseUrl, token } = serverInfo
     const cwd = (testServer as any).__cwd as string
 

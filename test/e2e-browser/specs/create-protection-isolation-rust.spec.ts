@@ -13,7 +13,8 @@
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 
@@ -49,7 +50,7 @@ class SyntheticClient {
     })
   }
 
-  static async connect(info: TestServerInfo): Promise<SyntheticClient> {
+  static async connect(info: E2eServerInfo): Promise<SyntheticClient> {
     const ws = new WebSocket(info.wsUrl)
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve())
@@ -99,12 +100,11 @@ class SyntheticClient {
 test.describe('Create protection: cross-server isolation (Rust only)', () => {
   test.setTimeout(240_000)
 
-  test('storming server A does not degrade server B', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('storming server A does not degrade server B', async ({ page }) => {
     const serverA = new RustServer({})
     const serverB = new RustServer({})
-    const infoA: TestServerInfo = await serverA.start()
-    const infoB: TestServerInfo = await serverB.start()
+    const infoA: E2eServerInfo = await serverA.start()
+    const infoB: E2eServerInfo = await serverB.start()
     expect(infoA.port).not.toBe(infoB.port)
     try {
       // Browser session on B with one live terminal.

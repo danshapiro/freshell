@@ -5,11 +5,11 @@ import { TestHarness } from '../helpers/test-harness.js'
 // Override the worker-scoped testServer so this spec manages its own lifecycle,
 // but keep it routed through the generalized E2eServerHandle seam (HARNESS-02)
 // so this SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `e2eServerKind` option.
+// depending on the active project's `rustFixture` option.
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     // Provide a dummy -- the test creates its own server handle.
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+    const server = await createE2eServerHandle(process.env, undefined)
     await server.start()
     await use(server)
     await server.stop()
@@ -21,8 +21,8 @@ test.describe('Server Restart Recovery', () => {
   // multi-pane recovery, so it needs more time than the default 60s.
   test.setTimeout(120_000)
 
-  test('all panes recover after server restart without rate limit errors', async ({ page, e2eServerKind }) => {
-    const server1 = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+  test('all panes recover after server restart without rate limit errors', async ({ page }) => {
+    const server1 = await createE2eServerHandle(process.env, undefined)
     const info1 = await server1.start()
 
     try {
@@ -89,16 +89,15 @@ test.describe('Server Restart Recovery', () => {
       }).toPass({ timeout: 20_000 })
 
       // Restart the SAME owned server in place (same home/port/token; all
-      // PTYs and terminal state are lost). Both `TestServer` and `RustServer`
-      // implement `restart()` (HARNESS-02), so this exercises the SAME
-      // restart-recovery flow regardless of `e2eServerKind`.
+      // PTYs and terminal state are lost). The owned Rust fixture implements
+      // `restart()`, exercising the baseline restart-recovery flow.
       //
       // The client's WS auto-reconnect will reach the restarted process,
       // authenticate with the original token, and try to attach to
       // terminals that no longer exist, triggering INVALID_TERMINAL_ID ->
       // recreate for each pane.
       if (!server1.restart) {
-        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+        throw new Error(`$() E2eServerHandle does not implement restart()`)
       }
       await server1.restart()
 

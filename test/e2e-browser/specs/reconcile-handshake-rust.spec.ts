@@ -3,7 +3,7 @@ import path from 'node:path'
 import { test, expect } from '@playwright/test'
 import WebSocket from 'ws'
 import { RustServer } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * RECONCILE-HANDSHAKE (PW-RUST, design §9.2) — synthetic-client proof of the
@@ -82,7 +82,7 @@ class SyntheticClient {
     })
   }
 
-  static async connect(info: TestServerInfo): Promise<SyntheticClient> {
+  static async connect(info: E2eServerInfo): Promise<SyntheticClient> {
     const ws = new WebSocket(info.wsUrl)
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve())
@@ -170,7 +170,7 @@ class SyntheticClient {
   }
 }
 
-async function listTerminals(info: TestServerInfo): Promise<Array<{ terminalId: string; status: string }>> {
+async function listTerminals(info: E2eServerInfo): Promise<Array<{ terminalId: string; status: string }>> {
   const res = await fetch(`${info.baseUrl}/api/terminals`, {
     headers: { 'x-auth-token': info.token },
   })

@@ -120,8 +120,8 @@ async function paneByMode(harness: TestHarness, mode: Provider): Promise<any | n
 }
 
 test.describe('continuity smoke (REAL CLIs) -- pre-deploy gate', () => {
-  test('three real panes survive server restart + page reload with the same sessions', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust') // rust-only guard (spec is also in every match-all project's testIgnore)
+  test('three real panes survive server restart + page reload with the same sessions', async ({ page }) => {
+    // rust-only guard (spec is also in every match-all project's testIgnore)
     test.setTimeout(300_000) // hard cap 5 min; target wall clock <= 5 min (single scenario, polling waits only)
 
     // EPHEMERAL-ONLY: construct RustServer directly (throwaway port + mkdtemp

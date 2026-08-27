@@ -9,15 +9,13 @@ import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import {
   findFreePort,
-  applyTestServerHomeEnvironment,
-  requireBuiltServerEntry,
-} from '../helpers/test-server.js'
+  applyServerHomeEnvironment,
+} from '../helpers/server-fixture-support.js'
 import {
   ensureRustServerBuilt,
   rustServerBinPath,
   rustClientDistPath,
 } from '../helpers/rust-server.js'
-import type { E2eServerKind } from '../helpers/external-target.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -42,7 +40,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * etc.) but never driven from a Playwright `PW-RUST` spec.
  *
  * Why this spec spawns servers directly instead of using the shared
- * `TestServer`/`RustServer` fixtures: BOTH fixtures' `start()`/`boot()`
+ * the shared Rust fixture's `start()`/`boot()`
  * unconditionally call a private `ensureSetupWizardBypassConfig()` helper
  * that does `JSON.parse()` on any EXISTING `config.json` and re-throws on a
  * non-ENOENT parse failure. CFG-03 needs to boot a server against an
@@ -50,7 +48,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * tolerate. Modifying that shared, non-owned helper is out of this lane's
  * file-ownership scope, so this spec reimplements the minimal
  * spawn-the-built-binary-and-wait-for-health sequence locally (reusing the
- * exported pure helpers -- `findFreePort`, `applyTestServerHomeEnvironment`,
+ * exported pure helpers -- `findFreePort`, `applyServerHomeEnvironment`,
  * `requireBuiltServerEntry`, `ensureRustServerBuilt`, `rustServerBinPath`,
  * `rustClientDistPath` -- none of which touch `config.json`).
  *
@@ -151,13 +149,12 @@ async function stopProcessGracefully(proc: ChildProcess): Promise<void> {
 }
 
 /**
- * Spawn the built server binary (Rust) or built server entry (legacy
- * Node), pointed directly at `homeDir`, WITHOUT running either fixture's
+ * Spawn the built Rust server binary pointed directly at `homeDir`, WITHOUT
+ * running the shared fixture's
  * `ensureSetupWizardBypassConfig()` pre-flight -- see the file doc comment
  * for why that matters for this spec.
  */
 async function spawnServerAgainstHome(
-  kind: E2eServerKind,
   homeDir: string,
   token: string,
 ): Promise<SpawnedServer> {
@@ -166,31 +163,17 @@ async function spawnServerAgainstHome(
   const stderrRef = { buf: '' }
   let proc: ChildProcess
 
-  if (kind === 'rust') {
-    const bin = ensureRustServerBuilt(PROJECT_ROOT)
-    const env = applyTestServerHomeEnvironment({
-      ...(process.env as Record<string, string>),
-      PORT: String(port),
-      FRESHELL_BIND_HOST: '127.0.0.1',
-      FRESHELL_CLIENT_DIR: rustClientDistPath(PROJECT_ROOT),
-      HIDE_STARTUP_TOKEN: 'true',
-      AUTH_TOKEN: token,
-    }, homeDir, 'isolated')
-    delete (env as Record<string, string | undefined>).VITE_PORT
-    proc = spawn(bin, [], { cwd: PROJECT_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
-  } else {
-    const serverEntry = requireBuiltServerEntry(PROJECT_ROOT)
-    const env = applyTestServerHomeEnvironment({
-      ...(process.env as Record<string, string>),
-      PORT: String(port),
-      NODE_ENV: 'production',
-      HIDE_STARTUP_TOKEN: 'true',
-      FRESHELL_BIND_HOST: '127.0.0.1',
-      AUTH_TOKEN: token,
-    }, homeDir, 'project')
-    delete (env as Record<string, string | undefined>).VITE_PORT
-    proc = spawn('node', [serverEntry], { cwd: PROJECT_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
-  }
+  const bin = ensureRustServerBuilt(PROJECT_ROOT)
+  const env = applyServerHomeEnvironment({
+    ...(process.env as Record<string, string>),
+    PORT: String(port),
+    FRESHELL_BIND_HOST: '127.0.0.1',
+    FRESHELL_CLIENT_DIR: rustClientDistPath(PROJECT_ROOT),
+    HIDE_STARTUP_TOKEN: 'true',
+    AUTH_TOKEN: token,
+  }, homeDir, 'isolated')
+  delete (env as Record<string, string | undefined>).VITE_PORT
+  proc = spawn(bin, [], { cwd: PROJECT_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
 
   proc.stderr?.on('data', (chunk: Buffer) => { stderrRef.buf += chunk.toString() })
   proc.stdout?.on('data', () => {})
@@ -257,7 +240,7 @@ function validBackupDocument(): string {
 }
 
 test.describe('CFG-03 backup/fallback matrix', () => {
-  test('corrupt primary + valid backup: Rust restores byte-identically and preserves the sentinel; legacy (KNOWN DIVERGENCE) loses it', async ({ e2eServerKind }) => {
+  test('corrupt primary + valid backup: Rust restores byte-identically and preserves the sentinel; legacy (KNOWN DIVERGENCE) loses it', async () => {
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg03-'))
     const freshellDir = path.join(homeDir, '.freshell')
     await fsp.mkdir(freshellDir, { recursive: true })
@@ -270,13 +253,13 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     await fsp.writeFile(backupPath, backupDoc)
 
     const token = randomUUID()
-    const server = await spawnServerAgainstHome(e2eServerKind, homeDir, token)
+    const server = await spawnServerAgainstHome(homeDir, token)
 
     try {
       const settings = await getSettings(server.baseUrl, token)
       const backupOnDiskAfter = await fsp.readFile(backupPath, 'utf8')
 
-      if (e2eServerKind === 'rust') {
+      if (true) {
         // THE FIX: `maybe_restore_config_from_backup` restores the primary
         // byte-identically from the backup BEFORE `SettingsStore::load()`
         // does anything else. What we observe here (after the full boot
@@ -332,14 +315,14 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     }
   })
 
-  test('missing primary, no backup at all: ordinary fresh install on both kinds (not a warning case)', async ({ e2eServerKind }) => {
+  test('missing primary, no backup at all: ordinary fresh install on both kinds (not a warning case)', async () => {
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg03-'))
     const freshellDir = path.join(homeDir, '.freshell')
     await fsp.mkdir(freshellDir, { recursive: true })
     // Deliberately: no config.json, no config.backup.json at all.
 
     const token = randomUUID()
-    const server = await spawnServerAgainstHome(e2eServerKind, homeDir, token)
+    const server = await spawnServerAgainstHome(homeDir, token)
 
     try {
       const settings = await getSettings(server.baseUrl, token)
@@ -354,8 +337,8 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     }
   })
 
-  test('Rust-only: BOTH primary and backup corrupt -- starts fresh with defaults but preserves forensic copies of both', async ({ e2eServerKind }) => {
-    test.skip(e2eServerKind === 'legacy', 'KNOWN DIVERGENCE: legacy has no forensic-preservation behavior at all -- it silently overwrites both files with defaults (the exact gap CFG-03 closes). Nothing legacy-specific to assert here beyond what the corrupt+valid-backup case above already proves.')
+  test('Rust-only: BOTH primary and backup corrupt -- starts fresh with defaults but preserves forensic copies of both', async () => {
+    test.skip(false, 'KNOWN DIVERGENCE: legacy has no forensic-preservation behavior at all -- it silently overwrites both files with defaults (the exact gap CFG-03 closes). Nothing legacy-specific to assert here beyond what the corrupt+valid-backup case above already proves.')
 
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg03-'))
     const freshellDir = path.join(homeDir, '.freshell')
@@ -365,7 +348,7 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     await fsp.writeFile(path.join(freshellDir, 'config.backup.json'), '{ not valid json, backup')
 
     const token = randomUUID()
-    const server = await spawnServerAgainstHome(e2eServerKind, homeDir, token)
+    const server = await spawnServerAgainstHome(homeDir, token)
 
     try {
       const settings = await getSettings(server.baseUrl, token)
@@ -380,9 +363,9 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     }
   })
 
-  test('GAP2 (Rust-only): a read-only config dir surfaces the write failure to PATCH /api/settings as an error, leaving primary/backup intact', async ({ e2eServerKind }) => {
+  test('GAP2 (Rust-only): a read-only config dir surfaces the write failure to PATCH /api/settings as an error, leaving primary/backup intact', async () => {
     test.skip(
-      e2eServerKind === 'legacy',
+      false,
       'The original has NO caller-visible error path for this exact failure either: ' +
       'settings-router.ts#handleSettingsPatch has no try/catch around configStore.patchSettings, ' +
       'so a real write failure there is an unhandled promise rejection in Express 4 (not a clean, ' +
@@ -395,7 +378,7 @@ test.describe('CFG-03 backup/fallback matrix', () => {
     await fsp.mkdir(freshellDir, { recursive: true })
 
     const token = randomUUID()
-    const server = await spawnServerAgainstHome(e2eServerKind, homeDir, token)
+    const server = await spawnServerAgainstHome(homeDir, token)
 
     try {
       // Establish a known-good baseline first, while the directory is still

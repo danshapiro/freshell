@@ -185,13 +185,12 @@ test.describe('Restore Double-Restart Regression', () => {
   // blank the pane's durable session identity; post-fix, the SAME durable
   // session must be recoverable (or, at strict minimum, the persisted
   // identity fields must never be wiped to a blank replacement).
-  test('a FreshCodex session with a completed turn survives two rapid, overlapping server restarts without a blank replacement pane', async ({ page, e2eServerKind }) => {
+  test('a FreshCodex session with a completed turn survives two rapid, overlapping server restarts without a blank replacement pane', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-dbl-restart-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           setupHome: (homeDir) => seedFreshcodexConfig(homeDir),
@@ -244,7 +243,7 @@ test.describe('Restore Double-Restart Regression', () => {
         })
 
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
 
         // --- THE INCIDENT: two restarts, back to back. The first restart
@@ -333,13 +332,12 @@ test.describe('Restore Double-Restart Regression', () => {
   // failed retry leaves it undefined, so it cannot re-fire) -- this is the
   // "bounded retry" this scenario pins, and the mechanical, countable
   // difference between the broken and fixed behavior.
-  test('a codex session with a genuinely-missing durable thread degrades to a bounded, recoverable lost state -- not an infinite spinner, not a silent blank', async ({ page, e2eServerKind }) => {
+  test('a codex session with a genuinely-missing durable thread degrades to a bounded, recoverable lost state -- not an infinite spinner, not a silent blank', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-resume-failure-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -400,7 +398,7 @@ test.describe('Restore Double-Restart Regression', () => {
         await harness.clearSentWsMessages()
 
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
         // A single restart is enough to force the client down the
         // `thread/resume` path (the in-memory thread + app-server sidecar
@@ -461,9 +459,9 @@ test.describe('Restore Double-Restart Regression', () => {
         // exactly 2 (the reload's own unconditional create-effect attempt,
         // PLUS one bounded `.lost`-triggered retry that pre-fix codex never
         // gets at all). Empirically that count reached 2 on BOTH pre-fix
-        // and post-fix code on `rust-chromium` (a confound from the owned
+        // and post-fix code on `Rust browser lane` (a confound from the owned
         // Rust server's reconnect/health-check timing independently
-        // re-sending the same request), and on `legacy-chromium` it did
+        // re-sending the same request), and on `retired Node browser lane` it did
         // not reliably reach 2 within 20s even on FIXED code.
         //
         // STRONGER CONCLUSION (the reviewer-proven finding, stated plainly

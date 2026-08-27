@@ -40,7 +40,7 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  *
  * Rust-only: MODE A requires `RustServer.restartAbrupt()` (SIGKILL + reboot
  * on the same home/port/token), an owned-fixture capability the legacy
- * TestServer seam does not implement; the frozen legacy tree is not the
+ * generic fixture seam does not implement; the frozen legacy tree is not the
  * subject of this hardening. Fixture shapes (fake codex CLI, `~/.codex`
  * session seed, restart choreography) mirror `codex-terminal-bounce-rust.spec.ts`.
  * Helpers are copied, not imported, per this suite's per-spec-ownership
@@ -258,9 +258,7 @@ test.describe('Compound Restart (Rust only)', () => {
   // -------------------------------------------------------------------
   // MODE A -- ABRUPT DEATH + REVIVAL (WSL-restart-like), no page reload.
   // -------------------------------------------------------------------
-  test('a resumed codex pane survives an abrupt SIGKILL server death + revival without a page reload', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('a resumed codex pane survives an abrupt SIGKILL server death + revival without a page reload', async ({ page }) => {
     const CODEX_SESSION_ID = 'codex-compound-sigkill-0001'
     const SESSION_TITLE = 'compound-restart sigkill seeded session'
 
@@ -329,9 +327,7 @@ test.describe('Compound Restart (Rust only)', () => {
   // -------------------------------------------------------------------
   // MODE B -- SERVER AND BROWSER RESTARTING TOGETHER.
   // -------------------------------------------------------------------
-  test('a resumed codex pane survives the server and the browser page restarting together', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('a resumed codex pane survives the server and the browser page restarting together', async ({ page }) => {
     const CODEX_SESSION_ID = 'codex-compound-both-0001'
     const SESSION_TITLE = 'compound-restart both seeded session'
 

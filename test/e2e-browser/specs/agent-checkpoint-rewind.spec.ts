@@ -70,8 +70,8 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  *
  * Routed through the generalized E2eServerHandle seam (HARNESS-02) so the
  * SAME spec exercises the legacy Node server and the owned Rust server via
- * the `e2eServerKind` project option (see `playwright.config.ts`'s
- * `MATRIX_SPECS`).
+ * the `rustFixture` project option (see `playwright.config.ts`'s
+ * `retired matrix list`).
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -119,8 +119,8 @@ function findFreshAgentLeaf(node: any): any {
 }
 
 test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
-  test('rewinding code through the real UI reverts tracked files while the later turn, model, and durable session survive a restart', async ({ page, e2eServerKind }) => {
-    // KNOWN DIVERGENCE (rust-chromium only): this gesture depends on the
+  test('rewinding code through the real UI reverts tracked files while the later turn, model, and durable session survive a restart', async ({ page }) => {
+    // KNOWN DIVERGENCE (Rust browser lane only): this gesture depends on the
     // client's single-slot optimistic local echo (`pendingLocalEcho`)
     // remaining visible/clickable long enough to hover + click "Rewind
     // code to here" -- the ONLY source for a "You: ..." bubble against
@@ -138,14 +138,14 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
     // defect in the checkpoint routes themselves (which are proven
     // correct by `crates/freshell-server/src/checkpoints.rs`'s 41 Rust
     // tests, route-level, real-HTTP). The gesture is fully proven reliable
-    // against the legacy server (`legacy-chromium`, `chromium`, below) --
+    // against the legacy server (`retired Node browser lane`, `chromium`, below) --
     // legacy is the parity control here, matching the divergence-handling
     // convention already used by `sidebar-click-resume.spec.ts` and
     // `safe03-origin-matrix.spec.ts` for analogous cases.
-    test.skip(e2eServerKind === 'rust', 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click on the Rust server faster than on legacy -- see comment above; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
+    test.skip(true, 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click on the Rust server faster than on legacy -- see comment above; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
 
     // This scenario's own real-server-restart leg (rebuilding/relaunching a
-    // release binary under `rust-chromium`) can push total wall-clock past
+    // release binary under `Rust browser lane`) can push total wall-clock past
     // the suite's default 60s per-test budget; extend it rather than touch
     // the shared global default.
     test.setTimeout(120_000)
@@ -158,7 +158,6 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
 
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           setupHome: async (homeDir) => {
@@ -369,7 +368,7 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // behind any state that corrupts session/model resumption on the
         // next restart. ---
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
         await harness.clearSentWsMessages()
         await server.restart()

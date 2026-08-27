@@ -7,7 +7,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * SESSION-16 — "Tolerate malformed and partially written provider data."
  *
  * Playwright validation (deferred-posture probe, per the df1 campaign policy: authored +
- * registered in MATRIX_SPECS + run ONCE per leg with per-leg outcome classification —
+ * registered in retired matrix list + run ONCE per leg with per-leg outcome classification —
  * this spec is NOT iterated to green by the worker):
  *
  *   "Seed healthy, empty, truncated, malformed, and invalid-UTF-8 records for every
@@ -33,7 +33,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * sweeps) and the frozen-behavior control
  * `test/unit/server/coding-cli/session-indexer-malformed-corpus.test.ts` (legacy, real
  * provider modules). Both legs of THIS spec exercise the REAL servers over an isolated
- * HOME; legacy-chromium is the behavioral control.
+ * HOME; retired Node browser lane is the behavioral control.
  *
  * Visibility discipline: the sidebar's DEFAULT browse projection hides non-interactive
  * sessions (SESSION-15's local filters), so every record this spec asserts as VISIBLE
@@ -154,9 +154,8 @@ const SIDEBAR_TIMEOUT = 15_000
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so the SAME spec
 // exercises the legacy Node server (control) and the Rust server (target).
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           // ── Claude corpus (`<home>/.claude/projects/s16-campaign/*.jsonl`) ──

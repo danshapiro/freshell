@@ -1,8 +1,6 @@
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
-import { TestServer } from '../helpers/test-server.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { E2eServerKind } from '../helpers/external-target.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -23,7 +21,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * STARTUP rejection, were both unproven at this layer).
  *
  * This spec closes that gap for every CHEAPLY PROVABLE clause, run against
- * BOTH `legacy-chromium` and `rust-chromium` (`server/auth.ts` and
+ * BOTH `retired Node browser lane` and `Rust browser lane` (`server/auth.ts` and
  * `crates/freshell-server/src/main.rs::validate_auth_token` share the exact
  * same messages/order/`DEFAULT_BAD_TOKENS` set, confirmed by direct
  * source read of both, so legacy is a true parity control here -- NOT a
@@ -56,10 +54,8 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const BAD_TOKEN_STARTUP_TIMEOUT_MS = 20_000
 
-async function bootWithToken(kind: E2eServerKind, token: string): Promise<{ started: boolean; message: string }> {
-  const server = kind === 'rust'
-    ? new RustServer({ token, startTimeoutMs: BAD_TOKEN_STARTUP_TIMEOUT_MS })
-    : new TestServer({ token, startTimeoutMs: BAD_TOKEN_STARTUP_TIMEOUT_MS })
+async function bootWithToken(token: string): Promise<{ started: boolean; message: string }> {
+  const server = new RustServer({ token, startTimeoutMs: BAD_TOKEN_STARTUP_TIMEOUT_MS })
 
   try {
     await server.start()
@@ -112,14 +108,14 @@ function connectAndSendHello(wsUrl: string, token: string | undefined): Promise<
 }
 
 test.describe('SAFE-01 startup token-validation matrix (bad tokens refuse to boot)', () => {
-  test('empty token refuses to start with the exact required-token message', async ({ e2eServerKind }) => {
-    const result = await bootWithToken(e2eServerKind, '')
+  test('empty token refuses to start with the exact required-token message', async () => {
+    const result = await bootWithToken('')
     expect(result.started).toBe(false)
     expect(result.message).toContain('AUTH_TOKEN is required. Refusing to start without authentication.')
   })
 
-  test('too-short token (generic) refuses to start with the exact too-short message', async ({ e2eServerKind }) => {
-    const result = await bootWithToken(e2eServerKind, 'short-secret')
+  test('too-short token (generic) refuses to start with the exact too-short message', async () => {
+    const result = await bootWithToken('short-secret')
     expect(result.started).toBe(false)
     expect(result.message).toContain('AUTH_TOKEN is too short. Use at least 16 characters.')
   })
@@ -127,8 +123,8 @@ test.describe('SAFE-01 startup token-validation matrix (bad tokens refuse to boo
   // Empirical proof that the "weak/default value" message is unreachable:
   // every DEFAULT_BAD_TOKENS entry is under 16 characters, so the too-short
   // check fires first in BOTH implementations. See the file doc comment.
-  test('weak/default token ("changeme") is actually caught by the too-short check, not the weak-value check', async ({ e2eServerKind }) => {
-    const result = await bootWithToken(e2eServerKind, 'changeme')
+  test('weak/default token ("changeme") is actually caught by the too-short check, not the weak-value check', async () => {
+    const result = await bootWithToken('changeme')
     expect(result.started).toBe(false)
     expect(result.message).toContain('AUTH_TOKEN is too short. Use at least 16 characters.')
     expect(result.message).not.toContain('default/weak value')
@@ -138,18 +134,11 @@ test.describe('SAFE-01 startup token-validation matrix (bad tokens refuse to boo
   // (legacy's `!token` check passes it through) but Rust additionally
   // rejects it via `token.trim().is_empty()`. KNOWN DIVERGENCE, not a bug:
   // documented directly in `main.rs::validate_auth_token`'s doc comment.
-  test('whitespace-only token: Rust hardens beyond legacy (rejected on Rust, accepted on legacy)', async ({ e2eServerKind }) => {
+  test('whitespace-only token: Rust hardens beyond legacy (rejected on Rust, accepted on legacy)', async () => {
     const whitespaceToken = ' '.repeat(20)
-    const result = await bootWithToken(e2eServerKind, whitespaceToken)
-    if (e2eServerKind === 'rust') {
-      expect(result.started).toBe(false)
-      expect(result.message).toContain('AUTH_TOKEN is required. Refusing to start without authentication.')
-    } else {
-      // KNOWN DIVERGENCE: legacy's `!token` check is JS-falsy-only, so a
-      // 20-space string (truthy, >=16 chars, not in DEFAULT_BAD_TOKENS)
-      // passes every startup check and the server boots normally.
-      expect(result.started).toBe(true)
-    }
+    const result = await bootWithToken(whitespaceToken)
+    expect(result.started).toBe(false)
+    expect(result.message).toContain('AUTH_TOKEN is required. Refusing to start without authentication.')
   })
 })
 

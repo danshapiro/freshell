@@ -1,8 +1,7 @@
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
-import { TestServer } from '../helpers/test-server.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { E2eServerHandle, E2eServerKind } from '../helpers/external-target.js'
+import type { E2eServerHandle } from '../helpers/external-target.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -31,7 +30,7 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * 4011 code before any session state is sent) because the Rust server's
  * production bind is `0.0.0.0` (LAN-reachable), where advisory-only leaves a
  * DNS-rebinding path open. This spec therefore runs the SAME connection
- * attempts against BOTH `legacy-chromium` and `rust-chromium`, but asserts
+ * attempts against BOTH `retired Node browser lane` and `Rust browser lane`, but asserts
  * the DIFFERENT, per-kind-correct outcome for the reject-path cases:
  * legacy is the CONTROL that empirically proves the pre-hardening gap this
  * checklist item exists to close, rust proves the fix.
@@ -50,12 +49,9 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  */
 
 async function bootWithAllowedOrigins(
-  kind: E2eServerKind,
   allowedOrigins: string,
 ): Promise<E2eServerHandle> {
-  const server = kind === 'rust'
-    ? new RustServer({ env: { ALLOWED_ORIGINS: allowedOrigins }, startTimeoutMs: 60_000 })
-    : new TestServer({ env: { ALLOWED_ORIGINS: allowedOrigins }, startTimeoutMs: 30_000 })
+  const server = new RustServer({ env: { ALLOWED_ORIGINS: allowedOrigins }, startTimeoutMs: 60_000 })
   await server.start()
   return server
 }
@@ -112,8 +108,8 @@ const ALLOW_LISTED_REMOTE_ORIGIN = 'https://trusted.example'
 test.describe.serial('SAFE-03 WS Origin policy matrix', () => {
   let server: E2eServerHandle
 
-  test.beforeAll(async ({ e2eServerKind }) => {
-    server = await bootWithAllowedOrigins(e2eServerKind, ALLOW_LISTED_REMOTE_ORIGIN)
+  test.beforeAll(async () => {
+    server = await bootWithAllowedOrigins(ALLOW_LISTED_REMOTE_ORIGIN)
   })
 
   test.afterAll(async () => {
@@ -136,42 +132,27 @@ test.describe.serial('SAFE-03 WS Origin policy matrix', () => {
     expect(outcome).toBe('ready')
   })
 
-  test('a hostile origin (DNS-rebinding shape) is rejected before session state -- KNOWN DIVERGENCE vs legacy', async ({ e2eServerKind }) => {
+  test('a hostile origin (DNS-rebinding shape) is rejected before session state -- KNOWN DIVERGENCE vs legacy', async () => {
     const outcome = await connectWithOrigin(server.info.wsUrl, server.info.token, 'http://evil.example')
-    if (e2eServerKind === 'rust') {
-      expect(outcome).not.toBe('ready')
-      const closed = outcome as { closeCode: number; closeReason: string }
-      expect(closed.closeCode).toBe(4011)
-      expect(closed.closeReason).toBe('Origin not allowed')
-    } else {
-      // CONTROL: legacy's Origin check is advisory-only -- it never closes
-      // the socket, so a hostile origin with a valid token still reaches
-      // `ready`. This is the exact pre-hardening gap SAFE-03 closes.
-      expect(outcome).toBe('ready')
-    }
+    expect(outcome).not.toBe('ready')
+    const closed = outcome as { closeCode: number; closeReason: string }
+    expect(closed.closeCode).toBe(4011)
+    expect(closed.closeReason).toBe('Origin not allowed')
   })
 
-  test('the literal `null` origin (sandboxed iframe / file://) is rejected -- KNOWN DIVERGENCE vs legacy', async ({ e2eServerKind }) => {
+  test('the literal `null` origin (sandboxed iframe / file://) is rejected -- KNOWN DIVERGENCE vs legacy', async () => {
     const outcome = await connectWithOrigin(server.info.wsUrl, server.info.token, 'null')
-    if (e2eServerKind === 'rust') {
-      expect(outcome).not.toBe('ready')
-      const closed = outcome as { closeCode: number; closeReason: string }
-      expect(closed.closeCode).toBe(4011)
-      expect(closed.closeReason).toBe('Origin not allowed')
-    } else {
-      expect(outcome).toBe('ready')
-    }
+    expect(outcome).not.toBe('ready')
+    const closed = outcome as { closeCode: number; closeReason: string }
+    expect(closed.closeCode).toBe(4011)
+    expect(closed.closeReason).toBe('Origin not allowed')
   })
 
-  test('a malformed origin (not a URL at all) is rejected -- KNOWN DIVERGENCE vs legacy', async ({ e2eServerKind }) => {
+  test('a malformed origin (not a URL at all) is rejected -- KNOWN DIVERGENCE vs legacy', async () => {
     const outcome = await connectWithOrigin(server.info.wsUrl, server.info.token, 'not-a-url')
-    if (e2eServerKind === 'rust') {
-      expect(outcome).not.toBe('ready')
-      const closed = outcome as { closeCode: number; closeReason: string }
-      expect(closed.closeCode).toBe(4011)
-      expect(closed.closeReason).toBe('Origin not allowed')
-    } else {
-      expect(outcome).toBe('ready')
-    }
+    expect(outcome).not.toBe('ready')
+    const closed = outcome as { closeCode: number; closeReason: string }
+    expect(closed.closeCode).toBe(4011)
+    expect(closed.closeReason).toBe('Origin not allowed')
   })
 })

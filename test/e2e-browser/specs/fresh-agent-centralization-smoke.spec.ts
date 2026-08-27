@@ -1,7 +1,7 @@
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 const LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
 const CANONICAL_CLAUDE_SESSION_ID = '11111111-1111-4111-8111-111111111111'
@@ -238,7 +238,7 @@ async function sendLegacyLayoutSync(page: Page) {
   }, legacyLayoutPayload())
 }
 
-async function fetchWithAuth(serverInfo: TestServerInfo, path: string, init: RequestInit = {}) {
+async function fetchWithAuth(serverInfo: E2eServerInfo, path: string, init: RequestInit = {}) {
   return fetch(`${serverInfo.baseUrl}${path}`, {
     ...init,
     headers: {
@@ -249,7 +249,7 @@ async function fetchWithAuth(serverInfo: TestServerInfo, path: string, init: Req
   })
 }
 
-async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: TestServerInfo, tabId: string): Promise<LayoutSnapshot> {
+async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
   await expect.poll(async () => {
     const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
     const body = await response.json()

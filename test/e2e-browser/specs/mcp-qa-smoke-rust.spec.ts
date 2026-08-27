@@ -23,7 +23,7 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
  * the post-restart assertions are deliberately negative (documenting a real
  * gap, not fabricating persistence that does not exist).
  *
- * Rust-only (gated via `playwright.config.ts`'s `rust-chromium`-only
+ * Rust-only (gated via `playwright.config.ts`'s `Rust browser lane`-only
  * `testMatch`, same as `mcp-bridge-rust.spec.ts`): the legacy MCP<->legacy-REST
  * path is legacy's own already-tested path. This pins RUST-SERVER REST
  * compatibility with the unmodified MCP client across the full mode matrix.

@@ -16,7 +16,7 @@ import { test, expect } from '@playwright/test'
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
 
 const SESSION_ID = randomUUID()
 const SESSION_KEY = `claude:${SESSION_ID}`
@@ -37,11 +37,11 @@ function buildSessionJsonl(sessionId: string, cwd: string): string {
   ].join('\n') + '\n'
 }
 
-function authed(info: TestServerInfo): Record<string, string> {
+function authed(info: E2eServerInfo): Record<string, string> {
   return { 'x-auth-token': info.token }
 }
 
-async function directorySessionIds(info: TestServerInfo): Promise<string[]> {
+async function directorySessionIds(info: E2eServerInfo): Promise<string[]> {
   const resp = await fetch(`${info.baseUrl}/api/session-directory?priority=visible`, {
     headers: authed(info),
   })
@@ -56,7 +56,7 @@ async function directorySessionIds(info: TestServerInfo): Promise<string[]> {
 test.describe('session delete (rust server)', () => {
   test.setTimeout(240_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
 
   test.beforeAll(async () => {
     // Same pattern as sidebar-registry-sync-rust.spec.ts:171-176: the first

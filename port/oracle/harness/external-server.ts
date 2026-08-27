@@ -6,10 +6,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  TestServer,
   findFreePort,
   applyIsolatedHomeEnvironment,
-} from '../../../test/e2e-browser/helpers/test-server.js'
+  ensureSetupWizardBypassConfig,
+} from '../../../test/e2e-browser/helpers/server-fixture-support.js'
+import { LegacyNodeServer } from './legacy-node-server.js'
 
 /**
  * External-process server harness for the equivalence oracle.
@@ -22,8 +23,7 @@ import {
  *
  * TWO TARGETS share one env contract and one capture path (the whole point of an
  * external-process harness — capture is transport-only):
- *   - `node` (DEFAULT): the ORIGINAL server (`dist/server/index.js`) via the E2E
- *     `TestServer`.
+ *   - `node` (DEFAULT): the original server via the oracle-local constructor.
  *   - `rust`: the PORT (`target/release/freshell-server`), spawned directly with
  *     the SAME env contract (PORT, AUTH_TOKEN, FRESHELL_BIND_HOST=127.0.0.1,
  *     isolated HOME, the `network:{configured:true}` config pre-seed, ownership
@@ -306,7 +306,7 @@ export async function startExternalServer(
   }
 }
 
-/** Boot the ORIGINAL node server via the E2E TestServer (the reference). */
+/** Boot the original Node server via the oracle-local temporary constructor. */
 async function startNodeServer(
   options: StartExternalServerOptions,
   _provider: string,
@@ -315,8 +315,7 @@ async function startNodeServer(
 ): Promise<ExternalServerHandle> {
   ensureServerBuilt()
 
-  const server = new TestServer({
-    authStrategy: 'explicit-env',
+  const server = new LegacyNodeServer({
     // RULING 2 (adjudication `...dc849de1bd584a39_self-driving-reviewer`,
     // 2026-07-11): default 'isolated' (RULING 1's T0 cwd-parity fix); the
     // rot-guard case opts into 'project' on BOTH targets so a real non-empty
@@ -326,7 +325,7 @@ async function startNodeServer(
     verbose: options.verbose ?? false,
     ...(options.setupHome ? { setupHome: options.setupHome } : {}),
     env: {
-      // Force loopback: WSL servers default to 0.0.0.0. TestServer already sets
+      // Force loopback: the constructor also sets this, but keep the oracle
       // this, but we assert it here too so the harness is self-documenting.
       FRESHELL_BIND_HOST: '127.0.0.1',
       // Ownership sentinels — inherited by every grandchild the server spawns.
@@ -395,16 +394,7 @@ async function startRustServer(
   const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oracle-rust-'))
   const freshellDir = path.join(homeDir, '.freshell')
   await fsp.mkdir(freshellDir, { recursive: true })
-  // Setup-wizard bypass config — byte-for-byte the network fields the E2E
-  // TestServer's ensureSetupWizardBypassConfig() pre-seeds for the node original.
-  await fsp.writeFile(
-    path.join(freshellDir, 'config.json'),
-    JSON.stringify(
-      { version: 1, settings: { network: { configured: true, host: '127.0.0.1' } } },
-      null,
-      2,
-    ),
-  )
+  await ensureSetupWizardBypassConfig(path.join(freshellDir, 'config.json'))
   const logsDir = path.join(freshellDir, 'logs')
   await fsp.mkdir(logsDir, { recursive: true })
 

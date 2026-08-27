@@ -28,7 +28,7 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  * `crates/freshell-ws/tests/codex_candidate_inert.rs` (the accept-and-ignore
  * contract).
  *
- * Rust-only (`playwright.config.ts` registers this under `rust-chromium`).
+ * Rust-only (`playwright.config.ts` registers this under `Rust browser lane`).
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -311,9 +311,7 @@ test.describe('Codex status completeness (Rust only)', () => {
 
   test('restartAbrupt mid-codex-turn: restored pane seeds busy from the rollout, then completes with identity', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-restart-'))
     // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
     // first; a terminal-only fake dies on it (PTY_SPAWN_FAILED).
@@ -414,10 +412,8 @@ test.describe('Codex status completeness (Rust only)', () => {
 
   test('two concurrent servers keep independent codex status streams', async ({
     page,
-    e2eServerKind,
     browser,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-twin-'))
     // Dual-role (see note at site one): the codex lane boots an app-server
     // sidecar first; the BEL fake must cover only the terminal branch.

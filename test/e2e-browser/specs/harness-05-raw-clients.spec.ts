@@ -1,9 +1,9 @@
 /**
  * HARNESS-05 — probe spec for the raw HTTP/WebSocket Playwright clients
  * (`test/e2e-browser/helpers/raw-clients.ts`). Matrix spec: runs under BOTH
- * `legacy-chromium` and `rust-chromium` because Group B legs drive REAL
+ * `retired Node browser lane` and `Rust browser lane` because Group B legs drive REAL
  * per-server code paths (hello handling, protocol-error enforcement,
- * ping/pong, orchestration REST). Registered in MATRIX_SPECS.
+ * ping/pong, orchestration REST). Registered in retired matrix list.
  *
  * Full item text: "Add raw HTTP and WebSocket clients to the Playwright
  * runner. Tests need to send malformed frames, delay reads/hello, create

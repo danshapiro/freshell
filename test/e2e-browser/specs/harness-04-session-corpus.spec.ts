@@ -25,7 +25,7 @@
  *     delta/epsilon titles — the corpus is genuinely browsable.
  *
  * Per the checklist validation text this does NOT exercise Rust
- * multi-provider indexing — the server leg pins `kind: 'legacy'` under BOTH
+ * multi-provider indexing — the server leg uses the Rust baseline under
  * matrix projects; Rust-side indexing of this corpus belongs to the later
  * SESSION-* items.
  */
@@ -146,7 +146,6 @@ const test = base.extend<Record<string, never>, {
   testServer: [async ({}, use) => {
     corpusHolder.value = undefined
     const server = await createE2eServerHandle(process.env, {
-      kind: 'legacy',
       construct: {
         setupHome: async (homeDir) => {
           corpusHolder.value = await buildSessionCorpus(homeDir)

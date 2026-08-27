@@ -10,7 +10,7 @@ import { test, expect, _electron as electron, type ElectronApplication, type Pag
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
-import { TestServer } from '../e2e-browser/helpers/test-server.js'
+import { RustServer } from '../e2e-browser/helpers/rust-server.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
 
@@ -146,7 +146,7 @@ function remoteConfig() {
 
 test.describe('Renderer crash recovery', () => {
   let app: ElectronApplication | undefined
-  let server: TestServer | undefined
+  let server: RustServer | undefined
   let tmpHome: string | undefined
 
   test.afterEach(async () => {
@@ -168,7 +168,7 @@ test.describe('Renderer crash recovery', () => {
   })
 
   test('recovers the main Freshell UI after the renderer process crashes', async () => {
-    server = new TestServer()
+    server = new RustServer()
     const serverInfo = await server.start()
     tmpHome = createTempHome({
       serverMode: 'remote',

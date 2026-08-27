@@ -21,7 +21,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * (`crates/freshell-freshagent/src/lib.rs`'s `send_keys`: "create the
  * durable session ONLY the FIRST time this pane sends") lives entirely in
  * that HTTP handler, independent of any client rendering. Routed through
- * the `e2eServerKind`/`E2eServerHandle` seam (HARNESS-02) so the SAME spec
+ * the `rustFixture`/`E2eServerHandle` seam (HARNESS-02) so the SAME spec
  * exercises the legacy Node server and the owned Rust server.
  */
 
@@ -77,11 +77,11 @@ async function sendKeys(baseUrl: string, token: string, paneId: string, data: st
 
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
 // SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `e2eServerKind` option.
+// depending on the active project's `rustFixture` option.
 const test = base.extend<{ auditLogPath: string; sharedCwd: string }, {
-  e2eServerKind: 'legacy' | 'rust'
+  rustFixture: 'legacy' | 'rust'
 }>({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agent-continuity-'))
     const binDir = path.join(sharedRoot, 'bin')
     const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
@@ -90,7 +90,6 @@ const test = base.extend<{ auditLogPath: string; sharedCwd: string }, {
     await fs.mkdir(sharedCwd, { recursive: true })
 
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,

@@ -30,13 +30,18 @@ export function ensureBuiltRuntime(
   },
 ): void {
   deps.rmSync(path.join(projectRoot, 'dist', '.env'), { force: true })
-  const npm = resolveNpmExecFileCommand(['run', 'build'], deps.env, deps.platform)
+  const npm = resolveNpmExecFileCommand(['run', 'build:client'], deps.env, deps.platform)
   deps.execFileSync(npm.command, npm.args, {
     cwd: projectRoot,
     env: {
       ...deps.env,
       NODE_ENV: 'production',
     },
+    stdio: 'inherit',
+  })
+  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server'], {
+    cwd: projectRoot,
+    env: { ...deps.env, NODE_ENV: 'production' },
     stdio: 'inherit',
   })
 }
