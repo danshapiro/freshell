@@ -85,8 +85,8 @@ test.describe('Settings Persistence Split', () => {
   //     CFG-12; CFG-12 (df1) then made the rust `/ws` connect handshake
   //     resolve the LIVE settings store per connection
   //     (`crates/freshell-ws/src/lib.rs` `WsState::handshake_settings` +
-  //     `SettingsStore::shared_settings_lock()`, mirroring the original's
-  //     per-connection `handshakeSnapshotProvider`, `server/index.ts:415-427`)
+  //     `SettingsStore::shared_settings_lock()`, preserving the
+  //     per-connection live-settings handshake contract.
   //     and the pin was deleted; triage entry point for a replication
   //     regression is docs/plans/df1-evidence/CFG-12.md.
   test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo }) => {

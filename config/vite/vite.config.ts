@@ -5,8 +5,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { execFileSync } from 'node:child_process'
 import { getFreshellConfigDir } from '../../shared/freshell-home.js'
-import { isWSL } from '../../server/platform.js'
-import { getNetworkHost } from './get-network-host.js'
+import { getNetworkHost, isWSL } from './get-network-host.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)

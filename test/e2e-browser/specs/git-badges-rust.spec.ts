@@ -162,9 +162,8 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
   // `crates/freshell-server/src/main.rs` wires it to
   // `freshell_ws::terminal_meta::seed_from_terminal` -- the SAME seed ->
   // async git enrich -> `commit_if_changed` -> `terminal.meta.updated`
-  // pipeline the WS `terminal.create` handler runs. Node parity:
-  // terminal (`server/index.ts:647-655` -> `seedFromTerminal`), REST
-  // creates included. This leg was a `test.fail()` KNOWN-GAP pin until the
+  // pipeline the WS `terminal.create` handler runs. This leg was a
+  // `test.fail()` KNOWN-GAP pin until the
   // hook landed (rest-tab-persistence.spec.ts flip regime).
   // ---------------------------------------------------------------------
   test('a REST-created shell tab (POST /api/tabs {cwd}) shows a git badge (seedFromTerminal parity)', async ({ page }) => {

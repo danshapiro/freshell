@@ -32,8 +32,8 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * (`io::ErrorKind::NotFound`, surfaced via the existing `wrap_terminal_spawn_error`
  * -> `PTY_SPAWN_FAILED` path) when no `$PATH` entry has a match.
  *
- * node-pty is unaffected (bare names go straight to PATH search, no cwd-first
- * branch) -- not a parity gap to gate per-assertion, a Rust-only regression.
+ * The Rust path is intentionally tested directly: bare names must use PATH
+ * search, with no cwd-first branch or fallback to a retired backend.
  */
 
 const __filename = fileURLToPath(import.meta.url)

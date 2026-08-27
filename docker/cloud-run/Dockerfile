@@ -44,14 +44,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 COPY package.json package-lock.json ./
 
-# Lifecycle scripts can build native add-ons for the retired backend. They are
-# deliberately disabled here; the final image needs only the retained JS tools.
+# Lifecycle scripts are disabled here; the final image needs only retained JS
+# tooling and static artifacts around the Rust backend.
 RUN npm ci --ignore-scripts
 
-# Until the dependency-removal task prunes these entries from the root lock,
-# delete their directories explicitly and fail if any remain. The split spelling
-# keeps the transitional name out of runtime path scans while still naming the
-# exact directory that is removed.
+# Keep the image fail-closed if a stale build context or cached dependency layer
+# carries any retired Node backend package. The package lock no longer requests
+# these paths; this explicit cleanup protects release images built from older
+# layers without retaining a Node application server.
 RUN set -eu; \
     RETIRED_BACKEND_DIRECTORIES="\
 node_modules/@ai-sdk/google \
@@ -71,7 +71,7 @@ node_modules/@types/cookie-parser \
 node_modules/@types/express \
 node_modules/@types/supertest \
 node_modules/supertest \
-node_modules/superwstest \
+node_modules/superwtest \
 node_modules/pino-pretty"; \
     for relative in $RETIRED_BACKEND_DIRECTORIES; do \
       rm -rf "/app/$relative"; \
@@ -111,9 +111,9 @@ COPY --from=node-builder /app/dist/client ./dist/client
 COPY --from=node-builder /app/dist/tools ./dist/tools
 COPY --from=node-builder /app/node_modules ./node_modules
 
-# Preserve the source tree for local parity checks until the source retirement
-# task removes it. Build outputs and dependency directories are excluded by
-# .dockerignore, so these copies cannot overwrite the staged artifacts.
+# Preserve the source tree for local release checks. Build outputs and
+# dependency directories are excluded by .dockerignore, so these copies cannot
+# overwrite the staged artifacts.
 COPY . .
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server

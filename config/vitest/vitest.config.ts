@@ -35,16 +35,9 @@ export default defineConfig({
       'docs/plans/**',
       // Port contract-freeze tests run under config/vitest/vitest.port.config.ts (node environment)
       'test/unit/port/**',
-      // Legacy server implementation tests remain quarantined until Task 10
-      // removes the retired implementation and its historical test tree.
-      'test/server/**',
-      'test/unit/server/**',
-      'test/integration/server/**',
       // These integration trees own their own runtime/artifact setup.
       'test/integration/tooling/**',
       'test/integration/electron/**',
-      'test/integration/session-repair.test.ts',
-      'test/integration/session-search-e2e.test.ts',
       'test/e2e-browser/**',
       'test/integration/real/**',
       // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
