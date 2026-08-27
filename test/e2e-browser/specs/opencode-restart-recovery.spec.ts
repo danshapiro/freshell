@@ -1057,4 +1057,89 @@ test.describe('OpenCode restart recovery', () => {
       includeShellPane: false,
     })
   })
+
+  test('restores an OpenCode pane when its persisted cwd was deleted with the old server home', async ({ page }) => {
+    // Kata ywwf: a pane created with cwd inside the TestServer's isolated
+    // /tmp/freshell-e2e-* home persists that path as initialCwd; stop()
+    // deletes the home, and the post-restart replay used to die in OpenCode
+    // MCP config injection ('cwd directory does not exist') with
+    // PTY_SPAWN_FAILED. Recovery must fall back to a live directory.
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-stale-cwd-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    await installFakeOpencode(binDir)
+
+    const server1 = new TestServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+    }))
+
+    let server2: TestServer | undefined
+    try {
+      const info1 = await server1.start()
+      await page.goto(`${info1.baseUrl}/?token=${info1.token}&e2e=1`)
+
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      const tab = { tabId: 'tab-stale-cwd', paneId: 'pane-stale-cwd', requestId: 'req-stale-cwd', mode: 'opencode' as const, title: 'Stale cwd pane' }
+      // The pane's cwd is the isolated home itself, which stop() deletes.
+      await addTerminalTab(page, { ...tab, cwd: info1.homeDir })
+      const [session] = await waitForOpenCodeSessions(page, [tab.tabId])
+      expect(session.sessionRef?.provider).toBe('opencode')
+      expect(typeof session.sessionRef?.sessionId).toBe('string')
+
+      const beforeRestart = await getPaneSnapshots(page, [tab.tabId])
+      const previousTerminalIdsByTab = Object.fromEntries(
+        beforeRestart.map((snapshot) => [snapshot.tabId, snapshot.terminalId]),
+      )
+      await harness.clearSentWsMessages()
+
+      await server1.stop() // deletes info1.homeDir
+      await expect(fsp.stat(info1.homeDir)).rejects.toThrow()
+
+      server2 = new TestServer(createServerOptions({
+        binDir,
+        auditLogPath,
+        logsDir,
+        sharedOpencodeDataDir,
+        port: info1.port,
+        token: info1.token,
+      }))
+      const info2 = await server2.start()
+      expect(info2.homeDir).not.toBe(info1.homeDir)
+
+      await harness.waitForConnection(30_000)
+      const afterRestart = await waitForRunningTerminals(page, [tab.tabId], previousTerminalIdsByTab)
+      expect(afterRestart[0]?.terminalId).not.toBe(beforeRestart[0]?.terminalId)
+      expect(afterRestart[0]?.sessionRef).toEqual(beforeRestart[0]?.sessionRef)
+
+      // Session resume is preserved across the re-home: the fake relaunches
+      // with the original --session arg.
+      await waitForRestoreLaunches(auditLogPath, [session.sessionRef!.sessionId!])
+
+      // The failure mode this regression pins: no cwd-missing MCP injection
+      // error anywhere the restart left evidence.
+      const sentMessages = await harness.getSentWsMessages()
+      const restoreCreates = sentMessages.filter((message: any) =>
+        message?.type === 'terminal.create' && message?.restore === true,
+      )
+      expect(restoreCreates.some((message: any) => message?.cwd === info1.homeDir)).toBe(true)
+      expect(await readLogs(logsDir)).not.toContain('cwd directory does not exist')
+
+      // The fallback target is filesystem-observable: MCP config was injected
+      // into the NEW server's live home, not the deleted one.
+      const injectedConfig = path.join(info2.homeDir, '.opencode', 'opencode.json')
+      await expect.poll(async () => fsp.stat(injectedConfig).then(() => true, () => false), { timeout: 5_000 }).toBe(true)
+    } finally {
+      await server2?.stop().catch(() => {})
+      await server1.stop().catch(() => {}) // server1 already stopped; tolerate double-stop
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
