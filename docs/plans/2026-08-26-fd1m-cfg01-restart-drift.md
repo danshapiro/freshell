@@ -107,8 +107,13 @@ Rust `freshell-server` binary.
   signature and pass/fail semantics; on failure the assertion message now
   embeds `fmt`-rendered unexpected paths and a `console.error` line prefixed
   `[cfg01-lossless]` carries the same set (Playwright's line reporter can
-  truncate long `Received` blocks; the `console.error` line is captured
-  verbatim in Cloud Run task logs and local stdout).
+  truncate long `Received` blocks; the `console.error` line rides worker
+  stderr into Cloud Run task logs and local output). The load-bearing probe
+  below greps for EITHER channel (LB7): the base-commit red run proved the
+  custom expect message prints verbatim under the line reporter; console.error
+  surfacing is proven by this probe itself at Step 4 — whichever channels
+  surface, the gate counts it, and a zero count is a real failure of the
+  diagnostic.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -123,7 +128,10 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   -g "every REST writer" \
   specs/cfg01-lossless-writes.spec.ts > /tmp/cfg01-fd1m/task1-red.log 2>&1
 echo "spec exit: $?"   # expected nonzero (spec still red; that is correct pre-fix)
-grep -F -c '[cfg01-lossless] UNEXPECTED DRIFT' /tmp/cfg01-fd1m/task1-red.log
+# Either-channel probe (LB7): matches the [cfg01-lossless] console.error line
+# AND/OR the expect message's new `(unexpected: [...])` suffix — a nonzero
+# count cannot depend on which stream the line reporter surfaces.
+grep -E -c '\[cfg01-lossless\] UNEXPECTED DRIFT|unexpected: \[' /tmp/cfg01-fd1m/task1-red.log
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -131,10 +139,11 @@ grep -F -c '[cfg01-lossless] UNEXPECTED DRIFT' /tmp/cfg01-fd1m/task1-red.log
 Run: the block from Step 1.
 
 Expected: FAIL — spec exit code is nonzero (the pre-existing restart-leg red)
-AND the final `grep -c` prints `0`, because the current `expectDiffWithin`
-failure output does not contain a `[cfg01-lossless] UNEXPECTED DRIFT` line.
-(The diagnostic is the missing behavior; the spec red is the reproduced
-pre-existing failure this task instruments.)
+AND the final `grep -c` prints `0`: the current failure output contains
+neither the `[cfg01-lossless] UNEXPECTED DRIFT` line nor an `unexpected: [`
+message suffix (its Expected/Received block renders `[\"completedMigrations\"]`
+with no such prefix). (The diagnostic is the missing behavior; the spec red is
+the reproduced pre-existing failure this task instruments.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -173,7 +182,8 @@ function expectDiffWithin(actual: DiffPath[], allowed: DiffPath[], context: stri
 Run: the same block from Step 1.
 
 Expected: PASS — spec exit code is STILL nonzero (the fix arrives in Task 2),
-but this time the probe's final `grep -c` prints `>=1` and
+but this time the probe's final `grep -c` prints `>=1` (both channels may
+surface; either alone satisfies the gate) and
 `/tmp/cfg01-fd1m/task1-red.log` names `["completedMigrations"]` as the sole
 unexpected path — the local reproduction fingerprint matching the cloud
 signature. (Record this log as the run's red/diagnostic evidence.)
@@ -247,13 +257,16 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium --retries=0 --reporter=line \
   specs/cfg01-lossless-writes.spec.ts > /tmp/cfg01-fd1m/task2-red.log 2>&1
 echo "spec exit: $?"
-grep -F -c '[cfg01-lossless] UNEXPECTED DRIFT (normalized boot with sentinels present): ["completedMigrations"]' /tmp/cfg01-fd1m/task2-red.log
+# Either-channel probe (LB7): the console.error marker line and/or the expect
+# message line, both bound to this leg's context.
+grep -E -c 'UNEXPECTED DRIFT \(normalized boot with sentinels present\): \["completedMigrations"\]|normalized boot with sentinels present: unexpected config.json drift' /tmp/cfg01-fd1m/task2-red.log
 ```
 
-Expected: FAIL — nonzero spec exit; the drift line (added by Task 1) names
-exactly `["completedMigrations"]` under context `normalized boot with
-sentinels present`, so the grep count is `1`. (The second test is skipped in
-this serial describe after the first's failure.)
+Expected: FAIL — nonzero spec exit; the drift set named under context
+`normalized boot with sentinels present` (by the marker line and/or the expect
+message, whichever channels surface) is exactly `["completedMigrations"]`, and
+the grep count is `>=1`. (The second test is skipped in this serial describe
+after the first's failure.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
