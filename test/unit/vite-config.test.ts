@@ -151,11 +151,20 @@ describe('vitest config', () => {
     expect(excluded).toContain('test/integration/real/**')
   })
 
-  it('runs real-provider integration contracts in the node server suite', async () => {
-    const configModule = await import('../../config/vitest/vitest.server.config.ts')
+  it('keeps artifact-owning integration trees out of the default lane', async () => {
+    const configModule = await import('../../config/vitest/vitest.config.ts')
     const config = configModule.default
-    const included = config.test?.include ?? []
+    const excluded = config.test?.exclude ?? []
 
-    expect(included).toContain('test/integration/real/**/*.test.ts')
+    expect(excluded).toContain('test/integration/tooling/**')
+    expect(excluded).toContain('test/integration/electron/**')
+  })
+
+  it('keeps the visible-first CLI harness in the default lane', async () => {
+    const configModule = await import('../../config/vitest/vitest.config.ts')
+    const config = configModule.default
+    const excluded = config.test?.exclude ?? []
+
+    expect(excluded).not.toContain('test/unit/visible-first/cli-command-harness.test.ts')
   })
 })

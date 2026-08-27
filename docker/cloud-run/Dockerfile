@@ -2,7 +2,7 @@
 #
 # Multi-stage build:
 #   1. rust-builder: compiles the freshell-server release binary
-#   2. node-builder: installs npm deps (native modules) + builds dist/client + dist/server
+#   2. node-builder: installs npm deps (native modules) + builds dist/client + dist/tools
 #   3. runtime: Node.js + Playwright chromium + pre-built artifacts (no build tools)
 #
 # The image is self-contained: no build steps run at test time (except the
@@ -38,8 +38,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 
-# Build only the server binary (release profile).
-RUN cargo build --release -p freshell-server
+# Build only the Rust server binary (release profile).
+RUN cargo build --release -p freshell-server --locked
 
 # ---------------------------------------------------------------------------
 # Stage 2: Build Node.js dependencies and dist artifacts
@@ -72,8 +72,9 @@ RUN npm ci
 # .git, .worktrees, docs, etc.).
 COPY . .
 
-# Build the client and server.
-RUN npm run build:client && npm run build:server
+# Build the retained client and CLI/tool artifacts. The Rust server is built in
+# the rust-builder stage above; there is no Node server artifact in this image.
+RUN npm run build:client && npm run build:tools
 
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime image with Node, Playwright, and pre-built artifacts

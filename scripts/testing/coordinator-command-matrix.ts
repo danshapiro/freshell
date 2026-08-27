@@ -3,8 +3,8 @@ export type SuiteKey =
   | 'default:coverage'
   | 'default:test/unit'
   | 'default:test/unit/client'
-  | 'server:test/server'
-  | 'server:all:run'
+  | 'rust:server'
+  | 'rust:integration'
 
 export type CommandKey =
   | 'test'
@@ -43,12 +43,16 @@ export type CoordinatorInput = {
 export type UpstreamPhase =
   | {
     runner: 'vitest'
-    config: 'default' | 'server'
+    config: 'default' | 'electron' | 'runtime' | 'direct'
     args: string[]
   }
   | {
     runner: 'npm'
     script: 'typecheck' | 'build' | 'test:balanced'
+    args: string[]
+  }
+  | {
+    runner: 'cargo'
     args: string[]
   }
 
@@ -58,115 +62,51 @@ export type CommandDisposition =
   | { kind: 'passthrough'; phases: UpstreamPhase[] }
   | { kind: 'rejected'; reason: string }
 
-type SinglePhaseSpec = {
-  owner: 'default' | 'server'
-  broadSuiteKey?: SuiteKey
-  broadArgs: string[]
-  delegatedArgs?: string[]
-  passthroughKind?: 'delegated' | 'passthrough'
-}
-
 const COMPOSITE_COMMANDS = new Set<CommandKey>(['test', 'test:all', 'check', 'verify'])
 const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
-const SERVER_VITEST_CONFIG = 'config/vitest/vitest.server.config.ts'
-const SINGLE_PHASE_SPECS: Record<Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>, SinglePhaseSpec> = {
-  'test:watch': {
-    owner: 'default',
-    broadArgs: ['--config', DEFAULT_VITEST_CONFIG],
-    passthroughKind: 'passthrough',
-  },
-  'test:ui': {
-    owner: 'default',
-    broadArgs: ['--config', DEFAULT_VITEST_CONFIG, '--ui'],
-    passthroughKind: 'passthrough',
-  },
-  'test:server': {
-    owner: 'server',
-    broadSuiteKey: 'server:all:run',
-    broadArgs: ['--config', SERVER_VITEST_CONFIG, '--run'],
-    delegatedArgs: ['--config', SERVER_VITEST_CONFIG],
-  },
-  'test:coverage': {
-    owner: 'default',
-    broadSuiteKey: 'default:coverage',
-    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage'],
-  },
-  'test:unit': {
-    owner: 'default',
-    broadSuiteKey: 'default:test/unit',
-    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit'],
-  },
-  'test:integration': {
-    owner: 'server',
-    broadSuiteKey: 'server:test/server',
-    broadArgs: ['run', '--config', SERVER_VITEST_CONFIG, 'test/server'],
-  },
-  'test:client': {
-    owner: 'default',
-    broadSuiteKey: 'default:test/unit/client',
-    broadArgs: ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client'],
-  },
-  'test:vitest': {
-    owner: 'default',
-    broadArgs: [],
-    passthroughKind: 'passthrough',
-  },
-}
-
-type CompositeTargetAnalysis =
-  | { kind: 'none' }
-  | { kind: 'default' | 'server' }
-  | { kind: 'cross-config'; suiteKey?: SuiteKey }
-  | { kind: 'mixed' }
-
-const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--config', '-c', '--bail', '--changed'])
+const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
+const RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.runtime.config.ts'
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
-  const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
+  const args = stripLeadingArgSeparator(input.forwardedArgs)
 
   if (input.commandKey === 'test:vitest') {
-    return passthrough([buildVitestPassthroughPhase(normalizedArgs)])
+    if (args.some((arg) => isRetiredServerConfigSelector(arg))) {
+      return {
+        kind: 'rejected',
+        reason: 'The Node server Vitest config was retired. Use npm run test:server for the Rust cargo lane.',
+      }
+    }
+    return passthrough([vitestPhase('direct', args)])
   }
 
-  if (hasExplicitConfigOverride(normalizedArgs)) {
+  if (hasExplicitConfigOverride(args)) {
     return {
       kind: 'rejected',
       reason: 'Public test commands do not accept --config overrides. Use npm run test:vitest -- ... for direct Vitest config control.',
     }
   }
 
-  if (hasHelpOrVersion(normalizedArgs)) {
-    return classifyHelpOrVersion(input.commandKey, normalizedArgs)
-  }
+  if (hasHelpOrVersion(args)) return classifyHelpOrVersion(input.commandKey, args)
+  if (COMPOSITE_COMMANDS.has(input.commandKey)) return classifyCompositeCommand(input.commandKey, args)
+  return classifySinglePhaseCommand(input.commandKey, args)
+}
 
-  if (COMPOSITE_COMMANDS.has(input.commandKey)) {
-    return classifyCompositeCommand(input.commandKey, normalizedArgs)
-  }
-
-  return classifySinglePhaseCommand(input.commandKey, normalizedArgs)
+function isRetiredServerConfigSelector(arg: string): boolean {
+  return /(?:^|[/=])server\.config(?:\.|$)/.test(arg)
+    || /(?:^|[/=])server(?:$|\.)/.test(arg)
 }
 
 export function isCommandKey(value: string): value is CommandKey {
   return (COMMAND_KEYS as readonly string[]).includes(value)
 }
 
-function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[]): CommandDisposition {
-  if (commandKey === 'test:vitest') {
-    return passthrough([buildVitestPassthroughPhase(normalizedArgs)])
-  }
-
-  if (COMPOSITE_COMMANDS.has(commandKey)) {
-    const targetOwnership = classifyTargetOwnership(normalizedArgs)
-    const owner = targetOwnership === 'server' ? 'server' : 'default'
-    return passthrough([vitestPhase(owner, [...ownerRunPrefix(owner), ...normalizedArgs])])
-  }
-
-  const spec = SINGLE_PHASE_SPECS[commandKey]
-  if (spec.passthroughKind === 'passthrough') {
-    return passthrough([buildSinglePhasePassthroughPhase(commandKey, normalizedArgs)])
-  }
-
-  return passthrough([buildSinglePhaseDelegatedPhase(commandKey, normalizedArgs)])
+function classifyHelpOrVersion(commandKey: CommandKey, args: string[]): CommandDisposition {
+  if (commandKey === 'test:vitest') return passthrough([vitestPhase('direct', args)])
+  if (COMPOSITE_COMMANDS.has(commandKey)) return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
+  if (commandKey === 'test:server') return passthrough([cargoPhase(['test', '-p', 'freshell-server', '--locked', ...args])])
+  if (commandKey === 'test:integration') return passthrough([cargoPhase(['test', '--workspace', '--tests', '--locked', ...args])])
+  return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
 }
 
 function classifyCompositeCommand(commandKey: CommandKey, args: string[]): CommandDisposition {
@@ -177,120 +117,71 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
     }
   }
 
-  const filteredArgs = removeCompositeCompatibilityFlags(args)
-  const targetAnalysis = analyzeCompositeTargets(filteredArgs)
-
-  if (targetAnalysis.kind === 'mixed') {
-    return {
-      kind: 'rejected',
-      reason: 'Mixed client and server selectors are not supported here. Please split the command by config owner.',
+  const filtered = removeCompositeCompatibilityFlags(args)
+  const targets = extractTargets(filtered)
+  if (targets.length > 0) {
+    const hasRustTarget = targets.some((target) => isRustTarget(target))
+    const hasClientTarget = targets.some((target) => !isRustTarget(target))
+    if (hasRustTarget && hasClientTarget) {
+      return {
+        kind: 'rejected',
+        reason: 'Mixed client and Rust selectors are not supported here. Please split the command by lane.',
+      }
     }
+    if (hasRustTarget) {
+      return delegated([cargoPhase(['test', '--workspace', '--locked', ...filtered])])
+    }
+    return delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filtered])])
   }
 
-  if (targetAnalysis.kind === 'cross-config') {
-    return coordinated(targetAnalysis.suiteKey, [
-      npmPhase('test:balanced', filteredArgs),
-    ])
+  if (isBroadCompositeWorkload(filtered)) {
+    return coordinated('full-suite', [npmPhase('test:balanced', filtered)])
   }
-
-  if (targetAnalysis.kind === 'server') {
-    return delegated([
-      vitestPhase('server', ['run', '--config', SERVER_VITEST_CONFIG, ...filteredArgs]),
-    ])
-  }
-
-  if (targetAnalysis.kind === 'default') {
-    return delegated([
-      vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filteredArgs]),
-    ])
-  }
-
-  if (isBroadCompositeWorkload(filteredArgs)) {
-    return coordinated(coordinatedSuiteKeyForCompositeWorkload(filteredArgs), [
-      npmPhase('test:balanced', filteredArgs),
-    ])
-  }
-
-  return delegated([
-    vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filteredArgs]),
-  ])
+  return delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filtered])])
 }
 
-function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>, args: string[]): CommandDisposition {
-  const spec = SINGLE_PHASE_SPECS[commandKey]
-
-  if (spec.passthroughKind === 'passthrough') {
-    return passthrough([buildSinglePhasePassthroughPhase(commandKey, args)])
-  }
-
-  if (hasWatchOrUi(args)) {
-    return delegated([buildSinglePhaseDelegatedPhase(commandKey, args)])
-  }
-
-  if (commandKey === 'test:server' && isExplicitBroadServerRun(args)) {
-    return coordinated(suiteKeyForSinglePhaseWorkload(spec, args), [
-      vitestPhase('server', buildBroadSinglePhaseArgs(spec, args)),
-    ])
-  }
-
-  if (commandKey === 'test:server' && args.length === 0) {
-    return delegated([vitestPhase('server', singlePhaseDelegatedBaseArgs(spec))])
-  }
-
-  if (isBroadSinglePhaseWorkload(commandKey, args) && spec.broadSuiteKey) {
-    return coordinated(suiteKeyForSinglePhaseWorkload(spec, args), [
-      vitestPhase(spec.owner, buildBroadSinglePhaseArgs(spec, args)),
-    ])
-  }
-
-  return delegated([buildSinglePhaseDelegatedPhase(commandKey, args)])
-}
-
-function buildSinglePhasePassthroughPhase(
+function classifySinglePhaseCommand(
   commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
   args: string[],
-): UpstreamPhase {
-  const spec = SINGLE_PHASE_SPECS[commandKey]
-  const targetOwnership = classifyTargetOwnership(args)
-
-  if (targetOwnership === 'mixed') {
-    throw new Error('Mixed config ownership is not supported in a single passthrough phase.')
+): CommandDisposition {
+  switch (commandKey) {
+    case 'test:server':
+      return args.length === 0 || isExplicitBroadCargoRun(args)
+        ? coordinated('rust:server', [cargoPhase(['test', '-p', 'freshell-server', '--locked', ...withoutCargoFlags(args)])])
+        : delegated([cargoPhase(['test', '-p', 'freshell-server', '--locked', ...withoutCargoFlags(args)])])
+    case 'test:integration':
+      return args.length === 0 || isExplicitBroadCargoRun(args)
+        ? coordinated('rust:integration', [cargoPhase(['test', '--workspace', '--tests', '--locked', ...withoutCargoFlags(args)])])
+        : delegated([cargoPhase(['test', '--workspace', '--tests', '--locked', ...withoutCargoFlags(args)])])
+    case 'test:coverage':
+      return coordinated('default:coverage', [vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, '--coverage', ...args])])
+    case 'test:unit':
+      return args.length === 0
+        ? coordinated('default:test/unit', [vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit'])])
+        : delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...args])])
+    case 'test:client':
+      return args.length === 0
+        ? coordinated('default:test/unit/client', [vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, 'test/unit/client'])])
+        : delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...args])])
+    case 'test:watch':
+      return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
+    case 'test:ui':
+      return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, '--ui', ...args])])
+    default:
+      return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
   }
-
-  if (targetOwnership && targetOwnership !== spec.owner) {
-    return vitestPhase(targetOwnership, [...singlePhasePassthroughTargetBaseArgs(spec, targetOwnership), ...args])
-  }
-
-  return vitestPhase(spec.owner, [...spec.broadArgs, ...args])
 }
 
-function buildSinglePhaseDelegatedPhase(
-  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
-  args: string[],
-): UpstreamPhase {
-  const spec = SINGLE_PHASE_SPECS[commandKey]
-  const targetOwnership = classifyTargetOwnership(args)
+function isExplicitBroadCargoRun(args: string[]): boolean {
+  return args.includes('--run') && !extractTargets(args).length
+}
 
-  if (targetOwnership === 'mixed') {
-    throw new Error('Mixed config ownership is not supported in a single delegated phase.')
-  }
-
-  if (targetOwnership && targetOwnership !== spec.owner) {
-    return vitestPhase(targetOwnership, [...ownerRunPrefix(targetOwnership), ...args])
-  }
-
-  if (targetOwnership === spec.owner) {
-    return vitestPhase(spec.owner, [...singlePhaseTargetBaseArgs(spec), ...args])
-  }
-
-  return vitestPhase(spec.owner, [...singlePhaseDelegatedBaseArgs(spec), ...args])
+function withoutCargoFlags(args: string[]): string[] {
+  return args.filter((arg) => arg !== '--run')
 }
 
 function stripLeadingArgSeparator(args: string[]): string[] {
-  if (args[0] === '--') {
-    return args.slice(1)
-  }
-  return [...args]
+  return args[0] === '--' ? args.slice(1) : [...args]
 }
 
 function removeCompositeCompatibilityFlags(args: string[]): string[] {
@@ -301,237 +192,44 @@ function hasHelpOrVersion(args: string[]): boolean {
   return args.some((arg) => arg === '--help' || arg === '-h' || arg === '--version' || arg === '-v')
 }
 
-function hasWatchOrUi(args: string[]): boolean {
-  return args.some((arg) => arg === '--watch' || arg === '-w' || arg === '--ui')
-}
-
-function hasNamePattern(args: string[]): boolean {
-  return args.some((arg) => arg === '-t' || arg === '--testNamePattern' || arg.startsWith('--testNamePattern='))
-}
-
 function hasReporter(args: string[]): boolean {
   return args.some((arg) => arg === '--reporter' || arg.startsWith('--reporter='))
 }
 
 function hasExplicitConfigOverride(args: string[]): boolean {
-  return args.some((arg) => (
-    arg === '--config'
-    || arg.startsWith('--config=')
-    || arg === '-c'
-    || arg.startsWith('-c=')
-  ))
-}
-
-function isExplicitBroadServerRun(args: string[]): boolean {
-  if (!args.includes('--run')) return false
-  return !hasNarrowingSelectors(args)
+  return args.some((arg) => arg === '--config' || arg.startsWith('--config=') || arg === '-c' || arg.startsWith('-c='))
 }
 
 function isBroadCompositeWorkload(args: string[]): boolean {
-  return !hasNarrowingSelectors(args)
-}
-
-function isBroadSinglePhaseWorkload(
-  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
-  args: string[],
-): boolean {
-  if (commandKey === 'test:server') {
-    return isExplicitBroadServerRun(args)
-  }
-
-  return !hasNarrowingSelectors(args)
-}
-
-function hasNarrowingSelectors(args: string[]): boolean {
-  return hasWatchOrUi(args) || hasNamePattern(args) || extractTargets(args).length > 0
-}
-
-function buildBroadSinglePhaseArgs(spec: SinglePhaseSpec, args: string[]): string[] {
-  if (spec.owner === 'server' && args.includes('--run')) {
-    const extraArgs = args.filter((arg) => arg !== '--run')
-    return [...spec.broadArgs, ...extraArgs]
-  }
-
-  return [...spec.broadArgs, ...args]
-}
-
-function suiteKeyForSinglePhaseWorkload(spec: SinglePhaseSpec, args: string[]): SuiteKey | undefined {
-  return hasPartialSelectionFlags(args) ? undefined : spec.broadSuiteKey
-}
-
-function coordinatedSuiteKeyForCompositeWorkload(args: string[]): SuiteKey | undefined {
-  return hasPartialSelectionFlags(args) ? undefined : 'full-suite'
-}
-
-function hasPartialSelectionFlags(args: string[]): boolean {
-  return args.some((arg) => arg === '--changed' || arg.startsWith('--changed='))
-}
-
-function analyzeCompositeTargets(args: string[]): CompositeTargetAnalysis {
-  const classifications = extractTargets(args)
-    .map(classifyCompositeTarget)
-    .filter((classification): classification is NonNullable<ReturnType<typeof classifyCompositeTarget>> => classification !== undefined)
-
-  if (classifications.length === 0) {
-    return { kind: 'none' }
-  }
-
-  const unique = new Set(classifications)
-  if (unique.size === 1) {
-    const [only] = unique
-    if (only === 'full-suite') {
-      return { kind: 'cross-config', suiteKey: 'full-suite' }
-    }
-    if (only === 'cross-config') {
-      return { kind: 'cross-config' }
-    }
-    return { kind: only }
-  }
-
-  const includesCrossConfig = unique.has('cross-config') || unique.has('full-suite')
-  if (includesCrossConfig) {
-    const onlyCrossConfig = [...unique].every((classification) => classification === 'cross-config' || classification === 'full-suite')
-    if (onlyCrossConfig) {
-      return { kind: 'cross-config' }
-    }
-    return { kind: 'mixed' }
-  }
-
-  return { kind: 'mixed' }
-}
-
-function classifyTargetOwnership(args: string[]): 'default' | 'server' | 'mixed' | undefined {
-  const ownerships = extractTargets(args)
-    .map(classifyTarget)
-    .filter((owner): owner is 'default' | 'server' => owner !== undefined)
-
-  if (ownerships.length === 0) {
-    return undefined
-  }
-
-  const unique = new Set(ownerships)
-  if (unique.size > 1) {
-    return 'mixed'
-  }
-
-  return ownerships[0]
+  return !extractTargets(args).length && !args.some((arg) => arg === '--changed' || arg.startsWith('--changed='))
 }
 
 function extractTargets(args: string[]): string[] {
   const targets: string[] = []
-
+  const valueFlags = new Set(['-t', '--testNamePattern', '--reporter', '--config', '-c', '--bail', '--changed'])
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]
     if (arg === '--') continue
-
-    if (TARGET_VALUE_FLAGS.has(arg)) {
+    if (valueFlags.has(arg)) {
       index += 1
       continue
     }
-
-    if (
-      arg.startsWith('--testNamePattern=')
-      || arg.startsWith('--reporter=')
-      || arg.startsWith('--config=')
-      || arg.startsWith('-c=')
-    ) {
-      continue
-    }
-
-    if (arg.startsWith('-')) {
-      continue
-    }
-
+    if (arg.startsWith('--testNamePattern=') || arg.startsWith('--reporter=') || arg.startsWith('--config=') || arg.startsWith('-c=')) continue
+    if (arg.startsWith('-')) continue
     targets.push(arg)
   }
-
   return targets
 }
 
-function classifyTarget(target: string): 'default' | 'server' | undefined {
-  const normalizedTarget = normalizeTargetForOwnership(target)
-
-  if (
-    normalizedTarget === 'test/server'
-    || normalizedTarget.startsWith('test/server/')
-    || normalizedTarget === 'test/unit/server'
-    || normalizedTarget.startsWith('test/unit/server/')
-    || normalizedTarget === 'test/integration/server'
-    || normalizedTarget.startsWith('test/integration/server/')
-    || normalizedTarget === 'test/integration/session-repair.test.ts'
-    || normalizedTarget === 'test/integration/session-search-e2e.test.ts'
-    || normalizedTarget === 'test/integration/extension-system.test.ts'
-  ) {
-    return 'server'
-  }
-
-  if (normalizedTarget.startsWith('test/')) {
-    return 'default'
-  }
-
-  return undefined
+function isRustTarget(target: string): boolean {
+  const normalized = target.replaceAll('\\', '/').replace(/^(?:\.\/)+/, '')
+  return normalized === 'test/server'
+    || normalized.startsWith('test/server/')
+    || normalized.startsWith('test/integration/server/')
+    || normalized.startsWith('crates/')
 }
 
-function classifyCompositeTarget(target: string): 'default' | 'server' | 'cross-config' | 'full-suite' | undefined {
-  const normalizedTarget = normalizeTargetForOwnership(target)
-
-  if (normalizedTarget === 'test') {
-    return 'full-suite'
-  }
-
-  if (normalizedTarget === 'test/unit' || normalizedTarget === 'test/integration') {
-    return 'cross-config'
-  }
-
-  return classifyTarget(target)
-}
-
-function normalizeTargetForOwnership(target: string): string {
-  return target
-    .replaceAll('\\', '/')
-    .replace(/^(?:\.\/)+/, '')
-    .replace(/\/+$/, '')
-}
-
-function ownerRunPrefix(owner: 'default' | 'server'): string[] {
-  if (owner === 'server') {
-    return ['run', '--config', SERVER_VITEST_CONFIG]
-  }
-  return ['run', '--config', DEFAULT_VITEST_CONFIG]
-}
-
-function singlePhaseDelegatedBaseArgs(spec: SinglePhaseSpec): string[] {
-  return spec.delegatedArgs ? [...spec.delegatedArgs] : [...spec.broadArgs]
-}
-
-function singlePhaseTargetBaseArgs(spec: SinglePhaseSpec): string[] {
-  return spec.delegatedArgs ? [...spec.delegatedArgs] : [...ownerRunPrefix(spec.owner)]
-}
-
-function singlePhasePassthroughTargetBaseArgs(spec: SinglePhaseSpec, owner: 'default' | 'server'): string[] {
-  if (owner === 'server') {
-    return ['--config', SERVER_VITEST_CONFIG, ...withoutDefaultConfigArgs(spec.broadArgs)]
-  }
-  return ['--config', DEFAULT_VITEST_CONFIG]
-}
-
-function withoutDefaultConfigArgs(args: string[]): string[] {
-  const filtered: string[] = []
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]
-    if ((arg === '--config' || arg === '-c') && args[index + 1] === DEFAULT_VITEST_CONFIG) {
-      index += 1
-      continue
-    }
-    if (arg === `--config=${DEFAULT_VITEST_CONFIG}` || arg === `-c=${DEFAULT_VITEST_CONFIG}`) {
-      continue
-    }
-    filtered.push(arg)
-  }
-  return filtered
-}
-
-function coordinated(suiteKey: SuiteKey | undefined, phases: UpstreamPhase[]): CommandDisposition {
+function coordinated(suiteKey: SuiteKey, phases: UpstreamPhase[]): CommandDisposition {
   return { kind: 'coordinated', suiteKey, phases }
 }
 
@@ -543,59 +241,18 @@ function passthrough(phases: UpstreamPhase[]): CommandDisposition {
   return { kind: 'passthrough', phases }
 }
 
-function buildVitestPassthroughPhase(args: string[]): UpstreamPhase {
-  if (hasExplicitConfigOverride(args)) {
-    return vitestPhase(inferVitestConfig(args), args)
-  }
-
-  const owner = classifyTargetOwnership(args)
-  if (owner === 'server') {
-    return vitestPhase('server', ['run', '--config', SERVER_VITEST_CONFIG, ...args])
-  }
-
-  return vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])
-}
-
-function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhase {
-  return {
-    runner: 'vitest',
-    config,
-    args,
-  }
+function vitestPhase(config: 'default' | 'electron' | 'runtime' | 'direct', args: string[]): UpstreamPhase {
+  return { runner: 'vitest', config, args }
 }
 
 function npmPhase(script: 'typecheck' | 'build' | 'test:balanced', args: string[]): UpstreamPhase {
-  return {
-    runner: 'npm',
-    script,
-    args,
-  }
+  return { runner: 'npm', script, args }
 }
 
-function inferVitestConfig(args: string[]): 'default' | 'server' {
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]
-    if (arg === '--config' || arg === '-c') {
-      return isServerConfigArg(args[index + 1]) ? 'server' : 'default'
-    }
-
-    if (arg.startsWith('--config=')) {
-      return isServerConfigArg(arg.slice('--config='.length)) ? 'server' : 'default'
-    }
-
-    if (arg.startsWith('-c=')) {
-      return isServerConfigArg(arg.slice('-c='.length)) ? 'server' : 'default'
-    }
-  }
-
-  return 'default'
+function cargoPhase(args: string[]): UpstreamPhase {
+  return { runner: 'cargo', args }
 }
 
-function isServerConfigArg(value: string | undefined): boolean {
-  if (!value) {
-    return false
-  }
-
-  const normalized = value.replaceAll('\\', '/')
-  return normalized === SERVER_VITEST_CONFIG || normalized.endsWith(`/${SERVER_VITEST_CONFIG}`)
-}
+export const RUNTIME_VITEST_CONFIG_PATH = RUNTIME_VITEST_CONFIG
+export const DEFAULT_VITEST_CONFIG_PATH = DEFAULT_VITEST_CONFIG
+export const ELECTRON_VITEST_CONFIG_PATH = ELECTRON_VITEST_CONFIG

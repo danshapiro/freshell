@@ -77,10 +77,9 @@ describe('coordinator-upstream', () => {
 
   it('passes delegated help and watch invocations through the repo-local vitest entry with the recursion guard env set', async () => {
     const expectedVitest = require.resolve('vitest/vitest.mjs')
-    const serverHelpPhase: UpstreamPhase = {
-      runner: 'vitest',
-      config: 'server',
-      args: ['--config', 'config/vitest/vitest.server.config.ts', '--help'],
+    const rustHelpPhase: UpstreamPhase = {
+      runner: 'cargo',
+      args: ['test', '-p', 'freshell-server', '--locked', '--help'],
     }
     const watchPhase: UpstreamPhase = {
       runner: 'vitest',
@@ -88,15 +87,15 @@ describe('coordinator-upstream', () => {
       args: ['--watch'],
     }
 
-    expect(await runUpstreamPhase(serverHelpPhase, fakeEnv())).toBe(0)
+    expect(await runUpstreamPhase(rustHelpPhase, fakeEnv())).toBe(0)
     expect(await runUpstreamPhase(watchPhase, fakeEnv())).toBe(0)
 
     const captures = await readCaptureLines()
     expect(captures).toHaveLength(2)
     expect(captures[0]).toMatchObject({
-      selector: 'vitest:server:--config config/vitest/vitest.server.config.ts --help',
-      command: process.execPath,
-      args: [expectedVitest, '--config', 'config/vitest/vitest.server.config.ts', '--help'],
+      selector: 'cargo:test -p freshell-server --locked --help',
+      command: process.platform === 'win32' ? 'cargo.exe' : 'cargo',
+      args: ['test', '-p', 'freshell-server', '--locked', '--help'],
       active: '1',
     })
     expect(captures[1]).toMatchObject({

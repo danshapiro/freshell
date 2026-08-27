@@ -39,7 +39,7 @@ export function ensureBuiltRuntime(
     },
     stdio: 'inherit',
   })
-  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server'], {
+  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: projectRoot,
     env: { ...deps.env, NODE_ENV: 'production' },
     stdio: 'inherit',

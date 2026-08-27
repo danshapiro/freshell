@@ -41,6 +41,13 @@ export function resolveNpmCommand(
   }
 }
 
+export function resolveCargoCommand(): { command: string; args: string[] } {
+  return {
+    command: process.platform === 'win32' ? 'cargo.exe' : 'cargo',
+    args: [],
+  }
+}
+
 export async function runUpstreamPhase(
   phase: UpstreamPhase,
   envVars: NodeJS.ProcessEnv = process.env,
@@ -65,6 +72,15 @@ function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): { c
       command: npm.command,
       args: npm.args,
       selector: `npm:${phase.script}${phase.args.length > 0 ? ` ${phase.args.join(' ')}` : ''}`,
+    }
+  }
+
+  if (phase.runner === 'cargo') {
+    const cargo = resolveCargoCommand()
+    return {
+      command: cargo.command,
+      args: [...cargo.args, ...phase.args],
+      selector: `cargo:${phase.args.join(' ')}`.trimEnd(),
     }
   }
 

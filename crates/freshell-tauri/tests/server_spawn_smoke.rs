@@ -5,11 +5,9 @@
 //! (the GUI launch itself is display-gated, covered separately by the xvfb smoke).
 //!
 //! The server binary is discovered via `FRESHELL_SERVER_BIN`, else as a sibling of
-//! the test executable (`target/<profile>/freshell-server`, where a workspace
-//! `cargo test` also builds/leaves the server bin). If it cannot be found, the test
-//! SOFT-SKIPS with a printed notice rather than failing — so `cargo test -p
-//! freshell-tauri` is green whether or not the sibling binary happens to be built,
-//! while a workspace `cargo test` (which builds it) exercises the real path.
+//! the test executable (`target/<profile>/freshell-server`). The test fails when
+//! neither location contains the explicit Rust binary: callers must build the
+//! artifact first so this smoke can never pass without exercising the real path.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,7 +15,7 @@ use std::time::Duration;
 use freshell_tauri::health::{self, HealthProbe};
 use freshell_tauri::server::{self, ReapOutcome, SpawnConfig};
 
-/// Find the `freshell-server` binary to drive, or `None` to soft-skip.
+/// Find the `freshell-server` binary to drive, if the caller has built it.
 fn discover_server_binary() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("FRESHELL_SERVER_BIN") {
         let p = PathBuf::from(explicit);
@@ -38,13 +36,9 @@ fn discover_server_binary() -> Option<PathBuf> {
 
 #[test]
 fn app_bound_spawn_health_reap_end_to_end() {
-    let Some(server_binary) = discover_server_binary() else {
-        eprintln!(
-            "SKIP app_bound_spawn_health_reap_end_to_end: freshell-server binary not found \
-             (set FRESHELL_SERVER_BIN or run a workspace `cargo build`/`cargo test`)."
-        );
-        return;
-    };
+    let server_binary = discover_server_binary().expect(
+        "freshell-server binary not found; build it first or set FRESHELL_SERVER_BIN",
+    );
     eprintln!("using server binary: {}", server_binary.display());
 
     // Isolated HOME so the smoke never reads/writes the real ~/.freshell.
