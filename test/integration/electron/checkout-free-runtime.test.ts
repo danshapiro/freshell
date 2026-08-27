@@ -3,6 +3,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { createServer } from 'node:net'
 import { randomUUID } from 'node:crypto'
+import WebSocket from 'ws'
 import {
   cp,
   mkdir,
@@ -14,6 +15,7 @@ import {
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../../..')
 const AUTHENTICATION_TOKEN = `electron-runtime-${randomUUID()}`
@@ -26,25 +28,34 @@ interface JsonRpcMessage {
   }
 }
 
+interface WebSocketMessage {
+  type?: string
+  requestId?: string
+  terminalId?: string
+  data?: string
+}
+
 function runtimeRoot(): string {
   const configured = process.env.FRESHELL_ELECTRON_RUNTIME_DIR
   return path.resolve(PROJECT_ROOT, configured ?? 'electron-runtime')
 }
 
 async function findFreePort(): Promise<number> {
-  const server = createServer()
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => resolve())
-  })
-  const address = server.address()
-  if (!address || typeof address === 'string') {
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    throw new Error('Could not determine an ephemeral port')
+  while (true) {
+    const server = createServer()
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      throw new Error('Could not determine an ephemeral port')
+    }
+    const port = address.port
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    if (port !== 3001) return port
   }
-  const port = address.port
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
-  return port
 }
 
 function waitForExit(child: ChildProcess, timeoutMs = 10_000): Promise<void> {
@@ -112,6 +123,91 @@ async function waitForJsonLine(
       readline.close()
       reject(new Error(`child exited before emitting the expected JSON line (code ${child.exitCode ?? 'unknown'}, signal ${child.signalCode ?? 'unknown'})`))
     })
+  })
+}
+
+function waitForWebSocketMessage(
+  ws: WebSocket,
+  predicate: (message: WebSocketMessage) => boolean,
+  timeoutMs = 10_000,
+): Promise<WebSocketMessage> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      ws.off('message', onMessage)
+      ws.off('error', onError)
+      ws.off('close', onClose)
+    }
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback()
+    }
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error('Timed out waiting for WebSocket message')))
+    }, timeoutMs)
+    const onMessage = (data: WebSocket.RawData) => {
+      let message: WebSocketMessage
+      try {
+        message = JSON.parse(data.toString()) as WebSocketMessage
+      } catch {
+        return
+      }
+      if (predicate(message)) finish(() => resolve(message))
+    }
+    const onError = (error: Error) => {
+      finish(() => reject(error))
+    }
+    const onClose = (code: number, reason: Buffer) => {
+      finish(() => reject(new Error(`Socket closed before the expected message arrived (${code}: ${reason.toString()})`)))
+    }
+    ws.on('message', onMessage)
+    ws.on('error', onError)
+    ws.on('close', onClose)
+  })
+}
+
+async function connectAuthenticatedWebSocket(baseUrl: string): Promise<WebSocket> {
+  const ws = new WebSocket(`${baseUrl.replace(/^http/, 'ws')}/ws`)
+  await new Promise<void>((resolve, reject) => {
+    ws.once('open', resolve)
+    ws.once('error', reject)
+  })
+  const readyPromise = waitForWebSocketMessage(ws, (message) => message.type === 'ready')
+  ws.send(JSON.stringify({
+    type: 'hello',
+    token: AUTHENTICATION_TOKEN,
+    protocolVersion: WS_PROTOCOL_VERSION,
+  }))
+  await readyPromise
+  return ws
+}
+
+async function closeWebSocket(ws: WebSocket): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve()
+      return
+    }
+
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      ws.off('close', finish)
+      ws.off('error', finish)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      ws.terminate()
+      finish()
+    }, 2_000)
+    ws.once('close', finish)
+    ws.once('error', finish)
+    ws.close()
   })
 }
 
@@ -189,6 +285,8 @@ describe('checkout-free Electron runtime acceptance', () => {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    let ws: WebSocket | undefined
+    let terminalId: string | undefined
     let mcp: ChildProcess | undefined
     let claude: ChildProcess | undefined
     try {
@@ -208,6 +306,64 @@ describe('checkout-free Electron runtime acceptance', () => {
       const asset = await requestJson(`${baseUrl}${assetPath}`)
       expect(asset.status).toBe(200)
       expect((await asset.text()).length).toBeGreaterThan(0)
+
+      ws = await connectAuthenticatedWebSocket(baseUrl)
+      if (!ws) throw new Error('WebSocket connection was not established')
+      const createRequestId = `checkout-free-terminal-${randomUUID()}`
+      const createdPromise = waitForWebSocketMessage(ws, (message) => (
+        message.type === 'terminal.created' && message.requestId === createRequestId
+      ))
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: createRequestId,
+        mode: 'shell',
+        shell: 'system',
+        cwd: emptyCwd,
+      }))
+      const terminalCreated = await createdPromise
+      terminalId = terminalCreated.terminalId
+      expect(terminalId).toEqual(expect.any(String))
+
+      const attachRequestId = `checkout-free-attach-${randomUUID()}`
+      const attachedPromise = waitForWebSocketMessage(ws, (message) => (
+        message.type === 'terminal.attach.ready' && message.terminalId === terminalId
+      ))
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId,
+        attachRequestId,
+        intent: 'viewport_hydrate',
+        priority: 'foreground',
+        cols: 80,
+        rows: 24,
+      }))
+      await attachedPromise
+
+      const ptyMarker = 'FRESHELL_ELECTRON_PTY_ROUNDTRIP_MARKER'
+      const shellCommand = process.platform === 'win32'
+        ? `echo ${ptyMarker}`
+        : `printf '%s\\n' ${ptyMarker}`
+      const outputPromise = waitForWebSocketMessage(ws, (message) => (
+        message.type === 'terminal.output'
+        && message.terminalId === terminalId
+        && typeof message.data === 'string'
+        && message.data.includes(ptyMarker)
+      ))
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId,
+        data: `${shellCommand}\n`,
+      }))
+      const output = await outputPromise
+      expect(output.data).toContain(ptyMarker)
+
+      const detachedPromise = waitForWebSocketMessage(ws, (message) => (
+        message.type === 'terminal.detached' && message.terminalId === terminalId
+      ))
+      ws.send(JSON.stringify({ type: 'terminal.detach', terminalId }))
+      await detachedPromise
+      await closeWebSocket(ws)
+      ws = undefined
 
       claude = spawn(nodeBinary, [sidecarEntry], {
         cwd: emptyCwd,
@@ -261,6 +417,21 @@ describe('checkout-free Electron runtime acceptance', () => {
       }
       expect(listeners).not.toContain(`pid=${mcp.pid}`)
     } finally {
+      if (ws) {
+        if (terminalId && ws.readyState === WebSocket.OPEN) {
+          try {
+            const detachedPromise = waitForWebSocketMessage(ws, (message) => (
+              message.type === 'terminal.detached' && message.terminalId === terminalId
+            ))
+            ws.send(JSON.stringify({ type: 'terminal.detach', terminalId }))
+            await detachedPromise
+          } catch {
+            // The server shutdown below still reaps the owned PTY if the
+            // connection failed before the detach acknowledgement arrived.
+          }
+        }
+        await closeWebSocket(ws)
+      }
       await stopOwnedChild(claude)
       await stopOwnedChild(mcp)
       await stopOwnedChild(server)

@@ -17,6 +17,7 @@ on:
       - 'config/vite/**'
       - 'config/vitest/vitest.electron-runtime.config.ts'
       - 'scripts/prepare-electron-runtime.ts'
+      - 'scripts/bundled-node-version.json'
       - 'scripts/verify-electron-artifact.ts'
       - 'scripts/assert-native-windows-build.ts'
       - 'package.json'
