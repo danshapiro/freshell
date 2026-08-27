@@ -4459,6 +4459,25 @@ async fn handle_pane_reconcile(
             }
         };
     }
+    // A `dead_session` verdict parks the pane in the client's dead-sessions
+    // dialog awaiting user adjudication — the loud, user-facing end of the
+    // restore ladder. Log each one with the claimed identity so the
+    // adjudication is reconstructable from server logs alone (previously a
+    // dead verdict left no trace: derivation is pure, and the wire frame is
+    // only visible to the requesting client).
+    for v in &verdicts {
+        if matches!(v.verdict, freshell_protocol::ReconcileVerdict::DeadSession) {
+            tracing::warn!(
+                pane_key = %v.pane_key,
+                verdict = "dead_session",
+                reason = v.reason.as_deref(),
+                terminal_id = v.terminal_id.as_deref(),
+                provider = v.session_ref.as_ref().map(|s| s.provider.as_str()),
+                session_id = v.session_ref.as_ref().map(|s| s.session_id.as_str()),
+                "pane_reconcile.dead_session"
+            );
+        }
+    }
     let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),

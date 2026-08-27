@@ -755,3 +755,150 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
     );
     assert_eq!(verdicts[0]["corrected"], true);
 }
+
+// ── dead_session verdict observability (WARN log at the result choke point) ──
+//
+// A `dead_session` verdict parks a pane in the client's dead-sessions dialog
+// — a loud, user-facing adjudication for which the server previously emitted
+// NO log line at all (reconstructing the "why" required ledger + on-disk
+// forensics). The verdict stream now logs once per dead verdict, with the
+// claimed identity fields, at the result-send choke point.
+
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    /// The event's OWN fields only (all dead-session log fields are recorded
+    /// on the event; no span merge needed).
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct CapVisitor {
+    message: String,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+impl Visit for CapVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+}
+
+struct LogCapture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S> Layer<S> for LogCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = CapVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+/// Thread-local capture. `#[tokio::test]` is a current-thread runtime, so the
+/// in-process server's reconcile task (tokio::spawn'd by the accept loop) is
+/// polled on THIS thread and observes the guard — the
+/// `diag01_lifecycle_events.rs` convention.
+fn log_capture() -> (
+    Arc<Mutex<Vec<CapturedEvent>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let layer = LogCapture {
+        events: Arc::clone(&events),
+    };
+    let subscriber = tracing_subscriber::registry().with(layer);
+    let guard = tracing::subscriber::set_default(subscriber);
+    (events, guard)
+}
+
+#[tokio::test]
+async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
+    let (events, _guard) = log_capture();
+    let probe = std::sync::Arc::new(StubProbe::default());
+    // GoneObserved: ledger-observed before, Absent now.
+    probe
+        .answers
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "gone-1".into()), SessionExistence::Absent);
+    probe
+        .observed
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "gone-1".into()));
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "deadpane", "kind": "fresh-agent",
+              "sessionRef": {"provider": "codex", "sessionId": "gone-1"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "dead_session");
+    assert_eq!(verdicts[0]["reason"], "session_not_on_disk");
+
+    let events = events.lock().expect("capture lock");
+    let hits: Vec<&CapturedEvent> = events
+        .iter()
+        .filter(|e| e.message.contains("pane_reconcile.dead_session"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one dead_session WARN per dead verdict; got {events:?}"
+    );
+    let fields = &hits[0].fields;
+    assert!(
+        fields
+            .get("pane_key")
+            .is_some_and(|v| v.contains("deadpane")),
+        "pane_key recorded: {fields:?}"
+    );
+    assert!(
+        fields.get("provider").is_some_and(|v| v.contains("codex")),
+        "provider recorded: {fields:?}"
+    );
+    assert!(
+        fields
+            .get("session_id")
+            .is_some_and(|v| v.contains("gone-1")),
+        "session_id recorded: {fields:?}"
+    );
+    assert!(
+        fields
+            .get("reason")
+            .is_some_and(|v| v.contains("session_not_on_disk")),
+        "reason recorded: {fields:?}"
+    );
+}
