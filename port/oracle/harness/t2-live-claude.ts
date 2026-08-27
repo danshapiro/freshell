@@ -34,10 +34,11 @@
  *             FRESHELL_T2_CLAUDE_MODEL). NO per-token cost on an OAuth plan.
  *   AUTH src: ~/.claude/.credentials.json                (user, READ-ONLY)
  *   AUTH dst: <isoHOME>/.claude/.credentials.json        (isolated copy)
- *   HOME    : TestServer(runtimeRootMode:'isolated') sets HOME=<isoHOME> and
- *             CLAUDE_HOME=<isoHOME>/.claude, so the CLI the SDK spawns
- *             authenticates from the isolated copy and writes ALL transcripts
- *             under the isolated HOME — NEVER the user's real ~/.claude.
+ *   HOME    : `startExternalServer` creates <isoHOME> and applies HOME plus
+ *             CLAUDE_HOME=<isoHOME>/.claude to the owned Rust server process.
+ *             Its setupHome callback copies the credential before startup, so
+ *             the SDK-spawned CLI authenticates from that copy and writes ALL
+ *             transcripts under the isolated HOME — NEVER the user's real ~/.claude.
  *   PERMS   : permissionMode='bypassPermissions' so a pure-text turn can never
  *             hang on an interactive tool-permission prompt while unattended.
  *

@@ -18,12 +18,21 @@ describe('Rust-only oracle boundary', () => {
       'port/oracle/harness/t2-live.ts',
       'port/oracle/harness/t2-live-claude.ts',
       'port/oracle/harness/t2-live-codex.ts',
+      'port/oracle/fixtures/pty-scenarios.ts',
       'config/vitest/vitest.oracle.config.ts',
       ...fs.readdirSync(path.join(root, 'test/unit/port/oracle'))
         .filter((entry) => entry.endsWith('.test.ts') && entry !== 'rust-only-oracle-boundary.test.ts')
         .map((entry) => path.join('test/unit/port/oracle', entry)),
     ]
     const source = activePaths.map((file) => `${file}\n${read(file)}`).join('\n')
+    const rustBaselineCommentPaths = [
+      'port/oracle/harness/t2-live-claude.ts',
+      'port/oracle/harness/t2-live-codex.ts',
+      'port/oracle/fixtures/pty-scenarios.ts',
+    ]
+    const rustBaselineComments = rustBaselineCommentPaths
+      .map((file) => `${file}\n${read(file)}`)
+      .join('\n')
     const forbidden = [
       /target\s*:\s*['"]node['"]/,
       /FRESHELL_ORACLE_TARGET/,
@@ -31,7 +40,6 @@ describe('Rust-only oracle boundary', () => {
       /opencode-warm-proxy/,
       /(?:npm run )?build:server/,
       /dist\/server\/index/,
-      /new\s+TestServer/,
       /warmProxy/,
       /baselines\/t2/,
       /listenersOn3001/,
@@ -40,6 +48,12 @@ describe('Rust-only oracle boundary', () => {
     ]
     for (const pattern of forbidden) {
       expect(source, `active oracle source contains retired pattern ${pattern}`).not.toMatch(pattern)
+    }
+    for (const pattern of [/\bTestServer\b/, /\boriginal\s+server\b/i, /\bnode-pty\b/i]) {
+      expect(
+        rustBaselineComments,
+        `active Rust oracle harness/scenario comments contain retired term ${pattern}`,
+      ).not.toMatch(pattern)
     }
   })
 
