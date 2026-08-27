@@ -859,8 +859,9 @@ async fn handle_client_text(
         // a fresh `terminal.create { recoveryIntent:
         // 'fresh_after_restore_unavailable' }` (TerminalView.tsx:4100-4112),
         // deduped by the client's own createRequestId -- already handled by
-        // the existing `handle_create` path (`recovery_intent` is a plain
-        // passthrough field on `TerminalCreate`). Mirrors legacy's own
+        // the existing `handle_create` path (`recovery_intent` remains a
+        // plain passthrough field, now also consumed there in the
+        // replayed-create cwd re-home gate). Mirrors legacy's own
         // `if (m.event === 'restore_unavailable')` guard so an unrecognized
         // future `event` value is tolerated (accept-and-strip) rather than
         // logged as a diagnostic it isn't.
