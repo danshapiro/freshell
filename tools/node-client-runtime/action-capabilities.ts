@@ -96,6 +96,29 @@ export function supportedActionCapabilities(): readonly ActionCapability[] {
   return ACTION_CAPABILITIES.filter((capability) => capability.supported)
 }
 
+/** Renders the standalone CLI reference from the closed Rust client contract. */
+export function renderCliHelp(capabilities: readonly ActionCapability[] = supportedActionCapabilities()): string {
+  const actionLines = capabilities.flatMap((capability) => {
+    const aliases = capability.aliases?.length ? ` (aliases: ${capability.aliases.join(', ')})` : ''
+    const required = capability.params.required.map((name) => `--${name}`).join(', ') || '(none)'
+    const optional = capability.params.optional.map((name) => `--${name}`).join(', ') || '(none)'
+    return [
+      `  ${capability.action}${aliases}`,
+      `    required: ${required}`,
+      `    optional: ${optional}`,
+    ]
+  })
+
+  return [
+    'Freshell CLI',
+    '',
+    'Usage: freshell <action> [options]',
+    '',
+    'Supported actions:',
+    ...actionLines,
+  ].join('\n')
+}
+
 export function unsupportedActionResult(action: string): { error: string; hint: string } | undefined {
   const capability = resolveActionCapability(action)
   if (capability?.supported !== false) return undefined

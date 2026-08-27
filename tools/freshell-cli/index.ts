@@ -8,7 +8,7 @@ import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
 import { partitionSendKeysArgs } from './send-keys-args.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
-import { resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
+import { renderCliHelp, resolveCanonicalAction, unsupportedInvocationResult } from '../node-client-runtime/action-capabilities.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -385,6 +385,10 @@ async function main() {
   }
   const flags = parsed.flags
   const args = parsed.args
+  if (command === 'help') {
+    writeText(renderCliHelp())
+    return
+  }
   // Local capability validation deliberately happens before client creation:
   // unsupported variants must not resolve a target or make any HTTP request.
   const client = createHttpClient()
