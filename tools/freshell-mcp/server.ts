@@ -17,7 +17,7 @@ import { TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction } from './f
 
 /**
  * Walk up from __dirname to find the repo root's package.json.
- * Works in both dev (server/mcp/server.ts) and prod (dist/server/mcp/server.js).
+ * Works in both dev (tools/freshell-mcp/server.ts) and prod (dist/tools/freshell-mcp/server.js).
  */
 function findPackageVersion(): string {
   let dir = dirname(fileURLToPath(import.meta.url))

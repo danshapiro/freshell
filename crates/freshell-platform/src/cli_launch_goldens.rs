@@ -18,7 +18,7 @@ const CLAUDE_SETTINGS_WIN: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type"
 const MCP_UNIX: &[&str] = &[
     "--import",
     "/repo/node_modules/tsx/dist/loader.mjs",
-    "/repo/server/mcp/server.ts",
+    "/repo/tools/freshell-mcp/server.ts",
 ];
 
 struct MapEnv(BTreeMap<String, String>);

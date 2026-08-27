@@ -7,8 +7,9 @@
 
 import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
-import { translateKeys } from '../cli/keys.js'
-import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
+import { translateKeys } from '../node-client-runtime/keys.js'
+import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
+import { unsupportedActionResult } from '../node-client-runtime/action-capabilities.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -256,7 +257,7 @@ async function resolvePaneTarget(target?: string): Promise<{ tab?: TabSummary; p
     const panes = await fetchPanes(tab.id)
     const paneById = panes.find((p) => p.id === target)
     if (paneById) return { tab, pane: paneById }
-    // Collect all title matches to detect ambiguity (matches CLI: server/cli/targets.ts:68)
+    // Collect all title matches to detect ambiguity (matches CLI target resolution).
     for (const pane of panes) {
       if (pane.title === target) {
         titleMatches.push({ tab, pane })
@@ -622,6 +623,17 @@ export async function executeAction(
   params?: Record<string, unknown>,
 ): Promise<any> {
   try {
+    const unsupported = unsupportedActionResult(action)
+    if (unsupported) return unsupported
+    if (action === 'new-tab' && params?.agent !== undefined && params.agent !== 'opencode') {
+      return { error: "Only agent 'opencode' is supported with the Rust Freshell server.", hint: 'Use mode for direct Claude or Codex terminals.' }
+    }
+    if (action === 'split-pane' && ['agent', 'model', 'effort'].some((key) => params?.[key] !== undefined)) {
+      return { error: 'Fresh-agent split parameters are unavailable with the Rust Freshell server.', hint: 'Use a supported mode pane instead.' }
+    }
+    if (action === 'wait-for' && (!params?.pattern || ['stable', 'exit', 'prompt'].some((key) => params?.[key] !== undefined))) {
+      return { error: 'wait-for requires pattern with the Rust Freshell server.', hint: 'Use a literal output pattern.' }
+    }
     const paramError = validateParams(action, params)
     if (paramError) return paramError
     return await routeAction(action, params)
@@ -679,7 +691,7 @@ async function routeAction(
         ...(sessionRef ? { sessionRef } : {}),
         ...rest,
       })
-      // Send prompt text to the newly created pane (mirrors CLI behavior: server/cli/index.ts:318)
+      // Send prompt text to the newly created pane (mirrors CLI behavior).
       if (prompt) {
         const data = unwrapData(tabResult)
         const paneId = data?.paneId
@@ -944,7 +956,7 @@ async function routeAction(
       return HELP_TEXT
 
     default: {
-      // tmux alias resolution (mirrors CLI: server/cli/index.ts aliases)
+      // tmux alias resolution (mirrors CLI aliases).
       const TMUX_ALIASES: Record<string, string> = {
         'new-window': 'new-tab',
         'new-session': 'new-tab',

@@ -1,4 +1,4 @@
-//! MCP config injection — the IO port of `server/mcp/config-writer.ts`
+//! MCP config injection for the retained standalone MCP client
 //! (`port/machine/specs/cli-argv-fidelity.md` §3.2).
 //!
 //! Per-mode injection (`generateMcpInjection`, `cw:252-423`):
@@ -20,10 +20,10 @@
 //! server of its own, so this port adopts **option (a)**: resolve the SAME
 //! Node-repo layout — repo root found by walking up from the process cwd
 //! looking for a `package.json` with `"name": "freshell"` (the reference walks
-//! from `server/mcp/`; both resolve the same root when the server runs from
+//! from the standalone tools tree; both resolve the same root when the server runs from
 //! the repo checkout, which is the deployment under test) — and inject the
 //! reference-identical `node --import <root>/node_modules/tsx/dist/loader.mjs
-//! <root>/server/mcp/server.ts` (dev) or `<root>/dist/server/mcp/server.js`
+//! <root>/tools/freshell-mcp/server.ts` (dev) or `<root>/dist/tools/freshell-mcp/server.js`
 //! (production build present + `NODE_ENV=production`). When `tsx` cannot be
 //! resolved the reference-exact error is raised (`cw:72-79`). The golden tests
 //! inject [`McpRuntime::server_command_args`] as a seam, so they remain valid
@@ -68,6 +68,15 @@ pub enum McpServerArg {
     Path(String),
 }
 
+/// An MCP command is a complete executable plus its arguments. Keeping the
+/// executable tagged alongside arguments prevents platform conversion from
+/// silently leaving a path-valued command on the wrong side of WSL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerCommand {
+    pub command: McpServerArg,
+    pub args: Vec<McpServerArg>,
+}
+
 /// The environment seam for the config writer: tmp dir (`os.tmpdir()`), WSL
 /// detection (`cw:45-51`), `wslpath -w` conversion (`cw:57-70`), and the MCP
 /// server command args (U1 seam — `cw:89-107`).
@@ -84,6 +93,15 @@ pub trait McpRuntime {
     /// minus the `needsWinPaths` mapping, which [`build_mcp_server_command_args`]
     /// applies.
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError>;
+
+    /// Complete server command. The default preserves the existing seam for
+    /// test runtimes while production overrides it with the explicit command.
+    fn server_command(&self) -> Result<McpServerCommand, McpInjectError> {
+        Ok(McpServerCommand {
+            command: McpServerArg::Literal("node".to_string()),
+            args: self.server_command_args()?,
+        })
+    }
 }
 
 /// The live runtime (see the module-level U1 decision).
@@ -108,15 +126,36 @@ impl McpRuntime for RealMcpRuntime {
     }
 
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
+        Ok(self.server_command()?.args)
+    }
+
+    fn server_command(&self) -> Result<McpServerCommand, McpInjectError> {
+        let node = std::env::var("FRESHELL_MCP_NODE").ok();
+        let entry = std::env::var("FRESHELL_MCP_ENTRY").ok();
+        match (node, entry) {
+            (Some(command), Some(entry)) if !command.is_empty() && !entry.is_empty() => {
+                return Ok(McpServerCommand {
+                    command: McpServerArg::Path(command),
+                    args: vec![McpServerArg::Path(entry)],
+                });
+            }
+            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+                return Err(McpInjectError::new(
+                    "FRESHELL_MCP_NODE and FRESHELL_MCP_ENTRY must be configured together.",
+                ));
+            }
+            (None, None) => {}
+        }
         let repo_root = find_repo_root();
-        let built = repo_root.join("dist/server/mcp/server.js");
+        let built = repo_root.join("dist/tools/freshell-mcp/server.js");
         let node_env_production = std::env::var("NODE_ENV")
             .map(|v| v == "production")
             .unwrap_or(false);
         if node_env_production && built.is_file() {
-            return Ok(vec![McpServerArg::Path(
-                built.to_string_lossy().into_owned(),
-            )]);
+            return Ok(McpServerCommand {
+                command: McpServerArg::Literal("node".to_string()),
+                args: vec![McpServerArg::Path(built.to_string_lossy().into_owned())],
+            });
         }
         // `require.resolve('tsx')` resolves the package export "." →
         // `./dist/loader.mjs` (rev 2 pin vs node_modules/tsx/package.json).
@@ -126,16 +165,19 @@ impl McpRuntime for RealMcpRuntime {
                 "Unable to resolve MCP dependency \"tsx\". Ensure project dependencies are installed.",
             ));
         }
-        Ok(vec![
-            McpServerArg::Literal("--import".to_string()),
-            McpServerArg::Path(tsx.to_string_lossy().into_owned()),
-            McpServerArg::Path(
+        Ok(McpServerCommand {
+            command: McpServerArg::Literal("node".to_string()),
+            args: vec![
+                McpServerArg::Literal("--import".to_string()),
+                McpServerArg::Path(tsx.to_string_lossy().into_owned()),
+                McpServerArg::Path(
                 repo_root
-                    .join("server/mcp/server.ts")
+                    .join("tools/freshell-mcp/server.ts")
                     .to_string_lossy()
                     .into_owned(),
-            ),
-        ])
+                ),
+            ],
+        })
     }
 }
 
@@ -222,6 +264,23 @@ pub fn build_mcp_server_command_args(
         .collect())
 }
 
+/// Render a complete MCP command for a provider target. This is the canonical
+/// path used by every injection renderer; the args-only helper remains for
+/// compatibility with existing callers and focused goldens.
+pub fn build_mcp_server_command(
+    rt: &dyn McpRuntime,
+    target: ProviderTarget,
+) -> Result<(String, Vec<String>), McpInjectError> {
+    let needs_win_paths = target == ProviderTarget::Windows && rt.is_wsl_environment();
+    let command = rt.server_command()?;
+    let convert = |arg: McpServerArg| match arg {
+        McpServerArg::Literal(value) => value,
+        McpServerArg::Path(value) if needs_win_paths => rt.convert_to_windows_path(&value),
+        McpServerArg::Path(value) => value,
+    };
+    Ok((convert(command.command), command.args.into_iter().map(convert).collect()))
+}
+
 /// `tomlEscape` (`cw:142-144`): wrap in `"` with `\` → `\\` and `"` → `\"`.
 pub fn toml_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
@@ -285,11 +344,11 @@ fn write_mcp_config_file(
     if let Some(dir) = file_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| McpInjectError::new(e.to_string()))?;
     }
-    let server_args = build_mcp_server_command_args(rt, target)?;
+    let (server_command, server_args) = build_mcp_server_command(rt, target)?;
     let config = serde_json::json!({
         "mcpServers": {
             "freshell": {
-                "command": "node",
+                "command": server_command,
                 "args": server_args,
             }
         }
@@ -477,12 +536,12 @@ fn opencode_inject(
             };
 
         if !user_managed {
-            let server_args = build_mcp_server_command_args(rt, target)?;
+            let (server_command, server_args) = build_mcp_server_command(rt, target)?;
             let obj = existing_config.as_object_mut().expect("validated object");
             if !obj.get("mcp").map(|m| m.is_object()).unwrap_or(false) {
                 obj.insert("mcp".to_string(), serde_json::json!({}));
             }
-            let mut command = vec![serde_json::Value::String("node".to_string())];
+            let mut command = vec![serde_json::Value::String(server_command)];
             command.extend(server_args.into_iter().map(serde_json::Value::String));
             obj.get_mut("mcp")
                 .and_then(|m| m.as_object_mut())
@@ -548,9 +607,13 @@ pub fn generate_mcp_injection(
             })
         }
         "codex" => {
-            let server_args = build_mcp_server_command_args(rt, target)?;
+            let (server_command, server_args) = build_mcp_server_command(rt, target)?;
             Ok(McpInjection {
-                args: codex_inline_toml_args(&server_args),
+                args: {
+                    let mut args = codex_inline_toml_args(&server_args);
+                    args[1] = format!("mcp_servers.freshell.command={}", toml_escape(&server_command));
+                    args
+                },
                 env: BTreeMap::new(),
             })
         }

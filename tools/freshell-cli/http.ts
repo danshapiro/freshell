@@ -1,4 +1,4 @@
-import { resolveConfig } from './config.js'
+import { resolveClientConfig } from '../node-client-runtime/config.js'
 
 export type HttpClient = {
   get: <T = any>(path: string) => Promise<T>
@@ -29,7 +29,7 @@ async function parseResponse(res: Response) {
   return text
 }
 
-export function createHttpClient(config = resolveConfig()) : HttpClient {
+export function createHttpClient(config = resolveClientConfig()) : HttpClient {
   const token = config.token
   const baseUrl = config.url
 

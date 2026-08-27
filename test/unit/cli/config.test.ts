@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveConfig } from '../../../server/cli/config'
+import { resolveClientConfig as resolveConfig } from '../../../tools/node-client-runtime/config'
 
 describe('resolveConfig', () => {
   it('prefers env vars', () => {

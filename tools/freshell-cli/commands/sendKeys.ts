@@ -1,4 +1,4 @@
-import { translateKeys } from '../keys.js'
+import { translateKeys } from '../../node-client-runtime/keys.js'
 
 export async function runCommand(
   opts: {

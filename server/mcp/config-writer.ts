@@ -80,8 +80,8 @@ function resolveDependencyPath(specifier: string): string {
 
 /**
  * Build the MCP server command + args for the given environment.
- * In production with a built server: node <repoRoot>/dist/server/mcp/server.js
- * In development: node --import <repoRoot>/node_modules/tsx/dist/esm/index.mjs <repoRoot>/server/mcp/server.ts
+ * In production with built tools: node <repoRoot>/dist/tools/freshell-mcp/server.js
+ * In development: node --import <repoRoot>/node_modules/tsx/dist/esm/index.mjs <repoRoot>/tools/freshell-mcp/server.ts
  *
  * When platform is 'windows' and running on WSL, paths are converted to
  * Windows UNC format so Windows-native agent processes can resolve them.
@@ -95,14 +95,14 @@ export function buildMcpServerCommandArgs(platform?: 'unix' | 'windows'): string
     return needsWinPaths ? convertToWindowsPath(resolved) : resolved
   }
 
-  const builtServerPath = resolve(repoRoot, 'dist/server/mcp/server.js')
+  const builtServerPath = resolve(repoRoot, 'dist/tools/freshell-mcp/server.js')
   if (process.env.NODE_ENV === 'production' && fs.existsSync(builtServerPath)) {
-    return [resolveRepoPath('dist/server/mcp/server.js')]
+    return [resolveRepoPath('dist/tools/freshell-mcp/server.js')]
   }
   return [
     '--import',
     resolveDependencyForPlatform('tsx'),
-    resolveRepoPath('server/mcp/server.ts'),
+    resolveRepoPath('tools/freshell-mcp/server.ts'),
   ]
 }
 
