@@ -4,9 +4,8 @@
  * Pre-flight check before starting dev/serve.
  *
  * Checks (in order):
- * 1. Update availability - prompts user to update if newer version exists
- * 2. Missing dependencies - ensures node_modules has all required packages
- * 3. Port conflicts - detects if freshell is already running
+ * 1. Missing dependencies - ensures node_modules has all required packages
+ * 2. Port conflicts - detects if freshell is already running
  */
 
 import { readFileSync } from 'fs'
@@ -15,22 +14,10 @@ import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import { createInterface } from 'readline/promises'
-import { runUpdateCheck, shouldSkipUpdateCheck } from '../server/updater/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const rootDir = resolve(__dirname, '..')
 const workspaceRequire = createRequire(resolve(rootDir, 'package.json'))
-
-// Load package.json for version
-function getPackageVersion(): string {
-  try {
-    const pkgPath = resolve(rootDir, 'package.json')
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
-    return pkg.version || '0.0.0'
-  } catch {
-    return '0.0.0'
-  }
-}
 
 function getCurrentBranch(): string | undefined {
   try {
@@ -246,25 +233,7 @@ async function main(): Promise<void> {
   const currentBranch = getCurrentBranch()
   await confirmServeBranchIfNeeded(currentBranch)
 
-  // 1. Check for updates first (before anything else can fail)
-  if (!shouldSkipUpdateCheck({ branch: currentBranch })) {
-    const currentVersion = getPackageVersion()
-    const updateResult = await runUpdateCheck(currentVersion)
-
-    if (updateResult.action === 'updated') {
-      // Update succeeded - it already ran npm install and build
-      // Exit with special code to signal caller that update happened
-      console.log('\n\x1b[32m✓ Update complete!\x1b[0m Restart freshell to use the new version.\n')
-      process.exit(0)
-    }
-
-    if (updateResult.action === 'error') {
-      console.error(`\n\x1b[33m⚠ Update failed: ${updateResult.error}\x1b[0m`)
-      console.error('Continuing with current version...\n')
-    }
-  }
-
-  // 2. Check for missing dependencies
+  // 1. Check for missing dependencies
   const missingDeps = checkMissingDependencies()
   if (missingDeps.length > 0) {
     console.error('\n\x1b[31m✖ Missing dependencies detected:\x1b[0m\n')
@@ -277,7 +246,7 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  // 3. Check for port conflicts
+  // 2. Check for port conflicts
   // Only check Vite port in dev mode (predev), not production (serve:precheck)
   const isDevMode = process.env.npm_lifecycle_event === 'predev'
 

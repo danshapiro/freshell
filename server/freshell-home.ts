@@ -1,12 +1,8 @@
-import os from 'os'
-import path from 'path'
-
-export function getFreshellHomeDir(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.FRESHELL_HOME?.trim()
-  if (override) return path.resolve(override)
-  return os.homedir()
-}
-
-export function getFreshellConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return path.join(getFreshellHomeDir(env), '.freshell')
-}
+// Temporary compatibility boundary.  Legacy Node-server modules continue to
+// import this path until the server tree is removed; the neutral owner is the
+// shared module so clients and the Rust migration use one contract.
+export {
+  getFreshellConfigDir,
+  getFreshellHomeDir,
+} from '../shared/freshell-home.js'
+export type { FreshellEnvironment } from '../shared/freshell-home.js'

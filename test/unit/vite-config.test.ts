@@ -4,19 +4,13 @@ import { loadEnv } from 'vite'
 import { readFileSync } from 'node:fs'
 
 vi.mock('node:fs')
-// Mock dotenv to prevent .env file loading in tests. getNetworkHost()
-// calls dotenv.config() at runtime, which would load any .env file from
-// the test runner's working directory — making tests non-hermetic.
-vi.mock('dotenv', () => ({
-  default: { config: vi.fn() },
-  config: vi.fn(),
-}))
 // Mock platform module — WSL detection is now centralized in platform.ts
 vi.mock('../../server/platform.js', () => ({
   isWSL: vi.fn(() => false),
 }))
 
 import { isWSL } from '../../server/platform.js'
+import { getNetworkHost } from '../../config/vite/get-network-host.js'
 
 const TEST_TIMEOUT_MS = 20_000
 
@@ -42,22 +36,19 @@ describe('getNetworkHost', () => {
 
   it('returns 127.0.0.1 when config file does not exist', async () => {
     vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT') })
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('returns host from config when configured', async () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '0.0.0.0', configured: true } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('returns 127.0.0.1 when config has no network settings', async () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ settings: {} }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('honors HOST env override when unconfigured', async () => {
@@ -65,8 +56,7 @@ describe('getNetworkHost', () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '127.0.0.1', configured: false } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('ignores HOST env when configured', async () => {
@@ -74,21 +64,18 @@ describe('getNetworkHost', () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '127.0.0.1', configured: true } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('uses HOST env when no config file exists', async () => {
     process.env.HOST = '0.0.0.0'
     vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT') })
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('always returns 0.0.0.0 on WSL regardless of config', async () => {
     vi.mocked(isWSL).mockReturnValue(true)
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: isWSL() })).toBe('0.0.0.0')
   })
 })
 
