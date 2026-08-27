@@ -21,8 +21,6 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * unmodified Node MCP binary can drive it unchanged.
  *
  * Deliberately gated to the RUST target only (see `playwright.config.ts`'s
- * `Rust browser lane` project `testMatch`), not run against legacy: the legacy
- * MCP<->legacy-REST path is legacy's own already-tested path (its own test
  * suite covers it). The NEW thing this pins is RUST-SERVER REST compatibility
  * with the unmodified MCP client -- i.e. a regression in the Rust
  * `/api/tabs`, `/api/panes`, `/api/panes/:id/send-keys`,
@@ -36,7 +34,6 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * here as `RustServer` (`helpers/rust-server.ts`, HARNESS-01). Duplicating
  * that ~250-line process-lifecycle harness in a second, Vitest-based location
  * would be pure duplication risk for zero benefit. This test needs NO browser
- * `page` at all -- like `agent-continuity-matrix.spec.ts`, it drives pure
  * REST (here, REST-over-MCP-over-stdio) -- so it pays none of Playwright's
  * browser-launch overhead; it only reuses the process-supervision half of
  * the harness, exactly as that spec does.

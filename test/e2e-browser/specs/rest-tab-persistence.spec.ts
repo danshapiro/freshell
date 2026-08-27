@@ -31,26 +31,18 @@ import { TestHarness } from '../helpers/test-harness.js'
  * state schema doesn't know this mode exists" is the actual bug shape.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `Rust browser lane`-only `testMatch` entry for this file, matching the
  * identical divergence note already established by
- * `amplifier-restore-rust.spec.ts` and `session-directory-matrix.spec.ts`):
- * this checked-out branch's `server/` tree (legacy Node implementation,
  * FROZEN for this task) predates `origin/main` commit `05c6b1fa`
  * ("feat(amplifier): durable session tracking via events.jsonl", #514).
  * Verified two independent ways before writing this gate: (1) `git
  * merge-base --is-ancestor 05c6b1fa HEAD` on this branch returns false, and
  * (2) `playwright.config.ts` already documents, for the sibling
- * `amplifier-restore-rust.spec.ts`, that legacy has "NO amplifier provider
- * registered at all" on this branch. So the legacy leg of this scenario
  * cannot even create the poisoned tab via REST in the first place -- this is
  * an absent feature on this branch, not a parity gap to gate per-assertion.
  * The underlying CLIENT bug this spec proves (`persistedState.ts`'s
  * `zTabMode` enum going stale relative to server-side extension discovery)
- * is still shared/frozen code, and legacy would be equally vulnerable to it
  * through any OTHER writer of `freshell.tabs.v2` that isn't gated by this
- * same REST mode-validation choke point (e.g. a future legacy extension
  * registration, or manual localStorage manipulation) -- this spec just
- * cannot prove that reachability on legacy in THIS environment.
  *
  * ---
  * FLIP INSTRUCTION for whoever lands the client fix (main commit range
@@ -96,7 +88,7 @@ async function createTab(
   return { status: res.status, tabId: data?.tabId, paneId: data?.paneId, body: rawBody }
 }
 
-const test = base.extend<Record<string, never>, { rustFixture: 'legacy' | 'rust' }>({
+const test = base.extend<Record<string, never>>({
   testServer: [async ({}, use) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rest-tab-persistence-'))
     const binDir = path.join(sharedRoot, 'bin')
@@ -133,14 +125,10 @@ test.describe('REST tab persistence (amplifier out-of-enum mode)', () => {
   test.setTimeout(60_000)
 
   test('creating a tab via REST with an out-of-enum mode materializes it in the tab strip and persists to localStorage, but the tab strip goes empty on reload while localStorage still holds the data', async ({ page, serverInfo, testServer }) => {
-    // Registered ONLY under the `Rust browser lane` project (see this file's
     // doc comment + `playwright.config.ts`) -- assert the precondition
-    // explicitly so an accidental `retired matrix list` inclusion fails loudly
-    // instead of silently no-op'ing on legacy.
     const { baseUrl, token } = serverInfo
     const cwd = (testServer as any).__cwd as string
 
-    // Connect the browser FIRST: the Rust server (like legacy) broadcasts
     // `ui.command{tab.create}` over the live WS connection when a tab is
     // created via REST (`state.broadcast(...)`,
     // `crates/freshell-freshagent/src/terminal_tabs.rs`) -- a client that

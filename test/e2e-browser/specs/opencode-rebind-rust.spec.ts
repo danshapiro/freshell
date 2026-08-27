@@ -210,7 +210,6 @@ test.describe('OpenCode signal-driven rebind (Rust only)', () => {
   test.setTimeout(240_000)
 
   test('signal file rebinds the pane end to end: broadcast, fold, persistence, respawn argv, never-steal', async ({ page }) => {
-    // Registered ONLY under Rust browser lane; fail loudly on any other kind.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-rebind-'))
     const argLogPath = path.join(sharedRoot, 'fake-opencode-terminal-argv.jsonl')
     try {
@@ -400,7 +399,7 @@ test.describe('OpenCode signal-driven rebind (Rust only)', () => {
       const terminalIdBeforeRestart: string = (await findLeafById(tabId!, pane1Id))!.content.terminalId
       capture.close()
       if (!server.restart) {
-        throw new Error(`$() E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
       await server.restart()
       await page.reload({ waitUntil: 'domcontentloaded' })

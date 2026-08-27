@@ -3,7 +3,6 @@ import { expect, test } from '../helpers/fixtures.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
- * SAFE-05 (JSON ping/pong slice only) -- matrix spec.
  *
  * SAFE-05's full acceptance text: "Enforce hello timeout, JSON ping/pong,
  * and transport heartbeat separately. Reply to an application
@@ -14,17 +13,13 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * This spec proves ONLY the cheaply-provable clause: a raw WS client
  * (bypassing the browser entirely, harness-token `hello`) sends the
  * app-level `{type:"ping"}` and gets back the exact `{type:"pong",
- * timestamp}` shape -- byte-identical between the legacy Node server
  * (`server/ws-handler.ts:1832-1835`) and the Rust port. It runs against
- * BOTH `retired Node browser lane` and `Rust browser lane` via `retired matrix list` in
- * `playwright.config.ts`, with legacy as the control.
  *
  * NOT covered here (see the SAFE-05 checklist entry for why each is
  * unproven):
  *   - hello-timeout enforcement (delay past/just-before the deadline) --
  *     the Rust port has no hello-timeout implementation at all (confirmed
  *     by exhaustive grep across `crates/`), so this clause cannot pass on
- *     Rust browser lane today; it is a genuine implementation gap, not a test
  *     gap.
  *   - transport control-frame heartbeat independently closing dead peers
  *     via a controllable proxy that can suppress/respond to pings at will
@@ -98,7 +93,6 @@ test.describe('SAFE-05 JSON ping/pong matrix', () => {
       const pong = await pongPromise
 
       // Byte-parity shape: EXACTLY {type, timestamp} -- no extra fields, no
-      // missing fields, timestamp is ISO-8601 millis 'Z' (matches legacy's
       // `nowIso()` at server/ws-handler.ts:1834).
       expect(Object.keys(pong).sort()).toEqual(['timestamp', 'type'])
       expect(pong.type).toBe('pong')

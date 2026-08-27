@@ -100,7 +100,6 @@ async function startFakeGemini(replyText: string): Promise<FakeGemini> {
  * `provider-generated` (`parse/claude.rs:521-526`), which blocks both the
  * sweep's AI branch and the generate-title route by design -- so none is
  * written. The FIRST user record is what `first_user_message` extracts.
- * Trimmed from `session-directory-matrix.spec.ts`'s `buildSessionJsonl`.
  */
 function buildClaudeSessionJsonl(input: {
   sessionId: string
@@ -161,7 +160,6 @@ function buildClaudeSessionJsonl(input: {
 }
 
 /**
- * Deterministic fake `claude` CLI (restore-matrix.spec.ts's
  * `installFakeClaudeCli` pattern): prints text then stays alive like the real
  * interactive TUI, so the resumed pane's terminal stays `running` for the
  * sweep's live-terminal match. Installed via the `CLAUDE_CMD` env override.
@@ -462,7 +460,6 @@ test.describe('Auto-title pipeline (rust)', () => {
       ).toBe(FIRST_MESSAGE)
 
       // User rename through the real PATCH route (titleSource:'user', the
-      // top ladder rung -- user=5 > ai=4 > first-message=3 > legacy=2 > dir=1).
       const res = await page.request.patch(
         `${booted.info.baseUrl}/api/sessions/${encodeURIComponent(`claude:${SESSION_ID}`)}`,
         {

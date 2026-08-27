@@ -13,16 +13,12 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`).
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `Rust browser lane`-only `testMatch` entry for this file, and
- * `amplifier-restore-rust.spec.ts`'s identical divergence note): legacy has
  * NO opencode terminal<->session association anywhere (spec §2) --
  * `server/coding-cli/amplifier-session-locator.ts` on `origin/main` is
  * amplifier-ONLY, and `opencode-session-controller.ts` binds the
  * freshopencode CHAT sidecar (`opencode serve`), never a raw terminal PTY.
  * This is not a parity gap to gate per-assertion; it is a capability that
- * does not exist in legacy, designed by analogy to the amplifier-locator
  * precedent, and this spec is scoped to the Rust project only rather than
- * pretending legacy participates.
  *
  * The fix under test (spec §4-5, Slices A+B): a Rust-side `OpencodeLocator`
  * (`crates/freshell-sessions/src/opencode_locator.rs`) correlates a fresh
@@ -149,10 +145,7 @@ test.describe('OpenCode Terminal Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
   test('an opencode terminal pane restores across a server restart via `opencode --session <id>`, and a never-submitted pane restores fresh', async ({ page }) => {
-    // This spec is registered ONLY under the `Rust browser lane` project
     // (`playwright.config.ts`), but assert the precondition explicitly so a
-    // future accidental `retired matrix list` inclusion fails loudly instead of
-    // silently no-op'ing on legacy.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-terminal-restore-'))
     const argLogPath = path.join(sharedRoot, 'fake-opencode-terminal-argv.jsonl')
     try {
@@ -281,7 +274,7 @@ test.describe('OpenCode Terminal Restore (Rust only)', () => {
         // pane, and fresh (no `--session`) for the never-submitted one.
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 

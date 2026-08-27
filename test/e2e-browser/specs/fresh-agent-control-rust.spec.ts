@@ -52,7 +52,6 @@
  *      })
  *      process.stdin.resume()
  *   2. FRESHELL_FAKE_NOOP=1 npx playwright test --config test/e2e-browser/playwright.config.ts \
- *        --project=Rust browser lane fresh-agent-control-rust -g "Allow"
  *   Expected: the approval-allow test fails — the approval card never renders
  *   (timeout waiting for role=alert "Permission request for Bash"), proving
  *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with

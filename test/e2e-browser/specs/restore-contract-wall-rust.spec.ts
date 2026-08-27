@@ -15,7 +15,6 @@
  * assertion run as a normal (green) expectation. Never widen a pin; never
  * convert a pin to test.fixme (fixme'd tests produce no evidence).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * restartAbrupt() exists only on RustServer.
  *
  * Helpers are copied, not imported, per this suite's per-spec-ownership
@@ -267,7 +266,6 @@ function leafDurableIdentity(leaf: any): string | undefined {
   )
 }
 
-// --- REST helpers (donor: continuity-smoke.spec.ts / agent-continuity-matrix) ---
 
 function restApiHeaders(info: E2eServerInfo): Record<string, string> {
   return { 'x-auth-token': info.token, 'content-type': 'application/json' }
@@ -333,12 +331,10 @@ async function findLeafById(harness: TestHarness, tabId: string, paneId: string)
   return collectLeaves(layout).find((leaf) => leaf.id === paneId) ?? null
 }
 
-// --- freshcodex fresh-agent helpers (donors: restore-matrix.spec.ts:62-92,
 // restore-double-restart.spec.ts:148-176) ---
 
 /**
  * Install the fake codex app-server as a re-exec WRAPPER, never a content
- * copy (donor: restore-matrix.spec.ts:62-92): the fixture's
  * `import { WebSocketServer } from 'ws'` is an ESM bare specifier resolved
  * relative to the FILE'S OWN location -- a copy dropped in a bare temp dir
  * has no `node_modules` ancestor and dies with ERR_MODULE_NOT_FOUND.
@@ -1040,7 +1036,6 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // (crates/freshell-freshagent/src/opencode_ws.rs, unit pin
     // `create_with_resume_session_id_rebinds_the_durable_session`), so
     // the pane rebinds the durable identity and rehydrates history -- the
-    // pin is removed (flip pattern: restore-matrix.spec.ts TERM-25).
     // NOTE: the flip unmasked a latent strict-mode locator ambiguity in
     // the history assertion below -- the prompt text renders in THREE
     // places post-rehydrate (pane-header detail span, transcript "You"

@@ -17,7 +17,6 @@
 //      anywhere (the banner is in-memory Redux state and does not survive
 //      reload -- V1 N3).
 //
-// Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch
 // (restartAbrupt exists only on RustServer). Tests 1-3 drive the server
 // directly (REST + raw WS, no browser page); test 4 is a browser test.
 //
@@ -26,7 +25,6 @@
 // codex-status-completeness-rust.spec.ts (WsCapture); the raw-create message
 // sequence from crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs
 // (:295); the raw-attach frame from freshagent_claude_attach.rs; the REST
-// opencode seeding from agent-continuity-matrix.spec.ts; the Freshcodex UI
 // pane-creation flow from agent-checkpoint-rewind.spec.ts (:207). Helpers are
 // copied, not imported, per this suite's per-spec-ownership convention.
 import fs from 'node:fs'
@@ -337,7 +335,6 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     const projectDir = path.join(sharedRoot, 'proj')
     await fsp.mkdir(projectDir, { recursive: true })
     // Install the fake as an executable named `opencode` (donor:
-    // agent-continuity-matrix.spec.ts installFakeOpencode) and point
     // OPENCODE_CMD at it (serve.rs ServeConfig).
     await fsp.mkdir(binDir, { recursive: true })
     const fakeOpencode = path.join(binDir, 'opencode')
@@ -350,7 +347,6 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
         FAKE_OPENCODE_AUDIT_LOG: auditLogPath,
       },
       // Re-seeded on every boot; keeps the freshAgent gate + provider enabled
-      // across the restart (donor: agent-continuity-matrix.spec.ts).
       setupHome: seedWallConfig({ providers: ['opencode'], freshAgent: true }),
     })
     let ws: WsCapture | null = null

@@ -1,9 +1,6 @@
 /**
  * HARNESS-05 — probe spec for the raw HTTP/WebSocket Playwright clients
- * (`test/e2e-browser/helpers/raw-clients.ts`). Matrix spec: runs under BOTH
- * `retired Node browser lane` and `Rust browser lane` because Group B legs drive REAL
  * per-server code paths (hello handling, protocol-error enforcement,
- * ping/pong, orchestration REST). Registered in retired matrix list.
  *
  * Full item text: "Add raw HTTP and WebSocket clients to the Playwright
  * runner. Tests need to send malformed frames, delay reads/hello, create
@@ -180,7 +177,6 @@ test.describe.serial('Group B: raw-client capability legs against the real serve
   test('B1: delayed hello — 1200ms of silence, then hello still reaches ready', async ({ serverInfo }, testInfo) => {
     const client = await connect(serverInfo.wsUrl)
     // Both servers send nothing and never close before the ~5s hello
-    // deadline (legacy ws-handler.ts: hello timer 5000ms default; rust
     // freshell-server hello_timeout_ms default 5000) — a 1200ms delay must
     // be a healthy, silent, still-connected window.
     const silentFrames = await client.collectFramesDuring(1200)

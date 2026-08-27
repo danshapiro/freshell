@@ -11,11 +11,19 @@ import { assertRustServerInfo, RustServer } from './rust-server.js'
 const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const browserRoot = path.resolve(import.meta.dirname, '..')
+const electronRoot = path.resolve(browserRoot, '../e2e-electron')
 const playwrightCli = require.resolve('@playwright/test/cli')
 const configLoader = require.resolve('playwright/lib/common/configLoader')
 const playwrightConfig = path.join(browserRoot, 'playwright.config.ts')
 const cloudConfig = path.join(browserRoot, 'playwright.cloud.config.ts')
 const continuityPattern = { kind: 'regexp', source: 'continuity-smoke\\.spec\\.ts$', flags: '' }
+const obsoleteVocabulary = [
+  ['rust', 'Fixture'].join(''),
+  ['retired', ' Node browser lane'].join(''),
+  ['Rust', ' browser lane'].join(''),
+  ['retired', ' matrix list'].join(''),
+  ['MATRIX', '_SPECS'].join(''),
+]
 
 interface ResolvedProject {
   name: string
@@ -130,6 +138,16 @@ describe('browser selection non-vacuity', () => {
         .map((match) => `${path.relative(projectRoot, file)} -> ${match[1]}`)
     })
     expect(legacyImports).toEqual([])
+
+    const obsoleteClaims = [browserRoot, electronRoot].flatMap((root) => sourceFiles(root).flatMap((file) => {
+      const source = fs.readFileSync(file, 'utf8')
+      const matchedVocabulary = obsoleteVocabulary.filter((term) => source.includes(term))
+      const claimsTwoBackends = /(?:runs?|selected)\s+(?:against|on)\s+both\s+(?:backends|server kinds|projects)/i.test(source)
+      return matchedVocabulary.length > 0 || claimsTwoBackends
+        ? [`${path.relative(projectRoot, file)}: ${[...matchedVocabulary, ...(claimsTwoBackends ? ['two-backend claim'] : [])].join(', ')}`]
+        : []
+    }))
+    expect(obsoleteClaims).toEqual([])
 
     expect(LOCAL_ONLY_SPECS).toContainEqual({
       spec: 'mcp-qa-smoke-rust.spec.ts',

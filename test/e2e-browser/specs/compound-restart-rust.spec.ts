@@ -39,8 +39,6 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  *     (`crates/freshell-ws/src/invariants.rs`) never fires.
  *
  * Rust-only: MODE A requires `RustServer.restartAbrupt()` (SIGKILL + reboot
- * on the same home/port/token), an owned-fixture capability the legacy
- * generic fixture seam does not implement; the frozen legacy tree is not the
  * subject of this hardening. Fixture shapes (fake codex CLI, `~/.codex`
  * session seed, restart choreography) mirror `codex-terminal-bounce-rust.spec.ts`.
  * Helpers are copied, not imported, per this suite's per-spec-ownership

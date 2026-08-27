@@ -6,7 +6,6 @@
 //   3. The next send continues the SAME conversation (fixture request log shows
 //      create carried resumeSessionId === the original durable UUID).
 //   4. A pane BUSY at restart un-wedges (idle status snapshot from the attach arm).
-// Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch (restartAbrupt
 // exists only on RustServer). NOTE: no page.reload() in test 1/2 -- the reload leg
 // is the contract wall's freshclaude test; this spec owns the reconnect leg.
 //

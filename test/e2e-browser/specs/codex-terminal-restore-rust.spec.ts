@@ -15,15 +15,12 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * `codex ... resume <id>`.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `Rust browser lane`-only `testMatch` entry for this file, and
  * `opencode-terminal-restore-rust.spec.ts`'s identical divergence note):
- * legacy has NO codex terminal rollout locator -- fresh codex terminal
  * identity there depended on the client's `terminal.codex.durability.updated`
  * candidate path, which the Rust server retired server-side. This is not a
  * parity gap to gate per-assertion; it is a capability that exists only on
  * the Rust port, designed by analogy to the amplifier/opencode locator
  * precedents, and this spec is scoped to the Rust project only rather than
- * pretending legacy participates.
  *
  * The fix under test (Tasks 1-7 of the codex rollout locator pipeline): the
  * Rust server arms fresh WS-created codex panes at create; the pane's first
@@ -162,10 +159,7 @@ test.describe('Codex Terminal Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
   test('a fresh codex terminal pane gains server-side identity and restores across a server restart via `codex resume <id>`, and a never-submitted pane restores fresh', async ({ page }) => {
-    // This spec is registered ONLY under the `Rust browser lane` project
     // (`playwright.config.ts`), but assert the precondition explicitly so a
-    // future accidental `retired matrix list` inclusion fails loudly instead of
-    // silently no-op'ing on legacy.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-terminal-restore-'))
     const argLogPath = path.join(sharedRoot, 'fake-codex-terminal-argv.jsonl')
     try {
@@ -310,7 +304,7 @@ test.describe('Codex Terminal Restore (Rust only)', () => {
         // fresh (no `resume`) for the never-submitted one.
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 

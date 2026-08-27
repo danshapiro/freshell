@@ -38,7 +38,6 @@
  *     F3-2: render-only assertions can pass on surviving local state with a
  *     fully broken reattach).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + the Rust browser lane testMatch
  * (socket-drop/freeze revival; drives RustServer + forceDisconnect +
  * SIGSTOP). Not in CLOUD_SKIP_SPECS -- no real provider binaries needed
  * (every claude interaction uses the committed fakes via CLAUDE_CMD /
@@ -258,8 +257,6 @@ async function openClaudePaneAndCapture(
  * Minimal claude transcript the session index treats as interactive and the
  * sidebar renders: TWO user/assistant turns (a one-turn session is classified
  * non-interactive and silently excluded from the sidebar's default query --
- * restore-matrix.spec.ts's root-cause note) plus a summary line carrying the
- * unique title. Shape donor: restore-matrix.spec.ts scenario 3.
  */
 async function writeClaudeTranscript(input: {
   homeDir: string

@@ -19,7 +19,6 @@ import {
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
- * CFG-03 -- matrix spec.
  *
  * Full acceptance text: "Add backup, fallback, and visible write-error
  * handling. Retain the last valid configuration; on parse, version, or read
@@ -53,7 +52,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * `rustClientDistPath` -- none of which touch `config.json`).
  *
  * KNOWN DIVERGENCE (documented in `settings_store.rs`'s own doc comment,
- * not a new finding): the legacy Node original's `loadInternal` treats ANY
  * read failure (parse/version/read) as "no existing config" and calls
  * `saveInternal(defaultsOnlyConfig)` UNCONDITIONALLY -- which overwrites
  * BOTH `config.json` AND (via `saveInternal`'s own unconditional
@@ -61,7 +59,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * backup a human could otherwise have restored from by hand. This is
  * precisely the data-loss gap CFG-03 exists to close. This spec runs the
  * SAME corrupt-primary-plus-valid-backup setup against BOTH kinds and
- * asserts the DIFFERENT, per-kind-correct outcome: legacy is the CONTROL
  * that empirically proves the gap, rust proves the fix.
  *
  * GAP1/GAP2 FIXED (CFG-03 checklist follow-up, this commit): the two
@@ -259,8 +256,7 @@ test.describe('CFG-03 backup/fallback matrix', () => {
       const settings = await getSettings(server.baseUrl, token)
       const backupOnDiskAfter = await fsp.readFile(backupPath, 'utf8')
 
-      if (true) {
-        // THE FIX: `maybe_restore_config_from_backup` restores the primary
+      // THE FIX: `maybe_restore_config_from_backup` restores the primary
         // byte-identically from the backup BEFORE `SettingsStore::load()`
         // does anything else. What we observe here (after the full boot
         // sequence) can legitimately be a LATER, fuller write: our minimal
@@ -300,15 +296,6 @@ test.describe('CFG-03 backup/fallback matrix', () => {
 
         first.ws.close()
         second.ws.close()
-      } else {
-        // CONTROL (KNOWN DIVERGENCE): legacy falls back to bare defaults on
-        // ANY read failure and unconditionally overwrites the backup with
-        // those same defaults -- the sentinel is gone from BOTH files.
-        expect(settings.safety.autoKillIdleMinutes).toBe(LEGACY_DEFAULT_AUTO_KILL_MINUTES)
-        expect(backupOnDiskAfter).not.toBe(backupDoc)
-        const reparsedBackup = JSON.parse(backupOnDiskAfter)
-        expect(reparsedBackup.settings.safety.autoKillIdleMinutes).toBe(LEGACY_DEFAULT_AUTO_KILL_MINUTES)
-      }
     } finally {
       await stopProcessGracefully(server.proc)
       await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})

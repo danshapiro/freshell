@@ -17,7 +17,6 @@
  * spec covers the VISIBLE one. DO NOT add a turn before the restart --
  * zero-turn is the entire point.
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch,
  * because restartAbrupt() exists only on RustServer.
  *
  * Helpers are COPIED from hidden-pane-rebind-rust.spec.ts, not imported,

@@ -37,9 +37,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  *      the incident violated -- a durable FreshCodex session must never
  *      be abandoned/blanked across back-to-back, overlapping restarts --
  *      on the FreshAgentView surface, using the SAME fake-app-server
- *      fixture infrastructure restore-matrix.spec.ts already established.
  *
- * Both scenarios reuse restore-matrix.spec.ts's helpers (copied, not
  * imported -- that spec is owned by a concurrently-running agent) and its
  * `installFakeCodexAppServer` / `FAKE_CODEX_APP_SERVER_BEHAVIOR` fixture
  * conventions. No fixture file changes were needed: the fake app-server's
@@ -57,7 +55,6 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
 )
 
 /**
- * Copied from restore-matrix.spec.ts (not imported -- that spec is owned by
  * a concurrently-editing agent and this pass must not touch it). See that
  * file's identical helper for the full rationale: a re-exec wrapper avoids
  * both a permission-bit change on a file outside this spec's owned path and
@@ -243,7 +240,7 @@ test.describe('Restore Double-Restart Regression', () => {
         })
 
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
 
         // --- THE INCIDENT: two restarts, back to back. The first restart
@@ -398,7 +395,7 @@ test.describe('Restore Double-Restart Regression', () => {
         await harness.clearSentWsMessages()
 
         if (!server.restart) {
-          throw new Error(`$() E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         // A single restart is enough to force the client down the
         // `thread/resume` path (the in-memory thread + app-server sidecar
@@ -459,15 +456,12 @@ test.describe('Restore Double-Restart Regression', () => {
         // exactly 2 (the reload's own unconditional create-effect attempt,
         // PLUS one bounded `.lost`-triggered retry that pre-fix codex never
         // gets at all). Empirically that count reached 2 on BOTH pre-fix
-        // and post-fix code on `Rust browser lane` (a confound from the owned
         // Rust server's reconnect/health-check timing independently
-        // re-sending the same request), and on `retired Node browser lane` it did
         // not reliably reach 2 within 20s even on FIXED code.
         //
         // STRONGER CONCLUSION (the reviewer-proven finding, stated plainly
         // rather than left implicit): Scenario 2 AS WRITTEN passes
         // IDENTICALLY on pre-fix and post-fix code -- empirically verified
-        // on both projects. It provides NO regression protection for the
         // FreshAgentView `triggerRecovery` gating fix itself; reverting that
         // fix would NOT turn this scenario red. It guards only the broader,
         // still-real contract this file's other assertions establish: the
@@ -481,7 +475,6 @@ test.describe('Restore Double-Restart Regression', () => {
         // attempts; RED without the negative-cache fix, GREEN with it).
         //
         // Rather than assert a specific count this spec cannot currently
-        // prove is fix-attributable across BOTH server kinds, this asserts
         // the weaker but still-real, task-mandated contract: the retry count
         // must never grow WITHOUT BOUND. See this test's final report for
         // the honest RED/GREEN finding on this specific line.

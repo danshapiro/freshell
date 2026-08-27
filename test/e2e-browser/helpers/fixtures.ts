@@ -80,20 +80,15 @@ export const test = base.extend<{
   // extended type to a degraded map, hiding genuine option keys from
   // test.use). Type-level correction; the fixture object below is unchanged.
   testServer: E2eServerHandle
-  /** Constant compatibility marker for legacy Rust-baseline assertions. */
-  rustFixture: 'rust'
 }>({
-  rustFixture: ['rust', { scope: 'worker' }],
   recoveryOfferHandling: ['auto-decline', { option: true }],
 
   // RESTORE-01 — every page of the default context carries the
   // recovery-offer auto-decline watcher (the harness answering a designed
-  // offer like a user; see recovery-offer.ts header). Legacy legs install
   // NOTHING (the route is absent there — byte-identical behavior). The
   // built-in `context` is overridden, so spec-authored
   // `browser.newContext()` pages bypass it; those specs adopt
   // `installRecoveryOfferAutoDeclineOnContext` directly (multi-client,
-  // tabs-client-retire, project-colors-matrix) or opt out via
   // `recoveryOfferHandling: 'manual'` (panel-owning specs).
   context: async ({ context, recoveryOfferHandling }, use) => {
     if (recoveryOfferHandling === 'auto-decline') {

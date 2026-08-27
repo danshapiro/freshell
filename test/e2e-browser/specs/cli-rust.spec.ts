@@ -75,8 +75,6 @@ async function runCliJson<T>(baseUrl: string, token: string, args: string[]): Pr
 /**
  * Rust-only standalone CLI acceptance coverage. It intentionally drives the
  * compiled `dist/tools/freshell-cli/index.js` entrypoint against the owned
- * Rust fixture, not a legacy Express fake. The direct RustServer assertion
- * prevents accidental collection under match-all legacy projects.
  */
 test.describe('standalone CLI -- Rust server replacement', () => {
   test.setTimeout(120_000)

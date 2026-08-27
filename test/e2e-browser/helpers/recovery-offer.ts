@@ -14,7 +14,6 @@ import type { BrowserContext, Page, Response } from '@playwright/test'
  * context against the worker-shared rust server is indistinguishable from a
  * real new browser connecting after the last browser vanished — the exact
  * scenario the feature and its e2e pin (recover-my-panes-rust.spec.ts)
- * codify. The legacy Node server has no recovery route at all, so nothing is
  * offered there (feature absent, a documented KNOWN DIVERGENCE).
  *
  * So the harness ANSWERS the offer exactly like an uninterested user: watch

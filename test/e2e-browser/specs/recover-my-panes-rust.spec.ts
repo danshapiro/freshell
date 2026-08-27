@@ -35,10 +35,7 @@
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
  * per-spec-ownership convention.
  *
- * Rust-only: drives `GET /api/recovery/inventory` (no legacy equivalent) and
  * owns a RustServer directly (ephemeral loopback port — NEVER 3001/3002).
- * Registered ONLY under `Rust browser lane` and testIgnore'd on every match-all
- * project (see playwright.config.ts's RUST_ONLY_SPECS).
  */
 import { test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'

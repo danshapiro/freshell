@@ -321,7 +321,6 @@ async function renderNormalizedLegacySyncSnapshot(page: Page, snapshot: LayoutSn
       payload: { id: tab.id, title: tab.title ?? tab.id, status: 'running' },
     })
     // The harness cannot receive an echoed ui.layout.sync, so this applies the exact
-    // server-normalized snapshot produced by the legacy sync before selecting the tab.
     const current = harness.getState().panes
     harness.dispatch({
       type: 'panes/hydratePanes',

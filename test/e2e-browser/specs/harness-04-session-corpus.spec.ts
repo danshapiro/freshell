@@ -14,7 +14,6 @@
  *     REAL provider homes were untouched (marker tripwires + absent-dir
  *     strictness, the attributable layers from harness-01's live-host idiom).
  *
- *   Leg B (legacy-open semantics): boot the LEGACY server against a corpus
  *     home and drive the real `/api/session-directory` read model through
  *     `page.request` — >1 page via nextCursor, exact identity/title/summary/
  *     projectPath/checkoutPath/archived/fractional-order matching vs the
@@ -26,7 +25,6 @@
  *
  * Per the checklist validation text this does NOT exercise Rust
  * multi-provider indexing — the server leg uses the Rust baseline under
- * matrix projects; Rust-side indexing of this corpus belongs to the later
  * SESSION-* items.
  */
 
@@ -142,7 +140,6 @@ const test = base.extend<Record<string, never>, {
   corpusWorker: SessionCorpus
   testServer: E2eServerHandle
 }>({
-  // Worker-scoped corpus built ONCE inside the legacy server's isolated home.
   testServer: [async ({}, use) => {
     corpusHolder.value = undefined
     const server = await createE2eServerHandle(process.env, {

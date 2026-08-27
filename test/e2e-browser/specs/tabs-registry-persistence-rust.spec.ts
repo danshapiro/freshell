@@ -27,7 +27,6 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
  * `tabs.sync.client.retire` wire messages over the same `/ws` endpoint +
  * harness-token `hello` handshake the browser uses (the raw-WS option the
  * task brief's Interfaces line allows; handshake helpers copied verbatim
- * from `ws-ping-pong-matrix.spec.ts`). Closing a raw socket without sending
  * retire is EXACTLY "close context A WITHOUT retiring" — the server retires
  * only on an explicit retire frame or the REST unload beacon, never on
  * socket close (see `tabs-client-retire.spec.ts` for the browser-side
@@ -56,7 +55,6 @@ const STALE_REVISION_MESSAGE = 'Stale snapshot revision rejected for tabs regist
 const DUPLICATE_CONTENT_MESSAGE = 'Duplicate snapshot revision has different tabs registry content'
 
 /** Open a raw WS connection and complete the harness-token `hello` handshake.
- *  (Copied verbatim from `ws-ping-pong-matrix.spec.ts`.) */
 function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl)
@@ -87,7 +85,6 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
 }
 
 /** Resolve with the next message matching `predicate`, or reject on timeout.
- *  (Copied verbatim from `ws-ping-pong-matrix.spec.ts`.) */
 function nextMessage(ws: WebSocket, predicate: (message: unknown) => boolean, timeoutMs = 5_000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -365,7 +362,6 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-tabs-registry-e2e-'))
     const registryRoot = path.join(homeRoot, '.freshell', 'tabs-registry')
     const v1Dir = path.join(registryRoot, 'v1')
-    // The legacy log the open() fall-through would rehydrate from lives at
     // `<store root>/tabs-registry.jsonl` (tabs_store.rs:215, Node
     // store.ts:692). The sibling `<home>/.freshell/tabs-registry.jsonl` is
     // asserted too, so the accounting holds even against a path regression.
@@ -399,10 +395,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       // Stop the server (process only — the caller-provided home survives).
       await serverBefore.stop()
 
-      // validator-A8-A9 legacy-file accounting: after the missing-object
-      // archive, `open()` falls through to the LEGACY branch BEFORE empty
       // (store.ts:692-709 / tabs_store.rs:215-242). The isolated home must
-      // hold NO stray legacy `tabs-registry.jsonl`, so the fall-through is
       // GUARANTEED to land on the empty branch — making "archive => empty" a
       // sound assertion below.
       for (const candidate of legacyJsonlCandidates) {
@@ -425,7 +418,6 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       const infoAfter = await serverAfter.start()
 
       // ...the tabs query returns EMPTY (missing-object self-heal discarded
-      // the whole registry; no legacy file existed to rehydrate from)...
       wsAfter = await connectAndHello(infoAfter.wsUrl, infoAfter.token)
       expect(await queryTabs(wsAfter, identity)).toEqual({
         localOpen: [],
@@ -440,7 +432,6 @@ test.describe('Durable tabs registry across restart (rust)', () => {
       const v1Entries = await fs.readdir(v1Dir)
       expect(v1Entries.filter((name) => name.startsWith('manifest.json.invalid-'))).toHaveLength(1)
       expect(v1Entries).not.toContain('manifest.json')
-      // Self-heal must not fabricate a legacy file either.
       for (const candidate of legacyJsonlCandidates) {
         await expect(fs.access(candidate)).rejects.toThrow()
       }

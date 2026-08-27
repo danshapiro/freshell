@@ -20,7 +20,6 @@
  *
  * Do not weaken any conjunct in either poll.
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * restartAbrupt() exists only on RustServer.
  *
  * Helpers are COPIED from restore-contract-wall-rust.spec.ts, not imported,

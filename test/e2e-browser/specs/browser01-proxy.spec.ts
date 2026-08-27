@@ -19,7 +19,6 @@ import { test, expect } from '../helpers/fixtures.js'
  * `crates/freshell-server/src/proxy.rs` + `tests/browser01_proxy.rs`; this
  * spec is the browser-visible, both-server-kinds leg.
  *
- * Runs on BOTH matrix projects (legacy = parity control, rust = the port).
  */
 
 interface CapturedRequest {

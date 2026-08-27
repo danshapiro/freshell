@@ -13,9 +13,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * TERM-15 + TERM-16 (Rust) — terminal-mode CLI activity, server-authoritative
  * turn completion, and the NEW `terminal.idle` truly-idle edge.
  *
- * Rust-only (`playwright.config.ts` registers this under `Rust browser lane`):
- * this is the Rust port's implementation of the legacy activity engine; the
- * frozen legacy server has its own (this branch's `server/` predates the
  * amplifier provider entirely — same KNOWN DIVERGENCE as
  * `amplifier-restore-rust.spec.ts`).
  *

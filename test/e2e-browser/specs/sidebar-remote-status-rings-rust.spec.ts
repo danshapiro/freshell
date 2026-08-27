@@ -110,13 +110,11 @@ async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Pa
 }
 
 // Donor: sidebar-registry-sync-rust.spec.ts:81-91 (buildClaudeSessionJsonl),
-// which trimmed session-directory-matrix.spec.ts:36 (buildSessionJsonl) down
 // to ONE user turn. This spec needs the seed visible in the DEFAULT sidebar
 // window (priority=visible&limit=50, no includeNonInteractive): a one-turn
 // transcript parses as isNonInteractive (claude.rs: user_message_count <= 1 →
 // non-interactive) and is excluded there (the donor spec never noticed — its
 // rows surface via LIVE terminal directory entries). So this copy keeps the
-// matrix donor's second user/assistant turn. Field names verified against the
 // donor (system/init: session_id, uuid, timestamp, cwd; turns: parentUuid,
 // sessionId, cwd, message, uuid, timestamp).
 function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string): string {
@@ -158,7 +156,6 @@ type RawSnapshotRecord = Record<string, unknown> & { status?: string }
 /**
  * A raw second WS device (not a browser). Handshake: bare `ws://` connect then
  * in-band `{type:'hello', token, protocolVersion}` → `ready` (Stage-2
- * evidence; raw-WS precedent: safe03-origin-matrix.spec.ts). `pushSnapshot`
  * assigns monotonically increasing `snapshotRevision` values and awaits the
  * matching ack per the file's header push discipline.
  */
@@ -305,8 +302,6 @@ test.describe.serial('sidebar remote status rings (rust)', () => {
     // Same hook-timeout + prebuild pattern as
     // sidebar-registry-sync-rust.spec.ts:168-172: the first release build of
     // freshell-server can take minutes, and the default 60s hook timeout would
-    // kill server.start() mid-build. Unlike the donor (which is RUST_ONLY_SPECS
-    // and never enters the cloud matrix), this spec runs under the plain
     // chromium project, so it ALSO runs in cloud images that ship a prebuilt
     // server binary but no Cargo toolchain: skip the prebuild when the
     // override is configured; RustServer.start() resolves it fail-closed via

@@ -5,21 +5,17 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * CROSS-SURFACE TITLE CONVERGENCE (Task 21, MATRIX -- both projects).
  *
  * Pins EDEV-09 (`port/oracle/DEVIATIONS.md`): the Task 19 client
  * title-convergence fixes -- sidebar/history/terminal-menu/Overview renames
  * now mirror into pane titles via `applySessionRenameCascade`
  * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`
- * (`src/store/panesSlice.ts`). The client is SHARED by both backends, so this
- * spec runs on `Rust browser lane` AND `retired Node browser lane`; the legacy run is the
  * regression control proving the client fixes didn't regress Node behavior.
  *
  * Each test drives a REAL UI journey (or the automation REST surface, where
  * the scenario is about automation) on its OWN dedicated seeded claude
  * session, then asserts BOTH surfaces (pane header + sidebar/tab) converge.
  * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI
- * (`CLAUDE_CMD` override -- restore-matrix.spec.ts precedent, works on both
  * server kinds). `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so neither
  * server's auto-name pass can reach a real Gemini: with no key, both servers'
  * sweeps settle sessions on the first-message heuristic, and every rename
@@ -116,7 +112,6 @@ process.stdin.resume()
   return dest
 }
 
-// Worker-scoped server (session-directory-matrix.spec.ts pattern): the fake
 // claude CLI is installed BEFORE the handle is constructed so `CLAUDE_CMD`
 // can point at it; the isolated home is seeded with one session per test so
 // no test's rename can poison another's assertions.
@@ -179,8 +174,7 @@ function visiblePaneHeader(page: import('@playwright/test').Page) {
   return page.locator('[data-context="pane-header"]:visible').first()
 }
 
-/** Sidebar-click resume of a dedicated seeded session (the WS create path,
- * which registers the terminal's session identity on both server kinds). */
+/** Sidebar-click resume of a dedicated seeded session. */
 async function resumeSeededSession(
   page: import('@playwright/test').Page,
   harness: import('../helpers/test-harness.js').TestHarness,
@@ -261,8 +255,6 @@ test.describe('Title sync convergence', () => {
   // pane in the server-side layout store, broadcasts `ui.command{pane.rename}`
   // (pane header), mirrors to the tab title (single-pane tab), and cascades
   // to the session override for a syncable coding-CLI pane (sidebar row via
-  // the changed-broadcast refetch). On retired Node browser lane this already works
-  // (Node behavior) -- the matrix run doubles as the regression control.
   test('automation PATCH /api/panes/:id converges pane header + tab + sidebar', async ({ freshellPage, page, harness, serverInfo }) => {
     const NEW_NAME = 'Automation Name Three'
     const { tabId, paneId } = await resumeSeededSession(page, harness, SESSION_AUTOMATION_RENAME)

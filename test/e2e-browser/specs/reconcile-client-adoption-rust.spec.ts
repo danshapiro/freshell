@@ -4,14 +4,12 @@
  * server (docs/plans reconcile-client-adoption lane, Tasks 2-13 merged).
  *
  * Three scenario contracts:
- *   1. restart with mixed pane types: verdicts drive recovery, the legacy
  *      destructive census never destroys a pane (F3 closed);
  *   2. dead sessions surface as ONE batched adjudication panel (council
  *      rule 1) -- nothing auto-closed, per-row explicit decisions;
  *   3. double-restart mid-reconcile converges: no permanent 'creating'
  *      wedge, exactly one live PTY per pane (no duplicates).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch, because
  * this spec imports RustServer directly (restart()/restartAbrupt()).
  *
  * Helpers are copied, not imported, per the e2e suite's per-spec-ownership
