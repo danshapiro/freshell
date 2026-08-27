@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -12,6 +12,8 @@ type RuntimeSurface = {
   path: string
   role: string
   listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
+  entries?: string[]
+  commandEvidence?: string
 }
 
 const ALLOWED_LISTENER_PATHS = [
@@ -77,6 +79,35 @@ describe('runtime boundary analyzer', () => {
     const result = await analyzeRuntimeBoundary(root)
 
     expect(result.unexpectedNodeBackend).toContain('scripts/invented-listener.ts')
+  })
+
+  it('rejects a manifest-listed package script that launches a non-executable root Node listener', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: ['serve'],
+        commandEvidence: 'sha256:7c34a7bec5d78bec828822651670524d60a6a53f9cd1c5faec468dd201706f07',
+      }],
+      {
+        'package.json': JSON.stringify({
+          scripts: { serve: 'node runtime-backend.mjs' },
+        }),
+        'runtime-backend.mjs': [
+          "import http from 'node:http'",
+          "http.createServer((_req, res) => res.end('nope')).listen(0)",
+        ].join('\n'),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect((await stat(path.join(root, 'runtime-backend.mjs')).mode & 0o111)).toBe(0)
+    expect(result.manifestDrift).toEqual([
+      'changed package script command evidence: package-scripts',
+    ])
+    expect(result.unexpectedNodeBackend).toEqual(['runtime-backend.mjs'])
   })
 
   it('rejects an unlisted Node listener in an e2e helper regardless of its filename', async () => {

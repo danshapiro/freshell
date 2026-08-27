@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -5,7 +6,8 @@ import path from 'node:path'
  * A runtime surface is an executable or resource that must have one owner in
  * the retirement manifest.  Paths are repository-relative POSIX paths.  A
  * package-script surface uses `package.json:scripts` and lists its command
- * names in `entries` so adding a command is visible as manifest drift.
+ * names in `entries` plus a hash of their commands so additions and command
+ * changes are both visible as manifest drift.
  */
 export type RuntimeSurface = {
   id: string
@@ -13,6 +15,7 @@ export type RuntimeSurface = {
   role: string
   listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
   entries?: string[]
+  commandEvidence?: string
 }
 
 export type RuntimeSurfaceManifest = {
@@ -199,6 +202,20 @@ export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeS
       throw new Error(`Runtime surface manifest row ${row.id} has invalid entries.`)
     }
     const normalizedPath = validateManifestPath(row.path, row.id)
+    if (row.commandEvidence !== undefined && (
+      typeof row.commandEvidence !== 'string'
+      || !/^sha256:[a-f0-9]{64}$/.test(row.commandEvidence)
+    )) {
+      throw new Error(`Runtime surface manifest row ${row.id} has invalid command evidence.`)
+    }
+    if (normalizedPath === PACKAGE_SCRIPTS_PATH && (
+      row.entries === undefined || row.commandEvidence === undefined
+    )) {
+      throw new Error(`Runtime surface manifest package script row ${row.id} requires entries and command evidence.`)
+    }
+    if (normalizedPath !== PACKAGE_SCRIPTS_PATH && row.commandEvidence !== undefined) {
+      throw new Error(`Runtime surface manifest row ${row.id} may only use command evidence for package scripts.`)
+    }
     if (row.listener === 'assertion-only' && (
       row.role !== 'test-listener-assertion'
       || !normalizedPath.startsWith('test/')
@@ -212,6 +229,7 @@ export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeS
       role: row.role,
       ...(row.listener ? { listener: row.listener } : {}),
       ...(row.entries ? { entries: [...row.entries].sort() } : {}),
+      ...(row.commandEvidence ? { commandEvidence: row.commandEvidence } : {}),
     })
   }
 
@@ -306,6 +324,24 @@ async function packageScriptNames(root: string): Promise<string[]> {
   }
 }
 
+async function packageScriptCommandEvidence(root: string): Promise<string | undefined> {
+  try {
+    const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts?: unknown }
+    if (!packageJson.scripts || typeof packageJson.scripts !== 'object' || Array.isArray(packageJson.scripts)) return undefined
+
+    const scripts = Object.entries(packageJson.scripts as Record<string, unknown>)
+    if (scripts.some(([, command]) => typeof command !== 'string')) return undefined
+
+    const canonicalCommands = scripts
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([name, command]) => `${JSON.stringify(name)}:${JSON.stringify(command)}`)
+      .join('\n')
+    return `sha256:${createHash('sha256').update(canonicalCommands).digest('hex')}`
+  } catch {
+    return undefined
+  }
+}
+
 async function reconcileManifest(root: string, manifest: RuntimeSurfaceManifest, discoveredOwners: string[]): Promise<string[]> {
   const drift: string[] = []
   const rowsByPath = new Map<string, RuntimeSurface[]>()
@@ -338,6 +374,13 @@ async function reconcileManifest(root: string, manifest: RuntimeSurfaceManifest,
       }
       if (!await pathExists(root, 'package.json')) {
         drift.push(`stale manifest row: ${row.id} -> ${relativePath}`)
+      } else {
+        const actualEvidence = await packageScriptCommandEvidence(root)
+        if (actualEvidence === undefined) {
+          drift.push(`invalid package script commands: ${row.id}`)
+        } else if (row.commandEvidence !== actualEvidence) {
+          drift.push(`changed package script command evidence: ${row.id}`)
+        }
       }
       continue
     }
@@ -363,20 +406,10 @@ function hasListenerCapability(contents: string): boolean {
 }
 
 function isCapabilityScanPath(relativePath: string): boolean {
-  if (isIgnoredRelativePath(relativePath) || !isSourcePath(relativePath)) return false
-  return [
-    'config/',
-    'crates/',
-    'electron/',
-    'examples/',
-    'port/',
-    'scripts/',
-    'server/',
-    'shared/',
-    'src/',
-    'test/',
-    'tools/',
-  ].some((prefix) => relativePath.startsWith(prefix))
+  // Source need not be executable to be launched by a manifest-listed package
+  // command. Scan every non-ignored Node source file so a root launcher target
+  // (or a target in a future source directory) cannot evade the boundary.
+  return !isIgnoredRelativePath(relativePath) && isSourcePath(relativePath)
 }
 
 function isReviewedAssertionOnlyListener(row: RuntimeSurface | undefined, relativePath: string): boolean {
