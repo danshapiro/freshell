@@ -99,6 +99,19 @@ describe('Rust-only distribution runtime contracts', () => {
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
   })
 
+  it('requires checkout-free Electron acceptance to prove an authenticated PTY round trip', () => {
+    const acceptance = readProjectFile('test/integration/electron/checkout-free-runtime.test.ts')
+
+    expect(acceptance).toContain("import WebSocket from 'ws'")
+    expect(acceptance).toContain("type: 'terminal.create'")
+    expect(acceptance).toContain("message.type === 'terminal.created'")
+    expect(acceptance).toContain("type: 'terminal.input'")
+    expect(acceptance).toContain('FRESHELL_ELECTRON_PTY_ROUNDTRIP_MARKER')
+    expect(acceptance).toContain("message.type === 'terminal.output'")
+    expect(acceptance).toContain("type: 'terminal.detach'")
+    expect(acceptance).toMatch(/await closeWebSocket\(ws\)/)
+  })
+
   it('runs the nonempty default Vitest lane without artifact prerequisites', () => {
     const workflow = readProjectFile('.github/workflows/typecheck-client.yml')
     const vitestConfig = readProjectFile('config/vitest/vitest.config.ts')
@@ -123,6 +136,7 @@ describe('Rust-only distribution runtime contracts', () => {
         expect(workflow).toContain("'crates/**'")
         expect(workflow).toContain("'Cargo.toml'")
         expect(workflow).toContain("'Cargo.lock'")
+        expect(workflow).toContain("'scripts/bundled-node-version.json'")
         expect(workflow).toContain("'tools/**'")
       }
       expect(workflow).toContain('toolchain: 1.96.0')
