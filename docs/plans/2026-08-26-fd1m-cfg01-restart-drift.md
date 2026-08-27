@@ -196,17 +196,23 @@ keeps formatting in one place; no new exports.
 - [ ] **Step 6: Run impacted-test verification**
 
 Only one spec file changed; no helper, config, or production code moved.
-Note: no `tsconfig` in this repo covers `test/` (`tsconfig.json` include is
-`src`, `shared`, `config/vite/vite.config.ts`; `tsconfig.server.json`
-includes `server`, `shared`), so the spec file has no `tsc` gate — its
-verification is the playwright execution itself (esbuild fails the transform
-on a syntax error) plus the linter-free direct review at the task gate. Run
-the repo typecheck as a cheap no-op guard and the e2e helper unit suite
-(none of its inputs changed):
+Note: the repo-owned typecheck configs exclude `test/` (`tsconfig.json`
+include is `src`, `shared`, `config/vite/vite.config.ts`; `tsconfig.server.json`
+includes `server`, `shared`), but CFG-01 has an item-scoped tsc gate:
+`test/e2e-browser/tsconfig.cfg01-check.json` covers exactly
+`specs/cfg01-lossless-writes.spec.ts` (house convention per
+`docs/plans/df1-evidence/CFG-01.md`, mirroring TERM-04/HARNESS-05). Its
+criterion is zero error lines attributed to the spec file — errors in
+pre-existing dependency files (e.g. `src/lib/perf-logger.ts`) reproduce
+identically on the base commit and are out of scope. Run the repo typecheck
+as a cheap guard, the e2e helper unit suite (none of its inputs changed), and
+the spec-attributed tsc gate:
 
-Run: `npm run typecheck && npm run test:e2e:helpers`
+Run: `npm run typecheck && npm run test:e2e:helpers && npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json 2>&1 | tee /tmp/cfg01-fd1m/task1-tsc.log; ! grep -F 'specs/cfg01-lossless-writes.spec.ts' /tmp/cfg01-fd1m/task1-tsc.log`
 
-Expected: PASS.
+Expected: PASS — typecheck and helper suite exit zero; the tsc log contains
+no line naming `specs/cfg01-lossless-writes.spec.ts` (the trailing grep fails
+the step if any spec-attributed type error exists).
 
 - [ ] **Step 7: Commit the task**
 
@@ -399,17 +405,20 @@ that contradicts it (no behavior). Confirm no duplicated constant strings
 - [ ] **Step 6: Run impacted-test verification**
 
 Blast radius is the one spec file. Impact set = the spec itself (Step 4),
-plus the repo typecheck no-op guard (`test/` is not covered by any tsconfig —
-see Task 1 Step 6), the e2e helper unit suite, and the sibling rust-only
+plus the repo typecheck guard (`tsconfig.json`/`tsconfig.server.json`
+exclude `test/`; the CFG-01 item-scoped tsc gate below carries the
+spec-file check — same convention as Task 1 Step 6), the e2e helper unit
+suite, and the sibling rust-only
 config specs that share the spawned-binary + config-on-disk pattern, to catch
 any accidental shared-assumption change (there should be none — no helper
 moved):
 
-Run: `npm run typecheck && npm run test:e2e:helpers && npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --retries=0 --reporter=line specs/cfg01-lossless-writes.spec.ts specs/cfg03-backup-restore.spec.ts specs/cfg04-legacy-browser-seed.spec.ts`
+Run: `npm run typecheck && npm run test:e2e:helpers && npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json 2>&1 | tee /tmp/cfg01-fd1m/task2-tsc.log; ! grep -F 'specs/cfg01-lossless-writes.spec.ts' /tmp/cfg01-fd1m/task2-tsc.log && npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --retries=0 --reporter=line specs/cfg01-lossless-writes.spec.ts specs/cfg03-backup-restore.spec.ts specs/cfg04-legacy-browser-seed.spec.ts`
 
-Expected: PASS (`cfg01`: 2 passed; `cfg03`/`cfg04`: all passed — unmodified
+Expected: PASS — no spec-attributed tsc error lines; `cfg01`: 2 passed;
+`cfg03`/`cfg04`: all passed — unmodified
 siblings must be exactly as green or red as they were on the base commit, and
-no `[cfg01-lossless] UNEXPECTED DRIFT` line appears).
+no `[cfg01-lossless] UNEXPECTED DRIFT` line appears.
 
 - [ ] **Step 7: Commit the task**
 
