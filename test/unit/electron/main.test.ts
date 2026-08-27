@@ -91,6 +91,40 @@ describe('initMainProcess', () => {
     expect(deps.stopServer).toHaveBeenCalled()
   })
 
+  it('prevents the initial quit until a slow stop settles, then resumes once', async () => {
+    let finishStop!: () => void
+    ;(deps.stopServer as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise<void>((resolve) => {
+      finishStop = resolve
+    }))
+    await initMainProcess(deps)
+
+    const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+    const firstQuit = { preventDefault: vi.fn() }
+    beforeQuit(firstQuit)
+
+    expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+    expect(app.quit).not.toHaveBeenCalled()
+
+    // A second quit request while cleanup is pending is still blocked, but it
+    // must not start another stop operation.
+    const duplicateQuit = { preventDefault: vi.fn() }
+    beforeQuit(duplicateQuit)
+    expect(duplicateQuit.preventDefault).toHaveBeenCalledTimes(1)
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+    expect(app.quit).not.toHaveBeenCalled()
+
+    finishStop()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(app.quit).toHaveBeenCalledTimes(1)
+
+    // The resumed quit is allowed through and does not stop the server again.
+    const resumedQuit = { preventDefault: vi.fn() }
+    beforeQuit(resumedQuit)
+    expect(resumedQuit.preventDefault).not.toHaveBeenCalled()
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+  })
+
   it('activate shows window on macOS', async () => {
     await initMainProcess(deps)
     app.emit('activate')
