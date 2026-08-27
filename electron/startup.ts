@@ -5,8 +5,7 @@ import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.
 import { registerRendererRecovery, type RecoverableWebContents } from './renderer-recovery.js'
 import { resolveCandidateToken } from './token-resolver.js'
 import type { DesktopConfig, ForcedLaunch, LaunchServerCandidate } from './types.js'
-import type { DaemonManager } from './daemon/daemon-manager.js'
-import type { ServerSpawner } from './server-spawner.js'
+import type { ServerSpawnResources, ServerSpawner } from './server-spawner.js'
 import type { HotkeyManager } from './hotkey.js'
 import type { WindowStatePersistence } from './window-state.js'
 import type { UpdateManager } from './updater.js'
@@ -31,7 +30,6 @@ export interface BrowserWindowConstructor {
 
 export interface StartupContext {
   desktopConfig: DesktopConfig
-  daemonManager: DaemonManager
   serverSpawner: ServerSpawner
   hotkeyManager: HotkeyManager
   windowStatePersistence: WindowStatePersistence
@@ -56,6 +54,65 @@ export interface StartupContext {
    * skips discovery and policy and performs exactly this action.
    */
   forcedLaunch?: ForcedLaunch
+}
+
+/**
+ * Resolve the complete runtime contract passed to the Rust server. The Rust
+ * process owns the HTTP server; the Electron process only supplies the paths
+ * it needs for its optional Node-based sidecars and static client assets.
+ */
+export function resolveDesktopRuntimeResources(
+  resourcesPath: string | undefined,
+  platform: NodeJS.Platform,
+  isDev: boolean,
+  configDir: string,
+): ServerSpawnResources {
+  if (!path.isAbsolute(configDir)) {
+    throw new Error('configDir must be an absolute path')
+  }
+  if (path.basename(path.normalize(configDir)) !== '.freshell') {
+    throw new Error('configDir must end with .freshell')
+  }
+
+  const homeDir = path.dirname(configDir)
+  const executable = platform === 'win32' ? 'freshell-server.exe' : 'freshell-server'
+  const nodeExecutable = platform === 'win32' ? 'node.exe' : 'node'
+  const repoRoot = path.resolve(process.cwd())
+
+  if (isDev) {
+    const sidecarNodeRuntime = process.env.FRESHELL_CLAUDE_NODE
+      ?? process.env.npm_node_execpath
+      ?? process.execPath
+    return {
+      serverBinary: path.join(repoRoot, 'target', 'debug', executable),
+      clientDir: path.join(repoRoot, 'dist', 'client'),
+      claudeNodeBinary: sidecarNodeRuntime,
+      claudeSidecarEntry: process.env.FRESHELL_CLAUDE_SIDECAR
+        ?? path.join(repoRoot, 'crates', 'freshell-claude-sidecar', 'index.mjs'),
+      mcpNodeBinary: process.env.FRESHELL_MCP_NODE ?? sidecarNodeRuntime,
+      mcpEntry: process.env.FRESHELL_MCP_ENTRY
+        ?? path.join(repoRoot, 'dist', 'tools', 'freshell-mcp', 'server.js'),
+      homeDir,
+      configDir,
+      logDir: path.join(configDir, 'logs'),
+    }
+  }
+
+  if (!resourcesPath) {
+    throw new Error('resourcesPath is required for production app-bound mode')
+  }
+
+  return {
+    serverBinary: path.join(resourcesPath, 'bin', executable),
+    clientDir: path.join(resourcesPath, 'client'),
+    claudeNodeBinary: path.join(resourcesPath, 'node', 'bin', nodeExecutable),
+    claudeSidecarEntry: path.join(resourcesPath, 'claude-sidecar', 'index.mjs'),
+    mcpNodeBinary: path.join(resourcesPath, 'node', 'bin', nodeExecutable),
+    mcpEntry: path.join(resourcesPath, 'mcp', 'server.js'),
+    homeDir,
+    configDir,
+    logDir: path.join(configDir, 'logs'),
+  }
 }
 
 export type StartupResult =
@@ -245,35 +302,19 @@ async function loadMainWindow(
 }
 
 async function startAppBoundServer(ctx: StartupContext, port: number): Promise<string> {
-  if (ctx.isDev) {
-    await ctx.serverSpawner.start({
-      spawn: {
-        mode: 'dev',
-        tsxPath: 'npx',
-        serverSourceEntry: 'server/index.ts',
-      },
-      port,
-      envFile: path.join(ctx.configDir, '.env'),
-      configDir: ctx.configDir,
-    })
-    return 'http://localhost:5173'
-  }
-
-  if (!ctx.resourcesPath) {
-    throw new Error('resourcesPath is required for production app-bound mode')
-  }
-  const resourcesPath = ctx.resourcesPath
+  const resources = resolveDesktopRuntimeResources(
+    ctx.resourcesPath,
+    ctx.platform,
+    ctx.isDev,
+    ctx.configDir,
+  )
+  const authToken = ctx.readEnvToken
+    ? await ctx.readEnvToken(path.join(resources.configDir, '.env'))
+    : undefined
   await ctx.serverSpawner.start({
-    spawn: {
-      mode: 'production',
-      nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', ctx.platform === 'win32' ? 'node.exe' : 'node'),
-      serverEntry: path.join(resourcesPath, 'server', 'index.js'),
-      nativeModulesDir: path.join(resourcesPath, 'bundled-node', 'native-modules'),
-      serverNodeModulesDir: path.join(resourcesPath, 'server-node-modules'),
-    },
+    resources,
     port,
-    envFile: path.join(ctx.configDir, '.env'),
-    configDir: ctx.configDir,
+    authToken,
   })
   return `http://localhost:${port}`
 }
@@ -342,17 +383,6 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   let serverUrl: string
 
   switch (desktopConfig.serverMode) {
-    case 'daemon': {
-      const status = await ctx.daemonManager.status()
-      if (!status.installed) {
-        throw new Error('Daemon service is not installed. Please re-run setup to configure the daemon.')
-      }
-      if (!status.running) {
-        await ctx.daemonManager.start()
-      }
-      serverUrl = `http://localhost:${port}`
-      break
-    }
     case 'app-bound': {
       serverUrl = await startAppBoundServer(ctx, port)
       break

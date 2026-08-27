@@ -61,15 +61,6 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
       minimizeToTray: true,
       setupCompleted: true,
     },
-    daemonManager: {
-      platform: 'linux',
-      install: vi.fn().mockResolvedValue(undefined),
-      uninstall: vi.fn().mockResolvedValue(undefined),
-      start: vi.fn().mockResolvedValue(undefined),
-      stop: vi.fn().mockResolvedValue(undefined),
-      status: vi.fn().mockResolvedValue({ installed: true, running: true, pid: 12345 }),
-      isInstalled: vi.fn().mockResolvedValue(true),
-    },
     serverSpawner: {
       start: vi.fn().mockResolvedValue(undefined),
       stop: vi.fn().mockResolvedValue(undefined),
@@ -131,87 +122,22 @@ describe('runStartup', () => {
     expect(result.type).toBe('wizard')
   })
 
-  describe('daemon mode', () => {
-    it('does not start daemon if already running', async () => {
-      const ctx = createDefaultContext({
-        desktopConfig: {
-          serverMode: 'daemon',
-          port: 3001,
-          knownServers: [],
-          alwaysAskOnLaunch: false,
-          globalHotkey: 'CommandOrControl+`',
-          startOnLogin: false,
-          minimizeToTray: true,
-          setupCompleted: true,
-        },
-      })
-      ;(ctx.daemonManager.status as ReturnType<typeof vi.fn>).mockResolvedValue({
-        installed: true,
-        running: true,
-        pid: 12345,
-      })
-
-      await runStartup(ctx)
-      expect(ctx.daemonManager.status).toHaveBeenCalled()
-      expect(ctx.daemonManager.start).not.toHaveBeenCalled()
-    })
-
-    it('starts daemon if not running', async () => {
-      const ctx = createDefaultContext({
-        desktopConfig: {
-          serverMode: 'daemon',
-          port: 3001,
-          knownServers: [],
-          alwaysAskOnLaunch: false,
-          globalHotkey: 'CommandOrControl+`',
-          startOnLogin: false,
-          minimizeToTray: true,
-          setupCompleted: true,
-        },
-      })
-      ;(ctx.daemonManager.status as ReturnType<typeof vi.fn>).mockResolvedValue({
-        installed: true,
-        running: false,
-      })
-
-      await runStartup(ctx)
-      expect(ctx.daemonManager.start).toHaveBeenCalled()
-    })
-
-    it('throws if daemon not installed', async () => {
-      const ctx = createDefaultContext({
-        desktopConfig: {
-          serverMode: 'daemon',
-          port: 3001,
-          knownServers: [],
-          alwaysAskOnLaunch: false,
-          globalHotkey: 'CommandOrControl+`',
-          startOnLogin: false,
-          minimizeToTray: true,
-          setupCompleted: true,
-        },
-      })
-      ;(ctx.daemonManager.status as ReturnType<typeof vi.fn>).mockResolvedValue({
-        installed: false,
-        running: false,
-      })
-
-      await expect(runStartup(ctx)).rejects.toThrow('not installed')
-    })
-  })
-
   describe('app-bound mode', () => {
-    it('spawns server in production mode with paths from resourcesPath', async () => {
+    it('spawns the Rust server with packaged resources', async () => {
       const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       const result = await runStartup(ctx)
 
       expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(startArgs.spawn.mode).toBe('production')
-      expect(norm(startArgs.spawn.nodeBinary)).toContain('/app/resources/bundled-node/bin/node')
-      expect(norm(startArgs.spawn.serverEntry)).toContain('/app/resources/server/index.js')
-      expect(norm(startArgs.spawn.nativeModulesDir)).toContain('/app/resources/bundled-node/native-modules')
-      expect(norm(startArgs.spawn.serverNodeModulesDir)).toContain('/app/resources/server-node-modules')
+      expect(norm(startArgs.resources.serverBinary)).toContain('/app/resources/bin/freshell-server')
+      expect(norm(startArgs.resources.clientDir)).toContain('/app/resources/client')
+      expect(norm(startArgs.resources.claudeNodeBinary)).toContain('/app/resources/node/bin/node')
+      expect(norm(startArgs.resources.claudeSidecarEntry)).toContain('/app/resources/claude-sidecar/index.mjs')
+      expect(norm(startArgs.resources.mcpNodeBinary)).toContain('/app/resources/node/bin/node')
+      expect(norm(startArgs.resources.mcpEntry)).toContain('/app/resources/mcp/server.js')
+      expect(startArgs.resources.configDir).toBe('/home/user/.freshell')
+      expect(startArgs.resources.homeDir).toBe('/home/user')
+      expect(startArgs.resources.logDir).toBe('/home/user/.freshell/logs')
       expect(result.type).toBe('main')
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
@@ -227,7 +153,8 @@ describe('runStartup', () => {
       const result = await runStartup(ctx)
       expect(result.type).toBe('main')
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(startArgs.spawn.nodeBinary).toMatch(/node\.exe$/)
+      expect(startArgs.resources.claudeNodeBinary).toMatch(/node\.exe$/)
+      expect(startArgs.resources.mcpNodeBinary).toMatch(/node\.exe$/)
     })
 
     it('uses node (no .exe) on Linux platform', async () => {
@@ -239,8 +166,8 @@ describe('runStartup', () => {
       const result = await runStartup(ctx)
       expect(result.type).toBe('main')
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(norm(startArgs.spawn.nodeBinary)).toMatch(/\/node$/)
-      expect(startArgs.spawn.nodeBinary).not.toMatch(/\.exe$/)
+      expect(norm(startArgs.resources.claudeNodeBinary)).toMatch(/\/node$/)
+      expect(startArgs.resources.claudeNodeBinary).not.toMatch(/\.exe$/)
     })
 
     it('throws if resourcesPath is missing in production mode', async () => {
@@ -248,15 +175,15 @@ describe('runStartup', () => {
       await expect(runStartup(ctx)).rejects.toThrow('resourcesPath is required')
     })
 
-    it('uses tsx in dev mode and points at Vite dev server', async () => {
+    it('uses the debug Rust server in dev mode', async () => {
       const ctx = createDefaultContext({ isDev: true })
       const result = await runStartup(ctx)
 
       expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(startArgs.spawn.mode).toBe('dev')
+      expect(norm(startArgs.resources.serverBinary)).toMatch(/target\/debug\/freshell-server$/)
       if (result.type === 'main') {
-        expect(result.serverUrl).toBe('http://localhost:5173')
+        expect(result.serverUrl).toBe('http://localhost:3001')
       }
     })
   })
@@ -309,7 +236,6 @@ describe('runStartup', () => {
       expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
       expect(fetchAuthenticated).toHaveBeenCalledWith('http://10.0.0.5:3001/api/settings', 'vpn-token')
       expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
-      expect(ctx.daemonManager.status).not.toHaveBeenCalled()
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://10.0.0.5:3001')
         const window = (ctx.createBrowserWindow as ReturnType<typeof vi.fn>).mock.results[0].value
@@ -1026,23 +952,6 @@ describe('runStartup', () => {
       })
       await runStartup(ctx)
       expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=a%2Bb%26c%23d%20')
-    })
-
-    it('appends ?token= to URL for daemon mode', async () => {
-      const mockWindow = createMockWindow()
-      const ctx = createDefaultContext({
-        desktopConfig: {
-          serverMode: 'daemon',
-          globalHotkey: 'CommandOrControl+`',
-          startOnLogin: false,
-          minimizeToTray: true,
-          setupCompleted: true,
-        },
-        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
-        readEnvToken: vi.fn().mockResolvedValue('daemon-token-xyz'),
-      })
-      await runStartup(ctx)
-      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=daemon-token-xyz')
     })
 
     it('appends ?token= to URL for remote mode using remoteToken', async () => {

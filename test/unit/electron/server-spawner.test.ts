@@ -1,20 +1,17 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
 
-// Mock child_process.spawn
 const mockSpawn = vi.fn()
 vi.mock('child_process', () => ({
   spawn: (...args: any[]) => mockSpawn(...args),
 }))
 
-// Mock http.get for health check
 const mockHttpGet = vi.fn()
 vi.mock('http', () => ({
   default: { get: (...args: any[]) => mockHttpGet(...args) },
   get: (...args: any[]) => mockHttpGet(...args),
 }))
 
-// Mock fs for log file
 const mockCreateWriteStream = vi.fn().mockReturnValue({ write: vi.fn(), end: vi.fn() })
 vi.mock('fs', () => ({
   default: {
@@ -25,42 +22,57 @@ vi.mock('fs', () => ({
   mkdirSync: vi.fn(),
 }))
 
-import { createServerSpawner, type ServerSpawnMode } from '../../../electron/server-spawner.js'
+import {
+  createServerSpawner,
+  type ServerSpawnResources,
+} from '../../../electron/server-spawner.js'
 
-function createMockProcess() {
+function createMockProcess(pid = 1234) {
   const proc = new EventEmitter() as EventEmitter & {
     pid: number
     stdout: EventEmitter
     stderr: EventEmitter
     kill: ReturnType<typeof vi.fn>
   }
-  proc.pid = 1234
+  proc.pid = pid
   proc.stdout = new EventEmitter()
   proc.stderr = new EventEmitter()
-  proc.kill = vi.fn()
+  proc.kill = vi.fn().mockReturnValue(true)
   return proc
 }
 
-function setupHealthCheckSuccess() {
-  mockHttpGet.mockImplementation((_url: string, callback: Function) => {
-    const response = new EventEmitter() as EventEmitter & { statusCode: number }
-    response.statusCode = 200
-    callback(response)
-    response.emit('data', '{"ok":true}')
-    response.emit('end')
-    return { on: vi.fn() }
-  })
+function resources(): ServerSpawnResources {
+  return {
+    serverBinary: '/app/resources/bin/freshell-server',
+    clientDir: '/app/resources/client with spaces',
+    claudeNodeBinary: '/app/resources/node/bin/node',
+    claudeSidecarEntry: '/app/resources/claude-sidecar/index.mjs',
+    mcpNodeBinary: '/app/resources/node/bin/node',
+    mcpEntry: '/app/resources/mcp/server.js',
+    homeDir: '/home/user',
+    configDir: '/home/user/.freshell with spaces',
+    logDir: '/home/user/.freshell with spaces/logs',
+  }
 }
 
-function setupHealthCheckFailure() {
-  mockHttpGet.mockImplementation((_url: string, _callback: Function) => {
-    const req = { on: vi.fn() }
-    // Simulate connection refused
-    req.on.mockImplementation((event: string, cb: Function) => {
-      if (event === 'error') {
-        setTimeout(() => cb(new Error('ECONNREFUSED')), 5)
-      }
-    })
+function response(statusCode: number, body: unknown): EventEmitter & { statusCode: number } {
+  const result = new EventEmitter() as EventEmitter & { statusCode: number }
+  result.statusCode = statusCode
+  queueMicrotask(() => {
+    result.emit('data', JSON.stringify(body))
+    result.emit('end')
+  })
+  return result
+}
+
+function setupRustReadiness(info: Record<string, unknown> = { runtime: 'rust', commit: 'abc123', buildDirty: false }) {
+  mockHttpGet.mockImplementation((url: string, ...args: any[]) => {
+    const callback = (typeof args[0] === 'function' ? args[0] : args[1]) as
+      (res: EventEmitter & { statusCode: number }) => void
+    const req = new EventEmitter() as EventEmitter & { setTimeout: (ms: number, cb: () => void) => void; destroy: () => void }
+    req.setTimeout = vi.fn()
+    req.destroy = vi.fn()
+    queueMicrotask(() => callback(response(200, url.endsWith('/server-info') ? info : { ok: true })))
     return req
   })
 }
@@ -78,312 +90,135 @@ describe('ServerSpawner', () => {
     vi.useRealTimers()
   })
 
-  describe('production mode', () => {
-    it('spawns nodeBinary with serverEntry and NODE_ENV=production', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
+  it('spawns the Rust binary with no server script and the explicit runtime env contract', async () => {
+    const proc = createMockProcess()
+    mockSpawn.mockReturnValue(proc)
+    setupRustReadiness()
 
-      const promise = spawner.start({
-        spawn: {
-          mode: 'production',
-          nodeBinary: '/app/bundled-node/bin/node',
-          serverEntry: '/app/server/index.js',
-          nativeModulesDir: '/app/resources/bundled-node/native-modules',
-          serverNodeModulesDir: '/app/resources/server-node-modules',
-        },
-        port: 3001,
-        envFile: '/home/user/.freshell/.env',
-        configDir: '/home/user/.freshell',
-      })
+    await spawner.start({ resources: resources(), port: 4311, authToken: 'secret-token' })
 
-      await promise
-
-      expect(mockSpawn).toHaveBeenCalledTimes(1)
-      const [cmd, args, opts] = mockSpawn.mock.calls[0]
-      expect(cmd).toBe('/app/bundled-node/bin/node')
-      expect(args).toContain('/app/server/index.js')
-      expect(opts.env.NODE_ENV).toBe('production')
+    expect(mockSpawn).toHaveBeenCalledTimes(1)
+    const [command, args, options] = mockSpawn.mock.calls[0]
+    expect(command).toBe('/app/resources/bin/freshell-server')
+    expect(args).toEqual([])
+    expect(options.cwd).toBe('/home/user/.freshell with spaces')
+    expect(options.env).toMatchObject({
+      PORT: '4311',
+      FRESHELL_HOME: '/home/user',
+      FRESHELL_CLIENT_DIR: '/app/resources/client with spaces',
+      FRESHELL_CLAUDE_NODE: '/app/resources/node/bin/node',
+      FRESHELL_CLAUDE_SIDECAR: '/app/resources/claude-sidecar/index.mjs',
+      FRESHELL_MCP_NODE: '/app/resources/node/bin/node',
+      FRESHELL_MCP_ENTRY: '/app/resources/mcp/server.js',
     })
+    expect(options.env.NODE_PATH).toBeUndefined()
+    expect(spawner.pid()).toBe(1234)
+    expect(spawner.isRunning()).toBe(true)
 
-    it('sets cwd to configDir when spawning server', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
-
-      await spawner.start({
-        spawn: {
-          mode: 'production',
-          nodeBinary: '/app/bundled-node/bin/node',
-          serverEntry: '/app/server/index.js',
-          nativeModulesDir: '/app/resources/bundled-node/native-modules',
-          serverNodeModulesDir: '/app/resources/server-node-modules',
-        },
-        port: 3001,
-        envFile: '/home/user/.freshell/.env',
-        configDir: '/home/user/.freshell',
-      })
-
-      const [, , opts] = mockSpawn.mock.calls[0]
-      expect(opts.cwd).toBe('/home/user/.freshell')
-    })
-
-    it('sets NODE_PATH with nativeModulesDir before serverNodeModulesDir', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
-
-      await spawner.start({
-        spawn: {
-          mode: 'production',
-          nodeBinary: '/app/bundled-node/bin/node',
-          serverEntry: '/app/server/index.js',
-          nativeModulesDir: '/app/resources/bundled-node/native-modules',
-          serverNodeModulesDir: '/app/resources/server-node-modules',
-        },
-        port: 3001,
-        envFile: '/home/user/.freshell/.env',
-        configDir: '/home/user/.freshell',
-      })
-
-      const [, , opts] = mockSpawn.mock.calls[0]
-      const nodePath = opts.env.NODE_PATH
-      expect(nodePath).toBeDefined()
-      // native-modules should come first so recompiled node-pty wins
-      expect(nodePath.indexOf('/app/resources/bundled-node/native-modules'))
-        .toBeLessThan(nodePath.indexOf('/app/resources/server-node-modules'))
-    })
+    const infoRequest = mockHttpGet.mock.calls.find(([url]: [string]) => url.endsWith('/api/server-info'))
+    expect(infoRequest?.[1]?.headers).toEqual({ 'x-auth-token': 'secret-token' })
   })
 
-  describe('dev mode', () => {
-    it('spawns tsx with server source entry without NODE_ENV=production', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
+  it('requires authenticated Rust server-info provenance before start resolves', async () => {
+    const proc = createMockProcess()
+    mockSpawn.mockReturnValue(proc)
+    setupRustReadiness({ runtime: 'node', commit: 'legacy' })
 
-      await spawner.start({
-        spawn: {
-          mode: 'dev',
-          tsxPath: 'npx',
-          serverSourceEntry: 'server/index.ts',
-        },
-        port: 3001,
-        envFile: '/home/user/.freshell/.env',
-        configDir: '/home/user/.freshell',
-      })
-
-      expect(mockSpawn).toHaveBeenCalledTimes(1)
-      const [cmd, args, opts] = mockSpawn.mock.calls[0]
-      expect(cmd).toBe('npx')
-      expect(args).toContain('tsx')
-      expect(args).toContain('server/index.ts')
-      expect(opts.env.NODE_ENV).toBeUndefined()
-    })
-
-    it('sets cwd to configDir when spawning in dev mode', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
-
-      await spawner.start({
-        spawn: {
-          mode: 'dev',
-          tsxPath: 'npx',
-          serverSourceEntry: 'server/index.ts',
-        },
-        port: 3001,
-        envFile: '/home/user/.freshell/.env',
-        configDir: '/home/user/.freshell',
-      })
-
-      const [, , opts] = mockSpawn.mock.calls[0]
-      expect(opts.cwd).toBe('/home/user/.freshell')
-    })
+    await expect(spawner.start({
+      resources: resources(),
+      port: 4312,
+      authToken: 'secret-token',
+      healthCheckTimeoutMs: 250,
+    })).rejects.toThrow(/runtime.*rust/i)
   })
 
-  describe('start', () => {
-    it('polls health endpoint and resolves on success', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
+  it('clears ownership when the captured child closes or errors', async () => {
+    const proc = createMockProcess()
+    mockSpawn.mockReturnValue(proc)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4313, authToken: 'secret-token' })
 
-      await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-      })
+    proc.emit('close', 0)
+    expect(spawner.isRunning()).toBe(false)
+    expect(spawner.pid()).toBeUndefined()
 
-      expect(mockHttpGet).toHaveBeenCalled()
-      expect(spawner.isRunning()).toBe(true)
-      expect(spawner.pid()).toBe(1234)
-    })
-
-    it('rejects if health check times out', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckFailure()
-
-      const promise = spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-        healthCheckTimeoutMs: 500,
-      })
-
-      // Advance time to trigger timeout
-      await vi.advanceTimersByTimeAsync(600)
-
-      await expect(promise).rejects.toThrow()
-    })
-
-    it('rejects early if process exits before health check succeeds', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckFailure()
-
-      const promise = spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-        healthCheckTimeoutMs: 30_000,
-      })
-
-      // Attach the rejection handler BEFORE advancing timers to avoid unhandled rejection
-      const rejection = expect(promise).rejects.toThrow('Server process exited before health check succeeded')
-
-      // Simulate the process crashing before health check succeeds
-      proc.emit('close', 1)
-
-      // Advance timers so the health check retry loop can re-check
-      // and detect the process exit
-      await vi.advanceTimersByTimeAsync(500)
-
-      await rejection
-      expect(spawner.isRunning()).toBe(false)
-    })
-
-    it('sets isRunning() to false when process exits during health check', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckFailure()
-
-      const promise = spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-        healthCheckTimeoutMs: 30_000,
-      })
-
-      // Attach the rejection handler BEFORE advancing timers to avoid unhandled rejection
-      const rejection = expect(promise).rejects.toThrow('Server process exited')
-
-      // isRunning is initially true after spawn
-      expect(spawner.isRunning()).toBe(true)
-
-      // Process exits (error event)
-      proc.emit('error', new Error('spawn ENOENT'))
-
-      // isRunning should now be false even though start() hasn't resolved yet
-      expect(spawner.isRunning()).toBe(false)
-
-      // Let the health check loop detect the exit
-      await vi.advanceTimersByTimeAsync(500)
-      await rejection
-    })
+    const proc2 = createMockProcess(5678)
+    mockSpawn.mockReturnValue(proc2)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4314, authToken: 'secret-token' })
+    proc2.emit('error', new Error('spawn failed'))
+    expect(spawner.isRunning()).toBe(false)
+    expect(spawner.pid()).toBeUndefined()
   })
 
-  describe('stop', () => {
-    it('sends SIGTERM to the process', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
+  it('stops only the exact captured child and resolves after graceful close', async () => {
+    const owned = createMockProcess(7001)
+    const foreign = createMockProcess(7002)
+    mockSpawn.mockReturnValue(owned)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4315, authToken: 'secret-token' })
 
-      await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-      })
-
-      const stopPromise = spawner.stop()
-      proc.emit('close', 0)
-      await stopPromise
-
-      expect(proc.kill).toHaveBeenCalledWith('SIGTERM')
+    owned.kill.mockImplementation((signal: string) => {
+      if (signal === 'SIGTERM') queueMicrotask(() => owned.emit('close', 0))
+      return true
     })
+    await spawner.stop()
 
-    it('removes start() close listener and uses once() to avoid listener accumulation', async () => {
-      const proc = createMockProcess()
-      mockSpawn.mockReturnValue(proc)
-      setupHealthCheckSuccess()
-
-      await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-      })
-
-      // After start(), there should be close listeners from start()
-      const closeListenersBefore = proc.listenerCount('close')
-
-      const stopPromise = spawner.stop()
-
-      // After stop() is called (before close fires), the start() listeners
-      // should have been removed and replaced with a single once() listener.
-      // once() still counts as a listener until it fires.
-      const closeListenersDuring = proc.listenerCount('close')
-      // Should have exactly 1 close listener (the once() from stop())
-      expect(closeListenersDuring).toBe(1)
-
-      proc.emit('close', 0)
-      await stopPromise
-
-      // After close fires, the once() listener auto-removes
-      const closeListenersAfter = proc.listenerCount('close')
-      expect(closeListenersAfter).toBe(0)
-    })
+    expect(owned.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(owned.kill).not.toHaveBeenCalledWith('SIGKILL')
+    expect(foreign.kill).not.toHaveBeenCalled()
+    expect(spawner.pid()).toBeUndefined()
   })
 
-  describe('isRunning', () => {
-    it('reflects process state', () => {
-      expect(spawner.isRunning()).toBe(false)
+  it('escalates the exact child and waits for its close after SIGKILL', async () => {
+    const owned = createMockProcess(7101)
+    mockSpawn.mockReturnValue(owned)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4316, authToken: 'secret-token' })
+
+    owned.kill.mockImplementation((signal: string) => {
+      if (signal === 'SIGKILL') queueMicrotask(() => owned.emit('close', 0))
+      return true
     })
+    const stopping = spawner.stop({ gracefulTimeoutMs: 10, forceTimeoutMs: 20 })
+    await vi.advanceTimersByTimeAsync(11)
+    expect(owned.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(owned.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    await stopping
+    expect(spawner.pid()).toBeUndefined()
   })
 
-  describe('double-start', () => {
-    it('kills old process first', async () => {
-      const proc1 = createMockProcess()
-      const proc2 = createMockProcess()
-      proc2.pid = 5678
-      mockSpawn.mockReturnValueOnce(proc1).mockReturnValueOnce(proc2)
-      setupHealthCheckSuccess()
+  it('reports a bounded failure when the exact child ignores both signals', async () => {
+    const owned = createMockProcess(7201)
+    mockSpawn.mockReturnValue(owned)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4317, authToken: 'secret-token' })
 
-      await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-      })
+    const stopping = spawner.stop({ gracefulTimeoutMs: 10, forceTimeoutMs: 20 })
+    const rejection = expect(stopping).rejects.toThrow(/did not exit/i)
+    await vi.advanceTimersByTimeAsync(31)
+    await rejection
+    expect(owned.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+    expect(owned.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    expect(spawner.pid()).toBe(7201)
+    expect(spawner.isRunning()).toBe(true)
+  })
 
-      // Simulate process exit for the kill
-      proc1.kill.mockImplementation(() => {
-        proc1.emit('close', 0)
-      })
-
-      await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
-        port: 3001,
-        envFile: '',
-        configDir: '',
-      })
-
-      expect(proc1.kill).toHaveBeenCalled()
-      expect(spawner.pid()).toBe(5678)
+  it('stops an existing exact child before a double-start', async () => {
+    const first = createMockProcess(7301)
+    const second = createMockProcess(7302)
+    mockSpawn.mockReturnValueOnce(first).mockReturnValueOnce(second)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4318, authToken: 'secret-token' })
+    first.kill.mockImplementation(() => {
+      queueMicrotask(() => first.emit('close', 0))
+      return true
     })
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4319, authToken: 'secret-token' })
+
+    expect(first.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(second.kill).not.toHaveBeenCalled()
+    expect(spawner.pid()).toBe(7302)
   })
 })
