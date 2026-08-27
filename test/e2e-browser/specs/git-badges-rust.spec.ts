@@ -5,7 +5,7 @@ import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * GIT BRANCH/DIRTY BADGES (Task 23, rust-only) -- e2e proof of the Rust
@@ -46,7 +46,7 @@ const BADGE_LABEL = 'badgerepo (main*)'
 
 interface BootedServer {
   server: E2eServerHandle
-  info: TestServerInfo
+  info: E2eServerInfo
   repoDir: string
 }
 
@@ -77,7 +77,6 @@ async function seedBadgeRepo(homeDir: string): Promise<string> {
 async function bootBadgeServer(): Promise<BootedServer> {
   let repoDir = ''
   const server = await createE2eServerHandle(process.env, {
-    kind: 'rust',
     construct: {
       setupHome: async (homeDir: string) => {
         repoDir = await seedBadgeRepo(homeDir)
@@ -89,7 +88,7 @@ async function bootBadgeServer(): Promise<BootedServer> {
   return { server, info, repoDir }
 }
 
-async function connect(page: Page, info: TestServerInfo): Promise<TestHarness> {
+async function connect(page: Page, info: E2eServerInfo): Promise<TestHarness> {
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
   await harness.waitForHarness()

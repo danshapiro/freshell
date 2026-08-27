@@ -10,7 +10,7 @@
  *      sessionRef (transcripts deleted server-side) yields the LOUD
  *      dead_session adjudication flow -- never a silent wrong-session attach
  *      and never a silent fresh.
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch.
+ * Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch.
  * Helpers copied, not imported, per this suite's per-spec-ownership
  * convention (donor: restore-contract-wall-rust.spec.ts).
  */
@@ -20,7 +20,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 // NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
@@ -132,7 +133,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -221,8 +222,7 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
 test.describe('Freshclaude identity persistence (P0.2)', () => {
   test.setTimeout(180_000)
 
-  test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -338,8 +338,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page }) => {
     // COUNCIL FOLLOW-UP (PR #562/#563 close-out, user-advocate's held
     // finding): every other journey in this suite (and the wall's leg G)
     // hand-cranks `persist/flushNow` before reloading -- a lever no real
@@ -415,8 +414,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('cold-open: persisted localStorage ALONE drives resume in a fresh browser context', async ({ page, browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('cold-open: persisted localStorage ALONE drives resume in a fresh browser context', async ({ page, browser }) => {
     // COUNCIL FOLLOW-UP (PR #562/#563 close-out, brian's cell): test 1
     // proves persistence in COMPOSITION (same page object reloads, so any
     // in-memory residue could in principle assist). This cell proves the
@@ -488,8 +486,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-stale-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })

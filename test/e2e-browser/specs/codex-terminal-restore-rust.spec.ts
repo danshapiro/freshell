@@ -15,7 +15,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * `codex ... resume <id>`.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `rust-chromium`-only `testMatch` entry for this file, and
+ * `Rust browser lane`-only `testMatch` entry for this file, and
  * `opencode-terminal-restore-rust.spec.ts`'s identical divergence note):
  * legacy has NO codex terminal rollout locator -- fresh codex terminal
  * identity there depended on the client's `terminal.codex.durability.updated`
@@ -161,20 +161,17 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 test.describe('Codex Terminal Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
-  test('a fresh codex terminal pane gains server-side identity and restores across a server restart via `codex resume <id>`, and a never-submitted pane restores fresh', async ({ page, e2eServerKind }) => {
-    // This spec is registered ONLY under the `rust-chromium` project
+  test('a fresh codex terminal pane gains server-side identity and restores across a server restart via `codex resume <id>`, and a never-submitted pane restores fresh', async ({ page }) => {
+    // This spec is registered ONLY under the `Rust browser lane` project
     // (`playwright.config.ts`), but assert the precondition explicitly so a
-    // future accidental `MATRIX_SPECS` inclusion fails loudly instead of
+    // future accidental `retired matrix list` inclusion fails loudly instead of
     // silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-terminal-restore-'))
     const argLogPath = path.join(sharedRoot, 'fake-codex-terminal-argv.jsonl')
     try {
       const fakeCodexPath = await installFakeCodexTerminal(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -313,7 +310,7 @@ test.describe('Codex Terminal Restore (Rust only)', () => {
         // fresh (no `resume`) for the never-submitted one.
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
         await server.restart()
 

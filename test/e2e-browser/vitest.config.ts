@@ -21,7 +21,7 @@ export default defineConfig({
     root: __dirname,
     globalSetup: [path.resolve(__dirname, '../setup/e2e-browser-global-setup.ts')],
     include: ['helpers/**/*.test.ts', 'perf/**/*.test.ts'],
-    testTimeout: 60_000, // TestServer startup can take a while
+    testTimeout: 60_000, // RustServer startup can take a while
     hookTimeout: 30_000,
   },
 })

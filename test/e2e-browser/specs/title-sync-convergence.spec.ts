@@ -12,7 +12,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * now mirror into pane titles via `applySessionRenameCascade`
  * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`
  * (`src/store/panesSlice.ts`). The client is SHARED by both backends, so this
- * spec runs on `rust-chromium` AND `legacy-chromium`; the legacy run is the
+ * spec runs on `Rust browser lane` AND `retired Node browser lane`; the legacy run is the
  * regression control proving the client fixes didn't regress Node behavior.
  *
  * Each test drives a REAL UI journey (or the automation REST surface, where
@@ -126,10 +126,9 @@ const test = base.extend<Record<never, never>, { sharedRootDir: string }>({
     await use(root)
     await fs.rm(root, { recursive: true, force: true }).catch(() => {})
   }, { scope: 'worker' }],
-  testServer: [async ({ e2eServerKind, sharedRootDir }, use) => {
+  testServer: [async ({ sharedRootDir }, use) => {
     const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRootDir, 'bin'))
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           CLAUDE_CMD: fakeClaudePath,
@@ -262,7 +261,7 @@ test.describe('Title sync convergence', () => {
   // pane in the server-side layout store, broadcasts `ui.command{pane.rename}`
   // (pane header), mirrors to the tab title (single-pane tab), and cascades
   // to the session override for a syncable coding-CLI pane (sidebar row via
-  // the changed-broadcast refetch). On legacy-chromium this already works
+  // the changed-broadcast refetch). On retired Node browser lane this already works
   // (Node behavior) -- the matrix run doubles as the regression control.
   test('automation PATCH /api/panes/:id converges pane header + tab + sidebar', async ({ freshellPage, page, harness, serverInfo }) => {
     const NEW_NAME = 'Automation Name Three'

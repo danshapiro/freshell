@@ -10,9 +10,9 @@ import { TestHarness } from '../helpers/test-harness.js'
 /**
  * SIDEBAR OPENCODE RAIL -- the user-level proof for the two sidebar bugs
  * fixed in `fix/sidebar-opencode-rail-fixes`. Runs against BOTH real
- * servers (default `chromium` project = Node, `rust-chromium` = Rust);
+ * servers (default `chromium` project = Node, `Rust browser lane` = Rust);
  * Node parity is part of the fix, so this spec is registered in the
- * rust-chromium `testMatch` rather than `RUST_ONLY_SPECS`.
+ * Rust browser lane `testMatch` rather than `RUST_ONLY_SPECS`.
  *
  *   - Bug 2: OpenCode's catch-all "global" project stores `worktree = '/'`.
  *     Treating that placeholder as a real checkout put every global-project
@@ -149,14 +149,13 @@ async function seedOpencodeDb(homeDir: string, workDir: string): Promise<void> {
 test.describe('sidebar opencode rail', () => {
   test.setTimeout(240_000)
 
-  test('global-project sessions show their real directory; subagent-target terminals stay off the rail', async ({ page, e2eServerKind }) => {
+  test('global-project sessions show their real directory; subagent-target terminals stay off the rail', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-oc-rail-'))
     try {
       const fakeOpencodePath = await installFakeOpencodeTerminal(path.join(sharedRoot, 'bin'))
       let childPaneDir = ''
       let childTerminalCwd = ''
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { OPENCODE_CMD: fakeOpencodePath },
           setupHome: async (homeDir: string) => {

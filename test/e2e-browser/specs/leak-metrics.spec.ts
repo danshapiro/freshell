@@ -23,8 +23,8 @@ import {
  * process or port behind, and fails with a retained process-tree artifact if
  * the bound is exceeded."
  *
- * What this spec proves on BOTH server kinds (legacy-chromium +
- * rust-chromium matrix projects, routed by the HARNESS-02 `e2eServerKind`
+ * What this spec proves on BOTH server kinds (retired Node browser lane +
+ * Rust browser lane matrix projects, routed by the HARNESS-02 `rustFixture`
  * fixture):
  *  1. The `leak-metrics` collector (helpers/leak-metrics.ts — logic unit-
  *     tested fixture-driven in leak-metrics.test.ts) captures the OWNED

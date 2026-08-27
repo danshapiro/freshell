@@ -26,7 +26,7 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  *       verify makes ZERO network calls in --after mode.
  *
  * Rust-only: legacy has no persisted snapshot generations. Registered ONLY
- * under `rust-chromium`; testIgnore'd via RUST_ONLY_SPECS everywhere else.
+ * under `Rust browser lane`; testIgnore'd via RUST_ONLY_SPECS everywhere else.
  *
  * EPHEMERAL-ONLY SAFETY: the server is constructed DIRECTLY via `new
  * RustServer(...)` -- throwaway binary, ephemeral loopback port, mkdtemp HOME.
@@ -80,8 +80,8 @@ async function closeCodexTab(page: import('@playwright/test').Page, harness: Tes
 }
 
 test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
-  test('verify passes when identity survives a restart and fails loudly + remediates when it does not', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust') // rust-only guard (also in every match-all project's testIgnore)
+  test('verify passes when identity survives a restart and fails loudly + remediates when it does not', async ({ page }) => {
+    // rust-only guard (also in every match-all project's testIgnore)
     test.setTimeout(240_000)
     // EPHEMERAL-ONLY: new RustServer(...) directly (never createE2eServerHandle).
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'fakecodex-'))

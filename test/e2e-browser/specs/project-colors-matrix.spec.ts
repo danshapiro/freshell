@@ -19,7 +19,7 @@ import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-of
  * broadcast → every open context refetches `/api/session-directory` whose
  * page now carries `projectColors` → the client's group overlay recolors
  * the History header swatch. Runs against BOTH server kinds via the
- * HARNESS-02 seam (`e2eServerKind`); legacy is a true parity control.
+ * HARNESS-02 seam (`rustFixture`); legacy is a true parity control.
  *
  * Seeds reuse the trimmed Claude-JSONL shape from
  * session-directory-matrix.spec.ts (the upstream corpus builder HARNESS-04
@@ -158,9 +158,8 @@ async function pickProjectColor(page: Page, projectPath: string, hex: string): P
 test.describe('SESSION-05 project colors (History project headers)', () => {
   test.setTimeout(120_000)
 
-  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser, page, e2eServerKind }) => {
+  test('color set in one browser renders in two contexts, persists across reload and restart, and leaves other projects unchanged', async ({ browser, page }) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           const projectsDir = path.join(homeDir, '.claude', 'projects')
@@ -246,7 +245,7 @@ test.describe('SESSION-05 project colors (History project headers)', () => {
 
       // --- Full server restart, SAME isolated home: still there. ---
       if (!server.restart) {
-        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+        throw new Error(`$() E2eServerHandle does not implement restart()`)
       }
       await server.restart()
       await expect(async () => {

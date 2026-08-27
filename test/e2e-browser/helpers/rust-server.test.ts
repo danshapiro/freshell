@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import http from 'node:http'
 import { RustServer, GEMINI_STRIP_ENV_PREFIXES } from './rust-server.js'
-import { findFreePort } from './test-server.js'
+import { findFreePort } from './server-fixture-support.js'
 
 describe('RustServer.start bind-race retry', () => {
   it('boots on a fresh port when the first picked port is occupied', async () => {

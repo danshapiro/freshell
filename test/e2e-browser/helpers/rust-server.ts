@@ -8,8 +8,9 @@ import { fileURLToPath } from 'node:url'
 import {
   findFreePort,
   applyIsolatedHomeEnvironment,
-  type TestServerInfo,
-} from './test-server.js'
+  ensureSetupWizardBypassConfig,
+  type E2eServerInfo,
+} from './server-fixture-support.js'
 import type { E2eServerHandle } from './external-target.js'
 
 /**
@@ -37,10 +38,9 @@ import type { E2eServerHandle } from './external-target.js'
  * before the server's graceful path finishes running. It is a backstop, not
  * the primary reap mechanism.
  *
- * This mirrors the Node `TestServer` (`test-server.ts`) isolation contract so
- * both fixtures share one safety story, and reuses its `findFreePort` /
- * `applyIsolatedHomeEnvironment` / `ensureSetupWizardBypassConfig` helpers
- * directly. The binary-path/build and health-poll logic is PORTED (not
+ * This owns the browser suite's Rust isolation contract and reuses the shared
+ * `findFreePort`, `applyIsolatedHomeEnvironment`, and setup-wizard helpers.
+ * The binary-path/build and health-poll logic is PORTED (not
  * imported) from the oracle harness's `port/oracle/harness/external-server.ts`
  * (`rustServerBinPath`, `ensureRustServerBuilt`, `startRustServer`,
  * `waitForRustHealth`) — ported rather than imported so the general-purpose
@@ -167,48 +167,19 @@ export function rustClientDistPath(root: string = PROJECT_ROOT): string {
   return path.join(root, 'dist', 'client')
 }
 
-async function readJsonFileIfPresent(filePath: string): Promise<Record<string, unknown> | null> {
-  try {
-    const parsed = JSON.parse(await fsp.readFile(filePath, 'utf8'))
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
+export function assertRustServerInfo(value: unknown): void {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Rust server-info response was not an object')
+  }
+  const info = value as Record<string, unknown>
+  if (info.runtime !== 'rust') {
+    throw new Error(`Rust server-info runtime must be "rust", received ${JSON.stringify(info.runtime)}`)
+  }
+  if (typeof info.commit !== 'string' || info.commit.length === 0) {
+    throw new Error('Rust server-info did not include build provenance (commit)')
   }
 }
 
-/**
- * Pre-seed `.freshell/config.json` with the setup-wizard bypass, byte-for-byte
- * the fields `test-server.ts`'s `ensureSetupWizardBypassConfig` writes for the
- * Node original, so both fixtures skip the same first-run wizard.
- * Source of truth: `test-server.ts`'s `ensureSetupWizardBypassConfig`
- * (currently module-private there, so this is a byte-for-byte PORT, not an
- * import -- same rationale as the `port/oracle/` pieces below: keep this
- * general-purpose fixture's imports scoped to what `test-server.ts` already
- * exports today). If that source drifts, re-sync this copy against it.
- */
-async function ensureSetupWizardBypassConfig(configPath: string): Promise<void> {
-  const existing = await readJsonFileIfPresent(configPath)
-  const existingSettings = existing && typeof existing.settings === 'object' && existing.settings !== null
-    ? existing.settings as Record<string, unknown>
-    : {}
-  const existingNetwork = existingSettings.network && typeof existingSettings.network === 'object'
-    ? existingSettings.network as Record<string, unknown>
-    : {}
-
-  await fsp.writeFile(configPath, JSON.stringify({
-    ...(existing ?? {}),
-    version: 1,
-    settings: {
-      ...existingSettings,
-      network: {
-        configured: true,
-        host: '127.0.0.1',
-        ...existingNetwork,
-      },
-    },
-  }, null, 2))
-}
 
 /**
  * Recursively enumerate the live descendant PIDs of `pid` (children,
@@ -282,6 +253,8 @@ export const GEMINI_STRIP_ENV_PREFIXES: string[] = [
 ]
 
 export interface RustServerOptions {
+  /** Use this port instead of allocating an ephemeral port. */
+  port?: number
   /** Reuse this isolated HOME instead of creating a fresh mkdtemp one. */
   homeDir?: string
   /** Preserve the isolated HOME after stop() (for audit/debugging). */
@@ -313,12 +286,12 @@ export interface RustServerOptions {
 
 /**
  * Owned Rust-server Playwright fixture (HARNESS-01). Implements the same
- * `E2eServerHandle` seam as the Node `TestServer` (`start`/`stop`/`info`),
+ * `E2eServerHandle` seam (`start`/`stop`/`info`),
  * plus `restart()` for same-home/same-port/same-token recovery testing.
  */
 export class RustServer implements E2eServerHandle {
   private process: ChildProcess | null = null
-  private _info: TestServerInfo | null = null
+  private _info: E2eServerInfo | null = null
   private homeDir: string | null = null
   private ownsHomeDir = false
   private stdoutBuffer = ''
@@ -329,12 +302,12 @@ export class RustServer implements E2eServerHandle {
     this.options = options
   }
 
-  get info(): TestServerInfo {
+  get info(): E2eServerInfo {
     if (!this._info) throw new Error('RustServer not started')
     return this._info
   }
 
-  async start(): Promise<TestServerInfo> {
+  async start(): Promise<E2eServerInfo> {
     if (this.process) throw new Error('RustServer already started')
 
     let homeDir: string
@@ -347,7 +320,9 @@ export class RustServer implements E2eServerHandle {
     }
     this.homeDir = homeDir
 
-    const pickPort = this.options.portPicker ?? findFreePort
+    const pickPort = this.options.port === undefined
+      ? this.options.portPicker ?? findFreePort
+      : async () => this.options.port!
     const token = this.options.token ?? randomUUID()
     const maxBootAttempts = 3
     let lastError: unknown
@@ -392,6 +367,7 @@ export class RustServer implements E2eServerHandle {
             `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
           )
         }
+        assertRustServerInfo(await identity.json().catch(() => null))
         return info
       } catch (error) {
         lastError = error
@@ -430,7 +406,7 @@ export class RustServer implements E2eServerHandle {
    * auto-reconnect targets the original port, so a restart onto a different
    * port would never let an existing page reconnect.
    */
-  async restart(): Promise<TestServerInfo> {
+  async restart(): Promise<E2eServerInfo> {
     const homeDir = this.homeDir
     const priorInfo = this._info
     if (!homeDir || !priorInfo) throw new Error('RustServer not started; cannot restart()')
@@ -452,7 +428,7 @@ export class RustServer implements E2eServerHandle {
    * here, not a backstop -- it must run BEFORE the reboot so an orphaned PTY
    * child can never linger past the fixture.
    */
-  async restartAbrupt(): Promise<TestServerInfo> {
+  async restartAbrupt(): Promise<E2eServerInfo> {
     const homeDir = this.homeDir
     const priorInfo = this._info
     if (!homeDir || !priorInfo) throw new Error('RustServer not started; cannot restartAbrupt()')
@@ -493,14 +469,14 @@ export class RustServer implements E2eServerHandle {
   }
 
   /** Spawn the binary bound to the given home/port/token and wait for health. */
-  private async boot(homeDir: string, port: number, token: string): Promise<TestServerInfo> {
+  private async boot(homeDir: string, port: number, token: string): Promise<E2eServerInfo> {
     const { bin, source } = resolveRustServerBin(process.env)
     if (source === 'override') {
       // eslint-disable-next-line no-console
       console.log(`[rust-server] using FRESHELL_E2E_RUST_SERVER_BIN=${bin} sha256=${rustServerBinSha256(bin).slice(0, 12)}`)
     }
 
-    // Ordering matches `TestServer.start()`: `setupHome` runs BEFORE the
+    // setupHome runs before the fixture writes its setup-wizard defaults.
     // wizard-bypass config write, so a caller-provided `setupHome` may
     // itself seed `.freshell/config.json` and have `ensureSetupWizardBypassConfig`
     // merge on top of it (rather than the bypass write happening first and

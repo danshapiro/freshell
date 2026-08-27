@@ -12,7 +12,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * the Rust port, on the LAUNCHER-ASSIGNED identity mechanism.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `rust-chromium`-only `testMatch` entry for this file, and
+ * `Rust browser lane`-only `testMatch` entry for this file, and
  * `session-directory-matrix.spec.ts`'s identical divergence note): this
  * checked-out branch's `server/` tree (legacy Node implementation, FROZEN
  * for this task) predates upstream `origin/main` commit `05c6b1fa`
@@ -155,13 +155,11 @@ async function openAmplifierPaneAndGetLeaf(
 test.describe('Amplifier Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
-  test('amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included', async ({ page, e2eServerKind }) => {
-    // This spec is registered ONLY under the `rust-chromium` project
+  test('amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included', async ({ page }) => {
+    // This spec is registered ONLY under the `Rust browser lane` project
     // (`playwright.config.ts`), but assert the precondition explicitly so a
-    // future accidental `MATRIX_SPECS` inclusion fails loudly instead of
+    // future accidental `retired matrix list` inclusion fails loudly instead of
     // silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
     // GATE-01 (2026-08-09): deterministic rust-side regression found by the
     // unchanged-suite gate — after the restart, `amplifier resume <id>` falls
     // back to "session could not be found on disk — started a fresh session"
@@ -171,7 +169,7 @@ test.describe('Amplifier Restore (Rust only)', () => {
     // content check; un-pin must re-verify the whole test per B001). Red in
     // the isolated rerun reproof-s3-amplifier-rust too — not load/flake.
     test.fail(
-      e2eServerKind === 'rust',
+      true,
       'TERM-27: amplifier resume across restart loses the on-disk session (GATE-01 2026-08-09)',
     )
 
@@ -181,7 +179,6 @@ test.describe('Amplifier Restore (Rust only)', () => {
       const fakeAmplifierPath = await installFakeAmplifierCli(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
@@ -338,7 +335,7 @@ test.describe('Amplifier Restore (Rust only)', () => {
         // BOTH panes must respawn with `resume <their-id>`.
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
         await server.restart()
 

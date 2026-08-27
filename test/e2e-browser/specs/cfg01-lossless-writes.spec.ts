@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test, expect } from '../helpers/fixtures.js'
-import { findFreePort, applyTestServerHomeEnvironment } from '../helpers/test-server.js'
+import { findFreePort, applyServerHomeEnvironment } from '../helpers/server-fixture-support.js'
 import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-server.js'
 
 /**
@@ -40,7 +40,7 @@ import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-serve
  *                              every other writer, asserted as sentinels in
  *                              every leg below.
  *
- * Why rust-only (not MATRIX_SPECS): the acceptance is `PW-RUST`, and the
+ * Why rust-only (not retired matrix list): the acceptance is `PW-RUST`, and the
  * Rust writer is a deliberate strict SUPERSET of the frozen legacy store —
  * legacy's `loadInternal` normalization REBUILDS `serverSecrets` down to
  * only `codexDisplayIdSecret` (`server/config-store.ts:348-355`), so the
@@ -165,7 +165,7 @@ async function spawnRustServer(homeDir: string, emptyExtDir: string): Promise<Sp
     const port = await findFreePort()
     const baseUrl = `http://127.0.0.1:${port}`
     const stderrRef = { buf: '' }
-    const env = applyTestServerHomeEnvironment({
+    const env = applyServerHomeEnvironment({
       ...(process.env as Record<string, string>),
       PORT: String(port),
       FRESHELL_BIND_HOST: '127.0.0.1',

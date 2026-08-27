@@ -29,8 +29,8 @@ export function ensureFreshE2eBuild(
     log: console,
   },
 ): void {
-  deps.log.log('[e2e-setup] Building client and server...')
-  deps.execSync('npm run build:client && npm run build:server', {
+  deps.log.log('[e2e-setup] Building client and Rust server...')
+  deps.execSync('npm run build:client && cargo build --release -p freshell-server', {
     cwd: root,
     stdio: 'inherit',
     env: { ...deps.env, NODE_ENV: 'production' },

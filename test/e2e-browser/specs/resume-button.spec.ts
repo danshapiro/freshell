@@ -143,7 +143,7 @@ interface ResumeScenario {
  * `sidebar-click-resume.spec.ts`'s codex seed (a `session_meta` record with
  * `payload.id`/`cwd` plus `response_item`/`message` records for a real title).
  */
-async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<ResumeScenario> {
+async function bootResumeScenario(rustFixture: 'legacy' | 'rust'): Promise<ResumeScenario> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-resume-button-'))
   const argvLogPath = path.join(sharedRoot, 'fake-codex-argv.jsonl')
   const projectDir = path.join(sharedRoot, 'project')
@@ -180,7 +180,6 @@ async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<Res
   }
 
   const server = await createE2eServerHandle(process.env, {
-    kind: e2eServerKind,
     construct: {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argvLogPath },
       setupHome: async (homeDir) => {
@@ -224,8 +223,8 @@ async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<Res
 
 test.setTimeout(90_000)
 
-test('resume button stays visible at top/middle/bottom scroll', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('resume button stays visible at top/middle/bottom scroll', async ({ page }) => {
+  const scenario = await bootResumeScenario(rustFixture)
   try {
     await bootAndConnect(page, scenario.info)
 
@@ -253,8 +252,8 @@ test('resume button stays visible at top/middle/bottom scroll', async ({ page, e
   }
 })
 
-test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('resume button is visible in fullWidth mobile mode', async ({ page }) => {
+  const scenario = await bootResumeScenario(rustFixture)
   try {
     await page.setViewportSize({ width: 390, height: 844 })
     await bootAndConnect(page, scenario.info)
@@ -271,8 +270,8 @@ test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServ
   }
 })
 
-test('paste-then-Enter resumes the session with the right agent', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('paste-then-Enter resumes the session with the right agent', async ({ page }) => {
+  const scenario = await bootResumeScenario(rustFixture)
   try {
     const harness = await bootAndConnect(page, scenario.info)
     const tabCountBefore = await harness.getTabCount()

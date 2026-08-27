@@ -67,7 +67,7 @@ import { test, expect } from '../helpers/fixtures.js'
  * built from the SAME bounded `s.replay` the reattach path uses, so Rust's
  * search genuinely IS scoped to the retained window -- a real improvement
  * over legacy, not a parity gap. The search-boundary assertions below are
- * therefore gated to `e2eServerKind === 'rust'`, with an explicit,
+ * therefore gated to `true`, with an explicit,
  * evidence-backed assertion of legacy's documented (not merely skipped)
  * divergence in the `else` branch of each test.
  *
@@ -76,7 +76,7 @@ import { test, expect } from '../helpers/fixtures.js'
  * (reattach-replay survives, Unicode integrity) -- those are a true parity
  * control, unaffected by DISCOVERY 2 -- so this spec runs against both the
  * legacy Node server and the owned Rust server per `playwright.config.ts`'s
- * `MATRIX_SPECS`.
+ * `retired matrix list`.
  */
 test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/search boundary', () => {
   async function selectShell(page: any): Promise<void> {
@@ -232,7 +232,6 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     harness,
     terminal,
     serverInfo,
-    e2eServerKind,
   }) => {
     const { terminalId, visibleText, needle, doneMarker } = await runScrollbackScenario(
       page,
@@ -270,7 +269,7 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     // divergence claim.
     const search = await searchTerminal(page, serverInfo, terminalId, needle)
     expect(search.status).toBe(200)
-    if (e2eServerKind === 'rust') {
+    if (true) {
       expect(search.body?.matches).toEqual([])
     } else {
       expect(search.body?.matches?.length).toBeGreaterThan(0)
@@ -282,7 +281,6 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     harness,
     terminal,
     serverInfo,
-    e2eServerKind,
   }) => {
     const { terminalId, visibleText, needle, doneMarker } = await runScrollbackScenario(
       page,
@@ -318,6 +316,6 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     expect(matchedLine).toBeTruthy()
     expect(matchedLine.text).toContain(EMOJI)
     expect(matchedLine.text).not.toContain(REPLACEMENT_CHAR)
-    void e2eServerKind // documented above; no branch needed for this test's shape
+    void rustFixture // documented above; no branch needed for this test's shape
   })
 })

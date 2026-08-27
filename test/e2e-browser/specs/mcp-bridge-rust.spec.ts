@@ -21,7 +21,7 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * unmodified Node MCP binary can drive it unchanged.
  *
  * Deliberately gated to the RUST target only (see `playwright.config.ts`'s
- * `rust-chromium` project `testMatch`), not run against legacy: the legacy
+ * `Rust browser lane` project `testMatch`), not run against legacy: the legacy
  * MCP<->legacy-REST path is legacy's own already-tested path (its own test
  * suite covers it). The NEW thing this pins is RUST-SERVER REST compatibility
  * with the unmodified MCP client -- i.e. a regression in the Rust

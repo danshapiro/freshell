@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * AUTO-TITLE PIPELINE (Task 21, rust-only) -- e2e proof of the Rust server's
@@ -187,7 +187,7 @@ interface SeededSession {
 
 interface BootedServer {
   server: E2eServerHandle
-  info: TestServerInfo
+  info: E2eServerInfo
   root: string
 }
 
@@ -204,7 +204,6 @@ async function bootAutoTitleServer(opts: {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-auto-title-'))
   const fakeClaudePath = await installFakeClaudeCli(path.join(root, 'bin'))
   const server = await createE2eServerHandle(process.env, {
-    kind: 'rust',
     construct: {
       env: {
         CLAUDE_CMD: fakeClaudePath,

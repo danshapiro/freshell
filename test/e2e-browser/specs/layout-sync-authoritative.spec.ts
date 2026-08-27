@@ -9,15 +9,15 @@
  * layout snapshot and assert exact tab IDs/order, pane tree/ratios, titles,
  * content, active tab, and active pane.
  *
- * Runs in BOTH matrix projects (`legacy-chromium` parity control +
- * `rust-chromium`): the legacy Node `LayoutStore` and the Rust layout store
+ * Runs in BOTH matrix projects (`retired Node browser lane` parity control +
+ * `Rust browser lane`): the legacy Node `LayoutStore` and the Rust layout store
  * (AUTO-01's port) must produce byte-identical read surfaces for the same
  * mirrored UI layout. Authored under the df1 deferred-Playwright policy
  * (probe-executable: run once per leg); see docs/plans/df1-evidence/AUTO-01.md.
  */
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 const LAYOUT_SYNC_DEBOUNCE_MS = 1000
 
@@ -40,7 +40,7 @@ type Snapshot = {
   timestamp?: number
 }
 
-async function fetchWithAuth(serverInfo: TestServerInfo, path: string) {
+async function fetchWithAuth(serverInfo: E2eServerInfo, path: string) {
   const response = await fetch(`${serverInfo.baseUrl}${path}`, {
     headers: { 'x-auth-token': serverInfo.token },
   })
@@ -49,7 +49,7 @@ async function fetchWithAuth(serverInfo: TestServerInfo, path: string) {
   return body?.data
 }
 
-async function fetchSnapshot(serverInfo: TestServerInfo): Promise<Snapshot> {
+async function fetchSnapshot(serverInfo: E2eServerInfo): Promise<Snapshot> {
   return (await fetchWithAuth(serverInfo, '/api/layout/snapshot')) as Snapshot
 }
 

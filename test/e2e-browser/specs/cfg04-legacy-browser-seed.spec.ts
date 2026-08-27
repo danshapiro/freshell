@@ -23,20 +23,19 @@ const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
  *
  * Routed through the generalized E2eServerHandle seam (HARNESS-02), so the
  * SAME spec exercises the legacy Node server (parity source) and the owned
- * Rust server depending on the active project's `e2eServerKind` —
- * `legacy-chromium` proves the fixture/assertions pin real legacy behavior,
- * `rust-chromium` proves the port.
+ * Rust server depending on the active project's `rustFixture` —
+ * `retired Node browser lane` proves the fixture/assertions pin real legacy behavior,
+ * `Rust browser lane` proves the port.
  *
  * df1 campaign posture: `deferred` — authored but intentionally NOT executed by
  * the CFG-04 worker (see docs/plans/df1-evidence/CFG-04.md); the close-out
- * campaign runs it through MATRIX_SPECS. Crate-level proofs for the same
+ * campaign runs it through retired matrix list. Crate-level proofs for the same
  * semantics are green in `crates/freshell-server/src/legacy_local_seed.rs` and
  * `settings_store.rs` (`frs-cfg04-*` tests).
  */
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')

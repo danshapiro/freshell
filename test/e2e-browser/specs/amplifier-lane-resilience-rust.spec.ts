@@ -240,9 +240,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
 
   test('events.jsonl truncation mid-session degrades then recovers: status flows again', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-lane-'))
     // Pinned FRESHELL_AMPLIFIER_HOME so this spec can find and mutate
     // events.jsonl; both the broker (resolve_amplifier_home, validated F1)
@@ -329,9 +327,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
 
   test('abrupt server death mid-turn: lane re-attaches after restore and status flows again', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-restart-'))
     const amplifierHome = path.join(sharedRoot, 'amplifier-home')
     let capture: WsCapture | null = null
@@ -455,9 +451,7 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
   test('two concurrent servers run independent amplifier lanes', async ({
     page,
     browser,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const rootA = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-a-'))
     const rootB = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-b-'))
     const homeA = path.join(rootA, 'amplifier-home')

@@ -17,7 +17,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import WebSocket from 'ws'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 const BURST_SIZE = 16
 
@@ -52,7 +53,7 @@ class SyntheticClient {
     })
   }
 
-  static async connect(info: TestServerInfo): Promise<SyntheticClient> {
+  static async connect(info: E2eServerInfo): Promise<SyntheticClient> {
     const ws = new WebSocket(info.wsUrl)
     await new Promise<void>((resolve, reject) => {
       ws.once('open', () => resolve())

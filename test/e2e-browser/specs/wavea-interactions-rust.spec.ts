@@ -29,7 +29,8 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
@@ -184,8 +185,7 @@ async function readClaudeBindingRows(ledgerDir: string): Promise<any[]> {
 test.describe('wave-A cross-lane interactions', () => {
   test.setTimeout(180_000)
 
-  test('A1xA3: reload + abrupt restart keeps the pane<->ledger createRequestId join coherent', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('A1xA3: reload + abrupt restart keeps the pane<->ledger createRequestId join coherent', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wavea-a1a3-'))
     let capturedHome = ''
     try {
@@ -283,8 +283,7 @@ test.describe('wave-A cross-lane interactions', () => {
     }
   })
 
-  test('A2xA3: one restart restores BOTH claude identity stores with no cross-talk', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('A2xA3: one restart restores BOTH claude identity stores with no cross-talk', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wavea-a2a3-'))
     // The fake sidecar mints a RANDOM canonical UUID per process (council
     // follow-up: the old static 44444444-... default was collision-blind),

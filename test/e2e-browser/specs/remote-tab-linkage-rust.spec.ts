@@ -43,7 +43,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  * `session-directory-matrix.spec.ts`): this branch's FROZEN legacy `server/`
  * tree predates upstream #514 (`05c6b1fa`) and has no amplifier provider
  * registered at all, so this scenario cannot run there. Registered ONLY
- * under the `rust-chromium` project in `playwright.config.ts`.
+ * under the `Rust browser lane` project in `playwright.config.ts`.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -107,12 +107,10 @@ function containsSessionRef(node: unknown, provider: string, sessionId: string):
 test.describe('Remote tab linkage (Rust only)', () => {
   test.setTimeout(150_000)
 
-  test('a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef', async ({ page, e2eServerKind }) => {
-    // Registered ONLY under `rust-chromium` (`playwright.config.ts`) --
+  test('a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef', async ({ page }) => {
+    // Registered ONLY under `Rust browser lane` (`playwright.config.ts`) --
     // assert the precondition explicitly so an accidental matrix inclusion
     // fails loudly instead of silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
     const SEEDED_SESSION_ID = 'amp-remote-linkage-0001'
     const SESSION_TITLE = 'remote-tab-linkage seeded session'
     const TAB_NAME = 'remote-linkage-tab'
@@ -126,7 +124,6 @@ test.describe('Remote tab linkage (Rust only)', () => {
       const fakeAmplifierPath = await installFakeAmplifierCli(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
@@ -300,7 +297,7 @@ test.describe('Remote tab linkage (Rust only)', () => {
         // count).
         // ------------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error(`$() E2eServerHandle does not implement restart()`)
         }
         await server.restart()
 
@@ -346,10 +343,8 @@ test.describe('Remote tab linkage (Rust only)', () => {
   // This case boots its OWN minimal rust server (no amplifier fixtures
   // needed — the rejection fires at the door before any mode work), unlike
   // the big linkage test above whose locals are out of scope here.
-  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async () => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {}, // no fixtures: door-top reject needs no provider state
     })
     const info = await server.start()

@@ -17,7 +17,7 @@
 //      anywhere (the banner is in-memory Redux state and does not survive
 //      reload -- V1 N3).
 //
-// Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch
+// Rust-only: registered in RUST_ONLY_SPECS + Rust browser lane testMatch
 // (restartAbrupt exists only on RustServer). Tests 1-3 drive the server
 // directly (REST + raw WS, no browser page); test 4 is a browser test.
 //
@@ -237,9 +237,8 @@ async function createFreshcodexPane(page: Page, cwd: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 test.describe('fresh-agent settings survive restart (rust)', () => {
-  test('codex: create-shaped resume after restart carries the recorded model', async ({ e2eServerKind }) => {
+  test('codex: create-shaped resume after restart carries the recorded model', async () => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-codex-'))
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
@@ -330,9 +329,8 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     }
   })
 
-  test('opencode: create-shaped resume after restart -> next send carries the recorded model/effort', async ({ e2eServerKind }) => {
+  test('opencode: create-shaped resume after restart -> next send carries the recorded model/effort', async () => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-opencode-'))
     const binDir = path.join(sharedRoot, 'bin')
     const auditLogPath = path.join(sharedRoot, 'opencode-audit.jsonl')
@@ -450,9 +448,8 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     }
   })
 
-  test('claude: attach resume request carries model/permissionMode', async ({ e2eServerKind }) => {
+  test('claude: attach resume request carries model/permissionMode', async () => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-claude-'))
     const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
@@ -558,9 +555,8 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
     }
   })
 
-  test('codex: crash respawn shows a visible memory-loss notice', async ({ page, e2eServerKind }) => {
+  test('codex: crash respawn shows a visible memory-loss notice', async ({ page }) => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-crash-banner-'))
     const threadOpsPath = path.join(sharedRoot, 'thread-ops.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')

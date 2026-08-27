@@ -38,7 +38,7 @@ import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
@@ -297,7 +297,7 @@ async function reloadAndReconnect(page: import('@playwright/test').Page): Promis
 test.describe.serial('sidebar remote status rings (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
   let sharedRoot: string
   let deviceB: Awaited<ReturnType<typeof connectRawDevice>>
 

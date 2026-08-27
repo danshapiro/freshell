@@ -5,7 +5,7 @@ import path from 'node:path'
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 /**
@@ -235,7 +235,7 @@ test.describe('Durable tabs registry across restart (rust)', () => {
     let wsB: WebSocket | undefined
     let wsC: WebSocket | undefined
     try {
-      const info: TestServerInfo = await server.start()
+      const info: E2eServerInfo = await server.start()
       const now = Date.now()
 
       // Context A: deviceId dev-A, revision 1, ONE open record.

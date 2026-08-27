@@ -20,7 +20,7 @@ import { test, expect } from '../helpers/fixtures.js'
  * a port of `server/instance-id.ts`'s `loadOrCreateServerInstanceId`) --
  * matching legacy's stable-installation-identity semantics. Once BOTH
  * implementations persist, `instanceId` stability across a restart is no
- * longer a node-vs-rust discriminator: a mis-wired `rust-chromium` fixture
+ * longer a node-vs-rust discriminator: a mis-wired `Rust browser lane` fixture
  * that secretly booted (or reused) a Node server would now ALSO show a
  * stable `instanceId` and incorrectly PASS the old assertion.
  *
@@ -44,7 +44,7 @@ import { test, expect } from '../helpers/fixtures.js'
  * (A permanent RED demonstration of this property lives in the HARNESS-02
  * implementation report/commit: the `runtime`/`nodeVersion` branch below was
  * temporarily inverted for the 'rust' case, run under
- * `--project=rust-chromium`, and observed to fail with the exact
+ * `--project=Rust browser lane`, and observed to fail with the exact
  * runtime-mismatch assertion error, before being restored to the correct
  * direction captured here.)
  */
@@ -87,7 +87,6 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
   test('the fixture-owned server is the one THIS project claims to own, across a restart', async ({
     testServer,
     serverInfo,
-    e2eServerKind,
   }) => {
     // --- (0) the fixture's recorded pid is a REAL, currently-alive local
     // process -- not a fabricated/stale record and not an external server
@@ -104,7 +103,7 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
 
     // --- (2) restart the SAME owned server (same home/port/token) ---
     if (!testServer.restart) {
-      throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart(); cannot run the bite test`)
+      throw new Error(`$() E2eServerHandle does not implement restart(); cannot run the bite test`)
     }
     const priorPid = serverInfo.pid
     const restartedInfo = await testServer.restart()
@@ -127,7 +126,7 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
 
     // --- (4) the REAL identity oracle: `GET /api/server-info`'s permanent,
     // structural node/rust discriminator (DIAG-05). This is the mutation
-    // negative-proof: a misconfigured rust-chromium fixture that actually
+    // negative-proof: a misconfigured Rust browser lane fixture that actually
     // boots (or reuses) a Node server would fail HERE, because a real Node
     // process always reports a `nodeVersion` string and never `runtime`,
     // while the Rust binary always reports `runtime: "rust"` and never
@@ -135,7 +134,7 @@ test.describe('HARNESS-02: Node/Rust matrix mutation negative-proof', () => {
     // whether CFG-07 makes `instanceId` stable on both sides.
     const runtimeInfoAfterRestart = await fetchServerInfo(restartedInfo.baseUrl, restartedInfo.token)
     for (const info of [runtimeInfoBeforeRestart, runtimeInfoAfterRestart]) {
-      if (e2eServerKind === 'rust') {
+      if (true) {
         expect(info.runtime).toBe('rust')
         expect(info.nodeVersion).toBeUndefined()
       } else {
