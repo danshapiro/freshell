@@ -382,10 +382,7 @@ describe('runtime boundary inventory for the current checkout', () => {
     expect(result.unexpectedNodeBackend).toEqual([])
     expect(result.legacyDebt).toEqual(expect.arrayContaining([
       'server/index.ts',
-      'package.json:scripts.start',
       'config/electron-builder.yml:dist/server',
-      'run-rust-server.sh:legacy-comment',
-      'port/laptop-bootstrap/2-bootstrap-wsl.sh:inherited-build-path',
       'examples/extensions/live-counter/server.js',
       'examples/extensions/status-dashboard/server.js',
     ]))

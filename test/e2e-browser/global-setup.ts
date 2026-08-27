@@ -30,7 +30,7 @@ export function ensureFreshE2eBuild(
   },
 ): void {
   deps.log.log('[e2e-setup] Building client and Rust server...')
-  deps.execSync('npm run build:client && cargo build --release -p freshell-server', {
+  deps.execSync('npm run build:client && cargo build --release -p freshell-server --locked', {
     cwd: root,
     stdio: 'inherit',
     env: { ...deps.env, NODE_ENV: 'production' },

@@ -104,16 +104,6 @@ const legacyDebtChecks: Array<{
     marker: 'test/e2e-browser/playwright.config.ts:legacy-chromium',
     matches: (contents) => contents.includes('legacy-chromium'),
   },
-  {
-    relativePath: 'run-rust-server.sh',
-    marker: 'run-rust-server.sh:legacy-comment',
-    matches: (contents) => /^\s*#.*\bLegacy server:/im.test(contents),
-  },
-  {
-    relativePath: 'port/laptop-bootstrap/2-bootstrap-wsl.sh',
-    marker: 'port/laptop-bootstrap/2-bootstrap-wsl.sh:inherited-build-path',
-    matches: (contents) => /npm run build/.test(contents),
-  },
 ]
 
 function normalizeRelativePath(relativePath: string): string {

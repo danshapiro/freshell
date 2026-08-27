@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { TabRegistryRecordSchema } from '../../../../server/tabs-registry/types.js'
+import { TabRegistryRecordSchema } from '../../../server/tabs-registry/types.js'
 
 describe('TabRegistryRecordSchema (server)', () => {
   it('accepts open tab records with device metadata and revision', () => {

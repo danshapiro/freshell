@@ -114,10 +114,12 @@ rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 bash "$SCRIPT" run --cloud --config=default 2>&1 > /dev/null || true
 check "--config=default sets correct config" grep -q 'vitest.config.ts' "$FAKE_GCLOUD_LOG"
 
-# Check 7: --config=server sets VITEST_CONFIGS to only server config
+# Check 7: the retired server selector is rejected with a Rust-lane hint
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
-bash "$SCRIPT" run --cloud --config=server 2>&1 > /dev/null || true
-check "--config=server sets correct config" grep -q 'vitest.server.config.ts' "$FAKE_GCLOUD_LOG"
+SERVER_OUTPUT=$(bash "$SCRIPT" run --cloud --config=server 2>&1) && SERVER_RC=0 || SERVER_RC=$?
+check "--config=server exits with usage error" bash -c "[ '$SERVER_RC' -eq 2 ]"
+check "--config=server explains the Rust lane" grep -qi 'Rust' <<< "$SERVER_OUTPUT"
+check "--config=server does not create or execute a cloud job" bash -c "! grep -q 'run jobs' '$FAKE_GCLOUD_LOG'"
 
 # Check 8: VITEST_ARGS_JSON is valid JSON when pass-through args are present
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"

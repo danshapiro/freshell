@@ -40,7 +40,11 @@ TASK_COUNT="${CLOUD_RUN_TASK_COUNT:-1}"
 if [ "${TEST_MODE:-}" = "vitest" ]; then
   SHARD_INDEX=$((TASK_INDEX + 1))
   SHARD_COUNT="$TASK_COUNT"
-  CONFIGS="${VITEST_CONFIGS:-config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts}"
+  CONFIGS="${VITEST_CONFIGS:-config/vitest/vitest.config.ts}"
+  if [ "$CONFIGS" != "config/vitest/vitest.config.ts" ]; then
+    echo "[vitest-entrypoint] ERROR: only the retained default Vitest config is supported; use the Rust cargo lane for server tests." >&2
+    exit 2
+  fi
 
   # Parse VITEST_ARGS_JSON (JSON array) into a bash array using jq.
   # This preserves argument boundaries (spaces, metacharacters, etc.)
@@ -60,7 +64,7 @@ if [ "${TEST_MODE:-}" = "vitest" ]; then
   EXIT_CODE=0
   for config in $CONFIGS; do
     echo "[vitest-entrypoint] Running vitest: $config ${SHARD_ARG[*]-} ${EXTRA_ARGS[*]-}"
-    npx vitest run --passWithNoTests --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
+    npx vitest run --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
   done
   exit "$EXIT_CODE"
 fi

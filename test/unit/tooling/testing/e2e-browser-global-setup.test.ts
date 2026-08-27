@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ensureBuiltRuntime, installBuiltRuntimeRefresh } from '../../../setup/e2e-browser-global-setup.js'
 
 describe('ensureBuiltRuntime', () => {
-  it('rebuilds the compiled runtime before helper tests', () => {
+  it('rebuilds the client and Rust runtime before helper tests', () => {
     const execFileSync = vi.fn()
     const rmSync = vi.fn()
 
@@ -17,7 +17,15 @@ describe('ensureBuiltRuntime', () => {
     })
 
     expect(rmSync).toHaveBeenCalledWith(path.join('/repo', 'dist', '.env'), { force: true })
-    expect(execFileSync).toHaveBeenCalledWith('npm', ['run', 'build'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(1, 'npm', ['run', 'build:client'], {
+      cwd: '/repo',
+      env: {
+        PATH: '/bin',
+        NODE_ENV: 'production',
+      },
+      stdio: 'inherit',
+    })
+    expect(execFileSync).toHaveBeenNthCalledWith(2, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
       cwd: '/repo',
       env: {
         PATH: '/bin',
@@ -43,7 +51,16 @@ describe('ensureBuiltRuntime', () => {
     })
 
     expect(rmSync).toHaveBeenCalledWith(path.join('C:\\repo', 'dist', '.env'), { force: true })
-    expect(execFileSync).toHaveBeenCalledWith(process.execPath, [npmExecPath, 'run', 'build'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(1, process.execPath, [npmExecPath, 'run', 'build:client'], {
+      cwd: 'C:\\repo',
+      env: {
+        PATH: 'C:\\Windows\\System32',
+        npm_execpath: npmExecPath,
+        NODE_ENV: 'production',
+      },
+      stdio: 'inherit',
+    })
+    expect(execFileSync).toHaveBeenNthCalledWith(2, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
       cwd: 'C:\\repo',
       env: {
         PATH: 'C:\\Windows\\System32',

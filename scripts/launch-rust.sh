@@ -124,7 +124,7 @@ if [[ "$SKIP_BUILD" != 1 ]]; then
     exit 0
   fi
   echo "Building Rust server (cargo build --release -p freshell-server)..."
-  cargo build --release -p freshell-server
+  cargo build --release -p freshell-server --locked
 fi
 
 [[ -x "$BINARY" ]] || { echo "Missing binary: $BINARY (build first)" >&2; exit 1; }

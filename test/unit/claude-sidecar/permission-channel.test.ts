@@ -20,11 +20,11 @@ import {
   raiseQuestionRequest,
   respondPermission,
   respondQuestion,
-} from '../../../../crates/freshell-claude-sidecar/permission-channel.mjs'
+} from '../../../crates/freshell-claude-sidecar/permission-channel.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const REPO_ROOT = path.resolve(__dirname, '../../../..')
+const REPO_ROOT = path.resolve(__dirname, '../../..')
 const SIDECAR_INDEX = path.join(REPO_ROOT, 'crates', 'freshell-claude-sidecar', 'index.mjs')
 const FAKE_QUERY_MODULE = path.join(__dirname, 'fixtures', 'fake-query-module.mjs')
 const CRASH_PROBE = path.join(__dirname, 'fixtures', 'sidecar-crash-probe.mjs')

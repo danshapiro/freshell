@@ -1,76 +1,8 @@
-import { describe, it, expect } from 'vitest'
-import { extractTitleFromMessage, extractTitleFromJsonlObject } from '../../../server/title-utils'
+import { describe, expect, it } from 'vitest'
+
+import { extractTitleFromJsonlObject } from '../../../server/title-utils.js'
 
 describe('title-utils', () => {
-  describe('extractTitleFromMessage', () => {
-    it('returns content unchanged if shorter than maxLen', () => {
-      const result = extractTitleFromMessage('Hello world', 50)
-      expect(result).toBe('Hello world')
-    })
-
-    it('truncates content to maxLen if longer', () => {
-      const result = extractTitleFromMessage('A'.repeat(100), 50)
-      expect(result).toBe('A'.repeat(50))
-      expect(result.length).toBe(50)
-    })
-
-    it('uses default maxLen of 50', () => {
-      const result = extractTitleFromMessage('A'.repeat(100))
-      expect(result.length).toBe(50)
-    })
-
-    it('collapses whitespace', () => {
-      const result = extractTitleFromMessage('  Multiple   spaces   here  ')
-      expect(result).toBe('Multiple spaces here')
-    })
-
-    it('trims leading and trailing whitespace', () => {
-      const result = extractTitleFromMessage('  trimmed  ')
-      expect(result).toBe('trimmed')
-    })
-
-    it('handles empty string', () => {
-      const result = extractTitleFromMessage('')
-      expect(result).toBe('')
-    })
-
-    it('handles string with only whitespace', () => {
-      const result = extractTitleFromMessage('   ')
-      expect(result).toBe('')
-    })
-
-    it('respects custom maxLen', () => {
-      const result = extractTitleFromMessage('A'.repeat(300), 200)
-      expect(result.length).toBe(200)
-    })
-
-    it('uses first non-empty line for multi-line content', () => {
-      const result = extractTitleFromMessage('Fix the login bug\nThis needs to handle edge cases\nAnd update tests')
-      expect(result).toBe('Fix the login bug')
-    })
-
-    it('skips empty first lines in multi-line content', () => {
-      const result = extractTitleFromMessage('\n\n  \nActual title here\nMore details')
-      expect(result).toBe('Actual title here')
-    })
-
-    it('truncates long first line in multi-line content', () => {
-      const longLine = 'A'.repeat(100)
-      const result = extractTitleFromMessage(`${longLine}\nSecond line`, 50)
-      expect(result).toBe('A'.repeat(50))
-    })
-
-    it('falls back to collapsing single-line content', () => {
-      const result = extractTitleFromMessage('Just a single line with   extra   spaces')
-      expect(result).toBe('Just a single line with extra spaces')
-    })
-
-    it('handles content where all lines are empty', () => {
-      const result = extractTitleFromMessage('\n\n  \n  ')
-      expect(result).toBe('')
-    })
-  })
-
   describe('extractTitleFromJsonlObject', () => {
     it('extracts title from explicit title field', () => {
       const result = extractTitleFromJsonlObject({ title: 'My Title' })
