@@ -67,6 +67,7 @@ export const NON_BACKEND_LISTENER_PATHS = [
   'scripts/proofs/browser-freeze-lifecycle-probe.ts',
   'scripts/proofs/browser-process-suspend-probe.ts',
   'electron/port-check.ts',
+  'test/e2e-browser/helpers/server-fixture-support.ts',
 ] as const
 
 const nonBackendListenerPaths = new Set<string>(NON_BACKEND_LISTENER_PATHS)

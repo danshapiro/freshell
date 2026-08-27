@@ -23,8 +23,6 @@ function createAuthenticatedState() {
     createdByRequestId: new Map(),
     claudeFreshSessionIdByRequestId: new Map(),
     terminalCreateTimestamps: [],
-    codingCliSessions: new Set<string>(),
-    codingCliSubscriptions: new Map(),
     sdkSessions: new Set<string>(),
     sdkSubscriptions: new Map(),
     sdkSessionTargets: new Map(),

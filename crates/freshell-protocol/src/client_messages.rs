@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 31 discriminants).
+//! Client → server messages (`ClientMessage`, 28 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -8,8 +8,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::common::{
-    double_option, AgentProvider, CodexDurability, PermissionMode, Sandbox, SessionLocator,
-    SessionType, Shell, StringOrNumber, TerminalAttachIntent, TerminalAttachPriority,
+    double_option, AgentProvider, CodexDurability, Sandbox, SessionLocator, SessionType, Shell,
+    StringOrNumber, TerminalAttachIntent, TerminalAttachPriority,
 };
 
 /// A message sent from a client to the server.
@@ -55,12 +55,6 @@ pub enum ClientMessage {
     UiLayoutSync(UiLayoutSync),
     #[serde(rename = "ui.screenshot.result")]
     UiScreenshotResult(UiScreenshotResult),
-    #[serde(rename = "codingcli.create")]
-    CodingCliCreate(CodingCliCreate),
-    #[serde(rename = "codingcli.input")]
-    CodingCliInput(CodingCliInput),
-    #[serde(rename = "codingcli.kill")]
-    CodingCliKill(CodingCliKill),
     #[serde(rename = "freshAgent.create")]
     FreshAgentCreate(FreshAgentCreate),
     #[serde(rename = "freshAgent.attach")]
@@ -85,14 +79,11 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 28] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
     "codex.activity.list",
-    "codingcli.create",
-    "codingcli.input",
-    "codingcli.kill",
     "freshAgent.approval.respond",
     "freshAgent.attach",
     "freshAgent.compact",
@@ -452,51 +443,6 @@ pub struct PaneReconcileRequest {
     pub panes: Vec<ReconcilePane>,
 }
 
-// --- codingcli.* ------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliCreate {
-    pub prompt: String,
-    /// Free-form provider string (`CodingCliProvider`).
-    pub provider: String,
-    pub request_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<PermissionMode>,
-    /// Retained solely so the handler can detect-and-reject; see kata ejh6.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume_session_id: Option<String>,
-    /// Canonical identity carrier (kata ejh6). Parity with the TS
-    /// `CodingCliCreateSchema.sessionRef`. The spec
-    /// (`port/machine/specs/cli-argv-fidelity.md` section 3.3/U7) governs
-    /// `TerminalCreate.resume_session_id` (the spawn-time id) and is silent
-    /// on `CodingCliCreate`; adding the canonical carrier here preserves the
-    /// shared-contract invariant without violating the spec.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_ref: Option<SessionLocator>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<Sandbox>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliInput {
-    pub data: String,
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliKill {
-    pub session_id: String,
-}
-
 // --- freshAgent.* -----------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -537,7 +483,7 @@ pub struct FreshAgentCreate {
         with = "double_option"
     )]
     pub model_selection: Option<Option<ModelSelection>>,
-    /// Free string here (unlike `codingcli.create`, which uses the enum).
+    /// Free string here because fresh-agent provider names are extension-defined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

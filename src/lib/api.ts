@@ -2,8 +2,6 @@ import type { CodingCliProviderName } from './coding-cli-types'
 import type { TokenSummary } from '@shared/ws-protocol'
 import {
   FreshAgentSnapshotSchema,
-  FreshAgentTurnBodySchema,
-  FreshAgentTurnPageSchema,
 } from '@shared/fresh-agent-contract'
 import { FreshAgentApiContractError } from '@/lib/fresh-agent-api-error'
 import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
@@ -16,22 +14,16 @@ import {
 } from '@shared/fresh-agent-model-capabilities'
 import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
 import {
-  FreshAgentThreadTurnBodyQuerySchema,
-  FreshAgentThreadTurnsQuerySchema,
   SessionDirectoryPageSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
-  TerminalScrollbackQuerySchema,
   TerminalSearchQuerySchema,
-  type FreshAgentThreadTurnBodyQuery,
-  type FreshAgentThreadTurnsQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
   type SessionDirectoryContextUsageExtra as ReadModelSessionDirectoryContextUsageExtra,
   type SessionDirectoryIntegrityError as ReadModelSessionDirectoryIntegrityError,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
   type TerminalDirectoryQuery,
-  type TerminalScrollbackQuery,
   type TerminalSearchQuery,
 } from '@shared/read-models'
 
@@ -385,40 +377,6 @@ export async function getTerminalDirectoryPage(
   )
 }
 
-export async function getFreshAgentThreadTurns(
-  sessionId: string,
-  query: FreshAgentThreadTurnsQuery,
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  const parsed = FreshAgentThreadTurnsQuerySchema.parse(query)
-  return api.get(
-    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns${buildQueryString([
-      ['cursor', parsed.cursor],
-      ['priority', parsed.priority],
-      ['revision', parsed.revision],
-      ['limit', parsed.limit],
-      ['includeBodies', parsed.includeBodies ? 'true' : undefined],
-    ])}`,
-    options,
-  )
-}
-
-export async function getFreshAgentThreadTurnBody(
-  sessionId: string,
-  turnId: string,
-  query: FreshAgentThreadTurnBodyQuery & { signal?: AbortSignal },
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  const parsed = FreshAgentThreadTurnBodyQuerySchema.parse(query)
-  const signal = query.signal ?? options.signal
-  return api.get(
-    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
-      ['revision', parsed.revision],
-    ])}`,
-    { ...options, signal },
-  )
-}
-
 export async function getFreshAgentThreadSnapshot(
   sessionType: string,
   provider: string,
@@ -440,85 +398,6 @@ export async function getFreshAgentThreadSnapshot(
     throw new FreshAgentApiContractError('Fresh-agent snapshot response did not match the shared contract.', parsed.error.issues)
   }
   return parsed.data
-}
-
-export async function getFreshAgentTurnPage(
-  sessionType: string,
-  provider: string,
-  threadId: string,
-  query: {
-    cursor?: string
-    priority?: string
-    revision: number
-    cwd?: string
-    limit?: number
-    includeBodies?: boolean
-    signal?: AbortSignal
-  },
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  const signal = query.signal ?? options.signal
-  const data = await api.get(
-    `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns${buildQueryString([
-      ['revision', query.revision],
-      ['cursor', query.cursor],
-      ['priority', query.priority],
-      ['cwd', query.cwd],
-      ['limit', query.limit],
-      ['includeBodies', query.includeBodies ? 'true' : undefined],
-    ])}`,
-    { ...options, signal },
-  )
-  const parsed = FreshAgentTurnPageSchema.safeParse(data)
-  if (!parsed.success) {
-    throw new FreshAgentApiContractError('Fresh-agent turn page response did not match the shared contract.', parsed.error.issues)
-  }
-  return parsed.data
-}
-
-export async function getFreshAgentTurnBody(
-  sessionType: string,
-  provider: string,
-  threadId: string,
-  turnId: string,
-  query: { revision: number; cwd?: string; signal?: AbortSignal },
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  const signal = query.signal ?? options.signal
-  const data = await api.get(
-    `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
-      ['revision', query.revision],
-      ['cwd', query.cwd],
-    ])}`,
-    { ...options, signal },
-  )
-  const parsed = FreshAgentTurnBodySchema.safeParse(data)
-  if (!parsed.success) {
-    throw new FreshAgentApiContractError('Fresh-agent turn body response did not match the shared contract.', parsed.error.issues)
-  }
-  return parsed.data
-}
-
-export async function getTerminalViewport(
-  terminalId: string,
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  return api.get(`/api/terminals/${encodeURIComponent(terminalId)}/viewport`, options)
-}
-
-export async function getTerminalScrollbackPage(
-  terminalId: string,
-  query: TerminalScrollbackQuery = {},
-  options: ApiRequestOptions = {},
-): Promise<any> {
-  const parsed = TerminalScrollbackQuerySchema.parse(query)
-  return api.get(
-    `/api/terminals/${encodeURIComponent(terminalId)}/scrollback${buildQueryString([
-      ['cursor', parsed.cursor],
-      ['limit', parsed.limit],
-    ])}`,
-    options,
-  )
 }
 
 export async function searchTerminalView(

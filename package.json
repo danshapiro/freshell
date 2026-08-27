@@ -55,7 +55,7 @@
     "test:integration": "tsx scripts/testing/test-coordinator.ts run test:integration",
     "test:client": "tsx scripts/testing/test-coordinator.ts run test:client",
     "test:real:coding-cli-contracts": "cross-env FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/real/coding-cli-session-contract.test.ts --run --pool=forks --poolOptions.forks.singleFork=true",
-    "test:visible-first:contract": "vitest run --config config/vitest/vitest.config.ts test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts test/unit/lib/visible-first-acceptance-report.test.ts",
+    "test:visible-first:contract": "vitest run --config config/vitest/vitest.config.ts test/unit/visible-first/acceptance-contract.test.ts test/unit/lib/visible-first-acceptance-report.test.ts",
     "test:all": "tsx scripts/testing/test-coordinator.ts run test:all",
     "test:status": "tsx scripts/testing/test-coordinator.ts status",
     "test:vitest": "tsx scripts/testing/test-coordinator.ts run test:vitest",
@@ -87,7 +87,6 @@
     "contract:generate": "tsx port/contract/generate-ws-contract.ts",
     "test:port": "vitest run --config config/vitest/vitest.port.config.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
-    "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts",
     "test:sandbox": "bash scripts/sandbox-test.sh"
   },
   "dependencies": {

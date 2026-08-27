@@ -19,7 +19,7 @@ import {
 /**
  * T0 handshake DETERMINISM — the normalization layer's first live proof.
  *
- * Boots the ORIGINAL (node) freshell server as an isolated external process,
+ * Boots the Rust freshell server as an isolated external process,
  * captures the connect handshake, and stops it; then boots a SECOND fresh
  * isolated instance and captures ITS handshake. After normalization the two
  * transcripts MUST be deep-equal: the handshake is deterministic modulo the
@@ -28,15 +28,11 @@ import {
  *
  * If they are NOT equal, the failure prints the residual diff. That residual is
  * itself the finding: either a nondeterministic field the registry still needs
- * to cover (add it), or genuine boot-nondeterminism in the server (a real bug to
- * record). This is exactly how the same layer will later diff the Rust port
- * against the original.
+ * to cover (add it), or genuine boot-nondeterminism in the Rust server.
  *
- * SAFETY: boots on ephemeral loopback ports (never :3001), reaps BOTH spawned
+ * SAFETY: boots on ephemeral loopback ports (never :3001), reaps both spawned
  * pids by tracked pid, and never touches a server it did not spawn.
  */
-
-const LIVE_PID_DO_NOT_TOUCH = 1262455 // the user's live freshell (recorded; never us)
 
 function pidAlive(pid: number): boolean {
   try {
@@ -62,7 +58,7 @@ interface Boot {
   handshake: CapturedMessage[]
 }
 
-describe('T0 handshake determinism (two fresh original boots normalize-equal)', () => {
+describe('T0 handshake determinism (two fresh Rust boots normalize-equal)', () => {
   const spawned: ExternalServerHandle[] = []
   let boot1: Boot | null = null
   let boot2: Boot | null = null
@@ -72,7 +68,7 @@ describe('T0 handshake determinism (two fresh original boots normalize-equal)', 
   let report2: NormalizationReport | null = null
   let diff: NormalizedDiff | null = null
 
-  /** Boot an isolated original server, capture its handshake, then stop it. */
+  /** Boot an owned Rust server, capture its handshake, then stop it. */
   async function bootAndCapture(tag: string): Promise<Boot> {
     const server = await startExternalServer({ provider: tag })
     spawned.push(server)
@@ -111,13 +107,12 @@ describe('T0 handshake determinism (two fresh original boots normalize-equal)', 
     }
   })
 
-  it('booted two distinct isolated servers (never :3001, never the live pid)', () => {
+  it('booted two distinct owned Rust servers (never :3001)', () => {
     expect(boot1, 'first boot must have captured').toBeTruthy()
     expect(boot2, 'second boot must have captured').toBeTruthy()
     for (const b of [boot1!, boot2!]) {
       expect(b.port).not.toBe(3001)
       expect(b.pid).toBeGreaterThan(0)
-      expect(b.pid).not.toBe(LIVE_PID_DO_NOT_TOUCH)
     }
     expect(boot1!.pid).not.toBe(boot2!.pid)
     expect(boot1!.port).not.toBe(boot2!.port)
@@ -166,7 +161,7 @@ describe('T0 handshake determinism (two fresh original boots normalize-equal)', 
 
     expect(
       diff!.equal,
-      'two fresh original boots must be identical after normalization; see residual diff above',
+      'two fresh Rust boots must be identical after normalization; see residual diff above',
     ).toBe(true)
     // Redundant with the diff, but pins the canonical golden-string equality too.
     expect(canonicalizeTranscript(norm1)).toBe(canonicalizeTranscript(norm2))

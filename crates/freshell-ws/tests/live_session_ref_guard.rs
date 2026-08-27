@@ -496,28 +496,3 @@ async fn legacy_reject_ws_restore_codex_legacy() {
         "no terminal may spawn"
     );
 }
-
-/// ejh6: a `codingcli.create` carrying the legacy field hits the raw-Value
-/// guard with `INVALID_MESSAGE` + frozen text. Rust has no codingcli handler
-/// (the `_ => true` arm of the dispatch) — without the guard this silently
-/// no-ops; the guard is the loud rejector.
-#[tokio::test]
-async fn legacy_reject_ws_codingcli_create() {
-    let (url, _registry) = spawn_server().await;
-    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
-    send_create(
-        &mut ws,
-        json!({
-            "type": "codingcli.create", "requestId": "req-codingcli-legacy",
-            "prompt": "hi", "provider": "claude",
-            "resumeSessionId": "legacy-codingcli",
-        }),
-    )
-    .await;
-    let err = expect_refusal_for(&mut ws, "req-codingcli-legacy").await;
-    assert_eq!(err["code"], json!("INVALID_MESSAGE"), "{err}");
-    assert_eq!(
-        err["message"],
-        json!("Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity."),
-    );
-}

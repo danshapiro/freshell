@@ -166,7 +166,7 @@ fn resolve_authoritative_ref(
 /// ingress where a wire `resumeSessionId` remains honored — old persisted
 /// pane content can carry a legacy-only claim INDEFINITELY, so this
 /// promotion stays forever with NO later-removal plan. Every create-class
-/// door (WS `terminal.create` / `codingcli.create` / `freshAgent.*`, REST
+/// door (WS `terminal.create` / `freshAgent.*`, REST
 /// `/api/tabs`·split·respawn) rejects the field outright with the frozen
 /// refusal text; this one alone promotes it.
 fn promoted_legacy_claim(pane: &ReconcilePane) -> Option<SessionLocator> {

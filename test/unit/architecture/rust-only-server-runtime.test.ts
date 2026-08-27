@@ -29,6 +29,7 @@ const ALLOWED_LISTENER_PATHS = [
   'scripts/proofs/browser-freeze-lifecycle-probe.ts',
   'scripts/proofs/browser-process-suspend-probe.ts',
   'electron/port-check.ts',
+  'test/e2e-browser/helpers/server-fixture-support.ts',
 ] as const
 
 const tempRoots: string[] = []
@@ -383,7 +384,6 @@ describe('runtime boundary inventory for the current checkout', () => {
       'server/index.ts',
       'package.json:scripts.start',
       'config/electron-builder.yml:dist/server',
-      'test/e2e-browser/playwright.config.ts:legacy-chromium',
       'run-rust-server.sh:legacy-comment',
       'port/laptop-bootstrap/2-bootstrap-wsl.sh:inherited-build-path',
       'examples/extensions/live-counter/server.js',
