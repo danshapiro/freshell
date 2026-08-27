@@ -86,12 +86,3 @@ export interface NormalizedEvent {
   toolResult?: { id: string; output: string; isError: boolean }
   tokenUsage?: { input: number; output: number; total: number }
 }
-
-// WS message types re-exported from shared protocol
-export type {
-  CodingCliEventMessage as CodingCliWsEvent,
-  CodingCliCreatedMessage as CodingCliWsCreated,
-  CodingCliExitMessage as CodingCliWsExit,
-  CodingCliStderrMessage as CodingCliWsStderr,
-  CodingCliWsMessage,
-} from '@shared/ws-protocol'

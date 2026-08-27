@@ -20,7 +20,6 @@ import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type 
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
-import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
 import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
@@ -241,7 +240,6 @@ async function main() {
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
-  const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = await createTabsRegistryStore()
   app.use('/api/tabs-sync', createTabsSyncRouter({ tabsRegistryStore }))
 
@@ -407,7 +405,6 @@ async function main() {
     server,
     registry,
     {
-      codingCliManager: codingCliSessionManager,
       codexLaunchPlanner,
       sdkBridge,
       freshAgentRuntimeManager,
@@ -1272,8 +1269,7 @@ async function main() {
         terminalShutdownTimeoutMs: 5000,
       })
     } finally {
-      // 5. Kill all coding CLI sessions
-      codingCliSessionManager.shutdown()
+      // Planner-owned provider runtimes were shut down above.
     }
 
     // 6. Close SDK bridge sessions

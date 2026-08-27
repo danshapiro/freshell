@@ -11,7 +11,6 @@ import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCom
 import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError, type UserConfig } from './config-store.js'
-import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { makeSessionKey, type CodingCliProviderName, type ProjectGroup } from './coding-cli/types.js'
 import { isOpencodeSubagentSessionWithDeadline } from './coding-cli/providers/opencode-subagent-query.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -85,8 +84,6 @@ import {
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
@@ -212,7 +209,6 @@ type CreatedTerminalRequestBinding = {
 }
 
 export type WsHandlerOptions = {
-  codingCliManager?: CodingCliSessionManager
   codexLaunchPlanner?: CodexLaunchPlanner
   sdkBridge?: SdkBridge
   sessionRepairService?: SessionRepairService
@@ -480,8 +476,6 @@ type ClientState = {
   createdByRequestId: Map<string, CreatedTerminalRequestBinding | typeof REPAIR_PENDING_SENTINEL>
   claudeFreshSessionIdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
-  codingCliSessions: Set<string>
-  codingCliSubscriptions: Map<string, () => void>
   freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
   freshAgentAuthorizations: Map<string, FreshAgentAuthorizationEntry>
   pendingFreshAgentAttachByKey: Map<string, PendingFreshAgentAttachEntry>
@@ -548,7 +542,6 @@ export class WsHandler {
   private readonly config: WsHandlerConfig
   private readonly authToken: string
   private readonly registry: TerminalRegistry
-  private readonly codingCliManager?: CodingCliSessionManager
   private readonly codexLaunchPlanner?: CodexLaunchPlanner
   private readonly sdkBridge?: SdkBridge
   private wss: WebSocketServer
@@ -622,7 +615,6 @@ export class WsHandler {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
     this.registry = registry
-    this.codingCliManager = options.codingCliManager
     this.codexLaunchPlanner = options.codexLaunchPlanner
     this.sdkBridge = options.sdkBridge
     this.sessionRepairService = options.sessionRepairService
@@ -804,22 +796,6 @@ export class WsHandler {
       })
     })
 
-    const dynamicCodingCliCreateSchema = z.object({
-      type: z.literal('codingcli.create'),
-      requestId: z.string().min(1),
-      provider: dynamicProviderSchema,
-      prompt: z.string().min(1),
-      cwd: z.string().optional(),
-      /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
-      resumeSessionId: z.string().optional(),
-      /** Canonical identity carrier (kata ejh6). */
-      sessionRef: SessionLocatorSchema.optional(),
-      model: z.string().optional(),
-      maxTurns: z.number().int().positive().optional(),
-      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    }).strict()
-
     this.clientMessageSchema = z.discriminatedUnion('type', [
       HelloSchema,
       PingSchema,
@@ -838,9 +814,6 @@ export class WsHandler {
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
       TabsSyncClientRetireSchema,
-      dynamicCodingCliCreateSchema,
-      CodingCliInputSchema,
-      CodingCliKillSchema,
       FreshAgentCreateSchema,
       FreshAgentAttachSchema,
       FreshAgentSendSchema,
@@ -1185,8 +1158,6 @@ export class WsHandler {
       createdByRequestId: new Map(),
       claudeFreshSessionIdByRequestId: new Map(),
       terminalCreateTimestamps: [],
-      codingCliSessions: new Set(),
-      codingCliSubscriptions: new Map(),
       freshAgentSubscriptions: new Map(),
       freshAgentAuthorizations: new Map(),
       pendingFreshAgentAttachByKey: new Map(),
@@ -1235,10 +1206,6 @@ export class WsHandler {
     // Detach from any terminals (broker-managed stream path).
     this.terminalStreamBroker.detachAllForSocket(ws)
     state.attachedTerminalIds.clear()
-    for (const off of state.codingCliSubscriptions.values()) {
-      off()
-    }
-    state.codingCliSubscriptions.clear()
     this.cancelPendingFreshAgentAttaches(state)
     this.cancelAllFreshAgentSubscriptions(state)
     this.flushWsErrorLogSummaries(state, 'connection_close')
@@ -1264,14 +1231,6 @@ export class WsHandler {
       },
       'WebSocket connection closed',
     )
-  }
-
-  private removeCodingCliSubscription(state: ClientState, sessionId: string) {
-    const off = state.codingCliSubscriptions.get(sessionId)
-    if (off) {
-      off()
-      state.codingCliSubscriptions.delete(sessionId)
-    }
   }
 
   private freshAgentKey(locator: FreshAgentLocator): string {
@@ -1962,18 +1921,6 @@ export class WsHandler {
             this.sendError(ws, {
               code: 'FRESH_AGENT_CREATE_FAILED',
               message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-            })
-            return
-          }
-          // Task 11: codingcli.create → INVALID_MESSAGE + frozen text. The
-          // reject is config-independent (coordinator ruling J) — it fires here
-          // at the raw layer, before the manager-missing INTERNAL_ERROR branch
-          // exists, so {no manager} + {resumeSessionId} answers INVALID_MESSAGE.
-          case 'codingcli.create': {
-            this.sendError(ws, {
-              code: 'INVALID_MESSAGE',
-              message: INVALID_RAW_CODEX_RESUME_MESSAGE,
-              requestId: typeof rawMsg.requestId === 'string' ? rawMsg.requestId : undefined,
             })
             return
           }
@@ -3328,157 +3275,6 @@ export class WsHandler {
             requestId: m.requestId,
           })
         }
-        return
-      }
-
-      case 'codingcli.create': {
-        if (!this.codingCliManager) {
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: 'Coding CLI sessions not enabled',
-            requestId: m.requestId,
-          })
-          return
-        }
-
-        const endCodingTimer = startPerfTimer(
-          'codingcli_create',
-          { connectionId: ws.connectionId, provider: m.provider },
-          { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
-        )
-        // ejh6: promote a provider-matched sessionRef into the spawn-time resume
-        // id (provider must equal m.provider, mirroring terminal.create's
-        // sessionRef match). The raw pre-parse guard above rejects any
-        // resumeSessionId carry, so sessionRef is the only wired carrier here.
-        const codingResumeSessionId = m.sessionRef && m.sessionRef.provider === m.provider
-          ? m.sessionRef.sessionId
-          : undefined
-        let sessionId: string | undefined
-        let error = false
-        try {
-          const cfg = await awaitConfig()
-          if (!this.codingCliManager.hasProvider(m.provider)) {
-            this.sendError(ws, {
-              code: 'INVALID_MESSAGE',
-              message: `Provider not supported: ${m.provider}`,
-              requestId: m.requestId,
-            })
-            return
-          }
-          const enabledProviders = cfg.settings?.codingCli?.enabledProviders
-          if (enabledProviders && !enabledProviders.includes(m.provider)) {
-            this.sendError(ws, {
-              code: 'INVALID_MESSAGE',
-              message: `Provider disabled: ${m.provider}`,
-              requestId: m.requestId,
-            })
-            return
-          }
-
-          const providerDefaults = cfg.settings?.codingCli?.providers?.[m.provider] || {}
-          const session = this.codingCliManager.create(m.provider, {
-            prompt: m.prompt,
-            cwd: m.cwd,
-            resumeSessionId: codingResumeSessionId,
-            model: m.model ?? providerDefaults.model,
-            maxTurns: m.maxTurns ?? providerDefaults.maxTurns,
-            permissionMode: m.permissionMode ?? providerDefaults.permissionMode,
-            sandbox: m.sandbox ?? providerDefaults.sandbox,
-          })
-
-          // Track this client's session
-          state.codingCliSessions.add(session.id)
-          sessionId = session.id
-
-          // Stream events to client with detachable listeners
-          const onEvent = (event: unknown) => {
-            this.safeSend(ws, {
-              type: 'codingcli.event',
-              sessionId: session.id,
-              provider: session.provider.name,
-              event,
-            })
-          }
-
-          const onExit = (code: number) => {
-            this.safeSend(ws, {
-              type: 'codingcli.exit',
-              sessionId: session.id,
-              provider: session.provider.name,
-              exitCode: code,
-            })
-            this.removeCodingCliSubscription(state, session.id)
-          }
-
-          const onStderr = (text: string) => {
-            this.safeSend(ws, {
-              type: 'codingcli.stderr',
-              sessionId: session.id,
-              provider: session.provider.name,
-              text,
-            })
-          }
-
-          session.on('event', onEvent)
-          session.on('exit', onExit)
-          session.on('stderr', onStderr)
-
-          state.codingCliSubscriptions.set(session.id, () => {
-            session.off('event', onEvent)
-            session.off('exit', onExit)
-            session.off('stderr', onStderr)
-          })
-
-          this.send(ws, {
-            type: 'codingcli.created',
-            requestId: m.requestId,
-            sessionId: session.id,
-            provider: session.provider.name,
-          })
-        } catch (err: any) {
-          error = true
-          log.warn({ err, connectionId: ws.connectionId }, 'codingcli.create failed')
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: err?.message || 'Failed to create coding CLI session',
-            requestId: m.requestId,
-          })
-        } finally {
-          endCodingTimer({ sessionId, error })
-        }
-        return
-      }
-
-      case 'codingcli.input': {
-        if (!this.codingCliManager) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Coding CLI sessions not enabled' })
-          return
-        }
-
-        const session = this.codingCliManager.get(m.sessionId)
-        if (!session) {
-          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'Session not found' })
-          return
-        }
-
-        session.sendInput(m.data)
-        return
-      }
-
-      case 'codingcli.kill': {
-        if (!this.codingCliManager) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Coding CLI sessions not enabled' })
-          return
-        }
-
-        const removed = this.codingCliManager.remove(m.sessionId)
-        state.codingCliSessions.delete(m.sessionId)
-        this.removeCodingCliSubscription(state, m.sessionId)
-        this.send(ws, {
-          type: 'codingcli.killed',
-          sessionId: m.sessionId,
-          success: removed,
-        })
         return
       }
 

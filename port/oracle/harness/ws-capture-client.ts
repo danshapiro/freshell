@@ -7,11 +7,11 @@ import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
  * Adapted from `test/helpers/visible-first/protocol-harness.ts`, but pointed at
  * an EXTERNAL server url + token (no in-process `http.createServer`/`WsHandler`).
  * It records BOTH directions as a single ordered transcript so the oracle can
- * replay/compare original-vs-port wire behaviour byte-for-byte.
+ * capture and compare Rust wire behaviour byte-for-byte.
  *
  * Do NOT import server internals here — the whole point of the external harness
- * is that capture is transport-only and works identically against the node
- * original and the future Rust port.
+ * is that capture is transport-only and works identically against every Rust
+ * server boot.
  */
 
 export type Direction = 'in' | 'out'

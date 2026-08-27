@@ -37,7 +37,7 @@ pub use settings::*;
 pub const WS_PROTOCOL_VERSION: u32 = 7;
 
 /// Every `type` discriminant the protocol speaks, both directions, sorted.
-/// (31 client→server + 58 server→client = 89.)
+/// (28 client→server + 53 server→client = 81.)
 pub fn all_message_types() -> Vec<&'static str> {
     let mut types: Vec<&'static str> = client_messages::CLIENT_MESSAGE_TYPES
         .iter()

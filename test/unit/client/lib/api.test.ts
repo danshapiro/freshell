@@ -4,30 +4,21 @@ import {
   getFreshAgentModelCapabilities,
   refreshFreshAgentModelCapabilities,
   getFreshAgentThreadSnapshot,
-  getFreshAgentThreadTurnBody,
-  getFreshAgentThreadTurns,
-  getFreshAgentTurnBody,
-  getFreshAgentTurnPage,
   fetchSidebarSessionsSnapshot,
   getBootstrap,
   getSessionDirectoryPage,
   getTerminalDirectoryPage,
   searchSessions,
-  getTerminalScrollbackPage,
-  getTerminalViewport,
   searchTerminalView,
   setSessionMetadata,
 } from '@/lib/api'
 import {
-  FreshAgentThreadTurnBodyQuerySchema,
   RestoreStaleRevisionResponseSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
 } from '@shared/read-models'
 import {
   codexContractSnapshot,
-  codexContractTurnBody,
-  codexContractTurnPage,
 } from '../../../fixtures/fresh-agent/codex/contract-fixtures.js'
 
 const mockFetch = vi.fn()
@@ -154,33 +145,6 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
-  it('fresh-agent helpers target only the new route family and forward AbortSignal', async () => {
-    const signal = new AbortController().signal
-    mockFetch
-      .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
-      .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', body: [] }))
-
-    await getFreshAgentThreadTurns('session-1', { cursor: 'page-2', limit: 20, revision: 7 }, { signal })
-    await getFreshAgentThreadTurnBody('session-1', 'turn-1', { revision: 7, signal })
-
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      1,
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?cursor=page-2&revision=7&limit=20',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      2,
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns/turn-1?revision=7',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-  })
-
   it('preserves typed capability errors from non-2xx capability reads and refreshes', async () => {
     mockFetch
       .mockResolvedValueOnce(mockJsonResponse(503, {
@@ -258,30 +222,15 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
-  it('fresh-agent helpers target the fresh-agent route family and pin provider, revision, and cursor', async () => {
+  it('fresh-agent snapshot helper targets the fresh-agent route family and pins provider and revision', async () => {
     const signal = new AbortController().signal
-    mockFetch
-      .mockResolvedValueOnce(mockJson(codexContractSnapshot))
-      .mockResolvedValueOnce(mockJson(codexContractTurnPage))
-      .mockResolvedValueOnce(mockJson(codexContractTurnBody))
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
 
     await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1', { revision: 7, cwd: '/repo/worktree', signal })
-    await getFreshAgentTurnPage('freshcodex', 'codex', 'thread-1', { revision: 7, cursor: 'cursor-1', cwd: '/repo/worktree', limit: 20 }, { signal })
-    await getFreshAgentTurnBody('freshcodex', 'codex', 'thread-1', 'turn-1', { revision: 7, cwd: '/repo/worktree', signal })
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
       '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7&cwd=%2Frepo%2Fworktree',
-      expect.objectContaining({ signal, headers: expect.any(Headers) }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      2,
-      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns?revision=7&cursor=cursor-1&cwd=%2Frepo%2Fworktree&limit=20',
-      expect.objectContaining({ signal, headers: expect.any(Headers) }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      3,
-      '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns/turn-1?revision=7&cwd=%2Frepo%2Fworktree',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
   })
@@ -297,72 +246,7 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
-  it('rejects thread-turn requests that omit the pinned restore revision', async () => {
-    await expect(getFreshAgentThreadTurns('session-1', { priority: 'visible' }, { signal: new AbortController().signal }))
-      .rejects
-      .toMatchObject({
-        name: 'ZodError',
-      })
-    expect(mockFetch).not.toHaveBeenCalled()
-  })
-
-  it('rejects turn-body requests that omit the pinned restore revision', async () => {
-    await expect(getFreshAgentThreadTurnBody('session-1', 'turn-1', { signal: new AbortController().signal }))
-      .rejects
-      .toMatchObject({
-        name: 'ZodError',
-      })
-    expect(mockFetch).not.toHaveBeenCalled()
-  })
-
-  it('serializes includeBodies=true for the first visible fresh-agent thread-turn request', async () => {
-    const signal = new AbortController().signal
-    mockFetch.mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
-
-    await getFreshAgentThreadTurns('session-1', { priority: 'visible', includeBodies: true, revision: 11 }, { signal })
-
-    expect(mockFetch).toHaveBeenCalledWith(
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=visible&revision=11&includeBodies=true',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-  })
-
-  it('pins restore revision onto both fresh-agent thread-turn and turn-body requests', async () => {
-    const signal = new AbortController().signal
-    mockFetch
-      .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
-      .mockResolvedValueOnce(mockJson({ turnId: 'turn-7', body: [] }))
-
-    await getFreshAgentThreadTurns(
-      'session-1',
-      { priority: 'visible', revision: 13, includeBodies: true },
-      { signal },
-    )
-    await getFreshAgentThreadTurnBody('session-1', 'turn-7', { revision: 13, signal })
-
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      1,
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns?priority=visible&revision=13&includeBodies=true',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      2,
-      '/api/fresh-agent/threads/freshclaude/claude/session-1/turns/turn-7?revision=13',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-  })
-
-  it('shares the turn-body revision query and stale-revision error contracts from read-models', () => {
-    expect(FreshAgentThreadTurnBodyQuerySchema.parse({ revision: '13' })).toEqual({ revision: 13 })
+  it('shares the stale-revision error contract from read-models', () => {
     expect(RestoreStaleRevisionResponseSchema.parse({
       error: 'Stale restore revision',
       code: 'RESTORE_STALE_REVISION',
@@ -374,35 +258,12 @@ describe('visible-first read-model helpers', () => {
     })
   })
 
-  it('terminal view helpers target only viewport, scrollback, and search routes while forwarding AbortSignal', async () => {
+  it('terminal search helper forwards AbortSignal', async () => {
     const signal = new AbortController().signal
-    mockFetch
-      .mockResolvedValueOnce(mockJson({ terminalId: 'term-1' }))
-      .mockResolvedValueOnce(mockJson({ items: [] }))
-      .mockResolvedValueOnce(mockJson({ matches: [] }))
-
-    await getTerminalViewport('term-1', { signal })
-    await getTerminalScrollbackPage('term-1', { cursor: 'line-100', limit: 50 }, { signal })
+    mockFetch.mockResolvedValueOnce(mockJson({ matches: [] }))
     await searchTerminalView('term-1', { query: 'error', cursor: 'hit-2', limit: 25 }, { signal })
 
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      1,
-      '/api/terminals/term-1/viewport',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      2,
-      '/api/terminals/term-1/scrollback?cursor=line-100&limit=50',
-      expect.objectContaining({
-        signal,
-        headers: expect.any(Headers),
-      }),
-    )
-    expect(mockFetch).toHaveBeenNthCalledWith(
-      3,
+    expect(mockFetch).toHaveBeenCalledWith(
       '/api/terminals/term-1/search?query=error&cursor=hit-2&limit=25',
       expect.objectContaining({
         signal,

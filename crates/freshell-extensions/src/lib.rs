@@ -1,7 +1,6 @@
 //! Extension manifest validation for the freshell Rust port (df1 EXT-01).
 //!
-//! Ports the legacy strict manifest schema — `server/extension-manifest.ts`
-//! (zod 4.3.6, the package-lock pin) — with behavior-for-behavior parity:
+//! Ports the strict manifest schema with behavior-for-behavior parity:
 //!
 //! * strict objects reject unknown keys at every level (`unrecognized_keys`)
 //! * category↔config-block coupling refine (exactly one `client`/`server`/
@@ -21,11 +20,9 @@
 //!   emission order (schema-definition order; `unrecognized_keys` last per
 //!   object; refines after their object's base issues)
 //!
-//! Behavior is pinned by a differential oracle:
-//! `fixtures/manifest-oracle.json` (124 cases) generated from the UNMODIFIED
-//! legacy schema by `port/contract/generate-manifest-oracle.ts`; iterated by
-//! `tests/oracle.rs`. Never hand-edit the fixture to match this crate —
-//! regenerate it and fix the crate instead.
+//! Behavior is pinned by the frozen migration fixture
+//! `fixtures/manifest-oracle.json` (124 cases), iterated by `tests/oracle.rs`.
+//! Keep the fixture as provenance and fix this crate when it exposes a mismatch.
 //!
 //! Locale note: JSON text in, typed manifest out. No I/O, no clocks, no
 //! randomness — hermetic by construction.

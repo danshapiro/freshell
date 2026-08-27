@@ -465,34 +465,6 @@ export const UiScreenshotResultSchema = z.object({
   error: z.string().optional(),
 }).strict()
 
-// Coding CLI session schemas
-export const CodingCliCreateSchema = z.object({
-  type: z.literal('codingcli.create'),
-  requestId: z.string().min(1),
-  provider: CodingCliProviderSchema,
-  prompt: z.string().min(1),
-  cwd: z.string().optional(),
-  /** Retained solely so the handler can detect-and-reject; see kata ejh6. */
-  resumeSessionId: z.string().optional(),
-  /** Canonical identity carrier (kata ejh6). */
-  sessionRef: SessionLocatorSchema.optional(),
-  model: z.string().optional(),
-  maxTurns: z.number().int().positive().optional(),
-  permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-})
-
-export const CodingCliInputSchema = z.object({
-  type: z.literal('codingcli.input'),
-  sessionId: z.string().min(1),
-  data: z.string(),
-})
-
-export const CodingCliKillSchema = z.object({
-  type: z.literal('codingcli.kill'),
-  sessionId: z.string().min(1),
-})
-
 export const FreshAgentCreateSchema = z.object({
   type: z.literal('freshAgent.create'),
   requestId: z.string().min(1),
@@ -718,9 +690,6 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   AmplifierActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
-  CodingCliCreateSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
@@ -1065,50 +1034,6 @@ export type SessionRepairActivityMessage = {
   message?: string
 }
 
-// -- Coding CLI --
-
-export type CodingCliCreatedMessage = {
-  type: 'codingcli.created'
-  requestId: string
-  sessionId: string
-  provider: CodingCliProviderName
-}
-
-export type CodingCliEventMessage = {
-  type: 'codingcli.event'
-  sessionId: string
-  provider: CodingCliProviderName
-  // Provider-specific payload shape. Consumers should narrow/cast based on
-  // provider and local event normalization contracts.
-  event: unknown
-}
-
-export type CodingCliExitMessage = {
-  type: 'codingcli.exit'
-  sessionId: string
-  provider: CodingCliProviderName
-  exitCode: number
-}
-
-export type CodingCliStderrMessage = {
-  type: 'codingcli.stderr'
-  sessionId: string
-  provider: CodingCliProviderName
-  text: string
-}
-
-export type CodingCliKilledMessage = {
-  type: 'codingcli.killed'
-  sessionId: string
-  success: boolean
-}
-
-export type CodingCliWsMessage =
-  | CodingCliEventMessage
-  | CodingCliCreatedMessage
-  | CodingCliExitMessage
-  | CodingCliStderrMessage
-
 // -- Fresh Agent server→client messages --
 
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
@@ -1222,11 +1147,6 @@ export type ServerMessage =
   | TabsSyncSnapshotMessage
   | SessionStatusMessage
   | SessionRepairActivityMessage
-  | CodingCliCreatedMessage
-  | CodingCliEventMessage
-  | CodingCliExitMessage
-  | CodingCliStderrMessage
-  | CodingCliKilledMessage
   | FreshAgentServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage

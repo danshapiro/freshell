@@ -10,38 +10,21 @@ import {
   applyIsolatedHomeEnvironment,
   ensureSetupWizardBypassConfig,
 } from '../../../test/e2e-browser/helpers/server-fixture-support.js'
-import { LegacyNodeServer } from './legacy-node-server.js'
 
 /**
- * External-process server harness for the equivalence oracle.
+ * External-process harness for the Rust server used by the port oracle.
  *
- * A thin wrapper that boots the SYSTEM-UNDER-TEST as an isolated external child
- * on a free loopback port with a deterministic auth token and a fully isolated
- * HOME, tags it with ownership-sentinel env vars so any grandchildren are
- * attributable to THIS probe, and exposes a minimal
- * `{ wsUrl, token, port, pid, homeDir, stop() }` handle.
- *
- * TWO TARGETS share one env contract and one capture path (the whole point of an
- * external-process harness — capture is transport-only):
- *   - `node` (DEFAULT): the original server via the oracle-local constructor.
- *   - `rust`: the PORT (`target/release/freshell-server`), spawned directly with
- *     the SAME env contract (PORT, AUTH_TOKEN, FRESHELL_BIND_HOST=127.0.0.1,
- *     isolated HOME, the `network:{configured:true}` config pre-seed, ownership
- *     sentinels). Selected via `options.target` or `FRESHELL_ORACLE_TARGET=rust`.
- *
- * SAFETY: this never binds :3001 and never touches a server it did not spawn.
- * `stop()` SIGTERM→SIGKILLs the tracked pid and removes the workspaces it created.
+ * Every invocation builds (or reuses) the worktree's Rust release binary,
+ * starts that binary on an ephemeral loopback port, and gives it an isolated
+ * HOME plus ownership sentinels. The returned handle owns the child and all
+ * temporary directories, so `stop()` can reap exactly what this probe started.
  */
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const PROJECT_ROOT = path.resolve(__dirname, '../../..')
 
-export type OracleTarget = 'node' | 'rust'
-
 export interface ExternalServerHandle {
-  /** Which implementation was booted (`node` original vs `rust` port). */
-  target: OracleTarget
   /** ws://127.0.0.1:<port>/ws */
   wsUrl: string
   /** http://127.0.0.1:<port> */
@@ -67,41 +50,16 @@ export interface ExternalServerHandle {
 }
 
 export interface StartExternalServerOptions {
-  /**
-   * Which implementation to boot. Defaults to `FRESHELL_ORACLE_TARGET === 'rust'`
-   * ? 'rust' : 'node' — so the default stays the original node server and the
-   * Rust port is opt-in (per-call or via the env var).
-   */
-  target?: OracleTarget
-  /** Provider tag recorded in the ownership sentinel (default: 'oracle'). */
+  /** Provider tag recorded in the ownership sentinel (default: `oracle`). */
   provider?: string
-  /** Health-poll budget in ms (default: 60000 — generous for cold WSL boots). */
+  /** Health-poll budget in ms (default: 60000 — generous for cold boots). */
   startTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr to this process's console. */
   verbose?: boolean
   /** Extra env vars to inject into the spawned server. */
   env?: Record<string, string>
-  /**
-   * Hook to populate the server's ISOLATED HOME before it boots (and before it
-   * lazily spawns any coding-CLI sidecars). Used by T2 to seed provider auth.
-   */
+  /** Populate the isolated HOME before the Rust server boots. */
   setupHome?: (homeDir: string) => Promise<void>
-  /**
-   * RULING 2 (antagonist adjudication
-   * `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11):
-   * comparator bite-proof support. Defaults to `'isolated'` (the T0 cwd-parity
-   * fix from RULING 1: an isolated scratch root with no `extensions/` dir, for
-   * BOTH targets). Pass `'project'` to instead boot from the real checkout
-   * (`PROJECT_ROOT`) on BOTH targets, so a non-empty `extensions/` dir is
-   * genuinely discovered by both — used by the
-   * `t0-known-providers-discovery-rust` rot-guard case to prove the comparator
-   * still catches a real `knownProviders` divergence.
-   */
-  cwdMode?: 'isolated' | 'project'
-}
-
-export function serverEntryPath(root: string = PROJECT_ROOT): string {
-  return path.join(root, 'dist', 'server', 'index.js')
 }
 
 /** Absolute path of the built Rust server binary (release profile). */
@@ -109,97 +67,9 @@ export function rustServerBinPath(root: string = PROJECT_ROOT): string {
   return path.join(root, 'target', 'release', 'freshell-server')
 }
 
-/**
- * Injectable knobs for `nodeBuildStampIsCurrent` — production passes nothing
- * (the HEAD probe spawns git); tests pass an explicit `head` or force the
- * git-less path so they never depend on the scratch root being a git repo.
- */
-export interface NodeStampFreshnessOptions {
-  /** Explicit HEAD sha to compare against; skips the git probe when given. */
-  head?: string
-  /** Force the git-less environment path (legacy reuse) when false. */
-  gitAvailable?: boolean
-}
-
-/**
- * Whether the node dist's baked build stamp (written by `build:server`'s
- * `scripts/bake-server-build-id.mjs`) matches the CURRENT checkout HEAD.
- *
- * STRICT when HEAD is available: ONLY an exact match counts as current.
- * False — rebuild — when NO bake file exists (post-feature `build:server`
- * ALWAYS writes the bake file, so absence means a pre-feature or raw-`tsc`
- * artifact whose ready frame may omit `buildId` entirely; delta review
- * round 1), when the file is malformed/unreadable (defensive — the writer
- * is atomic), when the stamp is `"unknown"` (a git-less build), or when the
- * stamp is any real-but-different sha. The strictness keeps the oracle from
- * ever comparing a git-less/stale node artifact against a fresh cargo-built
- * rust binary: a dist built WITHOUT git and reused in this git-full checkout
- * advertises `"unknown"` while the rust bake is a fresh sha, which would be
- * a spurious oracle failure, not a divergence (delta review round 2).
- *
- * LENIENT only when HEAD is unavailable — the git probe fails (spawn status
- * non-zero, e.g. a git-less environment) or `options.gitAvailable === false`:
- * there are no stamp semantics to violate, so the legacy reuse applies.
- */
-export function nodeBuildStampIsCurrent(
-  root: string,
-  options: NodeStampFreshnessOptions = {},
-): boolean {
-  let head: string | undefined = options.head
-  if (options.gitAvailable === false) return true
-  if (head === undefined) {
-    const probe = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })
-    // Git-less environment: no stamp semantics to violate, keep legacy reuse.
-    if (probe.status !== 0) return true
-    head = probe.stdout.trim()
-  }
-  // Missing bake = pre-feature or raw-tsc artifact: its ready frame may omit
-  // buildId entirely — rebuild (delta review round 1).
-  const bakePath = path.join(root, 'dist', 'server', 'build-id.json')
-  if (!fs.existsSync(bakePath)) return false
-  try {
-    const baked = (JSON.parse(fs.readFileSync(bakePath, 'utf8')) as { buildId?: unknown }).buildId
-    // ONLY an exact match with the current HEAD counts as current:
-    // "unknown", malformed, and mismatched stamps all trigger a rebuild so
-    // the oracle never compares a git-less/stale node artifact against a
-    // fresh cargo-built rust binary (delta review round 2).
-    return typeof baked === 'string' && baked === head
-  } catch {
-    return false
-  }
-}
-
-/**
- * Ensure the production node server bundle exists. Builds it with `npm run
- * build:server` if missing. Safe to call repeatedly — a no-op once built.
- */
-export function ensureServerBuilt(root: string = PROJECT_ROOT): string {
-  const entry = serverEntryPath(root)
-  if (fs.existsSync(entry) && nodeBuildStampIsCurrent(root)) return entry
-
-  const result = spawnSync('npm', ['run', 'build:server'], {
-    cwd: root,
-    stdio: 'inherit',
-    env: process.env,
-  })
-  if (result.status !== 0) {
-    throw new Error(
-      `\`npm run build:server\` failed (exit ${result.status ?? 'signal ' + result.signal}); ` +
-        'cannot boot the external oracle server.',
-    )
-  }
-  if (!fs.existsSync(entry)) {
-    throw new Error(`build:server completed but ${entry} is still missing.`)
-  }
-  return entry
-}
-
 let rustBuildDone = false
 
-/**
- * Ensure the Rust `freshell-server` release binary exists. Builds it once with
- * `cargo build --release -p freshell-server` (idempotent + cached by cargo).
- */
+/** Ensure the worktree's Rust server release binary exists. */
 export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
   const bin = rustServerBinPath(root)
   if (rustBuildDone && fs.existsSync(bin)) return bin
@@ -212,7 +82,7 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
   if (result.status !== 0) {
     throw new Error(
       `\`cargo build --release -p freshell-server\` failed ` +
-        `(exit ${result.status ?? 'signal ' + result.signal}); cannot boot the Rust oracle target.`,
+        `(exit ${result.status ?? 'signal ' + result.signal}); cannot boot the Rust oracle server.`,
     )
   }
   if (!fs.existsSync(bin)) {
@@ -246,255 +116,142 @@ async function createProbeWorkspace(
   return { probeHome, sentinelPath }
 }
 
-function resolveTarget(options: StartExternalServerOptions): OracleTarget {
-  if (options.target) return options.target
-  return process.env.FRESHELL_ORACLE_TARGET === 'rust' ? 'rust' : 'node'
-}
-
 /**
- * T0 harness cwd-parity fix (RULING 1, antagonist adjudication
- * `0000000000000000-dc849de1bd584a39_self-driving-reviewer`, 2026-07-11):
- * `startRustServer` used to spawn the rust binary with `cwd: PROJECT_ROOT`
- * (the real checkout, whose real `extensions/` dir it faithfully discovers),
- * while `startNodeServer` boots the original through `TestServer`
- * (`test-server.ts`'s `createIsolatedRuntimeRoot`), which spawns from an
- * ISOLATED mkdtemp root containing only `package.json` + `dist/` (no
- * `extensions/`). That asymmetry made T0 case (c) spuriously diverge on
- * `codingCli.knownProviders` (rust saw real extensions/, node's isolated root
- * never has any). This mirrors `createIsolatedRuntimeRoot` byte-for-byte so
- * both targets get the SAME cwd semantics: an isolated scratch root with no
- * `extensions/` dir, so both report `knownProviders: []` in the T0 harness.
- * (The REST-parity sweep is unaffected: its recipe boots both servers with
- * `cwd = checkout` by design, so both still see the real extensions there.)
- */
-async function createIsolatedRustRuntimeRoot(): Promise<string> {
-  ensureServerBuilt() // require dist/ to exist, mirroring test-server.ts's requireBuiltServerEntry
-  const runtimeRootsParent = path.join(PROJECT_ROOT, '.worktrees')
-  await fsp.mkdir(runtimeRootsParent, { recursive: true })
-  const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'oracle-rust-runtime-'))
-  try {
-    await fsp.copyFile(path.join(PROJECT_ROOT, 'package.json'), path.join(runtimeRoot, 'package.json'))
-    await fsp.cp(path.join(PROJECT_ROOT, 'dist'), path.join(runtimeRoot, 'dist'), {
-      recursive: true,
-      filter: (source) => path.basename(source) !== '.env',
-    })
-    return runtimeRoot
-  } catch (error) {
-    await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})
-    throw error
-  }
-}
-
-/**
- * Boot the freshell server (original OR Rust port) as an isolated external
- * process and return a handle for driving + reaping it.
+ * Boot an owned Rust server on a free loopback port.
+ *
+ * Port 3001 is reserved for the user's self-hosted instance. The harness
+ * rejects it explicitly even when a caller supplies PORT, and otherwise uses
+ * the repository's free-port helper. No listener inspection is needed because
+ * ownership is established from this child process and its PID ledger.
  */
 export async function startExternalServer(
   options: StartExternalServerOptions = {},
 ): Promise<ExternalServerHandle> {
   const provider = options.provider ?? 'oracle'
-  const target = resolveTarget(options)
   const { probeHome, sentinelPath } = await createProbeWorkspace(provider)
+  let homeDirForCleanup: string | undefined
 
   try {
-    return target === 'rust'
-      ? await startRustServer(options, provider, probeHome, sentinelPath)
-      : await startNodeServer(options, provider, probeHome, sentinelPath)
-  } catch (err) {
-    await fsp.rm(probeHome, { recursive: true, force: true }).catch(() => {})
-    throw err
-  }
-}
+    const bin = ensureRustServerBuilt()
+    const requestedPort = options.env?.PORT ? Number(options.env.PORT) : await findFreePort()
+    if (!Number.isInteger(requestedPort) || requestedPort <= 0 || requestedPort > 65_535) {
+      throw new Error(`invalid oracle server port: ${options.env?.PORT ?? requestedPort}`)
+    }
+    if (requestedPort === 3001) {
+      throw new Error('oracle server port 3001 is reserved for the self-hosted server')
+    }
 
-/** Boot the original Node server via the oracle-local temporary constructor. */
-async function startNodeServer(
-  options: StartExternalServerOptions,
-  _provider: string,
-  probeHome: string,
-  sentinelPath: string,
-): Promise<ExternalServerHandle> {
-  ensureServerBuilt()
+    const token = randomUUID()
+    const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oracle-rust-'))
+    homeDirForCleanup = homeDir
+    const freshellDir = path.join(homeDir, '.freshell')
+    await fsp.mkdir(freshellDir, { recursive: true })
+    await ensureSetupWizardBypassConfig(path.join(freshellDir, 'config.json'))
+    const logsDir = path.join(freshellDir, 'logs')
+    await fsp.mkdir(logsDir, { recursive: true })
 
-  const server = new LegacyNodeServer({
-    // RULING 2 (adjudication `...dc849de1bd584a39_self-driving-reviewer`,
-    // 2026-07-11): default 'isolated' (RULING 1's T0 cwd-parity fix); the
-    // rot-guard case opts into 'project' on BOTH targets so a real non-empty
-    // extensions/ dir is genuinely discovered by both sides.
-    runtimeRootMode: options.cwdMode === 'project' ? 'project' : 'isolated',
-    startTimeoutMs: options.startTimeoutMs ?? 60_000,
-    verbose: options.verbose ?? false,
-    ...(options.setupHome ? { setupHome: options.setupHome } : {}),
-    env: {
-      // Force loopback: the constructor also sets this, but keep the oracle
-      // this, but we assert it here too so the harness is self-documenting.
-      FRESHELL_BIND_HOST: '127.0.0.1',
-      // Ownership sentinels — inherited by every grandchild the server spawns.
-      FRESHELL_PROBE_HOME: probeHome,
-      FRESHELL_PROBE_SENTINEL: sentinelPath,
-      FRESHELL_PROBE_PROVIDER: _provider,
-      ...options.env,
-    },
-  })
+    if (options.setupHome) await options.setupHome(homeDir)
 
-  const info = await server.start()
+    const env = applyIsolatedHomeEnvironment(
+      {
+        ...(process.env as Record<string, string>),
+        PORT: String(requestedPort),
+        NODE_ENV: 'production',
+        FRESHELL_LOG_DIR: logsDir,
+        HIDE_STARTUP_TOKEN: 'true',
+        FRESHELL_BIND_HOST: '127.0.0.1',
+        AUTH_TOKEN: token,
+        FRESHELL_PROBE_HOME: probeHome,
+        FRESHELL_PROBE_SENTINEL: sentinelPath,
+        FRESHELL_PROBE_PROVIDER: provider,
+        ...options.env,
+      },
+      homeDir,
+    )
 
-  let stopped = false
-  const stop = async (): Promise<void> => {
-    if (stopped) return
-    stopped = true
-    try {
-      await server.stop()
-    } finally {
+    const child: ChildProcess = spawn(bin, [], {
+      cwd: PROJECT_ROOT,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const pid = child.pid
+    if (!pid) throw new Error('Rust server failed to spawn (no pid)')
+
+    let stdoutBuffer = ''
+    let stderrBuffer = ''
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBuffer += chunk.toString()
+      if (options.verbose) process.stdout.write(`[rust-server:${pid}] ${chunk}`)
+    })
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrBuffer += chunk.toString()
+      if (options.verbose) process.stderr.write(`[rust-server:${pid}] ${chunk}`)
+    })
+
+    const baseUrl = `http://127.0.0.1:${requestedPort}`
+    const wsUrl = `ws://127.0.0.1:${requestedPort}/ws`
+    let stopped = false
+
+    const cleanupHomes = async () => {
+      await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})
       await fsp.rm(probeHome, { recursive: true, force: true }).catch(() => {})
     }
-  }
 
-  return {
-    target: 'node',
-    wsUrl: info.wsUrl,
-    baseUrl: info.baseUrl,
-    token: info.token,
-    port: info.port,
-    pid: info.pid,
-    homeDir: info.homeDir,
-    logsDir: info.logsDir,
-    debugLogPath: info.debugLogPath,
-    probeHome,
-    sentinelPath,
-    stop,
-  }
-}
-
-/**
- * Boot the RUST port (`target/release/freshell-server`) as an isolated external
- * process, replicating the exact env contract the E2E `TestServer` gives the
- * node original: ephemeral PORT, explicit AUTH_TOKEN, FRESHELL_BIND_HOST=loopback,
- * an isolated HOME whose `.freshell/config.json` pre-seeds
- * `network:{configured:true,host:'127.0.0.1'}` (the setup-wizard bypass), an
- * isolated logs dir, and the ownership sentinels.
- */
-async function startRustServer(
-  options: StartExternalServerOptions,
-  _provider: string,
-  probeHome: string,
-  sentinelPath: string,
-): Promise<ExternalServerHandle> {
-  const bin = ensureRustServerBuilt()
-  // RULING 1 (see createIsolatedRustRuntimeRoot doc comment above): spawn from
-  // an isolated scratch root, matching startNodeServer's isolated runtimeRoot,
-  // instead of the real checkout (cwd parity for T0). RULING 2: `cwdMode:
-  // 'project'` opts BOTH targets into the real checkout instead, for the
-  // rot-guard case that needs a genuinely non-empty extensions/ dir.
-  const runtimeRoot =
-    options.cwdMode === 'project' ? PROJECT_ROOT : await createIsolatedRustRuntimeRoot()
-  const ownsRuntimeRoot = options.cwdMode !== 'project'
-
-  const port = options.env?.PORT ? Number(options.env.PORT) : await findFreePort()
-  const token = randomUUID()
-  const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-oracle-rust-'))
-  const freshellDir = path.join(homeDir, '.freshell')
-  await fsp.mkdir(freshellDir, { recursive: true })
-  await ensureSetupWizardBypassConfig(path.join(freshellDir, 'config.json'))
-  const logsDir = path.join(freshellDir, 'logs')
-  await fsp.mkdir(logsDir, { recursive: true })
-
-  if (options.setupHome) {
-    await options.setupHome(homeDir)
-  }
-
-  const env = applyIsolatedHomeEnvironment(
-    {
-      ...(process.env as Record<string, string>),
-      PORT: String(port),
-      NODE_ENV: 'production',
-      FRESHELL_LOG_DIR: logsDir,
-      HIDE_STARTUP_TOKEN: 'true',
-      FRESHELL_BIND_HOST: '127.0.0.1',
-      AUTH_TOKEN: token,
-      FRESHELL_PROBE_HOME: probeHome,
-      FRESHELL_PROBE_SENTINEL: sentinelPath,
-      FRESHELL_PROBE_PROVIDER: _provider,
-      ...options.env,
-    },
-    homeDir,
-  )
-
-  const child: ChildProcess = spawn(bin, [], {
-    cwd: runtimeRoot,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  const pid = child.pid
-  if (!pid) throw new Error('Rust server failed to spawn (no pid)')
-
-  let stdoutBuffer = ''
-  let stderrBuffer = ''
-  child.stdout?.on('data', (chunk: Buffer) => {
-    stdoutBuffer += chunk.toString()
-    if (options.verbose) process.stdout.write(`[rust-server:${pid}] ${chunk}`)
-  })
-  child.stderr?.on('data', (chunk: Buffer) => {
-    stderrBuffer += chunk.toString()
-    if (options.verbose) process.stderr.write(`[rust-server:${pid}] ${chunk}`)
-  })
-
-  const baseUrl = `http://127.0.0.1:${port}`
-  const wsUrl = `ws://127.0.0.1:${port}/ws`
-
-  const cleanupHomes = async () => {
-    await fsp.rm(homeDir, { recursive: true, force: true }).catch(() => {})
-    await fsp.rm(probeHome, { recursive: true, force: true }).catch(() => {})
-    // RULING 1: clean up the isolated runtime root alongside homeDir/probeHome.
-    // RULING 2: never remove PROJECT_ROOT itself (cwdMode:'project' reuses it).
-    if (ownsRuntimeRoot) {
-      await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})
-    }
-  }
-
-  let stopped = false
-  const stop = async (): Promise<void> => {
-    if (stopped) return
-    stopped = true
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          child.kill('SIGKILL')
-          resolve()
-        }, 5_000)
-        child.once('exit', () => {
-          clearTimeout(timeout)
-          resolve()
+    const stop = async (): Promise<void> => {
+      if (stopped) return
+      stopped = true
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => {
+            child.kill('SIGKILL')
+            resolve()
+          }, 5_000)
+          child.once('exit', () => {
+            clearTimeout(timeout)
+            resolve()
+          })
+          child.kill('SIGTERM')
         })
-        child.kill('SIGTERM')
-      })
+      }
+      await cleanupHomes()
     }
-    await cleanupHomes()
-  }
 
-  try {
-    await waitForRustHealth(child, baseUrl, options.startTimeoutMs ?? 60_000, () => stderrBuffer, () => stdoutBuffer)
+    try {
+      await waitForRustHealth(
+        child,
+        baseUrl,
+        options.startTimeoutMs ?? 60_000,
+        () => stderrBuffer,
+        () => stdoutBuffer,
+      )
+    } catch (err) {
+      await stop()
+      throw err
+    }
+
+    return {
+      wsUrl,
+      baseUrl,
+      token,
+      port: requestedPort,
+      pid,
+      homeDir,
+      logsDir,
+      debugLogPath: path.join(logsDir, `freshell-server.rust.${requestedPort}.log`),
+      probeHome,
+      sentinelPath,
+      stop,
+    }
   } catch (err) {
-    await stop()
+    if (homeDirForCleanup) {
+      await fsp.rm(homeDirForCleanup, { recursive: true, force: true }).catch(() => {})
+    }
+    await fsp.rm(probeHome, { recursive: true, force: true }).catch(() => {})
     throw err
   }
-
-  return {
-    target: 'rust',
-    wsUrl,
-    baseUrl,
-    token,
-    port,
-    pid,
-    homeDir,
-    logsDir,
-    debugLogPath: path.join(logsDir, `freshell-server.rust.${port}.log`),
-    probeHome,
-    sentinelPath,
-    stop,
-  }
 }
 
-/** Poll `/api/health` until `{ ok: true }`, or fail fast if the process exits. */
+/** Poll `/api/health` until `{ ok: true }`, or fail if the process exits. */
 async function waitForRustHealth(
   child: ChildProcess,
   baseUrl: string,
@@ -519,7 +276,7 @@ async function waitForRustHealth(
     } catch {
       // Not listening yet — expected during boot.
     }
-    await new Promise((r) => setTimeout(r, 200))
+    await new Promise((resolve) => setTimeout(resolve, 200))
   }
   throw new Error(
     `Timed out waiting for Rust server health after ${timeoutMs}ms.\n` +

@@ -316,10 +316,10 @@ describe('normalize (f) — shape violations are surfaced, not silently masked',
 // ── (g) opaque blobs masked, never value-compared ───────────────────────────
 
 describe('normalize (g) — opaque blobs masked to a family tag', () => {
-  it('data / event / imageBase64 are masked to their family tags', () => {
+  it('data / fresh-agent event / imageBase64 are masked to their family tags', () => {
     const { normalized, report } = normalizeTranscript([
       inbound({ type: 'terminal.output', terminalId: 't_aaaaaaaaaa', streamId: 's_aaaaaaaaaa', seqStart: 1, seqEnd: 2, data: 'raw pty bytes' }),
-      inbound({ type: 'codingcli.event', sessionId: 'ses_aaaaaaaa', event: { kind: 'delta', text: 'hello', nested: { a: 1 } } }),
+      inbound({ type: 'freshAgent.event', sessionId: 'ses_aaaaaaaa', event: { kind: 'delta', text: 'hello', nested: { a: 1 } } }),
       inbound({ type: 'ui.screenshot.result', requestId: 'req_aaaaaaaa', imageBase64: 'iVBORw0KGgoAAAANS', mimeType: 'image/png' }),
     ])
     expect((normalized[0].parsed as Record<string, unknown>).data).toBe('<OPAQUE:data>')
