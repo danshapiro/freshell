@@ -258,14 +258,25 @@ function fmt(p: DiffPath): string {
 }
 
 /** Assert every actual diff path is contained under one of the allowed
- * (prefix) paths — "only that writer's intended paths differ". */
+ * (prefix) paths — "only that writer's intended paths differ". On failure
+ * the unexpected set is named TWICE: in the expect message and on a
+ * `[cfg01-lossless]` console line, because cloud runs retain only the line
+ * reporter's stdout (no HTML report) and the reporter can abbreviate the
+ * Received block. */
 function expectDiffWithin(actual: DiffPath[], allowed: DiffPath[], context: string): void {
   const unexpected = actual.filter(
     (p) => !allowed.some((a) => a.length <= p.length && a.every((seg, i) => seg === p[i])),
   )
+  if (unexpected.length > 0) {
+    console.error(
+      `[cfg01-lossless] UNEXPECTED DRIFT (${context}): ${unexpected.map(fmt).join(', ')}` +
+        ` — allowed: ${allowed.length > 0 ? allowed.map(fmt).join(', ') : '(none)'}`,
+    )
+  }
   expect(
     unexpected.map(fmt),
-    `${context}: unexpected config.json drift beyond the writer's intended paths`,
+    `${context}: unexpected config.json drift beyond the writer's intended paths` +
+      ` (unexpected: ${unexpected.map(fmt).join(', ') || 'none'})`,
   ).toEqual([])
 }
 
