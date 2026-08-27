@@ -9,6 +9,42 @@ const repoRoot = process.cwd()
 // legacy Node backend is intentionally not an allowed production root.
 const productionRuntimeRoots = ['src', 'shared'] as const
 
+const retiredNodeBackendPaths = [
+  'server',
+  'test/server',
+  'test/unit/server',
+  'test/integration/server',
+  'test/integration/session-repair.test.ts',
+  'tsconfig.server.json',
+  'dist/server',
+  'scripts/find-corrupted.ts',
+  'scripts/repair-one.ts',
+  'scripts/repair-all.ts',
+  'scripts/proofs/terminal-catchup-pty-metrics.ts',
+] as const
+
+const retiredNodeBackendDependencies = [
+  '@ai-sdk/google',
+  '@anthropic-ai/claude-agent-sdk',
+  'ai',
+  'chokidar',
+  'cookie-parser',
+  'dotenv',
+  'express',
+  'express-rate-limit',
+  'glob',
+  'is-port-reachable',
+  'node-pty',
+  'pino',
+  'rotating-file-stream',
+  '@types/cookie-parser',
+  '@types/express',
+  '@types/supertest',
+  'pino-pretty',
+  'supertest',
+  'superwtest',
+] as const
+
 const runtimeExtensions = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'])
 
 const legacyRuntimeNeedles = [
@@ -243,6 +279,24 @@ describe('fresh-agent-only runtime architecture', () => {
   it('scans only existing retained production runtime roots', () => {
     for (const root of productionRuntimeRoots) {
       expect(fs.existsSync(path.join(repoRoot, root))).toBe(true)
+    }
+  })
+
+  it('keeps retired Node backend roots, artifacts, scripts, and direct dependencies absent', () => {
+    for (const relativePath of retiredNodeBackendPaths) {
+      expect(fs.existsSync(path.join(repoRoot, relativePath)), relativePath).toBe(false)
+    }
+
+    const packageJson = JSON.parse(readSourceSync('package.json')) as {
+      dependencies?: Record<string, unknown>
+      devDependencies?: Record<string, unknown>
+    }
+    const directDependencies = new Set([
+      ...Object.keys(packageJson.dependencies ?? {}),
+      ...Object.keys(packageJson.devDependencies ?? {}),
+    ])
+    for (const dependency of retiredNodeBackendDependencies) {
+      expect(directDependencies.has(dependency), dependency).toBe(false)
     }
   })
 

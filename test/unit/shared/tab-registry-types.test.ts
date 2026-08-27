@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { TabRegistryRecordSchema } from '../../../server/tabs-registry/types.js'
+import { TabRegistryRecordSchema } from '../../../shared/tab-registry-types.js'
 
-describe('TabRegistryRecordSchema (server)', () => {
+describe('TabRegistryRecordSchema', () => {
   it('accepts open tab records with device metadata and revision', () => {
     const parsed = TabRegistryRecordSchema.parse({
       tabKey: 'device-1:tab-1',

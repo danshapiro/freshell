@@ -37,7 +37,9 @@ const ignoredDirectoryNames = new Set([
   '.claude',
   '.worktrees',
   'dist',
+  'electron-runtime',
   'node_modules',
+  'release',
   'target',
 ])
 
@@ -68,6 +70,9 @@ export const NON_BACKEND_LISTENER_PATHS = [
   'scripts/proofs/browser-process-suspend-probe.ts',
   'electron/port-check.ts',
   'test/e2e-browser/helpers/server-fixture-support.ts',
+  'examples/extensions/live-counter/server.js',
+  'examples/extensions/status-dashboard/server.js',
+  'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 ] as const
 
 const nonBackendListenerPaths = new Set<string>(NON_BACKEND_LISTENER_PATHS)

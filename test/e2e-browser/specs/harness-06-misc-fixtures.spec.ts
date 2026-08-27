@@ -270,7 +270,7 @@ test.describe('harness-06 misc fixtures smoke', () => {
       const body = (await res.json()) as {
         candidates: Array<{ content: { parts: Array<{ text: string }> } }>
       }
-      // The EXACT response path @ai-sdk/google@3.0.43's Zod schema validates.
+      // The response path consumed by the Rust summary client.
       expect(body.candidates[0].content.parts[0].text).toBe(FAKE_GEMINI_DEFAULT_TEXT)
 
       const ledger = ai.ledger()

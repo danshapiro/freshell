@@ -28,10 +28,6 @@ files:
   - dist/electron/**
   - dist/wizard/**
   - package.json
-  # The root lock still carries the retired server's node-pty until the
-  # dependency-retirement task removes it. The Rust app has no native Node
-  # addon, so it must never enter the packaged app or be rebuilt by the packer.
-  - "!node_modules/node-pty{,/**}"
 
 # Electron's app-bound process is Rust; there are no native Node addons to
 # rebuild for Electron's ABI.

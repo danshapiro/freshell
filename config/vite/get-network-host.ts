@@ -9,6 +9,15 @@ export type NetworkHostOptions = {
   isWsl: boolean
 }
 
+/** Return whether this process is running inside WSL. */
+export function isWSL(): boolean {
+  try {
+    return readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft')
+  } catch {
+    return false
+  }
+}
+
 /**
  * Resolve the host Vite should bind to.  The function is deliberately pure
  * with respect to process state: callers provide environment, config path,

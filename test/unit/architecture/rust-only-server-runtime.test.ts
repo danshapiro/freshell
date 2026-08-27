@@ -30,6 +30,9 @@ const ALLOWED_LISTENER_PATHS = [
   'scripts/proofs/browser-process-suspend-probe.ts',
   'electron/port-check.ts',
   'test/e2e-browser/helpers/server-fixture-support.ts',
+  'examples/extensions/live-counter/server.js',
+  'examples/extensions/status-dashboard/server.js',
+  'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 ] as const
 
 const tempRoots: string[] = []
@@ -380,11 +383,6 @@ describe('runtime boundary inventory for the current checkout', () => {
 
     expect(result.manifestDrift).toEqual([])
     expect(result.unexpectedNodeBackend).toEqual([])
-    expect(result.legacyDebt).toEqual(expect.arrayContaining([
-      'server/index.ts',
-      'config/electron-builder.yml:dist/server',
-      'examples/extensions/live-counter/server.js',
-      'examples/extensions/status-dashboard/server.js',
-    ]))
+    expect(result.legacyDebt).toEqual([])
   })
 })

@@ -4,12 +4,6 @@ import { loadEnv } from 'vite'
 import { readFileSync } from 'node:fs'
 
 vi.mock('node:fs')
-// Mock platform module — WSL detection is now centralized in platform.ts
-vi.mock('../../server/platform.js', () => ({
-  isWSL: vi.fn(() => false),
-}))
-
-import { isWSL } from '../../server/platform.js'
 import { getNetworkHost } from '../../config/vite/get-network-host.js'
 
 const TEST_TIMEOUT_MS = 20_000
@@ -74,8 +68,7 @@ describe('getNetworkHost', () => {
   })
 
   it('always returns 0.0.0.0 on WSL regardless of config', async () => {
-    vi.mocked(isWSL).mockReturnValue(true)
-    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: isWSL() })).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: true })).toBe('0.0.0.0')
   })
 })
 

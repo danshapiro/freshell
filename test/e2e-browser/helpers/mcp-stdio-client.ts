@@ -42,9 +42,9 @@ export function mcpServerBinPath(root: string = REPO_ROOT): string {
  * Ensure `dist/tools/freshell-mcp/server.js` exists and is current by running
  * `npm run build:tools` (`tsc -p tsconfig.tools.json`). That project has
  * `incremental: true` with a committed `tsBuildInfo` cache
- * (`node_modules/.cache/tsconfig.server.tsbuildinfo`), so it is safe and fast
+ * (`node_modules/.cache/tsconfig.tools.tsbuildinfo`), so it is safe and fast
  * to run UNCONDITIONALLY on every call rather than hand-rolling mtime-staleness
- * detection across the whole frozen `server/` + `shared/` tree: an unchanged
+ * detection across the whole frozen tooling + shared tree: an unchanged
  * tree is a near-instant no-op, and a changed one gets a real (still
  * incremental) rebuild. Returns the elapsed build time in ms so callers can
  * log it.

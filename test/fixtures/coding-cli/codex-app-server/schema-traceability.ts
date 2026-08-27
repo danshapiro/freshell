@@ -80,18 +80,18 @@ export const CODEX_CLIENT_REQUEST_TRACEABILITY: readonly CodexTraceEntry<CodexCl
     name,
     status: implementedClientMethods.has(name) ? 'implemented' : 'unsupported',
     owner: implementedClientMethods.has(name)
-      ? 'server/coding-cli/codex-app-server/client.ts'
-      : 'server/coding-cli/codex-app-server/protocol.ts',
-    parser: 'server/coding-cli/codex-app-server/protocol.ts',
+      ? 'crates/freshell-codex/src/app_server.rs'
+      : 'crates/freshell-codex/src/protocol.rs',
+    parser: 'crates/freshell-codex/src/protocol.rs',
     normalizer: implementedClientMethods.has(name)
-      ? 'server/fresh-agent/adapters/codex/normalize.ts'
-      : 'server/coding-cli/codex-app-server/protocol.ts',
+      ? 'crates/freshell-freshagent/src/codex.rs'
+      : 'crates/freshell-codex/src/protocol.rs',
     ui: implementedClientMethods.has(name)
       ? 'src/components/fresh-agent/FreshAgentView.tsx'
       : 'clear unsupported Freshcodex action error',
     test: implementedClientMethods.has(name)
-      ? 'test/unit/server/coding-cli/codex-app-server/client.test.ts'
-      : 'test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts',
+      ? 'crates/freshell-codex/tests/app_server_drive.rs'
+      : 'test/unit/port/oracle/t2-codex-rust-baseline.test.ts',
     notes: name === 'thread/read'
       ? 'codex-cli 0.129.0 stable schema does not expose experimental thread/turns/list; Freshell opts into the experimental runtime method, falls back to thread/read when it is unavailable, and covers both paths with tests.'
       : undefined,
@@ -101,48 +101,48 @@ export const CODEX_SERVER_REQUEST_TRACEABILITY: readonly CodexTraceEntry<CodexSe
   CODEX_SERVER_REQUEST_METHODS.map((name) => ({
     name,
     status: 'planned',
-    owner: 'server/coding-cli/codex-app-server/client.ts',
-    parser: 'server/coding-cli/codex-app-server/protocol.ts',
-    normalizer: 'server/fresh-agent/adapters/codex/normalize.ts',
+    owner: 'crates/freshell-codex/src/app_server.rs',
+    parser: 'crates/freshell-codex/src/protocol.rs',
+    normalizer: 'crates/freshell-freshagent/src/codex.rs',
     ui: name === 'account/chatgptAuthTokens/refresh'
       ? 'runtime-global Freshcodex warning'
       : 'src/components/fresh-agent/FreshAgentView.tsx',
-    test: 'test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts',
+    test: 'test/unit/port/oracle/t2-codex-rust-baseline.test.ts',
   }))
 
 export const CODEX_SERVER_NOTIFICATION_TRACEABILITY: readonly CodexTraceEntry<CodexServerNotificationMethod>[] =
   CODEX_SERVER_NOTIFICATION_METHODS.map((name) => ({
     name,
     status: visibleNotificationMethods.has(name) ? 'planned' : 'unsupported',
-    owner: 'server/coding-cli/codex-app-server/client.ts',
-    parser: 'server/coding-cli/codex-app-server/protocol.ts',
+    owner: 'crates/freshell-codex/src/app_server.rs',
+    parser: 'crates/freshell-codex/src/protocol.rs',
     normalizer: visibleNotificationMethods.has(name)
-      ? 'server/fresh-agent/adapters/codex/normalize.ts'
+      ? 'crates/freshell-freshagent/src/codex.rs'
       : 'debug-only non-visible classification',
     ui: visibleNotificationMethods.has(name)
       ? 'src/components/fresh-agent/FreshAgentView.tsx'
       : 'no visible state effect',
-    test: 'test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts',
+    test: 'test/unit/port/oracle/t2-codex-rust-baseline.test.ts',
   }))
 
 export const CODEX_THREAD_ITEM_TRACEABILITY: readonly CodexTraceEntry<CodexThreadItemVariant>[] =
   CODEX_THREAD_ITEM_VARIANTS.map((name) => ({
     name,
     status: 'planned',
-    owner: 'server/fresh-agent/adapters/codex/normalize.ts',
-    parser: 'server/coding-cli/codex-app-server/protocol.ts',
-    normalizer: 'server/fresh-agent/adapters/codex/normalize.ts',
+    owner: 'crates/freshell-freshagent/src/codex.rs',
+    parser: 'crates/freshell-codex/src/protocol.rs',
+    normalizer: 'crates/freshell-freshagent/src/codex.rs',
     ui: 'src/components/fresh-agent/FreshAgentTranscript.tsx',
-    test: 'test/unit/server/fresh-agent/codex-normalize.test.ts',
+    test: 'test/unit/port/oracle/t2-codex-rust-baseline.test.ts',
   }))
 
 export const CODEX_RUNTIME_LEAF_TRACEABILITY: readonly CodexTraceEntry<CodexRuntimeLeafName>[] =
   (Object.keys(CODEX_RUNTIME_LEAF_VALUES) as CodexRuntimeLeafName[]).map((name) => ({
     name,
     status: 'implemented',
-    owner: 'server/coding-cli/codex-app-server/protocol.ts',
-    parser: 'server/coding-cli/codex-app-server/protocol.ts',
-    normalizer: 'server/fresh-agent/adapters/codex/normalize.ts',
+    owner: 'crates/freshell-codex/src/protocol.rs',
+    parser: 'crates/freshell-codex/src/protocol.rs',
+    normalizer: 'crates/freshell-freshagent/src/codex.rs',
     ui: 'src/lib/session-type-utils.ts',
-    test: 'test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts',
+    test: 'test/unit/port/oracle/t2-codex-rust-baseline.test.ts',
   }))

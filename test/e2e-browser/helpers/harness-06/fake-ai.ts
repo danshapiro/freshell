@@ -5,17 +5,11 @@ import net from 'node:net'
  * HARNESS-06 summary-AI fixture — a fake Gemini endpoint returning caller-
  * configured FIXED output.
  *
- * URL/shape contract matches the pinned production dependency
- * (`@ai-sdk/google@3.0.43`):
+ * URL/shape contract matches the Gemini generate-content API:
  *   POST {baseURL}/v1beta/models/{model}:generateContent
  *   POST {baseURL}/v1beta/models/{model}:streamGenerateContent?alt=sse
  * Header `x-goog-api-key` presence is recorded (never the value). Responses
- * satisfy the SDK's Zod schemas (candidates[0].content.parts[].text,
- * finishReason, usageMetadata), proven by the real-SDK vitest legs.
- *
- * NOTE (verified): the SDK only redirects via `createGoogleGenerativeAI({
- * constructs the default provider. Specs therefore drive this fixture
- * directly (or via a server seam added by a later item).
+ * contain the stable fields consumed by the Rust server's summary client.
  */
 
 export interface FakeGeminiRequest {
