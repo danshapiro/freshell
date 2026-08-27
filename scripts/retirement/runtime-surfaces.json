@@ -5,6 +5,7 @@
       "id": "package-scripts",
       "path": "package.json:scripts",
       "role": "package-commands",
+      "commandEvidence": "sha256:291a52d5899220d929705e5ad3fee905230c29c75cee098758d4be3461bdfffa",
       "entries": [
         "predev", "dev", "dev:client", "dev:server", "typecheck", "typecheck:client", "typecheck:server",
         "prebuild", "build", "build:client", "build:server", "build:electron", "build:wizard", "build:launch-chooser",
