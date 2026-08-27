@@ -63,7 +63,9 @@ Docker, and GitHub Actions.
   exec/diff/send, external editor opening, extension lifecycle/assets, raw TCP
   forwarding, WebSocket proxy upgrades, `/api/run`, paged transcript turns,
   terminal viewport/paged scrollback, `codingcli.*`, or the incident dump merely
-  to delete Node. Existing parity issue #624/checklist items retain ownership.
+  to delete Node. The interactive precheck self-update prompt is likewise
+  triaged, not silently equated with Rust's server-side update check. Existing
+  parity issue #624/checklist items retain ownership.
 - Never contact, stop, restart, or health-check port 3001. Every executable test
   owns an isolated `HOME`/`FRESHELL_HOME`, token, PID, and OS-assigned or unique
   non-3001 loopback port. Lifecycle/restart-storm tests use
@@ -119,9 +121,12 @@ Docker, and GitHub Actions.
   and `playwright.config.ts` own one Rust-backed browser lane. An external target
   is read-only and never stopped; an owned target records/reaps its exact PID.
 - `scripts/testing/**`, `config/vitest/vitest.config.ts`, and
-  `config/vitest/vitest.electron.config.ts` own the broad gate: retained Vitest,
-  the Rust workspace, and Electron. Required lanes reject zero selection and do
-  not use `--passWithNoTests`.
+  the dedicated `vitest.runtime.config.ts`, `vitest.electron.config.ts`, and
+  `vitest.electron-runtime.config.ts` own the broad/artifact gates: retained
+  default Vitest, source-runtime smoke, the Rust workspace, Electron unit tests,
+  and staged Electron runtime acceptance. Artifact-dependent trees are excluded
+  from default discovery; required lanes reject zero selection and do not use
+  `--passWithNoTests`.
 - `scripts/start-rust-server.ts`, `scripts/launch.sh`,
   `scripts/launch-rust.sh`, root `run-rust-server.sh`, and retained
   `port/**` bootstrap scripts own source start/serve lifecycle. They launch or
@@ -203,8 +208,10 @@ Docker, and GitHub Actions.
 - `resolveGitRepoRoot`, `resolveGitCheckoutRoot`, and cache reset remain available
   to the coordinator from `scripts/testing/repo-context.ts`.
 - `scripts/precheck.ts` retains branch confirmation, dependency checks, and port
-  conflict checks; it drops the duplicate Node-updater invocation because Rust
-  already owns update behavior.
+  conflict checks. It retires the interactive Node precheck self-update prompt;
+  Rust retains its distinct server-side update-check behavior, and Task 11
+  explicitly triages whether the removed interactive flow has an existing owner
+  or needs a Kata.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -218,7 +225,10 @@ Docker, and GitHub Actions.
   `test/e2e-browser/playwright.config.ts:legacy-chromium`, the stale legacy
   comment in root `run-rust-server.sh`, and the inherited build path in
   `port/laptop-bootstrap/2-bootstrap-wsl.sh`. Extend existing
-  Vite/coordinator/tab-registry tests to import only the new neutral paths.
+  Vite/coordinator/tab-registry tests to import only the new neutral paths. Rework
+  `session-corpus.test.ts` so it tests corpus writer/file invariants without
+  importing the soon-to-be-deleted Node Amplifier/OpenCode production readers;
+  Rust-owned browser/API corpus specs remain the production ingestion proof.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -244,8 +254,12 @@ Docker, and GitHub Actions.
   `server/tabs-registry/types.ts`. Make `server/freshell-home.ts` and
   `server/tabs-registry/types.ts` temporary NodeNext `.js` re-exports from the
   neutral owners so the intermediate backend consumes the same contracts. Remove
-  only the update-check block/import from `scripts/precheck.ts`; preserve its
-  serve-branch and port protections. Keep a temporary explicit debt list so
+  only the interactive update-check block/import from `scripts/precheck.ts`;
+  preserve its serve-branch and port protections and record the removed flow for
+  Task 11 triage. Remove the two Node provider-reader imports/assertions from the
+  session-corpus helper test while preserving writer/schema/hash coverage; do not
+  move deleted backend readers into a neutral namespace. Keep a temporary
+  explicit debt list so
   later tasks can remove entries one by one; manifest rows remain after their
   classification changes from legacy debt to Rust or sanctioned Node client.
 
@@ -280,7 +294,8 @@ Docker, and GitHub Actions.
   ```bash
   ! rg -n "server/(tabs-registry/types|get-network-host|coding-cli/utils|updater)" src config scripts test/e2e-browser test/unit --glob '!test/unit/server/**'
   npm run typecheck:client
-  npm run test:vitest -- run test/unit/architecture test/unit/vite-config.test.ts test/unit/server/testing test/unit/server/prebuild-guard.test.ts --config config/vitest/vitest.server.config.ts
+  npm run test:vitest -- run test/unit/architecture test/unit/vite-config.test.ts --config config/vitest/vitest.config.ts
+  npm run test:vitest -- run test/unit/server/testing test/unit/server/prebuild-guard.test.ts --config config/vitest/vitest.server.config.ts
   ```
 
   Expected: the search returns no retained consumer of those paths; typecheck and
@@ -316,6 +331,7 @@ Docker, and GitHub Actions.
 - Modify: `test/unit/server/mcp/config-writer-paths.test.ts`
 - Modify: `crates/freshell-platform/src/mcp_inject.rs`
 - Modify: `crates/freshell-platform/src/mcp_inject_tests.rs`
+- Modify: `crates/freshell-platform/src/cli_launch.rs`
 - Modify: `crates/freshell-platform/src/cli_launch_goldens.rs`
 - Modify: `test/e2e-browser/helpers/mcp-stdio-client.ts`
 - Modify: `test/e2e-browser/playwright.config.ts`
@@ -327,7 +343,8 @@ Docker, and GitHub Actions.
 **Interfaces:**
 
 - `package.json#bin.freshell` points to `dist/tools/freshell-cli/index.js`.
-  `build:tools` runs `tsc -p tsconfig.tools.json`; that config uses
+  `typecheck:tools` runs that config with `--noEmit`; `build:tools` runs
+  `tsc -p tsconfig.tools.json`. The config uses
   NodeNext/NodeNext, `rootDir: "tools"`, `outDir: "dist/tools"`, and includes
   only `tools/**/*.ts`. Tool-relative runtime imports carry `.js`; no tool emits
   under `dist/server` or requires a compiled `shared/**` tree.
@@ -379,7 +396,12 @@ Docker, and GitHub Actions.
   health/list/create/mutate tab and pane operations, send/capture/wait, browser
   navigation/screenshot, paged session listing/search, and the local unsupported
   `run` result. Register it explicitly in the pre-collapse `rust-chromium`
-  `testMatch`. This replaces the two Express/Node-backend fake E2E files.
+  `testMatch` and in the pre-collapse `RUST_ONLY_SPECS` exclusion so the legacy
+  `chromium` project cannot also collect it. This replaces the two
+  Express/Node-backend fake E2E files. Keep `mcp-qa-smoke-rust.spec.ts` explicitly
+  local-only because its codex-binary contract is unavailable in cloud E2E; its
+  positive local receipt is required and the cloud skip is not counted as
+  replacement coverage.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -411,7 +433,9 @@ Docker, and GitHub Actions.
   `@modelcontextprotocol/sdk` as a production dependency of the retained MCP
   program. Convert every Rust injection renderer from the old args-only,
   hard-coded `node` contract to `McpServerCommand`, including WSL path conversion
-  of both the executable and every path argument.
+  of both the executable and every path argument. Update retained
+  `cli_launch.rs` documentation so the old `server/mcp` path cannot trip the
+  final structural gate.
 
 - [ ] **Step 4: Run the focused GREEN command**
 
@@ -456,8 +480,9 @@ Docker, and GitHub Actions.
   variant has zero transport. The explicit local E2E command avoids the current
   cloud skip during this pre-collapse task, runs a nonzero test count, starts one
   owned Rust server, executes
-  `dist/tools/freshell-mcp/server.js`, and PASSes. Task 4 removes any transitional
-  cloud skip before these specs join configured broad coverage.
+  `dist/tools/freshell-mcp/server.js`, and PASSes. Task 4 removes the temporary
+  dual-project registration but preserves the explicitly owned local-only cloud
+  skip for `mcp-qa-smoke-rust.spec.ts`.
 
 - [ ] **Step 7: Commit the task**
 
@@ -606,6 +631,9 @@ Docker, and GitHub Actions.
 - Modify: `test/e2e-browser/vitest.config.ts`
 - Modify: `test/setup/e2e-browser-global-setup.ts`
 - Modify: `test/e2e-electron/electron-app.test.ts`
+- Modify: `port/oracle/harness/external-server.ts`
+- Create temporarily: `port/oracle/harness/legacy-node-server.ts` from the
+  oracle-only process-owning portion of `test-server.ts`; Task 5 deletes it
 - Modify: the closed current set of specs returned by
   `rg -l '\be2eServerKind\b' test/e2e-browser/specs | sort`; remove the obsolete
   fixture parameter and convert any executable legacy conditional to one
@@ -614,6 +642,10 @@ Docker, and GitHub Actions.
   `rg -l '\bTestServer\b|test-server\.js' test/e2e-browser/specs test/e2e-browser/perf test/e2e-electron | sort`;
   direct owned constructors become `RustServer`, while shared types/port/home
   helpers import from `server-fixture-support.ts`
+- Modify: the closed current comment/config set returned by
+  `rg -l 'legacy-chromium|dist/server/index' test/e2e-browser test/e2e-electron | sort`;
+  remove stale executable-path/project claims so structural gates do not confuse
+  historical comments with active owners
 - Create: `test/e2e-browser/helpers/selection-nonvacuity.test.ts`
 
 **Interfaces:**
@@ -624,13 +656,21 @@ Docker, and GitHub Actions.
 - `server-fixture-support.ts` owns `E2eServerInfo`, ephemeral-port allocation,
   isolated-home env construction, and setup-wizard seeding without any process
   constructor. `test-server.ts` is deleted only after every direct constructor
-  and type/helper import in the two closed sets above has moved.
-- `playwright.config.ts` exposes one application project named `chromium` with
-  Rust fixtures. There is no `legacy-chromium`, `rust-chromium`, `MATRIX_SPECS`,
-  or Node `TestServer`.
+  and type/helper import in the browser/Electron sets and the oracle harness has
+  moved. The oracle keeps its Node constructor temporarily under
+  `port/oracle/harness/legacy-node-server.ts` so Task 4 stays green; Task 5
+  deletes that explicitly while converting oracles to Rust.
+- `playwright.config.ts` exposes one primary application project named
+  `chromium` with Rust fixtures. CI-only `firefox`/`webkit` projects inherit the
+  same Rust fixture contract, and `continuity-smoke` remains a Rust-only
+  specialized project without `e2eServerKind`; none is a Node/Rust split lane.
+  There is no `legacy-chromium`, `rust-chromium`, `MATRIX_SPECS`, or browser-E2E
+  Node `TestServer`.
 - Selection inspection requires at least 308 tests in at least 86 files (the
-  observed pre-retirement Rust floor), zero legacy projects, and zero required
-  specs intersecting `CLOUD_SKIP_SPECS`.
+  observed pre-retirement Rust floor), zero legacy projects, and zero unexplained
+  required specs intersecting `CLOUD_SKIP_SPECS`. The codex-binary-dependent
+  `mcp-qa-smoke-rust.spec.ts` remains explicitly local-only with a required
+  positive local receipt; cloud never substitutes for it.
 - `gate01-baseline.json` remains frozen audit evidence, but its Node/Rust slice
   runner, alternate config, collator, and collator test are deleted so there is no
   executable path that can regenerate it by launching Node.
@@ -640,11 +680,13 @@ Docker, and GitHub Actions.
 - [ ] **Step 1: Write the failing behavioral test**
 
   Add `selection-nonvacuity.test.ts` to import local/cloud configs and fixture
-  factories, asserting the one-project/literal-Rust contract, positive floors,
-  no legacy helper import (including the visible-first audit runner), no cloud
-  skip for Tasks 2-4 specs, and a provenance failure when a fake healthy process
-  reports a non-Rust runtime. Update current helper tests to expect only
-  `RustServer` construction.
+  factories, asserting the primary-project/literal-Rust contract across
+  chromium/firefox/webkit/continuity projects, positive floors, no browser legacy
+  helper import (including the visible-first audit runner), no unexplained cloud
+  skip, and a provenance failure when a fake healthy process reports a non-Rust
+  runtime. Require the mcp-qa skip to carry its local-only classification and
+  local test selector. Update browser helper tests to expect only `RustServer`
+  construction.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -655,9 +697,10 @@ Docker, and GitHub Actions.
   npm exec playwright -- test --config test/e2e-browser/playwright.config.ts --project=chromium --list
   ```
 
-  Expected: FAIL because the default fixture is `legacy`, the `chromium` project
-  is not yet Rust-explicit, and legacy projects/helpers still exist. The list
-  command must not start a server.
+  Expected: the helper test FAILS because the default fixture is `legacy` and
+  legacy projects/helpers still exist. The list command may already pass before
+  implementation; it is a non-starting baseline/selection receipt, not the RED
+  assertion.
 
 - [ ] **Step 3: Add the minimal implementation**
 
@@ -667,7 +710,11 @@ Docker, and GitHub Actions.
   baseline assertions and delete legacy-only expectations/spec registrations.
   Build `dist/client` and `target/release/freshell-server` in global setup. Point
   Electron remote-connect E2E and `perf:audit:visible-first`'s owned sample server
-  at `RustServer`. Delete the completed GATE-01 executable/collator while retaining
+  at `RustServer`. Move the oracle-only Node process constructor beside the oracle
+  and move its free-port/isolated-home imports to `server-fixture-support.ts`, so
+  deleting the browser `test-server.ts` does not break the intermediate commit.
+  Remove stale project/server comments from the third closed set. Delete the
+  completed GATE-01 executable/collator while retaining
   its JSON as frozen historical evidence; update helper-config, teardown, and leak
   comments/types to the new fixture names.
 
@@ -680,8 +727,10 @@ Docker, and GitHub Actions.
   npm exec playwright -- test --config test/e2e-browser/playwright.config.ts --project=chromium --list
   ```
 
-  Expected: PASS; output names only `[chromium]`, reports at least 308 tests in at
-  least 86 files, and contains no `legacy-chromium` or zero-test warning.
+  Expected: PASS; the explicitly selected output names `[chromium]`, reports at
+  least 308 tests in at least 86 files, and contains no `legacy-chromium` or
+  zero-test warning. Config inspection separately proves every retained project
+  is Rust-only.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -696,6 +745,7 @@ Docker, and GitHub Actions.
 
   ```bash
   ! rg -n "legacy-chromium|e2eServerKind|TestServer|test-server\.js|dist/server/index" test/e2e-browser test/e2e-electron --glob '!gate01-baseline.json'
+  npm run test:vitest -- run test/unit/port/oracle/external-handshake-t0.test.ts --config config/vitest/vitest.port.config.ts
   npm run test:e2e -- --project=chromium test/e2e-browser/specs/auth.spec.ts test/e2e-browser/specs/terminal-lifecycle.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts test/e2e-browser/specs/rust-baseline-browser-actions.spec.ts
   ```
 
@@ -706,7 +756,7 @@ Docker, and GitHub Actions.
 - [ ] **Step 7: Commit the task**
 
   ```bash
-  git add test/e2e-browser test/setup/e2e-browser-global-setup.ts test/e2e-electron/electron-app.test.ts
+  git add test/e2e-browser test/setup/e2e-browser-global-setup.ts test/e2e-electron/electron-app.test.ts port/oracle/harness/external-server.ts port/oracle/harness/legacy-node-server.ts
   git commit -m "test: make browser coverage Rust-only"
   ```
 
@@ -746,9 +796,15 @@ Docker, and GitHub Actions.
 - Modify: `port/oracle/harness/t2-live.ts`
 - Modify: `port/oracle/harness/t2-live-claude.ts`
 - Modify: `port/oracle/harness/t2-live-codex.ts`
+- Delete: `port/oracle/harness/legacy-node-server.ts`
 - Delete: `port/oracle/harness/opencode-warm-proxy.ts`
+- Delete: `port/oracle/baselines/pty/generate-pty-goldens.ts`
+- Delete: `port/oracle/fixtures/generate-handshake-fixture.ts`
 - Create: `test/unit/port/oracle/rust-only-oracle-boundary.test.ts`
 - Modify: `test/unit/port/oracle/{external-handshake-t0,t0-equivalence-rust,t1-equivalence-rust,t1-batch-equivalence-rust,freshagent-wireshape-differential}.test.ts`
+- Modify: `test/unit/port/oracle/{handshake-determinism-t0,pty-determinism-t1,t0-known-providers-discovery-rust}.test.ts`
+- Modify: `test/unit/port/normalize.test.ts`
+- Modify: `port/contract/nondeterministic-fields.md`
 - Move: `test/unit/port/oracle/t2-opencode-equivalence-rust.test.ts` to `test/unit/port/oracle/t2-opencode-rust-baseline.test.ts`
 - Move: `test/unit/port/oracle/t2-claude-equivalence-rust.test.ts` to `test/unit/port/oracle/t2-claude-rust-baseline.test.ts`
 - Move: `test/unit/port/oracle/t2-codex-equivalence-rust.test.ts` to `test/unit/port/oracle/t2-codex-rust-baseline.test.ts`
@@ -790,6 +846,10 @@ Docker, and GitHub Actions.
 - `port/oracle/baselines/batch/*.json` likewise remain frozen byte goldens for
   `batch_wire_golden.rs`; the Node terminal-stream generator is deleted and the
   Rust test's mutation assertion keeps the fixture non-vacuous.
+- Handshake and PTY fixtures likewise become frozen Rust-baseline provenance;
+  their Node-default generators are deleted rather than silently retargeted to
+  Rust. Determinism/discovery tests name Rust explicitly, and active protocol
+  documentation removes the retired `codingcli.*` family.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -806,7 +866,9 @@ Docker, and GitHub Actions.
   Add `rust-only-oracle-boundary.test.ts` as an always-running source/exports
   guard: it rejects a `node` target, warm-proxy module, legacy build command, or
   active read of `port/oracle/baselines/t2/*.json` even when live-provider gates
-  are off. It also rejects `listenersOn3001`/`ss`-based inspection; an assertion
+  are off. It also rejects the temporary oracle-local Node constructor and any
+  active handshake/PTY fixture generator, plus `listenersOn3001`/`ss`-based
+  inspection; an assertion
   that an allocated owned port is not 3001 remains allowed.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
@@ -835,13 +897,17 @@ Docker, and GitHub Actions.
   through `npm run test:vitest -- run ... --config
   config/vitest/vitest.config.ts`.
   Make the external oracle harness wrap the existing owned Rust fixture, delete
-  Node build/spawn/copy logic and original-side live generators, and reframe
+  its temporary `legacy-node-server.ts`, all Node build/spawn/copy logic, and
+  original-side live generators, and reframe
   current tests around Rust determinism plus committed goldens/fixtures. Preserve
   mutation tests and nonempty-capture assertions. Delete the Node extension
   manifest generator and document its committed output as frozen migration
-  provenance rather than an active regeneration workflow. Delete the Node batch
-  generator too and update the consuming Rust golden test's provenance comment;
-  keep its byte-mutation bite proof. Collapse each T2 harness to Rust-only owned
+  provenance rather than an active regeneration workflow. Delete the Node batch,
+  handshake, and PTY generators too and update consuming Rust tests/docs to call
+  those committed fixtures frozen provenance; keep byte/field-mutation bite
+  proofs. Update the explicitly listed determinism/discovery/normalize tests and
+  nondeterministic-field documentation so no Node default or `codingcli.*`
+  vocabulary remains active. Collapse each T2 harness to Rust-only owned
   startup, delete the OpenCode warm proxy, rename the three gated tests to
   Rust-baseline files, and replace original-fixture equality with invariant,
   positive-event, isolation, cost-ceiling, and cleanup assertions. Keep the old
@@ -871,11 +937,12 @@ Docker, and GitHub Actions.
   Run:
 
   ```bash
-  ! rg -n "codingcli\.|getTerminalViewport|getTerminalScrollback|loadFreshAgent(ThreadTurns|TurnBody)" shared src crates/freshell-protocol crates/freshell-ws port/contract test/unit/port
+  ! rg -n "codingcli\.|getTerminalViewport|getTerminalScrollback|loadFreshAgent(ThreadTurns|TurnBody)" shared src crates/freshell-protocol crates/freshell-ws port/contract test/unit/port --glob '!oracle/rust-only-oracle-boundary.test.ts'
   ! rg -n "target: ['\"]node|FRESHELL_ORACLE_TARGET|build:server|dist/server/index|new TestServer|warmProxy|opencode-warm-proxy|baselines/t2" port/oracle/harness config/vitest/vitest.oracle.config.ts test/unit/port/oracle package.json --glob '!rust-only-oracle-boundary.test.ts'
   ! rg -n "listenersOn3001|ss .*3001|grep.*3001" port/oracle/harness test/unit/port/oracle --glob '!rust-only-oracle-boundary.test.ts'
   ! rg -n "server/extension-manifest|generate-manifest-oracle" port/contract package.json
   ! rg -n "server/terminal-stream|generate-batch-goldens" port/oracle/baselines/batch crates/freshell-terminal/tests/batch_wire_golden.rs
+  ! rg -n "legacy-node-server|generate-(pty-goldens|handshake-fixture)|target: ['\"]node" port/oracle test/unit/port port/contract --glob '!oracle/rust-only-oracle-boundary.test.ts'
   contract_hash_before="$(sha256sum port/contract/ws-message-inventory.json port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json)"
   npm run contract:generate
   contract_hash_after="$(sha256sum port/contract/ws-message-inventory.json port/contract/ws-protocol.schema.json port/contract/ws-server-messages.schema.json)"
@@ -888,7 +955,7 @@ Docker, and GitHub Actions.
 - [ ] **Step 7: Commit the task**
 
   ```bash
-  git add shared/ws-protocol.ts crates/freshell-protocol crates/freshell-ws crates/freshell-terminal/tests/batch_wire_golden.rs crates/freshell-extensions/Cargo.toml crates/freshell-extensions/src/lib.rs crates/freshell-extensions/tests/oracle.rs src/lib/api.ts src/store/freshAgentThunks.ts test/unit/client/lib/api.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/helpers/visible-first test/unit/visible-first port/contract port/oracle/baselines/batch port/oracle/harness test/unit/port/oracle test/integration/port/oracle config/vitest/vitest.oracle.config.ts config/vitest/vitest.oracle-t2.config.ts package.json
+  git add shared/ws-protocol.ts crates/freshell-protocol crates/freshell-ws crates/freshell-terminal/tests/batch_wire_golden.rs crates/freshell-extensions/Cargo.toml crates/freshell-extensions/src/lib.rs crates/freshell-extensions/tests/oracle.rs src/lib/api.ts src/store/freshAgentThunks.ts test/unit/client/lib/api.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/helpers/visible-first test/unit/visible-first port/contract port/oracle test/unit/port test/integration/port/oracle config/vitest/vitest.oracle.config.ts config/vitest/vitest.oracle-t2.config.ts package.json
   git commit -m "refactor: retire Node-only contracts and oracles"
   ```
 
@@ -898,6 +965,8 @@ Docker, and GitHub Actions.
 
 - Create: `scripts/start-rust-server.ts`
 - Create: `scripts/testing/run-rust-tests.ts`
+- Create: `scripts/testing/run-source-runtime-tests.ts`
+- Create: `config/vitest/vitest.runtime.config.ts`
 - Create: `test/unit/tooling/testing/test-selection.test.ts`
 - Create: `test/integration/tooling/source-runtime-rust.test.ts`
 - Modify: `package.json`
@@ -910,6 +979,7 @@ Docker, and GitHub Actions.
 - Modify: `scripts/testing/test-coordinator.ts`
 - Modify: `scripts/vitest-cloud.sh`
 - Modify: `scripts/test/cloud-vitest-wrapper.test.sh`
+- Modify: `scripts/test/cloud-vitest-entrypoint.test.sh`
 - Modify: `docker/cloud-run/entrypoint.sh`
 - Modify: `config/vitest/vitest.config.ts`
 - Modify: `test/unit/vite-config.test.ts`
@@ -947,13 +1017,21 @@ Docker, and GitHub Actions.
   laptop bootstrap invokes the Rust-inclusive build/start contract rather than
   inheriting a Node-server build path.
 - Broad `npm test`/`npm run check`/`npm run verify` cover retained default Vitest,
-  `cargo test --workspace --locked`, and Electron Vitest under one coordinator
-  gate. `test:server` runs the `freshell-server` crate; `test:integration` runs
+  an artifact-owning source-runtime phase, `cargo test --workspace --locked`, and
+  Electron Vitest under one coordinator gate. `test:server` runs the
+  `freshell-server` crate; `test:integration` runs
   `cargo test --workspace --tests --locked`; `test:unit` remains default
   `test/unit`.
 - No required runner uses `--passWithNoTests`. Cloud Vitest runs only the retained
   default config; `--config=server` is rejected with exit 2 and a Rust-lane hint.
   Cargo runs in the Rust lane.
+- Default Vitest explicitly excludes `test/integration/tooling/**` and
+  `test/integration/electron/**`. `vitest.runtime.config.ts` includes only the
+  source-runtime integration tree and rejects zero selection. The
+  `test:source-runtime` wrapper builds `dist/client`, `dist/tools`, and release
+  `freshell-server` before running that config. Thus the Node-only
+  `typecheck-client.yml` default lane never inherits Rust/artifact prerequisites,
+  while the broad coordinator still owns the source runtime smoke explicitly.
 - The default config stops excluding
   `test/unit/visible-first/cli-command-harness.test.ts` and its selection is
   asserted. Its two obsolete Node route/mirror siblings were deleted in Task 5.
@@ -975,7 +1053,9 @@ Docker, and GitHub Actions.
   server/real-provider Vitest configs and `--passWithNoTests`, removal of their
   now-invalid package scripts, and rejection of a simulated zero selected-test
   result. Require the retained visible-first CLI harness to be selected by the
-  default lane. Require the closed runtime manifest to reconcile root launchers
+  default lane and both artifact-dependent integration trees to be excluded from
+  it. Require the dedicated runtime config/wrapper to select the source smoke and
+  the broad coordinator to execute that phase. Require the closed runtime manifest to reconcile root launchers
   and `port/**` bootstrap owners. Add the owned source-runtime integration test
   described above. Change the Tauri smoke unit path to panic, not print SKIP,
   when no binary can be resolved.
@@ -987,7 +1067,8 @@ Docker, and GitHub Actions.
   ```bash
   npm run build:client
   npm run build:server
-  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling/run-standard-tests.test.ts test/unit/vite-config.test.ts test/integration/tooling/source-runtime-rust.test.ts --config config/vitest/vitest.config.ts
+  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling/run-standard-tests.test.ts test/unit/vite-config.test.ts --config config/vitest/vitest.config.ts
+  npm run test:vitest -- run test/integration/tooling/source-runtime-rust.test.ts --config config/vitest/vitest.runtime.config.ts
   bash scripts/test/cloud-vitest-wrapper.test.sh
   cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture
   ```
@@ -1000,7 +1081,11 @@ Docker, and GitHub Actions.
   Move retained non-server tests before removing exclusions/config. Implement the
   Rust phases and source scripts, delete server TypeScript build/typecheck/start
   scripts/config/global setup, and make cloud Vitest one truthful default-config
-  lane. Delete the four opt-in provider contracts and PTY harness that import the
+  lane. Exclude artifact-dependent integration trees from default discovery;
+  create the source-runtime-only config and prerequisite-owning wrapper, and add
+  that wrapper as a positive-count broad phase. Update both cloud wrapper and
+  cloud entrypoint shell tests to reject, rather than require,
+  `--passWithNoTests`. Delete the four opt-in provider contracts and PTY harness that import the
   legacy Codex/Claude/OpenCode runtime; they test external-provider or Node
   implementation behavior, not Freshell's retained Rust backend. Delete the two
   dedicated Node-backend real-provider configs/scripts; keep the two independent
@@ -1022,7 +1107,8 @@ Docker, and GitHub Actions.
   npm run build:client
   npm run build:tools
   cargo build --release -p freshell-server --locked
-  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling test/unit/claude-sidecar test/unit/contracts test/unit/provider-fixtures test/unit/visible-first/cli-command-harness.test.ts test/unit/vite-config.test.ts test/integration/tooling/source-runtime-rust.test.ts --config config/vitest/vitest.config.ts
+  npm run test:vitest -- run test/unit/tooling/testing test/unit/tooling test/unit/claude-sidecar test/unit/contracts test/unit/provider-fixtures test/unit/visible-first/cli-command-harness.test.ts test/unit/vite-config.test.ts --config config/vitest/vitest.config.ts
+  npm run test:source-runtime
   bash scripts/test/cloud-vitest-wrapper.test.sh
   cargo build -p freshell-server --locked
   FRESHELL_SERVER_BIN="$PWD/target/debug/freshell-server" cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture
@@ -1045,7 +1131,7 @@ Docker, and GitHub Actions.
   Run:
 
   ```bash
-  ! rg -n "vitest\.(server|codex-real-provider-smoke|opencode-serve-real-provider-smoke)|server-global-setup|tsconfig\.server|tsx watch server|dist/server/index|--passWithNoTests|test:real:coding-cli-contracts|test:codex-real-provider-smoke|test:opencode-serve-smoke|npm start" package.json config scripts run-rust-server.sh port/laptop-bootstrap docker/cloud-run test/setup test/unit/tooling .github/workflows/rust-clippy.yml
+  ! rg -n "vitest\.(server|codex-real-provider-smoke|opencode-serve-real-provider-smoke)|server-global-setup|tsconfig\.server|tsx watch server|dist/server/index|--passWithNoTests|test:real:coding-cli-contracts|test:codex-real-provider-smoke|test:opencode-serve-smoke" package.json config scripts run-rust-server.sh port/laptop-bootstrap docker/cloud-run test/setup test/unit/tooling .github/workflows/rust-clippy.yml
   test ! -f tsconfig.server.json
   test ! -f config/vitest/vitest.server.config.ts
   test ! -f test/setup/server-global-setup.ts
@@ -1054,8 +1140,8 @@ Docker, and GitHub Actions.
   ```
 
   Expected: search returns no match; absence checks succeed; typecheck and the
-  coordinated broad test PASS with nonzero retained Vitest, Rust workspace, and
-  Electron phase counts.
+  coordinated broad test PASS with nonzero retained Vitest, source-runtime,
+  Rust workspace, and Electron phase counts.
 
 - [ ] **Step 7: Commit the task**
 
@@ -1072,7 +1158,8 @@ Docker, and GitHub Actions.
 - Modify: `electron/startup.ts`
 - Modify: `electron/entry.ts`
 - Modify: `electron/{types,desktop-config,launch-policy,preload}.ts`
-- Modify: `electron/setup-wizard/{wizard-logic,wizard}.tsx`
+- Modify: `electron/setup-wizard/wizard-logic.ts`
+- Modify: `electron/setup-wizard/wizard.tsx`
 - Delete: `electron/daemon/**`
 - Delete: `installers/systemd/freshell.service.template`
 - Delete: `installers/launchd/com.freshell.server.plist.template`
@@ -1172,7 +1259,8 @@ Docker, and GitHub Actions.
   Run:
 
   ```bash
-  ! rg -n "server/index|NODE_PATH|server-node-modules|nativeModules|nodeBinary|serverEntry|serverMode.*daemon|Always-running daemon|createDaemonManager" electron config/electron-builder.yml
+  ! rg -n "server/index|NODE_PATH|server-node-modules|nativeModules|nodeBinary|serverEntry" electron
+  ! rg -n "serverMode.*daemon|Always-running daemon|createDaemonManager|electron/daemon|freshell\.(service\.template|task\.xml)|com\.freshell\.server" electron config/electron-builder.yml
   test ! -d electron/daemon
   test ! -e installers/systemd/freshell.service.template
   test -f installers/systemd/freshell-rust.service
@@ -1202,12 +1290,14 @@ Docker, and GitHub Actions.
 - Create: `test/unit/electron/prepare-electron-runtime.test.ts`
 - Create: `test/unit/electron/verify-electron-artifact.test.ts`
 - Create: `test/integration/electron/checkout-free-runtime.test.ts`
+- Create: `config/vitest/vitest.electron-runtime.config.ts`
 - Modify: `scripts/prepare-bundled-node.ts` by extracting reusable Node-download code, then delete it
 - Modify: `scripts/bundled-node-version.json`
 - Modify: `scripts/assert-native-windows-build.ts`
 - Modify: `config/electron-builder.yml`
 - Modify: `package.json`
 - Modify: `package-lock.json`
+- Modify: `.gitignore`
 - Delete after migration: generated/staging assumptions for `server-node-modules` and `bundled-node/native-modules`
 - Delete/replace: `test/unit/electron/prepare-bundled-node.test.ts`
 
@@ -1247,6 +1337,11 @@ Docker, and GitHub Actions.
   `node_modules`, authenticates to Rust server-info, fetches the SPA plus a real
   hashed asset, exercises the fake-Claude hook, speaks stdio JSON-RPC to the
   compiled MCP entry with no listening socket, and reaps every exact owned child.
+- `vitest.electron-runtime.config.ts` includes only
+  `test/integration/electron/**`, uses the Node environment, and rejects zero
+  selection. `test:electron:runtime` requires the producer-owned staged runtime
+  and runs that config; default Vitest continues to exclude this artifact-bound
+  tree. `electron-runtime/` is ignored as generated staging output.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1257,7 +1352,8 @@ Docker, and GitHub Actions.
   deliberate failures when it can see checkout files/root `node_modules`, MCP
   writes non-JSON-RPC stdout, or any owned PID survives. Change the Windows
   platform check message to require native Rust `.exe` production, not native
-  `node-pty` compilation.
+  `node-pty` compilation. Assert the dedicated config selects this integration
+  test and the default config does not; assert the staging directory is ignored.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -1265,10 +1361,12 @@ Docker, and GitHub Actions.
 
   ```bash
   npm run test:electron -- test/unit/electron/prepare-electron-runtime.test.ts test/unit/electron/verify-electron-artifact.test.ts test/unit/electron/native-windows-build-script.test.ts
+  npm run test:vitest -- run test/integration/electron/checkout-free-runtime.test.ts --config config/vitest/vitest.electron-runtime.config.ts
   ```
 
   Expected: FAIL because staging/verifier modules do not exist and builder config
-  still requires Node-server/native-module resources.
+  still requires Node-server/native-module resources; the dedicated runtime
+  config/script is not implemented yet.
 
 - [ ] **Step 3: Add the minimal implementation**
 
@@ -1278,7 +1376,9 @@ Docker, and GitHub Actions.
   their locked dependency closures. Preserve the locked archive libraries and
   extraction checks. Rewrite electron-builder resources and npm Electron scripts
   to use the staging directory and invoke the verifier on the unpacked result;
-  package only app-bound resources, with no Electron daemon templates.
+  package only app-bound resources, with no Electron daemon templates. Add the
+  isolated Electron-runtime Vitest config/script and ignore generated
+  `electron-runtime/` staging.
 
 - [ ] **Step 4: Run the focused GREEN command**
 
@@ -1290,7 +1390,7 @@ Docker, and GitHub Actions.
   npm run build:tools
   cargo build --release -p freshell-server --locked
   npm run prepare:electron-runtime
-  npm run test:vitest -- run test/integration/electron/checkout-free-runtime.test.ts --config config/vitest/vitest.electron.config.ts
+  npm run test:electron:runtime
   ```
 
   Expected: PASS; staging contains every allowlisted resource and none of the
@@ -1310,8 +1410,10 @@ Docker, and GitHub Actions.
 
   ```bash
   ! rg -n "dist/server|server-node-modules|node-pty|native-modules|prepare-bundled-node" config/electron-builder.yml scripts package.json --glob '!verify-electron-artifact.ts' --glob '!prepare-electron-runtime.ts'
+  git check-ignore electron-runtime/
   npm run electron:build
   npm run verify:electron-artifact
+  npm run test:electron:runtime
   ```
 
   Expected: search returns no match; the native host build/verification PASS and
@@ -1321,7 +1423,7 @@ Docker, and GitHub Actions.
 - [ ] **Step 7: Commit the task**
 
   ```bash
-  git add scripts/prepare-electron-runtime.ts scripts/verify-electron-artifact.ts scripts/assert-native-windows-build.ts scripts/bundled-node-version.json config/electron-builder.yml package.json package-lock.json test/unit/electron test/integration/electron
+  git add scripts/prepare-electron-runtime.ts scripts/verify-electron-artifact.ts scripts/assert-native-windows-build.ts scripts/bundled-node-version.json config/electron-builder.yml config/vitest/vitest.electron-runtime.config.ts package.json package-lock.json .gitignore test/unit/electron test/integration/electron
   git add -u scripts/prepare-bundled-node.ts
   git commit -m "build: package Rust backend in Electron"
   ```
@@ -1362,9 +1464,11 @@ Docker, and GitHub Actions.
   `cargo build -p freshell-server`, and `cargo test --workspace --locked` with
   `FRESHELL_SERVER_BIN` set for the non-skipping Tauri smoke. Retained Vitest and
   Electron tests have required jobs: `typecheck-client.yml` runs client
-  typecheck plus the nonempty default Vitest lane, `rust-clippy.yml` owns Cargo,
-  and `electron-build.yml` runs Electron Vitest before packaging on every matrix
-  OS.
+  typecheck plus the nonempty default Vitest lane, whose config explicitly
+  excludes artifact-dependent integration trees; `rust-clippy.yml` owns Cargo
+  plus the prerequisite-owning source-runtime smoke; and `electron-build.yml`
+  runs Electron unit tests, stages the artifact, then runs the isolated
+  checkout-free Electron runtime lane on every matrix OS.
 - Electron build/release matrix installs Rust 1.96.0, builds the native server,
   verifies each unpacked artifact, runs the checkout-free authenticated runtime
   acceptance (server-info, SPA asset, PTY creation/I/O, fake Claude, stdio MCP,
@@ -1377,7 +1481,10 @@ Docker, and GitHub Actions.
   Add `distribution-runtime.test.ts` to parse Dockerfiles/workflows and require
   Rust entrypoints/build/test jobs, Electron `crates/**` path triggers,
   the four-target required native acceptance, artifact verification, and absence
-  of Node-server build or artifact names. Add `verify-container-layout.sh`
+  of Node-server build or artifact names. Require the typecheck workflow's
+  default lane to exclude artifact integrations, the Rust job to run the source
+  runtime wrapper, and Electron jobs to stage before the dedicated runtime lane.
+  Add `verify-container-layout.sh`
   fixture tests that fail a staged `dist/server/index.js` and accept the
   Rust/client/tools layout.
 
@@ -1404,7 +1511,9 @@ Docker, and GitHub Actions.
   Electron path filters to `crates/**`, `Cargo.toml`, `Cargo.lock`, tools, and
   runtime scripts. Run Task 8's checkout-free acceptance against the unpacked
   native artifact in every matrix job, including an authenticated PTY round trip
-  and exact cleanup. Keep the permitted Node test/browser/MCP/Claude runtimes
+  and exact cleanup. Run Task 6's source-runtime wrapper in the Rust job after
+  its explicit build; do not add Rust/artifact prerequisites to the default
+  typecheck-client Vitest job. Keep the permitted Node test/browser/MCP/Claude runtimes
   explicit in comments and image checks.
 
 - [ ] **Step 4: Run the focused GREEN command**
@@ -1464,7 +1573,10 @@ Docker, and GitHub Actions.
 - Delete: `test/server/**`
 - Delete: remaining `test/unit/server/**`
 - Delete: `test/integration/server/**`
-- Delete: `test/integration/{session-repair,session-search-e2e}.test.ts`
+- Delete: `test/integration/session-repair.test.ts`
+- Move: `test/unit/server/title-utils.test.ts` to
+  `test/unit/shared/title-utils.test.ts`
+- Modify: `test/unit/architecture/fresh-agent-only-runtime.test.ts`
 - Delete: `test/helpers/coding-cli/fake-codex-launch-planner.ts`
 - Delete: `test/fixtures/fresh-agent/claude/thread.ts`
 - Delete: `scripts/{find-corrupted,repair-one,repair-all}.ts`
@@ -1503,6 +1615,12 @@ Docker, and GitHub Actions.
 - Deleted Node tests are not mechanically ported. Retained behavior stays covered
   by current Rust crate tests, default Vitest, Rust Playwright, Electron tests,
   and Tasks 1-9 regression tests.
+- A test's directory does not decide its fate. Before deleting
+  `test/unit/server/**`, any subject whose implementation owner survives under
+  `shared/**`, `tools/**`, or another retained namespace is re-homed and kept;
+  `title-utils.test.ts` is the first explicit case. The disposition verifier
+  rejects treating a retained shared subject as obsolete merely because its old
+  test lived under `server/`.
 - `node-test-disposition.json` is a committed deletion ledger for the complete
   346-file Task 5/6/10 candidate universe identified by the load-bearing review
   before deletion. Every old test path
@@ -1524,7 +1642,9 @@ Docker, and GitHub Actions.
   detector unless an entrypoint actually listens or owns backend state. Add the
   disposition verifier with a synthetic mixed test whose second subject is
   unresolved, a zero-test selector receipt, and a skipped optional T2 receipt;
-  all three must fail required replacement closure.
+  all three must fail required replacement closure. Update
+  `fresh-agent-only-runtime.test.ts` expectations to remove `server` from the
+  required roots/allowances and prove every remaining scanned root exists.
 
 - [ ] **Step 2: Run the test and verify the intended RED**
 
@@ -1543,7 +1663,11 @@ Docker, and GitHub Actions.
   disposition ledger from the closed Task 5/6/10 universe. Split mixed files by
   title/subject, bind each retained subject to an exact surviving test/lane and a
   positive-count receipt, mark obsolete Node-implementation subjects explicitly,
-  and resolve every row; the verifier refuses an unresolved or vacuous row. Then
+  and resolve every row; the verifier refuses an unresolved or vacuous row or a
+  deleted test of retained shared behavior. Re-home `title-utils.test.ts` and any
+  other ledger-identified retained shared/tool subject before the blanket delete.
+  Update the fresh-agent architecture walk to scan only existing retained roots
+  and remove server-only allowances. Then
   run a retained-fixture import scan and move any provider fixture still
   consumed by Rust/E2E to `test/fixtures/**`; Task 6 already removed the
   Node-runtime provider contracts while preserving the independent Amplifier
@@ -1665,7 +1789,8 @@ Docker, and GitHub Actions.
   timestamp, commit, result, and owner sections. Re-run source/caller searches for
   attachments, exec/diff/send, editor open, extension lifecycle/assets, raw/WS
   browser forwarding, `/api/run`, paged turns, viewport/scrollback,
-  `codingcli.*`, and incident dump. For every reachable Rust-absent capability,
+  `codingcli.*`, incident dump, and the removed interactive precheck self-update
+  flow. For every reachable Rust-absent capability,
   run targeted `kata search --workspace "$PWD" --lexical --limit 20`,
   `kata list --workspace "$PWD" --json`,
   `gh issue list --repo danshapiro/freshell --state all --limit 500 --search`, and
@@ -1676,9 +1801,9 @@ Docker, and GitHub Actions.
   exit code, and summarized result in the receipt:
 
   ```bash
-  rg -n "/api/(fresh-agent/(attachments|exec|diff|send)|files/open|extensions/.*/(start|assets)|proxy/forward|run)|codingcli\.|getTerminalViewport|getTerminalScrollback|loadFreshAgent(ThreadTurns|TurnBody)|debug/fresh-agent" src tools shared crates README.md AGENTS.md
+  rg -n "/api/(fresh-agent/(attachments|exec|diff|send)|files/open|extensions/.*/(start|assets)|proxy/forward|run)|codingcli\.|getTerminalViewport|getTerminalScrollback|loadFreshAgent(ThreadTurns|TurnBody)|debug/fresh-agent|runUpdateCheck|shouldSkipUpdateCheck" src tools shared crates scripts README.md AGENTS.md
   kata list --workspace "$PWD" --json
-  triage_terms=("fresh agent attachments" "fresh agent exec diff" "fresh agent send" "api run automation" "external editor reveal" "extension lifecycle assets" "browser proxy forwarding websocket" "session repair" "fresh agent paged turns" "terminal viewport scrollback" "codingcli websocket" "fresh agent incident")
+  triage_terms=("fresh agent attachments" "fresh agent exec diff" "fresh agent send" "api run automation" "external editor reveal" "extension lifecycle assets" "browser proxy forwarding websocket" "session repair" "fresh agent paged turns" "terminal viewport scrollback" "codingcli websocket" "fresh agent incident" "interactive precheck self update")
   for triage_term in "${triage_terms[@]}"; do
     kata search --workspace "$PWD" --lexical --limit 20 "$triage_term" --agent
     gh issue list --repo danshapiro/freshell --state all --limit 500 --search "$triage_term in:title,body" --json number,title,state,url
@@ -1727,7 +1852,8 @@ Docker, and GitHub Actions.
 
 - [ ] **Step 6: Run full impacted and non-vacuity verification**
 
-  Run from the v2 worktree without any server on port 3001:
+  Run from the v2 worktree without contacting or depending on the live server on
+  port 3001:
 
   ```bash
   npm run test:status
@@ -1748,13 +1874,13 @@ Docker, and GitHub Actions.
   npm run test:e2e:electron
   npm run electron:build
   npm run verify:electron-artifact
-  npm run test:vitest -- run test/integration/electron/checkout-free-runtime.test.ts --config config/vitest/vitest.electron.config.ts
+  npm run test:electron:runtime
   node --import tsx scripts/retirement/verify-node-test-disposition.ts
   docker build --tag freshell-retire-node-server-v2-cloud --file docker/cloud-run/Dockerfile .
   docker build --tag freshell-retire-node-server-v2-example --file examples/docker/Dockerfile .
   docker run --rm --entrypoint /bin/sh freshell-retire-node-server-v2-cloud -c 'test -x /app/target/release/freshell-server && test -f /app/dist/client/index.html && test -f /app/dist/tools/freshell-mcp/server.js && test ! -e /app/dist/server && test ! -e /app/server && test ! -e /app/node_modules/node-pty'
   docker run --rm --entrypoint /bin/sh freshell-retire-node-server-v2-example -c 'test -x /app/freshell-server && test -f /app/dist/client/index.html && test ! -e /app/dist/server && test ! -e /app/server && test ! -e /app/node_modules'
-  ! rg -n "dist/server|server/index\.(ts|js)|tsx watch server|tsconfig\.server|server-node-modules|node-pty|legacy-chromium|npm start" package.json config scripts run-rust-server.sh port/laptop-bootstrap tools electron installers docker examples .github test/e2e-browser test/e2e-electron README.md AGENTS.md .env.example docs/development/windows-electron-build.md docs/development/test-sandbox.md --glob '!scripts/retirement/runtime-boundary.ts' --glob '!scripts/verify-electron-artifact.ts' --glob '!scripts/prepare-electron-runtime.ts' --glob '!scripts/verify-container-layout.sh'
+  ! rg -n "dist/server|server/index\.(ts|js)|tsx watch server|tsconfig\.server|server-node-modules|node-pty|legacy-chromium" package.json config scripts run-rust-server.sh port/laptop-bootstrap tools electron installers docker examples .github test/e2e-browser test/e2e-electron README.md AGENTS.md .env.example docs/development/windows-electron-build.md docs/development/test-sandbox.md --glob '!scripts/retirement/runtime-boundary.ts' --glob '!scripts/verify-electron-artifact.ts' --glob '!scripts/prepare-electron-runtime.ts' --glob '!scripts/verify-container-layout.sh'
   test ! -d server
   test ! -d dist/server
   test ! -f tsconfig.server.json
@@ -1764,7 +1890,8 @@ Docker, and GitHub Actions.
 
   Expected: all commands PASS; Playwright lists at least 308 tests in at least 86
   files and no legacy project; full configured E2E has nonzero executed tests and
-  zero required skips; optional real-provider T2 tests are reported as
+  zero unexplained required skips, while the explicitly local-only MCP QA spec
+  has a positive local receipt; optional real-provider T2 tests are reported as
   supplemental rather than replacement coverage; Electron artifact works from a
   checkout-free staged copy with a runnable Rust server and no forbidden path;
   the disposition ledger has zero unresolved rows; rebuilt final container images contain no legacy source,
