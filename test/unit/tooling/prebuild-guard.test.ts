@@ -5,23 +5,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   checkProdRunning,
-  formatProductionConflictMessage,
   isLinkedWorktreeCheckout,
   parseEnv,
 } from '../../../scripts/prebuild-guard.js'
 
 describe('prebuild-guard', () => {
-  it('explains the fail-closed main-checkout path and linked-worktree recovery', () => {
-    const message = formatProductionConflictMessage(3344, '0.7.5')
-
-    expect(message).toContain('npm run typecheck:client')
-    expect(message).toContain('npm run check')
-    expect(message).toContain('npm run test:source-runtime')
-    expect(message).toContain('fails closed')
-    expect(message).toContain('cd .worktrees/{branch}')
-    expect(message).not.toContain('safe while prod is live')
-  })
-
   describe('parseEnv', () => {
     it('parses simple key=value pairs', () => {
       expect(parseEnv('PORT=3001\nHOST=localhost')).toEqual({

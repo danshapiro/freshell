@@ -27,7 +27,7 @@ function diagnostics(output: string): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>)
 }
 
-const NODE_PTY_RETIREMENT_TERM = /node-pty/
+const NODE_PTY_RUNTIME_PATH = /\bnode_modules\/node-pty\b/
 
 const FORBIDDEN_DISTRIBUTION_TERMS = [
   /node dist\/server/,
@@ -37,8 +37,23 @@ const FORBIDDEN_DISTRIBUTION_TERMS = [
   /vitest\.server/,
   /--passWithNoTests/,
   /legacy-chromium/,
-  NODE_PTY_RETIREMENT_TERM,
 ]
+
+function cloudRetiredBackendCleanupBlock(dockerfile: string): string {
+  const lines = dockerfile.split('\n')
+  const start = lines.findIndex((line) => line.includes('RETIRED_BACKEND_DIRECTORIES='))
+  const end = lines.findIndex(
+    (line, index) => index > start && line.includes('test ! -e "/app/$relative"'),
+  )
+
+  expect(start).toBeGreaterThanOrEqual(0)
+  expect(end).toBeGreaterThan(start)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+function expectNoNodePtyRuntimePath(contents: string): void {
+  expect(contents).not.toMatch(NODE_PTY_RUNTIME_PATH)
+}
 
 describe('Rust-only distribution runtime contracts', () => {
   it('builds and launches the example image with the Rust server', () => {
@@ -49,6 +64,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('npm run build:client')
     expect(dockerfile).toContain('CMD ["\/app\/freshell-server"]')
     expect(dockerfile).not.toMatch(/node\s+dist\//)
+    expectNoNodePtyRuntimePath(dockerfile)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
 
@@ -62,16 +78,14 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('target/release/freshell-server')
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')
-    expect(dockerfile).toContain('RETIRED_BACKEND_DIRECTORIES')
-    expect(dockerfile).toContain('node_modules/node-pty')
-    expect(dockerfile).toContain('test ! -e "/app/$relative"')
-    expect(dockerfile).toMatch(
-      /RETIRED_BACKEND_DIRECTORIES[\s\S]*node_modules\/node-pty[\s\S]*test ! -e "\/app\/\$relative"/,
-    )
-    for (const term of FORBIDDEN_DISTRIBUTION_TERMS) {
-      if (term === NODE_PTY_RETIREMENT_TERM) continue
-      expect(dockerfile).not.toMatch(term)
-    }
+    const cleanupBlock = cloudRetiredBackendCleanupBlock(dockerfile)
+    expect(cleanupBlock).toMatch(/for relative in \$RETIRED_BACKEND_DIRECTORIES; do/)
+    expect(cleanupBlock).toContain('rm -rf "/app/$relative"')
+    expect(cleanupBlock).toContain('node_modules/node-pty')
+    expect(cleanupBlock).toContain('test ! -e "/app/$relative"')
+    expect(cleanupBlock.match(/\bnode_modules\/node-pty\b/g)).toHaveLength(1)
+    expectNoNodePtyRuntimePath(dockerfile.replace(cleanupBlock, ''))
+    for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
 
   it('fails closed when Cloud Run discovery cannot produce a nonempty selection', () => {
@@ -82,6 +96,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(entrypoint).toMatch(/No spec files discovered[\s\S]*exit 1/)
     expect(entrypoint).not.toMatch(/falling back to glob/)
     expect(entrypoint).not.toMatch(/No spec files found\. Running all tests/)
+    expectNoNodePtyRuntimePath(entrypoint)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(entrypoint).not.toMatch(term)
   })
 
@@ -105,6 +120,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(workflow.indexOf('cargo build -p freshell-server --locked')).toBeLessThan(
       workflow.indexOf('npm run test:source-runtime'),
     )
+    expectNoNodePtyRuntimePath(workflow)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
   })
 
@@ -156,6 +172,7 @@ describe('Rust-only distribution runtime contracts', () => {
       expect(workflow).toContain('release/*.AppImage')
       expect(workflow).toContain('release/*.deb')
       expect(workflow).toContain('release/*.exe')
+      expectNoNodePtyRuntimePath(workflow)
       for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
     })
   }

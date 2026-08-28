@@ -129,8 +129,8 @@ npm run build:rust          # Release freshell-server binary
 npm run serve               # Build and run the Rust server
 # `npm run serve` prompts before serving from a non-main branch; use
 # `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
-# Note: `npm run build`, `npm run verify`, `npm run check`, and the
-# source-runtime phase are guarded — on the main checkout they fail closed
+# Note: `npm run build`, `npm run verify`, `npm run check`, `npm run electron:dev`,
+# and the source-runtime phase are guarded — on the main checkout they fail closed
 # before writing artifacts if a production server is detected on the configured
 # PORT. Use `npm run typecheck:client` for a no-write check, or run
 # source-runtime/build verification from a linked worktree
