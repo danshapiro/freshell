@@ -47,7 +47,7 @@ check "entrypoint.sh rejects vacuous test selection" bash -c "! grep -q -- '$NO_
 check "entrypoint.sh references 'VITEST_CONFIGS'" grep -q 'VITEST_CONFIGS' "$ENTRYPOINT"
 
 # Check 5b: entrypoint.sh cannot be pointed at a retired server config
-RETIRED_SERVER_CONFIG="config/vitest/server.config.ts"
+RETIRED_SERVER_CONFIG="config/vitest/vitest.server.config.ts"
 check "entrypoint.sh rejects a retired server config" bash -c "! grep -q '$RETIRED_SERVER_CONFIG' '$ENTRYPOINT'"
 
 # Check 6: entrypoint.sh references VITEST_ARGS_JSON (not VITEST_ARGS)

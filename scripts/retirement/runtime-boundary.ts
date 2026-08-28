@@ -41,6 +41,15 @@ const ignoredDirectoryNames = new Set([
   'target',
 ])
 
+// The main checkout can retain generated compatibility artifacts from an
+// earlier install. They are not source/runtime surfaces, but only at the
+// checkout root; a similarly named directory under scripts/ or test/ must
+// still be inspected as ordinary repository content.
+const ignoredGeneratedRootDirectoryNames = new Set([
+  'bundled-node',
+  'server-node-modules',
+])
+
 const ignoredPathPrefixes = [
   'docs/plans/',
   'docs/reports/',
@@ -190,7 +199,10 @@ async function walkFiles(root: string, current = root): Promise<string[]> {
 
   for (const entry of entries) {
     if (entry.isSymbolicLink() && entry.name === 'node_modules') continue
-    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) continue
+    if (entry.isDirectory() && (
+      ignoredDirectoryNames.has(entry.name)
+      || (current === root && ignoredGeneratedRootDirectoryNames.has(entry.name))
+    )) continue
 
     const absolutePath = path.join(current, entry.name)
     const relativePath = normalizeRelativePath(path.relative(root, absolutePath))

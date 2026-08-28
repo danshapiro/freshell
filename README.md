@@ -48,7 +48,7 @@ npm install
 npm run serve
 ```
 
-On first run, Freshell creates a `.env` file with a secure random `AUTH_TOKEN`. The Rust server prints the URL at startup — open it to connect.
+On first run, `npm run serve` creates a private `.env` file with a secure random `AUTH_TOKEN` if one is not already supplied. Existing environment variables and `.env` values are preserved. The Rust server prints the URL at startup — open it to connect.
 
 For a development checkout, use `npm run dev` for Vite plus the Rust server,
 or `PORT=3499 npm run dev:server` for the Rust server without Vite. For a

@@ -14,6 +14,7 @@ import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import { createInterface } from 'readline/promises'
+import { ensureAuthTokenFile } from './bootstrap-env.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const rootDir = resolve(__dirname, '..')
@@ -232,6 +233,10 @@ async function checkVitePort(): Promise<PortCheckResult> {
 async function main(): Promise<void> {
   const currentBranch = getCurrentBranch()
   await confirmServeBranchIfNeeded(currentBranch)
+
+  if (isServePrecheck()) {
+    ensureAuthTokenFile({ envPath: resolve(rootDir, '.env') })
+  }
 
   // 1. Check for missing dependencies
   const missingDeps = checkMissingDependencies()

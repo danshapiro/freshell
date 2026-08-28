@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { once } from 'node:events'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -15,6 +16,15 @@ import {
 const require = createRequire(import.meta.url)
 const cliPath = resolve(process.cwd(), 'tools/freshell-cli/index.ts')
 const tsxLoader = pathToFileURL(require.resolve('tsx')).href
+const capabilityFixture = JSON.parse(readFileSync(
+  resolve(import.meta.dirname, '../../fixtures/tools/rust-action-capability-matrix.json'),
+  'utf8',
+)) as {
+  canonicalActions: number
+  aliases: number
+  unsupported: string[]
+  acceptedNoOpCaptureParams: string[]
+}
 
 async function runCli(args: string[], url: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, ['--import', tsxLoader, cliPath, ...args], {
@@ -32,8 +42,14 @@ async function runCli(args: string[], url: string): Promise<{ code: number | nul
 describe('standalone CLI capability contract', () => {
   it('contains precisely 33 unique canonical actions and 14 unique aliases', () => {
     validateActionCapabilities(ACTION_CAPABILITIES)
-    expect(ACTION_CAPABILITIES).toHaveLength(33)
-    expect(ACTION_CAPABILITIES.flatMap((capability) => capability.aliases ?? [])).toHaveLength(14)
+    expect(ACTION_CAPABILITIES).toHaveLength(capabilityFixture.canonicalActions)
+    expect(ACTION_CAPABILITIES.flatMap((capability) => capability.aliases ?? [])).toHaveLength(capabilityFixture.aliases)
+    expect(ACTION_CAPABILITIES.filter((capability) => !capability.supported).map((capability) => capability.action)).toEqual(
+      capabilityFixture.unsupported,
+    )
+    expect(ACTION_CAPABILITIES.find((capability) => capability.action === 'capture-pane')?.params.optional).toEqual(
+      expect.arrayContaining(capabilityFixture.acceptedNoOpCaptureParams),
+    )
   })
 
   it('fails duplicate and unclassified capability entries at initialization', () => {

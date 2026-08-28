@@ -24,7 +24,7 @@
 #   --local-build     Build locally with Docker instead of Cloud Build
 #   --shards=N        Number of parallel Cloud Run tasks (default: 4)
 #   --timeout=DURATION Cloud Run task timeout (default: 30m)
-#   --config=default             Which retained Vitest config to run
+#   --config=default|all         Which retained Vitest config(s) to run
 #   --account=EMAIL   GCP account pin (highest precedence; default: none —
 #                     FRESHELL_GCP_ACCOUNT env, then the gcloud-robot identity
 #                     ladder, then ambient gcloud)
@@ -161,7 +161,7 @@ Flags:
   --local-build     Build locally with Docker instead of Cloud Build
   --shards=N        Number of parallel Cloud Run tasks (default: 4)
   --timeout=DURATION Cloud Run task timeout (default: 30m)
-  --config=default             Which retained Vitest config to run
+  --config=default|all         Which retained Vitest config(s) to run
   --account=EMAIL   GCP account pin (highest precedence; default: none)
   --project-id=ID   GCP project (default: misc-puttering-project)
   --region=REGION   GCP region (default: us-west1)
@@ -188,7 +188,7 @@ remain in Cloud Logging afterwards.
 Examples:
   scripts/vitest-cloud.sh run --local test/unit/lib/pane-utils.test.ts
   scripts/vitest-cloud.sh run --cloud --shards=4
-  scripts/vitest-cloud.sh run --cloud --config=default --shards=2
+  scripts/vitest-cloud.sh run --cloud --config=all --shards=2
   scripts/vitest-cloud.sh build
   scripts/vitest-cloud.sh help
 EOF
@@ -389,8 +389,8 @@ cmd_run() {
       configs="$DEFAULT_CONFIGS"
       ;;
     *)
-      echo "[vitest-cloud] Unknown --config value: $config_selector (expected default)" >&2
-      exit 1
+      echo "[vitest-cloud] Unknown --config value: $config_selector (expected default or all)" >&2
+      exit 2
       ;;
   esac
 

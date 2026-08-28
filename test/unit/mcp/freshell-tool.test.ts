@@ -49,10 +49,17 @@ describe('TOOL_DESCRIPTION and INPUT_SCHEMA', () => {
     expect(TOOL_DESCRIPTION).not.toContain('fresh-send')
     expect(ACTION_PARAMS['capture-pane']?.optional).toEqual(expect.arrayContaining(['J', 'e']))
     expect(ACTION_PARAMS['wait-for']?.optional).not.toEqual(expect.arrayContaining(['stable', 'exit', 'prompt']))
+
+    for (const capability of supported) {
+      expect(INPUT_SCHEMA.action.safeParse(capability.action).success).toBe(true)
+      for (const alias of capability.aliases ?? []) {
+        expect(INPUT_SCHEMA.action.safeParse(alias).success).toBe(true)
+      }
+    }
   })
 
   it.each(['run', 'fresh-send', 'attach'])('registers removed %s and returns its deterministic unavailable result', async (action) => {
-    expect(INPUT_SCHEMA.action.safeParse(action).success).toBe(true)
+    expect(INPUT_SCHEMA.action.safeParse(action).success).toBe(false)
 
     const result = await executeAction(action, {})
 

@@ -119,9 +119,23 @@ describe('runtime boundary analyzer', () => {
 
     const result = await analyzeRuntimeBoundary(root)
 
-    expect((await stat(path.join(root, 'runtime-backend.mjs')).mode & 0o111)).toBe(0)
+    await chmod(path.join(root, 'runtime-backend.mjs'), 0o755)
+    expect(((await stat(path.join(root, 'runtime-backend.mjs'))).mode & 0o111)).not.toBe(0)
     expect(result.manifestDrift).toEqual([])
     expect(result.unexpectedNodeBackend).toEqual(['runtime-backend.mjs'])
+  })
+
+  it('ignores generated legacy roots at checkout top level but still scans nested paths', async () => {
+    const root = await createSyntheticRoot([], {
+      'bundled-node/bin/node': 'require(\'node:http\').createServer().listen(0)\n',
+      'server-node-modules/index.js': 'require(\'node:http\').createServer().listen(0)\n',
+      'scripts/bundled-node/new-owner.ts': "require('node:http').createServer().listen(0)\n",
+    })
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual(['unlisted owner: scripts/bundled-node/new-owner.ts'])
+    expect(result.unexpectedNodeBackend).toEqual(['scripts/bundled-node/new-owner.ts'])
   })
 
   it('checks package launch behavior without hashing unrelated script text', async () => {
