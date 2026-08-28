@@ -139,6 +139,27 @@ fn live_wslpath_timeout_falls_back_and_reaps_the_child() {
     assert!(!status.success(), "timed-out wslpath child must be reaped");
 }
 
+#[cfg(unix)]
+#[test]
+fn live_wslpath_timeout_does_not_wait_for_a_grandchild_pipe_holder() {
+    let scratch = Scratch::new("grandchild-pipe-holder");
+    let holder = conversion_script(
+        &scratch,
+        "grandchild-holder",
+        "#!/bin/sh\n(sleep 5) &\nwhile :; do sleep 1; done\n",
+    );
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        convert_to_windows_path_with_command(holder.to_string_lossy().as_ref(), "/repo/file"),
+        "/repo/file"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(4_500),
+        "timed-out conversion must not join a reader blocked by a grandchild"
+    );
+}
+
 #[test]
 fn claude_writes_tmp_json_0600_pretty_two_space() {
     let scratch = Scratch::new("claude");

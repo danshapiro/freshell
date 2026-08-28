@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   ACTION_CAPABILITIES,
+  unsupportedInvocationResult,
   validateActionCapabilities,
 } from '../../../tools/node-client-runtime/action-capabilities.js'
 
@@ -44,6 +45,13 @@ describe('standalone CLI capability contract', () => {
       ...ACTION_CAPABILITIES.slice(0, 32),
       { action: '', supported: true, params: { required: [], optional: [] } },
     ])).toThrow('Every action capability must be classified')
+  })
+
+  it('does not treat the CLI-only -p alias as a shared wait-for parameter', () => {
+    expect(unsupportedInvocationResult('wait-for', { p: 'ready' })).toEqual({
+      error: 'wait-for requires pattern with the Rust Freshell server.',
+      hint: 'Use a literal output pattern.',
+    })
   })
 
   it('renders supported CLI help from the capability matrix without unsupported actions or variants', async () => {

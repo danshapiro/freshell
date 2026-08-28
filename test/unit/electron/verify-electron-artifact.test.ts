@@ -120,6 +120,21 @@ describe('verify-electron-artifact', () => {
     )
   })
 
+  it('resolves architecture-specific Windows and Linux release directories', () => {
+    expect(resolveDefaultArtifactPath('win32', 'x64')).toBe(
+      path.join(process.cwd(), 'release', 'win-unpacked', 'resources'),
+    )
+    expect(resolveDefaultArtifactPath('win32', 'arm64')).toBe(
+      path.join(process.cwd(), 'release', 'win-arm64-unpacked', 'resources'),
+    )
+    expect(resolveDefaultArtifactPath('linux', 'x64')).toBe(
+      path.join(process.cwd(), 'release', 'linux-unpacked', 'resources'),
+    )
+    expect(resolveDefaultArtifactPath('linux', 'arm64')).toBe(
+      path.join(process.cwd(), 'release', 'linux-arm64-unpacked', 'resources'),
+    )
+  })
+
   it('does not parse architecture when an explicit artifact path is provided', () => {
     const explicitPath = path.join(tmpdir(), 'prebuilt-electron-resources')
 

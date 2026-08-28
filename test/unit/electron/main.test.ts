@@ -174,6 +174,32 @@ describe('initMainProcess', () => {
     }
   })
 
+  it('does not re-enter quit when synchronous cleanup failure re-emits before-quit', async () => {
+    const stopServer = vi.fn(() => {
+      throw new Error('stop failed synchronously')
+    })
+    deps.stopServer = stopServer as unknown as MainProcessDeps['stopServer']
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await initMainProcess(deps)
+      const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+      const firstQuit = { preventDefault: vi.fn() }
+      ;(app.quit as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        // Electron emits before-quit again when the resumed quit is requested.
+        // A synchronous stop failure must not start another cleanup/quit cycle.
+        app.emit('before-quit', { preventDefault: vi.fn() })
+      })
+
+      beforeQuit(firstQuit)
+
+      expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+      expect(stopServer).toHaveBeenCalledTimes(1)
+      expect(app.quit).toHaveBeenCalledTimes(1)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
   it('activate shows window on macOS', async () => {
     await initMainProcess(deps)
     app.emit('activate')
