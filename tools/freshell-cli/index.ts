@@ -859,22 +859,6 @@ async function main() {
       await handleDisplay(format, target, client)
       return
     }
-    case 'run': {
-      const capture = isTruthy(getFlag(flags, 'capture', 'c'))
-      const detached = isTruthy(getFlag(flags, 'd', 'detach'))
-      const timeout = getFlag(flags, 'T', 'timeout') as string | undefined
-      const name = getFlag(flags, 'n', 'name', 'title') as string | undefined
-      const cwd = getFlag(flags, 'cwd') as string | undefined
-      const commandText = args.join(' ')
-      if (!commandText) {
-        writeError('command required')
-        process.exitCode = 1
-        return
-      }
-      const res = await client.post('/api/run', { command: commandText, capture, detached, timeout, name, cwd })
-      writeJson(res)
-      return
-    }
     case 'summarize': {
       const target = (getFlag(flags, 't', 'target', 'pane') as string | undefined) || args[0]
       const resolved = await resolvePaneTarget(client, target)

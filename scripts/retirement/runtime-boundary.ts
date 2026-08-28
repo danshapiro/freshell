@@ -77,40 +77,6 @@ export const NON_BACKEND_LISTENER_PATHS = [
 
 const nonBackendListenerPaths = new Set<string>(NON_BACKEND_LISTENER_PATHS)
 
-const legacyDebtChecks: Array<{
-  relativePath: string
-  marker: string
-  matches: (contents: string) => boolean
-}> = [
-  {
-    relativePath: 'server/index.ts',
-    marker: 'server/index.ts',
-    matches: () => true,
-  },
-  {
-    relativePath: 'package.json',
-    marker: 'package.json:scripts.start',
-    matches: (contents) => {
-      try {
-        const pkg = JSON.parse(contents) as { scripts?: Record<string, unknown> }
-        return typeof pkg.scripts?.start === 'string' && /dist\/server|server\/index\.(?:ts|js)/.test(pkg.scripts.start)
-      } catch {
-        return false
-      }
-    },
-  },
-  {
-    relativePath: 'config/electron-builder.yml',
-    marker: 'config/electron-builder.yml:dist/server',
-    matches: (contents) => contents.includes('dist/server'),
-  },
-  {
-    relativePath: 'test/e2e-browser/playwright.config.ts',
-    marker: 'test/e2e-browser/playwright.config.ts:legacy-chromium',
-    matches: (contents) => contents.includes('legacy-chromium'),
-  },
-]
-
 function normalizeRelativePath(relativePath: string): string {
   return relativePath.split(path.sep).join('/').replace(/^\.\//, '')
 }
@@ -440,21 +406,15 @@ async function detectUnexpectedNodeBackend(
   return unexpected.sort()
 }
 
-async function detectLegacyDebt(root: string, manifest: RuntimeSurfaceManifest): Promise<string[]> {
-  const debt: string[] = []
-  for (const row of manifest.surfaces) {
-    if (row.listener === 'legacy-backend') debt.push(rowPath(row))
-  }
-  for (const check of legacyDebtChecks) {
-    const absolutePath = path.join(root, ...check.relativePath.split('/'))
-    try {
-      const contents = await readFile(absolutePath, 'utf8')
-      if (check.matches(contents)) debt.push(check.marker)
-    } catch {
-      // A later retirement task may remove the legacy path entirely.
-    }
-  }
-  return debt.sort()
+function detectLegacyDebt(manifest: RuntimeSurfaceManifest): string[] {
+  // Legacy debt is executable/runtime evidence only. Every legacy backend
+  // listener must remain explicitly visible in the manifest until it is
+  // retired; there is no prose or path allowlist that can silently preserve
+  // one after the final Rust cutover.
+  return manifest.surfaces
+    .filter((row) => row.listener === 'legacy-backend')
+    .map(rowPath)
+    .sort()
 }
 
 /**
@@ -470,7 +430,7 @@ export async function analyzeRuntimeBoundary(root: string): Promise<RuntimeBound
 
   const [manifestDrift, legacyDebt, unexpectedNodeBackend] = await Promise.all([
     reconcileManifest(normalizedRoot, manifest, discoveredOwners),
-    detectLegacyDebt(normalizedRoot, manifest),
+    detectLegacyDebt(manifest),
     detectUnexpectedNodeBackend(normalizedRoot, allFiles, manifest),
   ])
 

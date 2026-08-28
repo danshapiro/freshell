@@ -641,14 +641,6 @@ async function routeAction(
   const c = client()
 
   switch (action) {
-    // -- Fresh agent (chat client) actions --
-    case 'fresh-send': {
-      const sessionId = requireParam(params, 'sessionId')
-      const sessionType = requireParam(params, 'sessionType')
-      const provider = requireParam(params, 'provider')
-      const text = requireParam(params, 'text')
-      return c.post('/api/fresh-agent/send', { sessionId, sessionType, provider, text })
-    }
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, resumeSessionId, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
@@ -839,11 +831,6 @@ async function routeAction(
       if (params?.timeout) queryParts.push(`T=${encodeURIComponent(String(params.timeout))}`)
       const qs = queryParts.length ? `?${queryParts.join('&')}` : ''
       return c.get(`/api/panes/${encodeURIComponent(paneId)}/wait-for${qs}`)
-    }
-    case 'run': {
-      const command = requireParam(params, 'command')
-      const { capture, detached, timeout, name, cwd } = params || {}
-      return c.post('/api/run', { command, capture, detached, timeout, name, cwd })
     }
     case 'summarize': {
       const target = params?.target as string | undefined
