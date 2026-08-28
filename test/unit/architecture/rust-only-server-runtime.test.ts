@@ -174,6 +174,10 @@ describe('runtime boundary analyzer', () => {
     'tsx --require "./hook.mjs" "./build/server/index.ts"',
     'cross-env NODE_ENV=production node "nested/build/server/index.cjs"',
     'node.exe --trace-warnings ".\\build\\server\\index.js"',
+    'concurrently "node dist/server/index.js"',
+    'sh -c "node server/index.js"',
+    'cmd /c "node .\\build\\server\\index.js"',
+    'concurrently "sh -c \'node dist/server/index.js\'"',
   ])('reports a retired Node backend command with flags or quoting: %s', async (command) => {
     const root = await createSyntheticRoot(
       [{
@@ -194,6 +198,31 @@ describe('runtime boundary analyzer', () => {
     expect(result.manifestDrift).toContain(
       'retired Node backend command: package.json:scripts.start',
     )
+  })
+
+  it('rejects a required Rust script that also invokes the retired Node backend', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: REQUIRED_RUST_SCRIPT_NAMES,
+      }],
+      {
+        'package.json': JSON.stringify({
+          scripts: packageScriptsWithRustRequirements({
+            start: 'concurrently "node dist/server/index.js" "tsx scripts/start-rust-server.ts target/release/freshell-server"',
+          }),
+        }),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual(expect.arrayContaining([
+      'invalid package script behavior: start',
+      'retired Node backend command: package.json:scripts.start',
+    ]))
   })
 
   it('does not classify a non-backend Node script as the retired backend', async () => {
@@ -219,10 +248,10 @@ describe('runtime boundary analyzer', () => {
   })
 
   it('requires every Rust script name in both the manifest and package.json', async () => {
-    const missingName = 'test:source-runtime'
-    const entries = REQUIRED_RUST_SCRIPT_NAMES.filter((name) => name !== missingName)
+    const missingNames = ['start', 'test:source-runtime']
+    const entries = REQUIRED_RUST_SCRIPT_NAMES.filter((name) => !missingNames.includes(name))
     const scripts = packageScriptsWithRustRequirements()
-    delete scripts[missingName]
+    for (const missingName of missingNames) delete scripts[missingName]
     const root = await createSyntheticRoot(
       [{
         id: 'package-scripts',
@@ -236,8 +265,10 @@ describe('runtime boundary analyzer', () => {
     const result = await analyzeRuntimeBoundary(root)
 
     expect(result.manifestDrift).toEqual(expect.arrayContaining([
-      `manifest missing required package script: ${missingName}`,
-      `invalid package script behavior: ${missingName}`,
+      ...missingNames.flatMap((missingName) => [
+        `manifest missing required package script: ${missingName}`,
+        `invalid package script behavior: ${missingName}`,
+      ]),
     ]))
   })
 
