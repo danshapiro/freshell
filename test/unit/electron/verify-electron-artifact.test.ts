@@ -3,18 +3,24 @@ import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { verifyElectronArtifact } from '../../../scripts/verify-electron-artifact.js'
+import {
+  resolveDefaultArtifactPath,
+  verifyElectronArtifact,
+} from '../../../scripts/verify-electron-artifact.js'
 
 function artifactRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-artifact-'))
 }
 
-function writeArtifact(root: string, platform: 'linux' | 'win32' = 'linux'): string {
+function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'linux'): string {
   const binary = path.join(root, 'bin', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
   mkdirSync(path.dirname(binary), { recursive: true })
-  writeFileSync(binary, platform === 'win32'
-    ? Buffer.concat([Buffer.from('MZ'), Buffer.alloc(32)])
-    : Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(32)]))
+  const magic = platform === 'win32'
+    ? Buffer.from('MZ')
+    : platform === 'darwin'
+      ? Buffer.from([0xfe, 0xed, 0xfa, 0xcf])
+      : Buffer.from([0x7f, 0x45, 0x4c, 0x46])
+  writeFileSync(binary, Buffer.concat([magic, Buffer.alloc(32)]))
   chmodSync(binary, 0o755)
   mkdirSync(path.join(root, 'client'), { recursive: true })
   writeFileSync(path.join(root, 'client', 'index.html'), '<!doctype html>')
@@ -86,6 +92,31 @@ describe('verify-electron-artifact', () => {
     writeArtifact(root, 'win32')
     const probe = () => { throw new Error('foreign binary must not execute locally') }
     expect(verifyElectronArtifact(root, 'win32', { probe })).toMatchObject({ ok: true, executed: false })
+  })
+
+  it('accepts the macOS icon and Windows NSIS helper in their resource roots', () => {
+    const cases = [
+      { platform: 'darwin' as const, file: 'icon.icns' },
+      { platform: 'win32' as const, file: 'elevate.exe' },
+    ]
+    for (const { platform, file } of cases) {
+      const root = artifactRoot()
+      writeArtifact(root, platform)
+      writeFileSync(path.join(root, file), 'electron-builder resource')
+      expect(verifyElectronArtifact(root, platform, {
+        hostPlatform: 'linux',
+        probe: () => { throw new Error('foreign binary must not execute locally') },
+      })).toMatchObject({ ok: true, platform, executed: false })
+    }
+  })
+
+  it('resolves the architecture-specific macOS release directory', () => {
+    expect(resolveDefaultArtifactPath('darwin', 'x64')).toBe(
+      path.join(process.cwd(), 'release', 'mac', 'Freshell.app', 'Contents', 'Resources'),
+    )
+    expect(resolveDefaultArtifactPath('darwin', 'arm64')).toBe(
+      path.join(process.cwd(), 'release', 'mac-arm64', 'Freshell.app', 'Contents', 'Resources'),
+    )
   })
 
   it('rejects a native probe that listens or returns the wrong authentication failure', () => {

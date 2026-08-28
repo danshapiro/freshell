@@ -28,8 +28,13 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+/** Convert a module URL to its platform-native directory before joining files. */
+export function moduleDirectoryFromUrl(moduleUrl: string, windows = process.platform === 'win32'): string {
+  const modulePath = fileURLToPath(moduleUrl, { windows })
+  return (windows ? path.win32 : path).dirname(modulePath)
+}
+
+const __dirname = moduleDirectoryFromUrl(import.meta.url)
 export const PROJECT_ROOT = path.resolve(__dirname, '..')
 
 export type ElectronRuntimePlatform = 'darwin' | 'linux' | 'win32'
@@ -71,6 +76,8 @@ export const RUNTIME_LAYOUT = Object.freeze({
   electronUnpackedClaudeSdk: 'app.asar.unpacked/node_modules/@anthropic-ai/claude-agent-sdk',
   launchChooser: 'launch-chooser',
   trayAssets: 'assets',
+  macIcon: 'icon.icns',
+  windowsElevate: 'elevate.exe',
 })
 
 export interface RuntimeAllowlist {
@@ -128,6 +135,8 @@ export function getRuntimeAllowlist(
       nodeBinary,
       RUNTIME_LAYOUT.receipt,
       RUNTIME_LAYOUT.electronArchive,
+      ...(platform === 'darwin' ? [RUNTIME_LAYOUT.macIcon] : []),
+      ...(platform === 'win32' ? [RUNTIME_LAYOUT.windowsElevate] : []),
     ]),
     recursiveDirectories: Object.freeze([
       path.posix.dirname(RUNTIME_LAYOUT.clientIndex),
@@ -399,6 +408,11 @@ function removePath(targetPath: string): void {
   rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 })
 }
 
+function ensureExecutable(filePath: string): void {
+  const mode = statSync(filePath).mode & 0o777
+  chmodSync(filePath, mode | 0o111)
+}
+
 function copyRequiredFile(source: string, destination: string): void {
   if (!existsSync(source)) throw new Error(`Required Electron runtime input is missing: ${source}`)
   mkdirSync(path.dirname(destination), { recursive: true })
@@ -520,10 +534,7 @@ async function downloadFile(url: string, destination: string): Promise<void> {
 }
 
 async function downloadText(url: string): Promise<string> {
-  const destination = path.join(
-    path.dirname(new URL(import.meta.url).pathname),
-    `.checksums-${process.pid}-${Date.now()}.txt`,
-  )
+  const destination = path.join(__dirname, `.checksums-${process.pid}-${Date.now()}.txt`)
   try {
     await downloadFile(url, destination)
     return readFileSync(destination, 'utf8')
@@ -602,7 +613,7 @@ async function extractNodeArchive(
       })
       copyRequiredFile(path.join(extractionDir, 'node'), binaryPath)
     }
-    if (platform !== 'win32') chmodSync(binaryPath, 0o755)
+    if (platform !== 'win32') ensureExecutable(binaryPath)
   } finally {
     removePath(extractionDir)
   }
@@ -618,7 +629,7 @@ async function ensureNodeBinary(
 ): Promise<void> {
   if (options.nodeBinary) {
     copyRequiredFile(options.nodeBinary, destination)
-    if (platform !== 'win32') chmodSync(destination, statSync(destination).mode & 0o777)
+    if (platform !== 'win32') ensureExecutable(destination)
     return
   }
   const archivePath = path.join(runtimeDir, `.download-${getNodeArchiveName(version, platform, arch)}`)
@@ -631,6 +642,7 @@ async function ensureNodeBinary(
     removePath(archivePath)
   }
   if (!existsSync(destination)) throw new Error(`Node runtime downloader did not produce ${destination}`)
+  if (platform !== 'win32') ensureExecutable(destination)
 }
 
 function copySidecar(
@@ -753,7 +765,7 @@ export async function stageElectronRuntime(
   removePath(runtimeDir)
   mkdirSync(runtimeDir, { recursive: true })
   copyRequiredFile(serverBinary, paths.serverBinary)
-  if (platform !== 'win32') chmodSync(paths.serverBinary, statSync(paths.serverBinary).mode & 0o777)
+  if (platform !== 'win32') ensureExecutable(paths.serverBinary)
   copyRequiredDirectory(clientDir, paths.clientDir)
   await ensureNodeBinary(options, nodeVersion, platform, arch, paths.nodeBinary, runtimeDir)
   copySidecar(sidecarDir, paths.claudeSidecarDir, sidecarNodeModulesDir, sidecarLock, platform, arch)

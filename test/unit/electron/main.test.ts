@@ -125,6 +125,29 @@ describe('initMainProcess', () => {
     expect(deps.stopServer).toHaveBeenCalledTimes(1)
   })
 
+  it('resumes quitting when server cleanup rejects', async () => {
+    ;(deps.stopServer as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('stop failed'))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await initMainProcess(deps)
+      const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+      const firstQuit = { preventDefault: vi.fn() }
+
+      beforeQuit(firstQuit)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+      expect(deps.stopServer).toHaveBeenCalledTimes(1)
+      expect(app.quit).toHaveBeenCalledTimes(1)
+
+      const resumedQuit = { preventDefault: vi.fn() }
+      beforeQuit(resumedQuit)
+      expect(resumedQuit.preventDefault).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
   it('activate shows window on macOS', async () => {
     await initMainProcess(deps)
     app.emit('activate')

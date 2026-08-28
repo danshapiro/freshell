@@ -32,7 +32,6 @@ const FORBIDDEN_DISTRIBUTION_TERMS = [
   /build:server/,
   /dist\/server/,
   /server-node-modules/,
-  /node-pty/,
   /vitest\.server/,
   /--passWithNoTests/,
   /legacy-chromium/,
@@ -61,6 +60,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')
     expect(dockerfile).toContain('RETIRED_BACKEND_DIRECTORIES')
+    expect(dockerfile).toContain('node_modules/node-pty')
     expect(dockerfile).toContain('test ! -e "/app/$relative"')
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
@@ -174,5 +174,18 @@ describe('Rust-only distribution runtime contracts', () => {
       'dist/server/index.js',
       'node_modules/node-pty/index.js',
     ]))
+  })
+
+  it('keeps tracked distribution fixtures visible to Git tooling', () => {
+    for (const fixturePath of [
+      'test/fixtures/distribution/rust-only/dist/client/index.html',
+      'test/fixtures/distribution/node-server/node_modules/node-pty/index.js',
+    ]) {
+      const result = spawnSync('git', ['check-ignore', '--no-index', fixturePath], {
+        cwd: PROJECT_ROOT,
+        encoding: 'utf8',
+      })
+      expect(result.status, `${fixturePath} must not be ignored`).toBe(1)
+    }
   })
 })

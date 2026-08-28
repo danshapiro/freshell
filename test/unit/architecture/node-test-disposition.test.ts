@@ -5,6 +5,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
+  isDirectRun,
   verifyNodeTestDisposition,
   type NodeTestDispositionLedger,
   type NodeTestDispositionRow,
@@ -38,6 +39,14 @@ function ledger(rows: NodeTestDispositionRow[]): NodeTestDispositionLedger {
 }
 
 describe('node-test-disposition verifier', () => {
+  it('recognizes direct execution with Windows file paths', () => {
+    const entryPoint = 'C:\\repo\\scripts\\retirement\\verify-node-test-disposition.js'
+    const moduleUrl = 'file:///C:/repo/scripts/retirement/verify-node-test-disposition.js'
+
+    expect(isDirectRun(entryPoint, moduleUrl, true)).toBe(true)
+    expect(isDirectRun(entryPoint, moduleUrl, false)).toBe(false)
+  })
+
   it('accepts the committed closed disposition ledger', async () => {
     const committed = JSON.parse(await readFile(
       path.join(repoRoot, 'scripts/retirement/node-test-disposition.json'),

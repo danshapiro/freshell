@@ -68,13 +68,17 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
         })
         .catch((error: unknown) => {
           serverStopInProgress = undefined
-          isQuitting = false
+          // Cleanup failure must not strand Electron in a half-quit state. We
+          // have already attempted the exact child; resume the quit while the
+          // structured error below preserves the failure for diagnosis.
+          quitAfterServerStop = true
           console.error(JSON.stringify({
             severity: 'error',
             component: 'electron-main',
             event: 'server_stop_before_quit_failed',
             error: error instanceof Error ? error.message : String(error),
           }))
+          app.quit()
         })
     } catch (error) {
       serverStopInProgress = undefined

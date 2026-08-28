@@ -72,7 +72,7 @@ function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Prom
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
-  const noTestsOverride = ['--pass', 'WithNoTests'].join('')
+  const noTestsOverride = '--passWithNoTests'
   if (argv.some((arg) => arg === noTestsOverride || arg.startsWith(`${noTestsOverride}=`))) {
     log('error', 'source_runtime_vacuous_flag_rejected', {
       message: `The source-runtime lane must fail when its selector is empty; ${noTestsOverride} is not allowed.`,

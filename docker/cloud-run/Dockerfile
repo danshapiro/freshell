@@ -63,7 +63,7 @@ node_modules/dotenv \
 node_modules/express \
 node_modules/express-rate-limit \
 node_modules/glob \
-node_modules/node-""pty \
+node_modules/node-pty \
 node_modules/pino \
 node_modules/rotating-file-stream \
 node_modules/is-port-reachable \

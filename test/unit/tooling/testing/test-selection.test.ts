@@ -60,7 +60,7 @@ describe('Rust-first build and test selection', () => {
     expect(runs.find((run) => run.name === 'source-runtime')?.script).toBe('test:source-runtime')
     expect(runs.find((run) => run.name === 'rust')?.script).toBe('test:rust')
     expect(runs.find((run) => run.name === 'electron')?.configPath).toBe('config/vitest/vitest.electron.config.ts')
-    expect(buildVitestArgs({ configPath: 'config/vitest/vitest.config.ts', forwardedArgs: [] })).not.toContain(['--pass', 'WithNoTests'].join(''))
+    expect(buildVitestArgs({ configPath: 'config/vitest/vitest.config.ts', forwardedArgs: [] })).not.toContain('--passWithNoTests')
   })
 
   it('maps server and integration public commands to explicit Rust cargo phases', () => {
@@ -82,7 +82,7 @@ describe('Rust-first build and test selection', () => {
     expect(configSource).not.toContain("'test/unit/visible-first/cli-command-harness.test.ts'")
     expect(configSource).toContain("'test/integration/tooling/**'")
     expect(configSource).toContain("'test/integration/electron/**'")
-    expect(configSource).not.toContain(['vitest', 'server.config'].join('.'))
+    expect(configSource).not.toContain('vitest.server.config')
 
     const runtimeConfig = path.join(PROJECT_ROOT, 'config/vitest/vitest.runtime.config.ts')
     expect(readFileSync(runtimeConfig, 'utf8')).toContain('source-runtime-rust.test.ts')
