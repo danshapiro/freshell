@@ -71,7 +71,7 @@ node_modules/@types/cookie-parser \
 node_modules/@types/express \
 node_modules/@types/supertest \
 node_modules/supertest \
-node_modules/superwtest \
+node_modules/superwstest \
 node_modules/pino-pretty"; \
     for relative in $RETIRED_BACKEND_DIRECTORIES; do \
       rm -rf "/app/$relative"; \

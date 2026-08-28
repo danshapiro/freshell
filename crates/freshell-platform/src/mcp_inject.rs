@@ -85,14 +85,13 @@ pub trait McpRuntime {
     fn tmp_dir(&self) -> PathBuf;
     /// `isWslEnvironment()` (`cw:45-51`): linux && (WSL_DISTRO_NAME || WSL_INTEROP || WSLENV).
     fn is_wsl_environment(&self) -> bool;
-    /// `convertToWindowsPath`: `wslpath -w`, 3s timeout. A failure is fatal so
-    /// a Windows-target agent never receives an unusable Linux path.
+    /// `convertToWindowsPath`: `wslpath -w`, 3s timeout, and the host path
+    /// unchanged when conversion is unavailable or fails.
     /// Callers must pre-gate on [`Self::is_wsl_environment`] (as the reference does
     /// via `needsWinPaths`).
-    fn convert_to_windows_path(&self, linux_path: &str) -> Result<String, McpInjectError>;
+    fn convert_to_windows_path(&self, linux_path: &str) -> String;
     /// The host-form MCP server command args (pre-conversion) — `cw:89-107`
-    /// minus the `needsWinPaths` mapping, which [`build_mcp_server_command_args`]
-    /// applies.
+    /// minus the `needsWinPaths` mapping applied by the command renderer.
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError>;
 
     /// Complete server command. The default preserves the existing seam for
@@ -122,7 +121,7 @@ impl McpRuntime for RealMcpRuntime {
             .any(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
     }
 
-    fn convert_to_windows_path(&self, linux_path: &str) -> Result<String, McpInjectError> {
+    fn convert_to_windows_path(&self, linux_path: &str) -> String {
         convert_to_windows_path_live(linux_path)
     }
 
@@ -206,97 +205,61 @@ fn find_repo_root() -> PathBuf {
     start
 }
 
-/// `convertToWindowsPath`'s exec half: `wslpath -w <path>` with a 3s timeout.
-/// Conversion errors are deliberately surfaced at injection time instead of
-/// leaking host paths into a Windows-target provider configuration.
-fn convert_to_windows_path_live(linux_path: &str) -> Result<String, McpInjectError> {
+/// `convertToWindowsPath`'s exec half: `wslpath -w <path>` with a 3s timeout,
+/// falling back to the input path if the utility is unavailable or fails.
+fn convert_to_windows_path_live(linux_path: &str) -> String {
     convert_to_windows_path_with_command("wslpath", linux_path)
 }
 
-fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> Result<String, McpInjectError> {
-    use std::io::Read;
+fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> String {
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::time::Duration;
 
-    let mut child = Command::new(program)
+    let child = Command::new(program)
         .arg("-w")
         .arg(linux_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| McpInjectError::new(format!("Failed to start wslpath for path conversion: {error}")))?;
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait().map_err(|error| McpInjectError::new(format!("Failed while waiting for wslpath: {error}")))? {
-            Some(status) => break status,
-            None if started.elapsed() >= Duration::from_secs(3) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                return Err(McpInjectError::new("wslpath timed out after 3 seconds during path conversion."));
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
+        .spawn();
+    let Ok(child) = child else {
+        return linux_path.to_string();
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| McpInjectError::new("wslpath output reader panicked during path conversion."))?
-        .map_err(|error| McpInjectError::new(format!("Failed to read wslpath output: {error}")))?;
-    if !status.success() {
-        return Err(McpInjectError::new(format!("wslpath exited with status {status} during path conversion.")));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(output)) if output.status.success() => {
+            let converted = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if converted.is_empty() {
+                linux_path.to_string()
+            } else {
+                converted
+            }
+        }
+        _ => linux_path.to_string(),
     }
-    let converted = String::from_utf8_lossy(&stdout).trim().to_string();
-    if converted.is_empty() {
-        return Err(McpInjectError::new("wslpath returned an empty path during path conversion."));
-    }
-    Ok(converted)
-}
-
-/// `buildMcpServerCommandArgs(platform)` (`cw:89-107`): the runtime's host-form
-/// args with the `needsWinPaths` conversion applied to path elements when
-/// `platform === 'windows' && isWslEnvironment()`.
-pub fn build_mcp_server_command_args(
-    rt: &dyn McpRuntime,
-    target: ProviderTarget,
-) -> Result<Vec<String>, McpInjectError> {
-    let needs_win_paths = target == ProviderTarget::Windows && rt.is_wsl_environment();
-    rt.server_command_args()?
-        .into_iter()
-        .map(|arg| convert_mcp_server_arg(rt, arg, needs_win_paths))
-        .collect()
 }
 
 /// Render a complete MCP command for a provider target. This is the canonical
-/// path used by every injection renderer; the args-only helper remains for
-/// compatibility with existing callers and focused goldens.
+/// path used by every injection renderer.
 pub fn build_mcp_server_command(
     rt: &dyn McpRuntime,
     target: ProviderTarget,
 ) -> Result<(String, Vec<String>), McpInjectError> {
     let needs_win_paths = target == ProviderTarget::Windows && rt.is_wsl_environment();
     let command = rt.server_command()?;
-    Ok((
-        convert_mcp_server_arg(rt, command.command, needs_win_paths)?,
-        command.args.into_iter().map(|arg| convert_mcp_server_arg(rt, arg, needs_win_paths)).collect::<Result<Vec<_>, _>>()?,
-    ))
-}
-
-fn convert_mcp_server_arg(
-    rt: &dyn McpRuntime,
-    arg: McpServerArg,
-    needs_win_paths: bool,
-) -> Result<String, McpInjectError> {
-    match arg {
-        McpServerArg::Literal(value) => Ok(value),
+    let convert = |arg: McpServerArg| match arg {
+        McpServerArg::Literal(value) => value,
         McpServerArg::Path(value) if needs_win_paths => rt.convert_to_windows_path(&value),
-        McpServerArg::Path(value) => Ok(value),
-    }
+        McpServerArg::Path(value) => value,
+    };
+    Ok((
+        convert(command.command),
+        command.args.into_iter().map(convert).collect(),
+    ))
 }
 
 /// `tomlEscape` (`cw:142-144`): wrap in `"` with `\` → `\\` and `"` → `\"`.
@@ -380,7 +343,7 @@ fn write_mcp_config_file(
     write_json_0600(&file_path, &config)?;
     let path_str = file_path.to_string_lossy().into_owned();
     if target == ProviderTarget::Windows && rt.is_wsl_environment() {
-        return rt.convert_to_windows_path(&path_str);
+        return Ok(rt.convert_to_windows_path(&path_str));
     }
     Ok(path_str)
 }
