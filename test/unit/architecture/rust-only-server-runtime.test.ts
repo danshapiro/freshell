@@ -178,6 +178,11 @@ describe('runtime boundary analyzer', () => {
     'sh -c "node server/index.js"',
     'cmd /c "node .\\build\\server\\index.js"',
     'concurrently "sh -c \'node dist/server/index.js\'"',
+    'pwsh -Command "node server/index.js"',
+    'powershell -NoProfile -Command "tsx dist/server/index.ts"',
+    'cmd.exe /d /s /c "node .\\build\\server\\index.js"',
+    'bash --norc -c "node dist/server/index.js"',
+    'sh -eu -c "node server/index.js"',
   ])('reports a retired Node backend command with flags or quoting: %s', async (command) => {
     const root = await createSyntheticRoot(
       [{

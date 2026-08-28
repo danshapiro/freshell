@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
+  resolveArtifactPath,
   resolveDefaultArtifactPath,
   verifyElectronArtifact,
 } from '../../../scripts/verify-electron-artifact.js'
@@ -117,6 +118,12 @@ describe('verify-electron-artifact', () => {
     expect(resolveDefaultArtifactPath('darwin', 'arm64')).toBe(
       path.join(process.cwd(), 'release', 'mac-arm64', 'Freshell.app', 'Contents', 'Resources'),
     )
+  })
+
+  it('does not parse architecture when an explicit artifact path is provided', () => {
+    const explicitPath = path.join(tmpdir(), 'prebuilt-electron-resources')
+
+    expect(resolveArtifactPath(explicitPath, 'darwin', 'unsupported-host-architecture')).toBe(explicitPath)
   })
 
   it('rejects a native probe that listens or returns the wrong authentication failure', () => {

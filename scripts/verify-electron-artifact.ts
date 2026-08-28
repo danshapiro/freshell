@@ -251,14 +251,28 @@ function parseArch(value: string | undefined): ElectronRuntimeArch {
   return arch
 }
 
+/** Resolve an explicit artifact override without consulting host architecture. */
+export function resolveArtifactPath(
+  override: string | undefined,
+  platform: ElectronRuntimePlatform,
+  architecture: string | undefined,
+): string {
+  if (override !== undefined) return override
+  return resolveDefaultArtifactPath(platform, parseArch(architecture))
+}
+
 function main(): void {
   const args = process.argv.slice(2)
   const pathArg = args[0] && !args[0].startsWith('--') ? args[0] : undefined
   const platformArgIndex = args.indexOf('--platform')
   const platform = parsePlatform(platformArgIndex >= 0 ? args[platformArgIndex + 1] : undefined)
   const archArgIndex = args.indexOf('--arch')
-  const arch = parseArch(archArgIndex >= 0 ? args[archArgIndex + 1] : undefined)
-  const artifactPath = pathArg ?? process.env.ELECTRON_ARTIFACT_PATH ?? resolveDefaultArtifactPath(platform, arch)
+  const artifactOverride = pathArg ?? process.env.ELECTRON_ARTIFACT_PATH
+  const artifactPath = resolveArtifactPath(
+    artifactOverride,
+    platform,
+    archArgIndex >= 0 ? args[archArgIndex + 1] : undefined,
+  )
   const receipt = verifyElectronArtifact(artifactPath, platform)
   process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'electron_artifact_verified', ...receipt })}\n`)
 }

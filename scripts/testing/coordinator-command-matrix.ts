@@ -92,7 +92,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   return classifySinglePhaseCommand(input.commandKey, args)
 }
 
-export function isRetiredServerConfigSelector(arg: string): boolean {
+function isRetiredServerConfigSelector(arg: string): boolean {
   const normalized = arg.replaceAll('\\', '/')
   return /(?:^|[/=])(?:vitest\.)?server\.config(?:\.[^/]+)?$/.test(normalized)
     || /(?:^|[/=])test\/(?:unit\/|integration\/)?server(?:\/|$)/.test(normalized)

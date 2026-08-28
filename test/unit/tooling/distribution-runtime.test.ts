@@ -27,7 +27,7 @@ function diagnostics(output: string): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>)
 }
 
-const NODE_PTY_RUNTIME_PATH = /\bnode_modules\/node-pty\b/
+const NODE_PTY_RETIREMENT_TERM = /\bnode-pty\b/i
 
 const FORBIDDEN_DISTRIBUTION_TERMS = [
   /node dist\/server/,
@@ -51,8 +51,14 @@ function cloudRetiredBackendCleanupBlock(dockerfile: string): string {
   return lines.slice(start, end + 1).join('\n')
 }
 
-function expectNoNodePtyRuntimePath(contents: string): void {
-  expect(contents).not.toMatch(NODE_PTY_RUNTIME_PATH)
+function nodePtyRetirementViolations(contents: string): string[] {
+  return contents
+    .split(/\r?\n/)
+    .filter((line) => NODE_PTY_RETIREMENT_TERM.test(line))
+}
+
+function expectNoNodePtyRuntimeTerm(contents: string): void {
+  expect(nodePtyRetirementViolations(contents)).toEqual([])
 }
 
 describe('Rust-only distribution runtime contracts', () => {
@@ -64,7 +70,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('npm run build:client')
     expect(dockerfile).toContain('CMD ["\/app\/freshell-server"]')
     expect(dockerfile).not.toMatch(/node\s+dist\//)
-    expectNoNodePtyRuntimePath(dockerfile)
+    expectNoNodePtyRuntimeTerm(dockerfile)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
 
@@ -83,8 +89,8 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(cleanupBlock).toContain('rm -rf "/app/$relative"')
     expect(cleanupBlock).toContain('node_modules/node-pty')
     expect(cleanupBlock).toContain('test ! -e "/app/$relative"')
-    expect(cleanupBlock.match(/\bnode_modules\/node-pty\b/g)).toHaveLength(1)
-    expectNoNodePtyRuntimePath(dockerfile.replace(cleanupBlock, ''))
+    expect(cleanupBlock.match(/\bnode-pty\b/gi)).toHaveLength(1)
+    expectNoNodePtyRuntimeTerm(dockerfile.replace(cleanupBlock, ''))
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
 
@@ -96,7 +102,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(entrypoint).toMatch(/No spec files discovered[\s\S]*exit 1/)
     expect(entrypoint).not.toMatch(/falling back to glob/)
     expect(entrypoint).not.toMatch(/No spec files found\. Running all tests/)
-    expectNoNodePtyRuntimePath(entrypoint)
+    expectNoNodePtyRuntimeTerm(entrypoint)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(entrypoint).not.toMatch(term)
   })
 
@@ -120,7 +126,7 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(workflow.indexOf('cargo build -p freshell-server --locked')).toBeLessThan(
       workflow.indexOf('npm run test:source-runtime'),
     )
-    expectNoNodePtyRuntimePath(workflow)
+    expectNoNodePtyRuntimeTerm(workflow)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
   })
 
@@ -172,10 +178,20 @@ describe('Rust-only distribution runtime contracts', () => {
       expect(workflow).toContain('release/*.AppImage')
       expect(workflow).toContain('release/*.deb')
       expect(workflow).toContain('release/*.exe')
-      expectNoNodePtyRuntimePath(workflow)
+      expectNoNodePtyRuntimeTerm(workflow)
       for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
     })
   }
+
+  it('detects node-pty install, copy, and rebuild terms as forbidden source references', () => {
+    const source = [
+      'RUN npm install node-pty',
+      'COPY node_modules/node-pty /app/node_modules/node-pty',
+      'RUN npm rebuild node-pty',
+    ].join('\n')
+
+    expect(nodePtyRetirementViolations(source)).toEqual(source.split('\n'))
+  })
 
   it('accepts the Rust/client/tools fixture and emits sorted JSONL evidence', () => {
     const result = runContainerLayoutFixture('test/fixtures/distribution/rust-only')

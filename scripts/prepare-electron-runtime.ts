@@ -28,10 +28,10 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
 
-/** Convert a module URL to its platform-native directory before joining files. */
+/** Convert a module URL to its requested platform path dialect before joining files. */
 export function moduleDirectoryFromUrl(moduleUrl: string, windows = process.platform === 'win32'): string {
   const modulePath = fileURLToPath(moduleUrl, { windows })
-  return (windows ? path.win32 : path).dirname(modulePath)
+  return (windows ? path.win32 : path.posix).dirname(modulePath)
 }
 
 const __dirname = moduleDirectoryFromUrl(import.meta.url)

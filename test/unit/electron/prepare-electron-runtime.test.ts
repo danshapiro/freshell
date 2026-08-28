@@ -104,6 +104,13 @@ describe('prepare-electron-runtime staging', () => {
     )).toBe('C:\\repo\\scripts')
   })
 
+  it('keeps POSIX path semantics when a POSIX file URL is requested on another host', () => {
+    expect(moduleDirectoryFromUrl(
+      'file:///C:/repo/scripts/prepare-electron-runtime.ts',
+      false,
+    )).toBe('/C:/repo/scripts')
+  })
+
   it('allows the platform resources electron-builder puts beside the runtime', () => {
     expect(findUnapprovedRuntimePaths(['icon.icns'], 'darwin')).toEqual([])
     expect(findUnapprovedRuntimePaths(['elevate.exe'], 'win32')).toEqual([])
