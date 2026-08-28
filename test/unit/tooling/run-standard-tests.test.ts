@@ -108,6 +108,19 @@ describe('run-standard-tests', () => {
       }).stages.flat().map((run) => run.name)).toEqual(['source-runtime'])
     })
 
+    it('routes Electron integration paths to the dedicated Electron runtime lane', () => {
+      expect(createStandardTestPlan({
+        availableParallelism: 32,
+        ci: false,
+        forwardedArgs: ['test/integration/electron/checkout-free-runtime.test.ts'],
+      }).stages.flat()).toEqual([{
+        name: 'electron-runtime',
+        runner: 'vitest',
+        configPath: 'config/vitest/vitest.electron-runtime.config.ts',
+        priority: 'background',
+      }])
+    })
+
     it('routes Electron paths to the Electron lane only', () => {
       expect(createStandardTestPlan({
         availableParallelism: 32,

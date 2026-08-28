@@ -12,9 +12,10 @@ const REQUIRE = createRequire(resolve(PROJECT_ROOT, 'package.json'))
 const VITEST_ENTRYPOINT = REQUIRE.resolve('vitest/vitest.mjs')
 const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
 const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
+const ELECTRON_RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.electron-runtime.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
-export type SuiteName = 'client' | 'source-runtime' | 'rust' | 'electron'
+export type SuiteName = 'client' | 'source-runtime' | 'rust' | 'electron' | 'electron-runtime'
 export type RunPriority = 'normal' | 'background'
 
 export interface StandardTestRun {
@@ -97,11 +98,15 @@ function classifySuitePath(token: string): SuiteName | null {
   }
   if (
     normalizedToken.startsWith('test/integration/tooling/')
-    || normalizedToken.startsWith('test/integration/electron/')
     || normalizedToken.includes('/test/integration/tooling/')
-    || normalizedToken.includes('/test/integration/electron/')
   ) {
     return 'source-runtime'
+  }
+  if (
+    normalizedToken.startsWith('test/integration/electron/')
+    || normalizedToken.includes('/test/integration/electron/')
+  ) {
+    return 'electron-runtime'
   }
   if (
     normalizedToken.startsWith('test/server/')
@@ -126,12 +131,17 @@ function detectRequestedSuites(forwardedArgs: string[]): SuiteName[] | null {
     if (suite) suites.add(suite)
   }
   if (suites.size === 0) return null
-  return ['client', 'source-runtime', 'rust', 'electron'].filter((suite): suite is SuiteName => suites.has(suite))
+  return ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime']
+    .filter((suite): suite is SuiteName => suites.has(suite))
 }
 
-function buildRuns(mode: StandardTestMode, workers: DesktopWorkerPlan): StandardTestRun[] {
+function buildRuns(
+  mode: StandardTestMode,
+  workers: DesktopWorkerPlan,
+  includeElectronRuntime: boolean,
+): StandardTestRun[] {
   const priority: RunPriority = mode === 'aggressive' ? 'normal' : 'background'
-  return [
+  const runs: StandardTestRun[] = [
     {
       name: 'client',
       runner: 'vitest',
@@ -158,6 +168,15 @@ function buildRuns(mode: StandardTestMode, workers: DesktopWorkerPlan): Standard
       priority,
     },
   ]
+  if (includeElectronRuntime) {
+    runs.push({
+      name: 'electron-runtime',
+      runner: 'vitest',
+      configPath: ELECTRON_RUNTIME_VITEST_CONFIG,
+      priority,
+    })
+  }
+  return runs
 }
 
 export function createStandardTestPlan({
@@ -169,7 +188,7 @@ export function createStandardTestPlan({
   const resolvedMode = mode ?? (ci ? 'aggressive' : 'desktop')
   const requestedSuites = detectRequestedSuites(forwardedArgs)
   const workers = resolveDesktopWorkerPlan(cpuCount)
-  const runs = buildRuns(resolvedMode, workers)
+  const runs = buildRuns(resolvedMode, workers, requestedSuites?.includes('electron-runtime') ?? false)
   const selectedRuns = requestedSuites
     ? runs.filter((run) => requestedSuites.includes(run.name))
     : runs
