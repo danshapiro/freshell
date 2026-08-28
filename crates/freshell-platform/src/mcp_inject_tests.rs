@@ -104,6 +104,41 @@ fn live_wslpath_conversion_falls_back_to_the_host_path_on_failures() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn live_wslpath_timeout_falls_back_and_reaps_the_child() {
+    let scratch = Scratch::new("live-conversion-timeout");
+    let pid_file = scratch.path().join("timeout.pid");
+    let timeout = conversion_script(
+        &scratch,
+        "timeout",
+        &format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    );
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        convert_to_windows_path_with_command(timeout.to_string_lossy().as_ref(), "/repo/file"),
+        "/repo/file"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "timed-out conversion should return promptly"
+    );
+
+    let pid = std::fs::read_to_string(&pid_file).expect("timeout script wrote its pid");
+    let status = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.trim())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("kill -0 status");
+    assert!(!status.success(), "timed-out wslpath child must be reaped");
+}
+
 #[test]
 fn claude_writes_tmp_json_0600_pretty_two_space() {
     let scratch = Scratch::new("claude");

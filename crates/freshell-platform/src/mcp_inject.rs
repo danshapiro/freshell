@@ -212,9 +212,9 @@ fn convert_to_windows_path_live(linux_path: &str) -> String {
 }
 
 fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> String {
+    use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let child = Command::new(program)
         .arg("-w")
@@ -223,23 +223,52 @@ fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();
-    let Ok(child) = child else {
+    let Ok(mut child) = child else {
         return linux_path.to_string();
     };
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return linux_path.to_string();
+    };
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
     });
-    match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(Ok(output)) if output.status.success() => {
-            let converted = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if converted.is_empty() {
-                linux_path.to_string()
-            } else {
-                converted
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return linux_path.to_string();
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return linux_path.to_string();
             }
         }
-        _ => linux_path.to_string(),
+    };
+    let Ok(Ok(output)) = reader.join() else {
+        return linux_path.to_string();
+    };
+
+    if status.success() {
+        let converted = String::from_utf8_lossy(&output).trim().to_string();
+        if converted.is_empty() {
+            linux_path.to_string()
+        } else {
+            converted
+        }
+    } else {
+        linux_path.to_string()
     }
 }
 

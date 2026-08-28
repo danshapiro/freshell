@@ -1290,6 +1290,48 @@ mod join_tests {
     use super::*;
     use freshell_ws::identity::TerminalIdentityRegistry;
 
+    struct LinkedWorktreeFixture {
+        root: std::path::PathBuf,
+        project: std::path::PathBuf,
+        checkout: std::path::PathBuf,
+        gitdir: std::path::PathBuf,
+    }
+
+    impl LinkedWorktreeFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "freshell-session-directory-worktree-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let project = root.join("project");
+            let checkout = root.join("checkouts/feature");
+            let gitdir = root.join("administrative/.git/worktrees/feature");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../../../../project/.git\n").unwrap();
+
+            Self {
+                root,
+                project,
+                checkout,
+                gitdir,
+            }
+        }
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     fn file_item(provider: &str, session_id: &str, last_activity_at: i64) -> DirItem {
         DirItem {
             session_id: session_id.to_string(),
@@ -1319,41 +1361,31 @@ mod join_tests {
 
     #[test]
     fn linked_worktree_payload_keeps_checkout_path_separate_from_project_path() {
-        let root = std::env::temp_dir().join(format!(
-            "freshell-session-directory-worktree-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let repo = root.join("repo");
-        let checkout = repo.join("worktrees/feature");
-        let gitdir = repo.join(".git/worktrees/feature");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::write(
-            checkout.join(".git"),
-            format!("gitdir: {}\\n", gitdir.display()),
-        )
-        .unwrap();
-        std::fs::write(gitdir.join("commondir"), "../..\\n").unwrap();
+        let fixture = LinkedWorktreeFixture::new();
+        assert_eq!(
+            std::fs::read_to_string(fixture.checkout.join(".git")).unwrap(),
+            format!("gitdir: {}\n", fixture.gitdir.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.gitdir.join("commondir")).unwrap(),
+            "../../../../project/.git\n"
+        );
+        let checkout_path = fixture.checkout.to_string_lossy().into_owned();
+        let project_path = fixture.project.to_string_lossy().into_owned();
+        assert_eq!(
+            freshell_platform::git_meta::resolve_git_repo_root(&checkout_path).as_deref(),
+            Some(project_path.as_str()),
+            "the commondir fixture must select the common repository, not the administrative fallback"
+        );
 
         let mut item = file_item("claude", "session-1", 1);
-        item.project_path = repo.to_string_lossy().into_owned();
-        item.cwd = Some(checkout.to_string_lossy().into_owned());
+        item.project_path = project_path.clone();
+        item.cwd = Some(checkout_path.clone());
         let payload = item.to_value();
 
-        assert_eq!(
-            payload["projectPath"],
-            serde_json::json!(repo.to_string_lossy())
-        );
-        assert_eq!(
-            payload["checkoutPath"],
-            serde_json::json!(checkout.to_string_lossy())
-        );
-        assert_eq!(
-            payload["cwd"],
-            serde_json::json!(checkout.to_string_lossy())
-        );
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(payload["projectPath"], serde_json::json!(project_path));
+        assert_eq!(payload["checkoutPath"], serde_json::json!(checkout_path));
+        assert_eq!(payload["cwd"], serde_json::json!(checkout_path));
     }
 
     // ── provider_display_name ──
