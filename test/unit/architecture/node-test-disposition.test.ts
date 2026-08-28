@@ -53,7 +53,10 @@ describe('node-test-disposition verifier', () => {
       'utf8',
     )) as NodeTestDispositionLedger
 
-    expect(await verifyNodeTestDisposition(committed, { expectedCandidateCount: 347 })).toEqual([])
+    expect(await verifyNodeTestDisposition(committed, {
+      root: repoRoot,
+      expectedCandidateCount: 347,
+    })).toEqual([])
   })
 
   it('rejects a Task 10 deletion omitted from the independently closed universe', async () => {
@@ -69,7 +72,10 @@ describe('node-test-disposition verifier', () => {
       rows: committed.rows.filter((candidateRow) => candidateRow.oldPath !== missingPath),
     }
 
-    const errors = await verifyNodeTestDisposition(incomplete, { expectedCandidateCount: 347 })
+    const errors = await verifyNodeTestDisposition(incomplete, {
+      root: repoRoot,
+      expectedCandidateCount: 347,
+    })
 
     expect(errors).toContain(
       `ledger: required Task 10 deleted test path missing from closed candidate universe: ${missingPath}`,
