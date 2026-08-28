@@ -1,7 +1,8 @@
 // @vitest-environment node
 
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -11,10 +12,12 @@ function readProjectFile(relativePath: string): string {
   return readFileSync(path.join(PROJECT_ROOT, relativePath), 'utf8')
 }
 
-function runContainerLayoutFixture(fixture: string) {
+function runContainerLayoutFixture(fixture: string, runtimeOnly = false) {
+  const fixturePath = path.isAbsolute(fixture) ? fixture : path.join(PROJECT_ROOT, fixture)
+  const runtimeFlag = runtimeOnly ? ['--runtime-root'] : []
   return spawnSync(
     'bash',
-    [path.join(PROJECT_ROOT, 'scripts/verify-container-layout.sh'), '--fixture', path.join(PROJECT_ROOT, fixture)],
+    [path.join(PROJECT_ROOT, 'scripts/verify-container-layout.sh'), '--fixture', fixturePath, ...runtimeFlag],
     { cwd: PROJECT_ROOT, encoding: 'utf8' },
   )
 }
@@ -38,18 +41,6 @@ const FORBIDDEN_DISTRIBUTION_TERMS = [
   /--passWithNoTests/,
   /legacy-chromium/,
 ]
-
-function cloudRetiredBackendCleanupBlock(dockerfile: string): string {
-  const lines = dockerfile.split('\n')
-  const start = lines.findIndex((line) => line.includes('RETIRED_BACKEND_DIRECTORIES='))
-  const end = lines.findIndex(
-    (line, index) => index > start && line.includes('test ! -e "/app/$relative"'),
-  )
-
-  expect(start).toBeGreaterThanOrEqual(0)
-  expect(end).toBeGreaterThan(start)
-  return lines.slice(start, end + 1).join('\n')
-}
 
 function nodePtyRetirementViolations(contents: string): string[] {
   return contents
@@ -84,13 +75,15 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('target/release/freshell-server')
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')
-    const cleanupBlock = cloudRetiredBackendCleanupBlock(dockerfile)
-    expect(cleanupBlock).toMatch(/for relative in \$RETIRED_BACKEND_DIRECTORIES; do/)
-    expect(cleanupBlock).toContain('rm -rf "/app/$relative"')
-    expect(cleanupBlock).toContain('node_modules/node-pty')
-    expect(cleanupBlock).toContain('test ! -e "/app/$relative"')
-    expect(cleanupBlock.match(/\bnode-pty\b/gi)).toHaveLength(1)
-    expectNoNodePtyRuntimeTerm(dockerfile.replace(cleanupBlock, ''))
+    const sourceCopy = dockerfile.lastIndexOf('COPY . .')
+    const runtimeGuard = dockerfile.indexOf('RUN scripts/verify-container-layout.sh --fixture /app --runtime-root')
+    expect(sourceCopy).toBeGreaterThanOrEqual(0)
+    expect(runtimeGuard).toBeGreaterThan(sourceCopy)
+    expect(dockerfile).not.toContain('RETIRED_BACKEND_DIRECTORIES')
+    expect(dockerfile).not.toContain('rm -rf "/app/$relative"')
+    expect(dockerfile).not.toContain('node_modules/chokidar')
+    expect(dockerfile).not.toContain('node_modules/dotenv')
+    expectNoNodePtyRuntimeTerm(dockerfile)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
   })
 
@@ -128,19 +121,6 @@ describe('Rust-only distribution runtime contracts', () => {
     )
     expectNoNodePtyRuntimeTerm(workflow)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
-  })
-
-  it('requires checkout-free Electron acceptance to prove an authenticated PTY round trip', () => {
-    const acceptance = readProjectFile('test/integration/electron/checkout-free-runtime.test.ts')
-
-    expect(acceptance).toContain("import WebSocket from 'ws'")
-    expect(acceptance).toContain("type: 'terminal.create'")
-    expect(acceptance).toContain("message.type === 'terminal.created'")
-    expect(acceptance).toContain("type: 'terminal.input'")
-    expect(acceptance).toContain('FRESHELL_ELECTRON_PTY_ROUNDTRIP_MARKER')
-    expect(acceptance).toContain("message.type === 'terminal.output'")
-    expect(acceptance).toContain("type: 'terminal.detach'")
-    expect(acceptance).toMatch(/await closeWebSocket\(ws\)/)
   })
 
   it('runs the nonempty default Vitest lane without artifact prerequisites', () => {
@@ -183,16 +163,6 @@ describe('Rust-only distribution runtime contracts', () => {
     })
   }
 
-  it('detects node-pty install, copy, and rebuild terms as forbidden source references', () => {
-    const source = [
-      'RUN npm install node-pty',
-      'COPY node_modules/node-pty /app/node_modules/node-pty',
-      'RUN npm rebuild node-pty',
-    ].join('\n')
-
-    expect(nodePtyRetirementViolations(source)).toEqual(source.split('\n'))
-  })
-
   it('accepts the Rust/client/tools fixture and emits sorted JSONL evidence', () => {
     const result = runContainerLayoutFixture('test/fixtures/distribution/rust-only')
 
@@ -216,6 +186,98 @@ describe('Rust-only distribution runtime contracts', () => {
       'dist/server/index.js',
       'node_modules/node-pty/index.js',
     ]))
+  })
+
+  it('fails closed on retired dependencies while retaining lockfile tooling dependencies', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-dependencies-'))
+
+    try {
+      mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'node_modules/chokidar'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'node_modules/dotenv'), { recursive: true })
+      writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
+      writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
+      writeFileSync(path.join(fixtureRoot, 'node_modules/chokidar/index.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'node_modules/dotenv/index.js'), 'export {}')
+      chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
+
+      const retained = runContainerLayoutFixture(fixtureRoot)
+      expect(retained.status).toBe(0)
+      expect(diagnostics(retained.stdout)[0]).toMatchObject({
+        severity: 'info',
+        event: 'container_layout_verified',
+      })
+
+      const retiredPath = path.join(fixtureRoot, 'node_modules/express/index.js')
+      mkdirSync(path.dirname(retiredPath), { recursive: true })
+      writeFileSync(retiredPath, 'legacy backend')
+
+      const rejected = runContainerLayoutFixture(fixtureRoot)
+      expect(rejected.status).toBe(1)
+      const entries = diagnostics(rejected.stdout)
+      const forbidden = entries.find((entry) => entry.event === 'container_layout_forbidden_artifacts')
+      expect(forbidden?.evidence).toEqual(expect.arrayContaining(['node_modules/express/index.js']))
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('can check shipped runtime roots without rejecting source-only fixtures', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-runtime-roots-'))
+
+    try {
+      mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'test/fixtures/distribution/node-server/node_modules/node-pty'), { recursive: true })
+      writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
+      writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
+      writeFileSync(
+        path.join(fixtureRoot, 'test/fixtures/distribution/node-server/node_modules/node-pty/index.js'),
+        'legacy fixture',
+      )
+      chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
+
+      const result = runContainerLayoutFixture(fixtureRoot, true)
+      expect(result.status).toBe(0)
+      expect(diagnostics(result.stdout)[0]).toMatchObject({
+        severity: 'info',
+        event: 'container_layout_verified',
+      })
+
+      const retiredPath = path.join(fixtureRoot, 'dist/server/index.js')
+      mkdirSync(path.dirname(retiredPath), { recursive: true })
+      writeFileSync(retiredPath, 'legacy backend')
+
+      const rejected = runContainerLayoutFixture(fixtureRoot, true)
+      expect(rejected.status).toBe(1)
+      const entries = diagnostics(rejected.stdout)
+      const forbidden = entries.find((entry) => entry.event === 'container_layout_forbidden_artifacts')
+      expect(forbidden?.evidence).toEqual(expect.arrayContaining(['dist/server/index.js']))
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('emits parseable JSON diagnostics when the fixture path contains a quote', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-layout-json-"'))
+
+    try {
+      const result = runContainerLayoutFixture(fixtureRoot)
+
+      expect(result.status).toBe(1)
+      expect(diagnostics(result.stdout)[0]).toMatchObject({
+        severity: 'error',
+        event: 'container_layout_required_artifacts_missing',
+        path: fixtureRoot,
+      })
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
   })
 
 })

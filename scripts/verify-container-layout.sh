@@ -4,16 +4,19 @@
 # This checker is intentionally independent of Docker. CI and local tests can
 # run it against a staged directory before building an image, and its JSONL
 # diagnostics make missing/forbidden paths straightforward to diagnose.
+# Pass --runtime-root when the fixture also contains source-only files that are
+# copied for test discovery; in that mode only shipped dist/, target/, and
+# node_modules/ roots are inspected for forbidden artifacts.
 set -euo pipefail
 
 usage() {
-  echo 'Usage: scripts/verify-container-layout.sh --fixture DIRECTORY' >&2
+  echo 'Usage: scripts/verify-container-layout.sh --fixture DIRECTORY [--runtime-root]' >&2
 }
 
 json_escape() {
   local value="$1"
   value=${value//\\/\\\\}
-  value=${value//"/\\"}
+  value=${value//\"/\\\"}
   value=${value//$'\n'/\\n}
   value=${value//$'\r'/\\r}
   value=${value//$'\t'/\\t}
@@ -48,6 +51,7 @@ emit() {
 }
 
 fixture=''
+runtime_root=false
 while (($# > 0)); do
   case "$1" in
     --fixture)
@@ -57,6 +61,10 @@ while (($# > 0)); do
       fi
       fixture="$2"
       shift 2
+      ;;
+    --runtime-root)
+      runtime_root=true
+      shift
       ;;
     --help|-h)
       usage
@@ -78,11 +86,24 @@ if [[ ! -d "$fixture" ]]; then
   exit 1
 fi
 
-mapfile -t evidence < <(
-  find "$fixture" -type f -o -type l |
-    sed "s#^${fixture%/}/##" |
-    LC_ALL=C sort -u
-)
+find_roots=("$fixture")
+if [[ "$runtime_root" == true ]]; then
+  find_roots=()
+  for relative_root in dist target node_modules; do
+    if [[ -e "$fixture/$relative_root" ]]; then
+      find_roots+=("$fixture/$relative_root")
+    fi
+  done
+fi
+
+evidence=()
+if ((${#find_roots[@]} > 0)); then
+  mapfile -t evidence < <(
+    find "${find_roots[@]}" \( -type f -o -type l \) |
+      sed "s#^${fixture%/}/##" |
+      LC_ALL=C sort -u
+  )
+fi
 
 required_paths=(
   'dist/client/index.html'
@@ -121,13 +142,43 @@ if [[ ! -x "$server_binary" ]]; then
   exit 1
 fi
 
+forbidden_prefixes=(
+  '/dist/server'
+  '/server-node-modules'
+  '/bundled-node'
+  '/native-modules'
+  '/node-pty'
+  '/node-gyp'
+  '/node_modules/@ai-sdk/google'
+  '/node_modules/@anthropic-ai/claude-agent-sdk'
+  '/node_modules/ai'
+  '/node_modules/cookie-parser'
+  '/node_modules/express'
+  '/node_modules/express-rate-limit'
+  '/node_modules/glob'
+  '/node_modules/node-pty'
+  '/node_modules/pino'
+  '/node_modules/rotating-file-stream'
+  '/node_modules/is-port-reachable'
+  '/node_modules/@types/cookie-parser'
+  '/node_modules/@types/express'
+  '/node_modules/@types/supertest'
+  '/node_modules/supertest'
+  '/node_modules/superwstest'
+  '/node_modules/pino-pretty'
+)
+
 forbidden_paths=()
 for relative in "${evidence[@]}"; do
-  case "/$relative" in
-    */dist/server|*/dist/server/*|*/server-node-modules|*/server-node-modules/*|*/bundled-node|*/bundled-node/*|*/native-modules|*/native-modules/*|*/node-pty|*/node-pty/*|*/node-gyp|*/node-gyp/*)
-      forbidden_paths+=("$relative")
-      ;;
-  esac
+  candidate="/$relative"
+  for prefix in "${forbidden_prefixes[@]}"; do
+    case "$candidate" in
+      "$prefix"|"$prefix"/*)
+        forbidden_paths+=("$relative")
+        break
+        ;;
+    esac
+  done
 done
 
 if ((${#forbidden_paths[@]} > 0)); then

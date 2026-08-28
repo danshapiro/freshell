@@ -48,38 +48,6 @@ COPY package.json package-lock.json ./
 # tooling and static artifacts around the Rust backend.
 RUN npm ci --ignore-scripts
 
-# Keep the image fail-closed if a stale build context or cached dependency layer
-# carries any retired Node backend package. The package lock no longer requests
-# these paths; this explicit cleanup protects release images built from older
-# layers without retaining a Node application server.
-RUN set -eu; \
-    RETIRED_BACKEND_DIRECTORIES="\
-node_modules/@ai-sdk/google \
-node_modules/@anthropic-ai/claude-agent-sdk \
-node_modules/ai \
-node_modules/chokidar \
-node_modules/cookie-parser \
-node_modules/dotenv \
-node_modules/express \
-node_modules/express-rate-limit \
-node_modules/glob \
-node_modules/node-pty \
-node_modules/pino \
-node_modules/rotating-file-stream \
-node_modules/is-port-reachable \
-node_modules/@types/cookie-parser \
-node_modules/@types/express \
-node_modules/@types/supertest \
-node_modules/supertest \
-node_modules/superwstest \
-node_modules/pino-pretty"; \
-    for relative in $RETIRED_BACKEND_DIRECTORIES; do \
-      rm -rf "/app/$relative"; \
-    done; \
-    for relative in $RETIRED_BACKEND_DIRECTORIES; do \
-      test ! -e "/app/$relative"; \
-    done
-
 COPY . .
 RUN npm run build:client && npm run build:tools
 
@@ -115,6 +83,12 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # dependency directories are excluded by .dockerignore, so these copies cannot
 # overwrite the staged artifacts.
 COPY . .
+
+# Check the assembled runtime tree after all staged artifacts are present. The
+# guard fails closed on any retired Node backend artifact instead of deleting a
+# path and then checking the absence it just created. Retained build/runtime
+# dependencies such as chokidar and dotenv remain available.
+RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 
