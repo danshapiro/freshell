@@ -276,17 +276,10 @@ async function packageScripts(root: string): Promise<PackageScripts | undefined>
   }
 }
 
-const REQUIRED_RUST_SCRIPT_BEHAVIORS: Readonly<Record<string, (command: string) => boolean>> = {
-  start: (command) => command.includes('scripts/start-rust-server.ts') && command.includes('target/release/freshell-server'),
-  dev: (command) => command.includes('cargo run -p freshell-server --locked'),
-  'dev:server': (command) => command.includes('cargo run -p freshell-server --locked'),
-  build: (command) => command.includes('build:client') && command.includes('build:tools') && command.includes('build:rust'),
-  'test:source-runtime': (command) => command.includes('scripts/testing/run-source-runtime-tests.ts'),
-}
-
 type ShellToken = {
   value: string
   separator: boolean
+  quoted: boolean
 }
 
 /**
@@ -299,11 +292,13 @@ function tokenizeShellCommand(command: string): ShellToken[] {
   const tokens: ShellToken[] = []
   let current = ''
   let quote: '"' | "'" | undefined
+  let currentWasQuoted = false
 
   const flush = (): void => {
     if (current.length > 0) {
-      tokens.push({ value: current, separator: false })
+      tokens.push({ value: current, separator: false, quoted: currentWasQuoted })
       current = ''
+      currentWasQuoted = false
     }
   }
 
@@ -329,6 +324,7 @@ function tokenizeShellCommand(command: string): ShellToken[] {
 
     if (character === '"' || character === "'") {
       quote = character
+      currentWasQuoted = true
       continue
     }
 
@@ -353,7 +349,7 @@ function tokenizeShellCommand(command: string): ShellToken[] {
       flush()
       const next = command[index + 1]
       if ((character === '&' || character === '|') && next === character) index += 1
-      tokens.push({ value: character, separator: true })
+      tokens.push({ value: character, separator: true, quoted: false })
       continue
     }
 
@@ -369,25 +365,92 @@ function isRetiredNodeBackendPath(value: string): boolean {
   return /(?:^|\/)(?:(?:dist|build)\/)?server\/index(?:\.[cm]?[jt]sx?)?$/i.test(normalized)
 }
 
-const RETIRED_NODE_BACKEND_COMMAND = (command: string): boolean => {
+const NODE_RUNTIME_COMMAND = /(?:^|\/)(?:node|tsx)(?:\.(?:cmd|exe))?$/i
+const CONCURRENTLY_COMMAND = /(?:^|\/)concurrently(?:\.(?:cmd|exe))?$/i
+const SHELL_COMMAND = /(?:^|\/)(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh)(?:\.(?:cmd|exe))?$/i
+
+function isShellCommandFlag(value: string): boolean {
+  return value === '-c'
+    || value === '--command'
+    || /^-[a-z]*c$/i.test(value)
+    || /^\/c$/i.test(value)
+}
+
+function containsRetiredNodeBackendCommand(command: string, depth = 0): boolean {
+  if (depth > 4) return false
+
   let nodeRuntimeCommand = false
+  let concurrentCommand = false
+  let shellCommand = false
+  let inspectNextQuotedCommand = false
 
   for (const token of tokenizeShellCommand(command)) {
     if (token.separator) {
       nodeRuntimeCommand = false
+      concurrentCommand = false
+      shellCommand = false
+      inspectNextQuotedCommand = false
       continue
     }
 
-    if (!nodeRuntimeCommand) {
-      const normalized = token.value.replace(/\\/g, '/')
-      nodeRuntimeCommand = /(?:^|\/)(?:node|tsx)(?:\.(?:cmd|exe))?$/i.test(normalized)
+    if (nodeRuntimeCommand) {
+      if (isRetiredNodeBackendPath(token.value)) return true
       continue
     }
 
-    if (isRetiredNodeBackendPath(token.value)) return true
+    const normalized = token.value.replace(/\\/g, '/')
+    if (NODE_RUNTIME_COMMAND.test(normalized)) {
+      nodeRuntimeCommand = true
+      continue
+    }
+
+    if (shellCommand) {
+      shellCommand = false
+      inspectNextQuotedCommand = isShellCommandFlag(token.value)
+      continue
+    }
+
+    if (SHELL_COMMAND.test(normalized)) {
+      shellCommand = true
+      continue
+    }
+
+    if (concurrentCommand && token.quoted) {
+      if (containsRetiredNodeBackendCommand(token.value, depth + 1)) return true
+      continue
+    }
+
+    if (inspectNextQuotedCommand) {
+      inspectNextQuotedCommand = false
+      if (token.quoted && containsRetiredNodeBackendCommand(token.value, depth + 1)) return true
+    }
+
+    if (CONCURRENTLY_COMMAND.test(normalized)) {
+      concurrentCommand = true
+    }
   }
 
   return false
+}
+
+const RETIRED_NODE_BACKEND_COMMAND = (command: string): boolean => (
+  containsRetiredNodeBackendCommand(command)
+)
+
+const REQUIRED_RUST_SCRIPT_BEHAVIORS: Readonly<Record<string, (command: string) => boolean>> = {
+  start: (command) => command.includes('scripts/start-rust-server.ts')
+    && command.includes('target/release/freshell-server')
+    && !RETIRED_NODE_BACKEND_COMMAND(command),
+  dev: (command) => command.includes('cargo run -p freshell-server --locked')
+    && !RETIRED_NODE_BACKEND_COMMAND(command),
+  'dev:server': (command) => command.includes('cargo run -p freshell-server --locked')
+    && !RETIRED_NODE_BACKEND_COMMAND(command),
+  build: (command) => command.includes('build:client')
+    && command.includes('build:tools')
+    && command.includes('build:rust')
+    && !RETIRED_NODE_BACKEND_COMMAND(command),
+  'test:source-runtime': (command) => command.includes('scripts/testing/run-source-runtime-tests.ts')
+    && !RETIRED_NODE_BACKEND_COMMAND(command),
 }
 
 function packageScriptBehaviorDrift(scripts: PackageScripts, expectedNames: readonly string[]): string[] {
