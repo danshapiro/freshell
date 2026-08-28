@@ -24,6 +24,11 @@ describe('Rust-first build and test selection', () => {
   it('defines Rust source build/start scripts and removes Node-server scripts', () => {
     const scripts = readJson<PackageJson>('package.json').scripts ?? {}
 
+    expect(scripts['prepare:rust-runtime']).toBe('tsx scripts/prepare-rust-runtime.ts')
+    expect(scripts.predev).toContain('npm run prepare:rust-runtime')
+    expect(scripts['predev:server']).toContain('npm run prepare:rust-runtime')
+    expect(scripts.prestart).toContain('npm run prepare:rust-runtime')
+    expect(scripts['electron:dev']).toContain('npm run prepare:rust-runtime')
     expect(scripts['dev:server']).toContain('cargo run -p freshell-server --locked')
     expect(scripts.dev).toContain('cargo run -p freshell-server --locked')
     expect(scripts['build:rust']).toContain('cargo build --release -p freshell-server --locked')
@@ -97,5 +102,8 @@ describe('Rust-first build and test selection', () => {
     expect(launch).toContain('launch-rust.sh')
     expect(launch).not.toContain('npm start')
     expect(readFileSync(path.join(PROJECT_ROOT, 'run-rust-server.sh'), 'utf8')).not.toContain('Legacy server:')
+
+    expect(readFileSync(path.join(PROJECT_ROOT, 'scripts/launch-rust.sh'), 'utf8'))
+      .toContain('npm run --silent prepare:rust-runtime')
   })
 })

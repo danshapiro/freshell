@@ -117,10 +117,12 @@ describe('runtime boundary analyzer', () => {
       },
     )
 
+    const backendPath = path.join(root, 'runtime-backend.mjs')
+    await chmod(backendPath, 0o644)
+    expect((await stat(backendPath)).mode & 0o111).toBe(0)
+
     const result = await analyzeRuntimeBoundary(root)
 
-    await chmod(path.join(root, 'runtime-backend.mjs'), 0o755)
-    expect(((await stat(path.join(root, 'runtime-backend.mjs'))).mode & 0o111)).not.toBe(0)
     expect(result.manifestDrift).toEqual([])
     expect(result.unexpectedNodeBackend).toEqual(['runtime-backend.mjs'])
   })

@@ -64,6 +64,24 @@ describe('coordinator command matrix', () => {
     })
   })
 
+  it('keeps bare and selector-based test:vitest invocations on the default config', () => {
+    expect(classifyCommand({ commandKey: 'test:vitest', forwardedArgs: [] })).toEqual({
+      kind: 'passthrough',
+      phases: [{ runner: 'vitest', config: 'default', args: ['--config', 'config/vitest/vitest.config.ts'] }],
+    })
+    expect(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: ['run', 'test/unit/tooling/testing/coordinator-command-matrix.test.ts'],
+    })).toEqual({
+      kind: 'passthrough',
+      phases: [{
+        runner: 'vitest',
+        config: 'default',
+        args: ['run', '--config', 'config/vitest/vitest.config.ts', 'test/unit/tooling/testing/coordinator-command-matrix.test.ts'],
+      }],
+    })
+  })
+
   it.each([
     'config/vitest/server.config.ts',
     'config/vitest/vitest.server.config.ts',
@@ -92,6 +110,17 @@ describe('coordinator command matrix', () => {
     })
     expect(JSON.stringify(disposition)).not.toContain('passWithNoTests')
   })
+
+  it.each(['test/server/ws-protocol.test.ts', './test/server/ws-protocol.test.ts', 'crates/freshell-server/src/main.rs'])
+    ('rejects Rust/path selectors in composite commands instead of passing them to Cargo as test names (%s)', (selector) => {
+      for (const commandKey of ['test', 'test:all', 'check', 'verify'] as const) {
+        const disposition = classifyCommand({ commandKey, forwardedArgs: ['--run', selector] })
+        expect(disposition.kind).toBe('rejected')
+        if (disposition.kind === 'rejected') {
+          expect(disposition.reason).toContain('Rust/path selectors')
+        }
+      }
+    })
 
   it('keeps the package command inventory free of deleted server scripts', async () => {
     const packageJson = JSON.parse(await readFile(path.join(PROJECT_ROOT, 'package.json'), 'utf8')) as {

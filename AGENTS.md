@@ -32,7 +32,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
-- `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` runs the Rust `freshell-server` crate. `test:server` stays watch-capable unless you pass an explicit broad `--run`.
+- `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. `test:server` stays watch-capable unless you pass an explicit broad `--run`.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
@@ -129,12 +129,14 @@ npm run build:rust          # Release freshell-server binary
 npm run serve               # Build and run the Rust server
 # `npm run serve` prompts before serving from a non-main branch; use
 # `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
-# Note: `npm run build`, `npm run verify`, `npm run check`, `npm run electron:dev`,
-# and the source-runtime phase are guarded — on the main checkout they fail closed
+# Note: `npm test` (through its source-runtime phase), `npm run build`,
+# `npm run verify`, `npm run check`, and `npm run electron:dev` are guarded —
+# on the main checkout they fail closed
 # before writing artifacts if a production server is detected on the configured
 # PORT. Use `npm run typecheck:client` for a no-write check, or run
 # source-runtime/build verification from a linked worktree
-# (`cd .worktrees/<branch>`).
+# (`cd .worktrees/<branch>`). `npm run dev` and `npm run dev:server` bootstrap
+# a first-run `.env` token and the locked Claude sidecar before starting Rust.
 ```
 
 **On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).

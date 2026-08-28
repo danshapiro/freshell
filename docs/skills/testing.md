@@ -14,7 +14,7 @@
 | `npm run test:unit` | Exact default-config `test/unit` workload |
 | `npm run test:client` | Exact default-config `test/unit/client` workload |
 | `npm run test:integration` | Exact Rust workspace integration-test workload |
-| `npm run test:server` | Rust `freshell-server` crate tests; only coordinates explicit broad `--run` |
+| `npm run test:server` | Cargo-backed Rust `freshell-server` tests; only coordinates explicit broad `--run` |
 | `npm run test:coverage` | Exact default-config `vitest run --coverage` workload |
 | `npm run test:status` | Show the current holder, latest results, and any matching advisory baseline |
 | `npm run test:vitest -- ...` | Repo-owned direct Vitest path for focused passthrough work |
@@ -24,7 +24,7 @@
 - Broad repo-supported runs wait instead of failing fast when another coordinated run is active.
 - `test:unit` is the exact default-config `test/unit` workload.
 - `test:integration` runs the Rust workspace integration tests.
-- `test:server` runs the Rust `freshell-server` crate and stays watch-capable by default; only explicit broad `--run` is coordinated.
+- `test:server` runs the Cargo-backed Rust `freshell-server` crate and stays watch-capable by default; only explicit broad `--run` is coordinated.
 - prior successful baselines are advisory only. They never short-circuit an explicitly requested run.
 - use `npm run test:vitest -- ...` if you need a repo-owned direct Vitest escape hatch. Raw `npx vitest` is not a supported coordinated path.
 
@@ -37,10 +37,13 @@
 5. If another holder is active, wait rather than killing a foreign process.
 
 When production is live from the main checkout, the prebuild guard fails closed
-before any artifact writes for `npm run check`, `npm run test:source-runtime`,
-`npm run build`, and `npm run verify`. Use `npm run typecheck:client` for a
-no-write check, or run source-runtime/build verification from a linked
-worktree such as `.worktrees/<branch>`.
+before any artifact writes for `npm test` (through its source-runtime phase),
+`npm run check`, `npm run test:source-runtime`, `npm run build`, and
+`npm run verify`. Use `npm run typecheck:client` for a no-write check, or run
+source-runtime/build verification from a linked worktree such as
+`.worktrees/<branch>`. `npm run dev` and `npm run dev:server` create a secure
+first-run `.env` token and install the locked Claude sidecar before starting
+the Rust server.
 
 ## Focused Examples
 
