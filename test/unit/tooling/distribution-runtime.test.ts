@@ -180,7 +180,11 @@ describe('Rust-only distribution runtime contracts', () => {
       mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
       mkdirSync(path.join(fixtureRoot, 'node_modules/chokidar'), { recursive: true })
       mkdirSync(path.join(fixtureRoot, 'node_modules/dotenv'), { recursive: true })
-      for (const dependency of ['express', 'glob', 'ai', 'pino']) {
+      // node-gyp is a lockfile-installed Electron build dependency, not a
+      // shipped Freshell backend artifact; keep this retained-package control
+      // so adding a node-gyp ban to the runtime guard fails loudly.
+      const retainedDependencies = ['express', 'glob', 'ai', 'pino', 'node-gyp']
+      for (const dependency of retainedDependencies) {
         mkdirSync(path.join(fixtureRoot, 'node_modules', dependency), { recursive: true })
       }
       writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
@@ -188,7 +192,7 @@ describe('Rust-only distribution runtime contracts', () => {
       writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
       writeFileSync(path.join(fixtureRoot, 'node_modules/chokidar/index.js'), 'export {}')
       writeFileSync(path.join(fixtureRoot, 'node_modules/dotenv/index.js'), 'export {}')
-      for (const dependency of ['express', 'glob', 'ai', 'pino']) {
+      for (const dependency of retainedDependencies) {
         writeFileSync(path.join(fixtureRoot, 'node_modules', dependency, 'index.js'), 'retained package')
       }
       chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
