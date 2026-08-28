@@ -376,7 +376,15 @@ async function main() {
   if (aliasNotice) writeError(aliasNotice)
 
   const command = resolveCanonicalAction(parsed.command) ?? parsed.command
-  const unsupported = unsupportedInvocationResult(parsed.command, parsed.flags)
+  // `-p` is the CLI's short spelling for wait-for's `--pattern`; keep that
+  // parser convenience local instead of widening the shared MCP capability
+  // contract with a CLI-only parameter.
+  const capabilityFlags = parsed.command === 'wait-for'
+    && parsed.flags.pattern === undefined
+    && parsed.flags.p !== undefined
+    ? { ...parsed.flags, pattern: parsed.flags.p }
+    : parsed.flags
+  const unsupported = unsupportedInvocationResult(parsed.command, capabilityFlags)
   if (unsupported) {
     writeError(unsupported.error)
     writeError(unsupported.hint)

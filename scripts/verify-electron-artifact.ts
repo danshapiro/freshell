@@ -235,8 +235,12 @@ export function resolveDefaultArtifactPath(
     const macDirectory = arch === 'arm64' ? 'mac-arm64' : 'mac'
     return path.join(process.cwd(), 'release', macDirectory, 'Freshell.app', 'Contents', 'Resources')
   }
-  if (platform === 'win32') return path.join(process.cwd(), 'release', 'win-unpacked', 'resources')
-  return path.join(process.cwd(), 'release', 'linux-unpacked', 'resources')
+  if (platform === 'win32') {
+    const winDirectory = arch === 'arm64' ? 'win-arm64-unpacked' : 'win-unpacked'
+    return path.join(process.cwd(), 'release', winDirectory, 'resources')
+  }
+  const linuxDirectory = arch === 'arm64' ? 'linux-arm64-unpacked' : 'linux-unpacked'
+  return path.join(process.cwd(), 'release', linuxDirectory, 'resources')
 }
 
 function parsePlatform(value: string | undefined): ElectronRuntimePlatform {

@@ -171,10 +171,10 @@ impl McpRuntime for RealMcpRuntime {
                 McpServerArg::Literal("--import".to_string()),
                 McpServerArg::Path(tsx.to_string_lossy().into_owned()),
                 McpServerArg::Path(
-                repo_root
-                    .join("tools/freshell-mcp/server.ts")
-                    .to_string_lossy()
-                    .into_owned(),
+                    repo_root
+                        .join("tools/freshell-mcp/server.ts")
+                        .to_string_lossy()
+                        .into_owned(),
                 ),
             ],
         })
@@ -211,6 +211,26 @@ fn convert_to_windows_path_live(linux_path: &str) -> String {
     convert_to_windows_path_with_command("wslpath", linux_path)
 }
 
+/// Join a stdout reader only while the caller's process deadline remains.
+///
+/// A helper process can outlive the command we spawned while inheriting its
+/// stdout handle. In that case `read_to_end` cannot finish until the helper
+/// exits, so an unconditional `JoinHandle::join` would defeat the conversion
+/// timeout. Dropping the handle detaches that reader; it will finish when the
+/// inherited pipe closes while the caller returns its bounded fallback.
+fn join_reader_until<T>(
+    reader: std::thread::JoinHandle<T>,
+    deadline: std::time::Instant,
+) -> Option<T> {
+    while !reader.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    reader.join().ok()
+}
+
 fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> String {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -244,19 +264,19 @@ fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> Stri
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                let _ = join_reader_until(reader, deadline);
                 return linux_path.to_string();
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                let _ = join_reader_until(reader, deadline);
                 return linux_path.to_string();
             }
         }
     };
-    let Ok(Ok(output)) = reader.join() else {
+    let Some(Ok(output)) = join_reader_until(reader, deadline) else {
         return linux_path.to_string();
     };
 
@@ -313,7 +333,10 @@ pub fn codex_inline_toml_command_args(server_command: &str, server_args: &[Strin
         .join(", ");
     vec![
         "-c".to_string(),
-        format!("mcp_servers.freshell.command={}", toml_escape(server_command)),
+        format!(
+            "mcp_servers.freshell.command={}",
+            toml_escape(server_command)
+        ),
         "-c".to_string(),
         format!("mcp_servers.freshell.args=[{toml_args}]"),
     ]
@@ -625,9 +648,7 @@ pub fn generate_mcp_injection(
         "codex" => {
             let (server_command, server_args) = build_mcp_server_command(rt, target)?;
             Ok(McpInjection {
-                args: {
-                    codex_inline_toml_command_args(&server_command, &server_args)
-                },
+                args: { codex_inline_toml_command_args(&server_command, &server_args) },
                 env: BTreeMap::new(),
             })
         }

@@ -77,6 +77,7 @@ describe('Rust capability rejection wall', () => {
     ['split-pane', { model: 'model' }],
     ['split-pane', { effort: 'high' }],
     ['wait-for', {}],
+    ['wait-for', { p: 'ready' }],
     ['wait-for', { pattern: 'ready', stable: 1 }],
     ['wait-for', { pattern: 'ready', exit: true }],
     ['wait-for', { pattern: 'ready', prompt: true }],
