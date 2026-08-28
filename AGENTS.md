@@ -32,7 +32,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
-- `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. `test:server` stays watch-capable unless you pass an explicit broad `--run`.
+- `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. Zero-argument and explicit broad `--run` server/integration invocations are coordinated; narrowed Cargo selectors are delegated.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).

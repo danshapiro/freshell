@@ -24,7 +24,7 @@
 - Broad repo-supported runs wait instead of failing fast when another coordinated run is active.
 - `test:unit` is the exact default-config `test/unit` workload.
 - `test:integration` runs the Rust workspace integration tests.
-- `test:server` runs the Cargo-backed Rust `freshell-server` crate and stays watch-capable by default; only explicit broad `--run` is coordinated.
+- `test:server` runs the Cargo-backed Rust `freshell-server` crate. Zero-argument and explicit broad `--run` invocations are coordinated; narrowed Cargo selectors are delegated.
 - prior successful baselines are advisory only. They never short-circuit an explicitly requested run.
 - use `npm run test:vitest -- ...` if you need a repo-owned direct Vitest escape hatch. Raw `npx vitest` is not a supported coordinated path.
 
