@@ -168,26 +168,12 @@ fi
 
 MAX_FORBIDDEN_EVIDENCE=20
 
-RETIRED_BACKEND_PACKAGES=(
-  '@ai-sdk/google'
-  '@anthropic-ai/claude-agent-sdk'
-  'ai'
-  'cookie-parser'
-  'express'
-  'express-rate-limit'
-  'pino'
-  'rotating-file-stream'
-  'is-port-reachable'
-  '@types/cookie-parser'
-  '@types/express'
-  '@types/supertest'
-  'supertest'
-  'superwstest'
-  'pino-pretty'
-)
 # node-gyp and glob are intentionally absent: the lockfile-installed Electron
 # and transitive tooling may retain them. Only direct top-level copies of the
-# retired backend package names above are forbidden; nested copies remain valid.
+# retired backend package names in the case table are forbidden; nested copies
+# remain valid.
+# The case table below is a depth-aware constant-time lookup, so a large
+# node_modules tree does not compare each path with every package name.
 
 is_forbidden_direct_backend_package() {
   local relative="$1"
@@ -200,13 +186,26 @@ is_forbidden_direct_backend_package() {
   esac
 
   local package_path="${relative#node_modules/}"
-  local package
-  for package in "${RETIRED_BACKEND_PACKAGES[@]}"; do
-    if [[ "$package_path" == "$package" || "$package_path" == "$package/"* ]]; then
+  local package_name
+  if [[ "$package_path" == @*/* ]]; then
+    local package_scope="${package_path%%/*}"
+    local scoped_path="${package_path#*/}"
+    package_name="$package_scope/${scoped_path%%/*}"
+  else
+    package_name="${package_path%%/*}"
+  fi
+
+  case "$package_name" in
+    '@ai-sdk/google'|'@anthropic-ai/claude-agent-sdk'|'ai'|'cookie-parser'|\
+    'express'|'express-rate-limit'|'pino'|'rotating-file-stream'|\
+    'is-port-reachable'|'@types/cookie-parser'|'@types/express'|\
+    '@types/supertest'|'supertest'|'superwstest'|'pino-pretty')
       return 0
-    fi
-  done
-  return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 is_forbidden_runtime_path() {

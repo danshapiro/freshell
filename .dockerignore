@@ -88,6 +88,38 @@ installers/*
 installers/systemd/*
 !installers/systemd/freshell-rust.service
 
+# Distribution guard fixtures are checked in and needed by the default
+# Cloud Run lane. Re-include only the six controls; sibling dist/node_modules
+# files remain excluded.
+!test/fixtures/distribution/rust-only/dist/
+test/fixtures/distribution/rust-only/dist/*
+!test/fixtures/distribution/rust-only/dist/client/
+test/fixtures/distribution/rust-only/dist/client/*
+!test/fixtures/distribution/rust-only/dist/client/index.html
+!test/fixtures/distribution/rust-only/dist/tools/
+test/fixtures/distribution/rust-only/dist/tools/*
+!test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/
+test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/*
+!test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/server.js
+!test/fixtures/distribution/node-server/dist/
+test/fixtures/distribution/node-server/dist/*
+!test/fixtures/distribution/node-server/dist/client/
+test/fixtures/distribution/node-server/dist/client/*
+!test/fixtures/distribution/node-server/dist/client/index.html
+!test/fixtures/distribution/node-server/dist/server/
+test/fixtures/distribution/node-server/dist/server/*
+!test/fixtures/distribution/node-server/dist/server/index.js
+!test/fixtures/distribution/node-server/dist/tools/
+test/fixtures/distribution/node-server/dist/tools/*
+!test/fixtures/distribution/node-server/dist/tools/freshell-mcp/
+test/fixtures/distribution/node-server/dist/tools/freshell-mcp/*
+!test/fixtures/distribution/node-server/dist/tools/freshell-mcp/server.js
+!test/fixtures/distribution/node-server/node_modules/
+test/fixtures/distribution/node-server/node_modules/*
+!test/fixtures/distribution/node-server/node_modules/node-pty/
+test/fixtures/distribution/node-server/node_modules/node-pty/*
+!test/fixtures/distribution/node-server/node_modules/node-pty/index.js
+
 assets/
 
 # Editor / IDE
