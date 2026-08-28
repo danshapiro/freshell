@@ -370,8 +370,10 @@ const CONCURRENTLY_COMMAND = /(?:^|\/)concurrently(?:\.(?:cmd|exe))?$/i
 const SHELL_COMMAND = /(?:^|\/)(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh)(?:\.(?:cmd|exe))?$/i
 
 function isShellCommandFlag(value: string): boolean {
-  return value === '-c'
-    || value === '--command'
+  const normalized = value.toLowerCase()
+  return normalized === '-c'
+    || normalized === '-command'
+    || normalized === '--command'
     || /^-[a-z]*c$/i.test(value)
     || /^\/c$/i.test(value)
 }
@@ -405,8 +407,15 @@ function containsRetiredNodeBackendCommand(command: string, depth = 0): boolean 
     }
 
     if (shellCommand) {
-      shellCommand = false
-      inspectNextQuotedCommand = isShellCommandFlag(token.value)
+      // Wrapper options can precede the command selector (`cmd /d /s /c`,
+      // `bash --norc -c`, or PowerShell's `-NoProfile -Command`). Keep
+      // looking until the selector rather than treating the first option as
+      // the command itself. A non-selector argument is ignored; without a
+      // selector there is no nested shell command to inspect.
+      if (isShellCommandFlag(token.value)) {
+        shellCommand = false
+        inspectNextQuotedCommand = true
+      }
       continue
     }
 

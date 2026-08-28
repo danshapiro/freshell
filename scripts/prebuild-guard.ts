@@ -122,7 +122,7 @@ export async function checkProdRunning(
   return { status: 'not-running' }
 }
 
-export function formatProductionConflictMessage(port: number, version?: string): string {
+function formatProductionConflictMessage(port: number, version?: string): string {
   const versionSuffix = version ? ` (v${version})` : ''
   return [
     `\n\x1b[31m✖ Freshell production server${versionSuffix} is running on port ${port}.\x1b[0m`,
