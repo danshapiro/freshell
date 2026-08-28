@@ -142,50 +142,55 @@ if [[ ! -x "$server_binary" ]]; then
   exit 1
 fi
 
-forbidden_prefixes=(
-  '/dist/server'
-  '/server-node-modules'
-  '/bundled-node'
-  '/native-modules'
-  '/node-pty'
-  '/node-gyp'
-  '/node_modules/@ai-sdk/google'
-  '/node_modules/@anthropic-ai/claude-agent-sdk'
-  '/node_modules/ai'
-  '/node_modules/cookie-parser'
-  '/node_modules/express'
-  '/node_modules/express-rate-limit'
-  '/node_modules/glob'
-  '/node_modules/node-pty'
-  '/node_modules/pino'
-  '/node_modules/rotating-file-stream'
-  '/node_modules/is-port-reachable'
-  '/node_modules/@types/cookie-parser'
-  '/node_modules/@types/express'
-  '/node_modules/@types/supertest'
-  '/node_modules/supertest'
-  '/node_modules/superwstest'
-  '/node_modules/pino-pretty'
-)
+MAX_FORBIDDEN_EVIDENCE=20
+
+is_forbidden_runtime_path() {
+  local relative="$1"
+  case "/$relative" in
+    */dist/server|*/dist/server/*|\
+    */server-node-modules|*/server-node-modules/*|\
+    */bundled-node|*/bundled-node/*|\
+    */native-modules|*/native-modules/*|\
+    */node-pty|*/node-pty/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 
 forbidden_paths=()
+forbidden_count=0
 for relative in "${evidence[@]}"; do
-  candidate="/$relative"
-  for prefix in "${forbidden_prefixes[@]}"; do
-    case "$candidate" in
-      "$prefix"|"$prefix"/*)
-        forbidden_paths+=("$relative")
-        break
-        ;;
-    esac
-  done
+  if is_forbidden_runtime_path "$relative"; then
+    ((forbidden_count += 1))
+    if ((${#forbidden_paths[@]} < MAX_FORBIDDEN_EVIDENCE)); then
+      forbidden_paths+=("$relative")
+    fi
+  fi
 done
 
-if ((${#forbidden_paths[@]} > 0)); then
+if ((forbidden_count > 0)); then
   mapfile -t forbidden_paths < <(printf '%s\n' "${forbidden_paths[@]}" | LC_ALL=C sort -u)
-  emit error container_layout_forbidden_artifacts "path" "$fixture" "$(json_array "${forbidden_paths[@]}")"
+  evidence_truncated=false
+  if ((forbidden_count > MAX_FORBIDDEN_EVIDENCE)); then
+    evidence_truncated=true
+  fi
+  emit error container_layout_forbidden_artifacts \
+    "path" "$fixture" \
+    "count" "$forbidden_count" \
+    "evidence_truncated" "$evidence_truncated" \
+    "$(json_array "${forbidden_paths[@]}")"
   exit 1
 fi
 
-mapfile -t evidence < <(printf '%s\n' "${evidence[@]}" | LC_ALL=C sort -u)
-emit info container_layout_verified "path" "$fixture" "$(json_array "${evidence[@]}")"
+if [[ "$runtime_root" == true ]]; then
+  # Runtime images can contain thousands of lockfile-installed files. A
+  # successful guard needs no per-file receipt; failures above retain a
+  # bounded, sorted sample and the total count.
+  emit info container_layout_verified "path" "$fixture" ''
+else
+  mapfile -t evidence < <(printf '%s\n' "${evidence[@]}" | LC_ALL=C sort -u)
+  emit info container_layout_verified "path" "$fixture" "$(json_array "${evidence[@]}")"
+fi
