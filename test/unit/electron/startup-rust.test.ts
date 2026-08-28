@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'path'
 import {
   resolveDesktopRuntimeResources,
   runStartup,
   type StartupContext,
 } from '../../../electron/startup.js'
+import {
+  resolveElectronDevPrerequisitePaths,
+  runElectronDevPrerequisites,
+} from '../../../scripts/electron-dev-prerequisites.js'
 
 function context(overrides: Partial<StartupContext> = {}): StartupContext {
   return {
@@ -65,36 +69,49 @@ function context(overrides: Partial<StartupContext> = {}): StartupContext {
 }
 
 describe('Electron Rust app-bound startup', () => {
-  it('runs the dev prerequisite pipeline and leaves every Rust-side resource available', () => {
-    const projectRoot = process.cwd()
-    const configDir = path.join(projectRoot, '.freshell')
-    const mcpEntry = path.join(projectRoot, 'dist', 'tools', 'freshell-mcp', 'server.js')
-    const hadMcpEntry = existsSync(mcpEntry)
-    const previousMcpEntry = hadMcpEntry ? readFileSync(mcpEntry) : undefined
+  it('runs isolated dev prerequisites and verifies every Rust startup resource', () => {
+    const projectRoot = mkdtempSync(path.join(tmpdir(), 'freshell-electron-dev-'))
+    const resources = resolveElectronDevPrerequisitePaths(projectRoot, 'linux')
+    const runCommand = vi.fn((command: string, args: string[], cwd: string) => {
+      expect(command).toBe('npm')
+      expect(cwd).toBe(projectRoot)
+
+      const phase = args.join(' ')
+      if (phase === 'run build:client') {
+        mkdirSync(path.dirname(resources.clientIndex), { recursive: true })
+        writeFileSync(resources.clientIndex, '<!doctype html>')
+      } else if (phase === 'run build:tools') {
+        mkdirSync(path.dirname(resources.mcpEntry), { recursive: true })
+        writeFileSync(resources.mcpEntry, 'export {}')
+      } else if (phase === 'run build:rust:debug') {
+        mkdirSync(path.dirname(resources.serverBinary), { recursive: true })
+        writeFileSync(resources.serverBinary, 'rust debug binary')
+      }
+    })
 
     try {
-      // Remove this ignored output so a missing build:tools phase cannot be
-      // hidden by a prior local build. `--help` is consumed by concurrently
-      // after the prerequisite commands, so no long-lived dev process starts.
-      rmSync(mcpEntry, { force: true })
-      const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-      const result = spawnSync(npm, ['run', 'electron:dev', '--', '--help'], {
-        cwd: projectRoot,
-        encoding: 'utf8',
-        timeout: 120_000,
+      const resolved = runElectronDevPrerequisites({
+        projectRoot,
+        platform: 'linux',
+        npm: 'npm',
+        runCommand,
       })
-      if (result.error) throw result.error
-      expect(result.status, result.stderr || result.stdout).toBe(0)
 
-      const resources = resolveDesktopRuntimeResources(undefined, process.platform, true, configDir)
+      expect(resolved).toEqual(resources)
+      expect(runCommand).toHaveBeenCalledTimes(4)
+      expect(runCommand.mock.calls.map(([, args]) => args)).toEqual([
+        ['run', 'prebuild'],
+        ['run', 'build:client'],
+        ['run', 'build:tools'],
+        ['run', 'build:rust:debug'],
+      ])
       expect(existsSync(resources.serverBinary)).toBe(true)
-      expect(existsSync(path.join(resources.clientDir, 'index.html'))).toBe(true)
+      expect(existsSync(resources.clientIndex)).toBe(true)
       expect(existsSync(resources.mcpEntry)).toBe(true)
     } finally {
-      if (previousMcpEntry) writeFileSync(mcpEntry, previousMcpEntry)
-      else rmSync(mcpEntry, { force: true })
+      rmSync(projectRoot, { recursive: true, force: true })
     }
-  }, 120_000)
+  })
 
   it('resolves packaged Rust resources without Node backend fields', () => {
     const resources = resolveDesktopRuntimeResources(
