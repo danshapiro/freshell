@@ -26,10 +26,12 @@ json_escape() {
 json_array() {
   local separator=''
   local value
+  printf '['
   for value in "$@"; do
     printf '%s"%s"' "$separator" "$(json_escape "$value")"
     separator=','
   done
+  printf ']'
 }
 
 emit() {
@@ -41,11 +43,24 @@ emit() {
     local key="$1"
     local value="$2"
     shift 2
-    printf ',"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+    case "$key" in
+      count|scanned_files)
+        printf ',"%s":%s' "$(json_escape "$key")" "$value"
+        ;;
+      evidence_truncated)
+        printf ',"%s":%s' "$(json_escape "$key")" "$value"
+        ;;
+      missing)
+        printf ',"%s":%s' "$(json_escape "$key")" "$value"
+        ;;
+      *)
+        printf ',"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+        ;;
+    esac
   done
   if (($# == 1)); then
-    # The final argument is the sorted evidence array encoded by the caller.
-    printf ',"evidence":[%s]' "$1"
+    # The final argument is the evidence array encoded by the caller.
+    printf ',"evidence":%s' "$1"
   fi
   printf '}\n'
 }
@@ -133,7 +148,10 @@ fi
 
 if ((${#missing_paths[@]} > 0)); then
   mapfile -t missing_paths < <(printf '%s\n' "${missing_paths[@]}" | LC_ALL=C sort -u)
-  emit error container_layout_required_artifacts_missing "path" "$fixture" "$(json_array "${missing_paths[@]}")"
+  emit error container_layout_required_artifacts_missing \
+    "path" "$fixture" \
+    "missing" "$(json_array "${missing_paths[@]}")" \
+    '[]'
   exit 1
 fi
 
@@ -143,6 +161,47 @@ if [[ ! -x "$server_binary" ]]; then
 fi
 
 MAX_FORBIDDEN_EVIDENCE=20
+
+RETIRED_BACKEND_PACKAGES=(
+  '@ai-sdk/google'
+  '@anthropic-ai/claude-agent-sdk'
+  'ai'
+  'cookie-parser'
+  'express'
+  'express-rate-limit'
+  'pino'
+  'rotating-file-stream'
+  'is-port-reachable'
+  '@types/cookie-parser'
+  '@types/express'
+  '@types/supertest'
+  'supertest'
+  'superwstest'
+  'pino-pretty'
+)
+# node-gyp and glob are intentionally absent: the lockfile-installed Electron
+# and transitive tooling may retain them. Only direct top-level copies of the
+# retired backend package names above are forbidden; nested copies remain valid.
+
+is_forbidden_direct_backend_package() {
+  local relative="$1"
+  case "$relative" in
+    node_modules/*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  local package_path="${relative#node_modules/}"
+  local package
+  for package in "${RETIRED_BACKEND_PACKAGES[@]}"; do
+    if [[ "$package_path" == "$package" || "$package_path" == "$package/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 is_forbidden_runtime_path() {
   local relative="$1"
@@ -154,10 +213,9 @@ is_forbidden_runtime_path() {
     */node-pty|*/node-pty/*)
       return 0
       ;;
-    *)
-      return 1
-      ;;
   esac
+
+  is_forbidden_direct_backend_package "$relative"
 }
 
 forbidden_paths=()
@@ -187,9 +245,13 @@ fi
 
 if [[ "$runtime_root" == true ]]; then
   # Runtime images can contain thousands of lockfile-installed files. A
-  # successful guard needs no per-file receipt; failures above retain a
-  # bounded, sorted sample and the total count.
-  emit info container_layout_verified "path" "$fixture" ''
+  # successful guard emits only the bounded scalar count; failures above retain
+  # a bounded, sorted sample and the total count.
+  scanned_files=${#evidence[@]}
+  emit info container_layout_verified \
+    "path" "$fixture" \
+    "scanned_files" "$scanned_files" \
+    '[]'
 else
   mapfile -t evidence < <(printf '%s\n' "${evidence[@]}" | LC_ALL=C sort -u)
   emit info container_layout_verified "path" "$fixture" "$(json_array "${evidence[@]}")"
