@@ -240,6 +240,12 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(vitestConfig).toContain("'test/integration/electron/**'")
   })
 
+  it('gives the default Vitest lane enough time to finish in the client workflow', () => {
+    const workflow = readProjectFile('.github/workflows/typecheck-client.yml')
+
+    expect(workflow).toMatch(/typecheck-client:\s*\n\s+runs-on:[\s\S]*?timeout-minutes:\s*30\b/)
+  })
+
   for (const workflowPath of ['.github/workflows/electron-build.yml', '.github/workflows/electron-release.yml']) {
     it(`${workflowPath} builds and verifies native artifacts on every required OS`, () => {
       const workflow = readProjectFile(workflowPath)

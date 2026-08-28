@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { ensureAuthTokenFile } from './bootstrap-env.js'
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {
   SIGHUP: 129,
@@ -53,6 +54,13 @@ export function run(argv: string[] = process.argv.slice(2)): Promise<number> {
   if (!requestedBinary) {
     logError('rust_server_wrapper_usage', 'Usage: start-rust-server.ts <freshell-server> [args...]')
     return Promise.resolve(2)
+  }
+
+  try {
+    ensureAuthTokenFile({ envPath: path.join(process.cwd(), '.env') })
+  } catch (error) {
+    logError('rust_server_wrapper_bootstrap_failed', error)
+    return Promise.resolve(1)
   }
 
   let binary: string

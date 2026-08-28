@@ -10,7 +10,6 @@ import { createApiClient, resolveConfig, type ApiClient } from './http-client.js
 import { translateKeys } from '../node-client-runtime/keys.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 import {
-  ACTION_CAPABILITIES,
   ACTION_ALIASES,
   resolveCanonicalAction,
   supportedActionCapabilities,
@@ -32,7 +31,7 @@ function client(): ApiClient {
 // ---------------------------------------------------------------------------
 
 const supportedCapabilities = supportedActionCapabilities()
-const registeredActionNames = ACTION_CAPABILITIES.flatMap((capability) => [capability.action, ...(capability.aliases ?? [])])
+const registeredActionNames = supportedCapabilities.flatMap((capability) => [capability.action, ...(capability.aliases ?? [])])
 const actionDescription = supportedCapabilities.map((capability) => capability.action).join(', ')
 
 export const TOOL_DESCRIPTION = `Freshell terminal multiplexer -- orchestrate tabs, panes, and terminals.
@@ -99,7 +98,7 @@ Use action "help" for the full command reference with params, examples, and play
 
 export const INPUT_SCHEMA = {
   action: z.enum(registeredActionNames as [string, ...string[]]).describe(
-    `Supported command: ${actionDescription}. Removed actions are accepted so they can return a deterministic unavailable result.`,
+    `Supported command: ${actionDescription}.`,
   ),
   params: z.record(z.string(), z.unknown()).optional().describe(
     'Named parameters for the action. Common: target, name, mode, direction, keys, url, scope',

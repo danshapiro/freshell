@@ -5,7 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import BrowserPane from '@/components/panes/BrowserPane'
+import BrowserPane, { resolveBrowserSource } from '@/components/panes/BrowserPane'
 
 // Mock clipboard
 vi.mock('@/lib/clipboard', () => ({
@@ -467,5 +467,14 @@ describe('BrowserPane', () => {
     rerender(<Provider store={createMockStore()}><BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://localhost:4040" devToolsOpen={false} /></Provider>)
     expect(await screen.findByRole('status')).toHaveTextContent('Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.')
     expect(api.post).not.toHaveBeenCalledWith('/api/proxy/forward', expect.anything())
+  })
+
+  it('keeps remote HTTPS loopback unavailable when resolving a recovery source', () => {
+    setWindowHostname('remote.example')
+
+    expect(resolveBrowserSource('https://localhost:4040/path')).toEqual({
+      src: null,
+      baselineUnavailable: true,
+    })
   })
 })

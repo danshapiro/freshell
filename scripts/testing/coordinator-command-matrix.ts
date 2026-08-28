@@ -43,7 +43,7 @@ export type CoordinatorInput = {
 export type UpstreamPhase =
   | {
     runner: 'vitest'
-    config: 'default' | 'electron' | 'runtime' | 'direct'
+    config: 'default' | 'direct'
     args: string[]
   }
   | {
@@ -62,10 +62,14 @@ export type CommandDisposition =
   | { kind: 'passthrough'; phases: UpstreamPhase[] }
   | { kind: 'rejected'; reason: string }
 
-const COMPOSITE_COMMANDS = new Set<CommandKey>(['test', 'test:all', 'check', 'verify'])
+type CompositeCommandKey = 'test' | 'test:all' | 'check' | 'verify'
+
+const COMPOSITE_COMMANDS = new Set<CompositeCommandKey>(['test', 'test:all', 'check', 'verify'])
 const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
-const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
-const RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.runtime.config.ts'
+
+function isCompositeCommand(commandKey: CommandKey): commandKey is CompositeCommandKey {
+  return COMPOSITE_COMMANDS.has(commandKey as CompositeCommandKey)
+}
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const args = stripLeadingArgSeparator(input.forwardedArgs)
@@ -88,7 +92,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   }
 
   if (hasHelpOrVersion(args)) return classifyHelpOrVersion(input.commandKey, args)
-  if (COMPOSITE_COMMANDS.has(input.commandKey)) return classifyCompositeCommand(input.commandKey, args)
+  if (isCompositeCommand(input.commandKey)) return classifyCompositeCommand(input.commandKey, args)
   return classifySinglePhaseCommand(input.commandKey, args)
 }
 
@@ -104,7 +108,7 @@ export function isCommandKey(value: string): value is CommandKey {
 
 function classifyHelpOrVersion(commandKey: CommandKey, args: string[]): CommandDisposition {
   if (commandKey === 'test:vitest') return passthrough([vitestPhase('direct', args)])
-  if (COMPOSITE_COMMANDS.has(commandKey)) return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
+  if (isCompositeCommand(commandKey)) return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
   if (commandKey === 'test:server') return passthrough([cargoPhase(['test', '-p', 'freshell-server', '--locked', ...args])])
   if (commandKey === 'test:integration') return passthrough([cargoPhase(['test', '--workspace', '--tests', '--locked', ...args])])
   return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
@@ -242,7 +246,7 @@ function passthrough(phases: UpstreamPhase[]): CommandDisposition {
   return { kind: 'passthrough', phases }
 }
 
-function vitestPhase(config: 'default' | 'electron' | 'runtime' | 'direct', args: string[]): UpstreamPhase {
+function vitestPhase(config: 'default' | 'direct', args: string[]): UpstreamPhase {
   return { runner: 'vitest', config, args }
 }
 
@@ -253,7 +257,3 @@ function npmPhase(script: 'typecheck' | 'build' | 'test:balanced', args: string[
 function cargoPhase(args: string[]): UpstreamPhase {
   return { runner: 'cargo', args }
 }
-
-export const RUNTIME_VITEST_CONFIG_PATH = RUNTIME_VITEST_CONFIG
-export const DEFAULT_VITEST_CONFIG_PATH = DEFAULT_VITEST_CONFIG
-export const ELECTRON_VITEST_CONFIG_PATH = ELECTRON_VITEST_CONFIG

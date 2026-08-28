@@ -147,6 +147,18 @@ function isUnsupportedRemoteLoopback(url: string): boolean {
   return false
 }
 
+export type BrowserSourceResolution = {
+  src: string | null
+  baselineUnavailable: boolean
+}
+
+export function resolveBrowserSource(url: string): BrowserSourceResolution {
+  const proxyUrl = buildHttpProxyUrl(url)
+  if (proxyUrl) return { src: proxyUrl, baselineUnavailable: false }
+  if (isUnsupportedRemoteLoopback(url)) return { src: null, baselineUnavailable: true }
+  return { src: toIframeSrc(url), baselineUnavailable: false }
+}
+
 export default function BrowserPane({
   paneId,
   tabId,
@@ -228,25 +240,10 @@ export default function BrowserPane({
       return
     }
 
-    // For localhost URLs, route through Freshell's HTTP proxy.
-    // This handles WSL2/Docker where the browser can't reach localhost
-    // ports directly, and also simplifies remote access.
-    const proxyUrl = buildHttpProxyUrl(currentUrl)
-    if (proxyUrl) {
-      setResolvedSrc(proxyUrl)
-      setBaselineUnavailable(false)
-      return
-    }
-
-    if (isUnsupportedRemoteLoopback(currentUrl)) {
-      setResolvedSrc(null)
-      setBaselineUnavailable(true)
-      setIsLoading(false)
-      return
-    }
-
-    setResolvedSrc(toIframeSrc(currentUrl))
-    setBaselineUnavailable(false)
+    const resolution = resolveBrowserSource(currentUrl)
+    setResolvedSrc(resolution.src)
+    setBaselineUnavailable(resolution.baselineUnavailable)
+    if (resolution.baselineUnavailable) setIsLoading(false)
   }, [currentUrl])
 
   const navigate = useCallback((newUrl: string) => {
@@ -304,9 +301,11 @@ export default function BrowserPane({
   const recoverCurrentPage = useCallback(() => {
     if (!currentUrl) return
 
+    const resolution = resolveBrowserSource(currentUrl)
     setLoadError(null)
-    setIsLoading(true)
-    setResolvedSrc(buildHttpProxyUrl(currentUrl) ?? toIframeSrc(currentUrl))
+    setResolvedSrc(resolution.src)
+    setBaselineUnavailable(resolution.baselineUnavailable)
+    setIsLoading(!resolution.baselineUnavailable)
   }, [currentUrl])
 
   const refresh = useCallback(() => {

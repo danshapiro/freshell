@@ -39,6 +39,7 @@ HELP_OUTPUT=$(bash "$SCRIPT" help 2>&1 || true)
 for term in "usage" "run" "--local" "--cloud" "FRESHELL_VITEST_BACKEND" "--shards" "--config"; do
   check "help contains '$term'" grep -qi -- "$term" <<< "$HELP_OUTPUT"
 done
+check "help documents the accepted all config selector" grep -q -- '--config=default|all' <<< "$HELP_OUTPUT"
 
 # Check 3: Default backend (unset env var) runs locally
 # Run with --local flag and a fast test to verify local execution works
@@ -120,6 +121,11 @@ SERVER_OUTPUT=$(bash "$SCRIPT" run --cloud --config=server 2>&1) && SERVER_RC=0 
 check "--config=server exits with usage error" bash -c "[ '$SERVER_RC' -eq 2 ]"
 check "--config=server explains the Rust lane" grep -qi 'Rust' <<< "$SERVER_OUTPUT"
 check "--config=server does not create or execute a cloud job" bash -c "! grep -q 'run jobs' '$FAKE_GCLOUD_LOG'"
+
+# Check 7b: an unknown config selector explains both accepted values.
+UNKNOWN_OUTPUT=$(bash "$SCRIPT" run --local --config=unknown 2>&1) && UNKNOWN_RC=0 || UNKNOWN_RC=$?
+check "unknown config selector exits with usage error" bash -c "[ '$UNKNOWN_RC' -eq 2 ]"
+check "unknown config selector documents default and all" grep -q 'expected default or all' <<< "$UNKNOWN_OUTPUT"
 
 # Check 8: VITEST_ARGS_JSON is valid JSON when pass-through args are present
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
