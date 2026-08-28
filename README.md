@@ -25,7 +25,7 @@
 - **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription. Rich chat UI with collapsible tool strips, token budget display, and full session persistence.
-- **Extension system** — Add client pane types and CLI integrations via manifest-based extensions. Server-hosted extension panes are not part of the Rust server contract.
+- **Extension system** — Add CLI integrations via manifest-based extensions. Client and server-hosted extension panes are not supported by the Rust server.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
@@ -221,15 +221,17 @@ checklist and existing issues; they are not silently presented as supported.
 
 ## Extensions
 
-Freshell supports custom pane types via extensions. The Rust server supports
-client assets and CLI extensions:
+Freshell discovers extension manifests and supports CLI extensions in terminal
+panes. The Rust server does not render extension iframe panes:
 
-- **Client** — Static HTML/JS assets served by the Rust server
 - **CLI** — Any terminal tool wrapped as a pane
-- **Server-hosted** — Not available in the Rust server; run the service
+- **Client** — Not available as a Freshell pane
+- **Server-hosted** — Not available as a Freshell pane; run the service
   separately and open it as a supported browser pane when appropriate
 
-Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart Freshell. See [`examples/extensions/`](examples/extensions/) for client and CLI examples.
+Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/`
+and restart Freshell. See [`examples/extensions/`](examples/extensions/) for
+CLI examples and historical client/server manifests.
 
 ## Contributing
 

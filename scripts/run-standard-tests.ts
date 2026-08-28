@@ -174,10 +174,12 @@ export function createStandardTestPlan({
     ? runs.filter((run) => requestedSuites.includes(run.name))
     : runs
 
-  // Each phase owns its prerequisites and artifacts. Keeping the phases in
-  // order prevents a source-runtime build and Cargo from racing over the same
-  // target/dist directories while retaining one coordinator gate for the full
-  // suite.
+  // Each phase owns its prerequisites and artifacts. The source-runtime
+  // wrapper begins with npm run prebuild, so the broad check/verify path keeps
+  // the same live-server build guard as a direct source-runtime invocation.
+  // Keeping the phases in order also prevents a source-runtime build and Cargo
+  // from racing over the same target/dist directories while retaining one
+  // coordinator gate for the full suite.
   return {
     mode: resolvedMode,
     stages: selectedRuns.map((run) => [run]),

@@ -10,6 +10,7 @@ import { createApiClient, resolveConfig, type ApiClient } from './http-client.js
 import { translateKeys } from '../node-client-runtime/keys.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../node-client-runtime/codex-restore-contract.js'
 import {
+  ACTION_CAPABILITIES,
   ACTION_ALIASES,
   resolveCanonicalAction,
   supportedActionCapabilities,
@@ -31,7 +32,7 @@ function client(): ApiClient {
 // ---------------------------------------------------------------------------
 
 const supportedCapabilities = supportedActionCapabilities()
-const supportedActionNames = supportedCapabilities.flatMap((capability) => [capability.action, ...(capability.aliases ?? [])])
+const registeredActionNames = ACTION_CAPABILITIES.flatMap((capability) => [capability.action, ...(capability.aliases ?? [])])
 const actionDescription = supportedCapabilities.map((capability) => capability.action).join(', ')
 
 export const TOOL_DESCRIPTION = `Freshell terminal multiplexer -- orchestrate tabs, panes, and terminals.
@@ -97,7 +98,9 @@ Key differences from tmux: HTTP transport (not local socket), multiple pane type
 Use action "help" for the full command reference with params, examples, and playbooks.`
 
 export const INPUT_SCHEMA = {
-  action: z.enum(supportedActionNames as [string, ...string[]]).describe(`Supported command: ${actionDescription}.`),
+  action: z.enum(registeredActionNames as [string, ...string[]]).describe(
+    `Supported command: ${actionDescription}. Removed actions are accepted so they can return a deterministic unavailable result.`,
+  ),
   params: z.record(z.string(), z.unknown()).optional().describe(
     'Named parameters for the action. Common: target, name, mode, direction, keys, url, scope',
   ),
@@ -370,201 +373,6 @@ function agentResumeProvider(agent: unknown): 'codex' | 'opencode' | undefined {
 // ---------------------------------------------------------------------------
 // Action router
 // ---------------------------------------------------------------------------
-
-const LEGACY_HELP_TEXT = `Freshell MCP tool -- full reference
-
-## Decision guide: which action and pane type to use
-
-User says...                  | Action                | Key param
-────────────────────────────────────────────────────────────────────────
-"open a pane / split"         | split-pane            | (no target = split your own pane)
-"open a tab / window"         | new-tab               |
-"open/edit/view a text file"   | split-pane            | editor: "/absolute/path" (for any text file)
-"open/show a URL"             | split-pane            | browser: "https://..."
-"view a webpage (new tab)"    | open-browser          | url: "https://..."
-"run a command"               | split-pane            | mode: "shell"
-"open alongside / next to"    | split-pane            | (not new-tab)
-
-Rules:
-- split-pane is the default. Use new-tab only when the user explicitly says "tab" or "window".
-- Prefer specialized pane types (editor, browser) over terminals with cat/vim/curl.
-- Do NOT append "ENTER" as literal text. Send the command text with literal:true, then ["ENTER"] separately.
-
-## Command reference
-
-Tab commands:
-  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume? (alias: resumeSessionId), sessionRef?, prompt?
-                  mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
-                  prompt: text to send to the terminal after creation (via send-keys with literal mode).
-                  To open a URL in a browser pane, use 'open-browser' instead.
-                  resume/resumeSessionId sugar is honored for mode panes and for agent: "opencode" only.
-  list-tabs       List all tabs. Returns { tabs: [...], activeTabId }.
-  select-tab      Activate a tab. Params: target (tab ID or title)
-  kill-tab        Close a tab. Params: target
-  rename-tab      Rename a tab. Params: name, target?
-                  Omit target to rename the caller tab (or active tab as fallback).
-  has-tab         Check if a tab exists. Params: target
-  next-tab        Switch to the next tab.
-  prev-tab        Switch to the previous tab.
-
-Pane commands:
-  split-pane      Split a pane. Params: target?, direction? (horizontal=left/right, vertical=top/bottom; defaults to horizontal = left/right), mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?
-                   Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
-  list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
-  select-pane     Activate a pane. Params: target (pane ID or index)
-  kill-pane       Close a pane. Params: target
-  rename-pane     Rename a pane. Params: name, target?
-                  Omit target to rename the caller pane (or the tab's active pane as fallback).
-  resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
-  swap-pane       Swap two panes. Params: target, with (other pane ID)
-  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
-
-Terminal I/O:
-  send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?
-                  Token mode (default): keys=["ls","ENTER"] translates ENTER to \\r, C-C to Ctrl-C, etc.
-                  Literal mode: keys="your prompt text here", literal=true sends raw string.
-                  IMPORTANT: Always use literal mode for natural-language prompts or multi-word text.
-  capture-pane    Capture pane output as text. Params: target, S? (start line, negative for scrollback), J? (join wrapped), e? (escape sequences)
-  wait-for        Wait for a condition in pane output. Params: target, pattern?, stable?, exit?, prompt?, timeout?
-                  stable: seconds of no new output (most reliable across CLI providers).
-                  exit: wait for the process to exit.
-                  prompt: wait for a shell prompt.
-                  timeout: max seconds to wait (default varies by server config).
-  run             Run a command in a new tab. Params: command, capture?, detached?, timeout?, name?, cwd?
-  summarize       Get AI summary of a terminal. Params: target (pane ID)
-  display         Format info about a pane. Params: target?, format (#S=tab name, #P=pane ID, #I=tab ID, #{pane_index}, #{terminal_id}, #{pane_type})
-  list-terminals  List all terminal processes.
-  attach          Attach a terminal to a pane. Params: target (pane ID), terminalId, sessionRef?
-
-Browser/navigation:
-  open-browser    Open a URL in a new browser tab to display web pages or images.
-                  Params: url (required), name? (optional)
-  navigate        Navigate an existing browser pane to a URL. Params: target (pane ID), url
-
-Screenshot:
-  screenshot      Take a screenshot. Params: scope (pane|tab|view), target?, name? (defaults to "screenshot")
-                  scope=pane: captures a single pane. target is pane ID/index/title.
-                  scope=tab: captures the full tab. target is tab ID/title.
-                  scope=view: captures the entire app viewport. No target needed.
-
-Session/service:
-  list-sessions   List visible coding CLI sessions.
-  search-sessions Search sessions. Params: query
-  health          Check server health.
-  lan-info        Show LAN access information.
-
-Meta:
-  help            Show this reference.
-
-## Fresh agents (in-app)
-
-Use new-tab/split-pane with agent="opencode" (also "claude"/"codex"), optional model=, effort=, cwd=. Then drive the pane with send-keys (the prompt; blocks until the turn completes), read it with capture-pane (returns the transcript), and optionally wait-for (reports idle). Example:
-  new-tab { agent: "opencode", model: "umans-ai-coding-plan/umans-kimi-k2.7", prompt: "Summarize README.md" }
-
-## Playbook: create a coding CLI tab and send a prompt
-
-  // Create tab with mode to skip the picker pane
-  result = freshell({ action: "new-tab", params: { name: "My Task", mode: "claude", cwd: "/path/to/repo" } })
-  // result contains { status: "ok", data: { tabId, paneId } }
-  paneId = result.data.paneId
-
-  // Send prompt in literal mode
-  freshell({ action: "send-keys", params: { target: paneId, keys: "Implement the feature described in SPEC.md", literal: true } })
-  freshell({ action: "send-keys", params: { target: paneId, keys: ["ENTER"] } })
-
-  // Wait for completion (stable = 8 seconds of silence)
-  freshell({ action: "wait-for", params: { target: paneId, stable: 8, timeout: 1800 } })
-
-  // Capture output
-  freshell({ action: "capture-pane", params: { target: paneId, S: -120 } })
-
-## Playbook: parallel coding panes in one tab
-
-  seed = freshell({ action: "new-tab", params: { name: "Eval x4", mode: "claude", cwd: "/path/to/repo" } })
-  p0 = seed.data.paneId
-
-  p1 = freshell({ action: "split-pane", params: { target: p0, mode: "claude", cwd: "/path/to/repo" } }).data.paneId
-  p2 = freshell({ action: "split-pane", params: { target: p0, direction: "horizontal", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
-  p3 = freshell({ action: "split-pane", params: { target: p1, direction: "horizontal", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
-
-  // Send same prompt to all 4 panes, wait, capture
-  for each paneId in [p0, p1, p2, p3]:
-    freshell({ action: "send-keys", params: { target: paneId, keys: "Implement <task>. Run tests.", literal: true } })
-    freshell({ action: "send-keys", params: { target: paneId, keys: ["ENTER"] } })
-  for each paneId in [p0, p1, p2, p3]:
-    freshell({ action: "wait-for", params: { target: paneId, stable: 8, timeout: 1800 } })
-    freshell({ action: "capture-pane", params: { target: paneId, S: -120 } })
-
-## Playbook: open file in editor pane (for text files)
-
-  // Use the editor pane type for any file that can be displayed as text:
-  // source code, markdown, config files, logs, CSVs, etc.
-  // The editor renders with syntax highlighting and line numbers.
-
-  // Split current pane with editor (preferred)
-  freshell({ action: "split-pane", params: { editor: "/absolute/path/to/README.md" } })
-
-  // Or new tab with editor
-  freshell({ action: "new-tab", params: { name: "Edit README", editor: "/absolute/path/to/README.md" } })
-
-## Playbook: create, split, and rename without manual UI interaction
-
-  seed = freshell({ action: "new-tab", params: { name: "Triager", mode: "codex", cwd: "/path/to/repo" } })
-  tabId = seed.data.tabId
-  p0 = seed.data.paneId
-  p1 = freshell({ action: "split-pane", params: { target: p0, editor: "/path/to/repo/README.md" } }).data.paneId
-
-  freshell({ action: "rename-tab", params: { target: tabId, name: "Issue 166 work" } })
-  freshell({ action: "rename-pane", params: { target: p0, name: "Codex" } })
-  freshell({ action: "select-pane", params: { target: p1 } })
-  freshell({ action: "rename-pane", params: { name: "Editor" } })
-
-## Playbook: open a URL in a browser pane
-
-  // Split current pane with browser (preferred for "open alongside")
-  freshell({ action: "split-pane", params: { browser: "https://example.com" } })
-
-  // Or open a URL in a new browser tab
-  result = freshell({ action: "open-browser", params: { url: "https://example.com", name: "My Page" } })
-
-  // IMPORTANT: Always screenshot after open-browser to confirm the page loaded.
-  // Blank pages, network errors, and CORS issues are invisible without a screenshot.
-  freshell({ action: "screenshot", params: { scope: "tab", target: result.data.tabId } })
-
-  // Navigate an existing browser pane to a different URL
-  freshell({ action: "navigate", params: { target: paneId, url: "https://other.com" } })
-
-
-## Screenshot guidance
-
-- **Always screenshot with \`screenshot({ scope: "tab", target: tabId })\` after open-browser.** Network errors, blank pages, and CORS failures are silent unless you look. open-browser returns a tabId — use it immediately to confirm the page rendered before acting on it.
-- Tab and pane IDs from earlier in a session may become stale after reconnections or server restarts. If screenshot fails to find a tab/pane, call list-tabs or list-panes to get fresh IDs rather than reusing old ones.
-- Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
-- Close temporary tabs/panes after verification unless user asked to keep them open.
-- Browser panes: proxied localhost URLs render actual content in the iframe screenshot. Truly cross-origin URLs (e.g. https://example.com) render a placeholder message with the source URL instead of a blank region.
-- Editor panes show "Loading..." until visited. When screenshotting multiple tabs, visit each tab once first (select-tab), then loop back for screenshots.
-
-## Gotchas
-
-- Always use literal: true with send-keys for natural-language prompts or multi-word text.
-- Do NOT write "ENTER" as literal text in a keys string. Use literal:true for the command, then send ["ENTER"] as a separate call in token mode.
-- wait-for with stable (seconds of no output) is usually more reliable than pattern matching across different CLI providers.
-- Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Use list-terminals and clean up with kill-tab/kill-pane.
-- Picker panes are transient -- a new tab without mode/browser/editor starts as a picker. Always specify mode/browser/editor to get a usable pane immediately.
-- If target resolution fails, run list-tabs and list-panes, then retry with explicit IDs.
-
-## tmux aliases
-
-These tmux action names are supported as aliases:
-  new-window, new-session -> new-tab
-  list-windows -> list-tabs
-  select-window -> select-tab
-  kill-window -> kill-tab
-  rename-window -> rename-tab
-  next-window -> next-tab
-  previous-window, prev-window -> prev-tab
-  split-window -> split-pane
-  display-message -> display`
 
 const HELP_TEXT = [
   'Freshell MCP tool -- supported Rust-server reference',

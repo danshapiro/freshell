@@ -6,8 +6,11 @@ export type ClientConfig = { url: string; token?: string }
 type ClientConfigFile = { url?: string; token?: string }
 
 function loadConfigFile(): ClientConfigFile {
-  const home = process.env.FRESHELL_HOME || path.join(os.homedir(), '.freshell')
-  const file = path.join(home, 'cli.json')
+  // FRESHELL_HOME names the user's home directory. Keep the same layout as
+  // the server-side config: <FRESHELL_HOME>/.freshell/cli.json.
+  const configuredHome = process.env.FRESHELL_HOME?.trim()
+  const home = configuredHome ? path.resolve(configuredHome) : os.homedir()
+  const file = path.join(home, '.freshell', 'cli.json')
   if (!fs.existsSync(file)) return {}
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as ClientConfigFile

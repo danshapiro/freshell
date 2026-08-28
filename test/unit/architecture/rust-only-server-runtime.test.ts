@@ -13,7 +13,6 @@ type RuntimeSurface = {
   role: string
   listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
   entries?: string[]
-  commandEvidence?: string
 }
 
 const ALLOWED_LISTENER_PATHS = [
@@ -92,7 +91,6 @@ describe('runtime boundary analyzer', () => {
         path: 'package.json:scripts',
         role: 'package-commands',
         entries: ['serve'],
-        commandEvidence: 'sha256:7c34a7bec5d78bec828822651670524d60a6a53f9cd1c5faec468dd201706f07',
       }],
       {
         'package.json': JSON.stringify({
@@ -108,10 +106,52 @@ describe('runtime boundary analyzer', () => {
     const result = await analyzeRuntimeBoundary(root)
 
     expect((await stat(path.join(root, 'runtime-backend.mjs')).mode & 0o111)).toBe(0)
-    expect(result.manifestDrift).toEqual([
-      'changed package script command evidence: package-scripts',
-    ])
+    expect(result.manifestDrift).toEqual([])
     expect(result.unexpectedNodeBackend).toEqual(['runtime-backend.mjs'])
+  })
+
+  it('checks package launch behavior without hashing unrelated script text', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: ['lint', 'start'],
+      }],
+      {
+        'package.json': JSON.stringify({
+          scripts: {
+            lint: 'eslint src --ext .ts',
+            start: 'cross-env NODE_ENV=production tsx scripts/start-rust-server.ts target/release/freshell-server',
+          },
+        }),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual([])
+  })
+
+  it('reports a package start command that falls back to the retired Node backend', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: ['start'],
+      }],
+      {
+        'package.json': JSON.stringify({ scripts: { start: 'cross-env node server/index.js' } }),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual(expect.arrayContaining([
+      'invalid package script behavior: start',
+      'retired Node backend command: package.json:scripts.start',
+    ]))
   })
 
   it('rejects an unlisted Node listener in an e2e helper regardless of its filename', async () => {

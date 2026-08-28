@@ -64,10 +64,15 @@ describe('coordinator command matrix', () => {
     })
   })
 
-  it('rejects the retired server config with a Rust-lane hint', () => {
+  it.each([
+    'config/vitest/server.config.ts',
+    'config/vitest/vitest.server.config.ts',
+    'test/server/ws-protocol.test.ts',
+    './test/server/ws-protocol.test.ts',
+  ])('rejects retired server selectors (%s) with a Rust-lane hint', (selector) => {
     const disposition = classifyCommand({
       commandKey: 'test:vitest',
-      forwardedArgs: ['run', '--config', ['config/vitest', 'server.config.ts'].join('/')],
+      forwardedArgs: ['run', '--config', selector],
     })
     expect(disposition.kind).toBe('rejected')
     if (disposition.kind === 'rejected') {

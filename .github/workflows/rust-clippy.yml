@@ -75,6 +75,11 @@ jobs:
       - name: Source-runtime smoke
         run: npm run test:source-runtime
 
+      # Execute the browser-selection contract so a stale project/filter can
+      # never make the supported Rust application lane silently select zero.
+      - name: Browser selection non-vacuity
+        run: npm run test:e2e:helpers -- helpers/selection-nonvacuity.test.ts
+
       - name: Tauri app-bound server spawn smoke
         env:
           FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server

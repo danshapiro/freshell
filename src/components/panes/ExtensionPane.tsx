@@ -1,4 +1,6 @@
-// Client and server extension panes need Node lifecycle and asset endpoints.
+// The Rust baseline discovers extension metadata but does not render client or
+// server extension iframe panes. Keep this deterministic panel until a Rust
+// extension-pane contract exists.
 
 import { useAppSelector } from '@/store/hooks'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'

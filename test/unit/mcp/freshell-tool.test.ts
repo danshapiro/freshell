@@ -50,6 +50,21 @@ describe('TOOL_DESCRIPTION and INPUT_SCHEMA', () => {
     expect(ACTION_PARAMS['capture-pane']?.optional).toEqual(expect.arrayContaining(['J', 'e']))
     expect(ACTION_PARAMS['wait-for']?.optional).not.toEqual(expect.arrayContaining(['stable', 'exit', 'prompt']))
   })
+
+  it.each(['run', 'fresh-send', 'attach'])('registers removed %s and returns its deterministic unavailable result', async (action) => {
+    expect(INPUT_SCHEMA.action.safeParse(action).success).toBe(true)
+
+    const result = await executeAction(action, {})
+
+    expect(result).toEqual(expect.objectContaining({
+      error: `Action '${action}' is unavailable with the Rust Freshell server.`,
+      hint: 'This action is unavailable with the Rust Freshell server.',
+    }))
+    expect(mockClient.get).not.toHaveBeenCalled()
+    expect(mockClient.post).not.toHaveBeenCalled()
+    expect(mockClient.patch).not.toHaveBeenCalled()
+    expect(mockClient.delete).not.toHaveBeenCalled()
+  })
 })
 
 describe('Rust capability rejection wall', () => {
