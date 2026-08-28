@@ -44,13 +44,33 @@ describe('node-test-disposition verifier', () => {
       'utf8',
     )) as NodeTestDispositionLedger
 
-    expect(await verifyNodeTestDisposition(committed, { expectedCandidateCount: 346 })).toEqual([])
+    expect(await verifyNodeTestDisposition(committed, { expectedCandidateCount: 347 })).toEqual([])
+  })
+
+  it('rejects a Task 10 deletion omitted from the independently closed universe', async () => {
+    const committed = JSON.parse(await readFile(
+      path.join(repoRoot, 'scripts/retirement/node-test-disposition.json'),
+      'utf8',
+    )) as NodeTestDispositionLedger
+    const missingPath = 'test/integration/session-repair.test.ts'
+    const incomplete: NodeTestDispositionLedger = {
+      ...committed,
+      candidateCount: committed.candidateCount - 1,
+      candidatePaths: committed.candidatePaths.filter((candidatePath) => candidatePath !== missingPath),
+      rows: committed.rows.filter((candidateRow) => candidateRow.oldPath !== missingPath),
+    }
+
+    const errors = await verifyNodeTestDisposition(incomplete, { expectedCandidateCount: 347 })
+
+    expect(errors).toContain(
+      `ledger: required Task 10 deleted test path missing from closed candidate universe: ${missingPath}`,
+    )
   })
 
   it('rejects an unresolved subject in a mixed test file', async () => {
     const errors = await verifyNodeTestDisposition(ledger([
       row({ subject: '' }),
-    ]), { expectedCandidateCount: 1 })
+    ]), { expectedCandidateCount: 1, enforceTask10Scope: false })
 
     expect(errors).toContain('test/unit/server/example.test.ts: subject is unresolved')
   })
@@ -61,7 +81,7 @@ describe('node-test-disposition verifier', () => {
         selector: 'test/unit/example.test.ts -t missing',
         latestReceipt: { status: 'passed', count: 0, source: 'receipt' },
       }),
-    ]), { expectedCandidateCount: 1 })
+    ]), { expectedCandidateCount: 1, enforceTask10Scope: false })
 
     expect(errors).toContain('test/unit/server/example.test.ts [example subject]: replacement receipt selected zero tests')
   })
@@ -72,7 +92,7 @@ describe('node-test-disposition verifier', () => {
         requiredLane: 'supplemental-t2',
         latestReceipt: { status: 'skipped', count: 0, source: 'optional provider unavailable' },
       }),
-    ]), { expectedCandidateCount: 1 })
+    ]), { expectedCandidateCount: 1, enforceTask10Scope: false })
 
     expect(errors).toEqual(expect.arrayContaining([
       'test/unit/server/example.test.ts [example subject]: optional/supplemental lane cannot satisfy a required replacement',
@@ -86,7 +106,7 @@ describe('node-test-disposition verifier', () => {
       ...ledger([row(), row()]),
       candidatePaths: ['test/unit/server/example.test.ts', 'test/unit/server/stale.test.ts'],
       candidateCount: 2,
-    }, { expectedCandidateCount: 2 })
+    }, { expectedCandidateCount: 2, enforceTask10Scope: false })
 
     expect(errors).toEqual(expect.arrayContaining([
       'duplicate disposition row: test/unit/server/example.test.ts [example subject]',
