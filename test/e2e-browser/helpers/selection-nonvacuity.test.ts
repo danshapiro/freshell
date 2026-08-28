@@ -18,23 +18,23 @@ const playwrightConfig = path.join(browserRoot, 'playwright.config.ts')
 const cloudConfig = path.join(browserRoot, 'playwright.cloud.config.ts')
 const continuityPattern = { kind: 'regexp', source: 'continuity-smoke\\.spec\\.ts$', flags: '' }
 const obsoleteVocabulary = [
-  ['rust', 'Fixture'].join(''),
-  ['retired', ' Node browser lane'].join(''),
-  ['Rust', ' browser lane'].join(''),
-  ['retired', ' matrix list'].join(''),
-  ['MATRIX', '_SPECS'].join(''),
+  'rustFixture',
+  'retired Node browser lane',
+  'Rust browser lane',
+  'retired matrix list',
+  'MATRIX_SPECS',
 ]
 const staleBackendNarratives = [
-  ['both', '\\s+', 'servers?'].join(''),
-  ['both', '\\s+', 'backends?'].join(''),
-  ['server', '\\s+', 'kinds?'].join(''),
-  ['legacy', '[- ]', 'open'].join(''),
-  ['(?:node', '|rust)', '\\s*[/+]', '\\s*(?:node', '|rust)'].join(''),
-  ['retired', '\\s+', '(?:node|matrix|browser)', '\\s+', '(?:server|build|lane|project|list)'].join(''),
-  ['(?:legacy', '|retired)', '\\s+', '(?:node\\s+)?(?:server|build|lane|project)'].join(''),
-  ['dist', '/server/', 'index'].join(''),
-  ['helpers/', 'test-server', '\\.ts'].join(''),
-].map((source) => new RegExp(source, 'i'))
+  /both\s+servers?/i,
+  /both\s+backends?/i,
+  /server\s+kinds?/i,
+  /legacy[- ]open/i,
+  /(?:node|rust)\s*[/+]\s*(?:node|rust)/i,
+  /retired\s+(?:node|matrix|browser)\s+(?:server|build|lane|project|list)/i,
+  /(?:legacy|retired)\s+(?:node\s+)?(?:server|build|lane|project)/i,
+  /dist\/server\/index/i,
+  /helpers\/test-server\.ts/i,
+]
 
 interface ResolvedProject {
   name: string

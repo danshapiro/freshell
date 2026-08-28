@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
-const VITE_ROOT = path.resolve(PROJECT_ROOT, '..', '..', 'node_modules')
+const VITE_ROOT = path.join(PROJECT_ROOT, 'node_modules')
 const RUST_BINARY = path.join(PROJECT_ROOT, 'target', 'debug', process.platform === 'win32'
   ? 'freshell-server.exe'
   : 'freshell-server')
@@ -179,6 +179,11 @@ async function stopCapturedChild(child: ChildProcess): Promise<void> {
 }
 
 test.describe('Electron app-bound Rust server', () => {
+  test('resolves the launch chooser from this checkout', () => {
+    expect(VITE_ROOT).toBe(path.join(PROJECT_ROOT, 'node_modules'))
+    expect(fs.existsSync(path.join(VITE_ROOT, 'vite/bin/vite.js'))).toBe(true)
+  })
+
   test('authenticates Rust server-info and stops only its exact child', async () => {
     test.skip(process.platform === 'win32', 'The exact /proc executable assertion is Linux-only.')
     expect(fs.existsSync(RUST_BINARY)).toBe(true)

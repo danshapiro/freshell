@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 export type DispositionDecision = 'retained' | 'deleted'
 
@@ -561,6 +562,14 @@ export async function loadNodeTestDisposition(root: string): Promise<NodeTestDis
   return JSON.parse(await readFile(file, 'utf8')) as NodeTestDispositionLedger
 }
 
+export function isDirectRun(
+  entryPoint: string | undefined,
+  moduleUrl: string,
+  windows = process.platform === 'win32',
+): boolean {
+  return Boolean(entryPoint && pathToFileURL(entryPoint, { windows }).href === moduleUrl)
+}
+
 async function main(): Promise<void> {
   const root = path.resolve(process.cwd())
   const ledger = await loadNodeTestDisposition(root)
@@ -580,6 +589,6 @@ async function main(): Promise<void> {
   }) + '\n')
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectRun(process.argv[1], import.meta.url)) {
   await main()
 }

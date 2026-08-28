@@ -179,8 +179,8 @@ export function createServerSpawner(): ServerSpawner {
       // Do not let Electron's Node-only module lookup/runtime mode leak into
       // the standalone Rust process. Keep normal process values (PATH, HOME,
       // and platform-specific variables) intact.
-      delete inheritedEnv[['NODE', 'PATH'].join('_')]
-      delete inheritedEnv[['NODE', 'ENV'].join('_')]
+      delete inheritedEnv.NODE_PATH
+      delete inheritedEnv.NODE_ENV
       // AUTH_TOKEN must come from the app-bound config directory's `.env`.
       // An inherited shell token would take precedence over dotenv loading
       // and could make the browser's configured token fail authentication.

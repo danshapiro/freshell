@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
   collectProductionDependencyClosure,
+  findUnapprovedRuntimePaths,
   getNodeDownloadUrl,
   getRuntimeBinaryName,
   getRuntimePaths,
+  moduleDirectoryFromUrl,
   stageElectronRuntime,
 } from '../../../scripts/prepare-electron-runtime.js'
 
@@ -95,6 +97,18 @@ describe('prepare-electron-runtime staging', () => {
     })
   })
 
+  it('uses platform-aware file URL conversion for Windows module paths', () => {
+    expect(moduleDirectoryFromUrl(
+      'file:///C:/repo/scripts/prepare-electron-runtime.ts',
+      true,
+    )).toBe('C:\\repo\\scripts')
+  })
+
+  it('allows the platform resources electron-builder puts beside the runtime', () => {
+    expect(findUnapprovedRuntimePaths(['icon.icns'], 'darwin')).toEqual([])
+    expect(findUnapprovedRuntimePaths(['elevate.exe'], 'win32')).toEqual([])
+  })
+
   it('resolves the locked production closure without pulling unrelated packages', () => {
     const lock = {
       packages: {
@@ -149,6 +163,27 @@ describe('prepare-electron-runtime staging', () => {
     expect(() => readFileSync(path.join(outputRoot, 'dist', 'server', 'index.js'))).toThrow()
     expect(() => readFileSync(path.join(outputRoot, 'server-node-modules', 'index.js'))).toThrow()
     expect(() => readFileSync(path.join(outputRoot, 'node-pty', 'index.js'))).toThrow()
+  })
+
+  it('ensures staged POSIX binaries are executable even when inputs are not', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    const fixture = createSourceFixture(sourceRoot)
+    chmodSync(fixture.serverBinary, 0o644)
+    chmodSync(fixture.nodeBinary, 0o644)
+
+    await stageElectronRuntime({
+      rootDir: sourceRoot,
+      runtimeDir: outputRoot,
+      platform: 'linux',
+      arch: 'x64',
+      releaseVersion: '9.9.9',
+      nodeVersion: '22.12.0',
+      ...fixture,
+    })
+
+    expect(statSync(path.join(outputRoot, 'bin', 'freshell-server')).mode & 0o111).not.toBe(0)
+    expect(statSync(path.join(outputRoot, 'node', 'bin', 'node')).mode & 0o111).not.toBe(0)
   })
 
   it('uses the locked Node archive URL for each supported target', () => {

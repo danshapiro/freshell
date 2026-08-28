@@ -11,11 +11,13 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import {
   FORBIDDEN_RUNTIME_NAMES,
   findUnapprovedRuntimePaths,
   getRuntimeAllowlist,
   getRuntimePaths,
+  type ElectronRuntimeArch,
   type ElectronRuntimePlatform,
 } from './prepare-electron-runtime.js'
 
@@ -225,8 +227,14 @@ export function verifyElectronArtifact(
   }
 }
 
-function defaultArtifactPath(platform: NodeJS.Platform): string {
-  if (platform === 'darwin') return path.join(process.cwd(), 'release', 'mac', 'Freshell.app', 'Contents', 'Resources')
+export function resolveDefaultArtifactPath(
+  platform: NodeJS.Platform,
+  arch: ElectronRuntimeArch | string = process.arch,
+): string {
+  if (platform === 'darwin') {
+    const macDirectory = arch === 'arm64' ? 'mac-arm64' : 'mac'
+    return path.join(process.cwd(), 'release', macDirectory, 'Freshell.app', 'Contents', 'Resources')
+  }
   if (platform === 'win32') return path.join(process.cwd(), 'release', 'win-unpacked', 'resources')
   return path.join(process.cwd(), 'release', 'linux-unpacked', 'resources')
 }
@@ -237,20 +245,25 @@ function parsePlatform(value: string | undefined): ElectronRuntimePlatform {
   return platform
 }
 
+function parseArch(value: string | undefined): ElectronRuntimeArch {
+  const arch = value ?? process.arch
+  if (arch !== 'x64' && arch !== 'arm64') throw new Error(`Unsupported Electron artifact architecture: ${arch}`)
+  return arch
+}
+
 function main(): void {
   const args = process.argv.slice(2)
   const pathArg = args[0] && !args[0].startsWith('--') ? args[0] : undefined
   const platformArgIndex = args.indexOf('--platform')
   const platform = parsePlatform(platformArgIndex >= 0 ? args[platformArgIndex + 1] : undefined)
-  const artifactPath = pathArg ?? process.env.ELECTRON_ARTIFACT_PATH ?? defaultArtifactPath(platform)
+  const archArgIndex = args.indexOf('--arch')
+  const arch = parseArch(archArgIndex >= 0 ? args[archArgIndex + 1] : undefined)
+  const artifactPath = pathArg ?? process.env.ELECTRON_ARTIFACT_PATH ?? resolveDefaultArtifactPath(platform, arch)
   const receipt = verifyElectronArtifact(artifactPath, platform)
   process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'electron_artifact_verified', ...receipt })}\n`)
 }
 
-const isMainModule = process.argv[1]
-  && (process.argv[1].endsWith('verify-electron-artifact.ts') || process.argv[1].endsWith('verify-electron-artifact.js'))
-
-if (isMainModule) {
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   try {
     main()
   } catch (error: unknown) {

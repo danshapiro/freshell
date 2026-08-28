@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import path from 'path'
 import {
   resolveDesktopRuntimeResources,
@@ -63,6 +64,16 @@ function context(overrides: Partial<StartupContext> = {}): StartupContext {
 }
 
 describe('Electron Rust app-bound startup', () => {
+  it('builds the debug Rust server and static client before Electron dev starts', () => {
+    const packageJson = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>
+    }
+    expect(packageJson.scripts['build:rust:debug']).toBe('cargo build -p freshell-server --locked')
+    expect(packageJson.scripts['electron:dev']).toMatch(
+      /^npm run build:client && npm run build:rust:debug && npm run build:electron &&/,
+    )
+  })
+
   it('resolves packaged Rust resources without Node backend fields', () => {
     const resources = resolveDesktopRuntimeResources(
       '/opt/Freshell/resources',
