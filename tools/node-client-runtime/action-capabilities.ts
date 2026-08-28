@@ -138,8 +138,9 @@ export function unsupportedInvocationResult(
   if (canonical === 'split-pane' && ['agent', 'model', 'effort'].some((key) => invocation?.[key] !== undefined)) {
     return { error: 'Fresh-agent split parameters are unavailable with the Rust Freshell server.', hint: 'Use a supported mode pane instead.' }
   }
+  const waitPattern = canonical === 'wait-for' ? invocation?.pattern ?? invocation?.p : undefined
   if (canonical === 'wait-for' && (
-    typeof invocation?.pattern !== 'string' || invocation.pattern.length === 0 || ['stable', 'exit', 'prompt'].some((key) => invocation?.[key] !== undefined)
+    typeof waitPattern !== 'string' || waitPattern.length === 0 || ['stable', 'exit', 'prompt'].some((key) => invocation?.[key] !== undefined)
   )) {
     return { error: 'wait-for requires pattern with the Rust Freshell server.', hint: 'Use a literal output pattern.' }
   }

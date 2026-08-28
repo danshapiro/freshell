@@ -6,6 +6,7 @@ import {
   resolveDesktopWorkerPlan,
   resolvePriorityValue,
 } from '../../../scripts/run-standard-tests.js'
+import { buildSourceRuntimePhases } from '../../../scripts/testing/run-source-runtime-tests.js'
 
 describe('run-standard-tests', () => {
   describe('resolveDesktopWorkerPlan', () => {
@@ -122,6 +123,15 @@ describe('run-standard-tests', () => {
         forwardedArgs: ['/home/user/code/freshell/test/server/ws-protocol.test.ts'],
       }).stages.flat().map((run) => run.name)).toEqual(['rust'])
     })
+  })
+
+  it('puts the prebuild safety guard before source-runtime artifact writers', () => {
+    expect(buildSourceRuntimePhases('npm')).toEqual([
+      { command: 'npm', args: ['run', 'prebuild'] },
+      { command: 'npm', args: ['run', 'build:client'] },
+      { command: 'npm', args: ['run', 'build:tools'] },
+      { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
+    ])
   })
 
   describe('resolvePriorityValue', () => {

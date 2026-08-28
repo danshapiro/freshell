@@ -18,6 +18,18 @@ function npmCommand(): string {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm'
 }
 
+export function buildSourceRuntimePhases(npm = npmCommand()): Array<{ command: string; args: string[] }> {
+  return [
+    // build:client/build:tools write the artifacts served by Freshell. Run the
+    // shared guard first so a direct source-runtime invocation is safe on a
+    // normal checkout with the production Rust server running.
+    { command: npm, args: ['run', 'prebuild'] },
+    { command: npm, args: ['run', 'build:client'] },
+    { command: npm, args: ['run', 'build:tools'] },
+    { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
+  ]
+}
+
 function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> {
   return new Promise((resolve) => {
     log('info', 'source_runtime_phase_started', { command, args })
@@ -80,13 +92,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2
   }
 
-  const npm = npmCommand()
-  const phases: Array<{ command: string; args: string[] }> = [
-    { command: npm, args: ['run', 'build:client'] },
-    { command: npm, args: ['run', 'build:tools'] },
-    { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
-  ]
-  for (const phase of phases) {
+  for (const phase of buildSourceRuntimePhases()) {
     const exitCode = await runChild(phase.command, phase.args, process.env)
     if (exitCode !== 0) return exitCode
   }

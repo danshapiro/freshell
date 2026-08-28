@@ -105,4 +105,41 @@ describe('standalone CLI capability contract', () => {
       await once(server, 'close')
     }
   })
+
+  it('accepts the short -p alias for a Rust pattern wait-for request', async () => {
+    const requests: string[] = []
+    const server = createServer((request, response) => {
+      requests.push(request.url ?? '')
+      response.setHeader('content-type', 'application/json')
+      if (request.url === '/api/tabs') {
+        response.end(JSON.stringify({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' }))
+        return
+      }
+      if (request.url === '/api/panes?tabId=t1') {
+        response.end(JSON.stringify({ panes: [{ id: 'p1', index: 0, kind: 'terminal' }] }))
+        return
+      }
+      if (request.url?.startsWith('/api/panes/p1/wait-for?')) {
+        response.end(JSON.stringify({ matched: true }))
+        return
+      }
+      response.statusCode = 404
+      response.end(JSON.stringify({ error: 'unexpected request' }))
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not listen')
+
+    try {
+      const result = await runCli(['wait-for', '-p', 'ready'], `http://127.0.0.1:${address.port}`)
+      expect(result.code).toBe(0)
+      expect(result.stderr).toBe('')
+      expect(JSON.parse(result.stdout)).toEqual({ matched: true })
+      expect(requests).toContain('/api/panes/p1/wait-for?pattern=ready')
+    } finally {
+      server.close()
+      await once(server, 'close')
+    }
+  })
 })

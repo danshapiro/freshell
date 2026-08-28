@@ -1,54 +1,57 @@
 # Example Extensions
 
-Example extensions demonstrating each extension category. To try one,
-symlink it into your extensions directory and restart freshell:
+These examples include supported CLI extensions and historical client/server
+manifests. The Rust server can launch the CLI examples in terminal panes;
+client and server extension panes are shown as unavailable and are not
+started or proxied. To try a supported example, symlink it into your
+extensions directory and restart Freshell:
 
 ```bash
 # macOS/Linux
-ln -sf "$(pwd)/examples/extensions/notepad" ~/.freshell/extensions/notepad
-ln -sf "$(pwd)/examples/extensions/status-dashboard" ~/.freshell/extensions/status-dashboard
-ln -sf "$(pwd)/examples/extensions/live-counter" ~/.freshell/extensions/live-counter
 ln -sf "$(pwd)/examples/extensions/system-monitor" ~/.freshell/extensions/system-monitor
 
 # Windows (use task-list instead of system-monitor)
 ln -sf "$(pwd)/examples/extensions/task-list" ~/.freshell/extensions/task-list
 ```
 
-After restarting, each extension appears in the **New Tab** pane picker.
+After restarting, enabled CLI extensions appear in the **New Tab** pane
+picker. The historical client and server manifests remain for reference and
+do not create working extension panes.
 
 ## Extensions
 
-### notepad (client)
+### notepad (client, historical)
 
 A scratchpad with auto-save to localStorage. No build step, no dependencies —
-just an `index.html` and a `freshell.json`. Freshell serves the static files
-directly.
+just an `index.html` and a `freshell.json`. The manifest documents the old
+client-pane shape, but the Rust server does not render it.
 
 **Key manifest fields:** `category: "client"`, `client.entry` points to the
 HTML file.
 
-### status-dashboard (server)
+### status-dashboard (server, historical)
 
-A live system resource monitor. Freshell spawns the Node process, allocates a
-port via the `{{port}}` template variable, and waits for the `readyPattern`
-to appear on stdout before rendering the iframe.
+A live system resource monitor. Its manifest and Node process are retained as
+historical documentation only. Freshell does not spawn the process or render
+its iframe in the Rust baseline.
 
-**Key manifest fields:** `category: "server"`, `server.command` and
-`server.args` define how to start the process, `server.env` passes the
-allocated port, `server.readyPattern` tells freshell when the server is ready.
+**Historical manifest fields:** `category: "server"`, `server.command`,
+`server.args`, `server.env`, and `server.readyPattern` describe the retired
+Node extension lifecycle.
 
 **Note:** If your server extension uses CommonJS (`require()`), include a
 `package.json` without `"type": "module"` in the extension directory.
 Otherwise Node may inherit an ESM `package.json` from a parent directory.
 
-### live-counter (server, WebSocket)
+### live-counter (server, WebSocket, historical)
 
-A shared counter with real-time updates. Click +/- in one pane and see
-the count update instantly in all other panes via WebSocket. Demonstrates
-that server extensions can use WebSocket through freshell's HTTP proxy.
+A shared counter with real-time updates. The files demonstrate the former
+server-extension lifecycle, but the Rust server does not start the process or
+proxy its WebSocket connection.
 
-**Key manifest fields:** Same as status-dashboard. The WebSocket connection
-uses a relative URL so it routes through the proxy automatically.
+**Historical manifest fields:** Same as status-dashboard. The former
+relative WebSocket URL depended on the retired proxy and is not a Rust-server
+feature.
 
 ### system-monitor (cli, macOS/Linux)
 
@@ -65,43 +68,26 @@ system-monitor example.
 **Note:** CLI extensions must also be enabled in freshell settings
 (Settings → Coding CLI → Enabled Providers) to appear in the picker.
 
-## How Server Extensions Are Proxied
+## Server examples and the Rust baseline
 
-Server extension iframes load through freshell's built-in HTTP proxy at
-`/api/proxy/http/:port/`. This means:
-
-- The browser only needs to reach freshell's port (e.g., 3001)
-- Extension server ports are internal — they don't need to be exposed
-- **Docker/WSL2/containers work out of the box** — no extra port mapping needed
-- Both HTTP and WebSocket are proxied transparently
-
-**Important:** Use relative URLs in your extension's JavaScript, not
-root-relative ones. The iframe loads at a proxy subpath, so root-relative
-URLs (starting with `/`) resolve against freshell's origin instead of the
-extension's.
-
-```javascript
-// GOOD — relative URL, resolves through the proxy
-fetch('api/status')
-const wsUrl = 'ws://' + location.host + location.pathname + '/ws'
-
-// BAD — root-relative, hits freshell's /api/status instead of the extension's
-fetch('/api/status')
-```
-
-See `live-counter/server.js` and `status-dashboard/server.js` for examples.
+The Rust server has no server-extension process manager or
+`/api/proxy/http/:port/` route. If you need one of these historical services,
+run it independently and open its separately reachable URL in a supported
+browser pane. The example files do not describe a Freshell launch or proxy
+path.
 
 ## Docker
 
-Server extensions work in Docker without exposing extension ports.
-See [`examples/docker/`](../docker/) for a ready-to-run Dockerfile.
+The Docker example packages the Rust server. It does not launch or proxy the
+historical server extensions; expose any independently-run service yourself.
+See [`examples/docker/`](../docker/) for the Dockerfile.
 
 ## Creating Your Own
 
 1. Create a directory with a `freshell.json` manifest
-2. Choose a category (`client`, `server`, or `cli`)
+2. Choose the supported `cli` category
 3. Symlink into `~/.freshell/extensions/<name>`
 4. Restart freshell
 
 See the [extension-installer skill](/.claude/skills/extension-installer/SKILL.md)
-for the full manifest reference and validation checklist.
+for the full CLI manifest reference and validation checklist.

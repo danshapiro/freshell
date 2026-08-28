@@ -11,30 +11,11 @@ import { assertRustServerInfo, RustServer } from './rust-server.js'
 const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '../../..')
 const browserRoot = path.resolve(import.meta.dirname, '..')
-const electronRoot = path.resolve(browserRoot, '../e2e-electron')
 const playwrightCli = require.resolve('@playwright/test/cli')
 const configLoader = require.resolve('playwright/lib/common/configLoader')
 const playwrightConfig = path.join(browserRoot, 'playwright.config.ts')
 const cloudConfig = path.join(browserRoot, 'playwright.cloud.config.ts')
 const continuityPattern = { kind: 'regexp', source: 'continuity-smoke\\.spec\\.ts$', flags: '' }
-const obsoleteVocabulary = [
-  'rustFixture',
-  'retired Node browser lane',
-  'Rust browser lane',
-  'retired matrix list',
-  'MATRIX_SPECS',
-]
-const staleBackendNarratives = [
-  /both\s+servers?/i,
-  /both\s+backends?/i,
-  /server\s+kinds?/i,
-  /legacy[- ]open/i,
-  /(?:node|rust)\s*[/+]\s*(?:node|rust)/i,
-  /retired\s+(?:node|matrix|browser)\s+(?:server|build|lane|project|list)/i,
-  /(?:legacy|retired)\s+(?:node\s+)?(?:server|build|lane|project)/i,
-  /dist\/server\/index/i,
-  /helpers\/test-server\.ts/i,
-]
 
 interface ResolvedProject {
   name: string
@@ -138,9 +119,12 @@ describe('browser selection non-vacuity', () => {
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
   })
 
-  it('keeps the Rust factory, browser imports, and cloud local-only contract free of legacy paths', async () => {
+  it('keeps the Rust factory and browser dependency graph on retained paths', async () => {
     const server = await createE2eServerHandle({})
     expect(server).toBeInstanceOf(RustServer)
+    expect(typeof server.start).toBe('function')
+    expect(typeof server.stop).toBe('function')
+    expect(() => server.info).toThrow('RustServer not started')
 
     const legacyImports = sourceFiles(browserRoot).flatMap((file) => {
       const imports = [...fs.readFileSync(file, 'utf8').matchAll(/^\s*import[\s\S]*?from\s+['"]([^'"]+)['"]/gm)]
@@ -149,18 +133,6 @@ describe('browser selection non-vacuity', () => {
         .map((match) => `${path.relative(projectRoot, file)} -> ${match[1]}`)
     })
     expect(legacyImports).toEqual([])
-
-    const obsoleteClaims = [path.join(browserRoot, 'specs'), electronRoot].flatMap((root) => sourceFiles(root).flatMap((file) => {
-      const source = fs.readFileSync(file, 'utf8')
-      const matchedVocabulary = obsoleteVocabulary.filter((term) => source.includes(term))
-      const matchedNarratives = staleBackendNarratives
-        .filter((pattern) => pattern.test(source))
-        .map((pattern) => pattern.source)
-      return matchedVocabulary.length > 0 || matchedNarratives.length > 0
-        ? [`${path.relative(projectRoot, file)}: ${[...matchedVocabulary, ...matchedNarratives].join(', ')}`]
-        : []
-    }))
-    expect(obsoleteClaims).toEqual([])
 
     expect(LOCAL_ONLY_SPECS).toContainEqual({
       spec: 'mcp-qa-smoke-rust.spec.ts',

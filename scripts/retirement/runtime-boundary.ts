@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 
@@ -6,8 +5,8 @@ import path from 'node:path'
  * A runtime surface is an executable or resource that must have one owner in
  * the retirement manifest.  Paths are repository-relative POSIX paths.  A
  * package-script surface uses `package.json:scripts` and lists its command
- * names in `entries` plus a hash of their commands so additions and command
- * changes are both visible as manifest drift.
+ * names in `entries`. The analyzer checks the behavior of the server/build
+ * commands directly; unrelated script text is not treated as drift.
  */
 export type RuntimeSurface = {
   id: string
@@ -15,7 +14,6 @@ export type RuntimeSurface = {
   role: string
   listener?: 'non-backend' | 'legacy-backend' | 'assertion-only'
   entries?: string[]
-  commandEvidence?: string
 }
 
 export type RuntimeSurfaceManifest = {
@@ -164,19 +162,8 @@ export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeS
       throw new Error(`Runtime surface manifest row ${row.id} has invalid entries.`)
     }
     const normalizedPath = validateManifestPath(row.path, row.id)
-    if (row.commandEvidence !== undefined && (
-      typeof row.commandEvidence !== 'string'
-      || !/^sha256:[a-f0-9]{64}$/.test(row.commandEvidence)
-    )) {
-      throw new Error(`Runtime surface manifest row ${row.id} has invalid command evidence.`)
-    }
-    if (normalizedPath === PACKAGE_SCRIPTS_PATH && (
-      row.entries === undefined || row.commandEvidence === undefined
-    )) {
-      throw new Error(`Runtime surface manifest package script row ${row.id} requires entries and command evidence.`)
-    }
-    if (normalizedPath !== PACKAGE_SCRIPTS_PATH && row.commandEvidence !== undefined) {
-      throw new Error(`Runtime surface manifest row ${row.id} may only use command evidence for package scripts.`)
+    if (normalizedPath === PACKAGE_SCRIPTS_PATH && row.entries === undefined) {
+      throw new Error(`Runtime surface manifest package script row ${row.id} requires entries.`)
     }
     if (row.listener === 'assertion-only' && (
       row.role !== 'test-listener-assertion'
@@ -191,7 +178,6 @@ export async function loadRuntimeSurfaceManifest(root: string): Promise<RuntimeS
       role: row.role,
       ...(row.listener ? { listener: row.listener } : {}),
       ...(row.entries ? { entries: [...row.entries].sort() } : {}),
-      ...(row.commandEvidence ? { commandEvidence: row.commandEvidence } : {}),
     })
   }
 
@@ -276,32 +262,45 @@ async function pathExists(root: string, relativePath: string): Promise<boolean> 
   }
 }
 
-async function packageScriptNames(root: string): Promise<string[]> {
-  try {
-    const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts?: unknown }
-    if (!packageJson.scripts || typeof packageJson.scripts !== 'object') return []
-    return Object.keys(packageJson.scripts as Record<string, unknown>).sort()
-  } catch {
-    return []
-  }
-}
+type PackageScripts = Record<string, string>
 
-async function packageScriptCommandEvidence(root: string): Promise<string | undefined> {
+async function packageScripts(root: string): Promise<PackageScripts | undefined> {
   try {
     const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts?: unknown }
     if (!packageJson.scripts || typeof packageJson.scripts !== 'object' || Array.isArray(packageJson.scripts)) return undefined
-
-    const scripts = Object.entries(packageJson.scripts as Record<string, unknown>)
-    if (scripts.some(([, command]) => typeof command !== 'string')) return undefined
-
-    const canonicalCommands = scripts
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([name, command]) => `${JSON.stringify(name)}:${JSON.stringify(command)}`)
-      .join('\n')
-    return `sha256:${createHash('sha256').update(canonicalCommands).digest('hex')}`
+    const entries = Object.entries(packageJson.scripts as Record<string, unknown>)
+    if (entries.some(([, command]) => typeof command !== 'string')) return undefined
+    return Object.fromEntries(entries) as PackageScripts
   } catch {
     return undefined
   }
+}
+
+const REQUIRED_RUST_SCRIPT_BEHAVIORS: Readonly<Record<string, (command: string) => boolean>> = {
+  start: (command) => command.includes('scripts/start-rust-server.ts') && command.includes('target/release/freshell-server'),
+  dev: (command) => command.includes('cargo run -p freshell-server --locked'),
+  'dev:server': (command) => command.includes('cargo run -p freshell-server --locked'),
+  build: (command) => command.includes('build:client') && command.includes('build:tools') && command.includes('build:rust'),
+  'test:source-runtime': (command) => command.includes('scripts/testing/run-source-runtime-tests.ts'),
+}
+
+const RETIRED_NODE_BACKEND_COMMAND = /\b(?:node|tsx)\s+(?:(?:\.\.\/|\.\/|dist\/)?)server(?:\/|\.[cm]?[jt]sx?\b)/i
+
+function packageScriptBehaviorDrift(scripts: PackageScripts, expectedNames: readonly string[]): string[] {
+  const drift: string[] = []
+  for (const [name, requirement] of Object.entries(REQUIRED_RUST_SCRIPT_BEHAVIORS)) {
+    if (!expectedNames.includes(name)) continue
+    const command = scripts[name]
+    if (command === undefined || !requirement(command)) {
+      drift.push(`invalid package script behavior: ${name}`)
+    }
+  }
+  for (const [name, command] of Object.entries(scripts)) {
+    if (RETIRED_NODE_BACKEND_COMMAND.test(command)) {
+      drift.push(`retired Node backend command: package.json:scripts.${name}`)
+    }
+  }
+  return drift
 }
 
 async function reconcileManifest(root: string, manifest: RuntimeSurfaceManifest, discoveredOwners: string[]): Promise<string[]> {
@@ -325,7 +324,8 @@ async function reconcileManifest(root: string, manifest: RuntimeSurfaceManifest,
   for (const row of manifest.surfaces) {
     const relativePath = rowPath(row)
     if (relativePath === PACKAGE_SCRIPTS_PATH) {
-      const actualNames = await packageScriptNames(root)
+      const scripts = await packageScripts(root)
+      const actualNames = scripts ? Object.keys(scripts).sort() : []
       const expectedNames = row.entries ?? []
       const expected = new Set(expectedNames)
       for (const name of actualNames) {
@@ -336,13 +336,10 @@ async function reconcileManifest(root: string, manifest: RuntimeSurfaceManifest,
       }
       if (!await pathExists(root, 'package.json')) {
         drift.push(`stale manifest row: ${row.id} -> ${relativePath}`)
+      } else if (scripts === undefined) {
+        drift.push(`invalid package script commands: ${row.id}`)
       } else {
-        const actualEvidence = await packageScriptCommandEvidence(root)
-        if (actualEvidence === undefined) {
-          drift.push(`invalid package script commands: ${row.id}`)
-        } else if (row.commandEvidence !== actualEvidence) {
-          drift.push(`changed package script command evidence: ${row.id}`)
-        }
+        drift.push(...packageScriptBehaviorDrift(scripts, expectedNames))
       }
       continue
     }

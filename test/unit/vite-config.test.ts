@@ -121,18 +121,18 @@ describe('vite config', () => {
 })
 
 describe('vitest config', () => {
-  const originalRealProviderContracts = process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+  const originalRealProviderContracts = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
 
   beforeEach(() => {
     vi.resetModules()
-    delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+    delete process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
   })
 
   afterEach(() => {
     if (originalRealProviderContracts !== undefined) {
-      process.env.FRESHELL_REAL_PROVIDER_CONTRACTS = originalRealProviderContracts
+      process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS = originalRealProviderContracts
     } else {
-      delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+      delete process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
     }
   })
 
@@ -142,6 +142,15 @@ describe('vitest config', () => {
     const excluded = config.test?.exclude ?? []
 
     expect(excluded).toContain('test/integration/real/**')
+  })
+
+  it('includes real-provider integration contracts when the documented opt-in is enabled', async () => {
+    process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS = '1'
+    const configModule = await import('../../config/vitest/vitest.config.ts')
+    const config = configModule.default
+    const excluded = config.test?.exclude ?? []
+
+    expect(excluded).not.toContain('test/integration/real/**')
   })
 
   it('keeps artifact-owning integration trees out of the default lane', async () => {

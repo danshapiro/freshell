@@ -92,9 +92,10 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   return classifySinglePhaseCommand(input.commandKey, args)
 }
 
-function isRetiredServerConfigSelector(arg: string): boolean {
-  return /(?:^|[/=])server\.config(?:\.|$)/.test(arg)
-    || /(?:^|[/=])server(?:$|\.)/.test(arg)
+export function isRetiredServerConfigSelector(arg: string): boolean {
+  const normalized = arg.replaceAll('\\', '/')
+  return /(?:^|[/=])(?:vitest\.)?server\.config(?:\.[^/]+)?$/.test(normalized)
+    || /(?:^|[/=])test\/(?:unit\/|integration\/)?server(?:\/|$)/.test(normalized)
 }
 
 export function isCommandKey(value: string): value is CommandKey {
