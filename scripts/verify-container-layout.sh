@@ -92,6 +92,12 @@ while (($# > 0)); do
   esac
 done
 
+# Normalize caller-supplied trailing separators before constructing scan roots;
+# otherwise find emits paths with a leading slash after the prefix is stripped.
+while [[ "$fixture" == */ && "$fixture" != "/" ]]; do
+  fixture="${fixture%/}"
+done
+
 if [[ -z "$fixture" ]]; then
   usage
   exit 2

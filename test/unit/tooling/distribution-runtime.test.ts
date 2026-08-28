@@ -58,6 +58,24 @@ const RETIRED_BACKEND_PACKAGES = [
   'pino-pretty',
 ]
 
+const MANIFEST_OWNED_IGNORE_EXCEPTIONS = [
+  '.github/workflows/docs-pages-deploy.yml',
+  '.github/workflows/electron-build.yml',
+  '.github/workflows/electron-release.yml',
+  '.github/workflows/port-contract.yml',
+  '.github/workflows/rust-clippy.yml',
+  '.github/workflows/typecheck-client.yml',
+  'electron/port-check.ts',
+  'examples/docker/Dockerfile',
+  'examples/extensions/live-counter/server.js',
+  'examples/extensions/status-dashboard/server.js',
+  'installers/systemd/freshell-rust.service',
+  'port/laptop-bootstrap/1-install-wsl.cmd',
+  'port/laptop-bootstrap/2-bootstrap-wsl.sh',
+  'port/vm-bridge/agent-console-vm.ps1',
+  'port/vm-bridge/agent-console-wsl.sh',
+]
+
 describe('Rust-only distribution runtime contracts', () => {
   it('builds and launches the example image with the Rust server', () => {
     const dockerfile = readProjectFile('examples/docker/Dockerfile')
@@ -228,6 +246,33 @@ describe('Rust-only distribution runtime contracts', () => {
       for (const dependency of nestedRetainedPackages) {
         expect(forbidden?.evidence).not.toContain(`node_modules/retained/node_modules/${dependency}/index.js`)
       }
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('normalizes trailing fixture slashes before scanning runtime roots', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-trailing-slash-'))
+
+    try {
+      mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'node_modules/express'), { recursive: true })
+      writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
+      writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
+      writeFileSync(path.join(fixtureRoot, 'node_modules/express/index.js'), 'retired backend package')
+      chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
+
+      const result = runContainerLayoutFixture(`${fixtureRoot}/`, true)
+
+      expect(result.status).toBe(1)
+      const forbidden = diagnostics(result.stdout).find(
+        (entry) => entry.event === 'container_layout_forbidden_artifacts',
+      )
+      expect(forbidden).toMatchObject({ count: 1, evidence_truncated: false })
+      expect(forbidden?.evidence).toEqual(['node_modules/express/index.js'])
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true })
     }
@@ -492,6 +537,47 @@ describe('Rust-only distribution runtime contracts', () => {
       expect(forbidden?.evidence).toEqual(['node_modules/node-pty/index.js'])
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps every manifest-owned file visible through both ignore filters', () => {
+    const manifest = JSON.parse(readProjectFile('scripts/retirement/runtime-surfaces.json')) as {
+      surfaces: Array<{ path: string }>
+    }
+    const manifestPaths = manifest.surfaces
+      .map((surface) => surface.path)
+    expect(MANIFEST_OWNED_IGNORE_EXCEPTIONS.every((surfacePath) => manifestPaths.includes(surfacePath))).toBe(true)
+
+    for (const filterPath of ['.dockerignore', '.gcloudignore']) {
+      const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-ignore-parity-'))
+
+      try {
+        writeFileSync(path.join(fixtureRoot, '.gitignore'), readProjectFile(filterPath))
+        for (const relativePath of MANIFEST_OWNED_IGNORE_EXCEPTIONS) {
+          const filePath = path.join(fixtureRoot, relativePath)
+          mkdirSync(path.dirname(filePath), { recursive: true })
+          writeFileSync(filePath, 'manifest-owned fixture')
+        }
+
+        const init = spawnSync('git', ['init', '--quiet'], {
+          cwd: fixtureRoot,
+          encoding: 'utf8',
+        })
+        expect(init.error, `${filterPath}: git is required for ignore parity`).toBeUndefined()
+        expect(init.status, `${filterPath}: ${init.stderr}`).toBe(0)
+
+        for (const relativePath of MANIFEST_OWNED_IGNORE_EXCEPTIONS) {
+          const result = spawnSync('git', ['check-ignore', '--quiet', '--no-index', '--', relativePath], {
+            cwd: fixtureRoot,
+            encoding: 'utf8',
+          })
+
+          expect(result.error, `${filterPath}: ${relativePath}`).toBeUndefined()
+          expect(result.status, `${filterPath}: ${relativePath}`).toBe(1)
+        }
+      } finally {
+        rmSync(fixtureRoot, { recursive: true, force: true })
+      }
     }
   })
 
