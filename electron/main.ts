@@ -48,6 +48,21 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
     })
   }
 
+  const resumeQuitAfterServerStopFailure = (error: unknown) => {
+    serverStopInProgress = undefined
+    // Cleanup failure must not strand Electron in a half-quit state. We have
+    // already attempted the exact child; resume the quit while the
+    // structured error below preserves the failure for diagnosis.
+    quitAfterServerStop = true
+    console.error(JSON.stringify({
+      severity: 'error',
+      component: 'electron-main',
+      event: 'server_stop_before_quit_failed',
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    app.quit()
+  }
+
   // Cleanup on quit
   app.on('before-quit', (event?: { preventDefault: () => void }) => {
     // Electron does not await async event listeners. Prevent the first quit
@@ -66,29 +81,9 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
           quitAfterServerStop = true
           app.quit()
         })
-        .catch((error: unknown) => {
-          serverStopInProgress = undefined
-          // Cleanup failure must not strand Electron in a half-quit state. We
-          // have already attempted the exact child; resume the quit while the
-          // structured error below preserves the failure for diagnosis.
-          quitAfterServerStop = true
-          console.error(JSON.stringify({
-            severity: 'error',
-            component: 'electron-main',
-            event: 'server_stop_before_quit_failed',
-            error: error instanceof Error ? error.message : String(error),
-          }))
-          app.quit()
-        })
+        .catch(resumeQuitAfterServerStopFailure)
     } catch (error) {
-      serverStopInProgress = undefined
-      isQuitting = false
-      console.error(JSON.stringify({
-        severity: 'error',
-        component: 'electron-main',
-        event: 'server_stop_before_quit_failed',
-        error: error instanceof Error ? error.message : String(error),
-      }))
+      resumeQuitAfterServerStopFailure(error)
     }
   })
 

@@ -32,7 +32,7 @@
     "build:launch-chooser": "vite build --config config/vite/vite.launch-chooser.config.ts",
     "dev:wizard": "vite --config config/vite/vite.wizard.config.ts",
     "dev:launch-chooser": "vite --config config/vite/vite.launch-chooser.config.ts",
-    "electron:dev": "npm run build:client && npm run build:rust:debug && npm run build:electron && cross-env ELECTRON_DEV=1 concurrently -n client,wizard,chooser,electron \"vite --config config/vite/vite.config.ts\" \"vite --config config/vite/vite.wizard.config.ts\" \"vite --config config/vite/vite.launch-chooser.config.ts\" \"electron .\"",
+    "electron:dev": "npm run prebuild && npm run build:client && npm run build:tools && npm run build:rust:debug && npm run build:electron && cross-env ELECTRON_DEV=1 concurrently -n client,wizard,chooser,electron \"vite --config config/vite/vite.config.ts\" \"vite --config config/vite/vite.wizard.config.ts\" \"vite --config config/vite/vite.launch-chooser.config.ts\" \"electron .\"",
     "electron:build": "npm run build && npm run build:electron && npm run build:wizard && npm run build:launch-chooser && npm run prepare:electron-runtime && electron-builder --config config/electron-builder.yml && npm run verify:electron-artifact",
     "electron:build:win": "tsx scripts/assert-native-windows-build.ts && npm run build && npm run build:electron && npm run build:wizard && npm run build:launch-chooser && npm run prepare:electron-runtime && electron-builder --config config/electron-builder.yml --win nsis --publish never && npm run verify:electron-artifact",
     "prepare:electron-runtime": "tsx scripts/prepare-electron-runtime.ts",

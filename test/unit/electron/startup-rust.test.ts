@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import path from 'path'
 import {
   resolveDesktopRuntimeResources,
@@ -64,15 +65,36 @@ function context(overrides: Partial<StartupContext> = {}): StartupContext {
 }
 
 describe('Electron Rust app-bound startup', () => {
-  it('builds the debug Rust server and static client before Electron dev starts', () => {
-    const packageJson = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as {
-      scripts: Record<string, string>
+  it('runs the dev prerequisite pipeline and leaves every Rust-side resource available', () => {
+    const projectRoot = process.cwd()
+    const configDir = path.join(projectRoot, '.freshell')
+    const mcpEntry = path.join(projectRoot, 'dist', 'tools', 'freshell-mcp', 'server.js')
+    const hadMcpEntry = existsSync(mcpEntry)
+    const previousMcpEntry = hadMcpEntry ? readFileSync(mcpEntry) : undefined
+
+    try {
+      // Remove this ignored output so a missing build:tools phase cannot be
+      // hidden by a prior local build. `--help` is consumed by concurrently
+      // after the prerequisite commands, so no long-lived dev process starts.
+      rmSync(mcpEntry, { force: true })
+      const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+      const result = spawnSync(npm, ['run', 'electron:dev', '--', '--help'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        timeout: 120_000,
+      })
+      if (result.error) throw result.error
+      expect(result.status, result.stderr || result.stdout).toBe(0)
+
+      const resources = resolveDesktopRuntimeResources(undefined, process.platform, true, configDir)
+      expect(existsSync(resources.serverBinary)).toBe(true)
+      expect(existsSync(path.join(resources.clientDir, 'index.html'))).toBe(true)
+      expect(existsSync(resources.mcpEntry)).toBe(true)
+    } finally {
+      if (previousMcpEntry) writeFileSync(mcpEntry, previousMcpEntry)
+      else rmSync(mcpEntry, { force: true })
     }
-    expect(packageJson.scripts['build:rust:debug']).toBe('cargo build -p freshell-server --locked')
-    expect(packageJson.scripts['electron:dev']).toMatch(
-      /^npm run build:client && npm run build:rust:debug && npm run build:electron &&/,
-    )
-  })
+  }, 120_000)
 
   it('resolves packaged Rust resources without Node backend fields', () => {
     const resources = resolveDesktopRuntimeResources(
