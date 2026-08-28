@@ -8,13 +8,14 @@
 
 **Architecture:** A new memoized selector computes one tier record (`sessionKey → status tier`) by composing the existing local activity collectors (`collectBusySessionKeys`, `collectPaneIdentityActivity`, `collectSessionRefsFromTabs`) with the existing remote ring selector (`deriveRemoteSessionActivity` fields, sameDevice suppression). Default activity sort consumes that tier map: tier rank ascending, then the legacy within-tier comparator (local tiers = pure recency; remote/grey tiers = ratchet-presence-first legacy ordering, which makes grey-touches float to the top of grey). A store-level watcher compares consecutive tier snapshots and dispatches `updateSessionActivity` when a key that was non-grey becomes absent (grey transition). Sidebar rendering is unchanged.
 
-**Tech Stack:** React 18 + Redux Toolkit (client), Vitest unit tests, Playwright e2e against an owned `RustServer` fixture (raw WebSocket device pushes for cross-device state; `fake-bel-cli.mjs` for a 6s stable local-busy window).
+**Tech Stack:** React 18 + Redux Toolkit (client), Vitest unit tests, Playwright e2e against an owned `RustServer` fixture (raw WebSocket device pushes for cross-device state, raw `terminal.input` injection for a ratchet-free local-busy edge).
 
 ## Global Constraints
 
 - Work only in `/home/dan/code/freshell/.worktrees/sidebar-status-sort`, branch `the-usual/sidebar-status-sort`, base_ref `5b8717017db793744f74d192d604d0739f1da2e1`. Never commit to or push `main`. PR creation requires explicit user approval — stop before it.
 - Every vitest/playwright command MUST be prefixed `env -u FRESHELL_BIND_HOST`. Agent shells on this machine export `FRESHELL_BIND_HOST=0.0.0.0`, which non-hermetically fails `test/unit/vite-config.test.ts` (pre-existing failure, out of scope, recorded in the run baseline ledger).
-- Broad suite entry point is the coordinated `npm test` (via `npm run check`); focused client suites use `npm run test:vitest -- ...`; focused e2e uses `npm run test:e2e:chromium -- <spec-path>`. `npm run lint` is a CI-required gate — include it.
+- E2E backend: run e2e through `npm run test:e2e -- --grep "<pattern>"` so the configured `FRESHELL_E2E_BACKEND` (local|cloud) applies. AGENTS.md requires asking the user and persisting the choice when the variable is unset — at plan time it was unset; a user-directed value lives in this plan's Global Constraints once answered. Both grep-patterns below match ONLY the default `chromium` project copies of the named specs (no matrix project duplicates).
+- Broad suite entry point is the coordinated `npm test` (via `npm run check`); focused client suites use `npm run test:vitest -- ...`. `npm run check` does NOT run Playwright — the e2e grep commands are an explicit, separate gate step. `npm run lint` is CI-required — include it.
 - Do NOT change Sidebar render semantics (busy dot, ring visuals). Tiers and the touch watcher only affect SORTING and the sessionActivity ratchet.
 - Tier logic applies only when `sortMode === 'activity'` (the default) and `disableTabPinning` is false (no active search). All other sort modes and search keep legacy paths byte-for-byte.
 - Follow the a11y and lint rules in AGENTS.md for any touched UI file.
@@ -26,12 +27,12 @@
 
 Tasks 1–5 were implemented pre-record (before this run was adopted into the-usual discipline) with red/green TDD cycles; each task below records its as-built state, its failing-red reason, and its green receipt. Task 6 is executable work. Task 7 finishes as-built commits, integration with current origin/main, and the repo gates. Do not re-do Tasks 1–5.
 
-Round-1 fresh-eyes findings are addressed throughout (plan rework commit): the e2e now proves a genuinely locally-discriminating assertion (new Phase 5), covers the local-busy top tier, defines all ledger paths literally, adds lint to the gate, corrects the as-built interface signatures, deletes a prose-text assertion per repo rule, cleans up its temp dirs, and adds the origin/main integration step before the gate.
+Fresh-eyes round 1 and round 2 findings are addressed throughout (plan rework commits): base-staleness integration step, genuinely discriminating e2e phases, deterministic ordering controls, local-busy coverage via ratchet-free WS input injection, 2s busy-window honesty, backend-respecting e2e commands, post-merge e2e rerun, prose-pin deletion, temp-dir uniqueness/cleanup, and corrected as-built interface signatures.
 
 ### Task 1: Status-tier model + sort bucketing in `sortSessionItems` — COMPLETE (as-built)
 
 **Files:**
-- Create: `src/store/selectors/sessionStatusTiers.ts` (tier type + ranks helper)
+- Create: `src/store/selectors/sessionStatusTiers.ts`
 - Modify: `src/store/selectors/sidebarSelectors.ts` (`sortSessionItems` accepts `options.statusTiers`)
 - Test: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
 
@@ -41,68 +42,51 @@ Round-1 fresh-eyes findings are addressed throughout (plan rework commit): the e
 - `sessionStatusTierRank(tiers: Record<string, SessionStatusTier> | undefined, sessionKey: string): number` (absent → grey rank)
 - `sortSessionItems(items: SidebarSessionItem[], sortMode: string, options?: { disableTabPinning?: boolean; statusTiers?: Record<string, SessionStatusTier> }): SidebarSessionItem[]`
 
-**Behavior (as-built):** When `sortMode === 'activity'`, `disableTabPinning` is false, and `statusTiers` is provided: bucket each item by `sessionStatusTierRank(tierMap, `${provider}:${sessionId}`)`; tier-rank ascending; within local tiers (0–1) order by pure recency (`ratchetedActivity ?? timestamp` desc, tiebreak `provider:sessionId`); within remote/grey tiers (2–4) keep the legacy **withoutTabs** comparator (ratchet-presence first, then recency). Items absent from the tier map are grey even when `hasTab` — the producing selector owns the hasTab→tier mapping. When `statusTiers` is absent (or pinning/search/non-activity mode), the legacy path runs unchanged.
+**Behavior (as-built):** In default activity mode with `statusTiers` provided: bucket by tier rank (absent → grey); local tiers (0–1) order by pure recency (`ratchetedActivity ?? timestamp` desc, tiebreak `provider:sessionId` ascending); remote/grey tiers (2–4) keep the legacy **withoutTabs** comparator (ratchet-presence first, then recency); when `statusTiers` absent / search active / non-activity mode, legacy runs unchanged.
 
-**Red reason (original):** tiers did not exist. **Green receipt:** 45/45 in the tiers describe block + full existing suite (2026-08-27).
+**Green receipt:** 45/45 tiers describe + full existing suite (2026-08-27).
 
 ### Task 2: `makeSelectSessionStatusTiers` memoized selector factory — COMPLETE (as-built)
 
-**Files:** `src/store/selectors/sessionStatusTiers.ts` (factory added), `test/unit/client/store/selectors/sessionStatusTiers.test.ts` (new).
-
 **Interfaces:** Consumes `collectBusySessionKeys`, `collectPaneIdentityActivity` (src/lib/pane-activity.ts), `collectSessionRefsFromTabs` (src/lib/session-utils.ts), `deriveRemoteSessionActivity` (tabsRegistrySelectors.ts). Produces `makeSelectSessionStatusTiers(): (state: RootState) => Record<string, SessionStatusTier>`.
 
-**Behavior (as-built):** local-busy if key in busy set, else local-open for every local identity; remote tier from `remoteActivityBySessionKey` with sameDevice suppression (busy outranks open); local outranks remote; plain-map output for structural sharing.
-
-**Red reason:** selector did not exist. **Green receipt:** 7/7 (2026-08-27).
+**Green receipt:** 7/7 (2026-08-27).
 
 ### Task 3: Wire tiers into `makeSelectSortedSessionItems` — COMPLETE (as-built)
 
-**Files:** `src/store/selectors/sidebarSelectors.ts`, `test/unit/client/store/selectors/sidebarSelectors.test.ts` (`createSelectorState` extended with `claudeActivityByTerminalId` + `remoteOpen`; new describe `makeSelectSortedSessionItems status tiers (default activity mode)`).
-
-**Behavior (as-built):** module-scope `selectSessionStatusTiers` instance feeds `sortSessionItems` in default mode; grey-touch ordering pinned at selector level (touched grey out-orders newer pristine grey inside the grey tier).
-
-**Red reason:** map existed but was not wired. **Green receipt:** 208 tests across 6 files (2026-08-27).
+Module-scope `selectSessionStatusTiers` instance feeds `sortSessionItems` in default mode; grey-touch ordering pinned at selector level. **Green receipt:** 208 tests / 6 files (2026-08-27).
 
 ### Task 4: Grey-transition touch watcher — COMPLETE (as-built)
 
-**Files:**
-- Create: `src/store/sessionGreyTouch.ts`
-- Test: `test/unit/client/store/sessionGreyTouch.test.ts` (new, 7 tests)
+**Interfaces (verified):** `type MinimalStore = Pick<Store<RootState>, 'getState' | 'subscribe' | 'dispatch'>`; `startSessionGreyTouchWatcher(store: MinimalStore): () => void`. Behavior: non-grey→absent transition dispatches `updateSessionActivity({ sessionId: key, lastInputAt: Date.now() })`; `previousTiers` assigned BEFORE dispatch (re-entrancy guard); `remoteOpen` persists across WS disconnect (blips never touch).
 
-**Interfaces (verified against source):**
-- `type MinimalStore = Pick<Store<RootState>, 'getState' | 'subscribe' | 'dispatch'>`
-- `startSessionGreyTouchWatcher(store: MinimalStore): () => void` — initial tier snapshot taken at start (no retroactive touches); returns a stop handle.
-
-**Behavior (as-built):** key present non-grey in the previous snapshot + absent in the current snapshot → `store.dispatch(updateSessionActivity({ sessionId: key, lastInputAt: Date.now() }))`. `previousTiers` assigned BEFORE dispatch (re-entrancy guard for the synchronous redispatch). `remoteOpen` persists across WS disconnect → blips never touch.
-
-**Red reason:** watcher did not exist. **Green receipt:** 7/7 (2026-08-27).
+**Files:** `src/store/sessionGreyTouch.ts` (new), `test/unit/client/store/sessionGreyTouch.test.ts` (new, 7/7 green 2026-08-27).
 
 ### Task 5: App wiring + settings label sync — COMPLETE (as-built)
 
-**Files:**
-- Modify: `src/App.tsx` (watcher start after `startTabRegistrySync`; stop at both `stopTabRegistrySync?.()` sites)
-- Modify: `src/components/settings/WorkspaceSettings.tsx:53` (`Activity (tabs first)` → `Activity (status first)`)
-- Modify: `docs/index.html:1102` (mock synced)
-- Test: `test/unit/client/components/SettingsView.behavior.test.tsx` — NOTE (round-1 finding M8): the change originally UPDATED the prose-text pin (`option[value="activity"]` textContent). Per the repo rule, that assertion must be DELETED, keeping the behavioral remainder (option presence, dispatch on change). This deletion is folded into Task 7's wiring/label commit and is part of that commit's verification.
+**Files:** `src/App.tsx` (watcher start/stop wiring), `src/components/settings/WorkspaceSettings.tsx:53` (`Activity (tabs first)` → `Activity (status first)`), `docs/index.html:1102` (mock synced), `test/unit/client/components/SettingsView.behavior.test.tsx` — NOTE (round-1 finding): the change originally UPDATED the prose-text pin (`option[value="activity"]` textContent). Per repo rule it must instead be DELETED, keeping the behavioral remainder. Folded into Task 7 Step 1.
 
 **Green receipt (pre-deletion):** 74 tests across settings/App/watcher suites; typecheck clean.
 
 ---
 
-### Task 6: E2E proof on the Rust server — tier ordering, local-busy top tier, grey-touch jump
+### Task 6: E2E proof on the Rust server — remote tiers, grey-touch jump, local-busy top tier
 
 **Files:**
 - Create: `test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts`
 
 **Interfaces:**
-- Verbatim-copied helpers per suite convention from `sidebar-remote-status-rings-rust.spec.ts`: `installFakeCli`, `selectShellIfPickerShowing`, `bootAndConnect`, `declineRecoveryOfferIfShowing`, `nextMessage`, `connectRawDevice`, `buildClaudeSessionJsonl` (verbatim body, extended ONLY with `t0`/`t1` ISO params), `buildRemoteClaudeTabRecord` (verbatim body, parameterized to `(sessionId, busy)`), row/ring helpers (verbatim, parameterized to an arbitrary id). New helpers: `expectSidebarOrder`, `focusOpenSessionRow` (documented below).
-- Local busy induction: type a prompt containing `slow` into the claude pane's xterm and press Enter. With `fake-bel-cli.mjs` the Rust activity engine emits provisional busy on submit and holds it ~6s (the fixture's slow-turn window) until the BEL turn-complete; proven pattern from `terminal-activity-rust.spec.ts`. The busy phase collapses again after the BEL — the order assertion polls and must observe the flipped order INSIDE that window.
+- Verbatim-copied helpers per suite convention from `sidebar-remote-status-rings-rust.spec.ts`: `installFakeCli`, `selectShellIfPickerShowing`, `bootAndConnect`, `declineRecoveryOfferIfShowing`, `nextMessage`, `connectRawDevice` (extended with a `sendRaw(frame)` escape hatch on the returned object), `buildClaudeSessionJsonl` (verbatim body + `t0`/`t1` params), remote-record builder (verbatim body, `(sessionId, busy)`), row/ring helpers (verbatim, parameterized). New helpers: `expectSidebarOrder`, `getSessionTerminalId` (reads pane layouts via the test harness state).
+- Fresh session ids are FIXED canonical v4 UUIDs chosen so the alphabetical tiebreak direction is deterministic (see Phase 4 note): S_GREY `…0001` < S_BUSY `…0002` < S_OPEN `…0003`.
+- The local-busy discriminator (round 1 + 2): typing into a page xterm both marks busy AND slides `updateSessionActivity`/`recordPaneTabActivity` ratchets, and opened tabs carry minute-bucketed tab recency (`tab-recency.ts`) that `buildSessionItems` maxes into the item timestamp — any UI-typed busy is confounded with the legacy ratchet float. So busy is induced RATCHET-FREE: a raw-WS `terminal.input` frame from device B (`connectRawDevice.sendRaw`) targeting S_OPEN's terminalId. Sidebar-clicking an open session row only focuses the tab and sets `lastInputAt: undefined` (tabsSlice.ts); the server's activity engine emits the provisional-busy on Enter, broadcast `claude.activity.updated` reaches the page, and the tier flip is observably IMPOSSIBLE under the legacy comparator.
+- Busy-window honesty (round 2 minor): the resumed session's seeded JSONL is a resolvable truth source, so the first submit probe (CLAUDE_SUBMIT_GRACE_MS = 2s, claude.rs:37) finds NoTurnStarted and silently reverts the provisional busy. Re-arming via repeated Enter (claude.rs:198 — repeat Enter while provisional resets the grace) extends the window: three Enters at t0/t0+1.5s/t0+3.0s hold busy until ≈t0+5s. Order polls use 15s deadlines with early exponential attempts (~100ms, 250ms, 500ms, 1s …) landing multiple times inside the window.
+- PROJECT_DIR lives under the per-run `sharedRoot` (not a fixed `/tmp` path) and afterAll removes sharedRoot.
 
 **Red mode (pre-feature), per phase:**
-- Phase 1 fails: legacy sort ignores remote state; order stays `[S_GREY, S_BUSY, S_OPEN]`.
-- Phase 2 fails: no watcher + no tiers → order stays recency `[S_GREY, S_BUSY, S_OPEN]`.
-- Phase 5 fails: legacy hasTab-first-with-recency keeps `[S_GREY, S_OPEN, S_BUSY]` for the two open tabs; only the tier-0 vs tier-1 rank flips busy S_OPEN above newer S_GREY.
-- Phases 3/4 are stability guards (both orders agree) — they exist so Phase 5's discriminator is reached in a controlled state.
+- Phase 1 fails: legacy ignores remote state; order stays `[S_GREY, S_BUSY, S_OPEN]`.
+- Phase 2 fails: no watcher + no tiers → remote-drop has no effect; recency stays `[S_GREY, S_BUSY, S_OPEN]` (the asserted `[S_OPEN, S_BUSY, S_GREY]` requires the touch AND tier ordering).
+- Phase 5 fails: legacy hasTab-first-with-recency keeps `[S_GREY, S_OPEN, S_BUSY]`; the flip to `[S_OPEN, S_GREY, S_BUSY]` requires the local-busy tier AND is impossible via keystroke-ratchet because the busy injection bypasses the page (no `updateSessionActivity`).
+- Phases 3/4 are stability guards (both orders agree by construction).
 
 - [ ] **Step 1: Create the behavioral spec**
 
@@ -111,40 +95,57 @@ Create the file with EXACTLY this content:
 ```ts
 /**
  * Sidebar status-tier sort (default activity mode) — E2E pin of cross-device
- * tier ordering, local-busy top tier, and the non-grey→grey "touch" jump,
- * against the REAL Rust server. Sibling of
- * sidebar-remote-status-rings-rust.spec.ts; same raw-WS second-device harness
- * (helpers copied VERBATIM per suite convention), same push discipline
- * (monotonic snapshotRevision, sequential pushes, exact ack-count match),
- * same 30s-query liveness model for REMOTE-driven assertions (poll ≤45s).
- * LOCAL assertions (row clicks, busy induction) are store-driven and far
- * faster; their polls use shorter deadlines accordingly.
+ * tier ordering, the non-grey→grey "touch" jump, and the local-busy top
+ * tier, against the REAL Rust server. Sibling of
+ * sidebar-remote-status-rings-rust.spec.ts; same raw-WS second-device
+ * harness (helpers copied VERBATIM per suite convention), same push
+ * discipline (monotonic snapshotRevision, sequential pushes, exact
+ * ack-count match), same 30s-query liveness model for REMOTE-driven
+ * assertions (poll ≤45s). Local store-driven phases poll on shorter
+ * deadlines.
+ *
+ * Ordering determinism (why fixed UUIDs): opening a session feeds its tab
+ * through buildSessionItems' timestamp max with a MINUTE-bucketed tab
+ * recency (tab-recency.ts), so two sessions opened seconds apart tie on
+ * timestamp; the legacy/tier tiebreak is provider:sessionId ASCENDING.
+ * Fixed ids S_GREY < S_BUSY < S_OPEN alphabetically make every tie land on
+ * the asserted order, and S_GREY is always opened SECOND so even a crossed
+ * minute boundary keeps the same recency order.
+ *
+ * Local-busy without the keystroke ratchet: typing in a page xterm would
+ * ALSO dispatch updateSessionActivity (TerminalView.tsx) — which floats the
+ * session under the LEGACY comparator too, and sidebar row clicks do not
+ * ratchet (openSessionTab sets lastInputAt: undefined). To isolate the tier
+ * effect, Phase 5 injects Enter keys through a raw WS terminal.input from
+ * device B (server-side submit; crates/freshell-ws/src/terminal.rs:874ff),
+ * producing provisional busy on the page WITHOUT any page-side ratchet.
+ * The resumed session's seeded JSONL is a resolvable truth source, so the
+ * 2s submit probe (claude.rs, CLAUDE_SUBMIT_GRACE_MS) reverts the busy —
+ * three Enters 1.5s apart re-arm the grace (repeat-Enter rule, claude.rs:198)
+ * and hold busy ≈5s, long enough for multiple poll attempts.
  *
  * Scenario (single serial test; the page is device A):
  * - Phase 0: three seeded claude sessions, all grey → pure activity recency
- *   newest→oldest (S_GREY, S_BUSY, S_OPEN; seeded timestamps control it —
- *   the indexer's last_activity_at comes from message timestamps,
- *   parse/claude.rs).
- * - Phase 1: device B pushes S_OPEN open (remote-green) + S_BUSY busy
- *   (remote-blue) → tier order beats raw recency: [S_BUSY, S_OPEN, S_GREY].
- *   NON-VACUOUS: legacy would stay [S_GREY, S_BUSY, S_OPEN].
+ *   newest→oldest (last_activity_at comes from message timestamps,
+ *   parse/claude.rs): [S_GREY, S_BUSY, S_OPEN].
+ * - Phase 1: device B pushes S_OPEN open + S_BUSY busy → tiers beat raw
+ *   recency: [S_BUSY, S_OPEN, S_GREY]. NON-VACUOUS: legacy keeps the P0
+ *   order (remote state is invisible to it).
  * - Phase 2: device B drops S_BUSY (remote-busy → grey) → the transition
  *   "touch" ratchets S_BUSY ABOVE pristine-grey S_GREY despite S_GREY's
  *   newer timestamp: [S_OPEN, S_BUSY, S_GREY]. NON-VACUOUS: without the
- *   watcher (and without tiers), recency keeps [S_GREY, S_BUSY, S_OPEN].
+ *   watcher + tiers the order never leaves [S_GREY, S_BUSY, S_OPEN].
  * - Phase 3: click S_OPEN locally → local-green; ring suppressed;
- *   data-has-tab="true" awaited. Stability step: order stays
- *   [S_OPEN, S_BUSY, S_GREY].
- * - Phase 4: click S_GREY locally → local-green for both. Pure recency
- *   inside tier 1 puts the newer S_GREY first: [S_GREY, S_OPEN, S_BUSY].
- *   Stability step (legacy agrees).
- * - Phase 5: focus S_OPEN's tab (its sidebar row click focuses the existing
- *   tab — Sidebar.tsx handleTabSessionClick existing-branch), type a `slow`
- *   prompt + Enter into its xterm → provisional local-busy for ~6s
- *   (fake-bel-cli.mjs slow-turn). Tier 0 outranks tier 1 despite S_GREY's
- *   NEWER timestamp: [S_OPEN, S_GREY, S_BUSY]. NON-VACUOUS: legacy
- *   hasTab-first-recency keeps [S_GREY, S_OPEN, S_BUSY]. The order poll is
- *   allowed only 20s and MUST catch the flip inside the ~6s busy window.
+ *   data-has-tab="true" awaited. Stability step: [S_OPEN, S_BUSY, S_GREY].
+ * - Phase 4: ALSO click S_GREY locally → both local-green, no ratchets,
+ *   tier-1 tie → fixed-id tiebreak (or crossed-minute recency; both
+ *   branches produce [S_GREY, S_OPEN, S_BUSY]). Stability step.
+ * - Phase 5: device B sends terminal.input Enter x3 (re-armed ~5s busy) to
+ *   S_OPEN's pane → tier 0 busy OUTRANKS tier 1 open: [S_OPEN, S_GREY,
+ *   S_BUSY], then busy reverts and the order returns to
+ *   [S_GREY, S_OPEN, S_BUSY]. NON-VACUOUS flip: legacy keeps
+ *   [S_GREY, S_OPEN, S_BUSY] throughout (no page-side input ever ratchets
+ *   S_OPEN).
  *
  * Owns a RustServer directly (ephemeral loopback port -- NEVER 3001/3002).
  */
@@ -152,7 +153,6 @@ import { test, expect } from '@playwright/test'
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
@@ -266,12 +266,15 @@ function nextMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs 
 
 type RawSnapshotRecord = Record<string, unknown> & { status?: string }
 
-// Copied VERBATIM from sidebar-remote-status-rings-rust.spec.ts. Handshake:
-// bare ws:// connect then in-band {type:'hello', token, protocolVersion} →
-// ready. pushSnapshot assigns monotonically increasing snapshotRevision and
-// awaits the matching ack (accepted + open/closed record counts).
+// Copied VERBATIM from sidebar-remote-status-rings-rust.spec.ts, PLUS the
+// `sendRaw` escape hatch (used by Phase 5 to inject a ratchet-free
+// terminal.input busy edge). Handshake: bare ws:// connect then in-band
+// {type:'hello', token, protocolVersion} → ready. pushSnapshot assigns
+// monotonically increasing snapshotRevision and awaits the matching ack
+// (accepted + open/closed record counts).
 async function connectRawDevice(wsUrl: string, token: string): Promise<{
   pushSnapshot: (opts: { deviceId: string; deviceLabel: string; clientInstanceId: string; records: RawSnapshotRecord[] }) => Promise<void>
+  sendRaw: (frame: Record<string, unknown>) => void
   close: () => void
 }> {
   const ws = new WebSocket(wsUrl)
@@ -327,6 +330,9 @@ async function connectRawDevice(wsUrl: string, token: string): Promise<{
         )
       }
     },
+    sendRaw(frame) {
+      ws.send(JSON.stringify(frame))
+    },
     close() {
       ws.removeAllListeners()
       ws.close()
@@ -335,22 +341,23 @@ async function connectRawDevice(wsUrl: string, token: string): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// Scenario constants: three seeded claude sessions with caller-pinned
-// timestamps so the all-grey Phase-0 order is deterministic (S_GREY newest,
-// S_BUSY middle, S_OPEN oldest). Anchored to NOW minus fixed offsets so the
-// default sidebar window + 30-day retention always include them.
+// Scenario constants. Fixed canonical v4 UUIDs, ordered S_GREY < S_BUSY <
+// S_OPEN alphabetically, make the ascending provider:sessionId tiebreak
+// deterministic when minute-bucketed tab recencies tie (see header).
+// Timestamps anchored to NOW minus fixed offsets so the default sidebar
+// window + 30-day retention always include them, while their spacing pins
+// the all-grey Phase-0 order: S_GREY newest, S_BUSY middle, S_OPEN oldest.
 // ---------------------------------------------------------------------------
 
-const PROJECT_DIR = '/tmp/sidebar-status-tier-sort-project'
 const DEVICE_B_ID = 'e2e-device-b-status-sort'
 const DEVICE_B_CLIENT = 'e2e-device-b-status-sort-window'
 
 const NOW = Date.now()
 const T = (hoursAgo: number): string => new Date(NOW - hoursAgo * 3_600_000).toISOString()
 
-const S_OPEN = randomUUID() // oldest; remote-open in P1, clicked open locally in P3, made locally-BUSY in P5
-const S_BUSY = randomUUID() // middle; remote-busy in P1, dropped to grey (touch) in P2
-const S_GREY = randomUUID() // newest; pristine grey until clicked open locally in P4
+const S_GREY = '00000000-0000-4000-8000-000000000001' // newest; pristine grey until clicked open in P4
+const S_BUSY = '00000000-0000-4000-8000-000000000002' // middle; remote-busy in P1, dropped to grey (touch) in P2
+const S_OPEN = '00000000-0000-4000-8000-000000000003' // oldest; remote-open in P1, local-open in P3, local-BUSY in P5
 
 const S_OPEN_T0 = T(3.5)
 const S_OPEN_T1 = T(3)
@@ -415,7 +422,7 @@ async function expectRing(row: ReturnType<typeof sessionRow>, kind: 'busy' | 'op
  * under [data-testid="sidebar-session-list"]. Full-array equality against
  * three known ids is non-vacuous: it fails on a missing row, an extra row,
  * or a wrong order. Remote-driven phases use the 45s default (one 30s query
- * interval + margin); local store-driven phases pass ~15s.
+ * interval + margin); local store-driven phases pass shorter deadlines.
  */
 async function expectSidebarOrder(
   page: import('@playwright/test').Page,
@@ -435,11 +442,77 @@ async function expectSidebarOrder(
     .toEqual(expectedIds)
 }
 
+/**
+ * The terminalId backing the page's own claude tab for sessionId, read from
+ * the client pane-layout store (no WS surface needed; same walk the
+ * terminal-activity spec performs via harness.getPaneLayout).
+ */
+async function getSessionTerminalId(
+  page: import('@playwright/test').Page,
+  sessionId: string,
+): Promise<string> {
+  const collectLeaves = (node: any): any[] => {
+    if (!node) return []
+    if (node.type === 'leaf') return [node]
+    if (node.type === 'split') return [...collectLeaves(node.children?.[0]), ...collectLeaves(node.children?.[1])]
+    return []
+  }
+  await expect
+    .poll(
+      async () =>
+        page.evaluate((sid) => {
+          const state = window.__FRESHELL_TEST_HARNESS__?.getState?.()
+          const layouts = state?.panes?.layouts ?? {}
+          for (const layout of Object.values(layouts)) {
+            const collect = (node: any): any[] => {
+              if (!node) return []
+              if (node.type === 'leaf') return [node]
+              if (node.type === 'split') return [...collect(node.children?.[0]), ...collect(node.children?.[1])]
+              return []
+            }
+            const hit = collect(layout).find(
+              (leaf: any) =>
+                leaf?.content?.kind === 'terminal' &&
+                leaf?.content?.sessionRef?.provider === 'claude' &&
+                leaf?.content?.sessionRef?.sessionId === sid &&
+                leaf?.content?.terminalId,
+            )
+            if (hit) return hit.content.terminalId
+          }
+          return null
+        }, sessionId),
+      { timeout: 30_000 },
+    )
+    .not.toBeNull()
+  return (await page.evaluate((sid) => {
+    const state = window.__FRESHELL_TEST_HARNESS__?.getState?.()
+    const layouts = state?.panes?.layouts ?? {}
+    for (const layout of Object.values(layouts)) {
+      const collect = (node: any): any[] => {
+        if (!node) return []
+        if (node.type === 'leaf') return [node]
+        if (node.type === 'split') return [...collect(node.children?.[0]), ...collect(node.children?.[1])]
+        return []
+      }
+      const hit = collect(layout).find(
+        (leaf: any) =>
+          leaf?.content?.kind === 'terminal' &&
+          leaf?.content?.sessionRef?.provider === 'claude' &&
+          leaf?.content?.sessionRef?.sessionId === sid &&
+          leaf?.content?.terminalId,
+      )
+      if (hit) return hit.content.terminalId
+    }
+    return null
+  }, sessionId)) as string
+}
+
 test.describe.serial('sidebar status-tier sort (rust)', () => {
   test.setTimeout(300_000)
   let server: RustServer
   let info: TestServerInfo
   let sharedRoot = ''
+  let projectDir = ''
   let deviceB: Awaited<ReturnType<typeof connectRawDevice>>
 
   test.beforeAll(async () => {
@@ -452,19 +525,16 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
       ensureRustServerBuilt()
     }
     sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'status-tier-sort-'))
+    projectDir = path.join(sharedRoot, 'project')
     const binDir = path.join(sharedRoot, 'bin')
-    // fake-bel-cli (same fixture terminal-activity-rust.spec.ts uses): prints
-    // a prompt, stays running, rings BEL after each stdin "turn" — a `slow`
-    // prompt holds busy ~6s (stable flip window for the Phase-5 poll); a
-    // plain fake-claude-cli gives no controlled busy window.
-    const fakeClaude = await installFakeCli(binDir, 'claude', 'fake-bel-cli.mjs')
+    const fakeClaude = await installFakeCli(binDir, 'claude', 'fake-claude-cli.mjs')
     server = new RustServer({
       env: {
         CLAUDE_CMD: fakeClaude,
         FAKE_CLAUDE_ARGV_LOG: path.join(sharedRoot, 'claude-argv.jsonl'),
       },
       setupHome: async (homeDir: string) => {
-        await fs.mkdir(PROJECT_DIR, { recursive: true })
+        await fs.mkdir(projectDir, { recursive: true })
         // enable the provider the scenario uses
         const freshellDir = path.join(homeDir, '.freshell')
         await fs.mkdir(freshellDir, { recursive: true })
@@ -476,20 +546,20 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
           }, null, 2),
         )
         // seed three claude sessions so the sidebar has three grey rows
-        const slug = PROJECT_DIR.replace(/\//g, '-')
+        const slug = projectDir.replace(/\//g, '-')
         const projDir = path.join(homeDir, '.claude', 'projects', slug)
         await fs.mkdir(projDir, { recursive: true })
         await fs.writeFile(
           path.join(projDir, `${S_OPEN}.jsonl`),
-          buildClaudeSessionJsonl(S_OPEN, PROJECT_DIR, 'Status tier: local busy flip', S_OPEN_T0, S_OPEN_T1),
+          buildClaudeSessionJsonl(S_OPEN, projectDir, 'Status tier: local busy flip', S_OPEN_T0, S_OPEN_T1),
         )
         await fs.writeFile(
           path.join(projDir, `${S_BUSY}.jsonl`),
-          buildClaudeSessionJsonl(S_BUSY, PROJECT_DIR, 'Status tier: grey touch jump', S_BUSY_T0, S_BUSY_T1),
+          buildClaudeSessionJsonl(S_BUSY, projectDir, 'Status tier: grey touch jump', S_BUSY_T0, S_BUSY_T1),
         )
         await fs.writeFile(
           path.join(projDir, `${S_GREY}.jsonl`),
-          buildClaudeSessionJsonl(S_GREY, PROJECT_DIR, 'Status tier: local open control', S_GREY_T0, S_GREY_T1),
+          buildClaudeSessionJsonl(S_GREY, projectDir, 'Status tier: local open control', S_GREY_T0, S_GREY_T1),
         )
       },
     })
@@ -500,12 +570,9 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
   test.afterAll(async () => {
     deviceB?.close()
     await server?.stop()
-    // The RustServer fixture removes only its isolated HOME; the shared fake
-    // root and the fixed PROJECT_DIR are this spec's own litter (round-1
-    // fresh-eyes finding). recursive+force: prior partial runs must not fail
-    // the suite.
+    // The RustServer fixture removes only its isolated HOME; sharedRoot (the
+    // fake binary dir + the scenario project dir) is this spec's own litter.
     await fs.rm(sharedRoot, { recursive: true, force: true })
-    await fs.rm(PROJECT_DIR, { recursive: true, force: true })
   })
 
   test('tiers order default sort; grey-touch jumps; local-busy beats newer local-open', async ({ page }) => {
@@ -523,7 +590,8 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     await expectNoRemoteStatusRing(rowGrey)
 
     // Phase 1 — remote-green S_OPEN + remote-blue S_BUSY. Tiers beat raw
-    // recency: [remote-busy, remote-open, grey].
+    // recency: [remote-busy, remote-open, grey]. Rings confirm the remote
+    // state is live before the sort assertion's poll completes.
     await deviceB.pushSnapshot({
       deviceId: DEVICE_B_ID,
       deviceLabel: 'E2E Device B',
@@ -549,7 +617,7 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     await expectNoRemoteStatusRing(rowBusy)
     await expectRing(rowOpen, 'open')
 
-    // Phase 3 — open S_OPEN locally (fake bel CLI runs it). Local-green;
+    // Phase 3 — open S_OPEN locally (fake claude CLI runs it). Local-green;
     // ring suppressed (local wins); data-has-tab awaited so the local tier
     // is registered before Phase 4. Stability: order unchanged.
     await rowOpen.click()
@@ -557,44 +625,47 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     await expectNoRemoteStatusRing(rowOpen)
     await expectSidebarOrder(page, [S_OPEN, S_BUSY, S_GREY])
 
-    // Phase 4 — ALSO open S_GREY locally. Both local-green; pure recency
-    // inside tier 1 puts the newer S_GREY first. Stability guard before the
-    // discriminating Phase 5 (legacy hasTab-first agrees here).
+    // Phase 4 — ALSO open S_GREY locally. Both local-green; tier 1 pure
+    // recency. Opening feeds tab-derived minute-bucketed recency into the
+    // item timestamp: S_GREY opened SECOND so a crossed boundary puts it
+    // first, and a same-minute tie falls to the provider:sessionId
+    // tiebreak where S_GREY ('…0001') < S_OPEN ('…0003'). Both branches
+    // deterministically yield [S_GREY, S_OPEN, S_BUSY]. Row clicks do not
+    // ratchet (openSessionTab sets lastInputAt: undefined), so neither
+    // model can change this — stability only.
     await rowGrey.click()
     await expect(rowGrey).toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
     await expectNoRemoteStatusRing(rowGrey)
     await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY])
 
-    // Phase 5 — focus S_OPEN's existing tab via its sidebar row (clicking an
-    // OPEN session row focuses the tab; it does not duplicate). Type a
-    // `slow` prompt + Enter into its xterm: provisional local-busy holds
-    // ~6s before the BEL turn completes. Tier 0 must beat tier 1 despite
-    // S_GREY's NEWER timestamp — legacy recency would keep
-    // [S_GREY, S_OPEN, S_BUSY], so catching [S_OPEN, S_GREY, S_BUSY] inside
-    // the busy window is the local-busy discriminator. Poll deadline 20s
-    // covers many polling attempts inside the 6s window; a miss means the
-    // flip never rendered (a REAL failure), not a slow query.
-    await rowOpen.click() // focuses the existing S_OPEN tab
-    const xterm = page.locator('.xterm:visible').first()
-    await xterm.click()
-    await page.keyboard.type('slow: local-busy tier flip')
-    await page.keyboard.press('Enter')
-    await expectSidebarOrder(page, [S_OPEN, S_GREY, S_BUSY], 20_000)
+    // Phase 5 — local-busy WITHOUT the page-side keystroke ratchet: device
+    // B injects terminal.input Enter frames into S_OPEN's pane. The page
+    // never saw a keystroke, so the legacy comparator CANNOT float S_OPEN;
+    // only the local-busy tier (rank 0) can move it above S_GREY.
+    // The resumed session's JSONL is resolvable, so the 2s submit probe
+    // reverts the provisional busy — three Enters 1.5s apart re-arm the
+    // grace and hold busy ≈5s (see header).
+    const sOpenTerminalId = await getSessionTerminalId(page, S_OPEN)
+    for (const text of ['busy one', 'busy two', 'busy three']) {
+      deviceB.sendRaw({ type: 'terminal.input', terminalId: sOpenTerminalId, data: `${text}\r` })
+      await page.waitForTimeout(1_500)
+    }
+    await expectSidebarOrder(page, [S_OPEN, S_GREY, S_BUSY], 15_000)
+    // After the grace lapses, busy reverts and tier 1 recency returns.
+    await expectSidebarOrder(page, [S_GREY, S_OPEN, S_BUSY], 30_000)
   })
 })
 ```
 
-- [ ] **Step 2: Run the spec**
+- [ ] **Step 2: Run the spec on the configured backend**
 
-Run: `env -u FRESHELL_BIND_HOST npm run test:e2e:chromium -- specs/sidebar-status-tier-sort-rust.spec.ts`
+Run: `env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort"`
 
-Expected: PASS (1 test). First run in this worktree may compile the Rust release server inside `beforeAll` (600s hook budget). If it fails, diagnose per phase (the plan's phase comments explain each expected state); never weaken assertions, widen deadlines, or drop phases.
+Expected: PASS (1 test). First local run in this worktree may compile the Rust release server inside `beforeAll` (600s hook budget; on the cloud backend the image ships a prebuilt binary). If it fails, diagnose per phase (the spec header explains each expected state); never weaken assertions, widen deadlines beyond the documented liveness/grace model, or drop phases.
 
-- [ ] **Step 3: Impacted-test verification**
+- [ ] **Step 3: Impacted-test verification (same backend)**
 
-Impacted set = the new spec plus its sibling (proves no harness/config interference):
-
-Run: `env -u FRESHELL_BIND_HOST npm run test:e2e:chromium -- specs/sidebar-status-tier-sort-rust.spec.ts specs/sidebar-remote-status-rings-rust.spec.ts`
+Run: `env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort|remote status rings"`
 
 Expected: PASS (both files green). The repo-wide gate is Task 7, not this step.
 
@@ -609,15 +680,15 @@ git commit -m "test(e2e): prove sidebar status tiers, grey-touch jump, and local
 
 **Files:** commit splits + one 1-line test deletion; no new code.
 
-- [ ] **Step 1: Delete the prose-text label assertion (round-1 finding M8)**
+- [ ] **Step 1: Delete the prose-text label assertion**
 
-In `test/unit/client/components/SettingsView.behavior.test.tsx` (the sortMode test around line 221–225), DELETE this line:
+In `test/unit/client/components/SettingsView.behavior.test.tsx` (the sortMode test), DELETE this line and keep the behavioral remainder (option presence, change dispatch):
 
 ```ts
       expect(sortModeSelect.querySelector('option[value="activity"]')?.textContent).toBe('Activity (status first)')
 ```
 
-and keep the behavioral remainder (option presence, change dispatch). Verify: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/components/SettingsView.behavior.test.tsx` → PASS.
+Verify: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/components/SettingsView.behavior.test.tsx` → PASS.
 
 - [ ] **Step 2: Focused commits for the as-built work**
 
@@ -630,34 +701,40 @@ git add src/App.tsx src/components/settings/WorkspaceSettings.tsx docs/index.htm
 git commit -m "feat(sidebar): wire grey-touch watcher; rename activity sort label to status-first"
 ```
 
-Verify `git status` clean afterwards. (Task 6's spec file may already be committed if Task 6 executed first — either order is valid; do not interleave files between these commits.)
+Verify `git status` clean afterwards. (If Task 6 committed first, do not interleave its file into these commits.)
 
-- [ ] **Step 3: Integrate current origin/main before the gate**
+- [ ] **Step 3: Integrate current origin/main**
 
-origin/main has advanced beyond base_ref (it was `6c541bec6` at plan-rework time, ~35 commits ahead of `5b8717017`, touching src/App.tsx and the playwright config this work relies on). Merge it into the branch (merge commit — keeps base_ref semantics and the review trail), resolve conflicts conservatively (always prefer the union of behaviors: my watcher wiring + upstream App.tsx changes; never drop upstream work), then re-verify focused suites touched by the conflict surface:
+origin/main has advanced beyond base_ref (6c541bec6 at plan-rework time), touching src/App.tsx and the playwright config this work relies on. Merge it into the branch (merge commit — keeps base_ref semantics and the review trail), resolve conflicts conservatively (union of behaviors; never drop upstream work), then re-verify focused suites:
 
-Run: `git fetch origin && git merge origin/main --no-edit` then
+Run: `git fetch origin && git merge origin/main --no-edit`
 Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sessionStatusTiers.test.ts test/unit/client/store/sessionGreyTouch.test.ts`
 
-Expected: merge completes; suites PASS. If a conflict resolution changes behavior, re-run the coordinating focused suites plus `npm run typecheck` before the gate.
+Expected: merge completes; suites PASS.
 
-- [ ] **Step 4: Lint + coordinated suite gate**
+- [ ] **Step 4: Post-merge e2e rerun (required — `npm run check` does NOT run Playwright)**
+
+Run: `env -u FRESHELL_BIND_HOST npm run test:e2e -- --grep "status-tier sort|remote status rings"`
+
+Expected: PASS on the configured `FRESHELL_E2E_BACKEND` (AGENTS.md: the affected specs must pass on the configured backend before any PR).
+
+- [ ] **Step 5: Lint + coordinated suite gate**
 
 Run: `env -u FRESHELL_BIND_HOST npm run lint`
-Expected: 0 errors (warnings acceptable only if pre-existing at base_ref — check with `git stash`-free comparison via base worktree receipts only if a new warning appears).
+Expected: 0 errors (a NEW warning vs base_ref counts as failure).
 
 Run: `env -u FRESHELL_BIND_HOST npm run check`
 Expected: PASS — typecheck + coordinated client/server/electron suites, green excluding pre-existing failures enumerated in the run baseline ledger (currently none; a failure must reproduce at base_ref before it may be excused).
 
-- [ ] **Step 5: Record gate results**
+- [ ] **Step 6: Record gate results**
 
 Append exact commands, exit codes, and outcome summaries to the progress ledger at `/home/dan/code/freshell/.git/worktrees/sidebar-status-sort/usual-sdd/progress.md` (resolve via `git rev-parse --git-dir` if moved), plus reports under `/home/dan/code/freshell/.worktrees/.the-usual-logs/sidebar-status-sort/reports/`, and update `/home/dan/code/freshell/.worktrees/.the-usual-logs/sidebar-status-sort/run-state.md`.
 
 ## Self-review result
 
-- Spec coverage: both user requirements (tier ordering; non-grey→grey touch) map to production behavior (Tasks 1–5) and user-level e2e proof (Task 6, phases 1, 2, 5 discriminating; 3/4 stability). Task 7 includes origin/main integration + lint + coordinated gate, matching repo requirements.
-- No silent deferrals: no stubs/seams in production; e2e uses real client bundle + real Rust server; only fakery = fake CLI fixture + raw-WS device (suite-standard).
-- File/interface consistency: interfaces re-verified against source (round-1 corrections applied: `sortSessionItems(items, sortMode, options)`, `sessionStatusTierRank(tiers, key)`, `MinimalStore` includes `dispatch`); e2e helpers verified verbatim against the rings spec donor; Sidebar.tsx existing-tab focus branch (handleTabSessionClick existing-dispatch) verified for the Phase-5 focus step; `fake-bel-cli.mjs` slow-turn semantics verified from the fixture source; claude activity provisional-busy window verified from crates/freshell-activity/src/claude.rs + terminal-activity-rust precedent.
-- Executable tests: per-phase red modes documented; the plan-embedded code block is intended verbatim (no corrections needed at materialization).
-- Placeholder scan: after rework, no TBD/TODO/"later"; `<logs_dir>`-style placeholders replaced with literal absolute paths.
-- Operational completeness: e2e cleans its temp dirs (sharedRoot + PROJECT_DIR); docs mock synced (Task 5); prose-pin deletion folded into Task 7.
+- Spec coverage: tier ordering (Tasks 1–3) and grey-touch (Tasks 4–5) map to production behavior; e2e proof: Phases 1, 2, 5 discriminating; 3/4 stability; Task 7 has origin/main integration + post-merge e2e rerun + lint + coordinated gate.
+- No silent deferrals: real client bundle + real Rust server; only fakery = fake CLI + raw-WS device (suite-standard); the local-busy edge is injected RATCHET-FREE so Phase 5 is genuinely discriminating (round-1/2 critique addressed by construction, with the reason documented in the spec header).
+- File/interface consistency: interfaces re-verified against source; deterministic ordering mechanics verified (tab-recency.ts 60s bucket; tabsSlice open no-ratchet; TerminalView keystroke-only ratchet; claude.rs 2s grace + repeat-Enter re-arm; ws terminal.input handler requires no attach).
+- Executable tests: per-phase red modes documented; embedded spec block intended verbatim.
+- Placeholder scan: no TBD/TODO/"later"; literal absolute ledger paths.
+- Operational completeness: unique per-run project dir under sharedRoot; afterAll cleanup; env-var backend policy honored (answer recorded in Global Constraints once given).
