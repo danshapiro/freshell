@@ -58,23 +58,107 @@ const RETIRED_BACKEND_PACKAGES = [
   'pino-pretty',
 ]
 
-const MANIFEST_OWNED_IGNORE_EXCEPTIONS = [
-  '.github/workflows/docs-pages-deploy.yml',
-  '.github/workflows/electron-build.yml',
-  '.github/workflows/electron-release.yml',
-  '.github/workflows/port-contract.yml',
-  '.github/workflows/rust-clippy.yml',
-  '.github/workflows/typecheck-client.yml',
-  'electron/port-check.ts',
-  'examples/docker/Dockerfile',
-  'examples/extensions/live-counter/server.js',
-  'examples/extensions/status-dashboard/server.js',
-  'installers/systemd/freshell-rust.service',
-  'port/laptop-bootstrap/1-install-wsl.cmd',
-  'port/laptop-bootstrap/2-bootstrap-wsl.sh',
-  'port/vm-bridge/agent-console-vm.ps1',
-  'port/vm-bridge/agent-console-wsl.sh',
+const DISTRIBUTION_FIXTURE_PATHS = [
+  'test/fixtures/distribution/rust-only/dist/client/index.html',
+  'test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/server.js',
+  'test/fixtures/distribution/node-server/dist/client/index.html',
+  'test/fixtures/distribution/node-server/dist/server/index.js',
+  'test/fixtures/distribution/node-server/dist/tools/freshell-mcp/server.js',
+  'test/fixtures/distribution/node-server/node_modules/node-pty/index.js',
 ]
+
+const IGNORED_DISTRIBUTION_CONTROLS = [
+  'test/fixtures/distribution/rust-only/dist/client/extra.js',
+  'test/fixtures/distribution/node-server/dist/server/extra.js',
+  'test/fixtures/distribution/node-server/node_modules/node-pty/extra.js',
+]
+
+type IgnoreRule = {
+  pattern: string
+  negated: boolean
+  directoryOnly: boolean
+}
+
+/*
+ * These filters intentionally share a small, gitignore-compatible pattern
+ * subset: ordered directory rules, path/* rules, basename globs, and `!`
+ * exceptions. This matcher exercises that behavior against materialized paths
+ * without claiming Docker or gcloud engine conformance for syntax outside the
+ * subset used by this repository.
+ */
+function parseIgnoreRules(contents: string): IgnoreRule[] {
+  return contents
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'))
+    .map((line) => {
+      const negated = line.startsWith('!')
+      const pattern = negated ? line.slice(1) : line
+      return {
+        pattern: pattern.replace(/^\/+/, ''),
+        negated,
+        directoryOnly: pattern.endsWith('/'),
+      }
+    })
+}
+
+function globToRegExp(pattern: string): RegExp {
+  let source = '^'
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]
+    if (character === '*') {
+      if (pattern[index + 1] === '*') {
+        source += '.*'
+        index += 1
+      } else {
+        source += '[^/]*'
+      }
+    } else if (character === '?') {
+      source += '[^/]'
+    } else {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')
+    }
+  }
+  return new RegExp(`${source}$`)
+}
+
+function matchesIgnoreRule(rule: IgnoreRule, candidate: string, isDirectory: boolean): boolean {
+  const pattern = rule.pattern.replace(/\/+$/, '')
+  if (rule.directoryOnly && !isDirectory) return false
+
+  if (!pattern.includes('/')) {
+    const candidateName = candidate.split('/').at(-1) ?? candidate
+    return globToRegExp(pattern).test(candidateName)
+  }
+
+  return globToRegExp(pattern).test(candidate)
+}
+
+function isIgnoredByFilter(contents: string, candidate: string): boolean {
+  const normalizedCandidate = candidate.replace(/^\/+|\/+$/g, '')
+  const segments = normalizedCandidate.split('/')
+  const directories = segments.slice(0, -1).map((_, index) => segments.slice(0, index + 1).join('/'))
+  const rules = parseIgnoreRules(contents)
+
+  const evaluate = (pathToEvaluate: string, isDirectory: boolean): boolean => {
+    let ignored = false
+    for (const rule of rules) {
+      if (matchesIgnoreRule(rule, pathToEvaluate, isDirectory)) ignored = !rule.negated
+    }
+    return ignored
+  }
+
+  if (directories.some((directory) => evaluate(directory, true))) return true
+  return evaluate(normalizedCandidate, false)
+}
+
+function manifestOwnedFilePaths(): string[] {
+  const manifest = JSON.parse(readProjectFile('scripts/retirement/runtime-surfaces.json')) as {
+    surfaces: Array<{ path: string }>
+  }
+
+  return [...new Set(manifest.surfaces.map(({ path: surfacePath }) => surfacePath.split(':', 1)[0]))]
+}
 
 describe('Rust-only distribution runtime contracts', () => {
   it('builds and launches the example image with the Rust server', () => {
@@ -541,43 +625,20 @@ describe('Rust-only distribution runtime contracts', () => {
   })
 
   it('keeps every manifest-owned file visible through both ignore filters', () => {
-    const manifest = JSON.parse(readProjectFile('scripts/retirement/runtime-surfaces.json')) as {
-      surfaces: Array<{ path: string }>
+    const manifestPaths = manifestOwnedFilePaths()
+    const visiblePaths = [...new Set([...manifestPaths, ...DISTRIBUTION_FIXTURE_PATHS])]
+
+    for (const relativePath of DISTRIBUTION_FIXTURE_PATHS) {
+      expect(() => readFileSync(path.join(PROJECT_ROOT, relativePath))).not.toThrow()
     }
-    const manifestPaths = manifest.surfaces
-      .map((surface) => surface.path)
-    expect(MANIFEST_OWNED_IGNORE_EXCEPTIONS.every((surfacePath) => manifestPaths.includes(surfacePath))).toBe(true)
 
     for (const filterPath of ['.dockerignore', '.gcloudignore']) {
-      const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-ignore-parity-'))
+      const filter = readProjectFile(filterPath)
+      const ignoredManifestPaths = visiblePaths.filter((relativePath) => isIgnoredByFilter(filter, relativePath))
+      expect(ignoredManifestPaths, `${filterPath} ignored required paths`).toEqual([])
 
-      try {
-        writeFileSync(path.join(fixtureRoot, '.gitignore'), readProjectFile(filterPath))
-        for (const relativePath of MANIFEST_OWNED_IGNORE_EXCEPTIONS) {
-          const filePath = path.join(fixtureRoot, relativePath)
-          mkdirSync(path.dirname(filePath), { recursive: true })
-          writeFileSync(filePath, 'manifest-owned fixture')
-        }
-
-        const init = spawnSync('git', ['init', '--quiet'], {
-          cwd: fixtureRoot,
-          encoding: 'utf8',
-        })
-        expect(init.error, `${filterPath}: git is required for ignore parity`).toBeUndefined()
-        expect(init.status, `${filterPath}: ${init.stderr}`).toBe(0)
-
-        for (const relativePath of MANIFEST_OWNED_IGNORE_EXCEPTIONS) {
-          const result = spawnSync('git', ['check-ignore', '--quiet', '--no-index', '--', relativePath], {
-            cwd: fixtureRoot,
-            encoding: 'utf8',
-          })
-
-          expect(result.error, `${filterPath}: ${relativePath}`).toBeUndefined()
-          expect(result.status, `${filterPath}: ${relativePath}`).toBe(1)
-        }
-      } finally {
-        rmSync(fixtureRoot, { recursive: true, force: true })
-      }
+      const ignoredControls = IGNORED_DISTRIBUTION_CONTROLS.filter((relativePath) => isIgnoredByFilter(filter, relativePath))
+      expect(ignoredControls, `${filterPath} failed to retain nested exclusions`).toEqual(IGNORED_DISTRIBUTION_CONTROLS)
     }
   })
 

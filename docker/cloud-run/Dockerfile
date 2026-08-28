@@ -87,8 +87,8 @@ COPY . .
 # Check the assembled runtime tree after all staged artifacts are present.
 # With --runtime-root the guard checks the required Rust/client/tools files and
 # executable, scans only shipped dist/, target/, and node_modules/ roots,
-# rejects retired artifact directories, node-pty, and direct top-level retired
-# backend packages, and permits nested transitive packages retained by tooling.
+# rejects retired artifact directories and direct top-level retired backend
+# packages, and permits nested transitive packages retained by tooling.
 RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
