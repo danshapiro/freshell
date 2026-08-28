@@ -40,6 +40,24 @@ const FORBIDDEN_DISTRIBUTION_TERMS = [
   /legacy-chromium/,
 ]
 
+const RETIRED_BACKEND_PACKAGES = [
+  '@ai-sdk/google',
+  '@anthropic-ai/claude-agent-sdk',
+  'ai',
+  'cookie-parser',
+  'express',
+  'express-rate-limit',
+  'pino',
+  'rotating-file-stream',
+  'is-port-reachable',
+  '@types/cookie-parser',
+  '@types/express',
+  '@types/supertest',
+  'supertest',
+  'superwstest',
+  'pino-pretty',
+]
+
 describe('Rust-only distribution runtime contracts', () => {
   it('builds and launches the example image with the Rust server', () => {
     const dockerfile = readProjectFile('examples/docker/Dockerfile')
@@ -164,6 +182,7 @@ describe('Rust-only distribution runtime contracts', () => {
     const entries = diagnostics(result.stdout)
     expect(entries.some((entry) => entry.event === 'container_layout_forbidden_artifacts')).toBe(true)
     const forbidden = entries.find((entry) => entry.event === 'container_layout_forbidden_artifacts')
+    expect(forbidden).toMatchObject({ count: 2, evidence_truncated: false })
     expect(forbidden?.evidence).toEqual([...(forbidden?.evidence as string[])].sort())
     expect(forbidden?.evidence).toEqual(expect.arrayContaining([
       'dist/server/index.js',
@@ -171,29 +190,78 @@ describe('Rust-only distribution runtime contracts', () => {
     ]))
   })
 
-  it('retains lockfile tooling and generic transitive dependencies', () => {
-    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-dependencies-'))
+  it('rejects direct retired backend packages but permits nested generic dependencies', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-direct-retired-'))
+    const directRetiredPackages = RETIRED_BACKEND_PACKAGES
+    const nestedRetainedPackages = ['express', 'glob', 'pino']
 
     try {
       mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
       mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
       mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
-      mkdirSync(path.join(fixtureRoot, 'node_modules/chokidar'), { recursive: true })
-      mkdirSync(path.join(fixtureRoot, 'node_modules/dotenv'), { recursive: true })
+      writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
+      writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
+      chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
+
+      for (const dependency of directRetiredPackages) {
+        const dependencyPath = path.join(fixtureRoot, 'node_modules', dependency, 'index.js')
+        mkdirSync(path.dirname(dependencyPath), { recursive: true })
+        writeFileSync(dependencyPath, 'retired backend package')
+      }
+      for (const dependency of nestedRetainedPackages) {
+        const dependencyPath = path.join(fixtureRoot, 'node_modules/retained/node_modules', dependency, 'index.js')
+        mkdirSync(path.dirname(dependencyPath), { recursive: true })
+        writeFileSync(dependencyPath, 'nested retained package')
+      }
+
+      const result = runContainerLayoutFixture(fixtureRoot, true)
+
+      expect(result.status).toBe(1)
+      const forbidden = diagnostics(result.stdout).find(
+        (entry) => entry.event === 'container_layout_forbidden_artifacts',
+      )
+      expect(forbidden).toMatchObject({ count: directRetiredPackages.length, evidence_truncated: false })
+      expect(forbidden?.evidence).toEqual(expect.arrayContaining(
+        directRetiredPackages.map((dependency) => `node_modules/${dependency}/index.js`),
+      ))
+      for (const dependency of nestedRetainedPackages) {
+        expect(forbidden?.evidence).not.toContain(`node_modules/retained/node_modules/${dependency}/index.js`)
+      }
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('retains lockfile tooling and generic transitive dependencies', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-dependencies-'))
+    const topLevelRetainedDependencies = ['chokidar', 'dotenv', 'glob', 'node-gyp']
+    const nestedRetainedDependencies = RETIRED_BACKEND_PACKAGES
+
+    try {
+      mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
       // node-gyp is a lockfile-installed Electron build dependency, not a
       // shipped Freshell backend artifact; keep this retained-package control
       // so adding a node-gyp ban to the runtime guard fails loudly.
-      const retainedDependencies = ['express', 'glob', 'ai', 'pino', 'node-gyp']
-      for (const dependency of retainedDependencies) {
+      for (const dependency of topLevelRetainedDependencies) {
         mkdirSync(path.join(fixtureRoot, 'node_modules', dependency), { recursive: true })
+      }
+      for (const dependency of nestedRetainedDependencies) {
+        mkdirSync(path.join(fixtureRoot, 'node_modules/retained/node_modules', dependency), { recursive: true })
       }
       writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
       writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
       writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
-      writeFileSync(path.join(fixtureRoot, 'node_modules/chokidar/index.js'), 'export {}')
-      writeFileSync(path.join(fixtureRoot, 'node_modules/dotenv/index.js'), 'export {}')
-      for (const dependency of retainedDependencies) {
+      for (const dependency of topLevelRetainedDependencies) {
         writeFileSync(path.join(fixtureRoot, 'node_modules', dependency, 'index.js'), 'retained package')
+      }
+      for (const dependency of nestedRetainedDependencies) {
+        writeFileSync(
+          path.join(fixtureRoot, 'node_modules/retained/node_modules', dependency, 'index.js'),
+          'nested retained package',
+        )
       }
       chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
 
@@ -233,7 +301,9 @@ describe('Rust-only distribution runtime contracts', () => {
       const forbidden = diagnostics(result.stdout).find(
         (entry) => entry.event === 'container_layout_forbidden_artifacts',
       )
-      expect(forbidden).toMatchObject({ count: '2', evidence_truncated: 'false' })
+      expect(forbidden).toMatchObject({ count: 2, evidence_truncated: false })
+      expect(typeof forbidden?.count).toBe('number')
+      expect(typeof forbidden?.evidence_truncated).toBe('boolean')
       expect(forbidden?.evidence).toEqual(expect.arrayContaining([
         'node_modules/retained/dist/server/index.js',
         'node_modules/retained/node_modules/node-pty/index.js',
@@ -265,7 +335,9 @@ describe('Rust-only distribution runtime contracts', () => {
       const forbidden = diagnostics(result.stdout).find(
         (entry) => entry.event === 'container_layout_forbidden_artifacts',
       )
-      expect(forbidden).toMatchObject({ count: '40', evidence_truncated: 'true' })
+      expect(forbidden).toMatchObject({ count: 40, evidence_truncated: true })
+      expect(typeof forbidden?.count).toBe('number')
+      expect(typeof forbidden?.evidence_truncated).toBe('boolean')
       expect(forbidden?.evidence).toHaveLength(20)
       expect(result.stdout.length).toBeLessThan(4000)
     } finally {
@@ -293,7 +365,13 @@ describe('Rust-only distribution runtime contracts', () => {
 
       expect(result.status).toBe(0)
       const verified = diagnostics(result.stdout)[0]
-      expect(verified).toMatchObject({ severity: 'info', event: 'container_layout_verified', evidence: [] })
+      expect(verified).toMatchObject({
+        severity: 'info',
+        event: 'container_layout_verified',
+        evidence: [],
+        scanned_files: 2003,
+      })
+      expect(typeof verified.scanned_files).toBe('number')
       expect(result.stdout.length).toBeLessThan(500)
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true })
@@ -322,6 +400,8 @@ describe('Rust-only distribution runtime contracts', () => {
       expect(diagnostics(result.stdout)[0]).toMatchObject({
         severity: 'info',
         event: 'container_layout_verified',
+        evidence: [],
+        scanned_files: 3,
       })
 
       const retiredPath = path.join(fixtureRoot, 'dist/server/index.js')
@@ -351,6 +431,65 @@ describe('Rust-only distribution runtime contracts', () => {
         event: 'container_layout_fixture_missing',
         path: quotedFixturePath,
       })
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('emits empty evidence arrays for missing fixtures and required artifacts', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-missing-'))
+    const missingFixture = path.join(fixtureRoot, 'missing-fixture')
+
+    try {
+      const missing = runContainerLayoutFixture(missingFixture)
+      expect(missing.status).toBe(1)
+      expect(diagnostics(missing.stdout)[0]).toMatchObject({
+        severity: 'error',
+        event: 'container_layout_fixture_missing',
+        evidence: [],
+      })
+
+      const required = runContainerLayoutFixture(fixtureRoot)
+      expect(required.status).toBe(1)
+      expect(diagnostics(required.stdout)[0]).toMatchObject({
+        severity: 'error',
+        event: 'container_layout_required_artifacts_missing',
+        evidence: [],
+        missing: [
+          'dist/client/index.html',
+          'dist/tools/freshell-mcp/server.js',
+          'freshell-server (or target/release/freshell-server)',
+        ],
+      })
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects node-pty from the runtime-root release surface', () => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), 'freshell-container-layout-node-pty-release-'))
+
+    try {
+      mkdirSync(path.join(fixtureRoot, 'dist/client'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'target/release'), { recursive: true })
+      mkdirSync(path.join(fixtureRoot, 'node_modules/node-pty'), { recursive: true })
+      writeFileSync(path.join(fixtureRoot, 'dist/client/index.html'), '<!doctype html>')
+      writeFileSync(path.join(fixtureRoot, 'dist/tools/freshell-mcp/server.js'), 'export {}')
+      writeFileSync(path.join(fixtureRoot, 'target/release/freshell-server'), 'rust server')
+      writeFileSync(path.join(fixtureRoot, 'node_modules/node-pty/index.js'), 'retired native module')
+      chmodSync(path.join(fixtureRoot, 'target/release/freshell-server'), 0o755)
+
+      const result = runContainerLayoutFixture(fixtureRoot, true)
+
+      expect(result.status).toBe(1)
+      const forbidden = diagnostics(result.stdout).find(
+        (entry) => entry.event === 'container_layout_forbidden_artifacts',
+      )
+      expect(forbidden).toMatchObject({ count: 1, evidence_truncated: false })
+      expect(typeof forbidden?.count).toBe('number')
+      expect(typeof forbidden?.evidence_truncated).toBe('boolean')
+      expect(forbidden?.evidence).toEqual(['node_modules/node-pty/index.js'])
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true })
     }
