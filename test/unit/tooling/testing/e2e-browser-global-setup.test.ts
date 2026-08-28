@@ -17,7 +17,7 @@ describe('ensureBuiltRuntime', () => {
     })
 
     expect(rmSync).toHaveBeenCalledWith(path.join('/repo', 'dist', '.env'), { force: true })
-    expect(execFileSync).toHaveBeenNthCalledWith(1, 'npm', ['run', 'build:client'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(1, 'npm', ['run', 'prebuild'], {
       cwd: '/repo',
       env: {
         PATH: '/bin',
@@ -25,7 +25,15 @@ describe('ensureBuiltRuntime', () => {
       },
       stdio: 'inherit',
     })
-    expect(execFileSync).toHaveBeenNthCalledWith(2, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(2, 'npm', ['run', 'build:client'], {
+      cwd: '/repo',
+      env: {
+        PATH: '/bin',
+        NODE_ENV: 'production',
+      },
+      stdio: 'inherit',
+    })
+    expect(execFileSync).toHaveBeenNthCalledWith(3, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
       cwd: '/repo',
       env: {
         PATH: '/bin',
@@ -51,7 +59,7 @@ describe('ensureBuiltRuntime', () => {
     })
 
     expect(rmSync).toHaveBeenCalledWith(path.join('C:\\repo', 'dist', '.env'), { force: true })
-    expect(execFileSync).toHaveBeenNthCalledWith(1, process.execPath, [npmExecPath, 'run', 'build:client'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(1, process.execPath, [npmExecPath, 'run', 'prebuild'], {
       cwd: 'C:\\repo',
       env: {
         PATH: 'C:\\Windows\\System32',
@@ -60,7 +68,16 @@ describe('ensureBuiltRuntime', () => {
       },
       stdio: 'inherit',
     })
-    expect(execFileSync).toHaveBeenNthCalledWith(2, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+    expect(execFileSync).toHaveBeenNthCalledWith(2, process.execPath, [npmExecPath, 'run', 'build:client'], {
+      cwd: 'C:\\repo',
+      env: {
+        PATH: 'C:\\Windows\\System32',
+        npm_execpath: npmExecPath,
+        NODE_ENV: 'production',
+      },
+      stdio: 'inherit',
+    })
+    expect(execFileSync).toHaveBeenNthCalledWith(3, 'cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
       cwd: 'C:\\repo',
       env: {
         PATH: 'C:\\Windows\\System32',

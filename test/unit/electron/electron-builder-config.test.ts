@@ -27,6 +27,15 @@ describe('electron-builder Windows config', () => {
     expect(packageJson.scripts['electron:build:win']).not.toContain('portable')
   })
 
+  it('prepares the locked Claude sidecar before both Electron package builds', () => {
+    const packageJson = JSON.parse(
+      readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf-8'),
+    ) as { scripts: Record<string, string> }
+
+    expect(packageJson.scripts['electron:build']).toContain('npm run prepare:claude-sidecar')
+    expect(packageJson.scripts['electron:build:win']).toContain('npm run prepare:claude-sidecar')
+  })
+
   it('does not require publish metadata for local package builds', () => {
     const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 

@@ -151,7 +151,7 @@ npm run test:status         # Show active holder, latest results, and advisory b
 npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthrough work
 ```
 
-External provider contract tests (`test/integration/real/`) spawn real `claude`, `codex`, and `opencode` binaries to verify external provider behavior, not Freshell code. They are opt-in and skipped by default to avoid blocking the coordinated suite on environment-dependent flakiness:
+External provider contract tests (`test/integration/real/`) exercise the real Amplifier CLI, not Freshell code. When the documented opt-in enables this tree, the version smoke runs when `amplifier` is available; tests that adopt a session or make a model call additionally require provider setup. The tree is excluded from the default suite to avoid blocking the coordinated run on environment-dependent external-tool behavior:
 ```bash
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
   run test/integration/real/ --config config/vitest/vitest.config.ts

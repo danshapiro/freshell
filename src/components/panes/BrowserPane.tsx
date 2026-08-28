@@ -306,7 +306,7 @@ export default function BrowserPane({
 
     setLoadError(null)
     setIsLoading(true)
-    setResolvedSrc(toIframeSrc(currentUrl))
+    setResolvedSrc(buildHttpProxyUrl(currentUrl) ?? toIframeSrc(currentUrl))
   }, [currentUrl])
 
   const refresh = useCallback(() => {
@@ -487,7 +487,7 @@ export default function BrowserPane({
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
               onLoad={() => setIsLoading(false)}
-              onError={() => {
+              onErrorCapture={() => {
                 setIsLoading(false)
                 setLoadError(`Unable to load "${currentUrl}". The page may not exist, or the server may be blocking embedded access.`)
               }}
