@@ -362,6 +362,26 @@ describe('BrowserPane', () => {
       })
     })
 
+    it('keeps the HTTP proxy when recovering a failed remote localhost page', async () => {
+      setWindowHostname('192.168.1.100')
+      renderBrowserPane({ url: 'http://localhost:4000/path' })
+
+      const iframe = await screen.findByTitle('Browser content')
+      expect(iframe).toHaveAttribute('src', '/api/proxy/http/4000/path')
+
+      await act(async () => {
+        fireEvent.error(iframe, { bubbles: true })
+      })
+      fireEvent.click(await screen.findByRole('button', { name: 'Try Again' }))
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Browser content')).toHaveAttribute(
+          'src',
+          '/api/proxy/http/4000/path',
+        )
+      })
+    })
+
     it('proxies http://127.0.0.1 URLs through HTTP proxy when accessing remotely', async () => {
       setWindowHostname('192.168.1.100')
 

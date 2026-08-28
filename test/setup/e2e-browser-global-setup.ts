@@ -29,19 +29,26 @@ export function ensureBuiltRuntime(
     platform: process.platform,
   },
 ): void {
+  const env = {
+    ...deps.env,
+    NODE_ENV: 'production',
+  }
+  const prebuild = resolveNpmExecFileCommand(['run', 'prebuild'], deps.env, deps.platform)
+  deps.execFileSync(prebuild.command, prebuild.args, {
+    cwd: projectRoot,
+    env,
+    stdio: 'inherit',
+  })
   deps.rmSync(path.join(projectRoot, 'dist', '.env'), { force: true })
   const npm = resolveNpmExecFileCommand(['run', 'build:client'], deps.env, deps.platform)
   deps.execFileSync(npm.command, npm.args, {
     cwd: projectRoot,
-    env: {
-      ...deps.env,
-      NODE_ENV: 'production',
-    },
+    env,
     stdio: 'inherit',
   })
   deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: projectRoot,
-    env: { ...deps.env, NODE_ENV: 'production' },
+    env,
     stdio: 'inherit',
   })
 }

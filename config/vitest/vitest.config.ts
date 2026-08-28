@@ -29,7 +29,6 @@ export default defineConfig({
     setupFiles: ['./test/setup/dom.ts'],
     exclude: [
       '**/node_modules/**',
-      '**/bundled-node/**',
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',

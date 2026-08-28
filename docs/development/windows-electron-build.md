@@ -25,7 +25,7 @@ artifact, rather than a Linux binary or a non-runnable installer stub.
 ## Option A — from a native Windows shell
 
 ```powershell
-npm install
+npm ci
 $env:CI = "true"
 npm run electron:build:win        # assert win32 → client/tools/Rust → Electron Builder NSIS
 ```
@@ -33,8 +33,12 @@ npm run electron:build:win        # assert win32 → client/tools/Rust → Elect
 `electron:build:win` runs, in order: the native-platform assertion, client and
 tool typechecks/builds, the release `freshell-server.exe` Cargo build,
 `build:electron`, `build:wizard`, `build:launch-chooser`,
-`prepare:electron-runtime`, `electron-builder --win nsis --publish never`, and
-the artifact verifier. Output lands in `release/`.
+`prepare:claude-sidecar`, `prepare:electron-runtime`, `electron-builder --win
+nsis --publish never`, and the artifact verifier. `prepare:claude-sidecar`
+runs a locked `npm ci` in `crates/freshell-claude-sidecar` and verifies the
+Claude SDK package before it is copied into the installer; no sidecar
+`node_modules` directory needs to be checked into the repository. Output lands
+in `release/`.
 
 ## Option B — driving the Windows build from WSL
 
@@ -58,13 +62,15 @@ and run Windows' own npm and Cargo against it via interop.
    will warn and mangle relative paths:
 
    ```bash
-   cmd.exe /c 'cd /d C:\Users\<you>\AppData\Local\Temp\freshell-electron-build && set "CI=true" && set "PORT=39517" && npm install && npm run electron:build:win'
+   cmd.exe /c 'cd /d C:\Users\<you>\AppData\Local\Temp\freshell-electron-build && set "CI=true" && set "PORT=39517" && npm ci && npm run electron:build:win'
    ```
 
    `PORT=<unused>` keeps the build's preflight isolated from any unrelated
-   local service. Reusing a previous Windows-local build directory keeps its
-   native dependencies warm, while `target/`, `dist/`, and `electron-runtime/`
-   are rebuilt for the copied checkout.
+   local service. The package build installs and verifies the isolated Claude
+   sidecar from its committed lockfile as part of the command. Reusing a
+   previous Windows-local build directory keeps its native dependencies warm,
+   while `target/`, `dist/`, and `electron-runtime/` are rebuilt for the copied
+   checkout.
 
 3. To move artifacts off `/mnt/c`, prefer WSL `cp` over `cmd copy` — `cmd`'s
    quote/path handling through interop is unreliable for paths with spaces.
