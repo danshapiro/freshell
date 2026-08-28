@@ -26,6 +26,28 @@ export type ElectronDevCommandRunner = (
   cwd: string,
 ) => void
 
+export interface ElectronDevSpawnOptions {
+  cwd: string
+  shell: boolean
+  stdio: 'inherit'
+  windowsHide: boolean
+}
+
+export interface ElectronDevSpawnResult {
+  error?: Error
+  signal: NodeJS.Signals | null
+  status: number | null
+}
+
+export type ElectronDevSpawn = (
+  command: string,
+  args: string[],
+  options: ElectronDevSpawnOptions,
+) => ElectronDevSpawnResult
+
+const defaultSpawn: ElectronDevSpawn = (command, args, options) =>
+  spawnSync(command, args, options)
+
 export function npmCommand(platform: NodeJS.Platform = process.platform): string {
   return platform === 'win32' ? 'npm.cmd' : 'npm'
 }
@@ -57,16 +79,25 @@ export function resolveElectronDevPrerequisitePaths(
   }
 }
 
-function runCommand(
+export function runElectronDevCommand(
   command: string,
   args: string[],
   cwd: string,
+  platform: NodeJS.Platform = process.platform,
+  spawn: ElectronDevSpawn = defaultSpawn,
 ): void {
-  const result = spawnSync(command, args, {
-    cwd,
-    stdio: 'inherit',
-    windowsHide: true,
-  })
+  let result: ElectronDevSpawnResult
+  try {
+    result = spawn(command, args, {
+      cwd,
+      shell: platform === 'win32',
+      stdio: 'inherit',
+      windowsHide: true,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`${command} ${args.join(' ')} failed to start: ${message}`)
+  }
 
   if (result.error) {
     throw new Error(`${command} ${args.join(' ')} failed to start: ${result.error.message}`)
@@ -83,6 +114,7 @@ export interface RunElectronDevPrerequisitesOptions {
   platform?: NodeJS.Platform
   npm?: string
   runCommand?: ElectronDevCommandRunner
+  spawn?: ElectronDevSpawn
   pathExists?: (filePath: string) => boolean
 }
 
@@ -90,12 +122,15 @@ export function runElectronDevPrerequisites({
   projectRoot = PROJECT_ROOT,
   platform = process.platform,
   npm,
-  runCommand: commandRunner = runCommand,
+  runCommand: injectedCommandRunner,
+  spawn: injectedSpawn = defaultSpawn,
   pathExists = existsSync,
 }: RunElectronDevPrerequisitesOptions = {}): ElectronDevPrerequisitePaths {
   const root = path.resolve(projectRoot)
   const paths = resolveElectronDevPrerequisitePaths(root, platform)
   const phases = buildElectronDevPrerequisitePhases(npm ?? npmCommand(platform))
+  const commandRunner = injectedCommandRunner ?? ((command: string, args: string[], cwd: string) =>
+    runElectronDevCommand(command, args, cwd, platform, injectedSpawn))
 
   for (const phase of phases) {
     commandRunner(phase.command, phase.args, root)
