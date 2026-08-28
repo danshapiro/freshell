@@ -88,13 +88,6 @@ installers/*
 installers/systemd/*
 !installers/systemd/freshell-rust.service
 
-!test/integration/electron/
-test/integration/electron/*
-!test/integration/electron/checkout-free-runtime.test.ts
-!test/unit/electron/
-test/unit/electron/*
-!test/unit/electron/port-check.test.ts
-
 assets/
 
 # Editor / IDE
