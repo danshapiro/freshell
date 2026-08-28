@@ -175,8 +175,6 @@ describe('refresh context menu flow (e2e)', () => {
   })
 
   it('Refresh tab exits zoom and refreshes all browser panes in the stored layout', async () => {
-    vi.mocked(api.post).mockImplementation(() => new Promise(() => {}))
-
     const layout: PaneNode = {
       type: 'split',
       id: 'split-1',
@@ -192,9 +190,11 @@ describe('refresh context menu flow (e2e)', () => {
     const { container } = renderFlow(store)
 
     await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.',
+      )
     })
-    vi.mocked(api.post).mockClear()
+    expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === '/api/proxy/forward')).toHaveLength(0)
 
     await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
     await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
@@ -205,13 +205,13 @@ describe('refresh context menu flow (e2e)', () => {
     await waitFor(() => {
       expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
     })
-    // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's own
-    // port so the HTTP proxy skips it. Pane-2 (port 3001) is proxied through
-    // /api/proxy/http/3001/ (same-origin) instead.  Each TCP-forwarded pane
-    // triggers one api.post for the initial render plus one for the refresh.
-    await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(2)
-    })
+    // Rust does not expose the retired raw TCP-forwarding endpoint. The
+    // remote loopback pane stays explicitly unavailable while the other
+    // browser pane uses Rust's supported HTTP proxy path.
+    expect(screen.getByText(
+      'Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.',
+    )).toBeInTheDocument()
+    expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === '/api/proxy/forward')).toHaveLength(0)
     await waitFor(() => {
       expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
     })
