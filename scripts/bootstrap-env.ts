@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import path from 'node:path'
 
 export type AuthTokenBootstrapResult = {
@@ -14,19 +14,32 @@ export type AuthTokenBootstrapOptions = {
 }
 
 const MIN_AUTH_TOKEN_LENGTH = 16
+const AUTH_TOKEN_PLACEHOLDER = 'replace-with-a-long-random-token'
+
+function normalizeAuthTokenValue(rawValue: string): string {
+  let value = rawValue.trim()
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1)
+  }
+  return value
+}
 
 function parseAuthToken(contents: string): string | undefined {
   for (const line of contents.split(/\r?\n/)) {
     const match = line.match(/^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*?)\s*$/)
     if (!match) continue
 
-    let value = match[1]
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
-    if (value.length > 0) return value
+    const value = normalizeAuthTokenValue(match[1])
+    if (value.length > 0 && value !== AUTH_TOKEN_PLACEHOLDER) return value
   }
   return undefined
+}
+
+function hasPlaceholderAuthToken(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const match = line.match(/^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*?)\s*$/)
+    return match !== null && normalizeAuthTokenValue(match[1]) === AUTH_TOKEN_PLACEHOLDER
+  })
 }
 
 function readExistingEnv(envPath: string): string | undefined {
@@ -72,6 +85,41 @@ function appendAtomically(envPath: string, contents: string): void {
   }
 }
 
+function replacePlaceholderAtomically(envPath: string, existing: string, token: string): void {
+  const replacement = existing.replace(
+    /^([ \t]*(?:export[ \t]+)?AUTH_TOKEN[ \t]*=[ \t]*)(?:"replace-with-a-long-random-token"|'replace-with-a-long-random-token'|replace-with-a-long-random-token)([ \t]*)(?=\r?$)/gm,
+    `$1${token}$2`,
+  )
+  const temporaryPath = `${envPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(temporaryPath, 'wx', 0o600)
+    writeSync(descriptor, replacement, undefined, 'utf8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = undefined
+    try {
+      renameSync(temporaryPath, envPath)
+    } catch (error) {
+      // Windows does not replace an existing destination with rename(2). The
+      // fallback still writes only the sanitized file contents and keeps the
+      // first-run creation path above atomic.
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : ''
+      if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(code)) throw error
+      writeFileSync(envPath, replacement, { mode: 0o600 })
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+    try {
+      unlinkSync(temporaryPath)
+    } catch {
+      // The temporary file was renamed successfully, or never created.
+    }
+  }
+}
+
 /**
  * Ensure the Rust server has an authentication token without starting a
  * server. Environment variables always win; otherwise an existing .env token
@@ -83,9 +131,11 @@ export function ensureAuthTokenFile(options: AuthTokenBootstrapOptions = {}): Au
   const envPath = options.envPath ?? path.join(process.cwd(), '.env')
   const generateToken = options.generateToken ?? (() => randomBytes(32).toString('hex'))
 
-  if (env.AUTH_TOKEN?.trim()) {
+  const environmentToken = env.AUTH_TOKEN ? normalizeAuthTokenValue(env.AUTH_TOKEN) : ''
+  if (environmentToken && environmentToken !== AUTH_TOKEN_PLACEHOLDER) {
     return { created: false, source: 'environment' }
   }
+  if (environmentToken === AUTH_TOKEN_PLACEHOLDER) delete env.AUTH_TOKEN
 
   let existing = readExistingEnv(envPath)
   if (existing !== undefined && parseAuthToken(existing)) {
@@ -113,7 +163,9 @@ export function ensureAuthTokenFile(options: AuthTokenBootstrapOptions = {}): Au
     }
   }
 
-  if (!parseAuthToken(existing)) {
+  if (hasPlaceholderAuthToken(existing)) {
+    replacePlaceholderAtomically(envPath, existing, token)
+  } else if (!parseAuthToken(existing)) {
     // O_APPEND makes this one write indivisible with respect to other
     // starters and avoids replacing a file that already contains settings.
     appendAtomically(envPath, `${existing.length > 0 && !existing.endsWith('\n') ? '\n' : ''}${assignment}`)

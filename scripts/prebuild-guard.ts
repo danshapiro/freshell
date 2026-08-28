@@ -130,7 +130,7 @@ function formatProductionConflictMessage(port: number, version?: string): string
     '',
     '\x1b[33mSafe alternatives:\x1b[0m',
     '  1. \x1b[36mnpm run typecheck:client\x1b[0m  TypeScript-only check; it does not write build artifacts.',
-    '  2. Run \x1b[36mnpm run check\x1b[0m from a linked worktree; its source-runtime phase fails closed on main while production is live.',
+    '  2. Run \x1b[36mnpm test\x1b[0m or \x1b[36mnpm run check\x1b[0m from a linked worktree; their source-runtime phase fails closed on main while production is live.',
     '     \x1b[36mcd .worktrees/{branch} && npm run check\x1b[0m',
     '  3. Run source-runtime/build checks from a linked worktree:',
     '     \x1b[36mcd .worktrees/{branch} && npm run test:source-runtime\x1b[0m',

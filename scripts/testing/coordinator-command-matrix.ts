@@ -81,7 +81,11 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
         reason: 'The Node server Vitest config was retired. Use npm run test:server for the Rust cargo lane.',
       }
     }
-    return passthrough([vitestPhase('direct', args)])
+    const explicitConfig = hasExplicitConfigOverride(args)
+    return passthrough([vitestPhase(
+      explicitConfig ? 'direct' : 'default',
+      explicitConfig ? args : withDefaultVitestConfig(args),
+    )])
   }
 
   if (hasExplicitConfigOverride(args)) {
@@ -134,7 +138,10 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
       }
     }
     if (hasRustTarget) {
-      return delegated([cargoPhase(['test', '--workspace', '--locked', ...filtered])])
+      return {
+        kind: 'rejected',
+        reason: 'Rust/path selectors are not supported by composite commands because Cargo treats file paths as test-name filters. Use npm run test:server or npm run test:integration for a Rust lane.',
+      }
     }
     return delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filtered])])
   }
@@ -203,6 +210,13 @@ function hasReporter(args: string[]): boolean {
 
 function hasExplicitConfigOverride(args: string[]): boolean {
   return args.some((arg) => arg === '--config' || arg.startsWith('--config=') || arg === '-c' || arg.startsWith('-c='))
+}
+
+function withDefaultVitestConfig(args: string[]): string[] {
+  if (args[0] === 'run' || args[0] === 'watch' || args[0] === 'dev') {
+    return [args[0], '--config', DEFAULT_VITEST_CONFIG, ...args.slice(1)]
+  }
+  return ['--config', DEFAULT_VITEST_CONFIG, ...args]
 }
 
 function isBroadCompositeWorkload(args: string[]): boolean {

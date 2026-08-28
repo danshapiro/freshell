@@ -3,8 +3,9 @@
  *
  * The sidecar is intentionally a separate npm package because it is the one
  * sanctioned Node client in the Rust application. Its node_modules directory
- * is a build artifact, so every clean Electron checkout must recreate it from
- * the committed lockfile before the runtime is staged.
+ * is a build artifact, so every clean source or Electron checkout must
+ * recreate it from the committed lockfile before the Rust runtime starts or
+ * the desktop runtime is staged.
  */
 
 import { execFileSync as defaultExecFileSync } from 'node:child_process'

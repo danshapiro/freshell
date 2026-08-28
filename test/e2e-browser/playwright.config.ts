@@ -48,6 +48,10 @@ export default defineConfig({
       use: devices['Desktop Chrome'],
       testMatch: [CONTINUITY_SMOKE_SPEC],
     }] : []),
+    // CI deliberately expands the application lane to Firefox and WebKit.
+    // Local and Cloud Run lanes stay Chromium-only because the latter has no
+    // browser binaries for the other projects and the former is the fast
+    // developer default; the selection contract tests pin both choices.
     ...(process.env.CI ? [
       {
         name: 'firefox',

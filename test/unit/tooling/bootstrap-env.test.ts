@@ -89,4 +89,23 @@ describe('ensureAuthTokenFile', () => {
     expect(await readFile(envPath, 'utf8')).toBe('PORT=3456\nCUSTOM=value\nAUTH_TOKEN=' + 'b'.repeat(64) + '\n')
     expect(env.AUTH_TOKEN).toBe('b'.repeat(64))
   })
+
+  it('replaces the copied .env.example placeholder instead of treating it as a token', async () => {
+    const envPath = await createTempEnvPath()
+    await writeFile(envPath, 'PORT=3456\nAUTH_TOKEN=replace-with-a-long-random-token\nCUSTOM=value\n', { mode: 0o600 })
+    const env: NodeJS.ProcessEnv = {}
+
+    const result = ensureAuthTokenFile({
+      env,
+      envPath,
+      generateToken: () => 'c'.repeat(64),
+    })
+
+    expect(result).toEqual({ created: true, source: 'generated' })
+    expect(env.AUTH_TOKEN).toBe('c'.repeat(64))
+    expect(await readFile(envPath, 'utf8')).toBe(
+      'PORT=3456\nAUTH_TOKEN=' + 'c'.repeat(64) + '\nCUSTOM=value\n',
+    )
+    expect(await readFile(envPath, 'utf8')).not.toContain('replace-with-a-long-random-token')
+  })
 })
