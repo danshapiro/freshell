@@ -34,6 +34,20 @@ const ALLOWED_LISTENER_PATHS = [
   'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 ] as const
 
+const REQUIRED_RUST_SCRIPT_COMMANDS: Record<string, string> = {
+  start: 'cross-env NODE_ENV=production tsx scripts/start-rust-server.ts target/release/freshell-server',
+  dev: 'cargo run -p freshell-server --locked',
+  'dev:server': 'cargo run -p freshell-server --locked',
+  build: 'npm run build:client && npm run build:tools && npm run build:rust',
+  'test:source-runtime': 'tsx scripts/testing/run-source-runtime-tests.ts',
+}
+
+const REQUIRED_RUST_SCRIPT_NAMES = Object.keys(REQUIRED_RUST_SCRIPT_COMMANDS)
+
+function packageScriptsWithRustRequirements(overrides: Record<string, string> = {}): Record<string, string> {
+  return { ...REQUIRED_RUST_SCRIPT_COMMANDS, ...overrides }
+}
+
 const tempRoots: string[] = []
 
 async function createSyntheticRoot(
@@ -90,11 +104,11 @@ describe('runtime boundary analyzer', () => {
         id: 'package-scripts',
         path: 'package.json:scripts',
         role: 'package-commands',
-        entries: ['serve'],
+        entries: [...REQUIRED_RUST_SCRIPT_NAMES, 'serve'],
       }],
       {
         'package.json': JSON.stringify({
-          scripts: { serve: 'node runtime-backend.mjs' },
+          scripts: packageScriptsWithRustRequirements({ serve: 'node runtime-backend.mjs' }),
         }),
         'runtime-backend.mjs': [
           "import http from 'node:http'",
@@ -116,14 +130,11 @@ describe('runtime boundary analyzer', () => {
         id: 'package-scripts',
         path: 'package.json:scripts',
         role: 'package-commands',
-        entries: ['lint', 'start'],
+        entries: [...REQUIRED_RUST_SCRIPT_NAMES, 'lint'],
       }],
       {
         'package.json': JSON.stringify({
-          scripts: {
-            lint: 'eslint src --ext .ts',
-            start: 'cross-env NODE_ENV=production tsx scripts/start-rust-server.ts target/release/freshell-server',
-          },
+          scripts: packageScriptsWithRustRequirements({ lint: 'eslint src --ext .ts' }),
         }),
       },
     )
@@ -139,10 +150,12 @@ describe('runtime boundary analyzer', () => {
         id: 'package-scripts',
         path: 'package.json:scripts',
         role: 'package-commands',
-        entries: ['start'],
+        entries: REQUIRED_RUST_SCRIPT_NAMES,
       }],
       {
-        'package.json': JSON.stringify({ scripts: { start: 'cross-env node server/index.js' } }),
+        'package.json': JSON.stringify({
+          scripts: packageScriptsWithRustRequirements({ start: 'cross-env node server/index.js' }),
+        }),
       },
     )
 
@@ -151,6 +164,80 @@ describe('runtime boundary analyzer', () => {
     expect(result.manifestDrift).toEqual(expect.arrayContaining([
       'invalid package script behavior: start',
       'retired Node backend command: package.json:scripts.start',
+      ]))
+  })
+
+  it.each([
+    'node server/index.js',
+    'tsx "server/index.ts"',
+    'node --loader tsx dist/server/index.js',
+    'tsx --require "./hook.mjs" "./build/server/index.ts"',
+    'cross-env NODE_ENV=production node "nested/build/server/index.cjs"',
+    'node.exe --trace-warnings ".\\build\\server\\index.js"',
+  ])('reports a retired Node backend command with flags or quoting: %s', async (command) => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: REQUIRED_RUST_SCRIPT_NAMES,
+      }],
+      {
+        'package.json': JSON.stringify({
+          scripts: packageScriptsWithRustRequirements({ start: command }),
+        }),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toContain(
+      'retired Node backend command: package.json:scripts.start',
+    )
+  })
+
+  it('does not classify a non-backend Node script as the retired backend', async () => {
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries: REQUIRED_RUST_SCRIPT_NAMES,
+      }],
+      {
+        'package.json': JSON.stringify({
+          scripts: packageScriptsWithRustRequirements({ start: 'node tools/server.js' }),
+        }),
+      },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).not.toContain(
+      'retired Node backend command: package.json:scripts.start',
+    )
+  })
+
+  it('requires every Rust script name in both the manifest and package.json', async () => {
+    const missingName = 'test:source-runtime'
+    const entries = REQUIRED_RUST_SCRIPT_NAMES.filter((name) => name !== missingName)
+    const scripts = packageScriptsWithRustRequirements()
+    delete scripts[missingName]
+    const root = await createSyntheticRoot(
+      [{
+        id: 'package-scripts',
+        path: 'package.json:scripts',
+        role: 'package-commands',
+        entries,
+      }],
+      { 'package.json': JSON.stringify({ scripts }) },
+    )
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual(expect.arrayContaining([
+      `manifest missing required package script: ${missingName}`,
+      `invalid package script behavior: ${missingName}`,
     ]))
   })
 

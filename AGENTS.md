@@ -129,9 +129,12 @@ npm run build:rust          # Release freshell-server binary
 npm run serve               # Build and run the Rust server
 # `npm run serve` prompts before serving from a non-main branch; use
 # `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
-# Note: `npm run build` is guarded — it will refuse to overwrite dist/
-# if a production server is detected on the configured PORT. Use
-# `npm run check` for safe verification, or build from a worktree.
+# Note: `npm run build`, `npm run verify`, `npm run check`, and the
+# source-runtime phase are guarded — on the main checkout they fail closed
+# before writing artifacts if a production server is detected on the configured
+# PORT. Use `npm run typecheck:client` for a no-write check, or run
+# source-runtime/build verification from a linked worktree
+# (`cd .worktrees/<branch>`).
 ```
 
 **On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).

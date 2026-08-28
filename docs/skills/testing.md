@@ -9,7 +9,7 @@
 | `npm run typecheck:client` | Cheap client-only compile gate; safe while prod is live |
 | `npm test` | Coordinated full suite: client Vitest, Rust source-runtime smoke, Cargo tests, and Electron tests |
 | `npm run test:all` | Alias for the same coordinated full suite |
-| `npm run check` | Run `typecheck`, then the coordinated full suite |
+| `npm run check` | Typecheck, then the coordinated full suite |
 | `npm run verify` | Run `build`, then the coordinated full suite |
 | `npm run test:unit` | Exact default-config `test/unit` workload |
 | `npm run test:client` | Exact default-config `test/unit/client` workload |
@@ -35,6 +35,12 @@
 3. Use `npm run typecheck:client` when you only need the cheap frontend compile gate.
 4. Use the narrowest truthful public command you can.
 5. If another holder is active, wait rather than killing a foreign process.
+
+When production is live from the main checkout, the prebuild guard fails closed
+before any artifact writes for `npm run check`, `npm run test:source-runtime`,
+`npm run build`, and `npm run verify`. Use `npm run typecheck:client` for a
+no-write check, or run source-runtime/build verification from a linked
+worktree such as `.worktrees/<branch>`.
 
 ## Focused Examples
 
