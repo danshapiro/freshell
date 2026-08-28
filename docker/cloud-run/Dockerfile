@@ -84,7 +84,7 @@ COPY --from=node-builder /app/node_modules ./node_modules
 # overwrite the staged artifacts.
 COPY . .
 
-# Check the assembled runtime tree after all staged artifacts are present. The
+# Check the assembled runtime tree after all staged artifacts are present.
 # With --runtime-root the guard checks the required Rust/client/tools files and
 # executable, scans only shipped dist/, target/, and node_modules/ roots,
 # rejects retired artifact directories, node-pty, and direct top-level retired
