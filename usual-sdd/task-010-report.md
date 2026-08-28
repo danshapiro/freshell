@@ -23,14 +23,15 @@ build/config debt, stale service rows, unlisted distribution fixtures, and the
 retirement verifier entry. The run had 14 passing tests and one failing test.
 
 The implementation then added a committed test-disposition ledger and its
-verifier before removing the old test trees. The ledger covers the complete
-346-path Task 5/6/10 candidate universe:
+verifier before removing the old test trees. The review fix corrected the
+closed universe to include the explicitly deleted session-repair integration
+test. The corrected ledger covers 347 Task 5/6/10 candidate paths:
 
-- 346 candidate paths, represented by 348 subject rows because mixed subjects
+- 347 candidate paths, represented by 349 subject rows because mixed subjects
   and the split title-utils subjects are recorded independently;
 - 21 retained subjects, each bound to an exact surviving test, selector, lane,
   and positive Task 6 receipt;
-- 327 explicitly deleted subjects, including the historical updater deletion
+- 328 explicitly deleted subjects, including the historical updater deletion
   row and supplemental real-provider T2 rows that cannot satisfy a required
   replacement;
 - no unknown, duplicate, stale, unresolved, zero-selector, skipped-required,
@@ -38,11 +39,14 @@ verifier before removing the old test trees. The ledger covers the complete
 
 `node-test-disposition.json` is checked by
 `verify-node-test-disposition.ts`. The architecture test includes synthetic
-failures for an unresolved mixed subject, a zero-test selector, and a skipped
-optional-T2 receipt. The verifier currently reports:
+failures for an unresolved mixed subject, a zero-test selector, a skipped
+optional-T2 receipt, and omission of the required session-repair path. The
+verifier independently checks the exact 300 test paths deleted by Task 10,
+including `test/integration/session-repair.test.ts`, instead of accepting only
+the ledger's self-declared candidate universe. It currently reports:
 
 ```json
-{"severity":"info","event":"node_test_disposition_verified","candidateCount":346,"rowCount":348,"retainedRows":21,"deletedRows":327}
+{"severity":"info","event":"node_test_disposition_verified","candidateCount":347,"rowCount":349,"retainedRows":21,"deletedRows":328}
 ```
 
 Shared subjects were re-homed before deletion. This includes shared title

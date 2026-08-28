@@ -1,7 +1,7 @@
 {
   "version": 1,
   "universe": "Task 5/6/10 legacy Node test candidates",
-  "candidateCount": 346,
+  "candidateCount": 347,
   "candidatePaths": [
     "test/e2e/agent-cli-flow.test.ts",
     "test/e2e/agent-cli-screenshot-smoke.test.ts",
@@ -57,6 +57,7 @@
     "test/integration/server/test-coordinator.test.ts",
     "test/integration/server/unified-rename-integration.test.ts",
     "test/integration/server/wsl-port-forward.test.ts",
+    "test/integration/session-repair.test.ts",
     "test/server/agent-api-fresh-agent.test.ts",
     "test/server/agent-capture-pane.test.ts",
     "test/server/agent-codex-identity-invariant.test.ts",
@@ -941,6 +942,17 @@
   {
     "oldPath": "test/integration/server/wsl-port-forward.test.ts",
     "title": "wsl-port-forward.test",
+    "subject": "legacy Node backend subject",
+    "decision": "deleted",
+    "replacementRequired": false,
+    "survivingTest": null,
+    "requiredLane": "none",
+    "selector": null,
+    "latestReceipt": "deleted task-010"
+  },
+  {
+    "oldPath": "test/integration/session-repair.test.ts",
+    "title": "session-repair.test",
     "subject": "legacy Node backend subject",
     "decision": "deleted",
     "replacementRequired": false,
