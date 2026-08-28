@@ -36,9 +36,8 @@ fn discover_server_binary() -> Option<PathBuf> {
 
 #[test]
 fn app_bound_spawn_health_reap_end_to_end() {
-    let server_binary = discover_server_binary().expect(
-        "freshell-server binary not found; build it first or set FRESHELL_SERVER_BIN",
-    );
+    let server_binary = discover_server_binary()
+        .expect("freshell-server binary not found; build it first or set FRESHELL_SERVER_BIN");
     eprintln!("using server binary: {}", server_binary.display());
 
     // Isolated HOME so the smoke never reads/writes the real ~/.freshell.
