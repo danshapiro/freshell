@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js Version">
+  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node.js tools version">
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-blue" alt="Platform Support">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
@@ -25,7 +25,7 @@
 - **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription. Rich chat UI with collapsible tool strips, token budget display, and full session persistence.
-- **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
+- **Extension system** — Add client pane types and CLI integrations via manifest-based extensions. Server-hosted extension panes are not part of the Rust server contract.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
@@ -44,26 +44,39 @@ cd freshell
 # Install dependencies
 npm install
 
-# Build and run
+# Build the client, tools, and Rust server, then run it
 npm run serve
 ```
 
-On first run, freshell auto-generates a `.env` file with a secure random `AUTH_TOKEN`. The token is printed to the console at startup — open the URL shown to connect.
+On first run, Freshell creates a `.env` file with a secure random `AUTH_TOKEN`. The Rust server prints the URL at startup — open it to connect.
+
+For a development checkout, use `npm run dev` for Vite plus the Rust server,
+or `PORT=3499 npm run dev:server` for the Rust server without Vite. For a
+previously built checkout, `scripts/launch-rust.sh --port 3499` builds and
+starts an isolated Rust instance; use a port other than the live self-hosted
+port when testing a worktree.
 
 ## Prerequisites
 
-Node.js 18+ (20+ recommended) and platform build tools for native modules (`windows-build-tools` on Windows, Xcode CLI Tools on macOS, `build-essential python3` on Linux).
+Node.js 22.5+ and Rust stable are required. Node is used for the client,
+standalone CLI/MCP tools, and Electron build; the Rust toolchain builds the
+`freshell-server` binary and owns PTY support. Platform-specific build tools
+are documented in [Building the Windows Electron App](docs/development/windows-electron-build.md).
 
 > **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
 
 ## Usage
 
 ```bash
-npm run dev     # Development with hot reload
-npm run serve   # Production build and run
+npm run dev     # Vite + Rust server with hot reload
+npm run serve   # Build and run the Rust server
 ```
 
 `npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
+
+For unattended operation, build `freshell-server` and install the optional
+user service in [`installers/systemd/freshell-rust.service`](installers/systemd/freshell-rust.service).
+The service is standalone and independent of Electron.
 
 ## Stream Deck
 
@@ -121,9 +134,12 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
-| `PORT` | No | Server port (default: 3001) |
+| `PORT` | No | Rust server port (default: 3001) |
+| `FRESHELL_BIND_HOST` | No | Explicit Rust server bind host, such as `127.0.0.1` or `0.0.0.0` |
+| `FRESHELL_HOME` | No | Freshell state/config home (default: the user's home directory) |
 | `ALLOWED_ORIGINS` | No | Auto-managed CORS origins for the active server bind host and LAN IPs |
 | `EXTRA_ALLOWED_ORIGINS` | No | Comma-separated custom CORS origins preserved across runtime origin rebuilds |
+| `RUST_LOG` | No | Rust structured-log filter (default: `info`) |
 | `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
 | `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |
 | `WINDOWS_SHELL` | No | Windows shell: `wsl` (default), `cmd`, or `powershell` |
@@ -135,6 +151,10 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
+| `FRESHELL_CLAUDE_NODE` | No | Node executable for the isolated Claude SDK sidecar (normally set by Electron) |
+| `FRESHELL_CLAUDE_SIDECAR` | No | Claude sidecar entrypoint override for Rust development/service runs |
+| `FRESHELL_MCP_NODE` | No | Node executable for the standalone MCP client |
+| `FRESHELL_MCP_ENTRY` | No | Standalone MCP client entrypoint override |
 
 ### Coding CLI Providers
 
@@ -156,23 +176,60 @@ OpenCode permissions are controlled by the OpenCode configuration for the OS use
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
+### Standalone CLI and MCP client
+
+The Rust server is the only Freshell HTTP/WebSocket backend. The Node programs
+under `tools/` are clients: they connect to an already-running Rust server and
+do not start one.
+
+```bash
+npm run build:tools
+FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
+  node dist/tools/freshell-cli/index.js list-tabs
+FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
+  node dist/tools/freshell-mcp/server.js
+```
+
+When Freshell starts a terminal, it supplies the MCP client endpoint through
+`FRESHELL_URL` and `FRESHELL_TOKEN`. In the packaged desktop app, the native
+Rust server is under `resources/bin/`; the packaged Node runtime and MCP client
+are separate resources. Claude fresh-agent panes use the isolated
+`crates/freshell-claude-sidecar` package, which wraps the Claude SDK over
+newline-delimited JSON on stdin/stdout. The sidecar is not a network service.
+
+### Rust server scope
+
+The Rust server supports the browser UI, terminal and session workflows, the
+supported agent pane flows, and the retained CLI/MCP actions. A small set of
+legacy Node-only operations is intentionally unavailable: server-managed
+extension processes/assets, external-editor reveal, the old command-running and
+direct fresh-agent-send APIs, legacy coding-client WebSocket messages, paged
+fresh-agent transcript/viewport APIs, and remote browser forwarding. Use a
+terminal pane or the supported Rust REST/WS/MCP operations instead. The session
+repair/backfill and remaining parity work are tracked in the project parity
+checklist and existing issues; they are not silently presented as supported.
+
 ## Tech Stack
 
 - **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react
-- **Backend**: Express, WebSocket (ws), node-pty, Pino, Chokidar, Zod
+- **Backend**: Rust `freshell-server`, Axum, Tokio, portable-pty, SQLite, and structured JSONL logging
+- **Client tooling**: Node.js standalone CLI and stdio MCP client
+- **Claude integration**: isolated Node Claude SDK sidecar, launched by the Rust fresh-agent runtime
 - **Build**: Vite, TypeScript
-- **Testing**: Vitest, Testing Library, supertest, superwstest
-- **AI**: Vercel AI SDK with Google Gemini
+- **Testing**: Vitest, Testing Library, Playwright, and Cargo tests
+- **AI**: Google Gemini integration in the Rust server
 
 ## Extensions
 
-Freshell supports custom pane types via extensions. Three categories are available:
+Freshell supports custom pane types via extensions. The Rust server supports
+client assets and CLI extensions:
 
-- **Client** — Static HTML/JS served by freshell (no server needed)
-- **Server** — Your own HTTP server, managed by freshell with automatic port allocation
+- **Client** — Static HTML/JS assets served by the Rust server
 - **CLI** — Any terminal tool wrapped as a pane
+- **Server-hosted** — Not available in the Rust server; run the service
+  separately and open it as a supported browser pane when appropriate
 
-Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart freshell. See [`examples/extensions/`](examples/extensions/) for working examples of each type.
+Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart Freshell. See [`examples/extensions/`](examples/extensions/) for client and CLI examples.
 
 ## Contributing
 

@@ -378,11 +378,13 @@ describe('runtime boundary analyzer', () => {
 })
 
 describe('runtime boundary inventory for the current checkout', () => {
-  it('keeps current legacy debt explicit while proving the manifest is reconciled', async () => {
+  it('requires executable runtime evidence to be fully Rust-only', async () => {
     const result = await analyzeRuntimeBoundary(process.cwd())
 
-    expect(result.manifestDrift).toEqual([])
-    expect(result.unexpectedNodeBackend).toEqual([])
-    expect(result.legacyDebt).toEqual([])
+    expect(result).toEqual({
+      manifestDrift: [],
+      legacyDebt: [],
+      unexpectedNodeBackend: [],
+    })
   })
 })
