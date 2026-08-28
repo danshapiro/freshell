@@ -122,6 +122,25 @@ export async function checkProdRunning(
   return { status: 'not-running' }
 }
 
+export function formatProductionConflictMessage(port: number, version?: string): string {
+  const versionSuffix = version ? ` (v${version})` : ''
+  return [
+    `\n\x1b[31m✖ Freshell production server${versionSuffix} is running on port ${port}.\x1b[0m`,
+    '  Building would overwrite dist/ and break the live server.',
+    '',
+    '\x1b[33mSafe alternatives:\x1b[0m',
+    '  1. \x1b[36mnpm run typecheck:client\x1b[0m  TypeScript-only check; it does not write build artifacts.',
+    '  2. Run \x1b[36mnpm run check\x1b[0m from a linked worktree; its source-runtime phase fails closed on main while production is live.',
+    '     \x1b[36mcd .worktrees/{branch} && npm run check\x1b[0m',
+    '  3. Run source-runtime/build checks from a linked worktree:',
+    '     \x1b[36mcd .worktrees/{branch} && npm run test:source-runtime\x1b[0m',
+    '     \x1b[36mcd .worktrees/{branch} && npm run build\x1b[0m',
+    '  4. Stop production, then build (only with explicit approval):',
+    '     \x1b[36mkill {PID} && npm run build\x1b[0m',
+    '',
+  ].join('\n')
+}
+
 export async function main(): Promise<void> {
   if (isLinkedWorktreeCheckout()) {
     process.exit(0)
@@ -137,15 +156,7 @@ export async function main(): Promise<void> {
     process.exit(0)
   }
 
-  const version = result.version ? ` (v${result.version})` : ''
-  console.error(`\n\x1b[31m✖ Freshell production server${version} is running on port ${port}.\x1b[0m`)
-  console.error(`  Building would overwrite dist/ and break the live server.\n`)
-  console.error(`\x1b[33mSafe alternatives:\x1b[0m`)
-  console.error(`  1. \x1b[36mnpm run check\x1b[0m        Typecheck + tests without building (safe while prod is live)`)
-  console.error(`  2. Kill production, then build:`)
-  console.error(`     \x1b[36mkill {PID} && npm run build\x1b[0m`)
-  console.error(`  3. Build in a worktree:`)
-  console.error(`     \x1b[36mcd .worktrees/{branch} && npm run build\x1b[0m\n`)
+  console.error(formatProductionConflictMessage(port, result.version))
   process.exit(1)
 }
 

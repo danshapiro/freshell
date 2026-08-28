@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
 const fixturePaths = [
+  'test/fixtures/distribution/rust-only/dist/client/index.html',
   'test/fixtures/distribution/node-server/node_modules/node-pty/index.js',
   'test/fixtures/distribution/node-server/dist/server/index.js',
 ]

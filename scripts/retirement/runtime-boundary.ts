@@ -284,19 +284,125 @@ const REQUIRED_RUST_SCRIPT_BEHAVIORS: Readonly<Record<string, (command: string) 
   'test:source-runtime': (command) => command.includes('scripts/testing/run-source-runtime-tests.ts'),
 }
 
-const RETIRED_NODE_BACKEND_COMMAND = /\b(?:node|tsx)\s+(?:(?:\.\.\/|\.\/|dist\/)?)server(?:\/|\.[cm]?[jt]sx?\b)/i
+type ShellToken = {
+  value: string
+  separator: boolean
+}
+
+/**
+ * Tokenize enough shell syntax to inspect package commands without executing
+ * them. Quotes are removed, escaped path separators are retained, and shell
+ * command separators prevent a later command from being attributed to an
+ * earlier Node invocation.
+ */
+function tokenizeShellCommand(command: string): ShellToken[] {
+  const tokens: ShellToken[] = []
+  let current = ''
+  let quote: '"' | "'" | undefined
+
+  const flush = (): void => {
+    if (current.length > 0) {
+      tokens.push({ value: current, separator: false })
+      current = ''
+    }
+  }
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]
+
+    if (quote !== undefined) {
+      if (character === quote) {
+        quote = undefined
+      } else if (character === '\\' && quote === '"' && index + 1 < command.length) {
+        const next = command[index + 1]
+        if (next === '"' || next === '\\' || next === '$' || next === '`') {
+          current += next
+          index += 1
+        } else {
+          current += character
+        }
+      } else {
+        current += character
+      }
+      continue
+    }
+
+    if (character === '"' || character === "'") {
+      quote = character
+      continue
+    }
+
+    if (character === '\\' && index + 1 < command.length) {
+      const next = command[index + 1]
+      if (/\s/.test(next) || next === '"' || next === "'" || next === '\\') {
+        current += next
+        index += 1
+      } else {
+        // Keep Windows path separators and other non-shell escapes intact.
+        current += character
+      }
+      continue
+    }
+
+    if (/\s/.test(character)) {
+      flush()
+      continue
+    }
+
+    if (character === ';' || character === '&' || character === '|' || character === '(' || character === ')') {
+      flush()
+      const next = command[index + 1]
+      if ((character === '&' || character === '|') && next === character) index += 1
+      tokens.push({ value: character, separator: true })
+      continue
+    }
+
+    current += character
+  }
+
+  flush()
+  return tokens
+}
+
+function isRetiredNodeBackendPath(value: string): boolean {
+  const normalized = value.replace(/\\/g, '/')
+  return /(?:^|\/)(?:(?:dist|build)\/)?server\/index(?:\.[cm]?[jt]sx?)?$/i.test(normalized)
+}
+
+const RETIRED_NODE_BACKEND_COMMAND = (command: string): boolean => {
+  let nodeRuntimeCommand = false
+
+  for (const token of tokenizeShellCommand(command)) {
+    if (token.separator) {
+      nodeRuntimeCommand = false
+      continue
+    }
+
+    if (!nodeRuntimeCommand) {
+      const normalized = token.value.replace(/\\/g, '/')
+      nodeRuntimeCommand = /(?:^|\/)(?:node|tsx)(?:\.(?:cmd|exe))?$/i.test(normalized)
+      continue
+    }
+
+    if (isRetiredNodeBackendPath(token.value)) return true
+  }
+
+  return false
+}
 
 function packageScriptBehaviorDrift(scripts: PackageScripts, expectedNames: readonly string[]): string[] {
   const drift: string[] = []
   for (const [name, requirement] of Object.entries(REQUIRED_RUST_SCRIPT_BEHAVIORS)) {
-    if (!expectedNames.includes(name)) continue
+    if (!expectedNames.includes(name)) {
+      drift.push(`manifest missing required package script: ${name}`)
+    }
     const command = scripts[name]
     if (command === undefined || !requirement(command)) {
       drift.push(`invalid package script behavior: ${name}`)
     }
   }
   for (const [name, command] of Object.entries(scripts)) {
-    if (RETIRED_NODE_BACKEND_COMMAND.test(command)) {
+    if (RETIRED_NODE_BACKEND_COMMAND(command)) {
       drift.push(`retired Node backend command: package.json:scripts.${name}`)
     }
   }

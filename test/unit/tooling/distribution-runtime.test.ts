@@ -27,6 +27,8 @@ function diagnostics(output: string): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>)
 }
 
+const NODE_PTY_RETIREMENT_TERM = /node-pty/
+
 const FORBIDDEN_DISTRIBUTION_TERMS = [
   /node dist\/server/,
   /build:server/,
@@ -35,6 +37,7 @@ const FORBIDDEN_DISTRIBUTION_TERMS = [
   /vitest\.server/,
   /--passWithNoTests/,
   /legacy-chromium/,
+  NODE_PTY_RETIREMENT_TERM,
 ]
 
 describe('Rust-only distribution runtime contracts', () => {
@@ -62,7 +65,13 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(dockerfile).toContain('RETIRED_BACKEND_DIRECTORIES')
     expect(dockerfile).toContain('node_modules/node-pty')
     expect(dockerfile).toContain('test ! -e "/app/$relative"')
-    for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
+    expect(dockerfile).toMatch(
+      /RETIRED_BACKEND_DIRECTORIES[\s\S]*node_modules\/node-pty[\s\S]*test ! -e "\/app\/\$relative"/,
+    )
+    for (const term of FORBIDDEN_DISTRIBUTION_TERMS) {
+      if (term === NODE_PTY_RETIREMENT_TERM) continue
+      expect(dockerfile).not.toMatch(term)
+    }
   })
 
   it('fails closed when Cloud Run discovery cannot produce a nonempty selection', () => {
@@ -176,16 +185,4 @@ describe('Rust-only distribution runtime contracts', () => {
     ]))
   })
 
-  it('keeps tracked distribution fixtures visible to Git tooling', () => {
-    for (const fixturePath of [
-      'test/fixtures/distribution/rust-only/dist/client/index.html',
-      'test/fixtures/distribution/node-server/node_modules/node-pty/index.js',
-    ]) {
-      const result = spawnSync('git', ['check-ignore', '--no-index', fixturePath], {
-        cwd: PROJECT_ROOT,
-        encoding: 'utf8',
-      })
-      expect(result.status, `${fixturePath} must not be ignored`).toBe(1)
-    }
-  })
 })

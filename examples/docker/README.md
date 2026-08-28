@@ -15,7 +15,8 @@ its port explicitly if you need to access it.
 ```bash
 # From the freshell repo root:
 docker build -t freshell-docker-test -f examples/docker/Dockerfile .
-docker run --rm -p 3001:3001 freshell-docker-test
+# Use a private random value of at least 16 characters; do not commit it.
+docker run --rm -e AUTH_TOKEN=replace-with-a-long-random-token -p 3001:3001 freshell-docker-test
 ```
 
 Open the URL printed to stdout. The pane picker contains the Rust-supported
