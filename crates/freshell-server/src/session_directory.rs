@@ -1317,6 +1317,45 @@ mod join_tests {
         }
     }
 
+    #[test]
+    fn linked_worktree_payload_keeps_checkout_path_separate_from_project_path() {
+        let root = std::env::temp_dir().join(format!(
+            "freshell-session-directory-worktree-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let repo = root.join("repo");
+        let checkout = repo.join("worktrees/feature");
+        let gitdir = repo.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\\n").unwrap();
+
+        let mut item = file_item("claude", "session-1", 1);
+        item.project_path = repo.to_string_lossy().into_owned();
+        item.cwd = Some(checkout.to_string_lossy().into_owned());
+        let payload = item.to_value();
+
+        assert_eq!(
+            payload["projectPath"],
+            serde_json::json!(repo.to_string_lossy())
+        );
+        assert_eq!(
+            payload["checkoutPath"],
+            serde_json::json!(checkout.to_string_lossy())
+        );
+        assert_eq!(
+            payload["cwd"],
+            serde_json::json!(checkout.to_string_lossy())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // ── provider_display_name ──
 
     #[test]

@@ -2352,6 +2352,43 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[test]
+    fn linked_worktree_session_groups_under_parent_repo_and_keeps_checkout_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "freshell-directory-index-worktree-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let repo = root.join("repo");
+        let checkout = repo.join("worktrees/feature");
+        let gitdir = repo.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\\n").unwrap();
+
+        let checkout_path = checkout.to_string_lossy().into_owned();
+        let indexed = item_from_meta(
+            &ParsedSessionMeta {
+                cwd: Some(checkout_path.clone()),
+                ..Default::default()
+            },
+            "claude",
+            "session-1".to_string(),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(indexed.project_path, repo.to_string_lossy());
+        assert_eq!(indexed.cwd.as_deref(), Some(checkout_path.as_str()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Poll `predicate` every 10ms until it's true or `timeout` elapses.
     /// Returns whether it became true -- used to observe a detached
     /// background refresh (stale-while-revalidate) settling, since that
