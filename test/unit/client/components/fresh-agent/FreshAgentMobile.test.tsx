@@ -136,7 +136,7 @@ describe('mobile coarse-pointer composer keyboard behavior', () => {
     expect(onSend).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    expect(onSend).toHaveBeenCalledWith('hello', [])
+    expect(onSend).toHaveBeenCalledWith('hello')
   })
 
   it('Enter still sends on fine pointers', () => {
@@ -147,6 +147,6 @@ describe('mobile coarse-pointer composer keyboard behavior', () => {
     const input = screen.getByRole('textbox', { name: 'Chat message input' })
     fireEvent.change(input, { target: { value: 'hello' } })
     fireEvent.keyDown(input, { key: 'Enter' })
-    expect(onSend).toHaveBeenCalledWith('hello', [])
+    expect(onSend).toHaveBeenCalledWith('hello')
   })
 })
