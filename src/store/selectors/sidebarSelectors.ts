@@ -667,10 +667,38 @@ export function filterSessionItemsByVisibility(
   })
 }
 
+export type PinnedStatusTier = 1 | 2 | 3 | 4
+
+export interface PinnedSortStatus {
+  /** Sessions currently busy on this device, keyed `provider:sessionId`. */
+  busySessionKeys?: ReadonlySet<string>
+  /** Per-session activity on OTHER devices (the fold already resolves busy-over-open). */
+  remoteActivity?: Record<string, 'busy' | 'open'>
+}
+
+/**
+ * Strict 4-way partition of pinned (hasTab) rows (coordinator decision A):
+ *   1 = busy on this device (blue) · 2 = open here, not busy, no remote state
+ *   3 = busy on another device (blue ring data) · 4 = open on another device (green ring data)
+ * Local busy beats any remote state; tier 2 is the catch-all "remaining pinned"
+ * bucket — exactly the rows rendering the sidebar's plain local green icon.
+ */
+export function resolvePinnedStatusTier(
+  item: SidebarSessionItem,
+  pinnedStatus?: PinnedSortStatus,
+): PinnedStatusTier {
+  const key = `${item.provider}:${item.sessionId}`
+  if (pinnedStatus?.busySessionKeys?.has(key)) return 1
+  const remote = pinnedStatus?.remoteActivity?.[key]
+  if (remote === 'busy') return 3
+  if (remote === 'open') return 4
+  return 2
+}
+
 export function sortSessionItems(
   items: SidebarSessionItem[],
   sortMode: string,
-  options?: { disableTabPinning?: boolean },
+  options?: { disableTabPinning?: boolean; pinnedStatus?: PinnedSortStatus },
 ): SidebarSessionItem[] {
   const sorted = [...items]
 
@@ -691,6 +719,11 @@ export function sortSessionItems(
     return bTime - aTime || compareBySessionKey(a, b)
   }
 
+  // Pinned status tier asc, then the mode's existing within-tier time
+  // comparator (decisions A/B). With no pinnedStatus every pinned row is
+  // tier 2, so tiering degenerates to the legacy comparators exactly.
+  const tierOf = (item: SidebarSessionItem) => resolvePinnedStatusTier(item, options?.pinnedStatus)
+
   const sortByMode = (list: SidebarSessionItem[]) => {
     const copy = [...list]
 
@@ -706,7 +739,11 @@ export function sortSessionItems(
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
-      withTabs.sort(compareByRecency)
+      withTabs.sort((a, b) => {
+        const tierDelta = tierOf(a) - tierOf(b)
+        if (tierDelta !== 0) return tierDelta
+        return compareByRecency(a, b)
+      })
       withoutTabs.sort(compareByRecency)
 
       return [...withTabs, ...withoutTabs]
@@ -721,6 +758,8 @@ export function sortSessionItems(
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
       withTabs.sort((a, b) => {
+        const tierDelta = tierOf(a) - tierOf(b)
+        if (tierDelta !== 0) return tierDelta
         const aTime = a.ratchetedActivity ?? a.timestamp
         const bTime = b.ratchetedActivity ?? b.timestamp
         return bTime - aTime || compareBySessionKey(a, b)

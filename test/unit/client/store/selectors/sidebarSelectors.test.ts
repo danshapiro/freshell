@@ -1193,6 +1193,121 @@ describe('sidebarSelectors', () => {
       })
     })
 
+    describe('pinned status tiers', () => {
+      const pinned = (id: string, timestamp: number, extra: Partial<SidebarSessionItem> = {}) =>
+        createSessionItem({ id, sessionId: id, timestamp, hasTab: true, ...extra })
+
+      it('orders pinned rows into four tiers: busy here, plain open here, remote busy, remote open', () => {
+        // Legacy time order would be remote-open > remote-busy > plain-open > busy-here.
+        const items = [
+          pinned('remote-open', 4000),
+          pinned('remote-busy', 3000),
+          pinned('plain-open', 2000),
+          pinned('busy-here', 1000),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          pinnedStatus: {
+            busySessionKeys: new Set(['claude:busy-here']),
+            remoteActivity: { 'claude:remote-busy': 'busy', 'claude:remote-open': 'open' },
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['busy-here', 'plain-open', 'remote-busy', 'remote-open'])
+      })
+
+      it('treats local-busy as tier 1 even when the session is also busy remotely', () => {
+        const items = [pinned('both', 1000), pinned('plain', 2000)]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          pinnedStatus: {
+            busySessionKeys: new Set(['claude:both']),
+            remoteActivity: { 'claude:both': 'busy' },
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['both', 'plain'])
+      })
+
+      it('keeps (ratchetedActivity ?? timestamp) ordering within a tier in activity mode', () => {
+        const items = [
+          pinned('old-ratcheted', 5000, { ratchetedActivity: 4000 }),
+          pinned('new-untouched', 3000),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', { pinnedStatus: {} })
+
+        expect(sorted.map((i) => i.id)).toEqual(['old-ratcheted', 'new-untouched'])
+      })
+
+      it('applies the same tiers in recency-pinned mode with timestamp ordering within a tier', () => {
+        const items = [
+          pinned('remote-open', 4000),
+          pinned('busy-here', 1000),
+          pinned('plain', 3000),
+        ]
+
+        const sorted = sortSessionItems(items, 'recency-pinned', {
+          pinnedStatus: {
+            busySessionKeys: new Set(['claude:busy-here']),
+            remoteActivity: { 'claude:remote-open': 'open' },
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['busy-here', 'plain', 'remote-open'])
+      })
+
+      it('flattens tiers when disableTabPinning is set (active search)', () => {
+        const items = [
+          pinned('remote-open', 4000),
+          pinned('busy-here', 1000),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          disableTabPinning: true,
+          pinnedStatus: {
+            busySessionKeys: new Set(['claude:busy-here']),
+            remoteActivity: { 'claude:remote-open': 'open' },
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['remote-open', 'busy-here'])
+      })
+
+      it('applies tiers within the archived partition (archived still last)', () => {
+        const items = [
+          createSessionItem({ id: 'arch-plain', sessionId: 'arch-plain', timestamp: 2000, hasTab: true, archived: true }),
+          createSessionItem({ id: 'arch-busy', sessionId: 'arch-busy', timestamp: 1000, hasTab: true, archived: true }),
+          createSessionItem({ id: 'live', sessionId: 'live', timestamp: 500, hasTab: false }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          pinnedStatus: { busySessionKeys: new Set(['claude:arch-busy']) },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['live', 'arch-busy', 'arch-plain'])
+      })
+
+      it('ignores pinnedStatus in recency and project modes', () => {
+        const pinnedStatus = { busySessionKeys: new Set(['claude:busy-here']) }
+
+        const recency = sortSessionItems([pinned('busy-here', 1000), pinned('plain', 2000)], 'recency', { pinnedStatus })
+        expect(recency.map((i) => i.id)).toEqual(['plain', 'busy-here'])
+
+        const project = sortSessionItems([
+          createSessionItem({ id: 'busy-here', sessionId: 'busy-here', timestamp: 1000, hasTab: true, projectPath: '/b' }),
+          createSessionItem({ id: 'plain', sessionId: 'plain', timestamp: 2000, hasTab: true, projectPath: '/a' }),
+        ], 'project', { pinnedStatus })
+        expect(project.map((i) => i.id)).toEqual(['plain', 'busy-here'])
+      })
+
+      it('leaves legacy pinned ordering untouched when pinnedStatus is omitted', () => {
+        const sorted = sortSessionItems([pinned('older', 1000), pinned('newer', 2000)], 'activity')
+
+        expect(sorted.map((i) => i.id)).toEqual(['newer', 'older'])
+      })
+    })
+
     describe('project mode', () => {
       it('sorts by project path alphabetically', () => {
         const items = [
