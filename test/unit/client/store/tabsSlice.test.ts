@@ -15,7 +15,8 @@ import panesReducer, { initLayout, splitPane } from '../../../../src/store/panes
 import sessionActivityReducer from '../../../../src/store/sessionActivitySlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
-import type { Tab } from '../../../../src/store/types'
+import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
+import type { BackgroundTerminal, Tab } from '../../../../src/store/types'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -672,6 +673,127 @@ describe('tabsSlice', () => {
 
       expect(store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`])
         .toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    function createRegistryRatchetStore(
+      terminals: BackgroundTerminal[],
+      sessions: Record<string, number> = {},
+    ) {
+      return configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          sessionActivity: sessionActivityReducer,
+          terminalDirectory: terminalDirectoryReducer,
+        },
+        preloadedState: {
+          sessionActivity: { sessions },
+          terminalDirectory: {
+            windows: { sidebar: { items: terminals, nextCursor: null } },
+            searches: {},
+          },
+        },
+      })
+    }
+
+    it('ratchets the fallback row key of every running identity-less registry terminal in the layout', async () => {
+      // Running agent terminals without sessionRef surface in the sidebar as
+      // fallback rows keyed `<mode>:terminal:<terminalId>`; the row persists
+      // after tab close because the terminal keeps running.
+      const store = createRegistryRatchetStore([
+        {
+          terminalId: 'term-op-1',
+          title: 'OpenCode one',
+          createdAt: 1,
+          lastActivityAt: 1,
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+        },
+        {
+          terminalId: 'term-op-2',
+          title: 'OpenCode two',
+          createdAt: 1,
+          lastActivityAt: 1,
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+        },
+      ])
+      store.dispatch(addTab({ mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-1' },
+      }))
+      const leafId = (store.getState().panes.layouts[tabId] as any).id
+      store.dispatch(splitPane({
+        tabId,
+        paneId: leafId,
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-2' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['opencode:terminal:term-op-1']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['opencode:terminal:term-op-2']).toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('skips the terminal key when a codex registry terminal has durability identity', async () => {
+      // That row is keyed codex:<durabilitySessionId> and is already ratcheted
+      // by the canonical refs loop (pane-content codex durability locator).
+      const codexDurability = { schemaVersion: 1, state: 'durable', durableThreadId: 'durable-cx-1' } as const
+      const store = createRegistryRatchetStore([{
+        terminalId: 'term-cx-1',
+        title: 'Codex pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'codex',
+        codexDurability,
+      }])
+      store.dispatch(addTab({ mode: 'codex' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-1', codexDurability },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['codex:durable-cx-1']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['codex:terminal:term-cx-1']).toBeUndefined()
+    })
+
+    it('skips the terminal key when the registry terminal carries a sessionRef', async () => {
+      // Canonical identity lives in the registry, not the pane content here;
+      // the alias terminal key would be junk (its row never exists).
+      const store = createRegistryRatchetStore([{
+        terminalId: 'term-ref-1',
+        title: 'Claude pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }])
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-ref-1' },
+      }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions).toEqual({})
     })
   })
 

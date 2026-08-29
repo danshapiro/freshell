@@ -6,7 +6,7 @@ import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
-import type { CodingCliProviderName } from '@/store/types'
+import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 type SessionMatchLocator = {
@@ -302,6 +302,41 @@ export function collectSessionRefsFromTabs(
     })),
     sessionKey,
   )
+}
+
+export interface LiveTerminalFallbackIdentity {
+  provider: CodingCliProviderName
+  /** activity/sessionActivity bucket key: `<mode>:terminal:<terminalId>` */
+  key: string
+}
+
+/**
+ * Identity of the sidebar's live-terminal fallback row for a registry
+ * terminal WITHOUT canonical session identity (see the `for (const terminal
+ * of terminals)` loop in store/selectors/sidebarSelectors.ts): shown keyed
+ * `<mode>:terminal:<terminalId>`, read from sessionActivity under that key.
+ * Returns undefined exactly when the registry terminal produces no such row:
+ * not running, carrying a sessionRef (canonical identity instead), shell or
+ * unset mode, or codex with a durability session id — that row is keyed
+ * `codex:<durabilitySessionId>` and is covered by the canonical refs loop.
+ * The predicate MUST stay in sync with the sidebar selector's loop guard.
+ */
+export function liveTerminalFallbackIdentity(
+  terminal: Pick<BackgroundTerminal, 'terminalId' | 'status' | 'mode' | 'sessionRef' | 'codexDurability'> | undefined,
+): LiveTerminalFallbackIdentity | undefined {
+  if (!terminal) return undefined
+  if (terminal.status !== 'running') return undefined
+  if (terminal.sessionRef) return undefined
+  if (!isNonShellMode(terminal.mode)) return undefined
+  if (
+    terminal.mode === 'codex'
+    && (terminal.codexDurability?.durableThreadId
+      ?? terminal.codexDurability?.candidate?.candidateThreadId)
+  ) {
+    return undefined
+  }
+  const provider = terminal.mode as CodingCliProviderName
+  return { provider, key: `${provider}:terminal:${terminal.terminalId}` }
 }
 
 export function getActiveSessionRefForTab(state: RootState, tabId: string): SessionRef | undefined {

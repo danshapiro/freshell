@@ -8,6 +8,7 @@ import {
   findTabIdForSession,
   getActiveSessionRefForTab,
   getSessionsForHello,
+  liveTerminalFallbackIdentity,
 } from '@/lib/session-utils'
 import type {
   FreshAgentPaneContent,
@@ -17,6 +18,7 @@ import type {
   TerminalPaneContent,
 } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
+import type { BackgroundTerminal } from '@/store/types'
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_SESSION_ID = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
@@ -393,5 +395,72 @@ describe('extractSessionLocators', () => {
     expect(extractSessionLocators(terminalContent('claude', { resumeSessionId: VALID_SESSION_ID }))).toEqual([
       { provider: 'claude', sessionId: VALID_SESSION_ID },
     ])
+  })
+})
+
+describe('liveTerminalFallbackIdentity', () => {
+  function registryTerminal(overrides: Partial<BackgroundTerminal> = {}): BackgroundTerminal {
+    return {
+      terminalId: 'term-1',
+      title: 'Agent pane',
+      createdAt: 1,
+      lastActivityAt: 1,
+      status: 'running',
+      hasClients: true,
+      mode: 'opencode',
+      ...overrides,
+    }
+  }
+
+  it('keys a running identity-less agent terminal as <mode>:terminal:<terminalId>', () => {
+    expect(liveTerminalFallbackIdentity(registryTerminal())).toEqual({
+      provider: 'opencode',
+      key: 'opencode:terminal:term-1',
+    })
+  })
+
+  it('returns undefined for a missing registry terminal', () => {
+    expect(liveTerminalFallbackIdentity(undefined)).toBeUndefined()
+  })
+
+  it('returns undefined when the terminal is not running', () => {
+    expect(liveTerminalFallbackIdentity(registryTerminal({ status: 'exited' }))).toBeUndefined()
+  })
+
+  it('returns undefined for shell-mode terminals', () => {
+    expect(liveTerminalFallbackIdentity(registryTerminal({ mode: 'shell' }))).toBeUndefined()
+    expect(liveTerminalFallbackIdentity(registryTerminal({ mode: undefined }))).toBeUndefined()
+  })
+
+  it('returns undefined when the registry terminal carries a sessionRef', () => {
+    expect(liveTerminalFallbackIdentity(registryTerminal({
+      sessionRef: { provider: 'opencode', sessionId: 'session-1' },
+    }))).toBeUndefined()
+  })
+
+  it('returns undefined for codex terminals with durability identity (covered via codex:<durabilityId>)', () => {
+    const durable = {
+      schemaVersion: 1,
+      state: 'durable',
+      durableThreadId: 'durable-1',
+    } as const
+    expect(liveTerminalFallbackIdentity(registryTerminal({ mode: 'codex', codexDurability: durable }))).toBeUndefined()
+    const candidateOnly = {
+      schemaVersion: 1,
+      state: 'identity_pending',
+      candidate: {
+        provider: 'codex',
+        candidateThreadId: 'cand-1',
+        rolloutPath: '/tmp/rollout.jsonl',
+        source: 'thread_start_response',
+        capturedAt: 1,
+      },
+    } as const
+    expect(liveTerminalFallbackIdentity(registryTerminal({ mode: 'codex', codexDurability: candidateOnly }))).toBeUndefined()
+    // codex WITHOUT any durability identity still gets a terminal key
+    expect(liveTerminalFallbackIdentity(registryTerminal({ mode: 'codex' }))).toEqual({
+      provider: 'codex',
+      key: 'codex:terminal:term-1',
+    })
   })
 })

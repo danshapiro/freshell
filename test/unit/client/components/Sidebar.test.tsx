@@ -1341,6 +1341,68 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(buttons()[2]).toHaveTextContent('Grey older session')
     })
 
+    it('floats a just-closed identity-less live-terminal row to the top of the grey section', async () => {
+      const now = Date.now()
+      const greyNewerSid = sessionId('grey-newer-live')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: greyNewerSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 1000,
+              title: 'Grey newer session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+      // Running agent terminal with no sessionRef: shows as an identity-less
+      // live-terminal fallback row keyed opencode:terminal:<terminalId>. Its
+      // last activity is older than the grey session's, so absent a close
+      // ratchet the row sinks below it once the tab closes.
+      const terminals: BackgroundTerminal[] = [{
+        terminalId: 'term-live-1',
+        title: 'Live terminal session',
+        createdAt: now - 7200000,
+        lastActivityAt: now - 7200000,
+        status: 'running',
+        hasClients: true,
+        mode: 'opencode',
+      }]
+      const tabs = [{ id: 'tab-live', terminalId: 'term-live-1', mode: 'opencode' }]
+      const store = createTestStore({ projects, terminals, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = () => screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('session')
+      )
+
+      // Pinned (open here) first while its tab is open, grey after.
+      expect(buttons()[0]).toHaveTextContent('Live terminal session')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+
+      const beforeClose = Date.now()
+      await act(async () => {
+        await store.dispatch(closeTab('tab-live') as any)
+        vi.advanceTimersByTime(100)
+      })
+
+      expect(store.getState().sessionActivity.sessions['opencode:terminal:term-live-1'])
+        .toBeGreaterThanOrEqual(beforeClose)
+      // The terminal keeps running, so the row stays; the close-touch ratchet
+      // floats it above the newer untouched grey session.
+      expect(buttons()).toHaveLength(2)
+      expect(buttons()[0]).toHaveTextContent('Live terminal session')
+      expect(buttons()[0]).toHaveAttribute('data-has-tab', 'false')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+    })
+
     it('shows green indicator for sessions with tabs, muted for others', async () => {
       const now = Date.now()
       const projects: ProjectGroup[] = [

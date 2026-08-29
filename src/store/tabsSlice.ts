@@ -4,7 +4,8 @@ import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
-import { findTabIdForSession, collectSessionRefsFromTabs } from '@/lib/session-utils'
+import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalFallbackIdentity } from '@/lib/session-utils'
+import { collectTerminalIds } from '@/lib/pane-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -501,6 +502,31 @@ export const closeTab = createAsyncThunk(
           provider: ref.provider,
           lastInputAt: touchedAt,
         }))
+      }
+      // The sidebar also renders running registry terminals WITHOUT canonical
+      // session identity as fallback rows keyed `<mode>:terminal:<terminalId>`
+      // (the live-terminal loop in selectors/sidebarSelectors.ts). Those rows
+      // persist in the grey section after close — the terminal keeps running —
+      // so ratchet that key as well. Registry read uses the same guarded
+      // cross-slice cast as Sidebar.tsx / the tabRegistry read below.
+      if (layout) {
+        const directoryItems = (stateBeforeClose as {
+          terminalDirectory?: RootState['terminalDirectory']
+        }).terminalDirectory?.windows?.sidebar?.items
+        for (const terminalId of collectTerminalIds(layout)) {
+          const identity = liveTerminalFallbackIdentity(
+            directoryItems?.find((item) => item.terminalId === terminalId),
+          )
+          if (!identity) continue
+          // identity.key is pre-composed and contains colons, so
+          // makeSessionKey passes it through unchanged (provider is kept for
+          // parity with the dispatch above, not for key construction).
+          dispatch(updateSessionActivity({
+            sessionId: identity.key,
+            provider: identity.provider,
+            lastInputAt: touchedAt,
+          }))
+        }
       }
     }
     const tabRegistryState = (stateBeforeClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
