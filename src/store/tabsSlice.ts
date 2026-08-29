@@ -4,8 +4,8 @@ import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
-import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalFallbackIdentity } from '@/lib/session-utils'
-import { collectTerminalIds } from '@/lib/pane-utils'
+import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentity } from '@/lib/session-utils'
+import { collectPaneContents } from '@/lib/pane-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -503,19 +503,24 @@ export const closeTab = createAsyncThunk(
           lastInputAt: touchedAt,
         }))
       }
-      // The sidebar also renders running registry terminals WITHOUT canonical
-      // session identity as fallback rows keyed `<mode>:terminal:<terminalId>`
-      // (the live-terminal loop in selectors/sidebarSelectors.ts). Those rows
-      // persist in the grey section after close — the terminal keeps running —
-      // so ratchet that key as well. Registry read uses the same guarded
-      // cross-slice cast as Sidebar.tsx / the tabRegistry read below.
+      // Leaf contents whose own canonical locators are empty still correspond
+      // to sidebar rows the canonical loop above cannot reach: registry-only
+      // canonical identity (sessionRef / codex durability known only to the
+      // registry), live-terminal fallback rows keyed
+      // `<mode>:terminal:<terminalId>`, and terminals whose registry entry
+      // hasn't loaded yet. liveTerminalRowIdentity resolves the right key (or
+      // none) per content; registry read uses the same guarded cross-slice
+      // cast as Sidebar.tsx / the tabRegistry read below.
       if (layout) {
         const directoryItems = (stateBeforeClose as {
           terminalDirectory?: RootState['terminalDirectory']
         }).terminalDirectory?.windows?.sidebar?.items
-        for (const terminalId of collectTerminalIds(layout)) {
-          const identity = liveTerminalFallbackIdentity(
-            directoryItems?.find((item) => item.terminalId === terminalId),
+        for (const content of collectPaneContents(layout)) {
+          const identity = liveTerminalRowIdentity(
+            content,
+            content.kind === 'terminal' && content.terminalId
+              ? directoryItems?.find((item) => item.terminalId === content.terminalId)
+              : undefined,
           )
           if (!identity) continue
           // identity.key is pre-composed and contains colons, so

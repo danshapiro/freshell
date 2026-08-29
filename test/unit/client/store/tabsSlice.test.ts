@@ -771,9 +771,12 @@ describe('tabsSlice', () => {
       expect(sessions['codex:terminal:term-cx-1']).toBeUndefined()
     })
 
-    it('skips the terminal key when the registry terminal carries a sessionRef', async () => {
-      // Canonical identity lives in the registry, not the pane content here;
-      // the alias terminal key would be junk (its row never exists).
+    it('ratchets the registry canonical key when the sessionRef exists only in the registry', async () => {
+      // Canonical identity lives in the registry, not the pane content: the
+      // content yields no locator, so the canonical loop ratchets nothing.
+      // The sidebar rows this terminal under claude:<sessionId>; the ratchet
+      // must target that canonical key, not a terminal alias (which would be
+      // junk — no row ever reads it).
       const store = createRegistryRatchetStore([{
         terminalId: 'term-ref-1',
         title: 'Claude pane',
@@ -791,9 +794,62 @@ describe('tabsSlice', () => {
         content: { kind: 'terminal', mode: 'claude', terminalId: 'term-ref-1' },
       }))
 
+      const beforeClose = Date.now()
       await store.dispatch(closeTab(tabId))
 
-      expect(store.getState().sessionActivity.sessions).toEqual({})
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['claude:terminal:term-ref-1']).toBeUndefined()
+    })
+
+    it('ratchets the registry codex canonical key when durability identity exists only in the registry', async () => {
+      // Same registry-only-identity gap as the sessionRef case: the content
+      // carries no codexDurability, so the canonical loop yields nothing, but
+      // the sidebar rows the terminal under codex:<durabilitySessionId>.
+      const codexDurability = { schemaVersion: 1, state: 'durable', durableThreadId: 'durable-cx-2' } as const
+      const store = createRegistryRatchetStore([{
+        terminalId: 'term-cx-2',
+        title: 'Codex pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'codex',
+        codexDurability,
+      }])
+      store.dispatch(addTab({ mode: 'codex' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-2' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['codex:durable-cx-2']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['codex:terminal:term-cx-2']).toBeUndefined()
+    })
+
+    it('falls back to the pane-mode terminal key when the registry entry is missing', async () => {
+      // terminalDirectory.windows.sidebar.items loads asynchronously, can
+      // fail or be stale, and is capped: closing before the entry arrives
+      // must still ratchet the key the still-running terminal's fallback row
+      // will read once it registers.
+      const store = createRegistryRatchetStore([])
+      store.dispatch(addTab({ mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-miss-1' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions['opencode:terminal:term-miss-1'])
+        .toBeGreaterThanOrEqual(beforeClose)
     })
   })
 
