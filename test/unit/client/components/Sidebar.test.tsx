@@ -1199,6 +1199,75 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(buttons[1]).toHaveTextContent('Never active session')
     })
 
+    it('orders a locally busy pinned session ahead of a newer idle pinned session', async () => {
+      const now = Date.now()
+      const busySid = sessionId('busy-pinned')
+      const idleSid = sessionId('idle-pinned')
+      const terminalId = 'term-busy-tier'
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySid,
+              provider: 'codex',
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 60000,
+              title: 'Busy pinned session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: idleSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 1000,
+              title: 'Idle pinned session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        // Explicit sessionRef is load-bearing for this fixture: production
+        // `extractSessionLocators` does not treat a codex `resumeSessionId`
+        // as a locator, so without it this tab produces no session ref,
+        // `hasTab` stays false, and tier sorting never applies to the row
+        // (proven by executed check: extractSessionLocators(codex terminal
+        // content with only resumeSessionId) returns []).
+        { id: 'tab-busy', terminalId, resumeSessionId: busySid, sessionRef: { provider: 'codex', sessionId: busySid }, mode: 'codex' },
+        { id: 'tab-idle', resumeSessionId: idleSid, mode: 'claude' },
+      ]
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        sortMode: 'activity',
+        codexActivity: {
+          byTerminalId: {
+            [terminalId]: {
+              terminalId,
+              sessionId: 'session-codex',
+              phase: 'busy',
+              updatedAt: 10,
+            },
+          },
+        },
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('pinned session')
+      )
+
+      // Busy (older) must lead the pinned section; idle (newer) follows.
+      expect(buttons[0]).toHaveTextContent('Busy pinned session')
+      expect(buttons[1]).toHaveTextContent('Idle pinned session')
+    })
+
     it('shows green indicator for sessions with tabs, muted for others', async () => {
       const now = Date.now()
       const projects: ProjectGroup[] = [

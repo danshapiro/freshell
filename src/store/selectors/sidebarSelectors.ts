@@ -50,6 +50,7 @@ export interface SidebarSessionItem {
 const EMPTY_ACTIVITY: Record<string, number> = {}
 const EMPTY_STRINGS: string[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
+const EMPTY_PINNED_STATUS: PinnedSortStatus = { busySessionKeys: new Set<string>(), remoteActivity: {} }
 
 const selectProjects = (state: RootState) => state.sessions.windows?.sidebar?.projects ?? state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
@@ -72,6 +73,12 @@ const selectAppliedQuery = (state: RootState) => state.sessions.windows?.sidebar
 const selectAppliedSearchTier = (state: RootState) => state.sessions.windows?.sidebar?.appliedSearchTier
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter
+const selectPinnedStatus = (
+  _state: RootState,
+  _terminals: BackgroundTerminal[],
+  _filter: string,
+  pinnedStatus?: PinnedSortStatus,
+): PinnedSortStatus => pinnedStatus ?? EMPTY_PINNED_STATUS
 
 function getProjectName(projectPath: string): string {
   return getLeafDirectoryName(projectPath) ?? projectPath
@@ -812,6 +819,7 @@ export const makeSelectSortedSessionItems = () =>
       selectAppliedSearchTier,
       selectTerminals,
       selectFilter,
+      selectPinnedStatus,
     ],
     (
       projects,
@@ -830,7 +838,8 @@ export const makeSelectSortedSessionItems = () =>
       appliedQuery,
       appliedSearchTier,
       terminals,
-      filter
+      filter,
+      pinnedStatus
     ) => {
       const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping, paneLastInputAt)
       const visible = filterSessionItemsByVisibility(items, {
@@ -845,6 +854,7 @@ export const makeSelectSortedSessionItems = () =>
       const filtered = filterSessionItems(searchAware, filter)
       return sortSessionItems(filtered, sortMode, {
         disableTabPinning: appliedQuery.trim().length > 0,
+        pinnedStatus,
       })
     }
   )

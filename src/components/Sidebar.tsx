@@ -21,6 +21,7 @@ import {
   filterSessionItemsByAgent,
   filterSessionItemsByRepo,
   makeSelectSortedSessionItems,
+  type PinnedSortStatus,
   type SidebarSessionItem,
 } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -336,7 +337,30 @@ export default function Sidebar({
     store,
   ])
 
-  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+  const busySessionKeys = useAppSelector((state) => collectBusySessionKeys({
+    tabs: state.tabs.tabs,
+    paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
+    codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
+    claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
+    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
+    opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
+    paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
+    freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
+  }), shallowEqual)
+  const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
+  const remoteActivityBySessionKey = useAppSelector(selectRemoteSessionActivity)
+  const sameDeviceSessionKeys = useAppSelector(selectSameDeviceSessionKeys)
+
+  // Pinned status input for the sort selector (decision C, alternative shape):
+  // reuse the already-memoized busy set and remote record so the selector only
+  // recomputes when the primitive status data actually changes — busy flips
+  // re-sort (intended); remote record identity changes at most once per
+  // registry snapshot reply (~30s), and useStableArray absorbs no-op re-sorts.
+  const pinnedSortStatus = useMemo<PinnedSortStatus>(
+    () => ({ busySessionKeys: busySessionKeySet, remoteActivity: remoteActivityBySessionKey }),
+    [busySessionKeySet, remoteActivityBySessionKey],
+  )
+  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, '', pinnedSortStatus))
   // Options come from the PRE-repo-filter list so every repo stays listed while
   // one is selected; the current selection is retained even if its rows are
   // temporarily absent (e.g. mid-search), keeping the controlled select valid.
@@ -372,23 +396,10 @@ export default function Sidebar({
   // value actually changes — the custom memo comparator on SidebarItem
   // handles that independently.
   const sortedItems = useStableArray(computedItems, isSessionItemEqual)
-  const busySessionKeys = useAppSelector((state) => collectBusySessionKeys({
-    tabs: state.tabs.tabs,
-    paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
-    codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
-    claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
-    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
-    opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
-    paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-    freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
-  }), shallowEqual)
-  const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
 
   // Remote status rings (R3): a ring appears only when the session is NOT open
   // on this device. Remote activity comes from other devices' pushed registry
   // snapshots; the suppression set unions three local identity sources.
-  const remoteActivityBySessionKey = useAppSelector(selectRemoteSessionActivity)
-  const sameDeviceSessionKeys = useAppSelector(selectSameDeviceSessionKeys)
   const localOpenSessionKeys = useAppSelector((state) => {
     const keys = new Set<string>()
     for (const ref of collectSessionRefsFromTabs(

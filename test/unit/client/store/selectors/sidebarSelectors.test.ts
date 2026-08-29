@@ -1021,6 +1021,44 @@ describe('sidebarSelectors', () => {
         'server-archived',
       ])
     })
+
+    it('orders pinned sessions by status tier when pinnedStatus is provided, flat under applied search', () => {
+      const busy = createFallbackTab('tab-busy', 'busy-s', 'Busy Session', '/tmp/a', 'codex')
+      const idle = createFallbackTab('tab-idle', 'idle-s', 'Idle Session', '/tmp/b', 'claude')
+      const projects = [
+        {
+          projectPath: '/tmp',
+          sessions: [
+            { sessionId: 'busy-s', provider: 'codex', projectPath: '/tmp', lastActivityAt: 1000, title: 'Busy Session', cwd: '/tmp' },
+            { sessionId: 'idle-s', provider: 'claude', projectPath: '/tmp', lastActivityAt: 9000, title: 'Idle Session', cwd: '/tmp' },
+          ],
+        },
+      ] as any
+      const makeState = (extra: { appliedQuery?: string; appliedSearchTier?: 'title' } = {}) =>
+        createSelectorState({
+          projects,
+          tabs: [busy.tab, idle.tab],
+          panes: {
+            layouts: { 'tab-busy': busy.layout, 'tab-idle': idle.layout },
+            activePane: {},
+            paneTitles: {},
+          },
+          sortMode: 'activity',
+          ...extra,
+        })
+      const selectSortedItems = makeSelectSortedSessionItems()
+      const pinnedStatus = { busySessionKeys: new Set(['codex:busy-s']), remoteActivity: {} }
+
+      // Omitted pinnedStatus: legacy pinned time order (newest first).
+      expect(selectSortedItems(makeState(), [], '').map((i) => i.sessionId)).toEqual(['idle-s', 'busy-s'])
+      // Provided pinnedStatus: busy session leads the pinned section.
+      expect(selectSortedItems(makeState(), [], '', pinnedStatus).map((i) => i.sessionId)).toEqual(['busy-s', 'idle-s'])
+      // Applied server search flattens pinning; tiers go with it (decision B).
+      expect(
+        selectSortedItems(makeState({ appliedQuery: 'Session', appliedSearchTier: 'title' }), [], '', pinnedStatus)
+          .map((i) => i.sessionId),
+      ).toEqual(['idle-s', 'busy-s'])
+    })
   })
 
   describe('sortSessionItems', () => {
