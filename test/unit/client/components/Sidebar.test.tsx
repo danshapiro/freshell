@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer, {
@@ -1266,6 +1266,79 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Busy (older) must lead the pinned section; idle (newer) follows.
       expect(buttons[0]).toHaveTextContent('Busy pinned session')
       expect(buttons[1]).toHaveTextContent('Idle pinned session')
+    })
+
+    it('floats a just-closed session to the top of the grey section', async () => {
+      const now = Date.now()
+      const closerSid = sessionId('closing-float')
+      const greyNewerSid = sessionId('grey-newer')
+      const greyOlderSid = sessionId('grey-older')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: closerSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 7200000,
+              title: 'Closing session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: greyNewerSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 1000,
+              title: 'Grey newer session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: greyOlderSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 5000,
+              title: 'Grey older session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [{ id: 'tab-closing', resumeSessionId: closerSid, mode: 'claude' }]
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = () => screen.getAllByRole('button').filter(
+        // endsWith would never match: every session row button's textContent
+        // ends with the appended relative-timestamp span (Sidebar.tsx), so
+        // match with `includes`, exactly like the existing ratchet-float test
+        // at Sidebar.test.tsx:1154 ff.
+        (btn) => btn.textContent?.includes('session')
+      )
+
+      // Pinned first, then grey newest-first.
+      expect(buttons()[0]).toHaveTextContent('Closing session')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+      expect(buttons()[2]).toHaveTextContent('Grey older session')
+
+      const beforeClose = Date.now()
+      await act(async () => {
+        await store.dispatch(closeTab('tab-closing') as any)
+        vi.advanceTimersByTime(100)
+      })
+
+      // The close ratcheted the session's activity timestamp...
+      expect(store.getState().sessionActivity.sessions[`claude:${closerSid}`])
+        .toBeGreaterThanOrEqual(beforeClose)
+      // ...so the stale session — sort order [newer, older, closer] without it —
+      // lands on top of the grey section instead of sinking below both.
+      expect(buttons()).toHaveLength(3)
+      expect(buttons()[0]).toHaveTextContent('Closing session')
+      expect(buttons()[0]).toHaveAttribute('data-has-tab', 'false')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+      expect(buttons()[2]).toHaveTextContent('Grey older session')
     })
 
     it('shows green indicator for sessions with tabs, muted for others', async () => {

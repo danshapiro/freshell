@@ -11,7 +11,8 @@ import tabsReducer, {
   openSessionTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
-import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
+import panesReducer, { initLayout, splitPane } from '../../../../src/store/panesSlice'
+import sessionActivityReducer from '../../../../src/store/sessionActivitySlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
 import type { Tab } from '../../../../src/store/types'
@@ -574,6 +575,103 @@ describe('tabsSlice', () => {
 
       // Layout should be removed
       expect(store.getState().panes.layouts[tabId]).toBeUndefined()
+    })
+  })
+
+  describe('closeTab session activity ratchet', () => {
+    const SECOND_CLAUDE_ID = '550e8400-e29b-41d4-a716-446655440001'
+
+    function createRatchetStore(sessions: Record<string, number> = {}) {
+      return configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          sessionActivity: sessionActivityReducer,
+        },
+        preloadedState: { sessionActivity: { sessions } },
+      })
+    }
+
+    it('ratchets activity for every session ref of the closing tab', async () => {
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        },
+      }))
+      const leafId = (store.getState().panes.layouts[tabId] as any).id
+      store.dispatch(splitPane({
+        tabId,
+        paneId: leafId,
+        direction: 'horizontal',
+        newContent: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: SECOND_CLAUDE_ID,
+          sessionRef: { provider: 'claude', sessionId: SECOND_CLAUDE_ID },
+        },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions[`claude:${SECOND_CLAUDE_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('records no activity when closing a sessionless shell tab', async () => {
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'shell' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions).toEqual({})
+    })
+
+    it('never downgrades a newer existing ratchet value', async () => {
+      const future = Date.now() + 60_000
+      const store = createRatchetStore({ [`claude:${VALID_CLAUDE_SESSION_ID}`]: future })
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'claude', resumeSessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBe(future)
+    })
+
+    it('ratchets layout-less tabs via tab-level fallback identity', async () => {
+      const store = createRatchetStore()
+      store.dispatch(hydrateTabs({
+        tabs: [{
+          id: 'layout-less',
+          createRequestId: 'layout-less',
+          title: 'Layout-less',
+          status: 'running',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          createdAt: 1,
+        } as any],
+        activeTabId: 'layout-less',
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab('layout-less'))
+
+      expect(store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`])
+        .toBeGreaterThanOrEqual(beforeClose)
     })
   })
 

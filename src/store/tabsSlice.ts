@@ -4,13 +4,14 @@ import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
-import { findTabIdForSession } from '@/lib/session-utils'
+import { findTabIdForSession, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getFreshAgentProviderConfig, getFreshAgentProviderLabel } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
+import { updateSessionActivity } from './sessionActivitySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
   buildClosedTabRegistryRecord,
@@ -483,6 +484,25 @@ export const closeTab = createAsyncThunk(
     const stateBeforeClose = getState() as RootState
     const tab = stateBeforeClose.tabs.tabs.find((item) => item.id === tabId)
     const layout = stateBeforeClose.panes.layouts[tabId]
+    // Closing a tab counts as a user touch on its sessions: ratchet each
+    // session's locally-stored activity timestamp so the just-closed session
+    // floats to the top of the unpinned (grey) section under the default
+    // 'activity' sort. Refs come from the pre-close snapshot via
+    // collectSessionRefsFromTabs([tab], panes) — chosen over getTabSessionRefs
+    // because it also covers layout-less tabs via buildTabFallbackLocator
+    // (session-utils.ts:143-157). Unconditional by design: REST/MCP/server-
+    // broadcast closes flow through this same thunk on every connected client
+    // (accepted residual: ratcheting a mirrored close is harmless-to-useful).
+    if (tab) {
+      const touchedAt = Date.now()
+      for (const ref of collectSessionRefsFromTabs([tab], stateBeforeClose.panes)) {
+        dispatch(updateSessionActivity({
+          sessionId: ref.sessionId,
+          provider: ref.provider,
+          lastInputAt: touchedAt,
+        }))
+      }
+    }
     const tabRegistryState = (stateBeforeClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
     const serverInstanceId = stateBeforeClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
     if (tab && layout && tabRegistryState) {
