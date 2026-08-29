@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import {
+  foldTerminalAliasActivity,
+  reconcileTerminalSessionAssociation,
+} from '@/lib/terminal-session-association'
 import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
+import sessionActivityReducer, { updateSessionActivity } from '@/store/sessionActivitySlice'
 
 function createState(content: Record<string, unknown>, tabOverrides: Record<string, unknown> = {}) {
   return {
@@ -205,6 +209,120 @@ describe('server-authoritative rebind (previousSessionId)', () => {
       'opencode:ses_new': { sessionType: 'opencode', firstUserMessage: 'hello world' },
     })
     expect(dispatched.map((action) => action.type)).toContain(flushPersistedLayoutNow.type)
+  })
+})
+
+describe('alias activity fold on later identity binding', () => {
+  // An identity-less terminal touched by the close-tab ratchet is recorded
+  // under `<provider>:terminal:<terminalId>` (liveTerminalRowIdentity's
+  // identity-less live-terminal row key). When the still-running terminal
+  // later acquires canonical identity, the sidebar rekeys the row to
+  // `<provider>:<sessionId>` and reads activity only from there, so the
+  // alias timestamp must be folded across at the binding point.
+
+  const ALIAS_KEY = 'claude:terminal:t-1'
+  const CANONICAL_KEY = 'claude:s-1'
+
+  function identityLessClaudePane(terminalId = 't-1') {
+    return {
+      kind: 'terminal',
+      terminalId,
+      createRequestId: 'req-1',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+    }
+  }
+
+  function createFoldHarness(
+    sessions: Record<string, number>,
+    content: Record<string, unknown> = identityLessClaudePane(),
+  ) {
+    const state = createState(content) as any
+    state.sessionActivity = { sessions: { ...sessions } }
+    const dispatch = vi.fn((action: any) => {
+      if (action?.type === updateSessionActivity.type) {
+        state.sessionActivity = sessionActivityReducer(state.sessionActivity, action)
+      }
+    })
+    return { state, dispatch, getState: () => state }
+  }
+
+  function bindClaudeSession(harness: ReturnType<typeof createFoldHarness>) {
+    return reconcileTerminalSessionAssociation({
+      dispatch: harness.dispatch,
+      getState: harness.getState,
+      terminalId: 't-1',
+      sessionRef: { provider: 'claude', sessionId: 's-1' },
+    })
+  }
+
+  it('migrates the close-tab alias timestamp into the canonical key when identity binds', () => {
+    const harness = createFoldHarness({ [ALIAS_KEY]: 1111 })
+    const result = bindClaudeSession(harness)
+    expect(result).toBe('reconciled')
+    expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBe(1111)
+  })
+
+  it('still folds the alias when the closed tab left no pane to match (the actual orphan)', () => {
+    // The close happened earlier: the tab is gone, so no pane matches the
+    // terminal and the reconciliation itself is 'ignored'. The fold must not
+    // depend on a pane match -- this IS the orphan scenario.
+    const harness = createFoldHarness({ [ALIAS_KEY]: 1111 }, identityLessClaudePane('t-other'))
+    const result = bindClaudeSession(harness)
+    expect(result).toBe('ignored')
+    expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBe(1111)
+  })
+
+  it('never lowers an already-newer canonical timestamp (ratchet non-regression)', () => {
+    const harness = createFoldHarness({ [ALIAS_KEY]: 1111, [CANONICAL_KEY]: 9999 })
+    bindClaudeSession(harness)
+    // The fold is attempted with the alias timestamp...
+    expect(harness.dispatch).toHaveBeenCalledWith(
+      updateSessionActivity({ sessionId: 's-1', provider: 'claude', lastInputAt: 1111 }),
+    )
+    // ...and the real reducer keeps the max.
+    expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBe(9999)
+  })
+
+  it('writes nothing to the canonical key when no alias activity exists', () => {
+    const harness = createFoldHarness({})
+    bindClaudeSession(harness)
+    expect(harness.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: updateSessionActivity.type }),
+    )
+    expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBeUndefined()
+  })
+
+  it('codex durability binding migrates codex:terminal:<id> into codex:<durabilitySessionId>', () => {
+    // Codex durability identity is a binding path independent of sessionRef
+    // association (the sidebar rows a codex terminal with durability but no
+    // sessionRef under codex:<durabilitySessionId>), so the fold helper the
+    // terminal.codex.durability.updated handler calls is exercised directly.
+    const harness = createFoldHarness({ 'codex:terminal:t-9': 2222 })
+    foldTerminalAliasActivity({
+      dispatch: harness.dispatch,
+      state: harness.state,
+      terminalId: 't-9',
+      provider: 'codex',
+      sessionId: 'durable-1',
+    })
+    expect(harness.state.sessionActivity.sessions['codex:durable-1']).toBe(2222)
+  })
+
+  it('codex durability binding writes nothing when no alias activity exists', () => {
+    const harness = createFoldHarness({})
+    foldTerminalAliasActivity({
+      dispatch: harness.dispatch,
+      state: harness.state,
+      terminalId: 't-9',
+      provider: 'codex',
+      sessionId: 'durable-1',
+    })
+    expect(harness.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: updateSessionActivity.type }),
+    )
+    expect(harness.state.sessionActivity.sessions['codex:durable-1']).toBeUndefined()
   })
 })
 

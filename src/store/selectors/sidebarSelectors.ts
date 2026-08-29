@@ -480,7 +480,8 @@ export function buildSessionItems(
     // Row-identity contract: the guard below must stay in sync with
     // liveTerminalRowIdentity in lib/session-utils.ts — the close-tab
     // ratchet in tabsSlice.ts uses it to write the activity key this loop
-    // reads (`<mode>:terminal:<terminalId>` at :522) for identity-less rows.
+    // reads for identity-less rows: `<mode>:terminal:<terminalId>`, built
+    // below from liveTerminalSessionId and read via sessionActivity[key].
     if (terminal.status !== 'running') continue
     if (terminal.sessionRef) continue
     if (!terminal.mode || terminal.mode === 'shell' || !isNonShellMode(terminal.mode)) continue

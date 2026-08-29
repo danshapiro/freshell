@@ -63,7 +63,7 @@ import {
   getCreateSessionStateFromRef,
   isStaleSessionIdentityMismatch,
 } from '@/components/terminal-view-utils'
-import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { foldTerminalAliasActivity, reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
@@ -4764,6 +4764,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               durability,
             })
             return
+          }
+          // Durability identity is itself a binding path: the sidebar rekeys
+          // the terminal's row from codex:terminal:<id> to
+          // codex:<durabilitySessionId> (mirroring getCodexDurabilitySessionId
+          // in selectors/sidebarSelectors.ts), so fold the close-tab alias the
+          // same way reconcileTerminalSessionAssociation does for sessionRef.
+          const durabilitySessionId = durability?.durableThreadId
+            ?? durability?.candidate?.candidateThreadId
+          if (durabilitySessionId) {
+            foldTerminalAliasActivity({
+              dispatch,
+              state: appStore.getState(),
+              terminalId: tid,
+              provider: 'codex',
+              sessionId: durabilitySessionId,
+            })
           }
           updateContent({ codexDurability: durability })
           const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined

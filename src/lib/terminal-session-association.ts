@@ -4,13 +4,46 @@ import {
   buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
 } from '@/store/persistControl'
+import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
 import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 type Dispatch = (action: any) => unknown
-type SessionAssociationState = Pick<RootState, 'panes' | 'tabs'>
+type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivity'>
+
+/**
+ * Migration fold for the close-tab ratchet alias: a terminal identity-less
+ * at close time had its touch recorded under
+ * `<provider>:terminal:<terminalId>` (liveTerminalRowIdentity in
+ * lib/session-utils.ts — the sidebar's identity-less live-terminal row key).
+ * When the terminal later acquires canonical identity, the sidebar rekeys
+ * the row to `<provider>:<sessionId>` and reads activity only from there,
+ * so the alias timestamp must be folded across at each binding point
+ * (sessionRef association here; codex durability in TerminalView's
+ * terminal.codex.durability.updated handler). updateSessionActivity is
+ * ratchet-only (max wins), so folding is safe even when the canonical key
+ * already holds a newer value. The alias entry may remain stored — no
+ * selector reads it once identity binds.
+ */
+export function foldTerminalAliasActivity({
+  dispatch,
+  state,
+  terminalId,
+  provider,
+  sessionId,
+}: {
+  dispatch: Dispatch
+  state: Pick<RootState, 'sessionActivity'>
+  terminalId: string
+  provider: string
+  sessionId: string
+}): void {
+  const aliasAt = state.sessionActivity?.sessions?.[`${provider}:terminal:${terminalId}`]
+  if (typeof aliasAt !== 'number') return
+  dispatch(updateSessionActivity({ sessionId, provider, lastInputAt: aliasAt }))
+}
 
 function collectMatchingTerminalPanes(
   node: PaneNode | undefined,
@@ -77,6 +110,18 @@ export function reconcileTerminalSessionAssociation({
   if (!sessionRef) return 'ignored'
 
   const state = getState()
+
+  // Alias migration must NOT depend on the pane-match outcome below: the
+  // orphan case is precisely a post-close association, where the tab is gone
+  // and no pane is left to match.
+  foldTerminalAliasActivity({
+    dispatch,
+    state,
+    terminalId,
+    provider: sessionRef.provider,
+    sessionId: sessionRef.sessionId,
+  })
+
   let matchedAnyPane = false
   let conflictingPane = false
   let shouldFlush = false
