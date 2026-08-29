@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Change Freshell's left-panel (sidebar) session list ordering: (1) within the pinned section (sessions open in tabs on this device), order sessions in four status tiers — busy on this device (blue) first, then needs-attention/turn-complete on this device (green), then busy on other devices (blue ring), then open on other devices (green ring) — with remaining pinned sessions after those tiers and existing time-based ordering within each tier; and (2) treat closing a tab as a user touch on that session: ratchet its locally-stored activity timestamp at close time so the just-closed session sorts near the top of the non-pinned (grey) section under the default activity sort mode.
+Change Freshell's left-panel (sidebar) session list ordering: (1) within the pinned section (sessions open in tabs on this device), order sessions in four status tiers — busy on this device (blue icon) first, then open here, not busy, with no remote-busy/open state (the row's persistent green open-here icon; this tier covers needs-attention/turn-complete rows and all other idle pinned rows alike), then busy on other devices (blue ring), then open on other devices (green ring) — with existing time-based ordering within each tier; the four tiers are a strict partition of the pinned section — every pinned row belongs to exactly one of them, so there is no separate "remaining pinned" bucket (requester confirmed this partition semantics on 2026-08-29, choosing it over a reading where tier 2 would contain only attention-flagged rows); and (2) treat closing a tab as a user touch on that session: ratchet its locally-stored activity timestamp at close time so the just-closed session sorts near the top of the non-pinned (grey) section under the default activity sort mode.
 
 ### Explicit constraints
 - None stated beyond the requested result.
@@ -25,7 +25,7 @@ Change Freshell's left-panel (sidebar) session list ordering: (1) within the pin
 
 1. **Documented deviation from decision C's recommended shape — C's own blessed alternative is chosen: tier data is passed as a `sortSessionItems` option, not stamped as a `pinnedTier` item field by `buildSessionItems`.** Rationale, from verification: (a) stamping would force the high-churn activity slices (`codexActivity`/`claudeActivity`/`opencodeActivity`/`amplifierActivity`/`freshAgent.sessions` — new record objects per WS message) into `buildSessionItems`' input rail, re-running the full build+filter+sort on every blue blink; the repo contains zero `resultEqualityCheck` usage to stabilize a sub-selector (grep over `src/` finds none), while Sidebar.tsx:375-391 already computes exactly the primitive busy-key array (`shallowEqual`) and remote-activity record the sort needs. (b) The item-identity precedent from the remote-status-rings work is that status travels as props/sets, never as item fields. (c) The option shape leaves `buildSessionItems`, `SidebarSessionItem`, and every existing build test untouched.
 2. **Decision C's "CRITICAL lockstep" (`isSessionItemEqual` must compare new fields or `useStableArray` swallows reorders) is resolved vacuously, verified:** `useStableArray` (src/hooks/useStableArray.ts:23-28) compares pairwise by index and `isSessionItemEqual` (Sidebar.tsx:142-165) compares `sessionId`, so any reorder of distinct sessions always adopts the new array; and under the chosen option shape there are no new item fields at all, so `isSessionItemEqual`, `areSessionItemsEqual`, `areSidebarItemPropsEqual`, and `Sidebar.render-stability.test.tsx` need no changes. Busy flips re-sort because `busySessionKeys` content changes (intended); unrelated WS churn cannot reach the selector (the component edge already reduces it to shallow-equal primitives).
-3. **Documented refinement of tier-2 semantics per binding decision A:** the user-facing "needs-attention/turn-complete on this device (green)" tier is implemented as the sidebar's actual local green affordance — open here, not busy here, no remote state. Verification: the Sidebar never consumes turn-completion attention (`attentionByTab`/`attentionByPane` are tabId/paneId-keyed, no session-key projection exists, and `closeTab` clears them), so a pinned row's only local green is the persistent `hasTab` icon (Sidebar.tsx:1063-1070); decision A fixes this as a strict four-way partition with no fifth tier, so tier 2 is the catch-all for "remaining pinned sessions," ordered second. No new attention machinery is built (decision F: no new UI, no visual changes).
+3. **Documented refinement of tier-2 semantics per binding decision A:** the user-facing "needs-attention/turn-complete on this device (green)" tier is implemented as the sidebar's actual local green affordance — open here, not busy here, no remote state. Verification: the Sidebar never consumes turn-completion attention (`attentionByTab`/`attentionByPane` are tabId/paneId-keyed, no session-key projection exists, and `closeTab` clears them), so a pinned row's only local green is the persistent `hasTab` icon (Sidebar.tsx:1063-1070); decision A fixes this as a strict four-way partition with no fifth tier, so tier 2 is the catch-all for "remaining pinned sessions," ordered second. This interpretation was confirmed as the requester's intent on 2026-08-29 (explicit choice over an attention-flagged-only tier 2; wording carried into the User Request block above). No new attention machinery is built (decision F: no new UI, no visual changes).
 4. **Close-ratchet ref derivation uses `collectSessionRefsFromTabs([tab], panes)`, not `getTabSessionRefs`** — verified: `getTabSessionRefs` (src/lib/session-utils.ts:325-329) returns `[]` when the tab has no layout, while `collectSessionRefsFromTabs([tab], panes)` additionally resolves layout-less tabs through `buildTabFallbackLocator` (session-utils.ts:143-157, 268-305). The ratchet must cover both.
 5. **Accepted residual (decision D, recorded):** the ratchet is applied unconditionally in the thunk, so REST/MCP/server-broadcast tab closes (which flow through the same `closeTab` thunk on every connected client) also ratchet — ratcheting a mirrored close is harmless-to-useful.
 6. **Behavior boundaries (decision D, plain):** (i) the float is visible under the default `activity` sort only; `recency`/`recency-pinned` receive no ratchet input by existing design (`selectSessionActivityForSort` returns the shared `EMPTY_ACTIVITY` for non-`activity` modes, sidebarSelectors.ts:59-63), so no float there; (ii) a session whose only sidebar row was a client-side fallback row (never indexed by the server) disappears on close and cannot float — the ratchet value is stored and takes effect once the session is indexed.
@@ -427,7 +427,13 @@ Append inside `describe('activity sort mode')` in test/unit/client/components/Si
       ]
 
       const tabs = [
-        { id: 'tab-busy', terminalId, resumeSessionId: busySid, mode: 'codex' },
+        // Explicit sessionRef is load-bearing for this fixture: production
+        // `extractSessionLocators` does not treat a codex `resumeSessionId`
+        // as a locator, so without it this tab produces no session ref,
+        // `hasTab` stays false, and tier sorting never applies to the row
+        // (proven by executed check: extractSessionLocators(codex terminal
+        // content with only resumeSessionId) returns []).
+        { id: 'tab-busy', terminalId, resumeSessionId: busySid, sessionRef: { provider: 'codex', sessionId: busySid }, mode: 'codex' },
         { id: 'tab-idle', resumeSessionId: idleSid, mode: 'claude' },
       ]
 
@@ -715,7 +721,11 @@ In test/unit/client/components/Sidebar.test.tsx: extend the line-8 import to `im
       })
 
       const buttons = () => screen.getAllByRole('button').filter(
-        (btn) => btn.textContent?.endsWith('session')
+        // endsWith would never match: every session row button's textContent
+        // ends with the appended relative-timestamp span (Sidebar.tsx), so
+        // match with `includes`, exactly like the existing ratchet-float test
+        // at Sidebar.test.tsx:1154 ff.
+        (btn) => btn.textContent?.includes('session')
       )
 
       // Pinned first, then grey newest-first.
