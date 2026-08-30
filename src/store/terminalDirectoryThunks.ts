@@ -2,6 +2,7 @@ import {
   getTerminalDirectoryPage,
   searchTerminalView,
 } from '@/lib/api'
+import { foldTerminalAliasActivity } from '@/lib/terminal-session-association'
 import type { AppDispatch, RootState } from './store'
 import {
   clearTerminalSearch,
@@ -82,9 +83,35 @@ export function fetchTerminalDirectoryWindow(args: FetchTerminalDirectoryWindowA
       })
       if (controller.signal.aborted) return
 
+      // Codex durability identity is a sidebar binding path: a running codex
+      // terminal with durability identity is rowed under
+      // codex:<durabilitySessionId> (getCodexDurabilitySessionId in
+      // selectors/sidebarSelectors.ts), never under the identity-less
+      // codex:terminal:<terminalId> close-tab alias. This thunk is the
+      // store-level choke point where refreshed directory data is applied,
+      // and the refresh fires on every terminals.changed broadcast (the Node
+      // server broadcasts terminals.changed immediately after
+      // terminal.codex.durability.updated), mounted or not — so the alias
+      // fold lives here, where a paneless post-close binding still reaches it.
+      const items = Array.isArray(response?.items) ? response.items : []
+      const stateBeforeFold = getState()
+      for (const item of items) {
+        if (item?.mode !== 'codex' || typeof item?.terminalId !== 'string') continue
+        const durabilitySessionId = item.codexDurability?.durableThreadId
+          ?? item.codexDurability?.candidate?.candidateThreadId
+        if (!durabilitySessionId) continue
+        foldTerminalAliasActivity({
+          dispatch,
+          state: stateBeforeFold,
+          terminalId: item.terminalId,
+          provider: 'codex',
+          sessionId: durabilitySessionId,
+        })
+      }
+
       dispatch(setTerminalDirectoryWindowData({
         surface: args.surface,
-        items: Array.isArray(response?.items) ? response.items : [],
+        items,
         revision: response?.revision,
         nextCursor: response?.nextCursor ?? null,
         append: args.append,

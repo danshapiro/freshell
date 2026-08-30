@@ -1,8 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import {
-  foldTerminalAliasActivity,
-  reconcileTerminalSessionAssociation,
-} from '@/lib/terminal-session-association'
+import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
@@ -294,37 +291,30 @@ describe('alias activity fold on later identity binding', () => {
     expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBeUndefined()
   })
 
-  it('codex durability binding migrates codex:terminal:<id> into codex:<durabilitySessionId>', () => {
-    // Codex durability identity is a binding path independent of sessionRef
-    // association (the sidebar rows a codex terminal with durability but no
-    // sessionRef under codex:<durabilitySessionId>), so the fold helper the
-    // terminal.codex.durability.updated handler calls is exercised directly.
-    const harness = createFoldHarness({ 'codex:terminal:t-9': 2222 })
-    foldTerminalAliasActivity({
-      dispatch: harness.dispatch,
-      state: harness.state,
-      terminalId: 't-9',
-      provider: 'codex',
-      sessionId: 'durable-1',
+  it('does not fold onto a session the association itself rejects (conflict)', () => {
+    // A stale/rejected association frame must not stamp alias activity onto
+    // the session it declines to bind: folding happens only when the
+    // association is accepted or harmlessly stale, never on the conflict
+    // path. (The pane below is already bound to a different claude session,
+    // so the s-1 frame is a conflict.)
+    const harness = createFoldHarness({ [ALIAS_KEY]: 1111 }, {
+      ...identityLessClaudePane(),
+      sessionRef: { provider: 'claude', sessionId: 's-bound' },
     })
-    expect(harness.state.sessionActivity.sessions['codex:durable-1']).toBe(2222)
-  })
-
-  it('codex durability binding writes nothing when no alias activity exists', () => {
-    const harness = createFoldHarness({})
-    foldTerminalAliasActivity({
-      dispatch: harness.dispatch,
-      state: harness.state,
-      terminalId: 't-9',
-      provider: 'codex',
-      sessionId: 'durable-1',
-    })
+    const result = bindClaudeSession(harness)
+    expect(result).toBe('conflict')
     expect(harness.dispatch).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: updateSessionActivity.type }),
     )
-    expect(harness.state.sessionActivity.sessions['codex:durable-1']).toBeUndefined()
+    expect(harness.state.sessionActivity.sessions[CANONICAL_KEY]).toBeUndefined()
   })
 })
+
+// Codex durability alias folding now lives in the store-level directory
+// path: fetchTerminalDirectoryWindow folds every applied page (the
+// terminals.changed refresh runs mounted or not). See
+// test/unit/client/store/terminalDirectoryThunks.test.ts,
+// 'codex durability alias fold on directory application'.
 
 describe('duplicate rebind broadcasts (idempotence regression guards)', () => {
   const boundPane = {

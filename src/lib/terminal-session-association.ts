@@ -21,11 +21,13 @@ type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivi
  * When the terminal later acquires canonical identity, the sidebar rekeys
  * the row to `<provider>:<sessionId>` and reads activity only from there,
  * so the alias timestamp must be folded across at each binding point
- * (sessionRef association here; codex durability in TerminalView's
- * terminal.codex.durability.updated handler). updateSessionActivity is
- * ratchet-only (max wins), so folding is safe even when the canonical key
- * already holds a newer value. The alias entry may remain stored — no
- * selector reads it once identity binds.
+ * (sessionRef association here; codex durability identity in
+ * fetchTerminalDirectoryWindow in store/terminalDirectoryThunks.ts — the
+ * store-level directory-apply choke point, reached by every
+ * terminals.changed refresh whether or not any pane is mounted).
+ * updateSessionActivity is ratchet-only (max wins), so folding is safe even
+ * when the canonical key already holds a newer value. The alias entry may
+ * remain stored — no selector reads it once identity binds.
  */
 export function foldTerminalAliasActivity({
   dispatch,
@@ -111,17 +113,6 @@ export function reconcileTerminalSessionAssociation({
 
   const state = getState()
 
-  // Alias migration must NOT depend on the pane-match outcome below: the
-  // orphan case is precisely a post-close association, where the tab is gone
-  // and no pane is left to match.
-  foldTerminalAliasActivity({
-    dispatch,
-    state,
-    terminalId,
-    provider: sessionRef.provider,
-    sessionId: sessionRef.sessionId,
-  })
-
   let matchedAnyPane = false
   let conflictingPane = false
   let shouldFlush = false
@@ -157,6 +148,21 @@ export function reconcileTerminalSessionAssociation({
   }
 
   if (conflictingPane) return 'conflict'
+
+  // Alias migration runs only once the association is known NOT to conflict:
+  // folding a rejected frame's alias onto the pane's canonical session would
+  // stamp recent activity onto a session that never bound, visibly
+  // misordering the sidebar. It must NOT depend on the pane-match outcome --
+  // the orphan case is precisely a post-close association, where the tab is
+  // gone and no pane is left to match.
+  foldTerminalAliasActivity({
+    dispatch,
+    state,
+    terminalId,
+    provider: sessionRef.provider,
+    sessionId: sessionRef.sessionId,
+  })
+
   if (!matchedAnyPane) return 'ignored'
 
   dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))

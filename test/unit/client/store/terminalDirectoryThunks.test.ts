@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
+import sessionActivityReducer from '@/store/sessionActivitySlice'
 import {
   _resetTerminalDirectoryThunkControllers,
   fetchTerminalDirectoryWindow,
@@ -184,5 +185,138 @@ describe('terminalDirectoryThunks', () => {
     expect(signals[0].aborted).toBe(true)
     expect(signals[1].aborted).toBe(false)
     await expect(firstDispatch).resolves.toBeUndefined()
+  })
+})
+
+describe('codex durability alias fold on directory application', () => {
+  // A codex terminal closed while identity-less had its close-tab touch
+  // recorded under codex:terminal:<terminalId> (liveTerminalRowIdentity's
+  // fallback row key). When the still-running terminal later gains codex
+  // durability identity, the sidebar rekeys the row to
+  // codex:<durabilitySessionId> (mirroring getCodexDurabilitySessionId in
+  // selectors/sidebarSelectors.ts). On the Node server every
+  // terminal.codex.durability.updated broadcast is followed by
+  // terminals.changed, which refreshes the directory regardless of whether
+  // any pane is still mounted -- so the applied directory page is the
+  // store-level binding point that must fold the alias across.
+
+  const CANDIDATE = {
+    provider: 'codex',
+    candidateThreadId: 'cand-1',
+    rolloutPath: '/tmp/rollout-cand-1.jsonl',
+    source: 'thread_start_response',
+    capturedAt: 1,
+  } as const
+
+  function codexItem(codexDurability: Record<string, unknown>) {
+    return {
+      terminalId: 'term-cx-1',
+      title: 'Codex',
+      createdAt: 1,
+      lastActivityAt: 10,
+      status: 'running',
+      hasClients: false,
+      mode: 'codex',
+      codexDurability,
+    }
+  }
+
+  function createStoreWithActivity(sessions: Record<string, number>) {
+    return configureStore({
+      reducer: {
+        terminalDirectory: terminalDirectoryReducer,
+        sessionActivity: sessionActivityReducer,
+      },
+      preloadedState: {
+        sessionActivity: { sessions },
+      },
+    })
+  }
+
+  it('folds the alias timestamp into codex:<durabilitySessionId> when the applied page carries durable identity', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexItem({ schemaVersion: 1, state: 'durable', durableThreadId: 'durable-1' })],
+      nextCursor: null,
+      revision: 11,
+    })
+
+    const store = createStoreWithActivity({ 'codex:terminal:term-cx-1': 1111 })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['codex:durable-1']).toBe(1111)
+  })
+
+  it('folds candidate-only durability identity the same way (identity_pending rekeys the row too)', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexItem({ schemaVersion: 1, state: 'identity_pending', candidate: CANDIDATE })],
+      nextCursor: null,
+      revision: 12,
+    })
+
+    const store = createStoreWithActivity({ 'codex:terminal:term-cx-1': 2222 })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['codex:cand-1']).toBe(2222)
+  })
+
+  it('never lowers an already-newer canonical timestamp (ratchet non-regression)', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexItem({ schemaVersion: 1, state: 'durable', durableThreadId: 'durable-1' })],
+      nextCursor: null,
+      revision: 13,
+    })
+
+    const store = createStoreWithActivity({
+      'codex:terminal:term-cx-1': 1111,
+      'codex:durable-1': 9999,
+    })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['codex:durable-1']).toBe(9999)
+  })
+
+  it('writes nothing when no alias activity exists for the terminal', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexItem({ schemaVersion: 1, state: 'durable', durableThreadId: 'durable-1' })],
+      nextCursor: null,
+      revision: 14,
+    })
+
+    const store = createStoreWithActivity({})
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    expect(store.getState().sessionActivity.sessions['codex:durable-1']).toBeUndefined()
+    expect(Object.keys(store.getState().sessionActivity.sessions)).toHaveLength(0)
+  })
+
+  it('writes nothing when the applied item carries no durability identity', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexItem({ schemaVersion: 1, state: 'identity_pending' })],
+      nextCursor: null,
+      revision: 15,
+    })
+
+    const store = createStoreWithActivity({ 'codex:terminal:term-cx-1': 3333 })
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    // The identity-less fallback row is still the one shown; the alias must
+    // not be folded onto a session that does not exist.
+    expect(store.getState().sessionActivity.sessions['codex:terminal:term-cx-1']).toBe(3333)
+    expect(Object.keys(store.getState().sessionActivity.sessions)).toHaveLength(1)
   })
 })
