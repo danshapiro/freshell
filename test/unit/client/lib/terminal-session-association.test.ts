@@ -310,6 +310,129 @@ describe('alias activity fold on later identity binding', () => {
   })
 })
 
+describe('canonical activity fold on accepted rebind (previousSessionId)', () => {
+  // Codex fork-handoff scenario: the tab was closed while the pane carried
+  // the PARENT identity, so the close-tab ratchet wrote the parent canonical
+  // key `codex:parent-1` (no terminal alias — liveTerminalRowIdentity yields
+  // none for identity-bearing content; pinned by the tabsSlice close-ratchet
+  // tests). When the detached terminal later commits the CHILD session and
+  // broadcasts previousSessionId, the sidebar rekeys the row to the child,
+  // so the parent key's timestamp must be folded across with the same
+  // ratchet-only mechanism as the terminal alias.
+
+  function codexPane(terminalId: string, sessionId: string) {
+    return {
+      kind: 'terminal',
+      terminalId,
+      createRequestId: 'req-1',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      sessionRef: { provider: 'codex', sessionId },
+    }
+  }
+
+  function createRebindHarness(
+    sessions: Record<string, number>,
+    content: Record<string, unknown>,
+  ) {
+    const state = createState(content) as any
+    state.sessionActivity = { sessions: { ...sessions } }
+    const dispatch = vi.fn((action: any) => {
+      if (action?.type === updateSessionActivity.type) {
+        state.sessionActivity = sessionActivityReducer(state.sessionActivity, action)
+      }
+    })
+    return { state, dispatch, getState: () => state }
+  }
+
+  function broadcastForkRebind(harness: ReturnType<typeof createRebindHarness>) {
+    return reconcileTerminalSessionAssociation({
+      dispatch: harness.dispatch,
+      getState: harness.getState,
+      terminalId: 't-1',
+      sessionRef: { provider: 'codex', sessionId: 'child-1' },
+      previousSessionId: 'parent-1',
+    })
+  }
+
+  it('folds the parent canonical timestamp onto the child when a live pane accepts the rebind', () => {
+    const harness = createRebindHarness({ 'codex:parent-1': 1111 }, codexPane('t-1', 'parent-1'))
+    const result = broadcastForkRebind(harness)
+    expect(result).toBe('reconciled')
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBe(1111)
+  })
+
+  it('still folds the parent timestamp when the tab closed before the rebind broadcast (orphan)', () => {
+    // THE finding scenario: the close happened while the pane carried the
+    // parent identity (parent key ratcheted, no terminal alias written) and
+    // the pane is gone now; the detached terminal's rebind broadcast must
+    // still fold, so the fold must not depend on a pane match.
+    const harness = createRebindHarness({ 'codex:parent-1': 1111 }, codexPane('t-other', 'parent-1'))
+    const result = broadcastForkRebind(harness)
+    expect(result).toBe('ignored')
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBe(1111)
+  })
+
+  it('never lowers an already-newer child timestamp (ratchet non-regression)', () => {
+    const harness = createRebindHarness(
+      { 'codex:parent-1': 1111, 'codex:child-1': 9999 },
+      codexPane('t-1', 'parent-1'),
+    )
+    broadcastForkRebind(harness)
+    // The fold is attempted with the parent timestamp...
+    expect(harness.dispatch).toHaveBeenCalledWith(
+      updateSessionActivity({ sessionId: 'child-1', provider: 'codex', lastInputAt: 1111 }),
+    )
+    // ...and the real reducer keeps the max.
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBe(9999)
+  })
+
+  it('writes nothing when the parent key holds no activity', () => {
+    const harness = createRebindHarness({}, codexPane('t-1', 'parent-1'))
+    broadcastForkRebind(harness)
+    expect(harness.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: updateSessionActivity.type }),
+    )
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBeUndefined()
+  })
+
+  it('does not fold onto the child when the rebind itself is rejected (conflict)', () => {
+    // The pane carries a third identity, so previousSessionId does not
+    // authorize the swap — a rejected frame must not stamp the parent's
+    // activity onto a session this client never accepted.
+    const harness = createRebindHarness({ 'codex:parent-1': 1111 }, codexPane('t-1', 'some-other'))
+    const result = broadcastForkRebind(harness)
+    expect(result).toBe('conflict')
+    expect(harness.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: updateSessionActivity.type }),
+    )
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBeUndefined()
+  })
+
+  it('does not move another session\'s activity on a plain association frame (no previousSessionId)', () => {
+    // Without the supersession token nothing authorizes a canonical swap:
+    // only the terminal alias may fold, never another session's key.
+    const harness = createRebindHarness({ 'codex:parent-1': 1111 }, {
+      kind: 'terminal',
+      terminalId: 't-1',
+      createRequestId: 'req-1',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+    })
+    const result = reconcileTerminalSessionAssociation({
+      dispatch: harness.dispatch,
+      getState: harness.getState,
+      terminalId: 't-1',
+      sessionRef: { provider: 'codex', sessionId: 'child-1' },
+    })
+    expect(result).toBe('reconciled')
+    expect(harness.state.sessionActivity.sessions['codex:child-1']).toBeUndefined()
+    expect(harness.state.sessionActivity.sessions['codex:parent-1']).toBe(1111)
+  })
+})
+
 // Codex durability alias folding now lives in the store-level directory
 // path: fetchTerminalDirectoryWindow folds every applied page (the
 // terminals.changed refresh runs mounted or not). See

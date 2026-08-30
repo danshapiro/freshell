@@ -2,7 +2,10 @@ import {
   getTerminalDirectoryPage,
   searchTerminalView,
 } from '@/lib/api'
-import { foldTerminalAliasActivity } from '@/lib/terminal-session-association'
+import {
+  foldCanonicalSessionActivity,
+  foldTerminalAliasActivity,
+} from '@/lib/terminal-session-association'
 import type { AppDispatch, RootState } from './store'
 import {
   clearTerminalSearch,
@@ -14,7 +17,37 @@ import {
   setTerminalSearchError,
   setTerminalSearchLoading,
   setTerminalSearchResults,
+  type TerminalDirectoryItem,
 } from './terminalDirectorySlice'
+
+/**
+ * Canonical identity the sidebar rows a directory item under — mirrors
+ * buildSessionItems' runningSessionMap derivation in
+ * selectors/sidebarSelectors.ts: sessionRef first, then the codex durability
+ * id for codex terminals (getCodexDurabilitySessionId). Items with neither
+ * are rowed under the identity-less `<mode>:terminal:<terminalId>` fallback
+ * key, which is not a canonical identity.
+ */
+function directoryItemCanonicalIdentity(
+  item: TerminalDirectoryItem,
+): { provider: string; sessionId: string } | undefined {
+  const ref = item?.sessionRef
+  if (
+    typeof ref?.provider === 'string'
+    && typeof ref.sessionId === 'string'
+    && ref.sessionId.length > 0
+  ) {
+    return { provider: ref.provider, sessionId: ref.sessionId }
+  }
+  if (item?.mode === 'codex') {
+    const durabilitySessionId = item.codexDurability?.durableThreadId
+      ?? item.codexDurability?.candidate?.candidateThreadId
+    if (typeof durabilitySessionId === 'string' && durabilitySessionId.length > 0) {
+      return { provider: 'codex', sessionId: durabilitySessionId }
+    }
+  }
+  return undefined
+}
 
 type TerminalDirectorySurface = 'sidebar' | 'background' | 'overview'
 
@@ -83,20 +116,52 @@ export function fetchTerminalDirectoryWindow(args: FetchTerminalDirectoryWindowA
       })
       if (controller.signal.aborted) return
 
-      // Codex durability identity is a sidebar binding path: a running codex
-      // terminal with durability identity is rowed under
-      // codex:<durabilitySessionId> (getCodexDurabilitySessionId in
-      // selectors/sidebarSelectors.ts), never under the identity-less
-      // codex:terminal:<terminalId> close-tab alias. This thunk is the
-      // store-level choke point where refreshed directory data is applied,
-      // and the refresh fires on every terminals.changed broadcast (the Node
-      // server broadcasts terminals.changed immediately after
-      // terminal.codex.durability.updated), mounted or not — so the alias
-      // fold lives here, where a paneless post-close binding still reaches it.
+      // Close-tab activity migration runs at this store-level choke point —
+      // the sidebar rows running terminals straight from the applied window
+      // (buildSessionItems reads terminalDirectory.windows.sidebar.items;
+      // the directory never passes through
+      // reconcileTerminalSessionAssociation), and the refresh fires on every
+      // terminals.changed broadcast as well as on (re)connect, mounted or
+      // not. Two folds, both ratchet-only:
+      //
+      // 1. Canonical-to-canonical: the terminal.session.associated frame
+      //    carrying previousSessionId is a single transient broadcast, so a
+      //    client disconnected at rebind time only ever sees a codex fork
+      //    handoff as the SAME terminalId swapping canonical identity between
+      //    two applied pages. The previous window is the only record of the
+      //    superseded identity — fold its activity onto the new one.
+      // 2. Alias-to-canonical: a codex terminal closed while identity-less
+      //    had its touch recorded under codex:terminal:<terminalId>; once the
+      //    refreshed item carries durability identity the row rekeys to
+      //    codex:<durabilitySessionId>, so fold the alias across.
       const items = Array.isArray(response?.items) ? response.items : []
       const stateBeforeFold = getState()
+      const previousIdentityByTerminalId = new Map<string, { provider: string; sessionId: string }>()
+      for (const previous of stateBeforeFold.terminalDirectory?.windows?.[args.surface]?.items ?? []) {
+        if (typeof previous?.terminalId !== 'string') continue
+        const identity = directoryItemCanonicalIdentity(previous)
+        if (identity) previousIdentityByTerminalId.set(previous.terminalId, identity)
+      }
       for (const item of items) {
-        if (item?.mode !== 'codex' || typeof item?.terminalId !== 'string') continue
+        if (typeof item?.terminalId !== 'string') continue
+        const identity = directoryItemCanonicalIdentity(item)
+        if (identity) {
+          const previous = previousIdentityByTerminalId.get(item.terminalId)
+          if (
+            previous
+            && previous.provider === identity.provider
+            && previous.sessionId !== identity.sessionId
+          ) {
+            foldCanonicalSessionActivity({
+              dispatch,
+              state: stateBeforeFold,
+              provider: identity.provider,
+              previousSessionId: previous.sessionId,
+              sessionId: identity.sessionId,
+            })
+          }
+        }
+        if (item?.mode !== 'codex') continue
         const durabilitySessionId = item.codexDurability?.durableThreadId
           ?? item.codexDurability?.candidate?.candidateThreadId
         if (!durabilitySessionId) continue

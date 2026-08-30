@@ -14,6 +14,31 @@ type Dispatch = (action: any) => unknown
 type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivity'>
 
 /**
+ * Shared ratchet-only migration core: copy the activity stored under one
+ * sidebar row key onto a canonical session key. updateSessionActivity is
+ * ratchet-only (max wins), so folding is safe even when the canonical key
+ * already holds a newer value. The source entry may remain stored — old keys
+ * are pruned by the slice's existing retention.
+ */
+function foldSessionActivityFromKey({
+  dispatch,
+  state,
+  fromKey,
+  provider,
+  sessionId,
+}: {
+  dispatch: Dispatch
+  state: Pick<RootState, 'sessionActivity'>
+  fromKey: string
+  provider: string
+  sessionId: string
+}): void {
+  const fromAt = state.sessionActivity?.sessions?.[fromKey]
+  if (typeof fromAt !== 'number') return
+  dispatch(updateSessionActivity({ sessionId, provider, lastInputAt: fromAt }))
+}
+
+/**
  * Migration fold for the close-tab ratchet alias: a terminal identity-less
  * at close time had its touch recorded under
  * `<provider>:terminal:<terminalId>` (liveTerminalRowIdentity in
@@ -25,9 +50,6 @@ type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessionActivi
  * fetchTerminalDirectoryWindow in store/terminalDirectoryThunks.ts — the
  * store-level directory-apply choke point, reached by every
  * terminals.changed refresh whether or not any pane is mounted).
- * updateSessionActivity is ratchet-only (max wins), so folding is safe even
- * when the canonical key already holds a newer value. The alias entry may
- * remain stored — no selector reads it once identity binds.
  */
 export function foldTerminalAliasActivity({
   dispatch,
@@ -42,9 +64,47 @@ export function foldTerminalAliasActivity({
   provider: string
   sessionId: string
 }): void {
-  const aliasAt = state.sessionActivity?.sessions?.[`${provider}:terminal:${terminalId}`]
-  if (typeof aliasAt !== 'number') return
-  dispatch(updateSessionActivity({ sessionId, provider, lastInputAt: aliasAt }))
+  foldSessionActivityFromKey({
+    dispatch,
+    state,
+    fromKey: `${provider}:terminal:${terminalId}`,
+    provider,
+    sessionId,
+  })
+}
+
+/**
+ * Migration fold for a canonical-to-canonical rebind (codex fork handoff):
+ * a terminal closed while carrying the PARENT identity had its touch
+ * recorded under `<provider>:<previousSessionId>` — liveTerminalRowIdentity
+ * deliberately yields no terminal alias for identity-bearing content. When
+ * the rebind is accepted and the sidebar rekeys the row to
+ * `<provider>:<sessionId>`, the superseded key's timestamp must be folded
+ * across the same way the terminal alias is, or the child row loses the
+ * close-touch float. previousSessionId equal to sessionId folds nothing
+ * (source and target would be the same key).
+ */
+export function foldCanonicalSessionActivity({
+  dispatch,
+  state,
+  provider,
+  previousSessionId,
+  sessionId,
+}: {
+  dispatch: Dispatch
+  state: Pick<RootState, 'sessionActivity'>
+  provider: string
+  previousSessionId: string
+  sessionId: string
+}): void {
+  if (previousSessionId.length === 0 || previousSessionId === sessionId) return
+  foldSessionActivityFromKey({
+    dispatch,
+    state,
+    fromKey: `${provider}:${previousSessionId}`,
+    provider,
+    sessionId,
+  })
 }
 
 function collectMatchingTerminalPanes(
@@ -162,6 +222,21 @@ export function reconcileTerminalSessionAssociation({
     provider: sessionRef.provider,
     sessionId: sessionRef.sessionId,
   })
+
+  // Canonical-to-canonical migration on a server-authoritative rebind:
+  // previousSessionId names the superseded session, whose stored activity
+  // (e.g. the close-tab touch recorded under the parent key — identity-
+  // bearing closes never write a terminal alias) folds onto the new key.
+  // Same conflict-gate and pane-match independence rules as the alias fold.
+  if (typeof previousSessionId === 'string') {
+    foldCanonicalSessionActivity({
+      dispatch,
+      state,
+      provider: sessionRef.provider,
+      previousSessionId,
+      sessionId: sessionRef.sessionId,
+    })
+  }
 
   if (!matchedAnyPane) return 'ignored'
 

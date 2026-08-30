@@ -320,3 +320,150 @@ describe('codex durability alias fold on directory application', () => {
     expect(Object.keys(store.getState().sessionActivity.sessions)).toHaveLength(1)
   })
 })
+
+describe('canonical rebind fold on directory refresh (snapshot swap)', () => {
+  // The sidebar rows a running terminal under the directory item's own
+  // sessionRef (buildSessionItems' runningSessionMap reads
+  // state.terminalDirectory.windows.sidebar.items directly — the directory is
+  // applied here and never passes through reconcileTerminalSessionAssociation).
+  // The terminal.session.associated frame carrying previousSessionId is a
+  // single transient broadcast: a client disconnected at rebind time (fresh
+  // page load, second device) only ever sees the parent->child swap as two
+  // consecutive directory snapshots for the same terminalId. The previous
+  // window is the client's only record of the superseded identity, so the
+  // canonical previous->new fold must run here too, ratchet-only.
+
+  function codexSessionItem(terminalId: string, sessionId: string) {
+    return {
+      terminalId,
+      title: 'Codex',
+      createdAt: 1,
+      lastActivityAt: 10,
+      status: 'running',
+      hasClients: false,
+      mode: 'codex',
+      sessionRef: { provider: 'codex', sessionId },
+    }
+  }
+
+  function createStoreWithActivity(sessions: Record<string, number>) {
+    return configureStore({
+      reducer: {
+        terminalDirectory: terminalDirectoryReducer,
+        sessionActivity: sessionActivityReducer,
+      },
+      preloadedState: {
+        sessionActivity: { sessions },
+      },
+    })
+  }
+
+  async function fetchSidebarPage(store: ReturnType<typeof createStoreWithActivity>) {
+    await store.dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+  }
+
+  it('folds the superseded canonical timestamp onto the new identity when a refresh swaps the same terminal\'s sessionRef', async () => {
+    getTerminalDirectoryPage
+      .mockResolvedValueOnce({
+        items: [codexSessionItem('term-cx-9', 'parent-1')],
+        nextCursor: null,
+        revision: 20,
+      })
+      .mockResolvedValueOnce({
+        items: [codexSessionItem('term-cx-9', 'child-1')],
+        nextCursor: null,
+        revision: 21,
+      })
+
+    const store = createStoreWithActivity({ 'codex:parent-1': 4444 })
+    await fetchSidebarPage(store)
+    expect(store.getState().sessionActivity.sessions['codex:child-1']).toBeUndefined()
+
+    await fetchSidebarPage(store)
+    expect(store.getState().sessionActivity.sessions['codex:child-1']).toBe(4444)
+    // The old key stays (ratchet-only, pruned by existing retention).
+    expect(store.getState().sessionActivity.sessions['codex:parent-1']).toBe(4444)
+  })
+
+  it('never lowers an already-newer new-identity timestamp (ratchet non-regression)', async () => {
+    getTerminalDirectoryPage
+      .mockResolvedValueOnce({
+        items: [codexSessionItem('term-cx-9', 'parent-1')],
+        nextCursor: null,
+        revision: 20,
+      })
+      .mockResolvedValueOnce({
+        items: [codexSessionItem('term-cx-9', 'child-1')],
+        nextCursor: null,
+        revision: 21,
+      })
+
+    const store = createStoreWithActivity({ 'codex:parent-1': 4444, 'codex:child-1': 9999 })
+    await fetchSidebarPage(store)
+    await fetchSidebarPage(store)
+
+    expect(store.getState().sessionActivity.sessions['codex:child-1']).toBe(9999)
+  })
+
+  it('writes nothing when the refreshed identity is unchanged', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexSessionItem('term-cx-9', 'parent-1')],
+      nextCursor: null,
+      revision: 20,
+    })
+
+    const store = createStoreWithActivity({ 'codex:parent-1': 4444 })
+    await fetchSidebarPage(store)
+    await fetchSidebarPage(store)
+
+    // No canonical->canonical fold happened: the map is untouched.
+    expect(store.getState().sessionActivity.sessions).toEqual({ 'codex:parent-1': 4444 })
+  })
+
+  it('writes nothing when the previous window never carried the terminal (first sighting)', async () => {
+    getTerminalDirectoryPage.mockResolvedValue({
+      items: [codexSessionItem('term-cx-9', 'child-1')],
+      nextCursor: null,
+      revision: 20,
+    })
+
+    const store = createStoreWithActivity({ 'codex:parent-1': 4444 })
+    await fetchSidebarPage(store)
+
+    // There is no evidence the terminal ever stood for parent-1 on this
+    // client, so nothing may move.
+    expect(store.getState().sessionActivity.sessions).toEqual({ 'codex:parent-1': 4444 })
+  })
+
+  it('does not fold across providers (a provider change is not a rebind)', async () => {
+    getTerminalDirectoryPage
+      .mockResolvedValueOnce({
+        items: [{
+          terminalId: 'term-x-1',
+          title: 'Claude',
+          createdAt: 1,
+          lastActivityAt: 10,
+          status: 'running',
+          hasClients: false,
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: 'claude-1' },
+        }],
+        nextCursor: null,
+        revision: 20,
+      })
+      .mockResolvedValueOnce({
+        items: [codexSessionItem('term-x-1', 'child-1')],
+        nextCursor: null,
+        revision: 21,
+      })
+
+    const store = createStoreWithActivity({ 'claude:claude-1': 4444 })
+    await fetchSidebarPage(store)
+    await fetchSidebarPage(store)
+
+    expect(store.getState().sessionActivity.sessions).toEqual({ 'claude:claude-1': 4444 })
+  })
+})
