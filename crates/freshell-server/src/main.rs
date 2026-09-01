@@ -402,13 +402,14 @@ async fn main() -> ExitCode {
     // `broadcast_tx`). `boot_anchor` backs `freshell.uptimeSec`.
     let host_stats_interest =
         freshell_ws::host_stats_interest::HostStatsInterestRegistry::default();
-    let host_stats_collector: std::sync::Arc<dyn freshell_ws::host_stats_collector::HostStatsCollector> =
-        std::sync::Arc::new(host_stats::HostStatsCollectorService::new(
-            host_stats::HostStatsCollectorConfig::from_env(),
-            registry.clone(),
-            host_stats_interest.clone(),
-            std::time::Instant::now(),
-        ));
+    let host_stats_collector: std::sync::Arc<
+        dyn freshell_ws::host_stats_collector::HostStatsCollector,
+    > = std::sync::Arc::new(host_stats::HostStatsCollectorService::new(
+        host_stats::HostStatsCollectorConfig::from_env(),
+        registry.clone(),
+        host_stats_interest.clone(),
+        std::time::Instant::now(),
+    ));
     // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a79 Risk 1): the
     // Agent-API's terminal-mode `POST /api/tabs` shares THIS SAME registry --
     // never a second one -- so an Agent-API-created shell terminal is a first-class

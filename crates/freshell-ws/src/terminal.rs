@@ -7101,8 +7101,8 @@ mod host_stats_dispatch_tests {
     use freshell_protocol::{
         HostStatsCpu, HostStatsDiskIo, HostStatsFreshell, HostStatsInotify, HostStatsLimits,
         HostStatsLive, HostStatsLoad, HostStatsMachine, HostStatsManual, HostStatsMemory,
-        HostStatsNetwork, HostStatsPaging, HostStatsProcessHealth, HostStatsPsi,
-        HostStatsSnapshot, HostStatsThermals, HostStatsTopProcesses,
+        HostStatsNetwork, HostStatsPaging, HostStatsProcessHealth, HostStatsPsi, HostStatsSnapshot,
+        HostStatsThermals, HostStatsTopProcesses,
     };
 
     use crate::host_stats_collector::{

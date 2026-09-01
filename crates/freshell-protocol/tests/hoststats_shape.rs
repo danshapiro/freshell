@@ -11,8 +11,8 @@ use freshell_protocol::server_messages::{
     HostStatsCpu, HostStatsDisk, HostStatsDiskIo, HostStatsDisks, HostStatsFreshell,
     HostStatsInotify, HostStatsLimits, HostStatsLive, HostStatsLoad, HostStatsMachine,
     HostStatsManual, HostStatsMemory, HostStatsNetwork, HostStatsPaging, HostStatsProcessHealth,
-    HostStatsPsi, HostStatsRefreshResponse, HostStatsSnapshot, HostStatsThermals,
-    HostStatsThermalZone, HostStatsTopProcess, HostStatsTopProcesses,
+    HostStatsPsi, HostStatsRefreshResponse, HostStatsSnapshot, HostStatsThermalZone,
+    HostStatsThermals, HostStatsTopProcess, HostStatsTopProcesses,
 };
 
 fn sample_live() -> HostStatsLive {
@@ -258,7 +258,10 @@ fn nullable_fields_serialize_null_and_optional_fields_are_absent() {
     assert_eq!(obj.len(), 2, "bare response carries requestId+ok only");
     assert_eq!(v["requestId"], "r1");
     assert!(!obj.contains_key("at"), "at must be absent, not null");
-    assert!(!obj.contains_key("manual"), "manual must be absent, not null");
+    assert!(
+        !obj.contains_key("manual"),
+        "manual must be absent, not null"
+    );
     assert!(!obj.contains_key("error"), "error must be absent, not null");
 
     // Snapshot with no manual refresh yet: `.nullable()` fields must be

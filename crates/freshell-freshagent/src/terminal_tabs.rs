@@ -202,7 +202,11 @@ async fn create_terminal_or_content_tab_with_delivery(
 
     // `hostStats: true` -> stateless host-stats pane (router.ts `wantsHostStats`
     // branch before browser): no process, no terminal admission.
-    if body.get("hostStats").and_then(Value::as_bool).unwrap_or(false) {
+    if body
+        .get("hostStats")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return create_content_tab(
             &state,
             name,
@@ -3194,13 +3198,8 @@ mod tests {
     async fn create_host_stats_tab_attaches_host_stats_pane_content_and_no_terminal() {
         let state = state_with_registry();
         let mut rx = state.broadcast_tx.subscribe();
-        let (status, body) = post(
-            app(state),
-            "/api/tabs",
-            json!({ "hostStats": true }),
-            true,
-        )
-        .await;
+        let (status, body) =
+            post(app(state), "/api/tabs", json!({ "hostStats": true }), true).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["data"]["tabId"].as_str().is_some());
         assert!(body["data"]["paneId"].as_str().is_some());

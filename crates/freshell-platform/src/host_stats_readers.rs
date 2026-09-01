@@ -188,7 +188,13 @@ pub fn read_cpu_times(proc_root: &Path) -> Option<CpuTimes> {
         } else {
             let idx: usize = idx_str.parse().ok()?;
             if per_core.len() <= idx {
-                per_core.resize(idx + 1, CpuCoreTimes { total: 0.0, busy: 0.0 });
+                per_core.resize(
+                    idx + 1,
+                    CpuCoreTimes {
+                        total: 0.0,
+                        busy: 0.0,
+                    },
+                );
             }
             per_core[idx] = CpuCoreTimes { total, busy };
         }
@@ -781,9 +787,12 @@ pub fn read_cpu_freq_mhz(sys_root: &Path) -> Option<f64> {
         if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if let Some(khz) =
-            read_number_file(&cpu_dir.join(&entry).join("cpufreq").join("scaling_cur_freq"))
-        {
+        if let Some(khz) = read_number_file(
+            &cpu_dir
+                .join(&entry)
+                .join("cpufreq")
+                .join("scaling_cur_freq"),
+        ) {
             if khz > 0 {
                 freqs.push(khz as f64);
             }

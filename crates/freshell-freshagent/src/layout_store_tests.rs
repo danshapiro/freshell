@@ -483,7 +483,10 @@ fn derive_pane_title_full_matrix() {
     assert_eq!(derive_pane_title(&json!({ "kind": "terminal" })), "Shell");
 
     // host-stats -> fixed title (stateless pane; plan Task 8 arm)
-    assert_eq!(derive_pane_title(&json!({ "kind": "host-stats" })), "Host Stats");
+    assert_eq!(
+        derive_pane_title(&json!({ "kind": "host-stats" })),
+        "Host Stats"
+    );
 
     // non-terminal unknown kinds and non-objects -> no title (Node: undefined)
     assert_eq!(derive_pane_title(&json!({ "kind": "picker" })), "");

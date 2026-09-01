@@ -212,7 +212,10 @@ fn record_for_child(pid: u32) -> CodexSidecarRecord {
                 }
             }
             attempts += 1;
-            assert!(attempts <= 1000, "child cmdline never reflected exec within 1000ms");
+            assert!(
+                attempts <= 1000,
+                "child cmdline never reflected exec within 1000ms"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     };

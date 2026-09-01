@@ -301,7 +301,8 @@ impl CollectorCtx {
         if !self.interest.any() {
             return;
         }
-        let msg = freshell_protocol::ServerMessage::HostStatsSnapshot(Box::new(self.snapshot_payload()));
+        let msg =
+            freshell_protocol::ServerMessage::HostStatsSnapshot(Box::new(self.snapshot_payload()));
         for sink in self.interest.senders() {
             sink(msg.clone());
         }
@@ -427,8 +428,7 @@ impl CollectorCtx {
         let cgroup = readers::read_cgroup_memory(&self.cfg.cgroup_root(), &self.cfg.proc_root);
         let meminfo = readers::read_meminfo(&self.cfg.proc_root);
         let swap_total_bytes = meminfo.map(|m| m.swap_total_kb * 1024);
-        let swap_used_bytes =
-            meminfo.map(|m| (m.swap_total_kb - m.swap_free_kb) * 1024);
+        let swap_used_bytes = meminfo.map(|m| (m.swap_total_kb - m.swap_free_kb) * 1024);
         if let Some(cg) = cgroup {
             if let Some(limit) = cg.limit_bytes {
                 return HostStatsMemory {
@@ -464,12 +464,7 @@ impl CollectorCtx {
         let Some(vm) = readers::read_vmstat(&self.cfg.proc_root) else {
             return zero_paging();
         };
-        let prev = self
-            .share
-            .prev_vmstat
-            .lock()
-            .unwrap()
-            .replace((at, vm));
+        let prev = self.share.prev_vmstat.lock().unwrap().replace((at, vm));
         let oom_kills_total = vm.oom_kill.unwrap_or(0);
         let Some((prev_at, prev_v)) = prev else {
             return HostStatsPaging {
@@ -494,7 +489,8 @@ impl CollectorCtx {
         let dt_sec = (at - prev_at) as f64 / 1000.0;
         HostStatsPaging {
             available: true,
-            swap_in_kbps: (vm.pswpin.saturating_sub(prev_v.pswpin) * VMSTAT_PAGE_KB) as f64 / dt_sec,
+            swap_in_kbps: (vm.pswpin.saturating_sub(prev_v.pswpin) * VMSTAT_PAGE_KB) as f64
+                / dt_sec,
             swap_out_kbps: (vm.pswpout.saturating_sub(prev_v.pswpout) * VMSTAT_PAGE_KB) as f64
                 / dt_sec,
             maj_faults_per_sec: vm.pgmajfault.saturating_sub(prev_v.pgmajfault) as f64 / dt_sec,
@@ -600,16 +596,22 @@ impl CollectorCtx {
             // Multi-device rule (plan thresholds): worst device wins; util
             // can never exceed 100.
             let util = clamp_pct(
-                (cur.time_doing_ios_ms.saturating_sub(before.time_doing_ios_ms)) as f64 / dt_ms
+                (cur.time_doing_ios_ms
+                    .saturating_sub(before.time_doing_ios_ms)) as f64
+                    / dt_ms
                     * 100.0,
             );
             if util_pct.is_none_or(|best| util > best) {
                 util_pct = Some(util);
                 let ios = cur.reads_completed.saturating_sub(before.reads_completed)
                     + cur.writes_completed.saturating_sub(before.writes_completed);
-                let io_ms =
-                    cur.read_ms.saturating_sub(before.read_ms) + cur.write_ms.saturating_sub(before.write_ms);
-                weighted_await_ms = if ios > 0 { Some(io_ms as f64 / ios as f64) } else { None };
+                let io_ms = cur.read_ms.saturating_sub(before.read_ms)
+                    + cur.write_ms.saturating_sub(before.write_ms);
+                weighted_await_ms = if ios > 0 {
+                    Some(io_ms as f64 / ios as f64)
+                } else {
+                    None
+                };
             }
         }
         HostStatsDiskIo {
@@ -815,8 +817,8 @@ impl HostStatsCollector for HostStatsCollectorService {
                 loop {
                     tokio::time::sleep(interval).await;
                     let now = Instant::now();
-                    let drift_ms =
-                        now.duration_since(last).as_secs_f64() * 1000.0 - interval.as_secs_f64() * 1000.0;
+                    let drift_ms = now.duration_since(last).as_secs_f64() * 1000.0
+                        - interval.as_secs_f64() * 1000.0;
                     last = now;
                     if drift_ms.is_finite() && drift_ms > 0.0 {
                         drift_ctx.share.lag_samples.lock().unwrap().push(drift_ms);
@@ -1537,7 +1539,11 @@ mod tests {
         let broken = scan.join("999");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("stat"), "999 (broken").unwrap();
-        std::fs::write(broken.join("status"), "Name:\tbroken\nVmRSS:\t       1234 kB\n").unwrap();
+        std::fs::write(
+            broken.join("status"),
+            "Name:\tbroken\nVmRSS:\t       1234 kB\n",
+        )
+        .unwrap();
         scan
     }
 
@@ -1632,7 +1638,10 @@ mod tests {
         let pid_max_only = tmp.path().join("pid-max-only").join("proc");
         std::fs::create_dir_all(pid_max_only.join("sys/kernel")).unwrap();
         std::fs::write(pid_max_only.join("sys/kernel/pid_max"), "4194304\n").unwrap();
-        assert_eq!(readers::read_pids_limit(&pid_max_only, &cgroup_fixture()), None);
+        assert_eq!(
+            readers::read_pids_limit(&pid_max_only, &cgroup_fixture()),
+            None
+        );
     }
 
     #[test]
@@ -1673,7 +1682,10 @@ mod tests {
         assert_eq!(tcp.time_wait, 3);
         let ports = readers::read_ephemeral_port_range(&proc_fixture()).expect("port range");
         assert_eq!((ports.start, ports.end), (32768, 60999));
-        assert_eq!(readers::read_self_limits_fds_max(&proc_fixture()), Some(1024));
+        assert_eq!(
+            readers::read_self_limits_fds_max(&proc_fixture()),
+            Some(1024)
+        );
         let inotify = readers::read_inotify_limits(&proc_fixture()).expect("inotify limits");
         assert_eq!(inotify.max_user_watches, Some(1048576));
         assert_eq!(inotify.max_user_instances, Some(128));
@@ -1748,10 +1760,14 @@ mod tests {
     async fn host_stats_scan_fixture_table_counts_and_names() {
         let tmp = tempfile::tempdir().unwrap();
         let scan_root = scan_proc_overlay(tmp.path());
-        let scan = scan_process_table(&scan_root, Duration::from_millis(50), Instant::now() + Duration::from_secs(10))
-            .await
-            .expect("fixture scan resolves")
-            .expect("no deadline");
+        let scan = scan_process_table(
+            &scan_root,
+            Duration::from_millis(50),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .expect("fixture scan resolves")
+        .expect("no deadline");
         // 8 numeric entries enumerated (7 committed + truncated 999).
         assert_eq!(scan.total, 8);
         assert_eq!(scan.zombies, 1);
@@ -1759,8 +1775,7 @@ mod tests {
         // truncated-stat pid 999 is skipped, never fatal.
         assert_eq!(scan.top.len(), 7);
         assert!(scan.top.iter().all(|p| p.pid != 999));
-        let by_pid: HashMap<u64, &ProcessSampleR> =
-            scan.top.iter().map(|p| (p.pid, p)).collect();
+        let by_pid: HashMap<u64, &ProcessSampleR> = scan.top.iter().map(|p| (p.pid, p)).collect();
         // comm-with-parens splits after the LAST ')'.
         assert_eq!(by_pid[&404].name, "my (weird) proc");
         assert_eq!(by_pid[&404].state, "D");
@@ -1775,14 +1790,20 @@ mod tests {
     async fn host_stats_scan_deadline_exceeded_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let scan_root = scan_proc_overlay(tmp.path());
-        let result =
-            scan_process_table(&scan_root, Duration::ZERO, Instant::now() - Duration::from_secs(1))
-                .await;
+        let result = scan_process_table(
+            &scan_root,
+            Duration::ZERO,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
         assert!(matches!(result, Err(ScanError::DeadlineExceeded)));
         // Missing proc root -> None (degraded), never an error.
-        let missing_result =
-            scan_process_table(&missing(), Duration::ZERO, Instant::now() + Duration::from_secs(10))
-                .await;
+        let missing_result = scan_process_table(
+            &missing(),
+            Duration::ZERO,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
         assert!(matches!(missing_result, Ok(None)));
     }
 
@@ -1794,7 +1815,10 @@ mod tests {
     async fn host_stats_set_active_spawn_abort_lifecycle() {
         let interest = HostStatsInterestRegistry::default();
         let collector = test_collector(proc_fixture(), sys_fixture(), &interest);
-        assert!(!collector.is_running(), "zero-cost idle before first interest");
+        assert!(
+            !collector.is_running(),
+            "zero-cost idle before first interest"
+        );
         collector.set_active(true);
         assert!(collector.is_running(), "0->1 interest spawns the cadence");
         collector.set_active(true);
@@ -1927,11 +1951,17 @@ mod tests {
         let scan_root = scan_proc_overlay(tmp.path());
         let interest = HostStatsInterestRegistry::default();
         let collector = test_collector(scan_root, sys_fixture(), &interest);
-        let (one, two) =
-            tokio::join!(collector.refresh(Duration::from_millis(2000)), collector.refresh(Duration::from_millis(2000)));
+        let (one, two) = tokio::join!(
+            collector.refresh(Duration::from_millis(2000)),
+            collector.refresh(Duration::from_millis(2000))
+        );
         let one = one.expect("leader refresh succeeds");
         let two = two.expect("joiner refresh succeeds");
-        assert_eq!(collector.scan_run_count(), 1, "one scan serves both callers");
+        assert_eq!(
+            collector.scan_run_count(),
+            1,
+            "one scan serves both callers"
+        );
         assert_eq!(one, two, "the joiner gets the leader's exact result");
         // The fixture scan powered both process sections.
         assert!(one.manual.top_processes.available);
@@ -2003,7 +2033,11 @@ mod tests {
         assert!(!result.manual.top_processes.available);
         assert!(!result.manual.process_health.available);
         assert_eq!(
-            result.manual.section_errors.get("topProcesses").map(String::as_str),
+            result
+                .manual
+                .section_errors
+                .get("topProcesses")
+                .map(String::as_str),
             Some("host-stats section deadline exceeded")
         );
         assert_eq!(

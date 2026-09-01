@@ -156,7 +156,10 @@ mod tests {
     fn host_stats_interest_reports_0_to_1_and_1_to_0_transitions() {
         let r = HostStatsInterestRegistry::default();
         // First arrival is the ->active edge; repeats are unchanged.
-        assert_eq!(r.set(1, Some(noop_sink())), InterestTransition::BecameActive);
+        assert_eq!(
+            r.set(1, Some(noop_sink())),
+            InterestTransition::BecameActive
+        );
         assert_eq!(r.set(1, Some(noop_sink())), InterestTransition::Unchanged);
         assert_eq!(r.set(2, Some(noop_sink())), InterestTransition::Unchanged);
         // Removing one of two stays active; removing the last is ->idle.
