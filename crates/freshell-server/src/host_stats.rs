@@ -142,10 +142,11 @@ impl HostStatsCollectorConfig {
     /// (`FRESHELL_HOST_STATS_FAST_MS`/`_SLOW_MS`, positive ms only — Node
     /// `envPositiveMs` parity).
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        cfg.fast = env_positive_ms("FRESHELL_HOST_STATS_FAST_MS", DEFAULT_FAST);
-        cfg.slow = env_positive_ms("FRESHELL_HOST_STATS_SLOW_MS", DEFAULT_SLOW);
-        cfg
+        Self {
+            fast: env_positive_ms("FRESHELL_HOST_STATS_FAST_MS", DEFAULT_FAST),
+            slow: env_positive_ms("FRESHELL_HOST_STATS_SLOW_MS", DEFAULT_SLOW),
+            ..Default::default()
+        }
     }
 
     fn cgroup_root(&self) -> PathBuf {
@@ -873,10 +874,14 @@ impl Drop for RefreshFlightGuard<'_> {
     }
 }
 
-/// `fs.statfs` on a mount; `free_bytes` is the unprivileged view (`bavail`).
-/// Node `statfsInfo` parity; unix-only on this Rust path.
+/// `(total_bytes, free_bytes, used_pct, inodes_total, inodes_free)`.
+/// `free_bytes` is the unprivileged view (`bavail`); inodes are None when the
+/// filesystem reports 0 total (some report 0/0 by design).
+type StatfsInfo = (u64, u64, f64, Option<u64>, Option<u64>);
+
+/// `fs.statfs` on a mount. Node `statfsInfo` parity; unix-only on this Rust path.
 #[cfg(unix)]
-fn statfs_info(mount: &str) -> Option<(u64, u64, f64, Option<u64>, Option<u64>)> {
+fn statfs_info(mount: &str) -> Option<StatfsInfo> {
     let c_path = std::ffi::CString::new(mount).ok()?;
     let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c_path.as_ptr(), &mut stats) } != 0 {
@@ -901,7 +906,7 @@ fn statfs_info(mount: &str) -> Option<(u64, u64, f64, Option<u64>, Option<u64>)>
 }
 
 #[cfg(not(unix))]
-fn statfs_info(_mount: &str) -> Option<(u64, u64, f64, Option<u64>, Option<u64>)> {
+fn statfs_info(_mount: &str) -> Option<StatfsInfo> {
     None
 }
 
