@@ -314,7 +314,10 @@ export class LayoutStore {
     return null
   }
 
-  private buildContent(opts: { terminalId?: string; browser?: string; editor?: string }) {
+  private buildContent(opts: { terminalId?: string; browser?: string; editor?: string; hostStats?: boolean }) {
+    if (opts.hostStats) {
+      return { kind: 'host-stats' }
+    }
     if (opts.browser) {
       return { kind: 'browser', url: opts.browser, devToolsOpen: false }
     }
@@ -433,6 +436,7 @@ export class LayoutStore {
     terminalId,
     browser,
     editor,
+    hostStats,
     tabId,
     paneId,
   }: {
@@ -440,13 +444,14 @@ export class LayoutStore {
     terminalId?: string
     browser?: string
     editor?: string
+    hostStats?: boolean
     tabId?: string
     paneId?: string
   }) {
     const snapshot = this.ensureSnapshot()
     const resolvedTabId = tabId ?? nanoid()
     const resolvedPaneId = paneId ?? nanoid()
-    const content = this.buildContent({ terminalId, browser, editor })
+    const content = this.buildContent({ terminalId, browser, editor, hostStats })
     snapshot.tabs.push({ id: resolvedTabId, title })
     snapshot.layouts[resolvedTabId] = {
       type: 'leaf',
@@ -465,6 +470,7 @@ export class LayoutStore {
     terminalId?: string
     browser?: string
     editor?: string
+    hostStats?: boolean
     newPaneId?: string
   }) {
     const snapshot = this.ensureSnapshot()
@@ -475,7 +481,7 @@ export class LayoutStore {
       if (!leaves.find((leaf) => leaf.id === opts.paneId)) continue
 
       const newPaneId = opts.newPaneId ?? nanoid()
-      const newContent = this.buildContent({ terminalId: opts.terminalId, browser: opts.browser, editor: opts.editor })
+      const newContent = this.buildContent({ terminalId: opts.terminalId, browser: opts.browser, editor: opts.editor, hostStats: opts.hostStats })
       const splitNode = {
         type: 'split',
         id: nanoid(),

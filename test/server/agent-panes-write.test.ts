@@ -28,6 +28,28 @@ it('splits a pane horizontally', async () => {
   expect(attachPaneContent).toHaveBeenCalled()
 })
 
+it('splits a pane into a host-stats pane without spawning a terminal', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    wsHandler: { broadcastUiCommand: () => {} },
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ hostStats: true })
+  expect(res.body.status).toBe('ok')
+  expect(res.body.message).toBe('pane split (non-terminal)')
+  expect(res.body.data.paneId).toBe('pane_new')
+  expect(res.body.data.terminalId).toBeUndefined()
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(splitPane).toHaveBeenCalledWith(expect.objectContaining({ hostStats: true }))
+  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_new', { kind: 'host-stats' })
+})
+
 it('rejects invalid Codex settings when splitting a pane before spawning', async () => {
   const app = express()
   app.use(express.json())

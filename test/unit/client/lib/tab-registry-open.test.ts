@@ -4,6 +4,7 @@ import {
   jumpToRecord,
   openPaneInNewTab,
   openRecordAsUnlinkedCopy,
+  sanitizePaneSnapshot,
   type TabsRegistryGroups,
 } from '@/lib/tab-registry-open'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
@@ -33,6 +34,14 @@ function makeRecord(overrides: Partial<RegistryTabRecord> = {}): RegistryTabReco
 function makeGroups(overrides: Partial<TabsRegistryGroups> = {}): TabsRegistryGroups {
   return { localOpen: [], sameDeviceOpen: [], remoteOpen: [], closed: [], ...overrides }
 }
+
+describe('sanitizePaneSnapshot', () => {
+  it('returns a host-stats pane for a host-stats snapshot (no picker fallback)', () => {
+    const record = makeRecord()
+    const snapshot = { paneId: 'pane-hs', kind: 'host-stats', payload: {} } as never
+    expect(sanitizePaneSnapshot(record, snapshot)).toEqual({ kind: 'host-stats' })
+  })
+})
 
 describe('findRecordByTabKey', () => {
   it('finds a record in any group', () => {

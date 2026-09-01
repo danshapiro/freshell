@@ -507,10 +507,11 @@ fn validate_pane(
         "fresh-agent" => validate_fresh_agent(path, payload, &payload_name),
         "extension" => validate_extension(path, payload, &payload_name),
         "picker" => Ok(()),
+        "host-stats" => Ok(()),
         _ => Err(invalid(
             path,
             &format!("{name}.kind"),
-            "one of terminal, browser, editor, fresh-agent, extension, or picker",
+            "one of terminal, browser, editor, fresh-agent, extension, picker, or host-stats",
         )),
     }
 }
