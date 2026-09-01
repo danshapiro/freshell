@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 58,
+  "messageCount": 60,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1135,6 +1135,1166 @@
         "provider",
         "sessionId",
         "sessionType",
+        "type"
+      ],
+      "type": "object"
+    },
+    "hoststats.refresh.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "type": "number"
+        },
+        "error": {
+          "type": "string"
+        },
+        "manual": {
+          "additionalProperties": false,
+          "properties": {
+            "disks": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "list": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "freeBytes": {
+                        "type": "number"
+                      },
+                      "inodesFree": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "inodesTotal": {
+                        "anyOf": [
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "mount": {
+                        "type": "string"
+                      },
+                      "totalBytes": {
+                        "type": "number"
+                      },
+                      "usedPct": {
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "freeBytes",
+                      "inodesFree",
+                      "inodesTotal",
+                      "mount",
+                      "totalBytes",
+                      "usedPct"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "list"
+              ],
+              "type": "object"
+            },
+            "inotify": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "instances": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxUserInstances": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxUserWatches": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "watches": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "instances",
+                "maxUserInstances",
+                "maxUserWatches",
+                "watches"
+              ],
+              "type": "object"
+            },
+            "processHealth": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "dState": {
+                  "type": "number"
+                },
+                "total": {
+                  "type": "number"
+                },
+                "zombies": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "dState",
+                "total",
+                "zombies"
+              ],
+              "type": "object"
+            },
+            "sectionErrors": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "thermals": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "battery": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "pct": {
+                          "type": "number"
+                        },
+                        "status": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "pct",
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "zones": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "celsius": {
+                        "type": "number"
+                      },
+                      "label": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "celsius",
+                      "label"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "battery",
+                "zones"
+              ],
+              "type": "object"
+            },
+            "topProcesses": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "dwellMs": {
+                  "type": "number"
+                },
+                "list": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "cpuPct": {
+                        "type": "number"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "pid": {
+                        "type": "number"
+                      },
+                      "rssBytes": {
+                        "type": "number"
+                      },
+                      "state": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "cpuPct",
+                      "name",
+                      "pid",
+                      "rssBytes",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "dwellMs",
+                "list"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "disks",
+            "inotify",
+            "processHealth",
+            "sectionErrors",
+            "thermals",
+            "topProcesses"
+          ],
+          "type": "object"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "hoststats.refresh.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "requestId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "hoststats.snapshot": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "type": "number"
+        },
+        "live": {
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "freqMHz": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "perCorePct": {
+                  "items": {
+                    "type": "number"
+                  },
+                  "type": "array"
+                },
+                "stealPct": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "usagePct": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "freqMHz",
+                "perCorePct",
+                "stealPct",
+                "usagePct"
+              ],
+              "type": "object"
+            },
+            "diskIo": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "readBps": {
+                  "type": "number"
+                },
+                "utilPct": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "weightedAwaitMs": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "writeBps": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "readBps",
+                "utilPct",
+                "weightedAwaitMs",
+                "writeBps"
+              ],
+              "type": "object"
+            },
+            "freshell": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "eventLoopLagP99Ms": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ptysMax": {
+                  "type": "number"
+                },
+                "ptysRunning": {
+                  "type": "number"
+                },
+                "rssBytes": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "enum": [
+                    "node",
+                    "rust"
+                  ],
+                  "type": "string"
+                },
+                "uptimeSec": {
+                  "type": "number"
+                },
+                "wsClients": {
+                  "type": "number"
+                },
+                "wsClientsMax": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "eventLoopLagP99Ms",
+                "ptysMax",
+                "ptysRunning",
+                "rssBytes",
+                "source",
+                "uptimeSec",
+                "wsClients",
+                "wsClientsMax"
+              ],
+              "type": "object"
+            },
+            "limits": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "ephemeralPorts": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fdsMax": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fdsUsed": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pidsMax": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pidsUsed": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "timeWait": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "ephemeralPorts",
+                "fdsMax",
+                "fdsUsed",
+                "pidsMax",
+                "pidsUsed",
+                "timeWait"
+              ],
+              "type": "object"
+            },
+            "load": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "cores": {
+                  "type": "number"
+                },
+                "load1": {
+                  "type": "number"
+                },
+                "load15": {
+                  "type": "number"
+                },
+                "load5": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "cores",
+                "load1",
+                "load15",
+                "load5"
+              ],
+              "type": "object"
+            },
+            "machine": {
+              "additionalProperties": false,
+              "properties": {
+                "batteryPresent": {
+                  "type": "boolean"
+                },
+                "cgroup": {
+                  "enum": [
+                    "v1",
+                    "v2",
+                    "none"
+                  ],
+                  "type": "string"
+                },
+                "cores": {
+                  "type": "number"
+                },
+                "gpu": {
+                  "const": "none",
+                  "type": "string"
+                },
+                "hostname": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "kernel": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memTotalBytes": {
+                  "type": "number"
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "psi": {
+                  "type": "boolean"
+                },
+                "thermalCount": {
+                  "type": "number"
+                },
+                "wsl": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "batteryPresent",
+                "cgroup",
+                "cores",
+                "gpu",
+                "hostname",
+                "kernel",
+                "memTotalBytes",
+                "platform",
+                "psi",
+                "thermalCount",
+                "wsl"
+              ],
+              "type": "object"
+            },
+            "memory": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "availableBytes": {
+                  "type": "number"
+                },
+                "cgroupLimitBytes": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "enum": [
+                    "cgroup",
+                    "host",
+                    "processes"
+                  ],
+                  "type": "string"
+                },
+                "swapTotalBytes": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "swapUsedBytes": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "totalBytes": {
+                  "type": "number"
+                },
+                "usedBytes": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "availableBytes",
+                "cgroupLimitBytes",
+                "source",
+                "swapTotalBytes",
+                "swapUsedBytes",
+                "totalBytes",
+                "usedBytes"
+              ],
+              "type": "object"
+            },
+            "network": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "rxBps": {
+                  "type": "number"
+                },
+                "rxDroppedDelta": {
+                  "type": "number"
+                },
+                "rxDroppedTotal": {
+                  "type": "number"
+                },
+                "rxErrorsDelta": {
+                  "type": "number"
+                },
+                "rxErrorsTotal": {
+                  "type": "number"
+                },
+                "txBps": {
+                  "type": "number"
+                },
+                "txDroppedDelta": {
+                  "type": "number"
+                },
+                "txDroppedTotal": {
+                  "type": "number"
+                },
+                "txErrorsDelta": {
+                  "type": "number"
+                },
+                "txErrorsTotal": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "rxBps",
+                "rxDroppedDelta",
+                "rxDroppedTotal",
+                "rxErrorsDelta",
+                "rxErrorsTotal",
+                "txBps",
+                "txDroppedDelta",
+                "txDroppedTotal",
+                "txErrorsDelta",
+                "txErrorsTotal"
+              ],
+              "type": "object"
+            },
+            "paging": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "majFaultsPerSec": {
+                  "type": "number"
+                },
+                "oomKillsDelta": {
+                  "type": "number"
+                },
+                "oomKillsTotal": {
+                  "type": "number"
+                },
+                "swapInKbps": {
+                  "type": "number"
+                },
+                "swapOutKbps": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "majFaultsPerSec",
+                "oomKillsDelta",
+                "oomKillsTotal",
+                "swapInKbps",
+                "swapOutKbps"
+              ],
+              "type": "object"
+            },
+            "psi": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "cpuSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ioFull10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ioSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memFull10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "cpuSome10",
+                "ioFull10",
+                "ioSome10",
+                "memFull10",
+                "memSome10"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "cpu",
+            "diskIo",
+            "freshell",
+            "limits",
+            "load",
+            "machine",
+            "memory",
+            "network",
+            "paging",
+            "psi"
+          ],
+          "type": "object"
+        },
+        "manual": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "disks": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "list": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "freeBytes": {
+                            "type": "number"
+                          },
+                          "inodesFree": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "inodesTotal": {
+                            "anyOf": [
+                              {
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "mount": {
+                            "type": "string"
+                          },
+                          "totalBytes": {
+                            "type": "number"
+                          },
+                          "usedPct": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "freeBytes",
+                          "inodesFree",
+                          "inodesTotal",
+                          "mount",
+                          "totalBytes",
+                          "usedPct"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "list"
+                  ],
+                  "type": "object"
+                },
+                "inotify": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "instances": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxUserInstances": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxUserWatches": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "watches": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "instances",
+                    "maxUserInstances",
+                    "maxUserWatches",
+                    "watches"
+                  ],
+                  "type": "object"
+                },
+                "processHealth": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "dState": {
+                      "type": "number"
+                    },
+                    "total": {
+                      "type": "number"
+                    },
+                    "zombies": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "dState",
+                    "total",
+                    "zombies"
+                  ],
+                  "type": "object"
+                },
+                "sectionErrors": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "thermals": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "battery": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "pct": {
+                              "type": "number"
+                            },
+                            "status": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "pct",
+                            "status"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "zones": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "celsius": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "celsius",
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "battery",
+                    "zones"
+                  ],
+                  "type": "object"
+                },
+                "topProcesses": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "dwellMs": {
+                      "type": "number"
+                    },
+                    "list": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cpuPct": {
+                            "type": "number"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "pid": {
+                            "type": "number"
+                          },
+                          "rssBytes": {
+                            "type": "number"
+                          },
+                          "state": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "cpuPct",
+                          "name",
+                          "pid",
+                          "rssBytes",
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "dwellMs",
+                    "list"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "disks",
+                "inotify",
+                "processHealth",
+                "sectionErrors",
+                "thermals",
+                "topProcesses"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manualAt": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "const": "hoststats.snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "live",
+        "manual",
+        "manualAt",
         "type"
       ],
       "type": "object"
