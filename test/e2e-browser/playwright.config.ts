@@ -167,6 +167,13 @@ export const MATRIX_SPECS = [
   // shared code, so legacy is a true regression control proving they didn't
   // regress Node behavior. See title-sync-convergence.spec.ts.
   /title-sync-convergence\.spec\.ts$/,
+  // HOST-STATS (host-pressure-pane plan, Task 10) — Host Stats pane smoke:
+  // picker create, verdict strip/CPU tile, refresh interaction (Collecting
+  // state + age label), Disks fallback em-dash contract, tab-switch liveness,
+  // reload restore. Assertions are backend-agnostic (the Rust lane renders
+  // zero-shape values identically), so legacy is a true parity control. See
+  // test/e2e-browser/specs/host-stats-pane.spec.ts.
+  /host-stats-pane\.spec\.ts$/,
 ]
 
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
