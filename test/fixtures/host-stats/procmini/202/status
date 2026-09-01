@@ -1,0 +1,12 @@
+Name:	node
+Umask:	0022
+State:	S (sleeping)
+Tgid:	202
+Pid:	202
+PPid:	1
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+VmPeak:	 1500000 kB
+VmSize:	  1464843 kB
+VmRSS:	  654321 kB
+Threads:	8
