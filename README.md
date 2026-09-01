@@ -28,6 +28,7 @@
 - **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
+- **Host pressure dashboard pane** — CPU, memory, pressure, and I/O at a glance with near-zero overhead (metrics stream only while you're watching). Linux, WSL, and macOS only — not shown on Windows.
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
 - **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
 - **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
