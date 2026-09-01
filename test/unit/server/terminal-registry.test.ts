@@ -2258,6 +2258,10 @@ describe('TerminalRegistry', () => {
   })
 
   describe('reaping exited terminals', () => {
+    it('exposes the constructed cap via getMaxTerminals()', () => {
+      expect(registry.getMaxTerminals()).toBe(10)
+    })
+
     it('does not count exited terminals against MAX_TERMINALS', () => {
       const reg = new TerminalRegistry(undefined, 2)
       const t1 = reg.create({ mode: 'shell' })
