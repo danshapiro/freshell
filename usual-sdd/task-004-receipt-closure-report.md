@@ -89,8 +89,8 @@ workers, and test-owned ports only.
 | `fresh-agent.spec.ts:695` — style setting persists per Fresh Agent pane type and applies serif rendering | F | `/tmp/task4-parent-binary-current-18.log` |
 | `freshopencode-db-history.spec.ts:245` — restores Freshopencode turns from DB history when export is truncated | F | `/tmp/task4-parent-binary-current-18.log` |
 | `freshopencode-db-history.spec.ts:324` — does not materialize Freshopencode from DB rows without top-level run sessionID | F | `/tmp/task4-parent-binary-current-18.log` |
-| `freshopencode-db-history.spec.ts:379` — repairs a persisted placeholder from a unique DB session | F | `/tmp/task4-parent-binary-current-18.log` |
-| `freshopencode-first-send-reload-repro.spec.ts:136` — keeps a submitted first prompt visible while materialization is pending | F | `/tmp/task4-parent-binary-current-18.log` |
+| `freshopencode-db-history.spec.ts:379` — repairs a persisted placeholder from a unique DB session | F | `/tmp/task4-parent-rust-db-receipt.log` (parent-Rust overlay) |
+| `freshopencode-first-send-reload-repro.spec.ts:136` — keeps a submitted first prompt visible while materialization is pending | F | `/tmp/task4-parent-rust-first-send-receipt.log` (parent-Rust overlay) |
 | `freshopencode-model-picker.spec.ts:256` — model selector commit persists the provider default | F | `/tmp/task4-parent-binary-current-18.log` |
 | `leak-metrics.spec.ts:196` — create/send/close returns to a bounded resource baseline | P | `/tmp/task4-parent-binary-current-18.log` |
 | `mobile-viewport.spec.ts:195` — permission banner buttons are visible and functional on mobile | F | `/tmp/task4-parent-binary-current-18.log` |
@@ -115,12 +115,27 @@ detached worktree at exact `8844e431c`; it timed out after five minutes with
 the same test title (`:2008` on the parent, `:1982` currently), establishing
 the missing baseline comparison without editing the parent.
 
+The two Freshopencode rows above use a direct Rust-baseline overlay because
+their parent files constructed the legacy Node server directly. The temporary
+worktree `/home/dan/code/freshell/.worktrees/task4-parent-rust` was checked
+out at `8844e431c` and changed only those two specs: four replacements in
+`freshopencode-db-history.spec.ts` and two in
+`freshopencode-first-send-reload-repro.spec.ts`. The DB placeholder test
+failed because the prompt was absent after 30 seconds; the first-send test
+failed because the placeholder pane was `idle`, not `running`. Those are
+the same assertions that fail on the current Rust-backed branch. The raw
+receipts are `/tmp/task4-parent-rust-db-receipt.log` and
+`/tmp/task4-parent-rust-first-send-receipt.log`; no temporary-worktree
+process remained after the runs.
+
 ## Final accounting
 
 The prior incomplete receipt is superseded. Its saved log ended after 337
 executions without a Playwright summary. The current receipt has a final
 summary, explicit selected count, and individually executed serial
-successors. Of the 22 current full-run failures, 21 directly reproduce on
-the Task 4 parent and one is current-only but not causally connected to Task
-4 executable changes. The only confirmed Task 4 regression is repaired and
-committed in `7bc113e10`.
+successors. Of the 22 current full-run failures, 21 reproduce on parent Rust
+source (19 through the expanded/mapped parent-source runs and two through the
+direct six-replacement Rust overlay). One leak-metrics identity is a
+run-sensitive parent pass; its executable behavior was unchanged by Task 4.
+The only confirmed Task 4 regression is repaired and committed in
+`7bc113e10`.
