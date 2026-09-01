@@ -171,7 +171,9 @@ struct Share {
     cadence: Mutex<Option<CadenceHandles>>,
     /// Single-flight: while Some, a refresh is in flight and later callers
     /// clone this receiver and await the SAME wire (Node returns the same
-    /// in-flight promise).
+    /// in-flight promise). The run itself is the COLLECTOR's own spawned
+    /// task — never the requesting caller's future — so a caller teardown
+    /// cancels nothing for anyone else (Node service-owned pendingRefresh).
     refresh_flight: Mutex<Option<tokio::sync::watch::Receiver<Option<RefreshWire>>>>,
     last_refresh_completed: Mutex<Option<Instant>>,
 }
@@ -713,36 +715,46 @@ impl HostStatsCollector for HostStatsCollectorService {
                     }
                 }
             }
-            enum Flight {
-                Lead(tokio::sync::watch::Sender<Option<RefreshWire>>),
-                Join(tokio::sync::watch::Receiver<Option<RefreshWire>>),
-            }
-            let flight = {
+            let mut rx = {
                 let mut flight = ctx.share.refresh_flight.lock().unwrap();
                 if let Some(rx) = flight.clone() {
-                    Flight::Join(rx)
+                    rx
                 } else {
                     let (tx, rx) = tokio::sync::watch::channel(None);
-                    *flight = Some(rx);
-                    Flight::Lead(tx)
+                    *flight = Some(rx.clone());
+                    // The COLLECTOR owns the run (Node parity: the service owns
+                    // pendingRefresh independent of any requesting socket): the
+                    // refresh runs as the collector's own spawned task, and
+                    // every caller — the leader included — merely awaits a
+                    // receiver. A leader connection tearing down mid-flight
+                    // cancels NOTHING: the run still completes, the completion
+                    // stamps land unconditionally, and every waiter gets the
+                    // wire.
+                    //
+                    // Stamp the cooldown + free the flight slot BEFORE waking
+                    // the waiters: a waiter whose next move is an immediate
+                    // re-refresh must see the cooldown and never re-run.
+                    let run_ctx = Arc::clone(&ctx);
+                    tokio::spawn(async move {
+                        let result = run_refresh(&run_ctx, deadline).await;
+                        *run_ctx.share.last_refresh_completed.lock().unwrap() =
+                            Some(Instant::now());
+                        *run_ctx.share.refresh_flight.lock().unwrap() = None;
+                        let _ = tx.send(Some(result));
+                    });
+                    rx
                 }
             };
-            match flight {
-                Flight::Lead(tx) => {
-                    let result = run_refresh(&ctx, deadline).await;
-                    let _ = tx.send(Some(result.clone()));
-                    *ctx.share.refresh_flight.lock().unwrap() = None;
-                    *ctx.share.last_refresh_completed.lock().unwrap() = Some(Instant::now());
-                    result
+            loop {
+                if let Some(wire) = rx.borrow().clone() {
+                    return wire;
                 }
-                Flight::Join(mut rx) => loop {
-                    if let Some(wire) = rx.borrow().clone() {
-                        return wire;
-                    }
-                    if rx.changed().await.is_err() {
-                        return Err("refresh leader vanished".to_string());
-                    }
-                },
+                if rx.changed().await.is_err() {
+                    // Only reachable if the collector's own run task vanished
+                    // without completing (runtime teardown/panic — run_refresh
+                    // never fails for data reasons).
+                    return Err("refresh run vanished".to_string());
+                }
             }
         })
     }
@@ -848,10 +860,50 @@ enum ScanOutcome {
     Watchdog,
 }
 
+/// Node's overall-watchdog section-error payload (the `DeadlineExceeded`
+/// message in `service.ts` runRefresh's watchdog promise).
+const REFRESH_WATCHDOG_MSG: &str = "host-stats refresh overall budget exceeded";
+
+/// The overall-watchdog verdict for a non-scan refresh section arm (Node
+/// `Promise.race([section.run(), watchdog])` settling with the watchdog):
+/// the section keeps its zero-shape and gains the watchdog sectionErrors
+/// entry. The entry check and a mid-flight timeout are the same race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionWatchdogFired;
+
+/// Race one refresh section arm against the overall watchdog. Sync-reader
+/// arms never yield, so a plain `timeout_at` wrapper's immediately-ready
+/// inner future would win the race even against an ALREADY-exhausted
+/// deadline (tokio observes an expired timer on a driver turn, which an
+/// instant section beats). Check the clock at arm ENTRY: a section whose
+/// turn comes after the watchdog fired (its first poll was delayed past the
+/// budget, e.g. by an earlier arm's sync work on the same executor task)
+/// degrades WITHOUT running its reads — exactly how a section's race
+/// settles in Node when the watchdog promise has already rejected. The
+/// `timeout_at` wrapper still covers a section that runs past the budget.
+async fn race_section_watchdog<T>(
+    overall_deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, SectionWatchdogFired> {
+    match tokio::time::timeout_at(overall_deadline, async {
+        if tokio::time::Instant::now() >= overall_deadline {
+            None
+        } else {
+            Some(work.await)
+        }
+    })
+    .await
+    {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) | Err(_) => Err(SectionWatchdogFired),
+    }
+}
+
 /// One refresh run: sections race under a shared absolute cooperative
 /// deadline (`started + deadline`, the trait argument — Node
-/// `sectionBudgetMs`) and a per-section overall watchdog (`started +
-/// overall_budget`, Node `overallBudgetMs`). Never fails for data reasons.
+/// `sectionBudgetMs`) and EVERY section arm races the overall watchdog
+/// (`started + overall_budget`, Node `overallBudgetMs`). Never fails for
+/// data reasons.
 async fn run_refresh(ctx: &Arc<CollectorCtx>, deadline: Duration) -> RefreshWire {
     let started = Instant::now();
     let section_deadline = started + deadline;
@@ -873,44 +925,53 @@ async fn run_refresh(ctx: &Arc<CollectorCtx>, deadline: Duration) -> RefreshWire
     };
     let inotify_ctx = Arc::clone(ctx);
     let inotify_fut = async move {
-        let usage = readers::read_self_inotify_stats(&inotify_ctx.cfg.proc_root);
-        let limits = readers::read_inotify_limits(&inotify_ctx.cfg.proc_root);
-        (usage, limits)
-    };
-    let disks_fut = async {
-        // Node: darwin mounts ['/'], else ['/', '/dev/shm'].
-        let mounts: &[&str] = if cfg!(target_os = "macos") {
-            &["/"]
-        } else if cfg!(target_os = "windows") {
-            &[]
-        } else {
-            &["/", "/dev/shm"]
+        let work = async move {
+            let usage = readers::read_self_inotify_stats(&inotify_ctx.cfg.proc_root);
+            let limits = readers::read_inotify_limits(&inotify_ctx.cfg.proc_root);
+            (usage, limits)
         };
-        let mut list = Vec::new();
-        for mount in mounts {
-            if let Some((total_bytes, free_bytes, used_pct, inodes_total, inodes_free)) =
-                statfs_info(mount)
-            {
-                list.push(HostStatsDisk {
-                    mount: mount.to_string(),
-                    total_bytes,
-                    free_bytes,
-                    used_pct,
-                    inodes_total,
-                    inodes_free,
-                });
+        race_section_watchdog(overall_deadline, work).await
+    };
+    let disks_fut = async move {
+        let work = async move {
+            // Node: darwin mounts ['/'], else ['/', '/dev/shm'].
+            let mounts: &[&str] = if cfg!(target_os = "macos") {
+                &["/"]
+            } else if cfg!(target_os = "windows") {
+                &[]
+            } else {
+                &["/", "/dev/shm"]
+            };
+            let mut list = Vec::new();
+            for mount in mounts {
+                if let Some((total_bytes, free_bytes, used_pct, inodes_total, inodes_free)) =
+                    statfs_info(mount)
+                {
+                    list.push(HostStatsDisk {
+                        mount: mount.to_string(),
+                        total_bytes,
+                        free_bytes,
+                        used_pct,
+                        inodes_total,
+                        inodes_free,
+                    });
+                }
             }
-        }
-        list
+            list
+        };
+        race_section_watchdog(overall_deadline, work).await
     };
     let thermals_ctx = Arc::clone(ctx);
     let thermals_fut = async move {
-        let zones = readers::read_thermals(&thermals_ctx.cfg.sys_root);
-        let battery = readers::read_battery(&thermals_ctx.cfg.sys_root);
-        (zones, battery)
+        let work = async move {
+            let zones = readers::read_thermals(&thermals_ctx.cfg.sys_root);
+            let battery = readers::read_battery(&thermals_ctx.cfg.sys_root);
+            (zones, battery)
+        };
+        race_section_watchdog(overall_deadline, work).await
     };
 
-    let (scan_out, (inotify_usage, inotify_limits), disk_list, (zones, battery)) =
+    let (scan_out, inotify_out, disks_out, thermals_out) =
         tokio::join!(scan_fut, inotify_fut, disks_fut, thermals_fut);
 
     let mut manual = zero_manual();
@@ -955,45 +1016,68 @@ async fn run_refresh(ctx: &Arc<CollectorCtx>, deadline: Duration) -> RefreshWire
             );
         }
         ScanOutcome::Watchdog => {
-            // Node's watchdog message.
-            let msg = "host-stats refresh overall budget exceeded".to_string();
+            let msg = REFRESH_WATCHDOG_MSG.to_string();
             section_errors.insert("topProcesses".to_string(), msg.clone());
             section_errors.insert("processHealth".to_string(), msg);
         }
     }
 
-    if inotify_usage.is_some() || inotify_limits.is_some() {
-        manual.inotify = HostStatsInotify {
-            available: true,
-            instances: inotify_usage.map(|u| u.instances),
-            watches: inotify_usage.map(|u| u.watches),
-            max_user_watches: inotify_limits.and_then(|l| l.max_user_watches),
-            max_user_instances: inotify_limits.and_then(|l| l.max_user_instances),
-        };
+    // A watchdog-losing non-scan section keeps the zero-shape already in
+    // place (zero_manual) and adds ONLY the sectionErrors entry — the same
+    // degradation Node's race produces for that key.
+    match inotify_out {
+        Ok((usage, limits)) => {
+            if usage.is_some() || limits.is_some() {
+                manual.inotify = HostStatsInotify {
+                    available: true,
+                    instances: usage.map(|u| u.instances),
+                    watches: usage.map(|u| u.watches),
+                    max_user_watches: limits.and_then(|l| l.max_user_watches),
+                    max_user_instances: limits.and_then(|l| l.max_user_instances),
+                };
+            }
+        }
+        Err(SectionWatchdogFired) => {
+            section_errors.insert("inotify".to_string(), REFRESH_WATCHDOG_MSG.to_string());
+        }
     }
 
-    if !disk_list.is_empty() {
-        manual.disks = HostStatsDisks {
-            available: true,
-            list: disk_list,
-        };
+    match disks_out {
+        Ok(disk_list) => {
+            if !disk_list.is_empty() {
+                manual.disks = HostStatsDisks {
+                    available: true,
+                    list: disk_list,
+                };
+            }
+        }
+        Err(SectionWatchdogFired) => {
+            section_errors.insert("disks".to_string(), REFRESH_WATCHDOG_MSG.to_string());
+        }
     }
 
-    if let Some(zones) = zones {
-        manual.thermals = HostStatsThermals {
-            available: true,
-            zones: zones
-                .into_iter()
-                .map(|z| HostStatsThermalZone {
-                    label: z.label,
-                    celsius: z.celsius,
-                })
-                .collect(),
-            battery: battery.map(|b| HostStatsBattery {
-                pct: b.pct,
-                status: b.status,
-            }),
-        };
+    match thermals_out {
+        Ok((zones, battery)) => {
+            if let Some(zones) = zones {
+                manual.thermals = HostStatsThermals {
+                    available: true,
+                    zones: zones
+                        .into_iter()
+                        .map(|z| HostStatsThermalZone {
+                            label: z.label,
+                            celsius: z.celsius,
+                        })
+                        .collect(),
+                    battery: battery.map(|b| HostStatsBattery {
+                        pct: b.pct,
+                        status: b.status,
+                    }),
+                };
+            }
+        }
+        Err(SectionWatchdogFired) => {
+            section_errors.insert("thermals".to_string(), REFRESH_WATCHDOG_MSG.to_string());
+        }
     }
 
     manual.section_errors = section_errors;
@@ -1869,5 +1953,129 @@ mod tests {
         assert!(!result.manual.disks.list.is_empty());
         assert!(result.manual.thermals.available);
         assert!(!result.manual.section_errors.contains_key("disks"));
+    }
+
+    #[tokio::test]
+    async fn host_stats_refresh_leader_teardown_joiner_and_cache_survive() {
+        // Parity regression (service.ts:321-331): the in-flight refresh run is
+        // owned by the COLLECTOR (Node's service-owned pendingRefresh), never
+        // by the requesting caller's future. If the "leader" caller is torn
+        // down mid-flight (its connection dies), the run still completes:
+        // the next caller joins the SAME collector-owned run and receives its
+        // result, and the manual cache is updated unconditionally.
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_root = scan_proc_overlay(tmp.path());
+        let interest = HostStatsInterestRegistry::default();
+        let collector = Arc::new(test_collector(scan_root, sys_fixture(), &interest));
+        // The leader drives refresh() from its own task, then tears down
+        // mid-flight (the abort drops the future mid-dwell).
+        let leader = {
+            let leader_collector = Arc::clone(&collector);
+            tokio::spawn(async move { leader_collector.refresh(Duration::from_millis(2000)).await })
+        };
+        let in_flight =
+            wait_until(Duration::from_secs(2), || collector.scan_run_count() == 1).await;
+        assert!(in_flight, "the leader's run started (scan in flight)");
+        leader.abort();
+        let outcome = leader.await;
+        let cancelled = matches!(&outcome, Err(e) if e.is_cancelled());
+        assert!(
+            cancelled,
+            "the leader task was aborted mid-flight: {outcome:?}"
+        );
+        // The NEXT caller joins the collector-owned run (never a "refresh
+        // leader vanished" error, never a poisoned flight slot).
+        let joined = collector
+            .refresh(Duration::from_millis(2000))
+            .await
+            .expect("the collector-owned run completes for every caller");
+        assert_eq!(
+            collector.scan_run_count(),
+            1,
+            "no re-run: the surviving run serves the joiner"
+        );
+        assert!(joined.manual.top_processes.available);
+        assert_eq!(joined.manual.top_processes.list.len(), 7);
+        assert!(joined.manual.process_health.available);
+        assert_eq!(joined.manual.process_health.zombies, 1);
+        assert_eq!(joined.manual.process_health.d_state, 1);
+        assert_eq!(joined.manual.process_health.total, 8);
+        assert!(joined.manual.disks.available);
+        assert!(joined.manual.thermals.available);
+        assert!(joined.manual.section_errors.is_empty());
+        // The manual cache was written by the collector at completion.
+        let snap = collector.snapshot();
+        assert_eq!(snap.manual_at, Some(joined.at));
+        assert_eq!(snap.manual, Some(joined.manual));
+    }
+
+    #[tokio::test]
+    async fn host_stats_refresh_overall_watchdog_covers_every_section() {
+        // Parity regression (service.ts:744): EVERY section arm races the
+        // overall watchdog — not only the process-scan arm. An overall budget
+        // that is already exhausted must degrade EVERY section to its full
+        // zero-shape (available:false + the watchdog sectionErrors entry)
+        // while the refresh still resolves Ok and the manual cache updates.
+        // (Healthy-path completion under the same wrapper is pinned by the
+        // single-flight + cooperative-budget tests above.)
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_root = scan_proc_overlay(tmp.path());
+        // Give the overlay readable inotify sysctls so an UNGUARDED inotify
+        // arm would complete as available:true (pre-fix discrimination).
+        let inotify_dir = scan_root.join("sys").join("fs").join("inotify");
+        std::fs::create_dir_all(&inotify_dir).unwrap();
+        std::fs::write(inotify_dir.join("max_user_watches"), "1048576\n").unwrap();
+        std::fs::write(inotify_dir.join("max_user_instances"), "128\n").unwrap();
+        let interest = HostStatsInterestRegistry::default();
+        let mut cfg = test_config(scan_root, sys_fixture());
+        // The watchdog fires at the first per-section preemption point.
+        cfg.overall_budget = Duration::ZERO;
+        let collector = HostStatsCollectorService::new(
+            cfg,
+            freshell_terminal::TerminalRegistry::new(),
+            interest,
+            Instant::now(),
+        );
+        // A HEALTHY cooperative budget: only the overall-watchdog path is
+        // under test here (the per-pid cooperative deadline never trips).
+        let result = collector
+            .refresh(Duration::from_millis(2000))
+            .await
+            .expect("watchdog preemption degrades sections, never rejects");
+        let manual = &result.manual;
+        assert!(!manual.top_processes.available);
+        assert!(!manual.process_health.available);
+        assert!(
+            !manual.inotify.available,
+            "the watchdog must preempt the inotify arm"
+        );
+        assert!(
+            !manual.disks.available,
+            "the watchdog must preempt the disks arm"
+        );
+        assert!(
+            !manual.thermals.available,
+            "the watchdog must preempt the thermals arm"
+        );
+        for key in [
+            "topProcesses",
+            "processHealth",
+            "inotify",
+            "disks",
+            "thermals",
+        ] {
+            assert_eq!(
+                manual.section_errors.get(key).map(String::as_str),
+                Some("host-stats refresh overall budget exceeded"),
+                "section {key} carries the watchdog error"
+            );
+        }
+        assert_eq!(manual.section_errors.len(), 5);
+        assert_eq!(collector.scan_run_count(), 1);
+        // The refresh still resolved and the manual cache holds the degraded
+        // shape (Node: manualCache is written after Promise.all, errors or not).
+        let snap = collector.snapshot();
+        assert_eq!(snap.manual_at, Some(result.at));
+        assert_eq!(snap.manual, Some(result.manual.clone()));
     }
 }
