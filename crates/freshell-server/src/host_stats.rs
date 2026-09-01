@@ -45,6 +45,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -192,6 +194,13 @@ struct CollectorCtx {
     boot_anchor: Instant,
     machine: HostStatsMachine,
     scan_runs: AtomicUsize,
+    /// Test-only fault-injection seam (never in production builds): a run
+    /// that consumes a `true` here dies mid-scan, unwinding the
+    /// collector's spawned run task — the "run vanished without
+    /// completing" fault the flight-slot guard cleans up after. One-shot,
+    /// so a recovery refresh runs healthily.
+    #[cfg(test)]
+    test_run_panic: AtomicBool,
     share: Share,
 }
 
@@ -243,6 +252,8 @@ impl HostStatsCollectorService {
                 boot_anchor,
                 machine,
                 scan_runs: AtomicUsize::new(0),
+                #[cfg(test)]
+                test_run_panic: AtomicBool::new(false),
             }),
         }
     }
@@ -736,10 +747,16 @@ impl HostStatsCollector for HostStatsCollectorService {
                     // re-refresh must see the cooldown and never re-run.
                     let run_ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
+                        // Declared first so a panic anywhere below unwinds
+                        // through this guard (its Drop frees the flight
+                        // slot); locals drop before the moved-in `tx`, so
+                        // waiters only wake AFTER the slot is free again.
+                        let mut guard = RefreshFlightGuard::new(&run_ctx.share);
                         let result = run_refresh(&run_ctx, deadline).await;
                         *run_ctx.share.last_refresh_completed.lock().unwrap() =
                             Some(Instant::now());
                         *run_ctx.share.refresh_flight.lock().unwrap() = None;
+                        guard.disarm();
                         let _ = tx.send(Some(result));
                     });
                     rx
@@ -817,6 +834,44 @@ impl HostStatsCollector for HostStatsCollectorService {
 // ---------------------------------------------------------------------------
 // On-request refresh (manual sections)
 // ---------------------------------------------------------------------------
+
+/// Panic-safety for the collector-owned refresh run (Node parity: `service.ts`
+/// wraps `runRefresh()` in `.finally(() => { pendingRefresh = null;
+/// lastRefreshCompletedAt = nowFn() })`, which runs even when the run
+/// THROWS). Constructed as the first statement of the spawned run — the
+/// earliest point after the flight slot is occupied. If the run dies without
+/// completing (a panic unwinds the spawned task), Drop frees the flight slot
+/// and stamps the cooldown, so every later refresh() starts a FRESH run
+/// instead of joining a dead channel forever. The manual cache is NEVER
+/// touched here — a run that did not complete has no data to cache. A normal
+/// completion stamps + clears explicitly (in the stamp-then-clear-then-send
+/// order waiters rely on) and then disarms the guard.
+struct RefreshFlightGuard<'a> {
+    share: &'a Share,
+    armed: bool,
+}
+
+impl<'a> RefreshFlightGuard<'a> {
+    fn new(share: &'a Share) -> Self {
+        Self { share, armed: true }
+    }
+
+    /// The run completed and already performed the finalize itself.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RefreshFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // The run died mid-flight (panic-unwind): Node .finally parity —
+            // free the slot AND stamp the cooldown. Never the manual cache.
+            *self.share.last_refresh_completed.lock().unwrap() = Some(Instant::now());
+            *self.share.refresh_flight.lock().unwrap() = None;
+        }
+    }
+}
 
 /// `fs.statfs` on a mount; `free_bytes` is the unprivileged view (`bavail`).
 /// Node `statfsInfo` parity; unix-only on this Rust path.
@@ -912,6 +967,12 @@ async fn run_refresh(ctx: &Arc<CollectorCtx>, deadline: Duration) -> RefreshWire
     let scan_ctx = Arc::clone(ctx);
     let scan_fut = async move {
         scan_ctx.scan_runs.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if scan_ctx.test_run_panic.swap(false, Ordering::SeqCst) {
+            // Test-injected run death: the run task unwinds from here —
+            // no completion stamp, no slot clear, no cache write, no send.
+            panic!("test-injected refresh run death");
+        }
         match tokio::time::timeout_at(
             overall_deadline,
             scan_process_table(&scan_ctx.cfg.proc_root, PROC_SCAN_DWELL, section_deadline),
@@ -2077,5 +2138,83 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.manual_at, Some(result.at));
         assert_eq!(snap.manual, Some(result.manual.clone()));
+    }
+
+    #[tokio::test]
+    async fn host_stats_refresh_dead_run_frees_flight_slot_and_never_caches() {
+        // Parity regression (service.ts:326-329 — Node wraps runRefresh() in
+        // `.finally(() => { pendingRefresh = null; lastRefreshCompletedAt =
+        // nowFn() })`, which runs even when the run THROWS): a refresh run
+        // that dies without completing (a panic unwinds the collector's
+        // spawned run task) must not brick the path. Without the drop-guard
+        // the flight slot stays occupied forever and every later refresh()
+        // joins the dead channel ("refresh run vanished"); with it, the next
+        // refresh() starts a FRESH run. The dead run NEVER writes the manual
+        // cache (Node's manualCache is only written by a completed run) but
+        // DOES stamp the cooldown (Node's .finally stamps even on a throw).
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_root = scan_proc_overlay(tmp.path());
+        let interest = HostStatsInterestRegistry::default();
+        let mut cfg = test_config(scan_root, sys_fixture());
+        // The cooldown stamp has its own dedicated test; here it must not
+        // gate the recovery refresh.
+        cfg.refresh_cooldown = Duration::ZERO;
+        let collector = HostStatsCollectorService::new(
+            cfg,
+            freshell_terminal::TerminalRegistry::new(),
+            interest,
+            Instant::now(),
+        );
+        // Arm the one-shot seam: the FIRST refresh run dies mid-scan.
+        collector.ctx.test_run_panic.store(true, Ordering::SeqCst);
+        let dead = collector.refresh(Duration::from_millis(2000)).await;
+        assert_eq!(
+            dead,
+            Err("refresh run vanished".to_string()),
+            "a caller attached to the dead run gets the vanished-run error"
+        );
+        assert_eq!(
+            collector.scan_run_count(),
+            1,
+            "the dead run started (and died in flight)"
+        );
+        // Node's .finally runs even on a throw: the flight slot is freed and
+        // the cooldown stamped...
+        assert!(
+            collector.ctx.share.refresh_flight.lock().unwrap().is_none(),
+            "a dead run frees the flight slot (Node .finally clears pendingRefresh)"
+        );
+        assert!(
+            collector
+                .ctx
+                .share
+                .last_refresh_completed
+                .lock()
+                .unwrap()
+                .is_some(),
+            "a dead run still stamps the cooldown (Node .finally stamps lastRefreshCompletedAt)"
+        );
+        // ...but the manual cache is NEVER updated by a failed run.
+        let snap = collector.snapshot();
+        assert!(
+            snap.manual_at.is_none() && snap.manual.is_none(),
+            "the dead run never wrote the manual cache"
+        );
+        // The next refresh() recovers: a FRESH run serves it.
+        let recovered = collector
+            .refresh(Duration::from_millis(2000))
+            .await
+            .expect("a dead run must not brick the refresh path");
+        assert_eq!(
+            collector.scan_run_count(),
+            2,
+            "a FRESH run served the recovery refresh"
+        );
+        assert!(recovered.manual.top_processes.available);
+        assert_eq!(recovered.manual.top_processes.list.len(), 7);
+        assert!(recovered.manual.section_errors.is_empty());
+        let snap = collector.snapshot();
+        assert_eq!(snap.manual_at, Some(recovered.at));
+        assert_eq!(snap.manual, Some(recovered.manual));
     }
 }
