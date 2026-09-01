@@ -214,7 +214,6 @@ pub struct LoadAvg {
 pub fn read_loadavg(proc_root: &Path) -> Option<LoadAvg> {
     let text = safe_read(&proc_root.join("loadavg"))?;
     let fields: Vec<f64> = text
-        .trim()
         .split_whitespace()
         .map(|tok| tok.parse::<f64>().unwrap_or(f64::NAN))
         .collect();
@@ -559,7 +558,7 @@ pub fn read_net_dev(proc_root: &Path) -> Option<NetDevTotals> {
             .split_whitespace()
             .map(|tok| tok.parse::<u64>().unwrap_or(u64::MAX))
             .collect();
-        if numbers.len() < 16 || numbers.iter().any(|n| *n == u64::MAX) {
+        if numbers.len() < 16 || numbers.contains(&u64::MAX) {
             continue;
         }
         totals.rx_bytes += numbers[0];
@@ -625,11 +624,10 @@ pub fn read_ephemeral_port_range(proc_root: &Path) -> Option<PortRange> {
             .join("ip_local_port_range"),
     )?;
     let fields: Vec<u64> = text
-        .trim()
         .split_whitespace()
         .map(|tok| tok.parse::<u64>().unwrap_or(u64::MAX))
         .collect();
-    if fields.len() < 2 || fields[..2].iter().any(|f| *f == u64::MAX) {
+    if fields.len() < 2 || fields[..2].contains(&u64::MAX) {
         return None;
     }
     Some(PortRange {
@@ -702,9 +700,7 @@ pub fn read_self_limits_fds_max(proc_root: &Path) -> Option<u64> {
         if !rest.starts_with(char::is_whitespace) {
             continue;
         }
-        let Some(soft) = rest.split_whitespace().next() else {
-            return None;
-        };
+        let soft = rest.split_whitespace().next()?;
         return soft.parse::<u64>().ok();
     }
     None

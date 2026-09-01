@@ -300,7 +300,7 @@ impl CollectorCtx {
         if !self.interest.any() {
             return;
         }
-        let msg = freshell_protocol::ServerMessage::HostStatsSnapshot(self.snapshot_payload());
+        let msg = freshell_protocol::ServerMessage::HostStatsSnapshot(Box::new(self.snapshot_payload()));
         for sink in self.interest.senders() {
             sink(msg.clone());
         }

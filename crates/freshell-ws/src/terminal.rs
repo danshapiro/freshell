@@ -1271,7 +1271,7 @@ async fn handle_client_text(
             if let Some(collector) = &state.host_stats.collector {
                 return send(
                     ws_tx,
-                    &ServerMessage::HostStatsSnapshot(collector.snapshot()),
+                    &ServerMessage::HostStatsSnapshot(Box::new(collector.snapshot())),
                 )
                 .await;
             }

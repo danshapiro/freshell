@@ -79,7 +79,7 @@ pub enum ServerMessage {
     #[serde(rename = "hoststats.refresh.response")]
     HostStatsRefreshResponse(HostStatsRefreshResponse),
     #[serde(rename = "hoststats.snapshot")]
-    HostStatsSnapshot(HostStatsSnapshot),
+    HostStatsSnapshot(Box<HostStatsSnapshot>),
     #[serde(rename = "opencode.activity.list.response")]
     OpencodeActivityListResponse(OpencodeActivityListResponse),
     #[serde(rename = "opencode.activity.updated")]
