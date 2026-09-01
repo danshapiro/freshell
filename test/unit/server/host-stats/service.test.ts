@@ -54,6 +54,19 @@ vi.mock('../../../../server/logger.js', () => {
   return { logger: { child: () => child }, __childLogger: child }
 })
 
+// Contract point 3 (enable / p99-drain+reset per fast tick / disable+null at stop) is
+// pinned against this fake; 3_200_000ns → 3.2ms also exercises the ns→ms conversion.
+const fakeHistogram = vi.hoisted(() => ({
+  enable: vi.fn(),
+  disable: vi.fn(),
+  reset: vi.fn(),
+  percentile: vi.fn(() => 3_200_000),
+}))
+
+vi.mock('node:perf_hooks', () => ({
+  monitorEventLoopDelay: vi.fn(() => fakeHistogram),
+}))
+
 const mockLog = (loggerModule as unknown as { __childLogger: { warn: ReturnType<typeof vi.fn> } }).__childLogger
 
 // ---------------------------------------------------------------------------
@@ -316,6 +329,47 @@ describe('start/stop (contract points 1, 5)', () => {
     expect(service.isRunning()).toBe(true)
     vi.advanceTimersByTime(2000)
     expect(readerFn('readCpuTimes')).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('event-loop lag histogram lifecycle (contract point 3)', () => {
+  it('enables at start; drains p99 and resets per fast tick (never slow ticks); disables once at stop', () => {
+    const service = makeService()
+    service.start()
+    expect(fakeHistogram.enable).toHaveBeenCalledTimes(1)
+    // start() runs one immediate fast tick → one p99 read at the 99th percentile + one reset.
+    expect(fakeHistogram.percentile).toHaveBeenCalledTimes(1)
+    expect(fakeHistogram.percentile).toHaveBeenCalledWith(99)
+    expect(fakeHistogram.reset).toHaveBeenCalledTimes(1)
+
+    // The drained value reaches the snapshot in ms (3_200_000ns → 3.2ms).
+    expect(service.getSnapshot().live.freshell.eventLoopLagP99Ms).toBe(3.2)
+
+    vi.advanceTimersByTime(4000) // fast ticks at t=2s,4s
+    expect(fakeHistogram.percentile).toHaveBeenCalledTimes(3)
+    expect(fakeHistogram.reset).toHaveBeenCalledTimes(3)
+    vi.advanceTimersByTime(1000) // t=5s: slow tick only — histogram is a fast-tier instrument
+    expect(fakeHistogram.percentile).toHaveBeenCalledTimes(3)
+    expect(fakeHistogram.reset).toHaveBeenCalledTimes(3)
+
+    service.stop()
+    expect(fakeHistogram.disable).toHaveBeenCalledTimes(1)
+    service.stop() // idempotent: no second disable
+    expect(fakeHistogram.disable).toHaveBeenCalledTimes(1)
+  })
+
+  it('collects no lag samples while stopped (cache retains last tick), then resumes per-tick on restart', () => {
+    const service = makeService()
+    service.start()
+    service.stop()
+    fakeHistogram.percentile.mockClear()
+    fakeHistogram.reset.mockClear()
+    vi.advanceTimersByTime(6000)
+    expect(fakeHistogram.percentile).not.toHaveBeenCalled()
+    expect(fakeHistogram.reset).not.toHaveBeenCalled()
+    service.start()
+    expect(fakeHistogram.reset).toHaveBeenCalledTimes(1) // immediate fast tick drains again
+    expect(service.getSnapshot().live.freshell.eventLoopLagP99Ms).toBe(3.2)
   })
 })
 
