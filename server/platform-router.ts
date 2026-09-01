@@ -17,7 +17,7 @@ function isTruthy(value: string | undefined): boolean {
   return value === '1' || value.toLowerCase() === 'true'
 }
 
-export function detectFeatureFlags(): Record<string, boolean> {
+export function detectFeatureFlags(platform: NodeJS.Platform = process.platform): Record<string, boolean> {
   return {
     kilroy: isTruthy(process.env.KILROY_ENABLED),
     aiEnabled: AI_CONFIG.enabled(),
@@ -25,6 +25,11 @@ export function detectFeatureFlags(): Record<string, boolean> {
     // /api/sessions/resolve and declare this flag — the Rust side in
     // build_platform_payload (crates/freshell-server/src/main.rs).
     sessionResolve: true,
+    // Host-stats collection reads /proc + /sys (unavailable on Windows).
+    // Boot-static platform check (no /proc probe): readers degrade to
+    // `available: false` on failure. Rust mirrors with
+    // cfg!(not(target_os = "windows")).
+    hostStatsAvailable: platform !== 'win32',
   }
 }
 

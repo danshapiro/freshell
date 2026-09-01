@@ -2434,17 +2434,24 @@ fn kilroy_enabled_flag() -> bool {
 /// declare now that the hardened resolve response surface
 /// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
 /// landed — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
-/// Tasks 2-6 (SYNC-06).
+/// Tasks 2-6 (SYNC-06). `featureFlags.hostStatsAvailable` mirrors Node's
+/// `process.platform !== 'win32'` as boot-static `cfg!(not(target_os =
+/// "windows"))`.
 fn build_platform_payload(
     available_clis: serde_json::Value,
     ai_enabled: bool,
 ) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
+    // Boot-static host-stats availability (mirrors Node's
+    // `process.platform !== 'win32'` in `detectFeatureFlags`): the collector
+    // reads /proc + /sys, so Windows reports `false`; no /proc probe at boot —
+    // readers degrade to `available: false` on failure.
+    let host_stats_available = cfg!(not(target_os = "windows"));
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true },
+        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true, "hostStatsAvailable": host_stats_available },
     })
 }
 
@@ -3581,12 +3588,16 @@ mod tests {
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
-        // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
-        // Rust payload. `sessionResolve` is TRUE: the hardened resolve
-        // response surface (degraded/providerErrors/unsearchedProviders/
+        // sessionResolve, hostStatsAvailable }`, camelCase, no extra fields —
+        // mirrored 1:1 in the Rust payload. `sessionResolve` is TRUE: the
+        // hardened resolve response surface
+        // (degraded/providerErrors/unsearchedProviders/
         // homeDir, warming default) landed via the hardened plan Tasks 2-6
-        // (SYNC-06), so the flag is genuinely earned. `KILROY_ENABLED` is pinned
-        // off under the shared lock so the assertion is environment-independent.
+        // (SYNC-06), so the flag is genuinely earned. `hostStatsAvailable` is
+        // boot-static on the build target (`cfg!(not(target_os = "windows"))`,
+        // mirroring Node's `process.platform !== 'win32'`). `KILROY_ENABLED` is
+        // pinned off under the shared lock so the assertion is
+        // environment-independent.
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3595,7 +3606,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
         );
     }
 
@@ -3609,7 +3620,21 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
+        );
+    }
+
+    #[test]
+    fn host_stats_flag_present_in_platform_payload() {
+        // Host-stats collection reads Linux `/proc` + `/sys`; both servers expose
+        // a boot-static availability flag so clients can degrade to
+        // `available: false` instead of probing — Node mirrors
+        // `process.platform !== 'win32'` (server/platform-router.ts), Rust uses
+        // the build target. Present-and-boolean regardless of host runtime.
+        let payload = build_platform_payload(serde_json::json!({}), false);
+        assert_eq!(
+            payload["featureFlags"]["hostStatsAvailable"],
+            serde_json::json!(cfg!(not(target_os = "windows")))
         );
     }
 
