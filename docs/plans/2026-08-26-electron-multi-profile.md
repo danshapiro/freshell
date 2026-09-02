@@ -13,28 +13,39 @@ registry defines more than one choice.
 from `--profile=<id>` / `FRESHELL_PROFILE` (precedence: argv > env > picker >
 default) and derives per-profile paths: config dir `~/.freshell-<id>` and
 Electron userData `<appData>/<AppName>-<id>` (the default profile keeps
-today's exact paths). `entry.ts` resolves the profile at module top and calls
-`app.setPath('userData', ...)` for named profiles before `app.whenReady()` —
-which also re-keys Electron's single-instance lock per profile for free
-(empirically verified on Electron 33.4.11: the lock is keyed to the userData
-dir; see load-bearing ledger). The instance lock is acquired **once the
-profile choice is final** — immediately after `app.whenReady()` for explicit
-flag/env launches, and after the picker resolves for flag-less launches — and
-always before provisioning or any server spawn. The picker itself runs while
-holding **no** lock, so a flag-less launch while a Default instance is
-resident still shows the picker (choosing the resident profile degrades to
-focusing the resident via `second-instance`; duplicate picker windows from
-racing launches are tolerated policy). A machine-global registry
-`~/.freshell/profiles.json` (zod-validated) lists named profiles; when at
-least one exists and no explicit profile was given, a new profile-picker
-window (built and packaged exactly like the launch chooser) lets the user
-pick the default profile (continues in-process, lock acquired at that point)
-or a named profile (relaunches with `--profile=<id>`). App-bound spawned
-servers receive `FRESHELL_CONFIG_DIR` whose support is added to
-`server/freshell-home.ts`, and the server-side audit (Task 4) routes every
-profile-scoped state path through `getFreshellConfigDir` while leaving
-genuinely machine-level state (firewall/WSL port bookkeeping,
-checkout/project-scoped files) deliberately shared.
+today's exact paths). `entry.ts` resolves the profile AND the registry at
+module top. Three launcher shapes are possible:
+
+1. **Explicit** (`--profile`/`FRESHELL_PROFILE`, valid): the process namespaced
+   userData for the named profile (default keeps today's userData untouched),
+   acquires the per-profile instance lock once `whenReady` resolves, and boots
+   normally. The lock is userData-keyed (empirically verified on Electron
+   33.4.11), so profiles run side by side.
+2. **Picker** (no explicit profile AND the registry names ≥1 profile): the
+   process namepaces userData to a dedicated **launcher** dir
+   (`<appData>/<AppName>-profile-picker`) — NEVER the default userData. This
+   is load-bearing: without it, a picker launch while a Default instance is
+   resident would have two browser processes sharing one Chromium userData
+   dir, which Chromium's process-singleton exists to prevent (storage
+   corruption hazard). The launcher takes its own picker-scoped instance lock
+   (so a racing flag-less launch focuses the resident picker instead of
+   stacking duplicate pickers), shows only the picker window, and on ANY
+   choice — Default included — calls `app.relaunch({ args: [...stripProfileArgs(argv), '--profile=<id>'] })`
+   and exits. The relaunched process is then an EXPLICIT launch (shape 1),
+   so the chosen profile's lock is acquired in a process whose userData
+   belongs to exactly that profile.
+3. **Plain default** (no explicit profile, no registry profiles): identical
+   to today's boot — default userData, default lock, no picker.
+
+A machine-global registry `~/.freshell/profiles.json` (zod-validated) lists
+named profiles (the choice set is `[Default, ...profiles]`; "more than one
+profile" per the request means the registry makes the choice set exceed one
+entry, i.e. ≥1 named profile). App-bound spawned servers receive
+`FRESHELL_CONFIG_DIR` whose support is added to `server/freshell-home.ts`,
+and the server-side audit (Task 4) routes every profile-scoped state path
+through `getFreshellConfigDir` while leaving genuinely machine-level state
+(firewall/WSL port bookkeeping, checkout/project-scoped files) deliberately
+shared.
 
 **Tech Stack:** Electron (main process ESM/NodeNext), React 18 + Vite (picker
 renderer), Zod, Vitest, Playwright `_electron`.
@@ -49,18 +60,20 @@ renderer), Zod, Vitest, Playwright `_electron`.
   and no registry file, behavior is identical to today: same paths
   (`~/.freshell`, default Electron userData), same boot flow, same windows. The
   default profile never calls `app.setPath('userData', ...)` at all.
-- **Lock timing policy (load-bearing finding LB-02):** the picker phase holds
-  NO lock. The single-instance lock is acquired only after the profile choice
-  is final — explicit flag/env launches lock immediately after
-  `app.whenReady()`; picker launches lock only after the user continues as
-  Default (named choices relaunch instead). Rationale: a launcher that grabs
-  the default lock before showing the picker makes the picker unreachable in
-  the feature's steady state (tray-resident Default turns every flag-less
-  launch away before the picker branch runs). Accepted trade-offs: two
-  racing flag-less launches may each show their own picker (duplicate pickers
-  tolerated — same-user good-faith environment); a Default choice that loses a
-  meanwhile-acquired default lock quits and delivers `second-instance` to the
-  resident (which then shows its window).
+- **Lock timing policy (load-bearing finding LB-02 + plan-review round 3):**
+  EVERY browser process holds exactly one userData-keyed instance lock from
+  `whenReady()` onward — no lock-free picker phase. A non-explicit launch
+  whose registry names ≥2 profiles becomes a **picker launcher**: it sets its
+  userData to a dedicated launcher dir (`<appData>/<AppName>-profile-picker`,
+  NEVER the default userData — sharing a Chromium userData between the
+  launcher and a resident Default instance is a storage-corruption hazard),
+  acquires the picker-scoped lock, and shows only the picker. A second
+  flag-less launch is turned away at the picker lock and the resident picker
+  focuses via `second-instance`. ANY confirmed choice — Default included —
+  relaunches the app with an explicit `--profile=<id>` and exits, so the
+  profile's own lock is only ever taken in a process whose userData belongs
+  to that profile; a choice of a running profile degrades to
+  focus-the-resident via the normal explicit-duplicate path.
 - **Resident surfacing fix:** the resident's `second-instance` handler must
   `show()` a tray-hidden window before `focus()` (today it only restores a
   minimized window, so a turned-away launch over a tray-hidden Default is a
@@ -624,6 +637,48 @@ describe('picker predicates', () => {
       ])
   })
 })
+
+describe('resolveBootShape', () => {
+  const REG = { profiles: [{ id: 'work' as const }] }
+  const NO_REGISTRY = { profiles: [] as const }
+  it('explicit named profile: namespaced userData + namespaced config dir', () => {
+    expect(resolveBootShape(['app', '--profile=work'], {}, REG, 'Freshell', '/app/data', '/home/u'))
+      .toEqual({
+        kind: 'explicit',
+        profileId: 'work',
+        userDataDir: path.join('/app/data', 'Freshell-work'),
+        configDir: path.join('/home/u', '.freshell-work'),
+      })
+  })
+  it('explicit default: untouched userData + default config dir, no picker', () => {
+    expect(resolveBootShape(['app', '--profile=default'], {}, REG, 'Freshell', '/app/data', '/home/u'))
+      .toEqual({
+        kind: 'explicit',
+        profileId: 'default',
+        userDataDir: undefined,
+        configDir: path.join('/home/u', '.freshell'),
+      })
+  })
+  it('flag-less launch with a non-empty registry becomes a picker launcher on its OWN userData', () => {
+    const shape = resolveBootShape(['app'], {}, REG, 'Freshell', '/app/data', '/home/u')
+    expect(shape).toEqual({
+      kind: 'picker',
+      profileId: 'default',
+      userDataDir: path.join('/app/data', 'Freshell-profile-picker'),
+      configDir: path.join('/home/u', '.freshell'),
+    })
+    // The picker userData must never equal a real profile's dir.
+    expect(shape.userDataDir).not.toBe(userDataDirForProfile('work', 'Freshell', '/app/data'))
+  })
+  it('flag-less launch with an empty registry is the plain default boot', () => {
+    expect(resolveBootShape(['app'], {}, NO_REGISTRY, 'Freshell', '/app/data', '/home/u'))
+      .toEqual({
+        kind: 'default',
+        profileId: 'default',
+        configDir: path.join('/home/u', '.freshell'),
+      })
+  })
+})
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -641,6 +696,14 @@ import path from 'path'
 import { z } from 'zod'
 
 export const DEFAULT_PROFILE_ID = 'default'
+
+/**
+ * The profile-picker launcher reserves this id: a flag-less launch that is
+ * about to show the picker namespaces its userData to
+ * `<appData>/<AppName>-profile-picker` so the picker process never shares a
+ * Chromium userData dir with a resident Default (or named) instance.
+ */
+export const PICKER_USERDATA_ID = 'profile-picker'
 
 /**
  * Profile ids become directory names on every supported OS, so keep them
@@ -662,6 +725,9 @@ export const ProfilesRegistrySchema = z.object({
     if (entry.id === DEFAULT_PROFILE_ID) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: `'${DEFAULT_PROFILE_ID}' is a reserved profile id` })
     }
+    if (entry.id === PICKER_USERDATA_ID) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `'${PICKER_USERDATA_ID}' is a reserved profile id` })
+    }
     if (seen.has(entry.id)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate profile id '${entry.id}'` })
     }
@@ -670,6 +736,14 @@ export const ProfilesRegistrySchema = z.object({
 })
 
 export type ProfileEntry = z.infer<typeof ProfileEntrySchema>
+
+/**
+ * Contract note — the built-in Default profile is ALWAYS part of the choice
+ * set, so "more than one profile is configured" (per the User Request wording)
+ * is satisfied as soon as the registry names ≥1 named profile: the effective
+ * choices are `[Default, ...registry.profiles]`. This keeps the registry file
+ * minimal (named profiles only) and matches the picker UX.
+ */
 
 export type ProfileSource = 'argv' | 'env' | 'default'
 
@@ -764,6 +838,18 @@ export function userDataDirForProfile(
   return path.join(appDataDir, `${appName}-${id}`)
 }
 
+/**
+ * userData dir for the ephemeral profile-picker launcher process. It MUST NOT
+ * be the default profile's userData: when a Default instance is resident, a
+ * picker launch that reused Default's userData would put two browser processes
+ * on one Chromium profile dir (process-singleton violation, storage hazard).
+ * The picker's own userData also re-keys the instance lock, giving one picker
+ * at a time with `second-instance` focusing the resident picker.
+ */
+export function userDataDirForPicker(appName: string, appDataDir: string): string {
+  return path.join(appDataDir, `${appName}-${PICKER_USERDATA_ID}`)
+}
+
 /** The registry is machine-global and always lives in the default config dir. */
 export function registryPathForHome(homedir: string): string {
   return path.join(homedir, '.freshell', 'profiles.json')
@@ -815,6 +901,57 @@ export function shouldShowProfilePicker(
   return !selection.explicit && registry.profiles.length >= 1
 }
 
+/**
+ * The full module-top boot decision for entry.ts. One of:
+ * - 'picker': flag-less launch with ≥1 named profiles in the registry —
+ *   userData is namespacespaced to the launcher dir and the boot shows ONLY
+ *   the picker (configDir stays the default profile dir, since the registry
+ *   and the launcher's diagnostic logs live there).
+ * - 'explicit': argv/env named a valid profile — namespace userData (except
+ *   default) and boot that profile.
+ * - 'default': everything else — today's boot, zero behavior change.
+ */
+export interface BootShape {
+  kind: 'picker' | 'explicit' | 'default'
+  profileId: string
+  userDataDir?: string
+  configDir: string
+}
+
+export function resolveBootShape(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  registry: RegistryReadResult,
+  appName: string,
+  appDataDir: string,
+  homedir: string,
+): BootShape {
+  const { selection } = resolveProfileSelection(argv, env)
+  if (selection.explicit) {
+    return {
+      kind: 'explicit',
+      profileId: selection.id,
+      userDataDir: userDataDirForProfile(selection.id, appName, appDataDir),
+      configDir: configDirForProfile(selection.id, homedir),
+    }
+  }
+  if (shouldShowProfilePicker(selection, registry)) {
+    // The picker launcher is not itself a profile session: it logs to the
+    // default config dir but parks its userData in its own dir.
+    return {
+      kind: 'picker',
+      profileId: DEFAULT_PROFILE_ID,
+      userDataDir: userDataDirForPicker(appName, appDataDir),
+      configDir: configDirForProfile(DEFAULT_PROFILE_ID, homedir),
+    }
+  }
+  return {
+    kind: 'default',
+    profileId: DEFAULT_PROFILE_ID,
+    configDir: configDirForProfile(DEFAULT_PROFILE_ID, homedir),
+  }
+}
+
 export interface PickerEntry {
   id: string
   label: string
@@ -862,10 +999,11 @@ git commit -m "feat(electron): add profile resolution module"
 Five small DI-module changes that profiles depend on. Default-path behavior
 is unchanged for each except the `second-instance` surfacing fix (a deliberate
 bug fix — see below). Note: `main.ts` today requests the single-instance
-lock at the very END of boot (`entry.ts:662`); Task 5/6 will acquire it once
-the profile choice is final via the new `acquireInstanceLock`, fixing a
-pre-existing race where a second instance booted fully (including server
-spawn) before being turned away.
+lock at the very END of boot (`entry.ts:662`); Task 5 will acquire it right
+after `whenReady()` via the new `acquireInstanceLock` (in whichever userData
+the module-top boot shape selected), fixing a pre-existing race where a
+second instance booted fully (including server spawn) before being turned
+away.
 
 **Files:**
 - Modify: `electron/main.ts` (new `acquireInstanceLock`; `initMainProcess` stops requesting the lock; `second-instance` handler shows tray-hidden windows)
@@ -1312,14 +1450,19 @@ const at `runtime.ts:226` is a call-time getter.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted: every server unit touching home/config resolution.
+Impacted: every server unit touching home/config resolution. The coordinator
+classifies mixed targets (`test/unit/server` = server-owned,
+`test/unit/vite-config.test.ts` = default-owned) under the DEFAULT vitest
+config, which EXCLUDES `test/unit/server/**` — so never combine both in one
+command; run them separately, letting the coordinator route each:
 
-Run: `npm run test:vitest -- run test/unit/server test/unit/vite-config.test.ts`
+Run: `npm run test:vitest -- run test/unit/server`
+Run: `npm run test:vitest -- run test/unit/vite-config.test.ts`
 
-Expected: PASS (no behavior change when `FRESHELL_CONFIG_DIR` is unset — every
-re-routed site's default still lands at `~/.freshell/...`; the deliberately
-machine-global sites are untouched, including `network-manager.ts`'s divergent
-`FRESHELL_HOME`-direct shape).
+Expected: PASS on both (no behavior change when `FRESHELL_CONFIG_DIR` is unset
+— every re-routed site's default still lands at `~/.freshell/...`; the
+deliberately machine-global sites are untouched, including
+`network-manager.ts`'s divergent `FRESHELL_HOME`-direct shape).
 
 - [ ] **Step 7: Commit the task**
 
@@ -1370,26 +1513,33 @@ the profile; none of this changes the default boot.
 - Modify: `electron/entry.ts`
 
 **Interfaces:**
-- Consumes: Task 2's `resolveProfileSelection`, `configDirForProfile`,
-  `userDataDirForProfile`, `DEFAULT_PROFILE_ID`; Task 1's optional `configDir`
-  params; Task 3's `acquireInstanceLock` and tray `appearance`.
-- Produces: `activeProfileId` + profile-bound `configDir` consumed by the rest
-  of the boot; picker flow arrives in Task 6.
+- Consumes: Task 2's `resolveBootShape`, `readProfilesRegistry`,
+  `registryPathForHome`, `configDirForProfile`, `DEFAULT_PROFILE_ID`; Task 1's
+  optional `configDir` params; Task 3's `acquireInstanceLock` and tray
+  `appearance`.
+- Produces: `activeProfileId`, `isPickerLauncher` + boot-bound `configDir`
+  consumed by the rest of the boot; the picker window flow arrives in Task 6.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Establish the red gate — profile decision covered by unit tests (Task 2), wiring covered by the sandboxed smoke**
 
-entry.ts is excluded from unit tests by repo convention (its header comment).
-The verification for this task is compile + the electron unit suite staying
-green + the manual smoke in Step 4.
+`entry.ts` is excluded from unit tests by repo convention (its header comment).
+The profile-selection DECISION is already red-green'd in Task 2 via
+`resolveBootShape` unit tests. What remains untested until the wiring lands is
+the wiring itself; its behavioral gate is the sandboxed xvfb smoke below
+(LB-03-executed procedure). Establish the red state first:
 
-- [ ] **Step 2: Compile check fails first**
+Run the Step-4 smoke NOW, before editing `entry.ts`. Expected red evidence:
+`$SMOKE/home/.freshell/logs/electron-main.*.jsonl` exists under the DEFAULT
+dir (no `.freshell-smoketest/` dir exists at all) and the first log line has
+no `"profile"` field — proving the wiring is absent.
+
+Also establish compile baseline:
 
 Run: `npm run build:electron`
 
-Expected: PASS today (baseline for the diff) — Task 5 is wiring-only; its
-proof is Step 4's smoke and later tasks' tests.
+Expected: PASS today (baseline for the diff).
 
-- [ ] **Step 3: Add the wiring**
+- [ ] **Step 2: Add the wiring**
 
 Three edits in `electron/entry.ts`:
 
@@ -1410,52 +1560,51 @@ const isPortAvailable = createPortAvailabilityCheck()
 
 const isDev = process.env.ELECTRON_DEV === '1'
 
-// --- Profile resolution (must run before configDir/logger binding) --------
-// A named profile (--profile=<id> or FRESHELL_PROFILE) gets its own Electron
-// userData dir — which also re-keys the single-instance lock per profile —
-// and its own Freshell config dir (~/.freshell-<id>). The default profile
-// keeps today's exact paths and never touches userData.
-const profileSelection = resolveProfileSelection(process.argv, process.env)
-if (profileSelection.error) {
-  console.warn(JSON.stringify({
-    severity: 'warn',
-    component: 'electron-profile',
-    event: 'profile_selection_invalid',
-    error: profileSelection.error,
-  }))
+// --- Boot-shape resolution (must run before configDir/logger binding) -------
+// One process = one Chromium userData = one instance lock, ALWAYS. Named
+// profiles (--profile=<id> or FRESHELL_PROFILE) and the picker launcher each
+// get their own userData dir — which also re-keys the single-instance lock —
+// so the picker NEVER shares a userData dir with a resident Default instance
+// (two browser processes on one profile dir is a Chromium storage hazard).
+const registryAtBoot = readProfilesRegistry(
+  registryPathForHome(os.homedir()),
+  (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
+)
+const bootShape = resolveBootShape(
+  process.argv, process.env, registryAtBoot,
+  app.getName(), app.getPath('appData'), os.homedir(),
+)
+if (bootShape.userDataDir) {
+  // Electron's doc contract for app.setPath: the target directory must
+  // exist. Empirically 33.4.11 does NOT throw for deep nonexistent paths on
+  // Linux (load-bearing finder Appendix B.2), but create-first is the
+  // documented-correct order and is required at minimum on other platforms.
+  fs.mkdirSync(bootShape.userDataDir, { recursive: true })
+  app.setPath('userData', bootShape.userDataDir)
 }
-const activeProfileId = profileSelection.selection.id
-if (activeProfileId !== DEFAULT_PROFILE_ID) {
-  const namespacedUserData = userDataDirForProfile(activeProfileId, app.getName(), app.getPath('appData'))
-  if (namespacedUserData) {
-    // Electron's doc contract for app.setPath: the target directory must
-    // exist. Empirically 33.4.11 does NOT throw for deep nonexistent paths on
-    // Linux (load-bearing finder Appendix B.2), but create-first is the
-    // documented-correct order and is required at minimum on other platforms.
-    fs.mkdirSync(namespacedUserData, { recursive: true })
-    app.setPath('userData', namespacedUserData)
-  }
-}
-const configDir = configDirForProfile(activeProfileId, os.homedir())
+const activeProfileId = bootShape.profileId
+const isPickerLauncher = bootShape.kind === 'picker'
+const configDir = bootShape.configDir
 const mainProcessLogger = createElectronMainLogger({ configDir })
+if (registryAtBoot.error) {
+  mainProcessLogger.log({ severity: 'warn', event: 'profiles_registry_invalid', error: registryAtBoot.error })
+}
 
-/** True once this process's profile choice is final (flag/env/picker). The
- *  wizard-driven main() re-entry must not re-run the picker. */
-let profileChoiceMade = profileSelection.selection.explicit
-/** True once this process holds the instance lock; re-entrant main() calls
- *  (wizard completion) must not re-request it. */
+/** True once this process holds its (userData-keyed) instance lock;
+ *  re-entrant main() calls (wizard completion) must not re-request it. */
 let instanceLockHeld = false
 ```
 
-and update the imports (Task 5 needs only these; the picker imports arrive in
+and update the imports (Task 5 needs these; the picker IPC imports arrive in
 Task 6):
 
 ```ts
 import {
-  DEFAULT_PROFILE_ID,
   configDirForProfile,
-  resolveProfileSelection,
-  userDataDirForProfile,
+  readProfilesRegistry,
+  registryPathForHome,
+  resolveBootShape,
+  DEFAULT_PROFILE_ID,
 } from './profile.js'
 import { acquireInstanceLock, initMainProcess } from './main.js'
 ```
@@ -1464,20 +1613,19 @@ import { acquireInstanceLock, initMainProcess } from './main.js'
 
 (b) In `main()`, immediately after the existing `electron_main_started` log
 (before `window-all-closed` registration and before any side effects such as
-provisioning or server spawn. Task 6 will insert the profile-picker block
-immediately BEFORE this lock gate — under the LB-02 "resolve-then-lock"
-policy the lock is only ever requested once the profile choice is final,
-which for explicit flag/env launches is exactly here). Keep the comment
-accurate: a picker-launch lock-loser WILL have written its `started` line
-into the default profile's log before being turned away — harmless (same
-shared file the Default resident uses) and diagnostically useful:
+provisioning or server spawn). Under the round-3-corrected model EVERY process
+— explicit profile, plain default, and picker launcher alike — passes this
+gate; the only variance is WHICH userData (and therefore which lock) module
+top selected. Task 6 will insert the profile-picker block immediately AFTER
+this gate for picker launchers only:
 
 ```ts
-  // Per-profile single-instance lock, acquired once the profile choice is
-  // final and BEFORE any side effects (provisioning, server spawn). Keyed to
-  // the userData dir, so each profile holds an independent lock and a
-  // same-profile duplicate quits here (delivering `second-instance` to the
-  // resident, which then shows its window — see Task 3's surfacing fix).
+  // Instance lock, acquired BEFORE any side effects (provisioning, server
+  // spawn). Keyed to the userData dir chosen at module top: an explicit
+  // profile's own dir, the default dir for a plain launch, or the launcher
+  // dir for a picker launch. A same-profile duplicate quits here (delivering
+  // `second-instance` to the resident, which then shows its window — see
+  // Task 3's surfacing fix).
   //
   // The onDenied hook lifts the `will-quit` wizard-phase veto: at this point
   // `wizardPhase` is still true (it only flips false once a chooser/main
@@ -1507,10 +1655,12 @@ createTray(Tray as any, Menu as any, iconPath, { /* existing callbacks */ },
   { tooltip: activeProfileId === DEFAULT_PROFILE_ID ? 'Freshell' : `Freshell (${activeProfileId})` })
 ```
 
-(d) In the `ipcMain.removeHandler(...)` block, also remove `'get-profiles'`
-and `'choose-profile'` (added in Task 6) so main() re-entry stays clean.
+(d) Nothing to clean up for Task 6: a picker launcher RETURNS from main()
+after `runProfilePicker` (its IPC handlers die with `app.exit(0)`), and an
+explicit/default boot never registers them, so the wizard-driven main()
+re-entry has no picker handlers to remove.
 
-- [ ] **Step 4: Verify compile + unit suite + sandboxed dev smoke**
+- [ ] **Step 3: Verify compile + unit suite + sandboxed dev smoke (green gate)**
 
 Run: `npm run build:electron && npm run test:vitest -- --config config/vitest/vitest.electron.config.ts --run`
 
@@ -1573,47 +1723,50 @@ Expected observable evidence:
 
 Cleanup: `rm -rf "$SMOKE"`.
 
-- [ ] **Step 5: Refactor while green**
+- [ ] **Step 4: Refactor while green**
 
 None expected.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 5: Run impacted-test verification**
 
-Same as Step 4 first command. Include the startup/desktop-config suites:
+Same as Step 3 first command. Include the startup/desktop-config suites:
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts --run`
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 6: Commit the task**
 
 ```bash
 git add electron/entry.ts docs/plans/2026-08-26-electron-multi-profile.md
-git commit -m "feat(electron): boot-time profile wiring (userData namespacing, early per-profile lock)"
+git commit -m "feat(electron): boot-time profile wiring (userData namespacing, per-profile lock, launcher-userData boot shape)"
 ```
 
 ---
 
 ### Task 6: Profile picker decision flow (IPC handler + preload + `entry.ts` picker)
 
-The picker window runs in the LAUNCHER process (default userData, default
-config dir) when no explicit profile was given and the registry names ≥1
-profile — and it runs **holding no instance lock**: the picker block is placed
-in `main()` BEFORE Task 5's lock gate (resolve-then-lock, LB-02 Design A). A
-flag-less launch can therefore always show the picker, even while a Default
-instance is resident. Choosing **Default** continues in-process and acquires
-the default profile's lock at the gate; if a Default became resident in the
-meantime the lock fails, the process quits, and the resident surfaces its
-window via `second-instance` (Task 3's show-before-focus fix makes that
-visible when the window was tray-hidden). Choosing a named profile relaunches
-with `--profile=<id>` and exits (this process holds no lock, so the relaunch
-is race-free). Closing the picker without choosing exits the app.
+The picker window runs in a dedicated LAUNCHER process: Task 5's module-top
+`resolveBootShape` gives a picker launch its own userData dir
+(`<appData>/<AppName>-profile-picker`) and the Task 5 lock gate makes it hold
+the launcher-scoped instance lock. Two consequences:
 
-Accepted policy under this ordering: two racing flag-less launches may each
-show their own picker (no lock is held while picking, so `second-instance`
-cannot focus one picker into the other) — tolerated in the good-faith
-same-user environment; each picker resolves independently and a Default choice
-after a Default became resident degrades to focusing the resident.
+1. A flag-less launch ALWAYS shows the picker when the registry names ≥1
+   profile — even while a Default (or named) instance is resident — because
+   the launcher never contends for a real profile's userData/lock (Chromium
+   never sees two browser processes over one profile dir).
+2. A racing second flag-less launch loses the launcher lock, quits at the
+   gate, and the resident picker receives `second-instance` (its own handler
+   surfaces the picker window — registered in `runProfilePicker` below).
+
+EVERY confirmed choice — Default included — relaunches the app as an explicit
+profile (`app.relaunch({ args: [...stripProfileArgs(argv.slice(1)), '--profile=<id>'] })`,
+then `app.exit(0)`). Continuing Default in-process is NOT possible because the
+launcher's userData is the launcher dir, not the default one; the relaunched
+process is an explicit launch that namespaces correctly (default leaves
+userData alone) and acquires the chosen profile's lock — turning away (and
+surfacing the resident) when that profile is already running, via the normal
+explicit-duplicate path. Closing the picker without choosing exits the app.
 
 **Files:**
 - Create: `electron/profile-choice-handler.ts`
@@ -1623,9 +1776,8 @@ after a Default became resident degrades to focusing the resident.
 - Test: `test/unit/electron/preload.test.ts` (extend the exact-keys assertion — it pins the API shape and currently lists 12 keys)
 
 **Interfaces:**
-- Consumes: Task 2's `DEFAULT_PROFILE_ID`, `PickerEntry`, `buildPickerEntries`,
-  `readProfilesRegistry`, `registryPathForHome`, `shouldShowProfilePicker`,
-  `stripProfileArgs`.
+- Consumes: Task 2's `PickerEntry`, `buildPickerEntries`, `stripProfileArgs`;
+  the Task 5 module-top products `registryAtBoot` and `isPickerLauncher`.
 - Produces: `createChooseProfileHandler(deps)`; preload API
   `getProfiles(): Promise<PickerEntry[]>` and `chooseProfile(id): Promise<ProfileChoiceResult>`.
 
@@ -1668,7 +1820,6 @@ function harness(overrides: Partial<Parameters<typeof createChooseProfileHandler
   const deps = {
     entries,
     isAllowedSender: vi.fn().mockReturnValue(true),
-    continueWithDefault: vi.fn(),
     relaunchWithProfile: vi.fn(),
     ...overrides,
   }
@@ -1692,18 +1843,16 @@ describe('choose-profile handler', () => {
     expect(deps.relaunchWithProfile).not.toHaveBeenCalled()
   })
 
-  it('default continues in-process without relaunch', async () => {
+  it('the default choice relaunches as the explicit default profile', async () => {
     const { deps, handler } = harness()
     expect(await handler({}, 'default')).toEqual({ ok: true })
-    expect(deps.continueWithDefault).toHaveBeenCalledTimes(1)
-    expect(deps.relaunchWithProfile).not.toHaveBeenCalled()
+    expect(deps.relaunchWithProfile).toHaveBeenCalledWith('default')
   })
 
   it('a named profile relaunches with it', async () => {
     const { deps, handler } = harness()
     expect(await handler({}, 'work')).toEqual({ ok: true })
     expect(deps.relaunchWithProfile).toHaveBeenCalledWith('work')
-    expect(deps.continueWithDefault).not.toHaveBeenCalled()
   })
 })
 ```
@@ -1722,15 +1871,15 @@ the exposed API.
 
 ```ts
 import { z } from 'zod'
-import { DEFAULT_PROFILE_ID, type PickerEntry } from './profile.js'
+import type { PickerEntry } from './profile.js'
 
 export interface ChooseProfileHandlerDeps {
   entries: PickerEntry[]
   /** Defense-in-depth: only the picker window may drive this channel. */
   isAllowedSender: (event: unknown) => boolean
-  /** Continue this launch with the default profile, in-process. */
-  continueWithDefault: () => void | Promise<void>
-  /** Relaunch the app pinned to a named profile, then exit. */
+  /** Relaunch the app pinned to the chosen profile id, then exit this
+   *  launcher process. 'default' is a valid id -- the relaunched process is
+   *  an explicit launch of the default profile. */
   relaunchWithProfile: (id: string) => void
 }
 
@@ -1746,11 +1895,7 @@ export function createChooseProfileHandler(deps: ChooseProfileHandlerDeps) {
     if (!parsed.success || !allowed.has(parsed.data)) {
       return { ok: false, error: 'Unknown profile.' }
     }
-    if (parsed.data === DEFAULT_PROFILE_ID) {
-      await deps.continueWithDefault()
-    } else {
-      deps.relaunchWithProfile(parsed.data)
-    }
+    deps.relaunchWithProfile(parsed.data)
     return { ok: true }
   }
 }
@@ -1777,15 +1922,13 @@ and to `registerPreloadApi`'s api object:
     chooseProfile: (id: string) => ipcRenderer.invoke('choose-profile', id),
 ```
 
-`electron/entry.ts` — add imports (Task 5's block already imports
-`DEFAULT_PROFILE_ID` etc.; extend it):
+`electron/entry.ts` — add imports (Task 5's block already imported
+`readProfilesRegistry` / `registryPathForHome` / `resolveBootShape` and defined
+`registryAtBoot` / `isPickerLauncher`; extend it):
 
 ```ts
 import {
   buildPickerEntries,
-  readProfilesRegistry,
-  registryPathForHome,
-  shouldShowProfilePicker,
   stripProfileArgs,
   type PickerEntry,
 } from './profile.js'
@@ -1796,16 +1939,15 @@ Add the launcher picker function (module level):
 
 ```ts
 /**
- * Show the profile picker and resolve the launch's profile.
+ * Show the profile picker and relaunch into the chosen profile.
  *
- * Resolves ONLY when the user picks the default profile (continue in-process);
- * a named choice relaunches with --profile=<id> and this process exits, so the
- * returned promise simply never settles on that path. Closing the picker
- * without choosing exits the app.
- *
- * NOTE: this process holds NO instance lock while the picker is up
- * (resolve-then-lock), so a racing flag-less launch simply shows its own
- * picker — there is nothing to forward a `second-instance` focus to.
+ * This launcher process holds the LAUNCHER-scoped instance lock (own
+ * userData dir), so a racing flag-less launch is turned away at the lock gate
+ * and delivers `second-instance` here, where we surface the existing picker
+ * window. Every confirmed choice — Default included — relaunches with an
+ * explicit `--profile=<id>` and exits; the relaunched process then takes the
+ * chosen profile's own lock. The returned promise simply never settles.
+ * Closing the picker without choosing exits the app.
  */
 async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
   const pickerWin = new BrowserWindow({
@@ -1820,86 +1962,73 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
     },
   })
   const pickerWebContentsId = pickerWin.webContents.id
+  const onSecondInstance = () => {
+    if (!pickerWin.isDestroyed()) {
+      pickerWin.show()
+      pickerWin.focus()
+    }
+  }
+  app.on('second-instance', onSecondInstance)
 
-  let continuing = false
   const cleanup = () => {
+    app.removeListener('second-instance', onSecondInstance)
     ipcMain.removeHandler('get-profiles')
     ipcMain.removeHandler('choose-profile')
   }
 
-  return new Promise<void>((resolve) => {
-    ipcMain.removeHandler('get-profiles')
-    ipcMain.removeHandler('choose-profile')
-    ipcMain.handle('get-profiles', () => entries)
-    ipcMain.handle('choose-profile', createChooseProfileHandler({
-      entries,
-      isAllowedSender: (event) =>
-        (event as { sender?: { id?: number } }).sender?.id === pickerWebContentsId,
-      continueWithDefault: () => {
-        continuing = true
-        profileChoiceMade = true
-        cleanup()
-        pickerWin.close()
-        resolve()
-      },
-      relaunchWithProfile: (id) => {
-        const args = [...stripProfileArgs(process.argv.slice(1)), `--profile=${id}`]
-        app.relaunch({ args })
-        app.exit(0)
-      },
-    }))
+  ipcMain.removeHandler('get-profiles')
+  ipcMain.removeHandler('choose-profile')
+  ipcMain.handle('get-profiles', () => entries)
+  ipcMain.handle('choose-profile', createChooseProfileHandler({
+    entries,
+    isAllowedSender: (event) =>
+      (event as { sender?: { id?: number } }).sender?.id === pickerWebContentsId,
+    relaunchWithProfile: (id) => {
+      const args = [...stripProfileArgs(process.argv.slice(1)), `--profile=${id}`]
+      app.relaunch({ args })
+      app.exit(0)
+    },
+  }))
 
-    pickerWin.on('closed', () => {
-      if (!continuing) {
-        cleanup()
-        app.exit(0)
-      }
-    })
+  pickerWin.on('closed', () => {
+    cleanup()
+    app.exit(0)
+  })
 
-    if (isDev) {
-      void pickerWin.loadURL('http://localhost:5179')
-    } else {
-      const packaged = path.join(process.resourcesPath, 'profile-picker', 'index.html')
-      const unpackaged = path.join(app.getAppPath(), 'dist', 'profile-picker', 'index.html')
-      void pickerWin.loadFile(fs.existsSync(packaged) ? packaged : unpackaged)
-    }
-    pickerWin.show()
+  if (isDev) {
+    void pickerWin.loadURL('http://localhost:5179')
+  } else {
+    const packaged = path.join(process.resourcesPath, 'profile-picker', 'index.html')
+    const unpackaged = path.join(app.getAppPath(), 'dist', 'profile-picker', 'index.html')
+    void pickerWin.loadFile(fs.existsSync(packaged) ? packaged : unpackaged)
+  }
+  pickerWin.show()
+  return new Promise<void>(() => {
+    // Never settles: this launcher exits via app.exit(0) on choice or close.
   })
 }
 ```
 
-And in `main()`, insert the picker block BEFORE the Task 5 (b) lock gate
-(right after the `electron_main_started` log). Under resolve-then-lock, a
-flag-less launch reaches this point holding no lock, so the picker shows even
-when a Default instance is resident; explicit-profile launches
-(`profileChoiceMade === true` from module top) skip the picker and hit the
-lock gate directly:
+And in `main()`, insert the picker block AFTER the Task 5 (b) lock gate (the
+gate is where the launcher locks its own userData). A picker launcher never
+proceeds past this point into provisioning or startup — it shows the picker
+and exits on choice/close:
 
 ```ts
   // --- Profile picker -------------------------------------------------------
-  // Shown when the launch carried no explicit profile and the machine-global
-  // registry (~/.freshell/profiles.json) names at least one profile. Runs in
-  // the DEFAULT environment; see runProfilePicker for choice semantics.
-  if (!profileChoiceMade) {
-    const registry = readProfilesRegistry(registryPathForHome(os.homedir()), (p) =>
-      fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined,
-    )
-    if (registry.error) {
-      mainProcessLogger.log({ severity: 'warn', event: 'profiles_registry_invalid', error: registry.error })
-    }
-    if (shouldShowProfilePicker(profileSelection.selection, registry)) {
-      await runProfilePicker(buildPickerEntries(registry))
-    }
+  // A picker launch (no explicit profile + registry names ≥1 profile) parks
+  // its userData in the launcher dir, holds the launcher lock, shows only the
+  // picker, and ends here. See resolveBootShape (module top) for the shape
+  // decision and runProfilePicker for choice semantics.
+  if (isPickerLauncher) {
+    await runProfilePicker(buildPickerEntries(registryAtBoot))
+    return
   }
 ```
 
-One ordering note to keep while editing `main()`: **provisioning remains AFTER
-this whole picker+lock preamble** (the current `entry.ts` order is
-whenReady → log → window-all-closed → provisioning → pendingForcedLaunch →
-readDesktopConfig — the picker+lock gate belongs between the log and
-window-all-closed). The picker's launcher process must not apply provisioning
-patches before the profile choice is final; provisioning of a named profile
-happens inside the relaunched process.
+Keep the rest of `main()` untouched for explicit/default boots — a picker
+launcher never reaches provisioning (`patchDesktopConfig`) or server spawn, so
+no provisioning can smear onto a config before the choice is final.
 
 - [ ] **Step 4: Run the focused test + compile**
 
@@ -2369,21 +2498,34 @@ test.describe('Profile picker', () => {
     await expect(picker.getByRole('button', { name: 'Work' })).toBeVisible()
   })
 
-  test('choosing Default continues in-process to the first-run wizard', async () => {
-    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work' }] })
+  // Every picker choice (Default included) relaunches as an explicit profile:
+  // the launcher's userData is the launcher dir, so continuing in-process
+  // would leak launcher storage into a real profile. Stub relaunch/exit in
+  // the main process before clicking and assert the rebuilt argv.
+  test('choosing Default from the picker relaunches as --profile=default', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
     app = await launchApp(tmpHome)
+
+    await app.evaluate(({ app: electronApp }) => {
+      const g = globalThis as Record<string, unknown>
+      g.__relaunchCalls = []
+      ;(electronApp as unknown as Record<string, unknown>).relaunch = (opts: unknown) => {
+        ;(g.__relaunchCalls as unknown[]).push(opts)
+      }
+      ;(electronApp as unknown as Record<string, unknown>).exit = (code: number) => {
+        g.__exitCode = code
+      }
+    })
 
     const picker = await app.firstWindow()
     await picker.waitForLoadState('domcontentloaded')
     await picker.getByRole('button', { name: 'Default' }).click()
 
-    // Fresh default home → no desktop.json → setup wizard replaces the picker.
-    await expect.poll(async () => {
-      for (const win of app!.windows()) {
-        if (await win.locator('h1:has-text("Welcome to Freshell")').count() > 0) return true
-      }
-      return false
-    }, { timeout: 30_000 }).toBe(true)
+    await expect.poll(async () => app.evaluate(() => (globalThis as Record<string, unknown>).__exitCode ?? null),
+      { timeout: 15_000 }).toBe(0)
+    const relaunchCalls = await app.evaluate(() => (globalThis as Record<string, unknown>).__relaunchCalls)
+    expect(relaunchCalls).toHaveLength(1)
+    expect((relaunchCalls as { args: string[] }[])[0].args).toContain('--profile=default')
   })
 
   test('--profile boots the named profile without the picker and namespaces state', async () => {
@@ -2410,59 +2552,86 @@ test.describe('Profile picker', () => {
   })
 
   // Two DIFFERENT named profiles must boot side by side (independent userData
-  // locks) AND read their own config dir. Isolation proof: the DEFAULT profile
-  // dir is pre-seeded with setupCompleted:true — if either named profile
-  // misresolved its config dir to the default, it would SKIP the wizard (and
-  // worse, write into ~/.freshell). Both named boots showing the wizard while
-  // the default dir stays untouched proves per-profile config reads.
-  // (App-bound/remote seeds are avoided deliberately: app-bound would spawn a
-  // server against the fixed default port and remote would probe the network —
-  // the wizard path touches neither, per LB-03's wizard-short-circuit.)
-  test('two named profiles run concurrently with isolated config dirs', async () => {
+  // locks), each reading its OWN config and loading its OWN server. The test
+  // process hosts two throwaway HTTP stub servers with distinct marker bodies;
+  // each profile's remote-mode desktop.json points at one stub. Window URLs
+  // then prove the full chain per profile: config-dir read → remote mode →
+  // window loaded the seeded server.
+  test('two named profiles run concurrently, each loading its own server', async () => {
     tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'e2ework' }, { id: 'e2ehome' }] })
 
-    // Seed ONLY the default profile as fully-set-up. No desktop.json is ever
-    // created for the named profiles.
-    fs.writeFileSync(
-      path.join(tmpHome, '.freshell', 'desktop.json'),
-      JSON.stringify({
-        serverMode: 'app-bound', port: 3001, knownServers: [],
+    const http = await import('http')
+    const stub = (marker: string) => new Promise<{ url: string; server: import('http').Server }>((resolve) => {
+      const server = http.createServer((req, res) => {
+        res.setHeader('content-type', (req.url ?? '').includes('/api/') ? 'application/json' : 'text/html')
+        if ((req.url ?? '').includes('/api/')) {
+          res.end(JSON.stringify({ ok: true }))
+        } else {
+          res.end(`<html><body>MARKER:${marker}</body></html>`)
+        }
+      })
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address()
+        if (!addr || typeof addr === 'string') throw new Error('stub listen failed')
+        resolve({ url: `http://127.0.0.1:${addr.port}`, server })
+      })
+    })
+    const [s1, s2] = await Promise.all([stub('WORK'), stub('HOME')])
+
+    const seedRemote = (id: string, url: string) => {
+      const dir = path.join(tmpHome!, `.freshell-${id}`)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'desktop.json'), JSON.stringify({
+        serverMode: 'remote', port: 3001,
+        remoteUrl: url, remoteToken: 'e2e-token',
+        knownServers: [{ url, label: id }],
         alwaysAskOnLaunch: false, globalHotkey: 'CommandOrControl+`',
         startOnLogin: false, minimizeToTray: false, setupCompleted: true,
-      }, null, 2),
-    )
+      }, null, 2))
+    }
+    seedRemote('e2ework', s1.url)
+    seedRemote('e2ehome', s2.url)
 
     app = await launchApp(tmpHome, ['--profile=e2ework'])
     const app2 = await launchApp(tmpHome, ['--profile=e2ehome'])
     try {
-      const w1 = await app.firstWindow()
-      const w2 = await app2.firstWindow()
-      await expect(w1.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
-      await expect(w2.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
-
-      // Both processes alive (independent per-profile locks).
+      // Both alive (independent per-profile locks).
       expect(app.process().exitCode).toBeNull()
       expect(app2.process().exitCode).toBeNull()
+
+      const w1 = await app.firstWindow()
+      const w2 = await app2.firstWindow()
+      // Neither shows the first-run wizard (each read its OWN seeded config).
+      await expect.poll(async () => {
+        const isWizard = async (w: typeof w1) => (await w.locator('h1:has-text("Welcome to Freshell")').count()) > 0
+        return !(await isWizard(w1)) && !(await isWizard(w2))
+      }, { timeout: 30_000 }).toBe(true)
+
+      // The core requested-behavior proof: each profile's window navigated to
+      // ITS OWN stub server. URL equality per profile = wrong-config wiring
+      // would land both windows on the same URL.
+      await expect.poll(() => w1.url(), { timeout: 30_000 }).toContain(String(new URL(s1.url).port))
+      await expect.poll(() => w2.url(), { timeout: 30_000 }).toContain(String(new URL(s2.url).port))
+      await expect(w1.locator('text=MARKER:WORK')).toBeVisible({ timeout: 30_000 })
+      await expect(w2.locator('text=MARKER:HOME')).toBeVisible({ timeout: 30_000 })
 
       const ud1 = await app.evaluate(({ app: a1 }) => a1.getPath('userData'))
       const ud2 = await app2.evaluate(({ app: a2 }) => a2.getPath('userData'))
       expect(path.basename(ud1).toLowerCase()).toBe('freshell-e2ework')
       expect(path.basename(ud2).toLowerCase()).toBe('freshell-e2ehome')
 
-      // Each profile logged into its own config dir; the seeded default dir
-      // got no logs from these two processes.
       for (const id of ['e2ework', 'e2ehome']) {
         await expect.poll(() => {
           const d = path.join(tmpHome!, `.freshell-${id}`, 'logs')
           return fs.existsSync(d) && fs.readdirSync(d).some((f) => /^electron-main\..*\.jsonl$/.test(f))
         }, { timeout: 15_000 }).toBe(true)
       }
-      expect(fs.existsSync(path.join(tmpHome, '.freshell', 'logs', ))).toBe(false)
-      // The default config was never overwritten by either named boot.
-      const seeded = JSON.parse(fs.readFileSync(path.join(tmpHome, '.freshell', 'desktop.json'), 'utf-8'))
-      expect(seeded.setupCompleted).toBe(true)
+      // The default profile dir received no logs from either named process.
+      expect(fs.existsSync(path.join(tmpHome, '.freshell', 'logs'))).toBe(false)
     } finally {
       await app2.close().catch(() => {})
+      s1.server.close()
+      s2.server.close()
     }
   })
 
@@ -2506,28 +2675,25 @@ test.describe('Profile picker', () => {
     await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
   })
 
-  // LB-02 / resolve-then-lock: a flag-less launch must reach the picker even
-  // while a Default-profile instance is resident (the picker phase holds no
-  // lock). This is the steady state the feature exists for (minimizeToTray
+  // LB-02 / dedicated-launcher design: a flag-less launch must reach the
+  // picker even while a Default-profile instance is resident (the launcher
+  // parks in its own userData with its own lock, so Default never blocks it).
+  // This is the steady state the feature exists for (minimizeToTray
   // defaults true, so Default typically stays resident).
   test('a flag-less launch while Default is resident still shows the picker', async () => {
     tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
 
-    // First process: pick Default, becomes the resident Default instance.
-    app = await launchApp(tmpHome)
-    const firstPicker = await app.firstWindow()
-    await firstPicker.waitForLoadState('domcontentloaded')
-    await firstPicker.getByRole('button', { name: 'Default' }).click()
-    // Resident evidence: first-run wizard (fresh home) proves Default booted.
-    await expect.poll(async () => {
-      for (const win of app!.windows()) {
-        if (await win.locator('h1:has-text("Welcome to Freshell")').count() > 0) return true
-      }
-      return false
-    }, { timeout: 30_000 }).toBe(true)
+    // First process: an EXPLICIT default launch becomes the resident Default
+    // instance (a picker choice would relaunch into a new untracked process).
+    app = await launchApp(tmpHome, ['--profile=default'])
+    const window1 = await app.firstWindow()
+    await window1.waitForLoadState('domcontentloaded')
+    await expect(window1.locator('h1:has-text("Welcome to Freshell")'))
+      .toBeVisible({ timeout: 30_000 })
 
-    // Second flag-less launch must show ITS OWN picker (initially under test
-    // this succeeds because the picker phase holds no lock).
+    // Second flag-less launch shows the picker: the launcher's userData (and
+    // lock) is the dedicated launcher dir, so the resident Default does not
+    // contend with it at all.
     const app2 = await launchApp(tmpHome)
     try {
       const picker2 = await app2.firstWindow()
@@ -2538,6 +2704,37 @@ test.describe('Profile picker', () => {
     } finally {
       await app2.close().catch(() => {})
     }
+  })
+
+  // Racing flag-less launches: the second one loses the launcher lock, exits,
+  // and the resident picker receives second-instance (one picker at a time).
+  test('a second flag-less launch is turned away and delivers second-instance to the resident picker', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
+    app = await launchApp(tmpHome)
+    const picker = await app.firstWindow()
+    await picker.waitForLoadState('domcontentloaded')
+    await expect(picker.getByRole('heading', { name: 'Choose a Freshell profile' }))
+      .toBeVisible({ timeout: 30_000 })
+
+    await app.evaluate(({ app: launcherApp }) => {
+      ;(globalThis as Record<string, unknown>).__pickerSecondInstance = 0
+      launcherApp.on('second-instance', () => {
+        ;(globalThis as Record<string, unknown>).__pickerSecondInstance =
+          ((globalThis as Record<string, unknown>).__pickerSecondInstance as number) + 1
+      })
+    })
+
+    const app2 = await launchApp(tmpHome)
+    await expect.poll(() => app2.process().exitCode, { timeout: 30_000 }).not.toBeNull()
+    await app2.close().catch(() => {})
+
+    await expect.poll(
+      () => app.evaluate(() => (globalThis as Record<string, unknown>).__pickerSecondInstance),
+      { timeout: 15_000 },
+    ).toBe(1)
+    // The resident picker is still there, alive.
+    expect(app.process().exitCode).toBeNull()
+    await expect(picker.getByRole('heading', { name: 'Choose a Freshell profile' })).toBeVisible()
   })
 
   // Same-profile turn-away stays intact: an explicit duplicate of the resident
@@ -2606,11 +2803,11 @@ base_ref necessarily fails the namespacing and picker specs). What Step 2/3
 protect is end-to-end integration: if any spec fails here, the wiring across
 Tasks 5-7 is wrong — fix the implementation, not the spec.
 
-- [ ] **Step 3: Confirm all eight specs pass**
+- [ ] **Step 3: Confirm all nine specs pass**
 
 Run: `CI=true npx playwright test --config test/e2e-electron/playwright.electron.config.ts profile-picker` (with `xvfb-run -a` if needed)
 
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 4: Refactor while green**
 
@@ -2681,14 +2878,19 @@ Create `~/.freshell/profiles.json`:
 ```
 
 Rules: `id` is lowercase letters/digits/dashes starting with a letter or digit
-(max 32 chars); `default` is reserved (it means the original un-namespaced
-environment); `label` is optional display text.
+(max 32 chars); `default` and `profile-picker` are reserved (the first means
+the original un-namespaced environment; the second is the picker launcher's
+own storage dir); `label` is optional display text.
 
 When at least one named profile is defined, launching the app without a
-profile shows a picker (the default profile is always listed first). Pin a
-launch to a profile with `--profile=<id>` or `FRESHELL_PROFILE=<id>`; named
-ids do not have to be listed in `profiles.json` — an unlisted id simply
-starts with a fresh configuration.
+profile shows a picker (the default profile is always listed first; the built-
+in default counts, so one named profile in the file already means "more than
+one configured"). The picker is a small launcher: whichever profile you pick,
+the app relaunches itself pinned to it — you'll see a quick restart, then the
+app continues in the chosen profile. Pin a launch to a profile with
+`--profile=<id>` or `FRESHELL_PROFILE=<id>`; named ids do not have to be
+listed in `profiles.json` — an unlisted id simply starts with a fresh
+configuration.
 
 ### Notes and limitations
 
@@ -2713,8 +2915,9 @@ starts with a fresh configuration.
   the Dock while ANY Freshell instance is running just activates the running
   instance (the OS enforces this) and never shows the picker — use
   `--profile=` flags or `FRESHELL_PROFILE` from a terminal, or Quit before
-  relaunching to get the picker. Two simultaneous flag-less launches can each
-  show their own picker window; that's expected, pick once in either one.
+  relaunching to get the picker. Two simultaneous flag-less launches race for
+  the picker's launcher slot: the first shows the picker; the second quietly
+  exits and brings the existing picker forward.
 - Daemon-service caveat for the Node server: the shipped daemon templates have
   always contained an (until now inert) `FRESHELL_CONFIG_DIR` environment
   line; starting with this release the Node server honors it. If you
