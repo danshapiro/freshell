@@ -537,7 +537,43 @@ fn attributed_row_within_grace_of_its_parent_is_offered() {
     assert_eq!(only[0]["sessionId"], "S1");
     // The stamped tabKey is forwarded for the client-side original-tab join.
     assert_eq!(only[0]["tabKey"], "d1:t1");
+    // A terminal row carries NO paneKind (the fresh-agent-only field).
+    assert!(only[0].get("paneKind").is_none());
     assert_eq!(out["recoverable"], true);
+}
+
+#[test]
+fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
+    // Finding 2 (delta-r1): a kept FRESH-AGENT ledger row must forward its
+    // `pane_kind` as `paneKind` in the ledgerOnly JSON so the client's plan
+    // builder packages it as a fresh-agent resume — never a terminal shell
+    // (the row's mode is a fresh-agent session type, not a terminal CLI mode).
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            1_000_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut row = binding_row_at("opencode", "ses_9", bound(), 995_000);
+    row.mode = "freshopencode".into();
+    row.pane_kind = Some("fresh-agent".into());
+    let row = with_attribution(row, "c1", "d1", "t9");
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    let only = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(only.len(), 1, "the attributed in-grace fresh-agent row is offered");
+    assert_eq!(only[0]["sessionId"], "ses_9");
+    assert_eq!(only[0]["mode"], "freshopencode");
+    assert_eq!(
+        only[0]["paneKind"], "fresh-agent",
+        "the row's pane_kind must reach the client as paneKind"
+    );
 }
 
 #[test]

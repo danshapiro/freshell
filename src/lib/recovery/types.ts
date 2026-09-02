@@ -58,6 +58,12 @@ export interface LedgerOnlyEntry {
    * trailing tab.
    */
   tabKey?: string
+  /**
+   * The ledger row's pane kind. `"fresh-agent"` rows restore as fresh-agent
+   * panes (their `mode` is a fresh-agent session type, not a terminal CLI
+   * mode); absent on terminal rows.
+   */
+  paneKind?: string
 }
 
 export interface RecoveryInventory {

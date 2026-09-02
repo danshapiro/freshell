@@ -1,5 +1,11 @@
 import { nanoid } from 'nanoid'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
+import {
+  normalizeFreshAgentSessionType,
+  resolveFreshAgentRuntimeProvider,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '@shared/fresh-agent'
 import type { RecoveryInventory, RecoveryPane, LedgerOnlyEntry } from './types'
 
 function terminalContent(p: {
@@ -62,7 +68,46 @@ export function countRecoverablePanes(inv: RecoveryInventory): number {
   return device + inv.ledgerOnly.length
 }
 
+// Defense-in-depth for a fresh-agent row whose mode is not a valid session
+// type (corrupt/pre-schema data): the provider's default flavor. Real rows
+// always carry the session type in `mode` (every fresh-agent binding write
+// stamps SESSION_TYPE), so this fallback never fires for genuine data — and
+// the resumed conversation identity is unaffected either way (the resume is
+// provider + sessionRef driven).
+const FALLBACK_SESSION_TYPE_BY_PROVIDER: Partial<Record<string, FreshAgentSessionType>> = {
+  claude: 'freshclaude',
+  codex: 'freshcodex',
+  opencode: 'freshopencode',
+}
+
+/**
+ * Package a kept FRESH-AGENT ledger row as a fresh-agent pane content for a
+ * SESSION RESUME — the minimal equivalent of the snapshot-restore path's
+ * fresh-agent branch (paneContent): the FreshAgentView create effect drives
+ * `freshAgent.create{sessionRef}` straight from this content, exactly as for
+ * a snapshot-restored fresh-agent pane. A fresh-agent leaf never enters
+ * `armRecoveredTerminalRestores` (that walk is kind-gated to terminal leaves),
+ * matching the snapshot path.
+ */
+function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
+  const sessionType =
+    normalizeFreshAgentSessionType(e.mode) ?? FALLBACK_SESSION_TYPE_BY_PROVIDER[e.provider]
+  return {
+    kind: 'fresh-agent',
+    sessionType,
+    // provider must satisfy pane validation's invariant (provider ===
+    // resolveFreshAgentRuntimeProvider(sessionType)); for genuine rows both
+    // derivations agree, the resolution just makes the invariant explicit.
+    provider: resolveFreshAgentRuntimeProvider(sessionType) ?? (e.provider as FreshAgentRuntimeProvider),
+    createRequestId: nanoid(), // re-minted by restoreLayout normalization; required by the type
+    status: 'creating',
+    ...(e.cwd ? { initialCwd: e.cwd } : {}),
+    sessionRef: { provider: e.provider, sessionId: e.sessionId },
+  } as PaneContent
+}
+
 function ledgerEntryContent(e: LedgerOnlyEntry): PaneContent {
+  if (e.paneKind === 'fresh-agent') return freshAgentEntryContent(e)
   return terminalContent({ mode: e.mode, shell: null, cwd: e.cwd, sessionRef: { provider: e.provider, sessionId: e.sessionId }, live: false })
 }
 

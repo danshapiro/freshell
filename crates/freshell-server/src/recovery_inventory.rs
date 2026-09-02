@@ -338,6 +338,12 @@ pub fn build_inventory(
             if let Some(tab_key) = &r.tab_key {
                 entry["tabKey"] = json!(tab_key);
             }
+            // Fresh-agent rows forward their pane_kind so the client's plan
+            // builder packages the row as a fresh-agent resume — never a
+            // terminal shell (the row's mode is a fresh-agent session type).
+            if let Some(pane_kind) = &r.pane_kind {
+                entry["paneKind"] = json!(pane_kind);
+            }
             entry
         })
         .collect();

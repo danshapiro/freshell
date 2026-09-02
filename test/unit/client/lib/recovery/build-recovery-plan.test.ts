@@ -156,6 +156,51 @@ describe('buildRecoveryPlan', () => {
     expect(trailContents[0]).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'C9' } })
   })
 
+  // Finding 2 (delta-r1): a kept fresh-agent ledger row must restore as a
+  // fresh-agent pane RESUME (the FreshAgentView create effect drives the
+  // sessionRef resume from the content) — never as a terminal shell: the
+  // row's mode is a fresh-agent session type ("freshopencode"), not a
+  // terminal CLI mode, so packaging it as terminalContent silently spawns a
+  // bare shell in place of the agent pane.
+  it('a ledgerOnly fresh-agent row restores as a resume-capable fresh-agent pane, not a shell', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'opencode', sessionId: 'ses_123', mode: 'freshopencode', cwd: '/proj', tabKey: 'k', paneKind: 'fresh-agent' },
+    ]))
+    expect(plans).toHaveLength(1)
+    const contents = leavesOf(plans[0].layout).map((l) => l.content)
+    expect(contents).toHaveLength(2)
+    const entryContent = contents[1]
+    expect(entryContent.kind).toBe('fresh-agent')
+    expect(entryContent).toMatchObject({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'creating',
+      initialCwd: '/proj',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_123' },
+    })
+    expect(typeof entryContent.createRequestId).toBe('string')
+    // Never a faux terminal: no terminal-only fields on the fresh-agent leaf.
+    expect(entryContent.mode).toBeUndefined()
+    expect(entryContent.shell).toBeUndefined()
+  })
+
+  it('a plain CLI ledgerOnly row still builds terminal content (finding-2 regime is fresh-agent-only)', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' },
+      { provider: 'claude', sessionId: 'K7', mode: 'kilroy', cwd: '/y', tabKey: 'k', paneKind: 'fresh-agent' },
+    ]))
+    const contents = leavesOf(plans[0].layout).map((l) => l.content)
+    expect(contents).toHaveLength(3)
+    expect(contents[1]).toMatchObject({
+      kind: 'terminal', mode: 'codex', initialCwd: '/x',
+      sessionRef: { provider: 'codex', sessionId: 'C9' },
+    })
+    expect(contents[2]).toMatchObject({
+      kind: 'fresh-agent', sessionType: 'kilroy', provider: 'claude', initialCwd: '/y',
+      sessionRef: { provider: 'claude', sessionId: 'K7' },
+    })
+  })
+
   it('countRecoverablePanes sums device panes and ledgerOnly', () => {
     expect(countRecoverablePanes(inv([pane(), pane({ paneId: 'p2' })], [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: null }]))).toBe(3)
   })
