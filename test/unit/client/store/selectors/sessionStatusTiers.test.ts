@@ -32,6 +32,55 @@ function makeLayout(sessionId: string, terminalId: string) {
   }
 }
 
+/**
+ * Fresh-agent restore-gap fixtures: the pane carries a STALE resume locator
+ * while the live session in freshAgent.sessions has a DIFFERENT canonical
+ * session id (e.g. the provider rebound the thread during restore).
+ */
+function makeFreshAgentTab(staleSessionId: string) {
+  return {
+    id: `tab-fresh-${staleSessionId}`,
+    createdAt: 1,
+  }
+}
+
+function makeFreshAgentLayout(staleSessionId: string, liveSessionId: string) {
+  return {
+    type: 'leaf',
+    id: `pane-fresh-${staleSessionId}`,
+    content: {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionId: liveSessionId,
+      resumeSessionId: staleSessionId,
+      createRequestId: `req-fresh-${staleSessionId}`,
+      status: 'connected',
+    },
+  }
+}
+
+function makeLiveFreshSession(liveSessionId: string, busy: boolean) {
+  return {
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    sessionId: liveSessionId,
+    sessionKey: `freshclaude:claude:${liveSessionId}`,
+    threadId: liveSessionId,
+    status: busy ? 'running' : 'idle',
+    turns: [],
+    historyItems: [],
+    historyBodies: {},
+    streamingText: '',
+    streamingActive: false,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+  }
+}
+
 function makeRemoteRecord(panePayloads: Array<Record<string, unknown>>): RegistryTabRecord {
   return {
     tabKey: 'device-b:tab-1',
@@ -56,12 +105,14 @@ const EMPTY_BY_ID: Record<string, never> = {}
 
 function makeState(options: {
   localSessions?: Array<{ sessionId: string; busy?: boolean }>
+  restoreGap?: { staleSessionId: string; liveSessionId: string; busy?: boolean }
   remoteOpen?: RegistryTabRecord[]
   sameDeviceOpen?: RegistryTabRecord[]
 } = {}): RootState {
   const tabs: unknown[] = []
   const layouts: Record<string, unknown> = {}
   const busyClaude: Record<string, unknown> = {}
+  let freshAgentSessions: Record<string, unknown> = EMPTY_BY_ID
 
   for (const local of options.localSessions ?? []) {
     const terminalId = `term-${local.sessionId}`
@@ -69,6 +120,15 @@ function makeState(options: {
     layouts[`tab-${local.sessionId}`] = makeLayout(local.sessionId, terminalId)
     if (local.busy) {
       busyClaude[terminalId] = { terminalId, phase: 'busy', updatedAt: 1 }
+    }
+  }
+
+  if (options.restoreGap) {
+    const { staleSessionId, liveSessionId, busy } = options.restoreGap
+    tabs.push(makeFreshAgentTab(staleSessionId))
+    layouts[`tab-fresh-${staleSessionId}`] = makeFreshAgentLayout(staleSessionId, liveSessionId)
+    freshAgentSessions = {
+      [`freshclaude:claude:${liveSessionId}`]: makeLiveFreshSession(liveSessionId, busy === true),
     }
   }
 
@@ -80,7 +140,7 @@ function makeState(options: {
     amplifierActivity: { byTerminalId: EMPTY_BY_ID },
     opencodeActivity: { byTerminalId: EMPTY_BY_ID },
     paneRuntimeActivity: { byPaneId: EMPTY_BY_ID },
-    freshAgent: { sessions: EMPTY_BY_ID },
+    freshAgent: { sessions: freshAgentSessions },
     tabRegistry: {
       remoteOpen: options.remoteOpen ?? [],
       sameDeviceOpen: options.sameDeviceOpen ?? [],
@@ -145,6 +205,44 @@ describe('makeSelectSessionStatusTiers', () => {
     }))
 
     expect(tiers).toEqual({})
+  })
+
+  it('restore-gap idle: live-canonical key stays grey while the stale locator key is local-open', () => {
+    const select = makeSelectSessionStatusTiers()
+    const tiers = select(makeState({
+      restoreGap: { staleSessionId: 'stale-gap', liveSessionId: 'live-gap' },
+    }))
+
+    // The Sidebar renders the canonical row grey (no hasTab, not busy): the
+    // identity collector's live key is a ring-suppression source, NOT a
+    // local-open render gate.
+    expect(tiers['claude:live-gap']).toBeUndefined()
+    expect(tiers['claude:stale-gap']).toBe('local-open')
+  })
+
+  it('restore-gap busy: live-canonical key is local-busy', () => {
+    const select = makeSelectSessionStatusTiers()
+    const tiers = select(makeState({
+      restoreGap: { staleSessionId: 'stale-gap', liveSessionId: 'live-gap', busy: true },
+    }))
+
+    expect(tiers['claude:live-gap']).toBe('local-busy')
+    expect(tiers['claude:stale-gap']).toBe('local-open')
+  })
+
+  it('restore-gap remote guard: a remote record for the ring-suppressed canonical key stays tier-less', () => {
+    const select = makeSelectSessionStatusTiers()
+    const tiers = select(makeState({
+      restoreGap: { staleSessionId: 'stale-gap', liveSessionId: 'live-gap' },
+      remoteOpen: [
+        makeRemoteRecord([{ sessionKeys: ['claude:live-gap'] }]),
+      ],
+    }))
+
+    // Ring suppression says "open on this device" — the row neither rings nor
+    // carries a local tier; it stays grey.
+    expect(tiers['claude:live-gap']).toBeUndefined()
+    expect(tiers['claude:stale-gap']).toBe('local-open')
   })
 
   it('omits sessions unknown to every source (grey is absence)', () => {

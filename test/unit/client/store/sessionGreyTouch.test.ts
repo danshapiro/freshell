@@ -3,6 +3,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { removeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import claudeActivityReducer, { setClaudeActivitySnapshot } from '@/store/claudeActivitySlice'
+import freshAgentReducer, { setSessionStatus } from '@/store/freshAgentSlice'
 import sessionActivityReducer, { selectAllSessionActivity } from '@/store/sessionActivitySlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import { startSessionGreyTouchWatcher } from '@/store/sessionGreyTouch'
@@ -33,6 +34,57 @@ function makeLayout(sessionId: string, terminalId = `term-${sessionId}`) {
         sessionRef: { provider: 'claude', sessionId },
       },
     },
+  }
+}
+
+/**
+ * Fresh-agent restore-gap fixtures: pane carries the STALE resume locator;
+ * the live session holds a DIFFERENT canonical session id.
+ */
+function makeFreshAgentGapTab(staleSessionId: string) {
+  return {
+    id: `tab-fresh-${staleSessionId}`,
+    title: staleSessionId,
+    createdAt: 1_000,
+  }
+}
+
+function makeFreshAgentGapLayout(staleSessionId: string, liveSessionId: string) {
+  return {
+    [`tab-fresh-${staleSessionId}`]: {
+      type: 'leaf',
+      id: `pane-fresh-${staleSessionId}`,
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionId: liveSessionId,
+        resumeSessionId: staleSessionId,
+        createRequestId: `req-fresh-${staleSessionId}`,
+        status: 'connected',
+      },
+    },
+  }
+}
+
+function makeLiveFreshSessionState(liveSessionId: string, status: 'idle' | 'running') {
+  return {
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    sessionId: liveSessionId,
+    sessionKey: `freshclaude:claude:${liveSessionId}`,
+    threadId: liveSessionId,
+    status,
+    turns: [],
+    historyItems: [],
+    historyBodies: {},
+    streamingText: '',
+    streamingActive: false,
+    pendingPermissions: {},
+    pendingQuestions: {},
+    totalCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
   }
 }
 
@@ -70,6 +122,7 @@ function createTouchStore(preloaded: {
   tabs?: any[]
   paneLayouts?: Record<string, any>
   claudeActivityByTerminalId?: Record<string, any>
+  freshAgentSessions?: Record<string, any>
   remoteOpen?: any[]
 }) {
   return configureStore({
@@ -77,6 +130,7 @@ function createTouchStore(preloaded: {
       tabs: tabsReducer,
       panes: panesReducer,
       claudeActivity: claudeActivityReducer,
+      freshAgent: freshAgentReducer,
       sessionActivity: sessionActivityReducer,
       tabRegistry: tabRegistryReducer,
     },
@@ -93,6 +147,14 @@ function createTouchStore(preloaded: {
             lastSnapshotSeq: 0,
             liveMutationSeqByTerminalId: {},
             removedMutationSeqByTerminalId: {},
+          }
+        : undefined,
+      freshAgent: preloaded.freshAgentSessions
+        ? {
+            sessions: preloaded.freshAgentSessions,
+            pendingCreates: {},
+            pendingCreateFailures: {},
+            availableModels: [],
           }
         : undefined,
       tabRegistry: preloaded.remoteOpen
@@ -182,6 +244,32 @@ describe('startSessionGreyTouchWatcher', () => {
 
     touched = selectAllSessionActivity(store.getState() as RootState)
     expect(touched).toEqual({})
+    stop()
+  })
+
+  it('restore-gap busy → idle: the live-canonical key goes local-busy → grey and gets touched', () => {
+    const store = createTouchStore({
+      tabs: [makeFreshAgentGapTab('stale-gap')],
+      paneLayouts: makeFreshAgentGapLayout('stale-gap', 'live-gap'),
+      freshAgentSessions: {
+        'freshclaude:claude:live-gap': makeLiveFreshSessionState('live-gap', 'running'),
+      },
+    })
+    const stop = startSessionGreyTouchWatcher(store as any)
+
+    store.dispatch(setSessionStatus({
+      sessionId: 'live-gap',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      status: 'idle',
+    }))
+
+    touched = selectAllSessionActivity(store.getState() as RootState)
+    // The canonical key rendered grey after idle — the touch must fire so the
+    // row ratchets to the top of the grey tier in the default sort.
+    expect(touched['claude:live-gap']).toBeGreaterThan(0)
+    // The stale locator key stayed local-open throughout: never grey, no touch.
+    expect(touched['claude:stale-gap']).toBeUndefined()
     stop()
   })
 

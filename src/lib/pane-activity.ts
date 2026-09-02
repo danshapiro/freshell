@@ -398,6 +398,29 @@ export type PaneIdentityActivity = {
 }
 
 /**
+ * Fabricated terminal fallback row keys across all local panes — the
+ * `<mode>:terminal:<terminalId>` rows the Sidebar renders with hasTab=true
+ * (green icon when not busy). Walks the same layout leaves as
+ * collectPaneIdentityActivity; terminal-only, deduped.
+ */
+export function collectTerminalFallbackRowKeys(input: PaneActivityMaps & {
+  tabs: Tab[]
+  paneLayouts: Record<string, PaneNode | undefined>
+}): string[] {
+  const keys = new Set<string>()
+  for (const tab of input.tabs) {
+    const layout = input.paneLayouts[tab.id]
+    if (!layout) continue
+    for (const entry of collectPaneEntries(layout)) {
+      if (entry.content.kind !== 'terminal') continue
+      const key = resolveTerminalFallbackRowKey(entry.content)
+      if (key) keys.add(key)
+    }
+  }
+  return Array.from(keys)
+}
+
+/**
  * Per-leaf-pane session identity + busy stamping for the tab registry push.
  * `sessionKeys` holds every identity a remote Sidebar row could join on:
  * the pane's canonical locators (same rules as the local green/hasTab join),

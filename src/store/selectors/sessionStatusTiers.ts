@@ -37,7 +37,7 @@ export function sessionStatusTierRank(
 
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '@/store/store'
-import { collectBusySessionKeys, collectPaneIdentityActivity } from '@/lib/pane-activity'
+import { collectBusySessionKeys, collectPaneIdentityActivity, collectTerminalFallbackRowKeys } from '@/lib/pane-activity'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { deriveRemoteSessionActivity } from '@/store/selectors/tabsRegistrySelectors'
 
@@ -61,10 +61,17 @@ const selectSameDeviceOpen = (state: RootState) => state.tabRegistry?.sameDevice
  * default-sort tiering, and the grey-transition touch watcher all read from
  * this shape so they can never disagree about what "grey" means.
  *
- * Producing sources are the exact helpers the Sidebar's render gate uses
- * (`collectBusySessionKeys` ∪ `collectSessionRefsFromTabs` ∪
- * `collectPaneIdentityActivity` locally; `deriveRemoteSessionActivity`
- * remotely), so a tier here always matches the icon/ring the row draws.
+ * Producing sources mirror the Sidebar's THREE separate render gates:
+ *   - solid blue icon (busy): collectBusySessionKeys
+ *   - solid green icon (hasTab): collectSessionRefsFromTabs keys plus
+ *     fabricated terminal fallback rows (collectTerminalFallbackRowKeys)
+ *   - remote-ring suppression: collectSessionRefsFromTabs ∪
+ *     collectPaneIdentityActivity sessionKeys/busySessionKeys
+ *
+ * collectPaneIdentityActivity is ONLY the ring-suppression gate — it also
+ * covers grey-rendered rows (e.g. a fresh-agent pane's live-canonical key in
+ * the restore gap), so it never grants local-open. deriveRemoteSessionActivity
+ * supplies remote tiers only for keys with no local tier and no suppression.
  *
  * Factory (like makeSelectSortedSessionItems): each consumer gets its own
  * memoized instance — the grey-touch watcher runs it on every store change.
@@ -108,19 +115,31 @@ export const makeSelectSessionStatusTiers = () =>
       const busyKeys = collectBusySessionKeys({ tabs, paneLayouts, ...activityMaps })
       const identityByPaneId = collectPaneIdentityActivity({ tabs, paneLayouts, ...activityMaps })
 
-      const localCoveredKeys = new Set<string>()
+      const refKeys = new Set<string>()
       for (const ref of collectSessionRefsFromTabs(tabs, { ...(panes ?? {}), layouts: paneLayouts })) {
-        localCoveredKeys.add(`${ref.provider}:${ref.sessionId}`)
+        refKeys.add(`${ref.provider}:${ref.sessionId}`)
       }
+
+      // local-open = the Sidebar's green-icon gate: tab session refs plus
+      // fabricated terminal fallback rows. NOT the identity collector (see
+      // the ring-suppression comment below).
+      const localOpenKeys = new Set<string>(refKeys)
+      for (const key of collectTerminalFallbackRowKeys({ tabs, paneLayouts, ...activityMaps })) {
+        localOpenKeys.add(key)
+      }
+
+      // Ring suppression = exactly the union Sidebar.tsx builds for its
+      // remote-ring gate; keys in it render ring-less on this device, so they
+      // must not receive remote tiers either.
+      const ringSuppressionKeys = new Set<string>(refKeys)
       for (const paneActivity of identityByPaneId.values()) {
-        for (const key of paneActivity.sessionKeys) localCoveredKeys.add(key)
-        for (const key of paneActivity.busySessionKeys) localCoveredKeys.add(key)
+        for (const key of paneActivity.sessionKeys) ringSuppressionKeys.add(key)
+        for (const key of paneActivity.busySessionKeys) ringSuppressionKeys.add(key)
       }
-      for (const key of busyKeys) localCoveredKeys.add(key)
 
       const tiers: Record<string, SessionStatusTier> = {}
       for (const key of busyKeys) tiers[key] = 'local-busy'
-      for (const key of localCoveredKeys) {
+      for (const key of localOpenKeys) {
         if (!tiers[key]) tiers[key] = 'local-open'
       }
 
@@ -129,6 +148,7 @@ export const makeSelectSessionStatusTiers = () =>
       for (const [key, status] of Object.entries(remoteActivity)) {
         if (tiers[key]) continue // local wins: a session open here never rings
         if (sameDeviceKeys.has(key)) continue // same-device records never ring
+        if (ringSuppressionKeys.has(key)) continue // ring suppressed here: no remote tier
         tiers[key] = status === 'busy' ? 'remote-busy' : 'remote-open'
       }
 
