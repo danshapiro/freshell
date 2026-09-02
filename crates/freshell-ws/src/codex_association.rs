@@ -770,6 +770,9 @@ mod tests {
                 permission_mode: None,
                 effort: None,
                 supersedes: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: now_ms(),
             })
             .expect("seed fresh-agent ledger row");

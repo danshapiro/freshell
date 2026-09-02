@@ -240,6 +240,9 @@ impl PaneIdentitySink for TestLedgerSink {
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
+                    client_instance_id: None,
+                    device_id: None,
+                    tab_key: None,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;

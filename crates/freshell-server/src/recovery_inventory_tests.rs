@@ -77,6 +77,11 @@ fn binding_row_at(
         sandbox: None,
         permission_mode: None,
         effort: None,
+        // D8 provenance: fixtures default to unattributed (pre-upgrade shape);
+        // Task 3's judgment-matrix fixtures name them explicitly.
+        client_instance_id: None,
+        device_id: None,
+        tab_key: None,
     }
 }
 

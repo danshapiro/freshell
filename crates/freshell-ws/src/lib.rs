@@ -816,6 +816,24 @@ async fn handle_socket(
         .and_then(|c| c.get("uiScreenshotV1"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // D8 (restore-open-sessions-only): the connection's client identity rides
+    // the `hello` frame as additive optional top-level fields (older clients
+    // omit them; an absent hello identity simply leaves ledger rows
+    // unstamped). Read from the raw payload exactly like the capability bools
+    // above; `tabs.sync.push` frames refresh it inside the serve loop.
+    let conn_identity = terminal::ConnectionIdentity {
+        device_id: value
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        client_instance_id: value
+            .get("clientInstanceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
     terminal::run(
@@ -827,6 +845,7 @@ async fn handle_socket(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         origin_kind,
+        conn_identity,
     )
     .await;
 }

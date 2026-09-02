@@ -205,6 +205,33 @@ fn map_shell(shell: Shell) -> ShellType {
     }
 }
 
+/// D8 (restore-open-sessions-only): this connection's client identity —
+/// stamped from the `hello` frame at handshake (`lib.rs`), then refreshed by
+/// every `tabs.sync.push` (a mid-lifetime clientInstanceId rotation self-heals
+/// at the next push instead of waiting out a reconnect; and a create issued
+/// between `ready` and the first push is still stamped from the hello).
+/// Connection-scoped bind lanes stamp ledger rows from it; conn-less lanes
+/// (respawn, locator/adoption resolution, REST/headless) never see one.
+/// `pub` only because [`run`] (also `pub`) takes it — crate-internal plumbing.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionIdentity {
+    pub device_id: Option<String>,
+    pub client_instance_id: Option<String>,
+}
+
+impl ConnectionIdentity {
+    /// The provenance stamps for one create off this connection — `tabKey`
+    /// composes as `deviceId:tabId` (exactly `src/lib/tab-registry-snapshot.ts`'s
+    /// record composition) and only when both halves exist.
+    fn bind_provenance(&self, tab_id: Option<&str>) -> freshell_freshagent::BindProvenance {
+        freshell_freshagent::BindProvenance::for_create(
+            self.client_instance_id.as_deref(),
+            self.device_id.as_deref(),
+            tab_id,
+        )
+    }
+}
+
 /// Serve one authenticated connection's `terminal.*` traffic (and fan out the
 /// shared broadcast bus) until the socket closes. `socket` has already had the
 /// connect handshake written by the caller; `bcast_rx` is this connection's
@@ -219,6 +246,7 @@ pub async fn run(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
+    conn_identity: ConnectionIdentity,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -258,6 +286,7 @@ pub async fn run(
         pane_reconcile_fresh_agent_v1,
         conn_id,
         origin_kind,
+        conn_identity,
     )
     .instrument(span)
     .await;
@@ -278,6 +307,7 @@ async fn run_loop(
     pane_reconcile_fresh_agent_v1: bool,
     conn_id: u64,
     origin_kind: &'static str,
+    mut conn_identity: ConnectionIdentity,
 ) {
     // This connection's single outbound channel. The registry delivers this
     // connection's attach.ready / replay / live-output / exit frames here (via the
@@ -417,6 +447,7 @@ async fn run_loop(
                             &mut create_limiter,
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
+                            &mut conn_identity,
                         )
                         .await
                         {
@@ -657,6 +688,9 @@ async fn handle_client_text(
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
     // Task 9: per-connection hoststats.refresh floor stamp (see run_loop).
     host_stats_last_refresh_at: &mut Option<std::time::Instant>,
+    // D8: the connection's hello-stamped client identity (refreshed by
+    // `tabs.sync.push` below) — the provenance source for ledger stamps.
+    conn_identity: &mut ConnectionIdentity,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -670,7 +704,27 @@ async fn handle_client_text(
     // `server/ws-handler.ts:3058-3145`.
     if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
         match msg_type {
-            "tabs.sync.push" => return handle_tabs_push(&value, ws_tx, state).await,
+            "tabs.sync.push" => {
+                // D8: refresh the connection identity from each push (same
+                // non-empty-string filter `validate_tabs_push` applies), so a
+                // mid-lifetime clientInstanceId rotation self-heals at the
+                // next push instead of waiting out a reconnect.
+                if let Some(device_id) = value
+                    .get("deviceId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    conn_identity.device_id = Some(device_id.to_string());
+                }
+                if let Some(client_instance_id) = value
+                    .get("clientInstanceId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    conn_identity.client_instance_id = Some(client_instance_id.to_string());
+                }
+                return handle_tabs_push(&value, ws_tx, state).await;
+            }
             "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
             "tabs.sync.client.retire" => {
                 handle_tabs_retire(&value, state).await;
@@ -854,6 +908,7 @@ async fn handle_client_text(
                     create_cancel_rx.clone(),
                     conn_id,
                     pane_reconcile_v1,
+                    conn_identity.clone(),
                 );
                 true
             } else {
@@ -867,6 +922,7 @@ async fn handle_client_text(
                     conn_id,
                     pane_reconcile_v1,
                     create_limiter,
+                    conn_identity,
                 )
                 .await;
                 // No-op on success (the entry is Settled by `handle_create`'s
@@ -975,18 +1031,24 @@ async fn handle_client_text(
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
+                // D8 (restore-open-sessions-only): thread this connection's
+                // provenance (hello identity + the create's `tabId`) down the
+                // provider `handle_create` chain so the identity-sink binding
+                // write is stamped. The message alone cannot carry the device/
+                // client identity (it is per-CONNECTION, not per-pane).
+                let provenance = conn_identity.bind_provenance(create.tab_id.as_deref());
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(
-                            async move { fresh_codex.handle_create(create).await }
+                            async move { fresh_codex.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(
-                            async move { fresh_claude.handle_create(create).await }
+                            async move { fresh_claude.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
@@ -994,7 +1056,7 @@ async fn handle_client_text(
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
                         tokio::spawn(
-                            async move { fresh_opencode.handle_create(create).await }
+                            async move { fresh_opencode.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
@@ -2489,7 +2551,10 @@ pub(crate) async fn prepare_launch(
 
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
-/// sends `terminal.attach` next.
+/// sends `terminal.attach` next. `conn_identity` (D8) is the creating connection's
+/// hello-stamped client identity; the ledger bind sites below stamp it onto the
+/// row (tabKey composed with the create's `tabId`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_create(
     create: TerminalCreate,
     prepared: Option<PreparedLaunch>,
@@ -2498,6 +2563,7 @@ pub(crate) async fn handle_create(
     conn_id: u64,
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    conn_identity: &ConnectionIdentity,
 ) -> bool {
     // P1 (graceful restore/resume S1): destructure the prepared values at
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
@@ -3381,6 +3447,11 @@ pub(crate) async fn handle_create(
     // (provider, session_id) key with the resolved cwd — a benign re-write
     // — and stays the ONLY writer for resume creates. Failure policy
     // identical to that arm: never blocks the create, surfaced LIVE.
+    // D8 (restore-open-sessions-only): the provenance this connection-scoped
+    // create stamps onto its ledger rows — the connection's hello identity plus
+    // the create's `tabId` (`tabKey` composes only when both halves exist).
+    let bind_provenance = conn_identity.bind_provenance(create.tab_id.as_deref());
+
     if claude_fresh_prealloc {
         if let Some(session_id) = resume_session_id.as_deref() {
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
@@ -3389,6 +3460,9 @@ pub(crate) async fn handle_create(
             let write_mode = mode.clone();
             let write_cwd = spec.cwd.clone();
             let write_request_id = create.request_id.clone();
+            let write_client_instance_id = bind_provenance.client_instance_id.clone();
+            let write_device_id = bind_provenance.device_id.clone();
+            let write_tab_key = bind_provenance.tab_key.clone();
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3398,6 +3472,9 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    client_instance_id: write_client_instance_id.as_deref(),
+                    device_id: write_device_id.as_deref(),
+                    tab_key: write_tab_key.as_deref(),
                     now_ms: now,
                 })
             })
@@ -3708,6 +3785,9 @@ pub(crate) async fn handle_create(
             let write_mode = mode.clone();
             let write_cwd = record.cwd.clone();
             let write_request_id = create.request_id.clone();
+            let write_client_instance_id = bind_provenance.client_instance_id.clone();
+            let write_device_id = bind_provenance.device_id.clone();
+            let write_tab_key = bind_provenance.tab_key.clone();
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3717,6 +3797,9 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    client_instance_id: write_client_instance_id.as_deref(),
+                    device_id: write_device_id.as_deref(),
+                    tab_key: write_tab_key.as_deref(),
                     now_ms: now,
                 })
             })
@@ -4383,6 +4466,12 @@ pub async fn respawn_agent_terminal(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Conn-less lane (D8): the auto-resume respawn has no
+                    // client connection; the upsert's keep-when-None merge
+                    // preserves the create's provenance stamps.
+                    client_instance_id: None,
+                    device_id: None,
+                    tab_key: None,
                     now_ms: now,
                 })
             })
@@ -7194,6 +7283,7 @@ mod pane_reconcile_gate_tests {
         let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         let keep_open = handle_client_text(
             r#"{"type":"pane.reconcile.request","reconcileId":"r1","panes":[{"paneKey":"tab-1:pane-1","kind":"terminal","mode":"shell","createRequestId":"cr-1"}]}"#,
@@ -7207,6 +7297,7 @@ mod pane_reconcile_gate_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(
@@ -7230,6 +7321,7 @@ mod pane_reconcile_gate_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(pong_ok);
@@ -7551,6 +7643,7 @@ mod host_stats_dispatch_tests {
         let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         // subscribe: 0->1 edge drives set_active(true) ONCE and the current
         // snapshot is sent immediately Node `sendHostStatsSnapshot` parity,
@@ -7568,6 +7661,7 @@ mod host_stats_dispatch_tests {
                 &mut create_limiter,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
+                &mut conn_identity,
             )
             .await;
             assert!(ok);
@@ -7598,6 +7692,7 @@ mod host_stats_dispatch_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7618,6 +7713,7 @@ mod host_stats_dispatch_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(pong_ok);
@@ -7641,6 +7737,7 @@ mod host_stats_dispatch_tests {
         let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         // First refresh passes the floor and invokes the collector.
         let ok = handle_client_text(
@@ -7655,6 +7752,7 @@ mod host_stats_dispatch_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7681,6 +7779,7 @@ mod host_stats_dispatch_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7708,6 +7807,7 @@ mod host_stats_dispatch_tests {
         let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         let ok = handle_client_text(
             r#"{"type":"hoststats.refresh","requestId":"r9"}"#,
@@ -7721,6 +7821,7 @@ mod host_stats_dispatch_tests {
             &mut create_limiter,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);

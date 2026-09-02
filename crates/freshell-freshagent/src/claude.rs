@@ -455,7 +455,13 @@ impl FreshClaudeState {
     /// SDK `create` to get the BARE nanoid placeholder, register the session + its stdout
     /// consumer, and broadcast `freshAgent.created` (or `freshAgent.create.failed`).
     /// Long-running (cold sidecar spawn), so the WS loop dispatches this as a detached task.
-    pub async fn handle_create(&self, msg: FreshAgentCreate) {
+    /// `provenance` (D8): the WS connection's stamped identity for this create
+    /// (`None` on conn-less lanes); threaded to the `sdk.session.init` binding write.
+    pub async fn handle_create(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) {
         let request_id = msg.request_id.clone();
         let session_type = session_type_str(msg.session_type);
 
@@ -657,6 +663,7 @@ impl FreshClaudeState {
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
+            provenance,
         );
 
         // V5 interleaving 2 (Task 12): on the create-resume path, insert
@@ -2304,6 +2311,10 @@ impl FreshClaudeState {
                 preseeded_init,
                 adopted_tx,
             }),
+            // Conn-less lane (D8): the rollback respawn has no client
+            // connection — the ledger merge inherits the superseded parent's
+            // stamps.
+            None,
         );
         self.sessions.lock().await.insert(
             map_key.clone(),
@@ -2742,6 +2753,9 @@ impl FreshClaudeState {
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
+            // Conn-less lane (D8): attach-resume is not a create; the ledger
+            // merge keeps the row's existing stamps.
+            None,
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
@@ -2834,7 +2848,11 @@ impl FreshClaudeState {
     /// warn-and-drop, then the identity event proceeds. No-laundering guard
     /// (V7/A10): never persist an all-blank snapshot UNLESS a supersession edge
     /// is being written (a supersession write always goes through — it is the
-    /// only record of the old→new linkage, G3).
+    /// only record of the old→new linkage, G3). `provenance` (D8): the creating
+    /// connection's stamps, when this adoption flows from a connection-scoped
+    /// create; `None` on conn-less lanes — the ledger's keep-when-None merge
+    /// then keeps (or, under `supersedes`, inherits the parent's) prior stamps.
+    #[allow(clippy::too_many_arguments)] // Session-init wiring; the spawn_consumer precedent.
     async fn adopt_session_init(
         &self,
         cli_id: &str,
@@ -2843,6 +2861,7 @@ impl FreshClaudeState {
         settings: Option<&crate::identity_sink::FreshAgentSettings>,
         supersedes: Option<&str>,
         identity_sink: Option<SharedPaneIdentitySink>,
+        provenance: Option<&crate::BindProvenance>,
     ) {
         self.cli_index
             .lock()
@@ -2859,6 +2878,11 @@ impl FreshClaudeState {
             return;
         }
         let Some(sink) = identity_sink else { return };
+        let crate::BindProvenance {
+            client_instance_id,
+            device_id,
+            tab_key,
+        } = provenance.cloned().unwrap_or_default();
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
@@ -2867,6 +2891,9 @@ impl FreshClaudeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: supersedes.map(str::to_string),
+                client_instance_id,
+                device_id,
+                tab_key,
                 settings: settings.cloned().unwrap_or_default(),
             })
             .await
@@ -2952,6 +2979,12 @@ impl FreshClaudeState {
         // adoption for it FIRST (supersedes-aware), then resolves the parked
         // rollback handler with the adopted durable id.
         adoption: Option<RollbackAdoption>,
+        // D8: the creating connection's provenance stamps, handed to both
+        // `adopt_session_init` arms (the rollback preseed lane and the
+        // in-stream `sdk.session.init`). `None` on conn-less consumers
+        // (rollback respawn, attach-resume) — the ledger merge keeps prior
+        // stamps.
+        provenance: Option<crate::BindProvenance>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
@@ -2979,6 +3012,7 @@ impl FreshClaudeState {
                             settings.as_ref(),
                             Some(&adoption.supersedes),
                             identity_sink.clone(),
+                            provenance.as_ref(),
                         )
                         .await;
                     let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
@@ -3225,6 +3259,7 @@ impl FreshClaudeState {
                                 settings.as_ref(),
                                 None,
                                 identity_sink.clone(),
+                                provenance.as_ref(),
                             )
                             .await;
                     }
@@ -4675,7 +4710,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-rebind-status"))
+        st.handle_create(dedup_create_msg("req-rebind-status"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-rebind-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -4726,7 +4761,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-settle-status"))
+        st.handle_create(dedup_create_msg("req-settle-status"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-settle-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -4777,7 +4812,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A tracked live claude session (fake sidecar standing in for the Node one).
-        st.handle_create(dedup_create_msg("req-running-status"))
+        st.handle_create(dedup_create_msg("req-running-status"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-running-status").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -5450,6 +5485,7 @@ rl.on('line', (line) => {
             sandbox: None,
             effort: None,
             plugins: None,
+            tab_id: None,
         }
     }
 
@@ -5493,7 +5529,7 @@ rl.on('line', (line) => {
             session_id: durable.to_string(),
         });
 
-        st.handle_create(msg).await;
+        st.handle_create(msg, None).await;
         let frame = await_claude_created(&mut rx, "req-sref-only-1").await;
 
         assert_eq!(
@@ -5519,13 +5555,13 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-seq"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq"), None)
             .await;
         let first = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
         assert_eq!(first["type"], "freshAgent.created", "sanity: {first}");
         let first_session_id = first["sessionId"].as_str().unwrap().to_string();
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-seq"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-seq"), None)
             .await;
         let second = await_claude_created(&mut rx, "req-claude-dedup-seq").await;
 
@@ -5553,8 +5589,8 @@ rl.on('line', (line) => {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_create(dedup_create_msg("req-claude-dedup-race")),
-            st2.handle_create(dedup_create_msg("req-claude-dedup-race")),
+            st1.handle_create(dedup_create_msg("req-claude-dedup-race"), None),
+            st2.handle_create(dedup_create_msg("req-claude-dedup-race"), None),
         );
 
         let first = await_claude_created(&mut rx, "req-claude-dedup-race").await;
@@ -5580,11 +5616,11 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-a"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-a"), None)
             .await;
         let a = await_claude_created(&mut rx, "req-claude-dedup-a").await;
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-b"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-b"), None)
             .await;
         let b = await_claude_created(&mut rx, "req-claude-dedup-b").await;
 
@@ -5617,7 +5653,7 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-kill"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -5630,7 +5666,7 @@ rl.on('line', (line) => {
         })
         .await;
 
-        st.handle_create(dedup_create_msg("req-claude-dedup-kill"))
+        st.handle_create(dedup_create_msg("req-claude-dedup-kill"), None)
             .await;
         let recreated = await_claude_created(&mut rx, "req-claude-dedup-kill").await;
 
@@ -5801,7 +5837,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-approval-respond"))
+        st.handle_create(dedup_create_msg("req-approval-respond"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-respond").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -5895,7 +5931,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-approval-null-decision"))
+        st.handle_create(dedup_create_msg("req-approval-null-decision"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-null-decision").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -5939,7 +5975,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-approval-unknown"))
+        st.handle_create(dedup_create_msg("req-approval-unknown"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-approval-unknown").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -5974,7 +6010,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-question-respond"))
+        st.handle_create(dedup_create_msg("req-question-respond"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-question-respond").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -6031,7 +6067,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-compact")).await;
+        st.handle_create(dedup_create_msg("req-compact"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-compact").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -6071,7 +6108,7 @@ rl.on('line', (line) => {
         let (st, mut rx) = state_with_bus();
         let mut create = dedup_create_msg("req-kilroy-respond");
         create.session_type = SessionType::Kilroy;
-        st.handle_create(create).await;
+        st.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "req-kilroy-respond").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -6122,7 +6159,7 @@ rl.on('line', (line) => {
         let (st, mut rx) = state_with_bus();
         let mut create = dedup_create_msg("req-kilroy-approval-lands");
         create.session_type = SessionType::Kilroy;
-        st.handle_create(create).await;
+        st.handle_create(create, None).await;
         let created = await_claude_created(&mut rx, "req-kilroy-approval-lands").await;
         assert_eq!(
             created["sessionType"], "kilroy",
@@ -6228,6 +6265,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
+            None, // provenance: test lane is conn-less (D8)
         );
 
         // The replace-resend is the LAST scripted line: observing its input proves the
@@ -6379,7 +6417,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-cli-idx-1")).await;
+        st.handle_create(dedup_create_msg("req-cli-idx-1"), None)
+            .await;
         let created_frame = await_claude_created(&mut rx, "req-cli-idx-1").await;
         let created = created_frame["sessionId"].as_str().unwrap().to_string();
 
@@ -6441,7 +6480,7 @@ rl.on('line', (line) => {
         msg.permission_mode = Some("plan".to_string());
         msg.effort = Some("high".to_string());
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
-        state.handle_create(msg).await;
+        state.handle_create(msg, None).await;
         await_claude_created(&mut rx, "req-binding-init").await;
 
         // Wait for sdk.session.init to be consumed: the binding write is AWAITED
@@ -6490,7 +6529,7 @@ rl.on('line', (line) => {
         // dedup_create_msg carries no model/permissionMode/effort/cwd — the
         // all-blank snapshot shape.
         state
-            .handle_create(dedup_create_msg("req-binding-blank"))
+            .handle_create(dedup_create_msg("req-binding-blank"), None)
             .await;
         await_claude_created(&mut rx, "req-binding-blank").await;
 
@@ -6511,6 +6550,53 @@ rl.on('line', (line) => {
             "an all-blank settings snapshot must not be persisted \
              (it would arm a false SETTINGS_RESET on resume)"
         );
+        drop(env);
+    }
+
+    /// D8 lane-reach (restore-open-sessions-only, review round 3): the
+    /// WS-dispatched connection provenance threaded into `handle_create` must
+    /// reach the identity-sink write at `sdk.session.init`. The ledger schema
+    /// fields are all optional, so without this pin the freshclaude/kilroy
+    /// lane could keep writing `None` silently — and the recovery judgment
+    /// that consumes the stamps would then drop genuinely-open sessions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_binding_carries_the_creates_connection_provenance() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // cwd set so the settings snapshot is recordable (the V7/A10
+        // no-laundering gate); the provenance rides the same create.
+        let mut msg = dedup_create_msg("req-binding-prov");
+        msg.cwd = Some(env.dir.to_string_lossy().to_string());
+        let provenance = crate::BindProvenance::for_create(
+            Some("client-claude"),
+            Some("device-claude"),
+            Some("tab-claude"),
+        );
+        state.handle_create(msg, Some(provenance)).await;
+        await_claude_created(&mut rx, "req-binding-prov").await;
+
+        // The binding write is AWAITED before the init frame broadcasts (same
+        // witness idiom as `session_init_records_binding_with_create_settings`).
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings.last().expect("binding at sdk.session.init");
+        assert_eq!(b.client_instance_id.as_deref(), Some("client-claude"));
+        assert_eq!(b.device_id.as_deref(), Some("device-claude"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-claude:tab-claude"));
         drop(env);
     }
 
@@ -6669,7 +6755,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-evict-1")).await;
+        st.handle_create(dedup_create_msg("req-evict-1"), None)
+            .await;
         let created_frame = await_claude_created(&mut rx, "req-evict-1").await;
         let created = created_frame["sessionId"].as_str().unwrap().to_string();
         // Kill the sidecar through the public API (fake exits on text "__exit__"),
@@ -6731,7 +6818,7 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-interrupt"))
+        st.handle_create(dedup_create_msg("req-claude-interrupt"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-claude-interrupt").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
@@ -6793,7 +6880,7 @@ rl.on('line', (line) => {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
 
-        st.handle_create(dedup_create_msg("req-claude-death-unwedge"))
+        st.handle_create(dedup_create_msg("req-claude-death-unwedge"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-claude-death-unwedge").await;
         assert_eq!(created["type"], "freshAgent.created", "sanity: {created}");
@@ -7011,6 +7098,7 @@ rl.on('line', (line) => {
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
+            None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
             map_key.to_string(),
@@ -7148,6 +7236,7 @@ rl.on('line', (line) => {
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
             None,
+            None, // provenance: test lane is conn-less (D8)
         );
         st.sessions.lock().await.insert(
             map_key.to_string(),
@@ -7284,7 +7373,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-in-turn-edges"))
+        st.handle_create(dedup_create_msg("req-in-turn-edges"), None)
             .await;
         let created = await_claude_created(&mut rx, "req-in-turn-edges").await;
         let sid = created["sessionId"].as_str().unwrap().to_string();
@@ -7422,7 +7511,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-compact-rb")).await;
+        st.handle_create(dedup_create_msg("req-compact-rb"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-compact-rb").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -7497,7 +7587,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qcompact")).await;
+        st.handle_create(dedup_create_msg("req-qcompact"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qcompact").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         // Fold the create-time idle BEFORE any turn starts (no stale clear edge).
@@ -7649,7 +7740,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-autocompact")).await;
+        st.handle_create(dedup_create_msg("req-autocompact"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-autocompact").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -7721,7 +7813,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-icand")).await;
+        st.handle_create(dedup_create_msg("req-icand"), None).await;
         let created = await_claude_created(&mut rx, "req-icand").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -7799,7 +7891,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-notfound")).await;
+        st.handle_create(dedup_create_msg("req-notfound"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-notfound").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -7852,7 +7945,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qproof")).await;
+        st.handle_create(dedup_create_msg("req-qproof"), None).await;
         let created = await_claude_created(&mut rx, "req-qproof").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -7898,7 +7991,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qdisarm")).await;
+        st.handle_create(dedup_create_msg("req-qdisarm"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qdisarm").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         // Fold the create-time idle BEFORE any turn starts (no stale clear edge).
@@ -7943,7 +8037,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qinterpose")).await;
+        st.handle_create(dedup_create_msg("req-qinterpose"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qinterpose").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8053,7 +8148,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-q2compact")).await;
+        st.handle_create(dedup_create_msg("req-q2compact"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-q2compact").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8148,7 +8244,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-q2sends")).await;
+        st.handle_create(dedup_create_msg("req-q2sends"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-q2sends").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8269,7 +8366,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qpair")).await;
+        st.handle_create(dedup_create_msg("req-qpair"), None).await;
         let created = await_claude_created(&mut rx, "req-qpair").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8366,7 +8463,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qstale")).await;
+        st.handle_create(dedup_create_msg("req-qstale"), None).await;
         let created = await_claude_created(&mut rx, "req-qstale").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8553,7 +8650,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-revive")).await;
+        st.handle_create(dedup_create_msg("req-revive"), None).await;
         let created = await_claude_created(&mut rx, "req-revive").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8655,7 +8752,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-dropahead")).await;
+        st.handle_create(dedup_create_msg("req-dropahead"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-dropahead").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8717,7 +8815,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qinterleave")).await;
+        st.handle_create(dedup_create_msg("req-qinterleave"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qinterleave").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8801,7 +8900,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qdropint")).await;
+        st.handle_create(dedup_create_msg("req-qdropint"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qdropint").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8873,7 +8973,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qadv")).await;
+        st.handle_create(dedup_create_msg("req-qadv"), None).await;
         let created = await_claude_created(&mut rx, "req-qadv").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -8937,7 +9037,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qdropabs")).await;
+        st.handle_create(dedup_create_msg("req-qdropabs"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-qdropabs").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -9001,7 +9102,7 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-qirq")).await;
+        st.handle_create(dedup_create_msg("req-qirq"), None).await;
         let created = await_claude_created(&mut rx, "req-qirq").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -9085,7 +9186,7 @@ rl.on('line', (line) => {
         let env = FakeClaudeSidecarEnv::install();
         std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_SETTLE_MS", "400");
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-settle")).await;
+        st.handle_create(dedup_create_msg("req-settle"), None).await;
         let created = await_claude_created(&mut rx, "req-settle").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -9139,7 +9240,8 @@ rl.on('line', (line) => {
         let env = FakeClaudeSidecarEnv::install();
         std::env::set_var("FRESHELL_TEST_CLAUDE_INTERRUPT_REJECT", "1");
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-ireject")).await;
+        st.handle_create(dedup_create_msg("req-ireject"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-ireject").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;
@@ -9269,7 +9371,8 @@ rl.on('line', (line) => {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
-        st.handle_create(dedup_create_msg("req-misattr")).await;
+        st.handle_create(dedup_create_msg("req-misattr"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-misattr").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
         await_status_frame(&mut rx, &session_id, "idle").await;

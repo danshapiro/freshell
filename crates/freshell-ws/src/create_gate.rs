@@ -68,6 +68,9 @@ pub(crate) fn spawn_gated_restore_create(
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     conn_id: u64,
     pane_reconcile_v1: bool,
+    // D8: the dispatching connection's identity, carried into the detached
+    // task so the restore create's ledger rows stamp like an inline create's.
+    conn_identity: crate::terminal::ConnectionIdentity,
 ) {
     let state = state.clone();
     let sink = std::sync::Arc::clone(conn_sink);
@@ -236,6 +239,7 @@ pub(crate) fn spawn_gated_restore_create(
                     conn_id,
                     pane_reconcile_v1,
                     &mut create_limiter,
+                    &conn_identity,
                 )
                 .await;
                 // Covers create failure: no-op when handle_create settled the entry,

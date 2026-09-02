@@ -315,6 +315,9 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             mode: provider,
             cwd: None,
             create_request_id: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: now_ms(),
         })
         .expect("seed bound ledger row");

@@ -45,7 +45,7 @@ import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotific
 import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
-import { startTabRegistrySync } from '@/store/tabRegistrySync'
+import { startTabRegistrySync, getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
@@ -723,6 +723,13 @@ export default function App() {
           appStore.getState().panes,
         ),
         client: { mobile: isMobileRef.current },
+        // D8 (restore-open-sessions-only): the connection's provenance identity
+        // — the same deviceId/clientInstanceId `tabs.sync.push` frames carry —
+        // so the server can stamp connection-scoped ledger bind rows. The
+        // provider is re-invoked per (re)connect, so a lease-collision rotation
+        // re-stamps on the next hello.
+        deviceId: appStore.getState().tabRegistry.deviceId,
+        clientInstanceId: getCurrentTabRegistryClientInstanceId(),
       }))
 
       const requestCodexActivityList = () => {

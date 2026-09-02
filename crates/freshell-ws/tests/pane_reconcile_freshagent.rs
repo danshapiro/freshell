@@ -722,6 +722,9 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             permission_mode: None,
             effort: None,
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: now,
         })
         .unwrap();
@@ -738,6 +741,9 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             permission_mode: None,
             effort: None,
             supersedes: Some("old-t"),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: now + 1,
         })
         .unwrap();

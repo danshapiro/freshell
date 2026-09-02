@@ -25,6 +25,43 @@ pub struct FreshAgentSettings {
     pub cwd: Option<String>,
 }
 
+/// D8 (restore-open-sessions-only) bind-lane provenance: WHICH browser client
+/// and tab caused a ledger binding write. Connection-scoped lanes stamp it
+/// from the WS connection's hello identity (`deviceId`/`clientInstanceId`)
+/// plus the create message's `tabId`; conn-less lanes (respawn, locator/
+/// adoption resolution, fork chains, REST/headless) carry `None`s and the
+/// ledger upsert bodies merge keep-when-`None` so re-binds preserve prior
+/// stamps (adoption lanes that DO know newer identity pass `Some` and
+/// replace).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindProvenance {
+    pub client_instance_id: Option<String>,
+    pub device_id: Option<String>,
+    /// `deviceId:tabId` — exactly `src/lib/tab-registry-snapshot.ts`'s record
+    /// composition, so the row can rejoin the right restored tab.
+    pub tab_key: Option<String>,
+}
+
+impl BindProvenance {
+    /// Compose the stamps for one connection-scoped create. `tab_key` exists
+    /// only when BOTH halves are known — a half-known tab identity is never
+    /// invented on the wire or in the ledger.
+    pub fn for_create(
+        client_instance_id: Option<&str>,
+        device_id: Option<&str>,
+        tab_id: Option<&str>,
+    ) -> Self {
+        Self {
+            client_instance_id: client_instance_id.map(str::to_string),
+            device_id: device_id.map(str::to_string),
+            tab_key: match (device_id, tab_id) {
+                (Some(d), Some(t)) => Some(format!("{d}:{t}")),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// One fresh-agent identity event. Settings are a FULL snapshot (replace,
 /// not merge). `resolves_pending` names a pending marker (placeholder id)
 /// this binding supersedes.
@@ -38,6 +75,11 @@ pub struct FreshAgentBindingUpsert {
     /// G3 supersession (V8/A14): OLD session id this binding replaces
     /// (codex crash-respawn passes the old thread id; everyone else None).
     pub supersedes: Option<String>,
+    /// D8 provenance stamps (see [`BindProvenance`]); `None` fields merge
+    /// keep-when-None against the existing (or superseded-parent) row.
+    pub client_instance_id: Option<String>,
+    pub device_id: Option<String>,
+    pub tab_key: Option<String>,
     pub settings: FreshAgentSettings,
 }
 
@@ -162,6 +204,9 @@ impl FakeIdentitySink {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: s,
         });
     }
@@ -365,6 +410,9 @@ mod tests {
             create_request_id: Some("r1".into()),
             resolves_pending: Some("freshopencode-r1".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -402,6 +450,9 @@ mod tests {
             create_request_id: Some("cr-blank".into()),
             resolves_pending: Some("freshopencode-cr-blank".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -443,6 +494,9 @@ mod tests {
             create_request_id: Some("cr-1".into()),
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings::default(),
         })
         .await

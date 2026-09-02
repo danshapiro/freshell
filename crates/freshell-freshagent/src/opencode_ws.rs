@@ -313,6 +313,12 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// D8 (restore-open-sessions-only): the connection-scoped create's
+    /// provenance, carried in-memory to the materialization binding write (the
+    /// binding row is born at first SEND, mediations after `handle_create`
+    /// returned). `None` for conn-less sessions (attach-resume rehydrate) —
+    /// the ledger merge keeps any prior stamps.
+    provenance: Option<crate::BindProvenance>,
 }
 
 /// Why [`FreshOpencodeState::resume_durable_session`] could not produce a live session for
@@ -348,6 +354,7 @@ impl OpencodeSession {
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            provenance: None,
         }
     }
 }
@@ -479,7 +486,14 @@ impl FreshOpencodeState {
     /// Handle a `freshAgent.create` for opencode: mint a placeholder session (NO serve
     /// spawn — `adapter.ts create():419-431`) and broadcast `freshAgent.created`.
     /// `sessionId == freshopencode-<requestId>` until a `send` materializes it.
-    pub async fn handle_create(&self, msg: FreshAgentCreate) {
+    /// `provenance` (D8): the WS connection's stamped identity for this create
+    /// (`None` on conn-less lanes); carried on the session to the materialization
+    /// binding write (opencode's row is written at first send, not at create).
+    pub async fn handle_create(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -527,7 +541,11 @@ impl FreshOpencodeState {
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
 
-        let session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        let mut session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        // D8: park the connection provenance ON the session — the binding row
+        // is written at materialization (first send), well after this create
+        // returns.
+        session.provenance = provenance;
         self.sessions
             .lock()
             .await
@@ -820,9 +838,13 @@ impl FreshOpencodeState {
                 .await
                 .insert(durable_id.clone(), session_arc.clone());
 
-            // P1.13: binding row at materialization (AWAITED BEFORE the materialized
-            // broadcast -- durable-before-answer), resolving the create's pending
-            // marker. Opencode has no sandbox/permission concepts -- always `None`.
+            // D8: stamps parked on the session at create reach the
+            // materialization row here.
+            let crate::BindProvenance {
+                client_instance_id,
+                device_id,
+                tab_key,
+            } = session.provenance.clone().unwrap_or_default();
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
@@ -839,6 +861,9 @@ impl FreshOpencodeState {
                     .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
+                client_instance_id,
+                device_id,
+                tab_key,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -871,6 +896,14 @@ impl FreshOpencodeState {
         // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
+            // D8: same session-carried stamps (a per-send refresh re-asserts
+            // them; a conn-less refresh lane would carry `None` and the
+            // ledger's keep-when-None merge would preserve them).
+            let crate::BindProvenance {
+                client_instance_id,
+                device_id,
+                tab_key,
+            } = session.provenance.clone().unwrap_or_default();
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: acked_session_id.clone(),
@@ -878,6 +911,9 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
+                client_instance_id,
+                device_id,
+                tab_key,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -1451,7 +1487,7 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, model, effort) = {
+        let (real_id, route, model, effort, parent_provenance) = {
             let session = session_arc.lock().await;
             let Some(real_id) = session.real_session_id.clone() else {
                 // Legacy throws FreshAgentLostSessionError BEFORE calling the serve
@@ -1476,6 +1512,11 @@ impl FreshOpencodeState {
                 session.cwd.clone(),
                 session.model.clone(),
                 session.effort.clone(),
+                // D8 fork-chain inheritance: the child pane is the parent's
+                // lineage in the same client context — carry the parent's
+                // parked provenance (None when the parent itself is conn-less,
+                // e.g. resumed after a restart).
+                session.provenance.clone(),
             )
         };
 
@@ -1543,6 +1584,7 @@ impl FreshOpencodeState {
             model.clone(),
             effort.clone(),
         );
+        child_session.provenance = parent_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
         child_session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
@@ -1558,6 +1600,11 @@ impl FreshOpencodeState {
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
         // (durable-before-answer). Opencode has no sandbox/permission concepts —
         // always `None`.
+        let crate::BindProvenance {
+            client_instance_id,
+            device_id,
+            tab_key,
+        } = parent_provenance.unwrap_or_default();
         self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
             provider: PROVIDER.into(),
             session_id: child.id.clone(),
@@ -1565,6 +1612,11 @@ impl FreshOpencodeState {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // D8: inherit the parent's parked provenance (fork chain = the
+            // same client context); `None` when the parent has none.
+            client_instance_id,
+            device_id,
+            tab_key,
             settings: crate::identity_sink::FreshAgentSettings {
                 model,
                 sandbox: None,
@@ -2464,6 +2516,11 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
+                // Conn-less lane (D8): resume/attach refresh — keep-when-None
+                // merge preserves the create's provenance stamps.
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: rec.model.clone(),
                     sandbox: None,
@@ -3141,6 +3198,7 @@ mod tests {
             resume_session_id: None,
             sandbox: None,
             session_ref: None,
+            tab_id: None,
         }
     }
 
@@ -3167,7 +3225,7 @@ mod tests {
             (FreshOpencodeState::new(fresh_agent), rx)
         };
 
-        st.handle_create(create_msg("req-1")).await;
+        st.handle_create(create_msg("req-1"), None).await;
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.created");
@@ -3189,7 +3247,7 @@ mod tests {
         let (st, killed) = state().await;
         let _ = &killed;
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let placeholder = "freshopencode-req-dedup-seq";
         st.handle_send(send_msg(placeholder, "hi")).await;
 
@@ -3209,7 +3267,7 @@ mod tests {
 
         // A duplicate create for the SAME requestId, as the frozen client resends on
         // every reconnect while the pane is still `status==creating` on its side.
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
 
         let sessions = st.sessions.lock().await;
         assert_eq!(
@@ -3241,8 +3299,8 @@ mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_create(create_msg("req-dedup-race")),
-            st2.handle_create(create_msg("req-dedup-race")),
+            st1.handle_create(create_msg("req-dedup-race"), None),
+            st2.handle_create(create_msg("req-dedup-race"), None),
         );
 
         assert_eq!(
@@ -3258,8 +3316,8 @@ mod tests {
     async fn handle_create_distinct_request_ids_create_distinct_sessions() {
         let (st, _killed) = state().await;
 
-        st.handle_create(create_msg("req-dedup-a")).await;
-        st.handle_create(create_msg("req-dedup-b")).await;
+        st.handle_create(create_msg("req-dedup-a"), None).await;
+        st.handle_create(create_msg("req-dedup-b"), None).await;
 
         assert_eq!(
             st.sessions.lock().await.len(),
@@ -3286,7 +3344,7 @@ mod tests {
         let (st, _killed) = state().await;
         let placeholder = "freshopencode-req-dedup-kill";
 
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         st.handle_send(send_msg(placeholder, "hi")).await;
         assert!(
             st.sessions
@@ -3309,7 +3367,7 @@ mod tests {
         })
         .await;
 
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
 
         let sessions = st.sessions.lock().await;
         assert_eq!(
@@ -3359,7 +3417,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-t3")).await;
+        st.handle_create(create_msg("req-t3"), None).await;
         let placeholder = "freshopencode-req-t3";
 
         // BEFORE the fix, this call falls straight through to
@@ -3455,7 +3513,7 @@ mod tests {
     #[tokio::test]
     async fn second_send_reuses_the_same_durable_session_id() {
         let (st, _killed) = state().await;
-        st.handle_create(create_msg("req-cont")).await;
+        st.handle_create(create_msg("req-cont"), None).await;
         let placeholder = "freshopencode-req-cont";
 
         st.handle_send(send_msg(placeholder, "first turn")).await;
@@ -3653,7 +3711,7 @@ mod tests {
         // never reports idle and would hang `run_turn` until the real 600s turn timeout.
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-attach")).await;
+        st.handle_create(create_msg("req-attach"), None).await;
         let placeholder = "freshopencode-req-attach";
         st.handle_send(send_msg(placeholder, "hello")).await;
         let real_id = {
@@ -3717,7 +3775,7 @@ mod tests {
     async fn attach_placeholder_addressed_session_emits_materialized_first() {
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-attach-ph")).await;
+        st.handle_create(create_msg("req-attach-ph"), None).await;
         let placeholder = "freshopencode-req-attach-ph";
         st.handle_send(send_msg(placeholder, "hello")).await;
         let real_id = {
@@ -3816,7 +3874,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-mat")).await;
+        st.handle_create(create_msg("req-mat"), None).await;
         let _ = rx.try_recv().unwrap(); // drain freshAgent.created
 
         let placeholder = "freshopencode-req-mat";
@@ -3843,7 +3901,7 @@ mod tests {
     #[tokio::test]
     async fn kill_removes_session_but_does_not_terminate_the_shared_serve_child() {
         let (st, killed) = state().await;
-        st.handle_create(create_msg("req-kill")).await;
+        st.handle_create(create_msg("req-kill"), None).await;
         let placeholder = "freshopencode-req-kill";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -3922,7 +3980,7 @@ mod tests {
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
         create.effort = Some("high".to_string());
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
         state
             .handle_send(send_msg("freshopencode-r1", "hello"))
             .await;
@@ -3975,7 +4033,7 @@ mod tests {
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
         create.effort = Some("high".to_string());
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
         let placeholder = "freshopencode-r2";
         state.handle_send(send_msg(placeholder, "first")).await;
 
@@ -3998,6 +4056,44 @@ mod tests {
             .unwrap();
         assert_eq!(b.settings.model.as_deref(), Some("small-model"));
         assert_eq!(b.settings.effort.as_deref(), Some("low"));
+    }
+
+    /// D8 lane-reach (restore-open-sessions-only, review round 3): opencode's
+    /// binding write happens at MATERIALIZATION (first send), not create — the
+    /// create-time connection provenance must survive on the session and reach
+    /// the sink write. Optional ledger fields would otherwise let this lane
+    /// keep writing `None` silently (and the recovery judgment would then
+    /// drop genuinely-open freshopencode sessions).
+    #[tokio::test]
+    async fn materialization_binding_carries_the_creates_connection_provenance() {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("r1");
+        create.cwd = Some("/w".to_string());
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-oc"),
+                    Some("device-oc"),
+                    Some("tab-oc"),
+                )),
+            )
+            .await;
+        state
+            .handle_send(send_msg("freshopencode-r1", "hello"))
+            .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id.starts_with("ses_"))
+            .expect("binding at materialization");
+        assert_eq!(b.client_instance_id.as_deref(), Some("client-oc"));
+        assert_eq!(b.device_id.as_deref(), Some("device-oc"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-oc:tab-oc"));
     }
 
     // ── P1.13 Task 8: settings-from-ledger resume (attach + create-with-resume) ──
@@ -4100,6 +4196,9 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -4241,7 +4340,7 @@ mod tests {
             provider: "opencode".to_string(),
             session_id: DURABLE_ID.to_string(),
         });
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
 
         let sessions = state.sessions.lock().await;
         assert!(
@@ -4320,7 +4419,7 @@ mod tests {
     async fn clean_turn_emits_busy_then_idle_then_one_monotonic_turn_complete() {
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-clean")).await;
+        st.handle_create(create_msg("req-clean"), None).await;
         let placeholder = "freshopencode-req-clean";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -4392,7 +4491,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-int")).await;
+        st.handle_create(create_msg("req-int"), None).await;
         let placeholder = "freshopencode-req-int";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -4464,7 +4563,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager.clone()).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-err")).await;
+        st.handle_create(create_msg("req-err"), None).await;
         let placeholder = "freshopencode-req-err";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -5793,7 +5892,7 @@ mod tests {
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
 
-        st.handle_create(create_msg("req-noop")).await;
+        st.handle_create(create_msg("req-noop"), None).await;
         let placeholder = "freshopencode-req-noop";
         // Drain the freshAgent.created frame.
         assert!(rx.try_recv().is_ok());
@@ -6476,7 +6575,7 @@ mod tests {
     async fn fork_on_an_unmaterialized_placeholder_replies_invalid_session_id_and_posts_nothing() {
         let http = Arc::new(ForkFakeHttp::child_ok());
         let st = fork_state(http.clone()).await;
-        st.handle_create(create_msg("req-fork")).await;
+        st.handle_create(create_msg("req-fork"), None).await;
         let placeholder = "freshopencode-req-fork";
 
         let (sink, captured) = capturing_sink();

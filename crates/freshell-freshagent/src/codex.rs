@@ -410,6 +410,10 @@ impl FreshCodexState {
         effort: Option<&str>,
         cwd: Option<&str>,
         supersedes: Option<&str>,
+        // D8 provenance stamps — `Some` from connection-scoped creates,
+        // `None` on conn-less refresh/fork lanes (the ledger merge keeps or
+        // supersedes-inherits prior stamps).
+        provenance: Option<&crate::BindProvenance>,
     ) {
         let Some(sink) = self.identity_sink() else {
             return;
@@ -431,6 +435,11 @@ impl FreshCodexState {
         if settings == crate::identity_sink::FreshAgentSettings::default() && supersedes.is_none() {
             return;
         }
+        let crate::BindProvenance {
+            client_instance_id,
+            device_id,
+            tab_key,
+        } = provenance.cloned().unwrap_or_default();
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: "codex".into(),
@@ -439,6 +448,9 @@ impl FreshCodexState {
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,
                 supersedes: supersedes.map(Into::into),
+                client_instance_id,
+                device_id,
+                tab_key,
                 settings,
             })
             .await
@@ -527,7 +539,13 @@ impl FreshCodexState {
     /// register the session + its notification consumer, and broadcast `freshAgent.created`
     /// (or `freshAgent.create.failed`). Long-running (cold sidecar spawn), so the WS loop
     /// dispatches this as a detached task and keeps fanning out the bus meanwhile.
-    pub async fn handle_create(&self, msg: FreshAgentCreate) {
+    /// `provenance` (D8): the WS connection's stamped identity for this create
+    /// (`None` on conn-less lanes); threaded to the `thread/start` binding write.
+    pub async fn handle_create(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -686,6 +704,7 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 lease_guard,
+                provenance,
             )
             .await;
             return;
@@ -739,6 +758,7 @@ impl FreshCodexState {
             None,
             // Threads freshell starts are paginated (we SET the mode at start).
             Some(HistoryMode::Paginated),
+            provenance,
         )
         .await;
     }
@@ -776,6 +796,9 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // D8: the creating connection's provenance (a resume-create is still a
+        // connection-scoped create: this pane IS open in that client's tab).
+        provenance: Option<crate::BindProvenance>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
@@ -895,6 +918,7 @@ impl FreshCodexState {
             permission_mode,
             lease_guard,
             history_mode,
+            provenance,
         )
         .await;
     }
@@ -923,6 +947,9 @@ impl FreshCodexState {
         // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
         // for threads freshell started, the rollout-meta parse for resumes.
         history_mode: Option<HistoryMode>,
+        // D8: the creating connection's provenance for the binding write below
+        // (`None` on conn-less lanes; the ledger merge keeps prior stamps).
+        provenance: Option<crate::BindProvenance>,
     ) {
         // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
         // same threadId -- orphaning the winner's sidecar and stealing its binding
@@ -1050,6 +1077,7 @@ impl FreshCodexState {
             effort.as_deref(),
             cwd.as_deref(),
             None,
+            provenance.as_ref(),
         )
         .await;
 
@@ -2227,6 +2255,8 @@ impl FreshCodexState {
 
         // P1.13: the child's binding row, AWAITED before the forked reply
         // (durable-before-answer). Fork is not a create: no create_request_id.
+        // D8: fork is conn-less here (the WS dispatch drops the connection) —
+        // provenance `None`; the row starts unattributed rather than invented.
         self.record_codex_binding(
             &child_id,
             None,
@@ -2235,6 +2265,7 @@ impl FreshCodexState {
             parent_permission_mode.as_deref(),
             parent_effort.as_deref(),
             eff_cwd.as_deref(),
+            None,
             None,
         )
         .await;
@@ -2836,6 +2867,7 @@ impl FreshCodexState {
         // snapshots the LIVE in-session values (which originate from a real
         // create/user change); the helper's no-laundering guard skips it if they
         // are all blank. AWAITED before this fn returns (durable-before-answer).
+        // D8: conn-less refresh — provenance `None` keeps the create's stamps.
         self.record_codex_binding(
             session_id,
             None,
@@ -2844,6 +2876,7 @@ impl FreshCodexState {
             permission_mode.as_deref(),
             effort.as_deref(),
             cwd.as_deref(),
+            None,
             None,
         )
         .await;
@@ -3003,6 +3036,9 @@ impl FreshCodexState {
             effort.as_deref(),
             cwd.as_deref(),
             Some(old_session_id),
+            // D8: conn-less crash-respawn — provenance `None`; the ledger
+            // inherits the superseded parent's stamps (fork-chain rule).
+            None,
         )
         .await;
 
@@ -3651,6 +3687,9 @@ impl FreshCodexState {
                 rec.permission_mode.as_deref(),
                 rec.effort.as_deref(),
                 cwd.or(rec.cwd.as_deref()),
+                None,
+                // D8: conn-less attach-resume refresh — provenance `None`
+                // keeps the row's existing stamps.
                 None,
             )
             .await;
@@ -9352,21 +9391,25 @@ pub(crate) mod tests {
             }
             configure_fake_codex_cmd("{}");
             let (st, mut rx) = state_with_bus();
-            st.handle_create(FreshAgentCreate {
-                request_id: format!("req-{case}"),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: None,
-                legacy_restore_context: None,
-                resume_session_id: Some(thread_id.to_string()),
-                session_ref: None,
-                model: None,
-                model_selection: None,
-                permission_mode: None,
-                sandbox: None,
-                effort: None,
-                plugins: None,
-            })
+            st.handle_create(
+                FreshAgentCreate {
+                    request_id: format!("req-{case}"),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: Some(thread_id.to_string()),
+                    session_ref: None,
+                    model: None,
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
             .await;
             let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
@@ -9806,21 +9849,25 @@ pub(crate) mod tests {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-retryable-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: None,
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-retryable-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
         std::env::remove_var("CODEX_CMD");
 
@@ -9867,6 +9914,7 @@ pub(crate) mod tests {
             sandbox: None,
             effort: None,
             plugins: None,
+            tab_id: None,
         }
     }
 
@@ -9917,7 +9965,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-sequential-marker-unused");
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let first = await_created(&mut rx, "req-dedup-seq").await;
         assert_eq!(
             first["type"], "freshAgent.created",
@@ -9925,7 +9973,7 @@ pub(crate) mod tests {
         );
         let first_session_id = first["sessionId"].as_str().unwrap().to_string();
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let second = await_created(&mut rx, "req-dedup-seq").await;
 
         assert_eq!(
@@ -9958,8 +10006,8 @@ pub(crate) mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_create(create_msg("req-dedup-race")),
-            st2.handle_create(create_msg("req-dedup-race")),
+            st1.handle_create(create_msg("req-dedup-race"), None),
+            st2.handle_create(create_msg("req-dedup-race"), None),
         );
 
         let first = await_created(&mut rx, "req-dedup-race").await;
@@ -9995,11 +10043,11 @@ pub(crate) mod tests {
         // requestIds -> distinct sessions" on its own merits, not on an accident of the
         // fixture's default.
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-a"}"#);
-        st.handle_create(create_msg("req-dedup-a")).await;
+        st.handle_create(create_msg("req-dedup-a"), None).await;
         let a = await_created(&mut rx, "req-dedup-a").await;
 
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-b"}"#);
-        st.handle_create(create_msg("req-dedup-b")).await;
+        st.handle_create(create_msg("req-dedup-b"), None).await;
         let b = await_created(&mut rx, "req-dedup-b").await;
 
         assert_ne!(
@@ -10028,7 +10076,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-post-exit-marker-unused");
 
-        st.handle_create(create_msg("req-dedup-exit")).await;
+        st.handle_create(create_msg("req-dedup-exit"), None).await;
         let created = await_created(&mut rx, "req-dedup-exit").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -10044,7 +10092,7 @@ pub(crate) mod tests {
         // app-server fail?".
         configure_fake_codex_cmd("{}");
 
-        st.handle_create(create_msg("req-dedup-exit")).await;
+        st.handle_create(create_msg("req-dedup-exit"), None).await;
         let replay = await_created(&mut rx, "req-dedup-exit").await;
 
         assert_eq!(
@@ -10073,7 +10121,7 @@ pub(crate) mod tests {
         let capture = tracing_capture::capture_by_session("dedup-post-kill-marker-unused");
 
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-1"}"#);
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         let created = await_created(&mut rx, "req-dedup-kill").await;
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -10089,7 +10137,7 @@ pub(crate) mod tests {
         // absent an override) so a genuine re-create is provably distinguishable from
         // an accidental fixture coincidence, not just from a cache replay.
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-2"}"#);
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         let recreated = await_created(&mut rx, "req-dedup-kill").await;
 
         assert_ne!(
@@ -10131,7 +10179,7 @@ pub(crate) mod tests {
         for i in 0..30 {
             let request_id = format!("req-order-{i}");
             configure_fake_codex_cmd(&format!(r#"{{"threadStartThreadId":"thread-order-{i}"}}"#));
-            st.handle_create(create_msg(&request_id)).await;
+            st.handle_create(create_msg(&request_id), None).await;
 
             // Settle window: give the (possibly-racing) consumer task a chance to run
             // and broadcast its first status-snapshot event, if it's going to.
@@ -10189,24 +10237,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-resume-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-existing-durable".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-resume-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-existing-durable".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -10252,24 +10304,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-sref-resume-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-existing-durable".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-sref-resume-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-existing-durable".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -10326,24 +10382,28 @@ pub(crate) mod tests {
         );
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-resume-2".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-truly-gone".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-resume-2".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-truly-gone".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -10388,24 +10448,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-term25-create".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-A-requested".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-term25-create".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-A-requested".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -10995,21 +11059,25 @@ pub(crate) mod tests {
         st: &FreshCodexState,
         rx: &mut tokio::sync::broadcast::Receiver<String>,
     ) -> String {
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: None,
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -11088,21 +11156,25 @@ pub(crate) mod tests {
         // inlines the same `freshAgent.create` the existing create tests send.
         let tmp_cwd = std::env::temp_dir().to_string_lossy().to_string();
         state
-            .handle_create(FreshAgentCreate {
-                request_id: "req-bind-1".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: Some(tmp_cwd),
-                legacy_restore_context: None,
-                resume_session_id: None,
-                session_ref: None,
-                model: Some("gpt-5.3-codex-spark".to_string()),
-                model_selection: None,
-                permission_mode: Some("on-request".to_string()),
-                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
-                effort: Some("high".to_string()),
-                plugins: None,
-            })
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-bind-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: Some(tmp_cwd),
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    model_selection: None,
+                    permission_mode: Some("on-request".to_string()),
+                    sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                    effort: Some("high".to_string()),
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
             .await;
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -11135,6 +11207,73 @@ pub(crate) mod tests {
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
     }
 
+    /// D8 lane-reach (restore-open-sessions-only, review round 3): the
+    /// WS-dispatched connection provenance threaded into `handle_create` must
+    /// reach the binding row at thread/start. Optional ledger fields would
+    /// otherwise let this lane keep writing `None` silently (and the recovery
+    /// judgment would then drop genuinely-open freshcodex sessions).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_binding_carries_the_creates_connection_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let tmp_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        state
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-bind-prov".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: Some(tmp_cwd),
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: None,
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                Some(crate::BindProvenance::for_create(
+                    Some("client-codex"),
+                    Some("device-codex"),
+                    Some("tab-codex"),
+                )),
+            )
+            .await;
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "fixture create failed: {created}"
+        );
+        let thread_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == thread_id)
+            .expect("binding row written at thread/start");
+        assert_eq!(b.client_instance_id.as_deref(), Some("client-codex"));
+        assert_eq!(b.device_id.as_deref(), Some("device-codex"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-codex:tab-codex"));
+    }
+
     /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a
     /// live `freshAgent.error{code:'LEDGER_WRITE_FAILED'}` frame (never a silent
     /// warn-and-drop) AND the create still succeeds -- a write failure never blocks
@@ -11150,21 +11289,25 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
 
         state
-            .handle_create(FreshAgentCreate {
-                request_id: "req-ledger-fail".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: None,
-                legacy_restore_context: None,
-                resume_session_id: None,
-                session_ref: None,
-                model: Some("gpt-5.3-codex-spark".to_string()),
-                model_selection: None,
-                permission_mode: None,
-                sandbox: None,
-                effort: None,
-                plugins: None,
-            })
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-ledger-fail".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
             .await;
 
         // Drain the bus (bounded, as in the alarm tests): both the alarm frame and

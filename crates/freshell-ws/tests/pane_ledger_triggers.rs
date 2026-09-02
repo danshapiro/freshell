@@ -6,7 +6,8 @@
 mod common;
 
 use common::{
-    connect_and_capture_inventory, next_frame_of_type, sleeper_cli_spec, spawn_server_with_ledger,
+    connect_and_capture_inventory, connect_and_capture_inventory_with_identity, next_frame_of_type,
+    sleeper_cli_spec, spawn_server_with_ledger,
 };
 use freshell_ws::pane_ledger::{PaneLedger, RetiredReason, RowState};
 use futures_util::SinkExt;
@@ -144,6 +145,9 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
             mode: "claude",
             cwd: Some("/prior/cwd"),
             create_request_id: Some("req-prior-epoch"),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: seeded_at,
         })
         .expect("seed prior-epoch binding row");
@@ -277,6 +281,89 @@ async fn resume_create_writes_binding_and_kill_retires_it_closed() {
         },
         "binding retired closed on user kill",
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_create_stamps_the_binding_row_from_the_connection_identity_and_tab_id() {
+    // D8 lane-reach pin (restore-open-sessions-only, review round 3): the WS
+    // terminal.create bind lane stamps the ledger row from the connection's
+    // hello-stamped identity plus the create's `tabId`; `tabKey` composes as
+    // `deviceId:tabId` — exactly `src/lib/tab-registry-snapshot.ts`'s
+    // composition, so the row joins the right restored tab later.
+    let dir = unique_ledger_dir("prov-stamp");
+    let (url, registry, _ledger_arc) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) =
+        connect_and_capture_inventory_with_identity(&url, "device-stamp", "client-stamp").await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-stamp-1",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-stamp",
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ledger = PaneLedger::new(Some(dir.clone()));
+    let row = ledger
+        .load_binding("claude", &session_id)
+        .expect("binding row written at create");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-stamp"));
+    assert_eq!(row.device_id.as_deref(), Some("device-stamp"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-stamp:tab-stamp"));
+
+    // A tabs.sync.push refreshes the connection's identity (a mid-lifetime
+    // clientInstanceId rotation self-heals at the next push instead of
+    // waiting out a reconnect): a LATER create off the same socket takes the
+    // refreshed stamps.
+    let push = serde_json::json!({
+        "type": "tabs.sync.push",
+        "deviceId": "device-stamp",
+        "deviceLabel": "Stamp Device",
+        "clientInstanceId": "client-stamp-rotated",
+        "snapshotRevision": 2,
+        "records": [],
+    });
+    ws.send(WsMessage::Text(push.to_string())).await.unwrap();
+    let create2 = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-stamp-2",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-stamp-2",
+    });
+    ws.send(WsMessage::Text(create2.to_string())).await.unwrap();
+    let created2 = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id2 = created2["terminalId"].as_str().unwrap().to_string();
+    let session_id2 = created2["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(ledger); // constructed before create2; its load-time index is stale
+    let ledger = PaneLedger::new(Some(dir.clone()));
+    let row2 = ledger
+        .load_binding("claude", &session_id2)
+        .expect("second binding row written");
+    assert_eq!(
+        row2.client_instance_id.as_deref(),
+        Some("client-stamp-rotated"),
+        "the push refreshed the connection identity before this create"
+    );
+    assert_eq!(row2.device_id.as_deref(), Some("device-stamp"));
+    assert_eq!(row2.tab_key.as_deref(), Some("device-stamp:tab-stamp-2"));
+
+    registry.kill(&terminal_id);
+    registry.kill(&terminal_id2);
     std::fs::remove_dir_all(&dir).ok();
 }
 

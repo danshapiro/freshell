@@ -427,6 +427,11 @@ export const HelloSchema = z.object({
     visible: z.array(z.string()).optional(),
     background: z.array(z.string()).optional(),
   }).optional(),
+  /** D8 (restore-open-sessions-only): additive optional connection provenance — the
+   * same values `tabs.sync.push` carries; the Rust server stores them per-connection
+   * and stamps connection-scoped ledger rows. Both servers tolerate their absence. */
+  deviceId: z.string().optional(),
+  clientInstanceId: z.string().optional(),
 })
 
 export const PingSchema = z.object({
@@ -652,6 +657,9 @@ export const FreshAgentCreateSchema = z.object({
   modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
   effort: z.string().trim().min(1).optional(),
   plugins: z.array(z.string()).optional(),
+  /** D8: the creating tab's client-side id; the server composes the ledger row's
+   * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
+  tabId: z.string().min(1).optional(),
 })
 
 export const FreshAgentAttachSchema = z.object({

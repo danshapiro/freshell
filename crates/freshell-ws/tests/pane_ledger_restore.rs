@@ -75,6 +75,9 @@ async fn inventory_stamping_falls_back_to_ledger_bound_rows() {
             mode: "codex",
             cwd: None,
             create_request_id: Some("req-stamp-1"),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -289,6 +292,9 @@ async fn claude_restore_is_refused_while_a_rest_shaped_live_claude_owns_the_sess
             mode: "claude",
             cwd: None,
             create_request_id: Some("req-rest-live-1"),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: 1_000,
         })
         .unwrap();

@@ -548,6 +548,12 @@
               },
               "type": "object"
             },
+            "clientInstanceId": {
+              "type": "string"
+            },
+            "deviceId": {
+              "type": "string"
+            },
             "protocolVersion": {
               "const": 8,
               "type": "number"
@@ -1656,6 +1662,10 @@
                 "kilroy",
                 "freshopencode"
               ],
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
               "type": "string"
             },
             "type": {
@@ -2926,6 +2936,10 @@
               ],
               "type": "string"
             },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "type": {
               "const": "freshAgent.create",
               "type": "string"
@@ -3671,6 +3685,10 @@
           ],
           "type": "string"
         },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "type": {
           "const": "freshAgent.create",
           "type": "string"
@@ -4127,6 +4145,12 @@
             }
           },
           "type": "object"
+        },
+        "clientInstanceId": {
+          "type": "string"
+        },
+        "deviceId": {
+          "type": "string"
         },
         "protocolVersion": {
           "const": 8,

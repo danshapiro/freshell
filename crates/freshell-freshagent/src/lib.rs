@@ -67,8 +67,8 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
-    SinkWrite,
+    BindProvenance, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
+    SharedPaneIdentitySink, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
@@ -2389,6 +2389,14 @@ async fn send_keys(
                         .map(str::to_string),
                     resolves_pending: Some(pane.placeholder_id.clone()),
                     supersedes: None,
+                    // D8 (restore-open-sessions-only): REST/MCP lineage rows
+                    // intentionally stamp NO provenance — no browser client
+                    // connection exists at bind time, so there is nothing true
+                    // to attribute. Rows without attribution are never offered
+                    // by the recovery judgment (`recovery_inventory.rs`).
+                    client_instance_id: None,
+                    device_id: None,
+                    tab_key: None,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,

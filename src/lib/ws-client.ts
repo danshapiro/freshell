@@ -21,6 +21,11 @@ type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
   sidebarOpenSessions?: SessionLocator[]
   client?: { mobile?: boolean }
+  // D8 (restore-open-sessions-only): connection-scoped provenance the server
+  // stores per-connection and stamps onto ledger bind rows (the same values
+  // `tabs.sync.push` carries).
+  deviceId?: string
+  clientInstanceId?: string
 }
 type TabsSyncPushPayload = {
   deviceId: string

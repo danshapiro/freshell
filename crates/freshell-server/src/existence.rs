@@ -656,6 +656,9 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -703,6 +706,9 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -1264,6 +1270,9 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: 2_000,
             })
             .expect("first bind: root");
@@ -1275,6 +1284,9 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: 3_000,
             })
             .expect("signal rebind: child");
@@ -1287,6 +1299,9 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: 2_500,
             })
             .expect("control bind: root2");

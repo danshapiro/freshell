@@ -94,6 +94,13 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             mode,
             cwd,
             create_request_id,
+            // D8 (restore-open-sessions-only): REST/headless rows stamp NO
+            // provenance — there is no browser connection to attribute at bind
+            // time, and rows without attribution are never offered by the
+            // recovery ledger-only judgment (`recovery_inventory.rs`).
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: now_ms(),
         }) {
             Self::warn_write_failure(terminal_id, "pre-spawn claude binding (PIN 2)", &err);
@@ -149,6 +156,12 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 mode,
                 cwd,
                 create_request_id,
+                // D8: REST/headless lineage rows stay UNATTRIBUTED by design
+                // (no browser connection exists here) — unlike the WS create
+                // lane, which stamps from the connection identity + `tabId`.
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
                 now_ms: now_ms(),
             }) {
                 Self::warn_write_failure(terminal_id, "post-spawn identity binding", &err);

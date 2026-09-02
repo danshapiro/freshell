@@ -63,6 +63,11 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
+                    // D8: the upsert's provenance stamps ride through verbatim;
+                    // the keep-when-None merge lives in the ledger itself.
+                    client_instance_id: upsert.client_instance_id.as_deref(),
+                    device_id: upsert.device_id.as_deref(),
+                    tab_key: upsert.tab_key.as_deref(),
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -234,6 +239,9 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -328,6 +336,9 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -371,6 +382,9 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-uuid".into()),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: settings.clone(),
         })
         .await
@@ -392,6 +406,9 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-thread".into()),
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings,
         })
         .await
@@ -514,6 +531,39 @@ mod tests {
         );
     }
 
+    /// D8 (restore-open-sessions-only): the adapter must carry the upsert's
+    /// provenance through to the ledger row — a dropped mapping at this seam
+    /// would silently orphan the parent-relative recovery judgment's inputs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_binding_maps_provenance_into_the_ledger_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-1".into()),
+            device_id: Some("device-1".into()),
+            tab_key: Some("device-1:tab-1".into()),
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        let row = ledger.load_binding("opencode", "ses_prov").expect("row");
+        assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(row.device_id.as_deref(), Some("device-1"));
+        assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    }
+
     /// resume path (sync, memory-only read).
     #[tokio::test(flavor = "multi_thread")]
     async fn lookup_by_create_request_id_resolves_the_durable_session() {
@@ -529,6 +579,9 @@ mod tests {
             create_request_id: Some("cr-1".into()),
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             // Blank settings on purpose: lineage must resolve even for
             // lineage-only rows (settings-bearing-ness is unrelated).
             settings: FreshAgentSettings::default(),
@@ -569,6 +622,9 @@ mod tests {
             create_request_id: Some("cr-9".into()),
             resolves_pending: Some("freshopencode-cr-9".into()),
             supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             settings: FreshAgentSettings::default(),
         })
         .await

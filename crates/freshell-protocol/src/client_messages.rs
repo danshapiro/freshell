@@ -187,6 +187,16 @@ pub struct Hello {
     pub sessions: Option<HelloSessions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_open_sessions: Option<Vec<SessionLocator>>,
+    /// D8 (restore-open-sessions-only): the client's stable device id — the
+    /// same value its `tabs.sync.push` frames carry — letting connection-scoped
+    /// ledger bind lanes stamp row provenance. Additive optional: absent on
+    /// older clients, stripped-tolerant on older servers (no version bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// D8: this browser tab-session's client instance id (page reloads mint a
+    /// new one; same value `tabs.sync.push` carries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
 }
 
 // --- client.diagnostic ------------------------------------------------------
@@ -566,6 +576,12 @@ pub struct FreshAgentCreate {
     pub sandbox: Option<Sandbox>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// D8 (restore-open-sessions-only): the creating tab's client-side id.
+    /// Connection-scoped create lanes compose the ledger row's `tabKey` as
+    /// `deviceId:tabId` (matching `src/lib/tab-registry-snapshot.ts`). Additive
+    /// optional; conn-less (REST/MCP) creates omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

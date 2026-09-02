@@ -1222,8 +1222,11 @@ export function FreshAgentView({
       sandbox: content.sandbox,
       effort: getEffectiveFreshAgentEffort(content, providerDefaults),
       plugins: content.plugins,
+      // D8 (restore-open-sessions-only): the server composes the ledger row's
+      // tabKey as `deviceId:tabId` from the connection identity + this field.
+      tabId,
     } as const
-  }, [providerDefaults, tabRestoreSource])
+  }, [providerDefaults, tabRestoreSource, tabId])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current

@@ -132,6 +132,21 @@ pub struct BindingRow {
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// D8 (restore-open-sessions-only) provenance: the browser client + tab
+    /// this binding was created from. Written by connection-scoped lanes only;
+    /// conn-less re-bind lanes (respawn, locator/adoption resolution, fork
+    /// chains) write `None` and the upsert bodies merge keep-when-`None` so
+    /// re-binds preserve the stamps. Serde-optional under LEDGER_VERSION 1:
+    /// pre-D8 rows (and REST/headless rows — intentionally never stamped,
+    /// `pane_identity_binder.rs`) parse to all-`None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// `deviceId:tabId` — exactly `src/lib/tab-registry-snapshot.ts`'s record
+    /// composition, so the row can rejoin the right restored tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_key: Option<String>,
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
@@ -154,6 +169,13 @@ pub struct BindingWrite<'a> {
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
     pub create_request_id: Option<&'a str>,
+    /// D8 provenance stamps — `Some` from connection-scoped create lanes
+    /// (`terminal.rs` compose from the stored hello identity + the create's
+    /// `tabId`), `None` from conn-less lanes (the upsert merges keep-when-None;
+    /// see `record_binding_locked`).
+    pub client_instance_id: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+    pub tab_key: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -175,6 +197,13 @@ pub struct FreshAgentBindingWrite<'a> {
     /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
     /// row is retired and linked AFTER the new row persists.
     pub supersedes: Option<&'a str>,
+    /// D8 provenance stamps — `Some` from connection-scoped create lanes,
+    /// `None` from conn-less lanes (keep-when-None merge, falling back to the
+    /// superseded parent's stamps on a fork-chain write; see
+    /// `record_fresh_agent_binding`).
+    pub client_instance_id: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+    pub tab_key: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -449,6 +478,25 @@ impl PaneLedger {
                 "pane_ledger_revived: gc_expired tombstone re-bound by a live identity event"
             );
         }
+        // D8 provenance merge (keep-when-None): conn-less re-bind lanes
+        // (auto-resume respawn, locator/adoption resolution) write `None` here
+        // and must NOT erase the stamps the connection-scoped create wrote.
+        // DELIBERATELY unlike this body's other advisory fields
+        // (`create_request_id` is wholesale-replaced): a stamped-lane write
+        // carries `Some` and still replaces (adoption lanes that KNOW newer
+        // identity), so only the `None` case inherits.
+        let client_instance_id = w
+            .client_instance_id
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|r| r.client_instance_id.clone()));
+        let device_id = w
+            .device_id
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|r| r.device_id.clone()));
+        let tab_key = w
+            .tab_key
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|r| r.tab_key.clone()));
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -468,6 +516,9 @@ impl PaneLedger {
             sandbox: None,
             permission_mode: None,
             effort: None,
+            client_instance_id,
+            device_id,
+            tab_key,
         };
         self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
@@ -552,6 +603,34 @@ impl PaneLedger {
             .create_request_id
             .map(str::to_string)
             .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
+        // D8 provenance merge (keep-when-None): conn-less refresh lanes carry
+        // `None` and keep the create's stamps. A fork-chain first write
+        // (`supersedes: Some(parent)`, no same-key row — the claude rollback
+        // adoption and codex crash-respawn lanes) inherits the superseded
+        // PARENT's stamps: the fork is, by construction, the same pane. The
+        // retire/link below is unchanged; this read is inheritance-only.
+        let superseded_parent = w
+            .supersedes
+            .filter(|old| *old != w.session_id)
+            .and_then(|old| {
+                index
+                    .bindings
+                    .get(&(w.provider.to_string(), old.to_string()))
+                    .cloned()
+            });
+        let inherit = existing.or(superseded_parent.as_ref());
+        let client_instance_id = w
+            .client_instance_id
+            .map(str::to_string)
+            .or_else(|| inherit.and_then(|r| r.client_instance_id.clone()));
+        let device_id = w
+            .device_id
+            .map(str::to_string)
+            .or_else(|| inherit.and_then(|r| r.device_id.clone()));
+        let tab_key = w
+            .tab_key
+            .map(str::to_string)
+            .or_else(|| inherit.and_then(|r| r.tab_key.clone()));
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -571,6 +650,9 @@ impl PaneLedger {
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
             effort: w.effort.map(str::to_string),
+            client_instance_id,
+            device_id,
+            tab_key,
         };
         self.write_binding(root, &mut index, &row)?; // new bound row FIRST (pinned)
 
@@ -1069,6 +1151,12 @@ pub(crate) async fn ledger_resolve_identity(
             mode: &provider_owned,
             cwd: cwd_owned.as_deref(),
             create_request_id: None,
+            // Conn-less lane (D8): no provenance in scope; the upsert's
+            // keep-when-None merge preserves any stamps the connection-scoped
+            // create wrote.
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
             now_ms: now,
         })
     })
