@@ -140,9 +140,10 @@ Create the file with EXACTLY this content:
  * - Phase 4: ALSO click S_GREY locally → both local-green, no ratchets,
  *   tier-1 tie → fixed-id tiebreak (or crossed-minute recency; both
  *   branches produce [S_GREY, S_OPEN, S_BUSY]). Stability step.
- * - Phase 5: device B sends terminal.input Enter x3 (re-armed ~5s busy) to
- *   S_OPEN's pane → tier 0 busy OUTRANKS tier 1 open: [S_OPEN, S_GREY,
- *   S_BUSY], then busy reverts and the order returns to
+ * - Phase 5: device B sends terminal.input text + CR-only Enter frames
+ *   (is_submit_input requires whole-frame CR/LF) x3, grace re-armed to ≈5s
+ *   busy, to S_OPEN's pane → tier 0 busy OUTRANKS tier 1 open: [S_OPEN,
+ *   S_GREY, S_BUSY], then busy reverts and the order returns to
  *   [S_GREY, S_OPEN, S_BUSY]. NON-VACUOUS flip: legacy keeps
  *   [S_GREY, S_OPEN, S_BUSY] throughout (no page-side input ever ratchets
  *   S_OPEN).
@@ -367,13 +368,14 @@ const S_GREY_T0 = T(1.5)
 const S_GREY_T1 = T(1)
 
 // Verbatim body from sidebar-remote-status-rings-rust.spec.ts's
-// buildRemoteClaudeTabRecord, parameterized ONLY to (sessionId, busy):
-// tabKey/tabId/paneId get a per-session suffix so distinct simulated tabs do
-// not collide inside device B's snapshot.
+// buildRemoteClaudeTabRecord, parameterized ONLY to (sessionId, busy). The
+// per-session tab/pane keying uses the LAST 8 chars: the fixed scenario ids
+// share their FIRST 8 chars ('00000000'), and the Rust registry rejects a
+// push carrying duplicate tabKeys (the whole push then goes unacked).
 function buildRemoteTabRecord(sessionId: string, busy: boolean): RawSnapshotRecord {
   const now = Date.now()
   const sessionKey = `claude:${sessionId}`
-  const short = sessionId.slice(0, 8)
+  const short = sessionId.slice(-8)
   return {
     tabKey: `${DEVICE_B_ID}:claude-tab-${short}`,
     tabId: `claude-tab-${short}`,
@@ -645,9 +647,16 @@ test.describe.serial('sidebar status-tier sort (rust)', () => {
     // The resumed session's JSONL is resolvable, so the 2s submit probe
     // reverts the provisional busy — three Enters 1.5s apart re-arm the
     // grace and hold busy ≈5s (see header).
+    // The server's submit detector (is_submit_input, freshell-activity
+    // signal.rs:36) only counts a frame consisting ENTIRELY of CR/LF bytes —
+    // matching how xterm really sends Enter (text and Enter are separate
+    // data events). Text first, then a CR-only frame. CR-only repeats
+    // re-arm the provisional-busy grace (claude.rs:198) — three rounds
+    // 1.5s apart hold busy ≈5s.
     const sOpenTerminalId = await getSessionTerminalId(page, S_OPEN)
     for (const text of ['busy one', 'busy two', 'busy three']) {
-      deviceB.sendRaw({ type: 'terminal.input', terminalId: sOpenTerminalId, data: `${text}\r` })
+      deviceB.sendRaw({ type: 'terminal.input', terminalId: sOpenTerminalId, data: text })
+      deviceB.sendRaw({ type: 'terminal.input', terminalId: sOpenTerminalId, data: '\r' })
       await page.waitForTimeout(1_500)
     }
     await expectSidebarOrder(page, [S_OPEN, S_GREY, S_BUSY], 15_000)
