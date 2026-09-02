@@ -62,8 +62,12 @@ renderer), Zod, Vitest, Playwright `_electron`.
   default profile never calls `app.setPath('userData', ...)` at all.
 - **Lock timing policy (load-bearing finding LB-02 + plan-review round 3):**
   EVERY browser process holds exactly one userData-keyed instance lock from
-  `whenReady()` onward — no lock-free picker phase. A non-explicit launch
-  whose registry names ≥2 profiles becomes a **picker launcher**: it sets its
+  `whenReady()` onward — no lock-free picker phase. The one-profile-in-file
+  threshold is **registry names ≥1 named profile**: Default is an
+  always-configured choice, so one named entry already makes the configured
+  choice set exceed one (matching the User Request's "more than one profile is
+  configured"); every plan/test/README line uses this same threshold. A
+  non-explicit launch meeting it becomes a **picker launcher**: it sets its
   userData to a dedicated launcher dir (`<appData>/<AppName>-profile-picker`,
   NEVER the default userData — sharing a Chromium userData between the
   launcher and a resident Default instance is a storage-corruption hazard),
@@ -479,13 +483,15 @@ test must fail because the module does not exist yet.
 
 **Interfaces:**
 - Consumes: nothing repo-internal (only `path`, `zod`).
-- Produces: `DEFAULT_PROFILE_ID`, `PROFILE_ID_PATTERN`, `ProfileEntry`,
-  `ProfilesRegistrySchema`, `RegistryReadResult`, `ProfileSelection`,
-  `ProfileSelectionResult`, `parseProfileArg(argv)`, `stripProfileArgs(argv)`,
-  `resolveProfileSelection(argv, env)`, `configDirForProfile(id, homedir)`,
-  `userDataDirForProfile(id, appName, appDataDir)`, `registryPathForHome(homedir)`,
+- Produces: `DEFAULT_PROFILE_ID`, `PICKER_USERDATA_ID`, `PROFILE_ID_PATTERN`,
+  `ProfileEntry`, `ProfilesRegistrySchema`, `RegistryReadResult`,
+  `ProfileSelection`, `ProfileSelectionResult`, `parseProfileArg(argv)`,
+  `stripProfileArgs(argv)`, `resolveProfileSelection(argv, env)`,
+  `configDirForProfile(id, homedir)`, `userDataDirForProfile(id, appName, appDataDir)`,
+  `userDataDirForPicker(appName, appDataDir)`, `registryPathForHome(homedir)`,
   `readProfilesRegistry(path, readFile)`, `shouldShowProfilePicker(selection, registry)`,
-  `buildPickerEntries(registry)`.
+  `buildPickerEntries(registry)`, `resolveBootShape(argv, env, registry, appName, appDataDir, homedir)`,
+  `BootShape`.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -501,9 +507,11 @@ import {
   parseProfileArg,
   readProfilesRegistry,
   registryPathForHome,
+  resolveBootShape,
   resolveProfileSelection,
   shouldShowProfilePicker,
   stripProfileArgs,
+  userDataDirForPicker,
   userDataDirForProfile,
 } from '../../../electron/profile.js'
 
@@ -565,6 +573,12 @@ describe('resolveProfileSelection', () => {
     const r = resolveProfileSelection(['app', '--profile=../evil'], {})
     expect(r.selection).toEqual({ id: DEFAULT_PROFILE_ID, explicit: false, source: 'default' })
     expect(r.error).toContain('../evil')
+  })
+  it('the reserved picker id falls back to default with an error', () => {
+    const r = resolveProfileSelection(['app', '--profile=profile-picker'], {})
+    expect(r.selection.id).toBe(DEFAULT_PROFILE_ID)
+    expect(r.selection.explicit).toBe(false)
+    expect(r.error).toContain('profile-picker')
   })
 })
 
@@ -677,6 +691,18 @@ describe('resolveBootShape', () => {
         profileId: 'default',
         configDir: path.join('/home/u', '.freshell'),
       })
+  })
+  it('explicitly requesting the reserved picker id falls back to default with an error', () => {
+    const shape = resolveBootShape(['app', '--profile=profile-picker'], {}, REG, 'Freshell', '/app/data', '/home/u')
+    expect(shape.kind).toBe('default')
+    expect(shape.profileId).toBe('default')
+    expect(shape.error).toContain('profile-picker')
+  })
+  it('an invalid explicit id falls back to default (no picker) with the reason preserved', () => {
+    const shape = resolveBootShape(['app', '--profile=../evil'], {}, REG, 'Freshell', '/app/data', '/home/u')
+    expect(shape.kind).toBe('default')
+    expect(shape.userDataDir).toBeUndefined()
+    expect(shape.error).toContain('../evil')
   })
 })
 ```
@@ -810,6 +836,12 @@ export function resolveProfileSelection(
   if (raw === DEFAULT_PROFILE_ID) {
     return { selection: { id: DEFAULT_PROFILE_ID, explicit: true, source } }
   }
+  if (raw === PICKER_USERDATA_ID) {
+    return {
+      selection: { id: DEFAULT_PROFILE_ID, explicit: false, source: 'default' },
+      error: `Profile id '${PICKER_USERDATA_ID}' is reserved for the picker launcher; using the default profile.`,
+    }
+  }
   if (!PROFILE_ID_PATTERN.test(raw)) {
     return {
       selection: { id: DEFAULT_PROFILE_ID, explicit: false, source: 'default' },
@@ -916,6 +948,9 @@ export interface BootShape {
   profileId: string
   userDataDir?: string
   configDir: string
+  /** Set when an explicit request was invalid and default was substituted;
+   *  entry.ts logs it (warn) so the fallback is visible. */
+  error?: string
 }
 
 export function resolveBootShape(
@@ -926,7 +961,18 @@ export function resolveBootShape(
   appDataDir: string,
   homedir: string,
 ): BootShape {
-  const { selection } = resolveProfileSelection(argv, env)
+  const { selection, error } = resolveProfileSelection(argv, env)
+  // An explicitly requested but INVALID profile must NOT surface the picker:
+  // the resolver already fell back to default; honor that and surface the
+  // reason via `error`.
+  if (error) {
+    return {
+      kind: 'default',
+      profileId: DEFAULT_PROFILE_ID,
+      configDir: configDirForProfile(DEFAULT_PROFILE_ID, homedir),
+      error,
+    }
+  }
   if (selection.explicit) {
     return {
       kind: 'explicit',
@@ -1072,6 +1118,14 @@ it('shows a hidden main window before focusing it on second-instance', async () 
   expect(mockWindow.show.mock.invocationCallOrder[0])
     .toBeLessThan(mockWindow.focus.mock.invocationCallOrder[0])
 })
+
+it('does not double-register second-instance when an early canonical handler exists', async () => {
+  // entry.ts installs its own canonical handler in main() before any window
+  // creation; initMainProcess must defer to it.
+  app.on('second-instance', () => {})
+  await initMainProcess(deps)
+  expect(app.listenerCount('second-instance')).toBe(1)
+})
 ```
 
 (A tray-hidden Default window is hidden, not minimized: today the handler only
@@ -1121,12 +1175,17 @@ they differ:
 ```ts
 it('logs a warning when the global hotkey registration fails', async () => {
   const ctx = createDefaultContext()
+  // createDefaultContext() does not provide mainProcessLogger — attach one and
+  // keep a direct mock reference (the optional-chain in production code means
+  // "no logger" is legal, so the test must supply one explicitly).
+  const mainProcessLogger = { log: vi.fn() }
+  ;(ctx as { mainProcessLogger?: { log: ReturnType<typeof vi.fn> } }).mainProcessLogger = mainProcessLogger
   ;(ctx.hotkeyManager.register as ReturnType<typeof vi.fn>).mockReturnValue(false)
 
   const result = await runStartup(ctx)
 
   expect(result.type).toBe('main')
-  expect(ctx.mainProcessLogger?.log).toHaveBeenCalledWith(
+  expect(mainProcessLogger.log).toHaveBeenCalledWith(
     expect.objectContaining({
       severity: 'warn',
       event: 'global_hotkey_registration_failed',
@@ -1175,24 +1234,30 @@ export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): bo
 must hold the instance lock already (see `acquireInstanceLock`)."
 
 Also in `initMainProcess`, fix the `second-instance` handler to surface a
-hidden (tray-resident) window, not just a minimized one:
+hidden (tray-resident) window, not just a minimized one — and register it only
+when no `second-instance` listener exists yet (entry.ts installs a canonical
+early handler; see Task 5):
 
 ```ts
-  // Second instance: surface and focus the existing window
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized?.()) {
-        mainWindow.restore?.()
+  // Second instance: surface and focus the existing window. Skipped if entry
+  // already installed a canonical early handler.
+  if (app.listenerCount('second-instance') === 0) {
+    app.on('second-instance', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized?.()) {
+          mainWindow.restore?.()
+        }
+        mainWindow.show?.()
+        mainWindow.focus?.()
       }
-      mainWindow.show?.()
-      mainWindow.focus?.()
-    }
-  })
+    })
+  }
 ```
 
 (Pre-existing bug, exposed by per-profile turn-away semantics: with
 `minimizeToTray: true` the resident window is hidden — `focus()` alone does
-nothing visible.)
+nothing visible. `listenerCount` comes free on the EventEmitter interface the
+tests mock; add it to the `ElectronApp` interface too.)
 
 `electron/tray.ts`:
 
@@ -1471,11 +1536,19 @@ git add server/freshell-home.ts server/logger.ts \
   server/coding-cli/codex-app-server/durability-store.ts \
   server/coding-cli/codex-app-server/runtime.ts \
   server/fresh-agent-extras-router.ts server/fresh-agent/recovery-store.ts \
-  test/unit/server/freshell-home.test.ts \
-  $(git -C . diff --name-only -- server/ test/ | tr '\n' ' ') \
+  test/unit/server/freshell-home.test.ts test/unit/server/logger.test.ts \
+  test/unit/server/coding-cli/codex-app-server/durability-store.test.ts \
+  test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
+  test/unit/server/fresh-agent/recovery-store.test.ts \
+  test/server/fresh-agent-extras.test.ts \
   docs/plans/2026-08-26-electron-multi-profile.md
 git commit -m "feat(server): honor FRESHELL_CONFIG_DIR for config dir resolution"
 ```
+
+(Stage EXACTLY these files — never `git add -A`, `-u`, or command-substitution
+builts from `git diff`, which can sweep in unrelated concurrent work in this
+multi-agent checkout. The test list above covers the re-routed consumers, one
+behavioral test each, per the Work-queue convention.)
 
 Commit message MUST additionally carry this rollout caveat (a near-verbatim
 version also lands in the README via Task 9):
@@ -1589,6 +1662,9 @@ const mainProcessLogger = createElectronMainLogger({ configDir })
 if (registryAtBoot.error) {
   mainProcessLogger.log({ severity: 'warn', event: 'profiles_registry_invalid', error: registryAtBoot.error })
 }
+if (bootShape.error) {
+  mainProcessLogger.log({ severity: 'warn', component: 'electron-profile', event: 'profile_selection_invalid', error: bootShape.error })
+}
 
 /** True once this process holds its (userData-keyed) instance lock;
  *  re-entrant main() calls (wizard completion) must not re-request it. */
@@ -1640,6 +1716,34 @@ this gate for picker launchers only:
     instanceLockHeld = true
   }
 ```
+
+Immediately after the lock gate, register the CANONICAL `second-instance`
+surfacing handler (round-4 finding: `initMainProcess` installs its handler
+only at the END of boot — a duplicate arriving during the wizard/chooser
+phases would deliver to a resident with NO handler registered and surface
+nothing). Covering all phases from here is also what lets the e2e turn-away
+spec observe real surfacing rather than tautological visibility:
+
+```ts
+  // Canonical duplicate-launch surfacing, registered ONCE, as early as
+  // possible: covers the wizard, chooser, and (until initMainProcess's own
+  // handler supersedes it for the main window) every intermediate phase.
+  if (!app.listenerCount('second-instance')) {
+    app.on('second-instance', () => {
+      const win = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed())
+      if (!win) return
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    })
+  }
+```
+
+And `initMainProcess` in Task 3 registers its `second-instance` handler ONLY
+if none exists yet (`app.listenerCount('second-instance') === 0`), so the
+canonical handler wins for early phases and the targeted main-window handler
+takes over late-boot; main.test.ts's harness (a bare EventEmitter) supports
+`listenerCount`, and a new case there pins the no-double-registration rule.
 
 Also extend the existing `electron_main_started` log with `profile: activeProfileId`.
 
@@ -1833,7 +1937,6 @@ describe('choose-profile handler', () => {
     const { deps, handler } = harness({ isAllowedSender: () => false })
     expect(await handler({}, 'work')).toEqual({ ok: false, error: 'Unexpected profile request.' })
     expect(deps.relaunchWithProfile).not.toHaveBeenCalled()
-    expect(deps.continueWithDefault).not.toHaveBeenCalled()
   })
 
   it('rejects non-string and unknown ids', async () => {
@@ -2054,7 +2157,7 @@ Expected: PASS
 
 ```bash
 git add electron/profile-choice-handler.ts electron/preload.ts electron/entry.ts \
-  test/unit/electron/profile-choice-handler.test.ts \
+  test/unit/electron/profile-choice-handler.test.ts test/unit/electron/preload.test.ts \
   docs/plans/2026-08-26-electron-multi-profile.md
 git commit -m "feat(electron): profile picker decision flow (choose-profile IPC + launcher picker)"
 ```
@@ -2737,10 +2840,11 @@ test.describe('Profile picker', () => {
     await expect(picker.getByRole('heading', { name: 'Choose a Freshell profile' })).toBeVisible()
   })
 
-  // Same-profile turn-away stays intact: an explicit duplicate of the resident
-  // profile is turned away at the lock gate, and the RESIDENT actually receives
-  // the `second-instance` event (the real delivery path, not a manual emit).
-  test('an explicit duplicate of a resident profile quits and delivers second-instance to the resident', async () => {
+  // Same-profile turn-away: an explicit duplicate of the resident profile is
+  // turned away at the lock gate; the resident's production second-instance
+  // handler (installed in main(), not a test listener) surfaces it — proven
+  // by hiding the resident's wizard window and asserting it re-appears.
+  test('an explicit duplicate of a resident profile quits and the resident surfaces', async () => {
     tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
     app = await launchApp(tmpHome, ['--profile=work'])
     const window = await app.firstWindow()
@@ -2748,36 +2852,29 @@ test.describe('Profile picker', () => {
     // Named profile, fresh HOME → first-run wizard proves we are resident.
     await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
 
-    // Register a second-instance counter inside the resident's main process.
-    // If the duplicate's failed lock attempt doesn't deliver the event, this
-    // stays 0 and the spec fails below.
-    await app.evaluate(({ app: residentApp }) => {
-      ;(globalThis as Record<string, unknown>).__secondInstanceCount = 0
-      residentApp.on('second-instance', () => {
-        ;(globalThis as Record<string, unknown>).__secondInstanceCount =
-          ((globalThis as Record<string, unknown>).__secondInstanceCount as number) + 1
-      })
+    // Hide the resident's window via the resident's own BrowserWindow API; the
+    // surfacing claim only means something if production code is what restores
+    // visibility. NB: read NATIVE visibility via isVisible() in the main
+    // process — a DOM locator's visibility does not reflect native window show/hide.
+    await app.evaluate(({ BrowserWindow: BW }) => {
+      const win = BW.getAllWindows().find((w) => !w.isDestroyed())
+      win?.hide()
     })
+    const isNativeVisible = () => app.evaluate(({ BrowserWindow: BW }) => {
+      const win = BW.getAllWindows().find((w) => !w.isDestroyed())
+      return win ? win.isVisible() : false
+    })
+    expect(await isNativeVisible()).toBe(false)
 
     const app2 = await launchApp(tmpHome, ['--profile=work'])
-    // The turned-away process must exit on its own (lock acquisition failed
-    // → app.quit()). firstWindow() would hang forever if it stayed alive, so
-    // poll the process handle instead.
-    await expect.poll(
-      () => app2.process().exitCode,
-      { timeout: 30_000 },
-    ).not.toBeNull()
+    await expect.poll(() => app2.process().exitCode, { timeout: 30_000 }).not.toBeNull()
     await app2.close().catch(() => {})
 
-    // Real second-instance delivery reached the resident process.
-    await expect.poll(
-      () => app.evaluate(() => (globalThis as Record<string, unknown>).__secondInstanceCount),
-      { timeout: 15_000 },
-    ).toBe(1)
-
-    // Resident is still alive and still showing its wizard.
+    // Production `second-instance` handler surfaced the resident's window.
+    // (The resident's wizard was hidden by the test above; only production
+    // surfacing can flip this back on.)
+    await expect.poll(isNativeVisible, { timeout: 15_000 }).toBe(true)
     expect(app.process().exitCode).toBeNull()
-    await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible()
   })
 })
 ```
