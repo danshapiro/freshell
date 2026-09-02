@@ -518,6 +518,11 @@ describe('stripProfileArgs', () => {
   it('drops a trailing bare --profile', () => {
     expect(stripProfileArgs(['--foo', '--profile'])).toEqual(['--foo'])
   })
+  it('keeps a flag that follows bare --profile (no value was consumed)', () => {
+    // Mirrors parseProfileArg: `--profile --other` took no value, so --other
+    // must survive stripping (it belongs to the relaunched process).
+    expect(stripProfileArgs(['--profile', '--other', 'x'])).toEqual(['--other', 'x'])
+  })
 })
 
 describe('resolveProfileSelection', () => {
@@ -694,14 +699,18 @@ export function parseProfileArg(argv: string[]): string | undefined {
   return undefined
 }
 
-/** Remove every `--profile=<id>` / `--profile <id>` pair from an argv slice. */
+/** Remove every `--profile=<id>` / `--profile <id>` pair from an argv slice.
+ * Mirrors parseProfileArg exactly: `--profile` only consumes the next token
+ * when it is a non-flag value; `--profile --other` drops just `--profile`
+ * (since no value was taken) and keeps `--other`. */
 export function stripProfileArgs(argv: string[]): string[] {
   const out: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg.startsWith('--profile=')) continue
     if (arg === '--profile') {
-      i++ // also drop its value if present
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith('--')) i++ // consumed a real value
       continue
     }
     out.push(arg)
@@ -899,6 +908,15 @@ describe('acquireInstanceLock', () => {
     expect(acquireInstanceLock(app)).toBe(false)
     expect(app.quit).toHaveBeenCalled()
   })
+
+  it('invokes onDenied BEFORE quitting (so entry.ts can lift the wizard-phase will-quit veto)', () => {
+    const app = createMockApp()
+    ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+    const onDenied = vi.fn()
+    expect(acquireInstanceLock(app, onDenied)).toBe(false)
+    expect(onDenied.mock.invocationCallOrder[0])
+      .toBeLessThan((app.quit as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+  })
 })
 ```
 
@@ -1000,11 +1018,14 @@ the export, and document the contract:
  * entry.ts has namespaced userData per profile, each profile holds its own
  * lock. Call BEFORE any boot side effects (provisioning, server spawn).
  * Returns true when the lock is held; on failure the app quits and this
- * returns false.
+ * returns false. `onDenied` (optional) runs immediately BEFORE app.quit() —
+ * entry.ts uses it to lift the wizard-phase `will-quit` veto for the denied
+ * duplicate, which never enters the wizard.
  */
-export function acquireInstanceLock(app: ElectronApp): boolean {
+export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): boolean {
   const gotLock = app.requestSingleInstanceLock()
   if (!gotLock) {
+    onDenied?.()
     app.quit()
     return false
   }
@@ -1457,8 +1478,15 @@ shared file the Default resident uses) and diagnostically useful:
   // the userData dir, so each profile holds an independent lock and a
   // same-profile duplicate quits here (delivering `second-instance` to the
   // resident, which then shows its window — see Task 3's surfacing fix).
+  //
+  // The onDenied hook lifts the `will-quit` wizard-phase veto: at this point
+  // `wizardPhase` is still true (it only flips false once a chooser/main
+  // window is reached), and entry.ts's module-level `will-quit` guard would
+  // otherwise preventDefault() this quit, leaving the turned-away duplicate
+  // as a headless zombie process. A denied duplicate never enters the wizard,
+  // so flipping it is unconditionally correct here.
   if (!instanceLockHeld) {
-    if (!acquireInstanceLock(app)) {
+    if (!acquireInstanceLock(app, () => { wizardPhase = false })) {
       return
     }
     instanceLockHeld = true
@@ -1592,6 +1620,7 @@ after a Default became resident degrades to focusing the resident.
 - Modify: `electron/preload.ts` (two new channels)
 - Modify: `electron/entry.ts` (picker step in `main()` + `runProfilePicker`)
 - Test: `test/unit/electron/profile-choice-handler.test.ts` (new)
+- Test: `test/unit/electron/preload.test.ts` (extend the exact-keys assertion — it pins the API shape and currently lists 12 keys)
 
 **Interfaces:**
 - Consumes: Task 2's `DEFAULT_PROFILE_ID`, `PickerEntry`, `buildPickerEntries`,
@@ -1601,6 +1630,29 @@ after a Default became resident degrades to focusing the resident.
   `getProfiles(): Promise<PickerEntry[]>` and `chooseProfile(id): Promise<ProfileChoiceResult>`.
 
 - [ ] **Step 1: Write the failing behavioral test**
+
+`test/unit/electron/preload.test.ts` — its 'has exactly the expected keys'
+assertion pins the API surface and will fail until the two new keys are added
+to the sorted list:
+
+```ts
+    expect(keys).toEqual([
+      'chooseLaunchOption',
+      'chooseProfile',
+      'completeSetup',
+      'getLaunchOptions',
+      'getProfiles',
+      'getServerMode',
+      'getServerStatus',
+      'installUpdate',
+      'isElectron',
+      'onUpdateAvailable',
+      'onUpdateDownloaded',
+      'openExternal',
+      'platform',
+      'setGlobalHotkey',
+    ])
+```
 
 ```ts
 // test/unit/electron/profile-choice-handler.test.ts
@@ -1658,9 +1710,11 @@ describe('choose-profile handler', () => {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/profile-choice-handler.test.ts --run`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/profile-choice-handler.test.ts test/unit/electron/preload.test.ts --run`
 
-Expected: FAIL because `electron/profile-choice-handler.js` does not exist.
+Expected: FAIL — `electron/profile-choice-handler.js` does not exist, and
+`preload.test.ts`'s exact-keys assertion lacks `getProfiles`/`chooseProfile` in
+the exposed API.
 
 - [ ] **Step 3: Add the production implementation**
 
@@ -1849,7 +1903,7 @@ happens inside the relaunched process.
 
 - [ ] **Step 4: Run the focused test + compile**
 
-Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/profile-choice-handler.test.ts --run && npm run build:electron`
+Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts test/unit/electron/profile-choice-handler.test.ts test/unit/electron/preload.test.ts --run && npm run build:electron`
 
 Expected: PASS both. Note: the picker renderer does not exist yet (Task 7), so
 a live boot with a registry present will fail to load the picker URL — that is
@@ -1911,7 +1965,7 @@ surface in-file.
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ProfilePicker } from '../../../electron/profile-picker/picker.js'
+import { ProfilePicker } from '../../../../electron/profile-picker/picker.js'
 
 function installDesktopApi(options: { chooseProfile?: ReturnType<typeof vi.fn> } = {}) {
   const chooseProfile = options.chooseProfile ?? vi.fn().mockResolvedValue({ ok: true })
@@ -1953,6 +2007,23 @@ describe('ProfilePicker', () => {
     render(<ProfilePicker />)
     fireEvent.click(await screen.findByRole('button', { name: 'Work' }))
     expect(await screen.findByRole('alert')).toBeTruthy()
+  })
+
+  it('surfaces a rejected getProfiles() promise via role="alert" instead of a blank window', async () => {
+    window.freshellDesktop = {
+      getProfiles: vi.fn().mockRejectedValue(new Error('ipc blew up')),
+      chooseProfile: vi.fn(),
+    }
+    render(<ProfilePicker />)
+    expect((await screen.findByRole('alert')).textContent).toContain('ipc blew up')
+  })
+
+  it('surfaces a rejected chooseProfile() promise via role="alert"', async () => {
+    const chooseProfile = vi.fn().mockRejectedValue(new Error('channel closed'))
+    installDesktopApi({ chooseProfile })
+    render(<ProfilePicker />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Work' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('channel closed')
   })
 })
 ```
@@ -2025,6 +2096,8 @@ export function ProfilePicker() {
     let cancelled = false
     void window.freshellDesktop?.getProfiles?.().then((list) => {
       if (!cancelled) setEntries(list ?? [])
+    }).catch((err: unknown) => {
+      if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load profiles')
     })
     return () => {
       cancelled = true
@@ -2033,8 +2106,12 @@ export function ProfilePicker() {
 
   const choose = async (id: string) => {
     setError(null)
-    const result = await window.freshellDesktop?.chooseProfile?.(id)
-    if (result && !result.ok) setError(result.error)
+    try {
+      const result = await window.freshellDesktop?.chooseProfile?.(id)
+      if (result && !result.ok) setError(result.error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to choose profile')
+    }
   }
 
   return (
@@ -2160,13 +2237,16 @@ npm run build && npm run build:electron && npm run build:wizard && \
   npm run build:launch-chooser && npm run build:profile-picker && \
   npm run prepare:bundled-node
 npx electron-builder --config config/electron-builder.yml --dir
-test -f dist/linux-unpacked/resources/profile-picker/index.html && echo "picker staged"
+test -f release/linux-unpacked/resources/profile-picker/index.html && echo "picker staged"
 ```
 
-(Adjust `linux-unpacked` for the host OS. `--dir` stages the full packaged
-layout without building an installer. If `prepare:bundled-node` is unusually
-slow, it may be skipped for THIS check only: extraResources staging does not
-depend on the bundled runtime.)
+(NOTE: `config/electron-builder.yml` sets `directories.output: release` — the
+staged layout lands under `release/linux-unpacked/` on Linux, NOT `dist/`,
+so the assertion above must use `release/`. Adjust the platform dir segment
+for the host OS. `--dir` stages the full packaged layout without building an
+installer. If `prepare:bundled-node` is unusually slow, it may be skipped for
+THIS check only: extraResources staging does not depend on the bundled
+runtime.)
 
 Expected: the file exists (electron-builder copied `dist/profile-picker` into
 `resources/profile-picker`). If it does not, the extraResources mapping is
@@ -2239,10 +2319,18 @@ async function launchApp(tmpHome: string, extraArgs: string[] = []): Promise<Ele
   // XDG_CONFIG_HOME, and Chromium also writes XDG_CACHE_HOME/XDG_DATA_HOME.
   // Without these, named profiles and locks could escape into the real home
   // and collide with a live install (evidence: load-bearing-validator-lb-03).
+  //
+  // Also scrub profile-selection env from the ambient shell: an exported
+  // FRESHELL_PROFILE would silently make every "flag-less" spec explicit,
+  // and ELECTRON_DEV=1 would point the picker/wizard at dev-server URLs
+  // instead of the built dist/ assets these specs assert on.
+  const env = { ...process.env }
+  delete env.FRESHELL_PROFILE
+  delete env.ELECTRON_DEV
   return electron.launch({
     args: [PROJECT_ROOT, ...extraArgs],
     env: {
-      ...process.env,
+      ...env,
       HOME: tmpHome,
       XDG_CONFIG_HOME: path.join(tmpHome, '.config'),
       XDG_CACHE_HOME: path.join(tmpHome, '.cache'),
@@ -2322,10 +2410,28 @@ test.describe('Profile picker', () => {
   })
 
   // Two DIFFERENT named profiles must boot side by side (independent userData
-  // locks). This is the core user story; without it a per-profile lock bug
-  // could pass every other spec.
-  test('two named profiles run concurrently', async () => {
+  // locks) AND read their own config dir. Isolation proof: the DEFAULT profile
+  // dir is pre-seeded with setupCompleted:true — if either named profile
+  // misresolved its config dir to the default, it would SKIP the wizard (and
+  // worse, write into ~/.freshell). Both named boots showing the wizard while
+  // the default dir stays untouched proves per-profile config reads.
+  // (App-bound/remote seeds are avoided deliberately: app-bound would spawn a
+  // server against the fixed default port and remote would probe the network —
+  // the wizard path touches neither, per LB-03's wizard-short-circuit.)
+  test('two named profiles run concurrently with isolated config dirs', async () => {
     tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'e2ework' }, { id: 'e2ehome' }] })
+
+    // Seed ONLY the default profile as fully-set-up. No desktop.json is ever
+    // created for the named profiles.
+    fs.writeFileSync(
+      path.join(tmpHome, '.freshell', 'desktop.json'),
+      JSON.stringify({
+        serverMode: 'app-bound', port: 3001, knownServers: [],
+        alwaysAskOnLaunch: false, globalHotkey: 'CommandOrControl+`',
+        startOnLogin: false, minimizeToTray: false, setupCompleted: true,
+      }, null, 2),
+    )
+
     app = await launchApp(tmpHome, ['--profile=e2ework'])
     const app2 = await launchApp(tmpHome, ['--profile=e2ehome'])
     try {
@@ -2334,7 +2440,7 @@ test.describe('Profile picker', () => {
       await expect(w1.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
       await expect(w2.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
 
-      // Both processes are still alive (neither was turned away by the lock).
+      // Both processes alive (independent per-profile locks).
       expect(app.process().exitCode).toBeNull()
       expect(app2.process().exitCode).toBeNull()
 
@@ -2343,11 +2449,18 @@ test.describe('Profile picker', () => {
       expect(path.basename(ud1).toLowerCase()).toBe('freshell-e2ework')
       expect(path.basename(ud2).toLowerCase()).toBe('freshell-e2ehome')
 
-      // Each profile logged into its own config dir.
-      await expect.poll(() => {
-        const d = path.join(tmpHome!, '.freshell-e2ehome', 'logs')
-        return fs.existsSync(d) && fs.readdirSync(d).some((f) => /^electron-main\..*\.jsonl$/.test(f))
-      }, { timeout: 15_000 }).toBe(true)
+      // Each profile logged into its own config dir; the seeded default dir
+      // got no logs from these two processes.
+      for (const id of ['e2ework', 'e2ehome']) {
+        await expect.poll(() => {
+          const d = path.join(tmpHome!, `.freshell-${id}`, 'logs')
+          return fs.existsSync(d) && fs.readdirSync(d).some((f) => /^electron-main\..*\.jsonl$/.test(f))
+        }, { timeout: 15_000 }).toBe(true)
+      }
+      expect(fs.existsSync(path.join(tmpHome, '.freshell', 'logs', ))).toBe(false)
+      // The default config was never overwritten by either named boot.
+      const seeded = JSON.parse(fs.readFileSync(path.join(tmpHome, '.freshell', 'desktop.json'), 'utf-8'))
+      expect(seeded.setupCompleted).toBe(true)
     } finally {
       await app2.close().catch(() => {})
     }
@@ -2428,14 +2541,26 @@ test.describe('Profile picker', () => {
   })
 
   // Same-profile turn-away stays intact: an explicit duplicate of the resident
-  // profile is turned away at the lock gate, and the resident surfaces.
-  test('an explicit duplicate of a resident profile quits and surfaces the resident', async () => {
+  // profile is turned away at the lock gate, and the RESIDENT actually receives
+  // the `second-instance` event (the real delivery path, not a manual emit).
+  test('an explicit duplicate of a resident profile quits and delivers second-instance to the resident', async () => {
     tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
     app = await launchApp(tmpHome, ['--profile=work'])
     const window = await app.firstWindow()
     await window.waitForLoadState('domcontentloaded')
     // Named profile, fresh HOME → first-run wizard proves we are resident.
     await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
+
+    // Register a second-instance counter inside the resident's main process.
+    // If the duplicate's failed lock attempt doesn't deliver the event, this
+    // stays 0 and the spec fails below.
+    await app.evaluate(({ app: residentApp }) => {
+      ;(globalThis as Record<string, unknown>).__secondInstanceCount = 0
+      residentApp.on('second-instance', () => {
+        ;(globalThis as Record<string, unknown>).__secondInstanceCount =
+          ((globalThis as Record<string, unknown>).__secondInstanceCount as number) + 1
+      })
+    })
 
     const app2 = await launchApp(tmpHome, ['--profile=work'])
     // The turned-away process must exit on its own (lock acquisition failed
@@ -2446,6 +2571,16 @@ test.describe('Profile picker', () => {
       { timeout: 30_000 },
     ).not.toBeNull()
     await app2.close().catch(() => {})
+
+    // Real second-instance delivery reached the resident process.
+    await expect.poll(
+      () => app.evaluate(() => (globalThis as Record<string, unknown>).__secondInstanceCount),
+      { timeout: 15_000 },
+    ).toBe(1)
+
+    // Resident is still alive and still showing its wizard.
+    expect(app.process().exitCode).toBeNull()
+    await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible()
   })
 })
 ```
