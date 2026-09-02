@@ -282,4 +282,39 @@ describe('RecoveryOfferPanel', () => {
     expect(content.sessionRef).toBeUndefined()
     expect(consumeTerminalRestoreRequestId(content.createRequestId)).toBe(false)
   })
+
+  it('a joinable ledgerOnly row lists under its tab (device-pane format) and joins it on accept (D8 placement)', async () => {
+    const joinableInventory: RecoveryInventory = {
+      ...INVENTORY,
+      ledgerOnly: [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' }],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(joinableInventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    // The heading counts the joined row exactly once
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+    // Listed under its tab in the same format as device panes, never the flat
+    // "session" line reserved for trailing rows
+    expect(screen.getByText('work: codex — /x')).toBeInTheDocument()
+    expect(screen.queryByText(/codex session — \/x/)).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    // No trailing tab exists when every kept row joined its original tab
+    expect(store.getState().tabs.tabs.find((t) => t.title === 'Recovered sessions')).toBeUndefined()
+    const leaves = findRecoveredTerminalLeaves(store, 'work')
+    expect(leaves).toHaveLength(2)
+    const bySessionId = new Map(
+      leaves.map((l) => {
+        if (l.content.kind !== 'terminal') throw new Error('unreachable')
+        return [l.content.sessionRef?.sessionId, l.content] as const
+      }),
+    )
+    for (const sessionId of ['S2', 'C9']) {
+      const content = bySessionId.get(sessionId)
+      expect(content, `expected an armed leaf for session ${sessionId}`).toBeTruthy()
+      expect(consumeTerminalRestoreRequestId(content!.createRequestId)).toBe(true)
+    }
+  })
 })

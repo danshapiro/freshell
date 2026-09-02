@@ -11,7 +11,7 @@ import {
   isDismissed,
   recordDismissal,
 } from '@/lib/recovery/dismissal'
-import { buildRecoveryPlan, countRecoverablePanes } from '@/lib/recovery/build-recovery-plan'
+import { buildRecoveryPlan, countRecoverablePanes, placeLedgerEntries } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { addTab } from '@/store/tabsSlice'
@@ -167,6 +167,13 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   const paneCount = countRecoverablePanes(inventory)
   const device = inventory.device
   const anyLive = device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
+  // D8 placement: the listing must match the plan's physical destination, so
+  // both consume the same partition — a kept ledger row whose stamped tabKey
+  // names a restorable tab renders under THAT tab in the same line format as
+  // its snapshot panes; rows without a restorable tab match keep the flat
+  // "session" line of the trailing tab they land in.
+  const restorableTabs = (device?.tabs ?? []).filter((tab) => tab.panes.length > 0)
+  const placement = placeLedgerEntries(inventory)
 
   return createPortal(
     <div
@@ -219,15 +226,21 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         {device && <p className="mt-1 text-xs text-muted-foreground">{device.deviceLabel}</p>}
         {/* Sole scroll region (R1): keeps heading, notes, and buttons out of the scrollable area. */}
         <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1 overflow-y-auto flex-1 min-h-0">
-          {(device?.tabs ?? []).flatMap((tab) =>
-            tab.panes.map((pane) => (
+          {restorableTabs.flatMap((tab) => [
+            ...tab.panes.map((pane) => (
               <li key={`${tab.tabKey}:${pane.paneId}`}>
                 {tab.tabName}: {pane.mode ?? pane.kind}
                 {pane.cwd ? ` — ${pane.cwd}` : ''}
               </li>
-            ))
-          )}
-          {inventory.ledgerOnly.map((entry) => (
+            )),
+            ...(placement.joinedByTabKey.get(tab.tabKey) ?? []).map((entry) => (
+              <li key={`${entry.provider}:${entry.sessionId}`}>
+                {tab.tabName}: {entry.mode}
+                {entry.cwd ? ` — ${entry.cwd}` : ''}
+              </li>
+            )),
+          ])}
+          {placement.trailing.map((entry) => (
             <li key={`${entry.provider}:${entry.sessionId}`}>
               {entry.mode} session — {entry.cwd ?? 'unknown directory'}
             </li>

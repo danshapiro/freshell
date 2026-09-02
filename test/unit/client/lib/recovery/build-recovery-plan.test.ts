@@ -14,6 +14,9 @@ const inv = (panes: unknown[], ledgerOnly: unknown[] = []): RecoveryInventory =>
   otherDevices: [], ledgerOnly,
 } as RecoveryInventory)
 
+const leavesOf = (node: any): any[] =>
+  !node ? [] : node.type === 'leaf' ? [node] : (node.children ?? []).flatMap(leavesOf)
+
 describe('buildRecoveryPlan', () => {
   it('single terminal pane -> one tab, leaf layout, cwd + mode carried', () => {
     const [tab] = buildRecoveryPlan(inv([pane()]))
@@ -82,7 +85,9 @@ describe('buildRecoveryPlan', () => {
     expect(root.children[1].content).toMatchObject({ kind: 'picker' })
   })
 
-  it('ledgerOnly entries get a trailing Recovered sessions tab', () => {
+  // Missing-tabKey pin (D8): a stamp-less row (pre-upgrade or headless
+  // REST/MCP lineage) can never be placed, so it keeps the trailing tab.
+  it('ledgerOnly entries without a stamped tabKey get a trailing Recovered sessions tab', () => {
     const plans = buildRecoveryPlan(inv([pane()], [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x' }]))
     expect(plans).toHaveLength(2)
     expect(plans[1].title).toBe('Recovered sessions')
@@ -90,7 +95,74 @@ describe('buildRecoveryPlan', () => {
     expect(content).toMatchObject({ kind: 'terminal', mode: 'codex', initialCwd: '/x', sessionRef: { provider: 'codex', sessionId: 'C9' } })
   })
 
+  it('a ledgerOnly row whose tabKey matches a restored tab joins that tab (rightmost leaf), no trailing tab', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' },
+    ]))
+    expect(plans).toHaveLength(1)
+    expect(plans[0].title).toBe('work')
+    expect(plans[0].sourceTabKey).toBe('k')
+    const contents = leavesOf(plans[0].layout).map((l) => l.content)
+    expect(contents).toHaveLength(2)
+    // Snapshot panes first; the joined row lands rightmost in the existing chain.
+    expect(contents[0]).toMatchObject({ kind: 'terminal', mode: 'shell', initialCwd: '/w' })
+    expect(contents[1]).toMatchObject({
+      kind: 'terminal', mode: 'claude', initialCwd: '/j',
+      sessionRef: { provider: 'claude', sessionId: 'S9' },
+    })
+  })
+
+  it('a ledgerOnly row whose tabKey matches no restored tab keeps the trailing tab', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' },
+    ]))
+    expect(plans).toHaveLength(2)
+    expect(plans[1].title).toBe('Recovered sessions')
+    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
+    expect(trailContents).toHaveLength(1)
+    expect(trailContents[0]).toMatchObject({
+      kind: 'terminal', mode: 'codex', initialCwd: '/x',
+      sessionRef: { provider: 'codex', sessionId: 'C9' },
+    })
+    // The device tab's plan is untouched by the unmatched row.
+    expect(leavesOf(plans[0].layout)).toHaveLength(1)
+  })
+
+  it('a tabKey naming a tab with no snapshot panes falls back to the trailing tab (no plan exists for it)', () => {
+    const inventory = inv([pane()], [
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k-empty' },
+    ])
+    inventory.device!.tabs.push({ tabKey: 'k-empty', tabName: 'empty', panes: [] })
+    const plans = buildRecoveryPlan(inventory)
+    expect(plans).toHaveLength(2)
+    expect(plans.map((p) => p.title)).toEqual(['work', 'Recovered sessions'])
+    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
+    expect(trailContents).toHaveLength(1)
+    expect(trailContents[0]).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'C9' } })
+  })
+
+  it('a mixed cohort joins the matched row and trails the unmatched one in a single trailing tab', () => {
+    const plans = buildRecoveryPlan(inv([pane(), pane({ paneId: 'p2' })], [
+      { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' },
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' },
+    ]))
+    expect(plans).toHaveLength(2)
+    const deviceContents = leavesOf(plans[0].layout).map((l) => l.content)
+    expect(deviceContents).toHaveLength(3)
+    expect(deviceContents[2]).toMatchObject({ sessionRef: { provider: 'claude', sessionId: 'S9' } })
+    expect(plans[1].title).toBe('Recovered sessions')
+    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
+    expect(trailContents).toHaveLength(1)
+    expect(trailContents[0]).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'C9' } })
+  })
+
   it('countRecoverablePanes sums device panes and ledgerOnly', () => {
     expect(countRecoverablePanes(inv([pane(), pane({ paneId: 'p2' })], [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: null }]))).toBe(3)
+  })
+
+  it('countRecoverablePanes counts a joined row identically (placement changes the total by nothing)', () => {
+    expect(countRecoverablePanes(inv([pane()], [
+      { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' },
+    ]))).toBe(2)
   })
 })

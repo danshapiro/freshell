@@ -50,6 +50,14 @@ export interface LedgerOnlyEntry {
   sessionId: string
   mode: string
   cwd: string | null
+  /**
+   * D8 provenance stamp: `<deviceId>:<tabId>` of the tab the pane was open in
+   * (present only for rows bound by a connection-scoped lane). The recovery
+   * plan joins the row into the restored tab with this key when one exists;
+   * rows without it (or whose tab left no retained evidence) fall back to the
+   * trailing tab.
+   */
+  tabKey?: string
 }
 
 export interface RecoveryInventory {
